@@ -1,10 +1,11 @@
-// Data loaders for KernelBench-Hard. Source of truth lives in the public
-// GitHub repo at github.com/Infatoshi/KernelBench-Hard. We fetch raw JSON +
-// YAML at build time (with hourly ISR) so the website mirrors whatever's
-// in the repo.
+// Data loaders for KernelBench. Source of truth lives in this monorepo
+// under benchmarks/<version>/. The website reads from the local filesystem
+// at build time — no network fetch needed since data and site ship together.
 
-const REPO_RAW =
-  "https://raw.githubusercontent.com/Infatoshi/KernelBench-Hard/master"
+import { readFile, readdir } from "node:fs/promises"
+import { join } from "node:path"
+
+const REPO_ROOT = process.cwd()
 
 export type Cell = {
   run_id: string
@@ -56,81 +57,56 @@ export type Annotation = {
 }
 
 export async function loadLeaderboard(): Promise<Leaderboard> {
-  const res = await fetch(`${REPO_RAW}/results/leaderboard.json`, {
-    next: { revalidate: 3600 },
-  })
-  if (!res.ok) {
-    throw new Error(`Failed to fetch leaderboard.json: ${res.status}`)
-  }
-  return res.json()
+  const path = join(REPO_ROOT, "benchmarks/v-hard/results/leaderboard.json")
+  const text = await readFile(path, "utf-8")
+  return JSON.parse(text)
 }
 
-// Annotations: list of YAML files under results/annotations/. We list the
-// directory via the GitHub API, then fetch each. Cached for an hour to keep
-// the API hits low.
 export async function loadAnnotations(): Promise<Map<string, Annotation>> {
   const map = new Map<string, Annotation>()
+  const dir = join(REPO_ROOT, "benchmarks/v-hard/results/annotations")
   try {
-    const apiRes = await fetch(
-      "https://api.github.com/repos/Infatoshi/KernelBench-Hard/contents/results/annotations",
-      {
-        next: { revalidate: 3600 },
-        headers: { Accept: "application/vnd.github.v3+json" },
-      },
-    )
-    if (!apiRes.ok) return map
-    type GhItem = { name: string; download_url: string | null; type: string }
-    const items: GhItem[] = await apiRes.json()
-    const yamls = items.filter(
-      (it) => it.type === "file" && it.name.endsWith(".yaml"),
-    )
-    const fetched = await Promise.all(
-      yamls.map(async (it) => {
-        if (!it.download_url) return null
-        const r = await fetch(it.download_url, {
-          next: { revalidate: 3600 },
-        })
-        if (!r.ok) return null
-        const text = await r.text()
-        return parseAnnotationYaml(text)
-      }),
-    )
-    for (const a of fetched) if (a) map.set(a.run_id, a)
+    const entries = await readdir(dir)
+    for (const name of entries) {
+      if (!name.endsWith(".yaml")) continue
+      const text = await readFile(join(dir, name), "utf-8")
+      const a = parseAnnotationYaml(text)
+      if (a) map.set(a.run_id, a)
+    }
   } catch {
-    // Network failures shouldn't break the page render; cells just don't
-    // get the star marker.
+    // Missing annotations dir is non-fatal — cells just don't get the marker.
   }
   return map
 }
 
-// Tiny YAML subset parser. We control the schema so we don't need a full
-// YAML library — just need to pull the top-level scalar fields. The quoted
-// schema (results/annotations/SCHEMA.md) limits the surface enough that
-// this is robust for our use case.
+// Tiny YAML subset parser. We control the schema (results/annotations/SCHEMA.md)
+// so we don't pull in a full YAML library — flat key:value pairs plus block
+// scalars (`|` and `>`) is the entire surface.
 function parseAnnotationYaml(text: string): Annotation | null {
+  const lines = text.split("\n")
   const get = (key: string): string | null => {
-    const re = new RegExp(`^${key}:\\s*(.*)$`, "m")
-    const m = text.match(re)
-    if (!m) return null
+    const re = new RegExp(`^${key}:\\s*(.*)$`)
+    const idx = lines.findIndex((l) => l.match(re))
+    if (idx < 0) return null
+    const m = lines[idx].match(re)!
     let v = m[1].trim()
-    // Multi-line block scalar: pipe or fold indicator
     if (v === "|" || v === ">") {
-      const lineIdx = text.split("\n").findIndex((l) => l.match(re))
-      const lines = text.split("\n").slice(lineIdx + 1)
       const collected: string[] = []
-      for (const line of lines) {
-        if (line.match(/^\S/)) break
+      for (let j = idx + 1; j < lines.length; j++) {
+        const line = lines[j]
+        if (line.match(/^\S/) || line.match(/^$/)) {
+          if (line.match(/^\S/)) break
+          collected.push("")
+          continue
+        }
         collected.push(line.replace(/^\s{2}/, ""))
       }
       v = collected.join("\n").trim()
-    } else {
-      // Strip surrounding quotes if present
-      if (
-        (v.startsWith('"') && v.endsWith('"')) ||
-        (v.startsWith("'") && v.endsWith("'"))
-      ) {
-        v = v.slice(1, -1)
-      }
+    } else if (
+      (v.startsWith('"') && v.endsWith('"')) ||
+      (v.startsWith("'") && v.endsWith("'"))
+    ) {
+      v = v.slice(1, -1)
     }
     return v
   }

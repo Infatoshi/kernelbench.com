@@ -2,25 +2,57 @@
 
 GPU kernel engineering benchmarks for autonomous LLM coding agents.
 
-- **v-Hard** (latest, 2026-04) — single Blackwell SM120, 7 hand-designed problems, 12 frontier models, real coding-agent CLI harnesses, forensic audit of every high-peak run with rubric leaks documented inline. Source: [github.com/Infatoshi/KernelBench-Hard](https://github.com/Infatoshi/KernelBench-Hard)
-- **v3** (archive, 2026-02) — 43-58 problems per GPU across RTX 3090 / H100 / B200, 10 models, 4 difficulty levels, 1500+ evaluations.
+This is the canonical monorepo: it ships both the public website and the benchmark suites it visualizes. The website reads benchmark data straight from `benchmarks/*/results/` at build time — what's on disk is what's on the site.
 
-## Architecture
+## Layout
 
-Next.js 16 + React 19 + Tailwind v4. Hacker-theme aesthetic (phosphor green on near-black, monospace everywhere, subtle CRT scanlines).
+```
+.
+├── app/                    Next.js website
+├── lib/data.ts             Reads benchmark data from benchmarks/ at build time
+├── public/                 Website static assets
+├── benchmarks/
+│   ├── v-hard/             Latest (2026-04). Single Blackwell, 7 problems, 12 models.
+│   │   ├── DEVLOG.md       Decisions, dead ends, lessons.
+│   │   ├── LEADERBOARD.md  Human-readable cross-model grid + rubric-leak footnotes.
+│   │   ├── results/
+│   │   │   ├── leaderboard.json    Schema-versioned, machine-readable.
+│   │   │   └── annotations/        Per-cell YAML commentary (clean / rubric_leak / etc.).
+│   │   ├── problems/       Problem definitions (reference.py, check.py, benchmark.py, …).
+│   │   ├── src/            Eval infrastructure (timing, correctness, hardware ceilings).
+│   │   ├── scripts/        Sweep orchestration.
+│   │   └── tests/
+│   └── v3/                 Archive (2026-02). RTX 3090 + H100 + B200, 43-58 problems/GPU, 10 models.
+│       ├── DEVLOG.md
+│       ├── README.md
+│       ├── problems/, src/, scripts/, tests/, …
+└── README.md               (this file)
+```
 
-- `app/page.tsx` — landing
-- `app/v3/page.tsx` — v3 leaderboard with client-side filterable explorer (CSV under `public/data/v3/`)
-- `app/v-hard/page.tsx` — v-hard leaderboard, fetches `leaderboard.json` and YAML annotations from the [KernelBench-Hard repo](https://github.com/Infatoshi/KernelBench-Hard) at build time with hourly ISR
-- `lib/data.ts` — data loaders + tiny YAML subset parser
+Each benchmark in `benchmarks/` keeps its own DEVLOG.md as the running record of decisions and dead ends. The website surfaces the visualization-ready slice (leaderboard, per-problem ceilings, annotations); the benchmark subdirs hold the full machinery so the work can be reproduced or extended.
 
-## Local development
+## How the site reads data
+
+`lib/data.ts` reads `benchmarks/v-hard/results/leaderboard.json` and the YAML annotations directly from the filesystem at build time. No network fetch, no HTTP cache — Next.js bakes the data into the page during `next build`. To update what the site shows: change the file under `benchmarks/`, push, Vercel rebuilds.
+
+## Versions
+
+| version | date | hardware | problems | models | live page |
+| --- | --- | --- | --- | --- | --- |
+| **v-hard** | 2026-04 | RTX PRO 6000 Blackwell (sm_120) | 7 | 12 | [/v-hard](https://kernelbench.com/v-hard) |
+| v3 | 2026-02 | RTX 3090 + H100 + B200 | 43-58 per GPU | 10 | [/v3](https://kernelbench.com/v3) |
+
+## Running the website locally
 
 ```bash
 npm install
 npm run dev
 ```
 
-## Deploy
+## Deploying
 
-Vercel native GitHub integration auto-deploys on push to `main`. No GHA workflow needed.
+Vercel native GitHub integration. Every push to `master` auto-deploys. No CI workflow required.
+
+## Source / mirrors
+
+The standalone `Infatoshi/KernelBench-Hard` and `Infatoshi/KernelBench-v3` GitHub repos still exist and are mirror images of `benchmarks/v-hard/` and `benchmarks/v3/` here. This monorepo is the new canonical home.
