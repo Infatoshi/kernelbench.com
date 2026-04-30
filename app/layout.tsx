@@ -51,6 +51,7 @@ function Header() {
           <a href="/v3">v3</a>
           <a href="/hard">v-hard</a>
           <a href="/runs">runs</a>
+          <a href="/blog">blog</a>
           <a
             href="https://github.com/Infatoshi/kernelbench.com"
             target="_blank"

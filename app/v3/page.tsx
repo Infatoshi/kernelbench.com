@@ -265,6 +265,7 @@ export default function V3Page() {
                     {sortKey === k ? (sortDir === "asc" ? " ↑" : " ↓") : ""}
                   </th>
                 ))}
+                <th>code</th>
               </tr>
             </thead>
             <tbody>
@@ -304,6 +305,36 @@ export default function V3Page() {
                     {r.estimated_cost_usd !== null
                       ? `$${r.estimated_cost_usd.toFixed(3)}`
                       : "-"}
+                  </td>
+                  <td className="whitespace-nowrap">
+                    {r.solution_link ? (
+                      <a
+                        href={r.solution_link.replace(
+                          "/data/kernelbench-v3/",
+                          "/data/v3/",
+                        )}
+                        target="_blank"
+                        rel="noreferrer"
+                        className="text-[var(--color-fg-bright)] no-underline hover:text-[var(--color-accent)] mr-2"
+                        title="open the model's solution.py"
+                      >
+                        sol
+                      </a>
+                    ) : null}
+                    {r.baseline_link ? (
+                      <a
+                        href={r.baseline_link.replace(
+                          "/data/kernelbench-v3/",
+                          "/data/v3/",
+                        )}
+                        target="_blank"
+                        rel="noreferrer"
+                        className="text-[var(--color-fg-muted)] no-underline hover:text-[var(--color-accent)]"
+                        title="open the PyTorch reference"
+                      >
+                        ref
+                      </a>
+                    ) : null}
                   </td>
                 </tr>
               ))}
