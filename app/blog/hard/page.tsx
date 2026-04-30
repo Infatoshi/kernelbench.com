@@ -57,6 +57,34 @@ export default function KernelBenchHardPost() {
             <strong>GPT-5.5 at extra-high reasoning is the only model that solved every problem.</strong> Claude Opus 4.7 max ate one FAIL on sonic_moe but earned the highest peak fraction on the deck — 0.602 on paged attention, with a real Triton FlashDecoding-style kernel. Kimi K2.6 was the surprise of the run: 6/7 PASS at a much lower API cost than the top tier, including the only PASS where it took the deck-leading peak (0.220 on w4a16). Qwen 3.6 35B-A3B never got a single tool call through — its only OpenRouter providers don&apos;t advertise tool-use, so the agent harness couldn&apos;t reach it. That&apos;s an honest <code>0/7</code>: not a capability failure, an infrastructure ceiling.
           </p>
 
+          <figure className="my-8">
+            <Image
+              src="/blog-hard/leaderboard_heatmap.png"
+              alt="peak_fraction heatmap across 12 models and 7 problems"
+              width={1700}
+              height={1000}
+              className="w-full h-auto rounded"
+              unoptimized
+            />
+            <figcaption className="text-xs text-[var(--color-fg-muted)] mt-2">
+              The whole leaderboard at a glance. Brighter cells = closer to the relevant hardware ceiling. The two brightest cells (opus on paged attention 0.602, opus on FP8 GEMM 0.534) are both flagged in the Rubric Leaks section below — only one of them is actually doing the work the problem name implies.
+            </figcaption>
+          </figure>
+
+          <figure className="my-8">
+            <Image
+              src="/blog-hard/pass_count_by_model.png"
+              alt="pass count by model"
+              width={1300}
+              height={870}
+              className="w-full h-auto rounded"
+              unoptimized
+            />
+            <figcaption className="text-xs text-[var(--color-fg-muted)] mt-2">
+              Pass count tier ranking. The amber bar (gpt-5.5 xhigh) is the only 7/7 on the deck.
+            </figcaption>
+          </figure>
+
           <h3 className="text-xl font-bold mt-8 mb-4">Per-problem ceilings</h3>
 
           <div className="overflow-x-auto mb-6 text-sm">
@@ -85,6 +113,20 @@ export default function KernelBenchHardPost() {
             Two of the seven problems have peaks above 0.30 (paged attention 0.602, FP8 GEMM 0.534, Kahan softmax 0.363). The rest cap below — 02 KDA Cutlass and 05 TopK Bitonic don&apos;t even break 5%. Either the references on those two are unusually well-tuned or the autonomous-agent gap is biggest there. Both, probably.
           </p>
 
+          <figure className="my-8">
+            <Image
+              src="/blog-hard/best_peak_per_problem.png"
+              alt="best peak fraction per problem"
+              width={1300}
+              height={650}
+              className="w-full h-auto rounded"
+              unoptimized
+            />
+            <figcaption className="text-xs text-[var(--color-fg-muted)] mt-2">
+              Per-problem ceilings, taking each problem&apos;s best model. Two clear difficulty regimes: paged attention / FP8 GEMM / Kahan softmax (where models reach the 30-60% range), and KDA / TopK / w4a16 / MoE up-proj (where the deck&apos;s hardest fully-fused work caps the leaderboard at 5-25%).
+            </figcaption>
+          </figure>
+
           <h2 className="text-2xl font-bold mt-12 mb-6">The Rubric Leaks</h2>
 
           <p className="leading-relaxed mb-6">
@@ -92,6 +134,20 @@ export default function KernelBenchHardPost() {
           </p>
 
           <h3 className="text-xl font-bold mt-8 mb-4">01 fp8_gemm: every high-peak solution is a bf16 GEMM in disguise</h3>
+
+          <figure className="my-6">
+            <Image
+              src="/blog-hard/fp8_gemm_cluster.png"
+              alt="five models cluster at peak_fraction 0.42 to 0.53 on FP8 GEMM"
+              width={1200}
+              height={620}
+              className="w-full h-auto rounded"
+              unoptimized
+            />
+            <figcaption className="text-xs text-[var(--color-fg-muted)] mt-2">
+              All five high-peak solutions ate the same shortcut. Cluster around 0.42-0.53 isn&apos;t coincidence — it&apos;s the achievable bf16 ceiling on Blackwell consumer when you cast fp8 inputs and run CUTLASS Ampere kernels. None of these are touching the SM120 fp8 tensor cores.
+            </figcaption>
+          </figure>
 
           <p className="leading-relaxed mb-6">
             All five solutions that scored above <code>peak_fraction = 0.4</code> on the FP8 GEMM problem do the same thing: cast the fp8 inputs to bf16 inside the kernel and run a bf16 GEMM. Both Opus 4.7 max and GPT-5.5 xhigh explicitly pin to <code>cutlass::arch::Sm80</code> — Ampere CUTLASS, not the SM120 Blackwell FP8 tensor cores the problem name implies.
@@ -128,6 +184,20 @@ shapes via:
           </p>
 
           <h3 className="text-xl font-bold mt-8 mb-4">04 kahan_softmax: six of seven models skipped the algorithm in the problem name</h3>
+
+          <figure className="my-6">
+            <Image
+              src="/blog-hard/kahan_inversion.png"
+              alt="model that implemented Kahan scored lowest of the seven passes"
+              width={1240}
+              height={620}
+              className="w-full h-auto rounded"
+              unoptimized
+            />
+            <figcaption className="text-xs text-[var(--color-fg-muted)] mt-2">
+              The benchmark inverts: the only model that actually implemented Kahan compensation (deepseek-v4-pro, green, 0.101) scored lowest of the seven passes. The other six, in orange, ran naive softmax — faster but algorithmically dishonest given the problem name.
+            </figcaption>
+          </figure>
 
           <p className="leading-relaxed mb-6">
             Kahan compensated summation is a classic numerically-stable alternative to naive summation. It&apos;s slower (extra add per iteration to track and re-inject the rounding error) but more accurate. The reference for this problem implements it; the problem name is <code>kahan_softmax</code>; the goal is a custom kernel that does the compensated path quickly.
