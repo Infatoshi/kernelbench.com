@@ -1,7 +1,7 @@
 import Link from "next/link"
 import { readdir } from "node:fs/promises"
 import { join } from "node:path"
-import { loadLeaderboard, loadAnnotations } from "@/lib/data"
+import { loadLeaderboard, loadAnnotations, loadBaselines } from "@/lib/data"
 
 async function loadAvailableViewers(): Promise<Set<string>> {
   try {
@@ -27,10 +27,11 @@ const PROBLEMS = [
 ]
 
 export default async function VHardPage() {
-  const [lb, annotations, hasViewer] = await Promise.all([
+  const [lb, annotations, hasViewer, baselines] = await Promise.all([
     loadLeaderboard(),
     loadAnnotations(),
     loadAvailableViewers(),
+    loadBaselines(),
   ])
 
   return (
@@ -101,23 +102,44 @@ export default async function VHardPage() {
         <h2 className="text-xl font-bold text-[var(--color-fg-bright)] mb-4 glow">
           # per-problem ceilings
         </h2>
+        <p className="text-xs text-[var(--color-fg-muted)] mb-3">
+          eager / compiled = PyTorch reference timings. SOTA = the existing best-known kernel
+          for the problem (vLLM paged attention, fbgemm grouped GEMM, etc.) when one exists
+          on this hardware. best peak = the model that pushed furthest above the
+          reference line.
+        </p>
         <div className="box overflow-x-auto">
           <table className="term tabular text-sm">
             <thead>
               <tr>
                 <th>problem</th>
-                <th>best peak</th>
+                <th className="text-right">eager ms</th>
+                <th className="text-right">compiled ms</th>
+                <th className="text-right">SOTA ms</th>
+                <th className="text-right">best peak</th>
                 <th>best model</th>
-                <th>n correct</th>
+                <th className="text-right">n pass</th>
               </tr>
             </thead>
             <tbody>
               {PROBLEMS.map((p) => {
                 const pp = lb.per_problem[p.key]
+                const bl = baselines?.problems[p.key] ?? {}
+                const fmtMs = (t: { ms: number } | undefined) =>
+                  t ? t.ms.toFixed(3) : "—"
                 return (
                   <tr key={p.key}>
                     <td>{p.key}</td>
-                    <td className="text-[var(--color-fg-bright)]">
+                    <td className="text-right text-[var(--color-fg-muted)]">
+                      {fmtMs(bl.eager)}
+                    </td>
+                    <td className="text-right text-[var(--color-fg-muted)]">
+                      {fmtMs(bl.compiled)}
+                    </td>
+                    <td className="text-right text-[var(--color-fg-muted)]">
+                      {fmtMs(bl.sota)}
+                    </td>
+                    <td className="text-right text-[var(--color-fg-bright)]">
                       {pp.best_peak_fraction
                         ? pp.best_peak_fraction.toFixed(3)
                         : "-"}
@@ -125,7 +147,7 @@ export default async function VHardPage() {
                     <td className="text-[var(--color-fg-muted)]">
                       {pp.best_model ? shortLabel(pp.best_model) : "-"}
                     </td>
-                    <td>
+                    <td className="text-right">
                       {pp.n_passed}/{pp.n_attempted}
                     </td>
                   </tr>
@@ -134,6 +156,11 @@ export default async function VHardPage() {
             </tbody>
           </table>
         </div>
+        {!baselines && (
+          <p className="text-xs text-[var(--color-fg-dim)] mt-2">
+            (baseline timings not yet generated — run scripts/run_baselines.sh in benchmarks/hard/)
+          </p>
+        )}
       </section>
 
       <section>

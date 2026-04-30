@@ -56,6 +56,37 @@ export type Annotation = {
   implication?: string
 }
 
+export type VariantTiming = {
+  ms: number
+  tflops: number
+  gbps: number
+  n_shapes: number
+}
+
+export type ProblemBaseline = {
+  eager?: VariantTiming
+  compiled?: VariantTiming
+  sota?: VariantTiming
+  _solution_peak_fraction_baseline?: number
+}
+
+export type ProblemBaselines = {
+  _schema: string
+  _generated: string
+  _hardware: string
+  problems: Record<string, ProblemBaseline>
+}
+
+export async function loadBaselines(): Promise<ProblemBaselines | null> {
+  const path = join(REPO_ROOT, "benchmarks/hard/results/problem_baselines.json")
+  try {
+    const text = await readFile(path, "utf-8")
+    return JSON.parse(text)
+  } catch {
+    return null
+  }
+}
+
 export async function loadLeaderboard(): Promise<Leaderboard> {
   const path = join(REPO_ROOT, "benchmarks/hard/results/leaderboard.json")
   const text = await readFile(path, "utf-8")
