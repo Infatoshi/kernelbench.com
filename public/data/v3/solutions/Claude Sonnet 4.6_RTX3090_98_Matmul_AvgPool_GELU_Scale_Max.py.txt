@@ -1,0 +1,266 @@
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+cuda_source = r'''
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <cuda_fp16.h>
+#include <mma.h>
+#include <cmath>
+#include <float.h>
+
+using namespace nvcuda;
+
+// GELU exact: 0.5 * x * (1 + erf(x / sqrt(2)))
+__device__ __forceinline__ float gelu_f(float x) {
+    return 0.5f * x * (1.0f + erff(x * 0.7071067811865476f));
+}
+
+// ========================
+// Fused AvgPool + GELU + Scale + Max kernel
+// One block per row, threads do parallel reduction
+// ========================
+__global__ void avgpool_gelu_scale_max_kernel(
+    const float* __restrict__ linear_out,  // (M, N)
+    float* __restrict__ result,            // (M,)
+    int N,
+    int pool_kernel_size,
+    float scale_factor
+) {
+    int row = blockIdx.x;
+    int pooled_size = N / pool_kernel_size;
+    const float* src = linear_out + row * N;
+    
+    float thread_max = -FLT_MAX;
+    
+    for (int i = threadIdx.x; i < pooled_size; i += blockDim.x) {
+        float sum = 0.f;
+        int base = i * pool_kernel_size;
+        #pragma unroll 4
+        for (int k = 0; k < pool_kernel_size; k++) {
+            sum += src[base + k];
+        }
+        float avg = sum * (1.0f / pool_kernel_size);
+        float g = gelu_f(avg) * scale_factor;
+        thread_max = fmaxf(thread_max, g);
+    }
+    
+    // Warp-level reduce
+    #pragma unroll
+    for (int mask = 16; mask > 0; mask >>= 1) {
+        thread_max = fmaxf(thread_max, __shfl_xor_sync(0xffffffff, thread_max, mask));
+    }
+    
+    // Block-level reduce via shared mem
+    __shared__ float smax[32];
+    int lane   = threadIdx.x & 31;
+    int warp_id = threadIdx.x >> 5;
+    if (lane == 0) smax[warp_id] = thread_max;
+    __syncthreads();
+    
+    if (warp_id == 0) {
+        int num_warps = (blockDim.x + 31) >> 5;
+        float val = (lane < num_warps) ? smax[lane] : -FLT_MAX;
+        #pragma unroll
+        for (int mask = 16; mask > 0; mask >>= 1) {
+            val = fmaxf(val, __shfl_xor_sync(0xffffffff, val, mask));
+        }
+        if (lane == 0) result[row] = val;
+    }
+}
+
+// ========================
+// WMMA GEMM: C = A * B^T + bias
+// A: (M, K) row-major
+// B: (N, K) row-major  (weight matrix)
+// bias: (N,)
+// C: (M, N) row-major
+//
+// Using 16x16x16 WMMA tiles
+// Block computes BM x BN output tile
+// BM = 16 rows (1 WMMA tile in M)
+// BN = 64 cols (4 WMMA tiles in N)
+// K dimension tiled with BK = 16
+// ========================
+
+#define BM 16
+#define BN 64
+#define BK 16
+// 4 warps per block, each handling one BM x WMMA_N = 16x16 tile
+#define WARPS_PER_BLOCK 4
+
+__global__ void wmma_linear_kernel(
+    const float* __restrict__ A,     // (M, K)
+    const float* __restrict__ B,     // (N, K)
+    const float* __restrict__ bias,  // (N,)
+    float* __restrict__ C,           // (M, N)
+    int M, int N, int K
+) {
+    // Block covers rows [block_row, block_row+BM) and cols [block_col, block_col+BN)
+    int block_row = blockIdx.x * BM;
+    int block_col = blockIdx.y * BN;
+    
+    int warp_id = threadIdx.x / 32;
+    // Each warp handles a BM x 16 column tile within the block's BN columns
+    int warp_col_offset = warp_id * 16;  // 0, 16, 32, 48
+    
+    // Accumulator
+    wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc;
+    wmma::fill_fragment(acc, 0.0f);
+    
+    // Shared memory to hold half-precision tiles
+    __shared__ __half sA[BM][BK];   // 16 x 16
+    __shared__ __half sB[BN][BK];   // 64 x 16
+    
+    int tid = threadIdx.x;
+    int nthreads = blockDim.x;  // 128
+    
+    for (int k_base = 0; k_base < K; k_base += BK) {
+        // Load A tile: BM x BK = 16 x 16 = 256 elements
+        // 128 threads -> each loads 2 elements
+        for (int i = tid; i < BM * BK; i += nthreads) {
+            int r = i / BK;
+            int c = i % BK;
+            int gr = block_row + r;
+            int gc = k_base + c;
+            float val = (gr < M && gc < K) ? A[gr * K + gc] : 0.f;
+            sA[r][c] = __float2half(val);
+        }
+        
+        // Load B tile: BN x BK = 64 x 16 = 1024 elements
+        // 128 threads -> each loads 8 elements
+        for (int i = tid; i < BN * BK; i += nthreads) {
+            int r = i / BK;
+            int c = i % BK;
+            int gr = block_col + r;
+            int gc = k_base + c;
+            float val = (gr < N && gc < K) ? B[gr * K + gc] : 0.f;
+            sB[r][c] = __float2half(val);
+        }
+        
+        __syncthreads();
+        
+        // WMMA multiply-accumulate
+        // a_frag: sA[0:16, 0:16] with row_major and stride BK=16
+        // b_frag: sB[warp_col_offset:warp_col_offset+16, 0:16] with col_major
+        //         (since B is (N,K) and we want A*B^T, the B fragment is col_major)
+        wmma::fragment<wmma::matrix_a, 16, 16, 16, __half, wmma::row_major> a_frag;
+        wmma::fragment<wmma::matrix_b, 16, 16, 16, __half, wmma::col_major> b_frag;
+        
+        wmma::load_matrix_sync(a_frag, &sA[0][0], BK);
+        wmma::load_matrix_sync(b_frag, &sB[warp_col_offset][0], BK);
+        wmma::mma_sync(acc, a_frag, b_frag, acc);
+        
+        __syncthreads();
+    }
+    
+    // Store accumulator to shared memory, then write to C with bias
+    __shared__ float tmp[BM][BN];
+    wmma::store_matrix_sync(&tmp[0][warp_col_offset], acc, BN, wmma::mem_row_major);
+    __syncthreads();
+    
+    // Write with bias
+    for (int i = tid; i < BM * BN; i += nthreads) {
+        int r = i / BN;
+        int c = i % BN;
+        int gr = block_row + r;
+        int gc = block_col + c;
+        if (gr < M && gc < N) {
+            C[gr * N + gc] = tmp[r][c] + bias[gc];
+        }
+    }
+}
+
+
+torch::Tensor fused_linear_avgpool_gelu_scale_max(
+    torch::Tensor input,    // (M, K)
+    torch::Tensor weight,   // (N, K)
+    torch::Tensor bias_t,   // (N,)
+    int pool_kernel_size,
+    float scale_factor
+) {
+    int M = input.size(0);
+    int K = input.size(1);
+    int N = weight.size(0);
+    
+    auto linear_out = torch::empty({M, N}, input.options());
+    
+    // WMMA GEMM
+    dim3 grid((M + BM - 1) / BM, (N + BN - 1) / BN);
+    dim3 block(WARPS_PER_BLOCK * 32);
+    
+    wmma_linear_kernel<<<grid, block>>>(
+        input.data_ptr<float>(),
+        weight.data_ptr<float>(),
+        bias_t.data_ptr<float>(),
+        linear_out.data_ptr<float>(),
+        M, N, K
+    );
+    
+    // Fused post-processing
+    auto result = torch::empty({M}, input.options());
+    int pooled_size = N / pool_kernel_size;
+    int threads = min(pooled_size, 512);
+    threads = ((threads + 31) / 32) * 32;
+    
+    avgpool_gelu_scale_max_kernel<<<M, threads>>>(
+        linear_out.data_ptr<float>(),
+        result.data_ptr<float>(),
+        N, pool_kernel_size, scale_factor
+    );
+    
+    return result;
+}
+'''
+
+cpp_source = '''
+torch::Tensor fused_linear_avgpool_gelu_scale_max(
+    torch::Tensor input,
+    torch::Tensor weight,
+    torch::Tensor bias_t,
+    int pool_kernel_size,
+    float scale_factor
+);
+'''
+
+ext = load_inline(
+    name='fused_ops_v3',
+    cpp_sources=cpp_source,
+    cuda_sources=cuda_source,
+    functions=['fused_linear_avgpool_gelu_scale_max'],
+    extra_cuda_cflags=['-arch=sm_86', '-O3', '--use_fast_math', '-std=c++17'],
+    verbose=True,
+)
+
+
+class Model(nn.Module):
+    def __init__(self, in_features, out_features, pool_kernel_size, scale_factor):
+        super(Model, self).__init__()
+        self.matmul = nn.Linear(in_features, out_features)
+        self.pool_kernel_size = pool_kernel_size
+        self.scale_factor = float(scale_factor)
+
+    def forward(self, x):
+        return ext.fused_linear_avgpool_gelu_scale_max(
+            x,
+            self.matmul.weight,
+            self.matmul.bias,
+            self.pool_kernel_size,
+            self.scale_factor
+        )
+
+
+batch_size = 128
+in_features = 4096
+out_features = 4096
+pool_kernel_size = 4
+scale_factor = 2.0
+
+
+def get_inputs():
+    return [torch.randn(batch_size, in_features)]
+
+
+def get_init_inputs():
+    return [in_features, out_features, pool_kernel_size, scale_factor]

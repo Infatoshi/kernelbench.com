@@ -1,0 +1,284 @@
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Strategy:
+# - Use cublasSgemm for the GEMM (fastest on RTX 3090)
+# - Fuse: add linear_bias + swish + add extra_bias in one kernel
+# - Fuse GroupNorm in a second kernel
+# This avoids torch.matmul/F.linear by calling cuBLAS directly.
+
+cuda_source = r'''
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <cuda_fp16.h>
+#include <cublas_v2.h>
+#include <stdint.h>
+#include <math.h>
+
+// ─────────────────────────────────────────────────────────────────────────────
+// cuBLAS handle (per-device, lazily initialized)
+// ─────────────────────────────────────────────────────────────────────────────
+static cublasHandle_t g_cublas_handle = nullptr;
+
+static cublasHandle_t get_cublas_handle() {
+    if (g_cublas_handle == nullptr) {
+        cublasCreate(&g_cublas_handle);
+        // Use Tensor Cores with FP32 accumulation (TF32 mode on Ampere)
+        cublasSetMathMode(g_cublas_handle, CUBLAS_TF32_TENSOR_OP_MATH);
+    }
+    return g_cublas_handle;
+}
+
+// C = A * B^T  where A:[M,K], B:[N,K] => C:[M,N]
+torch::Tensor cublas_gemm(torch::Tensor A, torch::Tensor B) {
+    // A: [M, K], B: [N, K] (weight is stored as [out, in])
+    int M = A.size(0), K = A.size(1), N = B.size(0);
+    auto C = torch::empty({M, N}, A.options());
+
+    cublasHandle_t handle = get_cublas_handle();
+
+    // cuBLAS uses column-major. We compute C^T = B * A^T
+    // C (row-major [M,N]) = A (row-major [M,K]) * B^T (row-major [N,K] -> col-major [K,N])
+    // In cuBLAS column-major notation:
+    //   C^T [N,M] = B [N,K] * A^T [K,M]
+    // cublasSgemm(handle, CUBLAS_OP_T, CUBLAS_OP_N, M, N, K, alpha, A, K, B, K, beta, C, M)
+    // This gives C[M,N] in row-major correctly.
+    float alpha = 1.f, beta = 0.f;
+    cublasSgemm(handle,
+                CUBLAS_OP_T,   // op(B) = B^T, but B is [N,K], treat as col-major [K,N]
+                CUBLAS_OP_N,   // op(A) = A,   A is [M,K], treat as col-major [K,M]
+                N, M, K,
+                &alpha,
+                B.data_ptr<float>(), K,   // B: leading dim = K
+                A.data_ptr<float>(), K,   // A: leading dim = K
+                &beta,
+                C.data_ptr<float>(), N);  // C: leading dim = N
+    return C;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Fused: add linear_bias, swish, add extra_bias (in-place, vectorized)
+// ─────────────────────────────────────────────────────────────────────────────
+__global__ void swish_bias_kernel(float* __restrict__ x,
+                                   const float* __restrict__ linear_bias,
+                                   const float* __restrict__ extra_bias,
+                                   int batch, int out_features) {
+    // Each thread processes 4 floats (float4) for coalesced access
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;  // element index (in groups of 4)
+    int col4 = tid % (out_features / 4);
+    int row  = tid / (out_features / 4);
+    if (row >= batch) return;
+
+    int col = col4 * 4;
+    float4 v  = *reinterpret_cast<const float4*>(x             + row * out_features + col);
+    float4 lb = *reinterpret_cast<const float4*>(linear_bias   + col);
+    float4 eb = *reinterpret_cast<const float4*>(extra_bias    + col);
+
+    #pragma unroll
+    for (int i = 0; i < 4; i++) {
+        float vi;
+        if (i == 0) vi = v.x + lb.x;
+        else if (i == 1) vi = v.y + lb.y;
+        else if (i == 2) vi = v.z + lb.z;
+        else vi = v.w + lb.w;
+        float si = __frcp_rn(1.f + __expf(-vi));
+        vi = vi * si;
+        if (i == 0) v.x = vi + eb.x;
+        else if (i == 1) v.y = vi + eb.y;
+        else if (i == 2) v.z = vi + eb.z;
+        else v.w = vi + eb.w;
+    }
+    *reinterpret_cast<float4*>(x + row * out_features + col) = v;
+}
+
+void fused_swish_bias(torch::Tensor x,
+                      torch::Tensor linear_bias,
+                      torch::Tensor extra_bias) {
+    int batch = x.size(0);
+    int out_f = x.size(1);
+    int total4 = batch * (out_f / 4);
+    int block = 256;
+    int grid  = (total4 + block - 1) / block;
+    swish_bias_kernel<<<grid, block>>>(
+        x.data_ptr<float>(),
+        linear_bias.data_ptr<float>(),
+        extra_bias.data_ptr<float>(),
+        batch, out_f);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GroupNorm: x [batch, C], each block = one (batch, group)
+// ─────────────────────────────────────────────────────────────────────────────
+__global__ void group_norm_kernel(const float* __restrict__ x,
+                                   float* __restrict__ y,
+                                   const float* __restrict__ weight,
+                                   const float* __restrict__ bias_gn,
+                                   int batch, int C, int groups,
+                                   float eps) {
+    int n = blockIdx.x;
+    int g = blockIdx.y;
+    int C_per_g = C / groups;
+    const float* xg = x + n * C + g * C_per_g;
+    float*       yg = y + n * C + g * C_per_g;
+
+    // Welford-style accumulation using float2 vectorized loads
+    float sum = 0.f, sum2 = 0.f;
+    for (int i = threadIdx.x; i < C_per_g / 4; i += blockDim.x) {
+        float4 v = *reinterpret_cast<const float4*>(xg + i * 4);
+        sum  += v.x + v.y + v.z + v.w;
+        sum2 += v.x*v.x + v.y*v.y + v.z*v.z + v.w*v.w;
+    }
+    // Handle remainder
+    int base4 = (C_per_g / 4) * 4;
+    for (int i = base4 + threadIdx.x; i < C_per_g; i += blockDim.x) {
+        float v = xg[i];
+        sum += v; sum2 += v*v;
+    }
+
+    // Warp reduce
+    for (int mask = 16; mask > 0; mask >>= 1) {
+        sum  += __shfl_xor_sync(0xffffffff, sum,  mask);
+        sum2 += __shfl_xor_sync(0xffffffff, sum2, mask);
+    }
+
+    __shared__ float smem_sum[32], smem_sum2[32];
+    int lane   = threadIdx.x & 31;
+    int warpid = threadIdx.x >> 5;
+    if (lane == 0) { smem_sum[warpid] = sum; smem_sum2[warpid] = sum2; }
+    __syncthreads();
+
+    int nwarps = (blockDim.x + 31) >> 5;
+    if (warpid == 0) {
+        sum  = (lane < nwarps) ? smem_sum[lane]  : 0.f;
+        sum2 = (lane < nwarps) ? smem_sum2[lane] : 0.f;
+        for (int mask = 16; mask > 0; mask >>= 1) {
+            sum  += __shfl_xor_sync(0xffffffff, sum,  mask);
+            sum2 += __shfl_xor_sync(0xffffffff, sum2, mask);
+        }
+        if (lane == 0) { smem_sum[0] = sum; smem_sum2[0] = sum2; }
+    }
+    __syncthreads();
+
+    float mean = smem_sum[0] / (float)C_per_g;
+    float var  = fmaxf(smem_sum2[0] / (float)C_per_g - mean * mean, 0.f);
+    float rstd = rsqrtf(var + eps);
+
+    const float* wg = weight + g * C_per_g;
+    const float* bg = bias_gn + g * C_per_g;
+
+    for (int i = threadIdx.x; i < C_per_g / 4; i += blockDim.x) {
+        float4 v  = *reinterpret_cast<const float4*>(xg + i * 4);
+        float4 w4 = *reinterpret_cast<const float4*>(wg + i * 4);
+        float4 b4 = *reinterpret_cast<const float4*>(bg + i * 4);
+        float4 out;
+        out.x = (v.x - mean) * rstd * w4.x + b4.x;
+        out.y = (v.y - mean) * rstd * w4.y + b4.y;
+        out.z = (v.z - mean) * rstd * w4.z + b4.z;
+        out.w = (v.w - mean) * rstd * w4.w + b4.w;
+        *reinterpret_cast<float4*>(yg + i * 4) = out;
+    }
+    for (int i = base4 + threadIdx.x; i < C_per_g; i += blockDim.x) {
+        int c = g * C_per_g + i;
+        yg[i] = (xg[i] - mean) * rstd * weight[c] + bias_gn[c];
+    }
+}
+
+torch::Tensor fused_group_norm(torch::Tensor x,
+                                torch::Tensor weight,
+                                torch::Tensor bias_gn,
+                                int groups, float eps) {
+    int batch   = x.size(0);
+    int C       = x.size(1);
+    int C_per_g = C / groups;
+
+    auto y = torch::empty_like(x);
+
+    // Choose block size: cover C_per_g/4 elements with warps
+    int elems_per_group = C_per_g / 4;  // with float4
+    int bs = 32;
+    while (bs < elems_per_group && bs < 256) bs <<= 1;
+    bs = min(bs, 256);
+
+    dim3 grid(batch, groups);
+    group_norm_kernel<<<grid, bs>>>(
+        x.data_ptr<float>(), y.data_ptr<float>(),
+        weight.data_ptr<float>(), bias_gn.data_ptr<float>(),
+        batch, C, groups, eps);
+    return y;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// All-in-one fused forward
+// ─────────────────────────────────────────────────────────────────────────────
+torch::Tensor fused_forward(
+        torch::Tensor x,
+        torch::Tensor weight,
+        torch::Tensor linear_bias,
+        torch::Tensor extra_bias,
+        torch::Tensor gn_weight,
+        torch::Tensor gn_bias,
+        int groups, float eps) {
+    auto out = cublas_gemm(x, weight);
+    fused_swish_bias(out, linear_bias, extra_bias);
+    return fused_group_norm(out, gn_weight, gn_bias, groups, eps);
+}
+''';
+
+cpp_source = r'''
+#include <cublas_v2.h>
+torch::Tensor cublas_gemm(torch::Tensor A, torch::Tensor B);
+void fused_swish_bias(torch::Tensor x, torch::Tensor linear_bias, torch::Tensor extra_bias);
+torch::Tensor fused_group_norm(torch::Tensor x, torch::Tensor weight, torch::Tensor bias_gn, int groups, float eps);
+torch::Tensor fused_forward(torch::Tensor x, torch::Tensor weight, torch::Tensor linear_bias,
+                             torch::Tensor extra_bias, torch::Tensor gn_weight, torch::Tensor gn_bias,
+                             int groups, float eps);
+''';
+
+ext = load_inline(
+    name='fused_ops_v5',
+    cpp_sources=cpp_source,
+    cuda_sources=cuda_source,
+    functions=['cublas_gemm', 'fused_swish_bias', 'fused_group_norm', 'fused_forward'],
+    extra_cuda_cflags=['-O3', '--use_fast_math', '-arch=sm_86', '-std=c++17'],
+    extra_ldflags=['-lcublas'],
+    verbose=False,
+)
+
+
+class Model(nn.Module):
+    """
+    Fused: Linear -> Swish -> Add bias -> GroupNorm
+    """
+    def __init__(self, in_features, out_features, num_groups, bias_shape):
+        super(Model, self).__init__()
+        self.matmul = nn.Linear(in_features, out_features)
+        self.bias = nn.Parameter(torch.randn(bias_shape))
+        self.group_norm = nn.GroupNorm(num_groups, out_features)
+        self.num_groups = num_groups
+
+    def forward(self, x):
+        return ext.fused_forward(
+            x,
+            self.matmul.weight,     # [out_features, in_features]
+            self.matmul.bias,       # [out_features]
+            self.bias,              # [out_features]
+            self.group_norm.weight,
+            self.group_norm.bias,
+            self.num_groups,
+            self.group_norm.eps,
+        )
+
+
+batch_size   = 128
+in_features  = 4096
+out_features = 4096
+num_groups   = 32
+bias_shape   = (out_features,)
+
+
+def get_inputs():
+    return [torch.randn(batch_size, in_features)]
+
+def get_init_inputs():
+    return [in_features, out_features, num_groups, bias_shape]
