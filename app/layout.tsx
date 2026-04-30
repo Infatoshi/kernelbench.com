@@ -12,7 +12,7 @@ export const metadata: Metadata = {
   metadataBase: new URL("https://kernelbench.com"),
   title: "KernelBench",
   description:
-    "GPU kernel engineering benchmarks for autonomous LLM coding agents. v3 (multi-GPU, 2026-Q1) and v-Hard (single Blackwell, 2026-Q2).",
+    "GPU kernel engineering benchmarks for autonomous LLM coding agents. v3 (multi-GPU, 2026-Q1) and Hard (single Blackwell, 2026-Q2).",
   openGraph: {
     title: "KernelBench",
     description:
@@ -49,7 +49,7 @@ function Header() {
         </a>
         <nav className="flex items-center gap-5 text-sm">
           <a href="/v3">v3</a>
-          <a href="/hard">v-hard</a>
+          <a href="/hard">hard</a>
           <a href="/runs">runs</a>
           <a href="/blog">blog</a>
           <a

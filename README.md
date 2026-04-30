@@ -12,7 +12,7 @@ This is the canonical monorepo: it ships both the public website and the benchma
 ├── lib/data.ts             Reads benchmark data from benchmarks/ at build time
 ├── public/                 Website static assets
 ├── benchmarks/
-│   ├── v-hard/             Latest (2026-04). Single Blackwell, 7 problems, 12 models.
+│   ├── hard/             Latest (2026-04). Single Blackwell, 7 problems, 12 models.
 │   │   ├── DEVLOG.md       Decisions, dead ends, lessons.
 │   │   ├── LEADERBOARD.md  Human-readable cross-model grid + rubric-leak footnotes.
 │   │   ├── results/
@@ -33,13 +33,13 @@ Each benchmark in `benchmarks/` keeps its own DEVLOG.md as the running record of
 
 ## How the site reads data
 
-`lib/data.ts` reads `benchmarks/v-hard/results/leaderboard.json` and the YAML annotations directly from the filesystem at build time. No network fetch, no HTTP cache — Next.js bakes the data into the page during `next build`. To update what the site shows: change the file under `benchmarks/`, push, Vercel rebuilds.
+`lib/data.ts` reads `benchmarks/hard/results/leaderboard.json` and the YAML annotations directly from the filesystem at build time. No network fetch, no HTTP cache — Next.js bakes the data into the page during `next build`. To update what the site shows: change the file under `benchmarks/`, push, Vercel rebuilds.
 
 ## Versions
 
 | version | date | hardware | problems | models | live page |
 | --- | --- | --- | --- | --- | --- |
-| **v-hard** | 2026-04 | RTX PRO 6000 Blackwell (sm_120) | 7 | 12 | [/v-hard](https://kernelbench.com/v-hard) |
+| **hard** | 2026-04 | RTX PRO 6000 Blackwell (sm_120) | 7 | 12 | [/hard](https://kernelbench.com/hard) |
 | v3 | 2026-02 | RTX 3090 + H100 + B200 | 43-58 per GPU | 10 | [/v3](https://kernelbench.com/v3) |
 
 ## Running the website locally
@@ -55,4 +55,4 @@ Vercel native GitHub integration. Every push to `master` auto-deploys. No CI wor
 
 ## Source / mirrors
 
-The standalone `Infatoshi/KernelBench-Hard` and `Infatoshi/KernelBench-v3` GitHub repos still exist and are mirror images of `benchmarks/v-hard/` and `benchmarks/v3/` here. This monorepo is the new canonical home.
+The standalone `Infatoshi/KernelBench-Hard` and `Infatoshi/KernelBench-v3` GitHub repos still exist and are mirror images of `benchmarks/hard/` and `benchmarks/v3/` here. This monorepo is the new canonical home.

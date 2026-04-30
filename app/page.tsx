@@ -26,7 +26,7 @@ export default function HomePage() {
         >
           <div className="text-xs text-[var(--color-accent)] mb-2">[ latest ]</div>
           <h2 className="text-xl font-bold text-[var(--color-fg-bright)] mb-3">
-            v-Hard <span className="text-[var(--color-fg-muted)] text-sm">2026-04</span>
+            Hard <span className="text-[var(--color-fg-muted)] text-sm">2026-04</span>
           </h2>
           <p className="text-sm text-[var(--color-fg)] mb-4">
             7 hand-designed problems · 12 frontier models · single Blackwell SM120 · forensic audit of every high-peak run · two rubric leaks documented inline · <span className="text-[var(--color-fg-bright)]">click any cell on the leaderboard to open the full transcript viewer for that run</span>

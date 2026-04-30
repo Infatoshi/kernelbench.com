@@ -26,7 +26,7 @@ const PROBLEMS = [
   { key: "07_w4a16_gemm", short: "07 w4a16" },
 ]
 
-export default async function VHardPage() {
+export default async function HardPage() {
   const [lb, annotations, hasViewer, baselines] = await Promise.all([
     loadLeaderboard(),
     loadAnnotations(),
@@ -38,7 +38,7 @@ export default async function VHardPage() {
     <div className="space-y-12">
       <section>
         <h1 className="prompt cursor text-3xl font-bold text-[var(--color-fg-bright)] glow mb-4">
-          kernelbench v-hard
+          kernelbench hard
         </h1>
         <p className="text-sm text-[var(--color-fg-muted)] mb-6">
           12 models × 7 problems · RTX PRO 6000 Blackwell · sm_120 · 96 GB GDDR7 · 1.8 TB/s
