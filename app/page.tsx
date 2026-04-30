@@ -85,6 +85,21 @@ export default function HomePage() {
           </Bullet>
         </ul>
       </section>
+
+      <section className="box p-6">
+        <h2 className="text-lg font-bold text-[var(--color-fg-bright)] mb-2">
+          # contact
+        </h2>
+        <p className="text-sm text-[var(--color-fg)] leading-relaxed">
+          Open to inquiries — collaborations, model evals, custom benchmark builds, kernel-engineering consulting, anything kernel-adjacent.
+        </p>
+        <p className="text-sm text-[var(--color-fg)] leading-relaxed mt-2">
+          Reach out:{" "}
+          <a href="mailto:infatoshi@gmail.com" className="font-bold">
+            infatoshi@gmail.com
+          </a>
+        </p>
+      </section>
     </div>
   )
 }

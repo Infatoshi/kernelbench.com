@@ -72,11 +72,13 @@ function Footer() {
         <span>
           built by{" "}
           <a href="https://elliotarledge.com">elliot arledge</a>
+          {" · "}
+          <a href="mailto:infatoshi@gmail.com">infatoshi@gmail.com</a>
         </span>
         <span>
           source:{" "}
-          <a href="https://github.com/Infatoshi/KernelBench-Hard">
-            github.com/Infatoshi/KernelBench-Hard
+          <a href="https://github.com/Infatoshi/kernelbench.com">
+            github.com/Infatoshi/kernelbench.com
           </a>
         </span>
       </div>
