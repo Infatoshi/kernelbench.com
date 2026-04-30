@@ -21,7 +21,7 @@ export default function HomePage() {
 
       <section className="grid sm:grid-cols-2 gap-6">
         <Link
-          href="/v-hard"
+          href="/hard"
           className="block box p-6 no-underline hover:border-[var(--color-fg-bright)] transition-colors"
         >
           <div className="text-xs text-[var(--color-accent)] mb-2">[ latest ]</div>

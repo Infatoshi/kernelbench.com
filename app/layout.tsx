@@ -49,7 +49,7 @@ function Header() {
         </a>
         <nav className="flex items-center gap-5 text-sm">
           <a href="/v3">v3</a>
-          <a href="/v-hard">v-hard</a>
+          <a href="/hard">v-hard</a>
           <a href="/runs">runs</a>
           <a
             href="https://github.com/Infatoshi/kernelbench.com"

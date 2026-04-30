@@ -587,7 +587,7 @@ def render(run_dir: Path, session: Session, out_path: Path | None = None) -> Pat
     site_nav = (
         '<div class="kb-site-nav">'
         '<a href="/" class="kb-brand">./kernelbench</a>'
-        '<a href="/v-hard">v-hard</a>'
+        '<a href="/hard">v-hard</a>'
         '<a href="/v3">v3</a>'
         '<a href="/runs">runs</a>'
         '<span style="margin-left:auto;color:#15803d">'

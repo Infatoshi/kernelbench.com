@@ -57,14 +57,14 @@ export type Annotation = {
 }
 
 export async function loadLeaderboard(): Promise<Leaderboard> {
-  const path = join(REPO_ROOT, "benchmarks/v-hard/results/leaderboard.json")
+  const path = join(REPO_ROOT, "benchmarks/hard/results/leaderboard.json")
   const text = await readFile(path, "utf-8")
   return JSON.parse(text)
 }
 
 export async function loadAnnotations(): Promise<Map<string, Annotation>> {
   const map = new Map<string, Annotation>()
-  const dir = join(REPO_ROOT, "benchmarks/v-hard/results/annotations")
+  const dir = join(REPO_ROOT, "benchmarks/hard/results/annotations")
   try {
     const entries = await readdir(dir)
     for (const name of entries) {
