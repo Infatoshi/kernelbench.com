@@ -1,7 +1,20 @@
 import Link from "next/link"
+import { readdir } from "node:fs/promises"
+import { join } from "node:path"
 import { loadLeaderboard, loadAnnotations } from "@/lib/data"
 
-export const revalidate = 3600 // 1h ISR — pull fresh from GitHub each hour
+async function loadAvailableViewers(): Promise<Set<string>> {
+  try {
+    const entries = await readdir(join(process.cwd(), "public/runs"))
+    return new Set(
+      entries
+        .filter((n) => n.endsWith(".html"))
+        .map((n) => n.slice(0, -5)),
+    )
+  } catch {
+    return new Set()
+  }
+}
 
 const PROBLEMS = [
   { key: "01_fp8_gemm", short: "01 fp8" },
@@ -14,8 +27,11 @@ const PROBLEMS = [
 ]
 
 export default async function VHardPage() {
-  const lb = await loadLeaderboard()
-  const annotations = await loadAnnotations()
+  const [lb, annotations, hasViewer] = await Promise.all([
+    loadLeaderboard(),
+    loadAnnotations(),
+    loadAvailableViewers(),
+  ])
 
   return (
     <div className="space-y-12">
@@ -36,7 +52,7 @@ export default async function VHardPage() {
           # leaderboard
         </h2>
         <p className="text-xs text-[var(--color-fg-muted)] mb-4">
-          cells = peak_fraction (fraction of the relevant hardware ceiling). FAIL = solution written but missed correctness. ERR = no solution produced. <span className="text-[var(--color-warn)]">★</span> = annotation attached, click for forensics.
+          cells = peak_fraction (fraction of the relevant hardware ceiling). FAIL = solution written but missed correctness. ERR = no solution produced. <span className="text-[var(--color-warn)]">★</span> = annotation attached. <span className="text-[var(--color-fg-bright)]">click any cell to open the full transcript viewer</span> — every tool call, every reasoning step, the solution.py, the check.log.
         </p>
         <div className="overflow-x-auto box">
           <table className="term tabular text-xs sm:text-sm">
@@ -67,7 +83,7 @@ export default async function VHardPage() {
                     const cell = m.results[p.key]
                     return (
                       <td key={p.key} className="text-right">
-                        {renderCell(cell, annotations)}
+                        {renderCell(cell, annotations, hasViewer)}
                       </td>
                     )
                   })}
@@ -246,8 +262,24 @@ function renderCell(
       }
     | undefined,
   annotations: Map<string, { verdict: string }>,
+  hasViewer: Set<string>,
 ) {
   if (!cell) return <span className="cell-err">-</span>
+  const viewerUrl = hasViewer.has(cell.run_id)
+    ? `/runs/${cell.run_id}.html`
+    : null
+  const wrap = (inner: React.ReactNode) =>
+    viewerUrl ? (
+      <a
+        href={viewerUrl}
+        className="no-underline hover:text-[var(--color-accent)]"
+        title="open transcript viewer"
+      >
+        {inner}
+      </a>
+    ) : (
+      <span>{inner}</span>
+    )
   if (cell.correct) {
     const annot = annotations.get(cell.run_id)
     const star =
@@ -257,15 +289,15 @@ function renderCell(
         <span className="text-[var(--color-fg-bright)]">★</span>
       ) : null
     const pf = cell.peak_fraction
-    return (
-      <span>
+    return wrap(
+      <>
         {pf !== null ? pf.toFixed(3) : "PASS"}
         {star ? <span className="ml-1">{star}</span> : null}
-      </span>
+      </>,
     )
   }
-  if (cell.has_solution) return <span className="cell-fail">FAIL</span>
-  return <span className="cell-err">ERR</span>
+  if (cell.has_solution) return wrap(<span className="cell-fail">FAIL</span>)
+  return wrap(<span className="cell-err">ERR</span>)
 }
 
 function LeakCard({
