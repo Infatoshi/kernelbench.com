@@ -500,6 +500,115 @@ def _read_artifact(run_dir: Path, name: str) -> str | None:
     return None
 
 
+VERDICT_COLORS = {
+    "clean": ("#86efac", "#0d2814"),          # green / dark green bg
+    "rubric_leak": ("#fb923c", "#2a1408"),    # warn orange / dark
+    "reward_hack": ("#f87171", "#2a0808"),    # red / dark
+    "interesting": ("#60a5fa", "#0a1428"),    # blue / dark
+    "bug": ("#a3a3a3", "#1f1f1f"),            # gray / dark
+}
+
+
+def _render_annotation(run_id: str) -> str | None:
+    """Load benchmarks/hard/results/annotations/<run_id>.yaml (path overridable
+    via KB_ANNOTATIONS_DIR) and render it as a tab body. Returns None if no
+    annotation exists for this run."""
+    annot_dir = os.environ.get("KB_ANNOTATIONS_DIR")
+    if not annot_dir:
+        return None
+    yaml_path = Path(annot_dir) / f"{run_id}.yaml"
+    if not yaml_path.exists():
+        return None
+    try:
+        import yaml  # type: ignore
+        data = yaml.safe_load(yaml_path.read_text())
+    except Exception:
+        return None
+    if not isinstance(data, dict):
+        return None
+
+    verdict = (data.get("verdict") or "clean").lower()
+    fg, bg = VERDICT_COLORS.get(verdict, VERDICT_COLORS["clean"])
+    summary = data.get("summary") or ""
+    implication = data.get("implication") or ""
+    quotes = data.get("quotes") or []
+    auditor = data.get("auditor") or {}
+
+    auditor_line = ""
+    if auditor:
+        a_model = auditor.get("model", "?")
+        a_eff = auditor.get("effort", "")
+        auditor_line = (
+            f'<div style="font-size:11px;color:#15803d;margin-top:6px;">'
+            f'audited by <b>{_esc(a_model)}</b>'
+            f'{f" [{_esc(a_eff)}]" if a_eff else ""}'
+            f'</div>'
+        )
+
+    parts = []
+    parts.append(
+        f'<div style="display:inline-block;padding:4px 12px;border-radius:4px;'
+        f'background:{bg};color:{fg};font-weight:700;letter-spacing:0.05em;'
+        f'text-transform:uppercase;font-size:13px;margin-bottom:14px;">'
+        f'{_esc(verdict.replace("_", " "))}</div>'
+    )
+    if summary:
+        parts.append(
+            f'<div style="font-size:14px;line-height:1.6;margin-bottom:18px;">'
+            f'{_esc(summary)}</div>'
+        )
+
+    if quotes:
+        parts.append(
+            '<div style="font-size:11px;text-transform:uppercase;letter-spacing:0.06em;'
+            'color:#15803d;margin-bottom:8px;">pull quotes</div>'
+        )
+        for q in quotes:
+            anchor = q.get("anchor") or q.get("file") or ""
+            lines = q.get("lines")
+            if lines and isinstance(lines, list):
+                if len(lines) == 1:
+                    anchor_str = f"{q.get('file','solution.py')}:{lines[0]}"
+                else:
+                    anchor_str = f"{q.get('file','solution.py')}:{lines[0]}-{lines[-1]}"
+            else:
+                anchor_str = anchor
+            label = q.get("label") or ""
+            text = q.get("text") or ""
+            lang = "python" if str(anchor_str).endswith(".py") or "solution" in str(anchor_str) else "text"
+            parts.append('<div style="margin-bottom:14px;">')
+            parts.append(
+                f'<div style="font-size:12px;color:#86efac;font-weight:600;margin-bottom:4px;">'
+                f'{_esc(label)} '
+                f'<span style="color:#15803d;font-weight:400;font-family:ui-monospace,monospace;">'
+                f'@ {_esc(anchor_str)}</span></div>'
+            )
+            parts.append(_render_code(text, lang))
+            parts.append('</div>')
+
+    if implication:
+        parts.append(
+            '<div style="font-size:11px;text-transform:uppercase;letter-spacing:0.06em;'
+            'color:#15803d;margin-top:18px;margin-bottom:8px;">implication</div>'
+        )
+        parts.append(
+            f'<div style="font-size:14px;line-height:1.6;color:#fbbf24;'
+            f'border-left:3px solid #fbbf24;padding-left:12px;">{_esc(implication)}</div>'
+        )
+
+    if auditor_line:
+        parts.append(auditor_line)
+    else:
+        parts.append(
+            '<div style="font-size:11px;color:#15803d;margin-top:18px;">'
+            'audited by hand — see <a href="https://github.com/Infatoshi/kernelbench.com/'
+            'tree/master/benchmarks/hard/results/annotations" style="color:#86efac;">'
+            'results/annotations/</a> for the full schema.</div>'
+        )
+
+    return "".join(parts)
+
+
 def render(run_dir: Path, session: Session, out_path: Path | None = None) -> Path:
     """Generate index.html in run_dir and return its path."""
     run_dir = Path(run_dir)
@@ -558,6 +667,9 @@ def render(run_dir: Path, session: Session, out_path: Path | None = None) -> Pat
     tabs: list[tuple[str, str, str]] = []  # (id, label, html)
     if solution:
         tabs.append(("tab-solution", "solution.py", _render_code(solution, "python")))
+    annotation_html = _render_annotation(run_dir.name)
+    if annotation_html:
+        tabs.append(("tab-reward-hack", "reward hack", annotation_html))
     if final_text:
         tabs.append(("tab-final", "final answer", f'<div style="white-space:pre-wrap">{_esc(final_text)}</div>'))
     if bench_log:
@@ -587,7 +699,7 @@ def render(run_dir: Path, session: Session, out_path: Path | None = None) -> Pat
     site_nav = (
         '<div class="kb-site-nav">'
         '<a href="/" class="kb-brand">./kernelbench</a>'
-        '<a href="/hard">v-hard</a>'
+        '<a href="/hard">hard</a>'
         '<a href="/v3">v3</a>'
         '<a href="/runs">runs</a>'
         '<span style="margin-left:auto;color:#15803d">'
