@@ -24,6 +24,8 @@ const PROBLEMS = [
   { key: "05_topk_bitonic", short: "05 topk" },
   { key: "06_sonic_moe_swiglu", short: "06 moe" },
   { key: "07_w4a16_gemm", short: "07 w4a16" },
+  { key: "09_fmha_preattn_mrope", short: "09 mrope" },
+  { key: "10_patch_embed_conv3d_gemm", short: "10 patch" },
 ]
 
 export default async function HardPage() {
@@ -41,10 +43,10 @@ export default async function HardPage() {
           kernelbench hard
         </h1>
         <p className="text-sm text-[var(--color-fg-muted)] mb-6">
-          12 models × 7 problems · RTX PRO 6000 Blackwell · sm_120 · 96 GB GDDR7 · 1.8 TB/s
+          12 models × 9 problems · RTX PRO 6000 Blackwell · sm_120 · 96 GB GDDR7 · 1.8 TB/s
         </p>
         <p className="text-[var(--color-fg)] leading-relaxed max-w-3xl">
-          A focused successor to KernelBench v3. One Blackwell GPU, seven hand-designed problems, real coding-agent CLIs as the harness. Twelve frontier models swept; only GPT-5.5 xhigh solved every problem. Two of the seven problems leak the rubric — five models all took the same bf16 shortcut on FP8 GEMM, and the only model that implemented Kahan compensated summation scored lowest of the seven passes.
+          A focused successor to KernelBench v3. One Blackwell GPU, nine hand-designed problems, real coding-agent CLIs as the harness. Twelve frontier models swept; only GPT-5.5 xhigh solved every problem. Two of the original seven problems leak the rubric — five models all took the same bf16 shortcut on FP8 GEMM, and the only model that implemented Kahan compensated summation scored lowest of the seven passes. Problems 09 (multi-axis RoPE pre-attention) and 10 (Conv3d-as-GEMM patch embedding) were added in the second sweep round; problem 10 is the harder differentiator — three OpenRouter models that handled 09 fine couldn&apos;t produce a correct conv3d-as-GEMM kernel.
         </p>
       </section>
 
