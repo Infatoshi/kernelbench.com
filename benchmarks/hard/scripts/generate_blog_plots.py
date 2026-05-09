@@ -6,7 +6,6 @@ Style: dark phosphor theme to match the site.
 from __future__ import annotations
 
 import json
-import os
 import sys
 from pathlib import Path
 
@@ -77,6 +76,8 @@ def main() -> None:
         "05_topk_bitonic": "05 topk",
         "06_sonic_moe_swiglu": "06 moe",
         "07_w4a16_gemm": "07 w4a16",
+        "09_fmha_preattn_mrope": "09 mrope",
+        "10_patch_embed_conv3d_gemm": "10 patch",
     }
 
     models = lb["models"]
@@ -193,7 +194,7 @@ def plot_fp8_cluster(models, out_path):
     )
     plt.xticks(rotation=18, ha="right", color=COL_FG_MUTED)
     ax.grid(axis="y", alpha=0.3)
-    for b, v in zip(bars, values):
+    for b, v in zip(bars, values, strict=False):
         ax.text(b.get_x() + b.get_width()/2, v + 0.01, f"{v:.3f}",
                 ha="center", color=COL_WARN, fontsize=9, fontweight="bold")
     plt.tight_layout()
@@ -232,7 +233,7 @@ def plot_kahan_inversion(models, out_path):
     )
     plt.xticks(rotation=18, ha="right", color=COL_FG_MUTED)
     ax.grid(axis="y", alpha=0.3)
-    for b, v, c in zip(bars, values, colors):
+    for b, v, c in zip(bars, values, colors, strict=False):
         ax.text(b.get_x() + b.get_width()/2, v + 0.008, f"{v:.3f}",
                 ha="center", color=c, fontsize=9, fontweight="bold")
     plt.tight_layout()
@@ -258,7 +259,7 @@ def plot_top_peaks_per_problem(lb, problem_short_labels, out_path):
         loc="left", fontsize=10, color=COL_FG_BRIGHT,
     )
     ax.grid(axis="y", alpha=0.3)
-    for b, v in zip(bars, bests):
+    for b, v in zip(bars, bests, strict=False):
         ax.text(b.get_x() + b.get_width()/2, v + 0.012, f"{v:.3f}",
                 ha="center", color=COL_FG_BRIGHT, fontsize=9, fontweight="bold")
     plt.tight_layout()

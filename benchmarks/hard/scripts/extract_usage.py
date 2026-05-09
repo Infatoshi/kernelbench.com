@@ -8,7 +8,7 @@ Emits a JSON object on stdout with normalized fields:
     cache_creation_tokens, reasoning_tokens, total_cost_usd
 
 Any field that is not reported by the given harness is null. The point is a
-single uniform shape across claude / codex / kimi / opencode so result.json
+single uniform shape across claude / codex / kimi / droid / opencode so result.json
 aggregation is cheap downstream. Coding-plan billing on the CLI does not
 expose per-token cost; transcripts still report the raw token counts, which
 is what matters for cross-model comparison.
@@ -128,6 +128,38 @@ def _opencode(events: list[dict]) -> dict:
     }
 
 
+def _droid(events: list[dict]) -> dict:
+    """Droid stream-json plus Factory sidecar settings file."""
+    session_id = None
+    for e in events:
+        if e.get("type") == "system" and e.get("subtype") == "init":
+            session_id = e.get("session_id")
+            break
+    if not session_id:
+        return _empty()
+
+    base = Path.home() / ".factory" / "sessions"
+    if not base.exists():
+        return _empty()
+    for settings_path in base.rglob(f"{session_id}.settings.json"):
+        try:
+            settings = json.loads(settings_path.read_text())
+        except json.JSONDecodeError:
+            continue
+        usage = settings.get("tokenUsage") or {}
+        if not usage:
+            return _empty()
+        return {
+            "input_tokens": usage.get("inputTokens"),
+            "output_tokens": usage.get("outputTokens"),
+            "cache_read_tokens": usage.get("cacheReadTokens"),
+            "cache_creation_tokens": usage.get("cacheCreationTokens"),
+            "reasoning_tokens": usage.get("thinkingTokens"),
+            "total_cost_usd": None,
+        }
+    return _empty()
+
+
 def _empty() -> dict:
     return {
         "input_tokens": None,
@@ -148,6 +180,8 @@ def extract(run_dir: Path, harness: str) -> dict:
     transcript = _read_jsonl(run_dir / "transcript.jsonl")
     if harness in ("claude", "ccr-claude", "kimi", "cursor"):
         return _claude_or_kimi(transcript)
+    if harness == "droid":
+        return _droid(transcript)
     if harness == "opencode":
         return _opencode(transcript)
     return _empty()

@@ -8,6 +8,7 @@
 #   ./scripts/run_hard.sh claude claude-opus-4-7 problems/01_fp8_gemm
 #   ./scripts/run_hard.sh codex gpt-5.5 problems/01_fp8_gemm xhigh
 #   ./scripts/run_hard.sh kimi kimi-k2.6 problems/01_fp8_gemm
+#   ./scripts/run_hard.sh droid glm-5.1 problems/01_fp8_gemm
 #   ./scripts/run_hard.sh ccr-claude glm-5.1 problems/01_fp8_gemm
 #
 # Archives everything to outputs/runs/<ts>_<harness>_<model>_<problem>/.
@@ -176,6 +177,21 @@ case "$HARNESS" in
             > "$LOG_FILE" 2> "$STDERR_FILE" || HARNESS_EXIT=$?
         ;;
 
+    droid)
+        EFFORT_ARG=()
+        if [ -n "$REASONING_EFFORT" ]; then
+            EFFORT_ARG=(--reasoning-effort "$REASONING_EFFORT")
+        fi
+        timeout "$BUDGET_SECONDS" droid exec \
+            --output-format stream-json \
+            --skip-permissions-unsafe \
+            --cwd "$PROBLEM_DIR" \
+            -m "$MODEL" \
+            "${EFFORT_ARG[@]}" \
+            "$PROMPT" \
+            > "$LOG_FILE" 2> "$STDERR_FILE" || HARNESS_EXIT=$?
+        ;;
+
     opencode)
         # OpenCode SST with custom OpenAI-shape providers (deepseek, zai, minimax).
         # Provider/model pair encoded as MODEL="provider/model-id" e.g.
@@ -187,7 +203,7 @@ case "$HARNESS" in
 
     *)
         echo "Unknown harness: $HARNESS" >&2
-        echo "Supported: claude, ccr-claude, codex, kimi, opencode" >&2
+        echo "Supported: claude, ccr-claude, codex, kimi, droid, opencode" >&2
         exit 1
         ;;
 esac
@@ -202,6 +218,7 @@ ELAPSED=$((END_TIME - START_TIME))
 #   claude / ccr-claude:  {"type":"result"} (final summary with usage)
 #   codex:                {"payload":{"type":"task_complete"}}
 #   cursor:               {"type":"result"} (final usage block)
+#   droid:                exit code only; stream has init/message/error events
 #   kimi:                 no canonical terminal event — treat exit code as truth
 #
 # We surface this as session_complete=true|false in result.json so the viewer
@@ -225,7 +242,7 @@ case "$HARNESS" in
             SESSION_COMPLETE=false
         fi
         ;;
-    kimi|opencode)
+    droid|kimi|opencode)
         # No reliable terminal marker; trust the exit code.
         if [ "$HARNESS_EXIT" -ne 0 ]; then
             SESSION_COMPLETE=false

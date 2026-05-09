@@ -43,10 +43,10 @@ export default async function HardPage() {
           kernelbench hard
         </h1>
         <p className="text-sm text-[var(--color-fg-muted)] mb-6">
-          12 models × 9 problems · RTX PRO 6000 Blackwell · sm_120 · 96 GB GDDR7 · 1.8 TB/s
+          14 model-harness sweeps × 9 problems · RTX PRO 6000 Blackwell · sm_120 · 96 GB GDDR7 · 1.8 TB/s
         </p>
         <p className="text-[var(--color-fg)] leading-relaxed max-w-3xl">
-          A focused successor to KernelBench v3. One Blackwell GPU, nine hand-designed problems, real coding-agent CLIs as the harness. Twelve frontier models swept; only GPT-5.5 xhigh solved every problem. Two of the original seven problems leak the rubric — five models all took the same bf16 shortcut on FP8 GEMM, and the only model that implemented Kahan compensated summation scored lowest of the seven passes. Problems 09 (multi-axis RoPE pre-attention) and 10 (Conv3d-as-GEMM patch embedding) were added in the second sweep round; problem 10 is the harder differentiator — three OpenRouter models that handled 09 fine couldn&apos;t produce a correct conv3d-as-GEMM kernel.
+          A focused successor to KernelBench v3. One Blackwell GPU, nine hand-designed problems, real coding-agent CLIs as the harness. The original public board swept twelve frontier model-harness pairs; the May 8 Z.ai rerun adds fresh GLM-5.1 rows for OpenCode and Droid. Only GPT-5.5 xhigh solved every problem. Two of the original seven problems leak the rubric — five models all took the same bf16 shortcut on FP8 GEMM, and the only model that implemented Kahan compensated summation scored lowest of the original seven passes. Problems 09 (multi-axis RoPE pre-attention) and 10 (Conv3d-as-GEMM patch embedding) were added in the second sweep round; problem 10 is the harder differentiator.
         </p>
       </section>
 
@@ -243,10 +243,10 @@ export default async function HardPage() {
         <ul className="space-y-2 text-sm leading-relaxed list-none pl-0 max-w-3xl">
           <Bullet>One GPU instead of three. RTX PRO 6000 Blackwell (sm_120, 96 GB GDDR7, 1.8 TB/s).</Bullet>
           <Bullet>Seven hand-designed problems instead of 43-58. Per-trial L2 flush, 30-trial median, 10 warmup absorbing torch.compile CUDA-graph capture and Triton autotune.</Bullet>
-          <Bullet>Real coding-agent CLIs as the harness — Claude Code, codex CLI, Kimi CLI, opencode — not a custom KernelBench agent loop.</Bullet>
+          <Bullet>Real coding-agent CLIs as the harness — Claude Code, codex CLI, Kimi CLI, opencode, Droid — not a custom KernelBench agent loop.</Bullet>
           <Bullet>Wall-clock budgets, not turn limits. 45 min/run.</Bullet>
           <Bullet>peak_fraction grounded in physical hardware ceilings instead of raw speedup ratios.</Bullet>
-          <Bullet>Per-cell annotations with verdict, pull quotes from solution.py, and an &ldquo;implication&rdquo; statement. 13 annotations as of launch.</Bullet>
+          <Bullet>Per-cell annotations with verdict, pull quotes from solution.py, and an &ldquo;implication&rdquo; statement. 30 annotations as of launch, with fresh Z.ai rerun viewers added on May 8.</Bullet>
         </ul>
       </section>
 

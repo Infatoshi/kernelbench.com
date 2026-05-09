@@ -4,6 +4,20 @@ A running record of decisions, dead ends, and lessons. Newest entries on top. Th
 
 ---
 
+## 2026-05-08 — Z.ai GLM-5.1 rerun: OpenCode, Droid, Claude Code attempt
+
+Z.ai reached out after the public KernelBench-Hard GLM-5.1 row, asking for a rerun because several OpenCode cells appeared to terminate early as `ERR` after a small number of iterations. We reran all CUDA-track problems on the RTX PRO 6000 using their dedicated `$ZAI_API_KEY` against the actual Z.ai endpoint. `08_metal_lightning_attn` stayed out of scope on this CUDA host.
+
+OpenCode rerun used `zai/glm-5.1` through the Z.ai API. It reproduced the core anomaly: `03_paged_attention`, `05_topk_bitonic`, `07_w4a16_gemm`, and `09_fmha_preattn_mrope` all ended as `ERR` well before the 2700s budget. Passing cells were `02_kda_cutlass` (correct but no parsed peak), `04_kahan_softmax` at 0.0561, `06_sonic_moe_swiglu` at 0.2154, and `10_patch_embed_conv3d_gemm` at 0.1742. `01_fp8_gemm` wrote a solution but failed correctness at timeout.
+
+Droid rerun used the Factory custom model `custom:GLM-5.1-[Z.AI-Coding-Plan]-0`, also pointed at `https://api.z.ai/api/coding/paas/v4`. It solved five of nine: `01_fp8_gemm` 0.4140, `03_paged_attention` 0.2523, `04_kahan_softmax` 0.2339, `06_sonic_moe_swiglu` 0.1490, and `07_w4a16_gemm` 0.0863. `02_kda_cutlass`, `05_topk_bitonic`, `09_fmha_preattn_mrope`, and `10_patch_embed_conv3d_gemm` timed out incomplete with no scored solution.
+
+Claude Code was attempted only against Z.ai, not Anthropic: first through `ccr-rust` with a Z.ai-only router, then directly with `ANTHROPIC_BASE_URL=https://api.z.ai/api/coding/paas/v4` and `ANTHROPIC_AUTH_TOKEN=$ZAI_API_KEY`. The proxy path authenticated but returned malformed/empty HTTP 200 responses to Claude Code; direct model names returned 404 model-access errors. Those runs are setup-invalid, not model results, and are not counted on the leaderboard.
+
+Website changes from this rerun: add Droid harness support to `scripts/run_hard.sh`, add Droid usage extraction, render all 18 May 8 transcript viewers, and publish two additional leaderboard rows: `opencode/zai/glm-5.1 [2026-05-08]` and `droid/zai/glm-5.1 [2026-05-08]`. This preserves the original public GLM row while making the rerun evidence explicit.
+
+---
+
 ## 2026-04-30 — Launch prep: monorepo, kernelbench.com, transcript viewers, blog plots
 
 Three substantial pieces went in between the rubric-leak audit and shipping public.

@@ -29,13 +29,13 @@ export default function HomePage() {
             Hard <span className="text-[var(--color-fg-muted)] text-sm">2026-04</span>
           </h2>
           <p className="text-sm text-[var(--color-fg)] mb-4">
-            7 hand-designed problems · 12 frontier models · single Blackwell SM120 · forensic audit of every high-peak run · two rubric leaks documented inline · <span className="text-[var(--color-fg-bright)]">click any cell on the leaderboard to open the full transcript viewer for that run</span>
+            9 hand-designed problems · 14 model-harness sweeps · single Blackwell SM120 · forensic audit of every high-peak run · two rubric leaks documented inline · <span className="text-[var(--color-fg-bright)]">click any cell on the leaderboard to open the full transcript viewer for that run</span>
           </p>
           <div className="grid grid-cols-4 gap-3 text-xs tabular">
-            <Stat label="problems" value="7" />
-            <Stat label="models" value="12" />
-            <Stat label="runs" value="100" />
-            <Stat label="best peak" value="0.602" emphasize />
+            <Stat label="problems" value="9" />
+            <Stat label="sweeps" value="14" />
+            <Stat label="runs" value="140" />
+            <Stat label="best peak" value="0.722" emphasize />
           </div>
         </Link>
 
