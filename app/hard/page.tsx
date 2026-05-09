@@ -1,5 +1,4 @@
 import Link from "next/link"
-import { Fragment } from "react"
 import { readdir } from "node:fs/promises"
 import { join } from "node:path"
 import { loadLeaderboard, loadAnnotations, loadBaselines } from "@/lib/data"
@@ -73,42 +72,29 @@ export default async function HardPage() {
               </tr>
             </thead>
             <tbody>
-              {models.map((m, index) => (
-                <Fragment key={m.label}>
-                  {m.harness === "opencode" &&
-                  models[index - 1]?.harness !== "opencode" ? (
-                    <tr key="opencode-warning">
-                      <td
-                        colSpan={PROBLEMS.length + 2}
-                        className="sticky left-0 bg-[var(--color-bg)] text-[var(--color-bad)] uppercase tracking-normal"
-                      >
-                        OpenCode below: diagnostic / do not rank as primary evidence
+              {models.map((m) => (
+                <tr key={m.label}>
+                  <td className="sticky left-0 bg-[var(--color-bg)] text-[var(--color-fg-bright)] whitespace-nowrap">
+                    {shortLabel(m.label)}
+                    {m.effort ? (
+                      <span className="text-[var(--color-fg-muted)]">
+                        {" "}
+                        [{m.effort}]
+                      </span>
+                    ) : null}
+                  </td>
+                  {PROBLEMS.map((p) => {
+                    const cell = m.results[p.key]
+                    return (
+                      <td key={p.key} className="text-right">
+                        {renderCell(cell, annotations, hasViewer)}
                       </td>
-                    </tr>
-                  ) : null}
-                  <tr>
-                    <td className="sticky left-0 bg-[var(--color-bg)] text-[var(--color-fg-bright)] whitespace-nowrap">
-                      {shortLabel(m.label)}
-                      {m.effort ? (
-                        <span className="text-[var(--color-fg-muted)]">
-                          {" "}
-                          [{m.effort}]
-                        </span>
-                      ) : null}
-                    </td>
-                    {PROBLEMS.map((p) => {
-                      const cell = m.results[p.key]
-                      return (
-                        <td key={p.key} className="text-right">
-                          {renderCell(cell, annotations, hasViewer)}
-                        </td>
-                      )
-                    })}
-                    <td className="text-right text-[var(--color-fg-bright)]">
-                      {m.pass_count}/{m.total_runs}
-                    </td>
-                  </tr>
-                </Fragment>
+                    )
+                  })}
+                  <td className="text-right text-[var(--color-fg-bright)]">
+                    {m.pass_count}/{m.total_runs}
+                  </td>
+                </tr>
               ))}
             </tbody>
           </table>
