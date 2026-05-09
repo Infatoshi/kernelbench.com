@@ -59,9 +59,6 @@ export default async function HardPage() {
         <p className="text-xs text-[var(--color-fg-muted)] mb-4">
           cells = peak_fraction (fraction of the relevant hardware ceiling). FAIL = solution written but missed correctness. ERR = no solution produced. <span className="text-[var(--color-warn)]">★</span> = annotation attached. <span className="text-[var(--color-fg-bright)]">click any cell to open the full transcript viewer</span> — every tool call, every reasoning step, the solution.py, the check.log.
         </p>
-        <p className="text-xs text-[var(--color-bad)] mb-4 max-w-4xl leading-relaxed">
-          OpenCode rows are diagnostic only. We saw OpenCode/Z.ai runs terminate as early ERRs after hidden-reasoning budget exhaustion and other harness/provider issues; do not cite OpenCode as the primary model-quality signal. Prefer native-harness rows such as Claude Code and Droid when they exist.
-        </p>
         <div className="overflow-x-auto box">
           <table className="term tabular text-xs sm:text-sm">
             <thead>
@@ -116,6 +113,12 @@ export default async function HardPage() {
             </tbody>
           </table>
         </div>
+        <p className="text-[10px] sm:text-xs text-[var(--color-fg-muted)] mt-2 max-w-4xl leading-relaxed">
+          OpenCode note: we saw runs consume reasoning-token limits before taking
+          useful actions, which prevented some models from performing. This was
+          less of an issue with the other harnesses, so OpenCode rows are best
+          read as diagnostic.
+        </p>
       </section>
 
       <section>
