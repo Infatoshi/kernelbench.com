@@ -4,6 +4,14 @@ A running record of decisions, dead ends, and lessons. Newest entries on top. Th
 
 ---
 
+## 2026-05-09 — Website policy: demote OpenCode, remove blocked Qwen 35B-A3B row
+
+After inspecting the May 8 GLM-5.1 rerun transcripts, we changed the public `/hard` page to treat OpenCode rows as diagnostic rather than primary evidence. The OpenCode Z.ai rerun had multiple early `ERR` cells caused by hidden-reasoning budget exhaustion before tool use, so the page now shows a red disclaimer and pushes OpenCode rows below the native-harness rows. Droid and Claude Code rows should carry more weight when they exist.
+
+Also removed `opencode/openrouter-pinned/qwen/qwen3.6-35b-a3b` from the public leaderboard data. Its previous `0/7 ERR` row was an infrastructure block, not a model result: available providers did not advertise tool-use support to the agent harness. The historical details remain in this devlog; the website no longer presents it as an evaluated model row.
+
+For Qwen 3.6 27B, a transcript dive found no result-parser bug. The frequent failures are mostly missing `solution.py` / early-stop behavior, plus several full-budget OpenCode timeouts where a written solution still failed `check.py`. The later problem 09/10 first attempts failed due to OpenRouter insufficient-credit API errors, then reran successfully and are represented by the passing rows in `leaderboard.json`.
+
 ## 2026-05-08 — Z.ai GLM-5.1 rerun: OpenCode, Droid, Claude Code attempt
 
 Z.ai reached out after the public KernelBench-Hard GLM-5.1 row, asking for a rerun because several OpenCode cells appeared to terminate early as `ERR` after a small number of iterations. We reran all CUDA-track problems on the RTX PRO 6000 using their dedicated `$ZAI_API_KEY` against the actual Z.ai endpoint. `08_metal_lightning_attn` stayed out of scope on this CUDA host.

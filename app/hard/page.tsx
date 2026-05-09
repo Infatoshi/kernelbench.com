@@ -1,4 +1,5 @@
 import Link from "next/link"
+import { Fragment } from "react"
 import { readdir } from "node:fs/promises"
 import { join } from "node:path"
 import { loadLeaderboard, loadAnnotations, loadBaselines } from "@/lib/data"
@@ -35,6 +36,7 @@ export default async function HardPage() {
     loadAvailableViewers(),
     loadBaselines(),
   ])
+  const models = [...lb.models].sort(compareModelRows)
 
   return (
     <div className="space-y-12">
@@ -43,10 +45,10 @@ export default async function HardPage() {
           kernelbench hard
         </h1>
         <p className="text-sm text-[var(--color-fg-muted)] mb-6">
-          14 model-harness sweeps × 9 problems · RTX PRO 6000 Blackwell · sm_120 · 96 GB GDDR7 · 1.8 TB/s
+          13 model-harness sweeps × 9 problems · RTX PRO 6000 Blackwell · sm_120 · 96 GB GDDR7 · 1.8 TB/s
         </p>
         <p className="text-[var(--color-fg)] leading-relaxed max-w-3xl">
-          A focused successor to KernelBench v3. One Blackwell GPU, nine hand-designed problems, real coding-agent CLIs as the harness. The original public board swept twelve frontier model-harness pairs; the May 8 Z.ai rerun adds fresh GLM-5.1 rows for OpenCode and Droid. Only GPT-5.5 xhigh solved every problem. Two of the original seven problems leak the rubric — five models all took the same bf16 shortcut on FP8 GEMM, and the only model that implemented Kahan compensated summation scored lowest of the original seven passes. Problems 09 (multi-axis RoPE pre-attention) and 10 (Conv3d-as-GEMM patch embedding) were added in the second sweep round; problem 10 is the harder differentiator.
+          A focused successor to KernelBench v3. One Blackwell GPU, nine hand-designed problems, real coding-agent CLIs as the harness. The original public board swept twelve frontier model-harness pairs; the May 8 Z.ai rerun adds fresh GLM-5.1 rows for OpenCode and Droid. Only GPT-5.5 xhigh solved every problem. Treat Droid and Claude Code as the serious GLM-5.1 rerun signals; OpenCode rows are retained for transparency but demoted because its provider adapter produced unstable early ERRs. Problems 09 (multi-axis RoPE pre-attention) and 10 (Conv3d-as-GEMM patch embedding) were added in the second sweep round; problem 10 is the harder differentiator.
         </p>
       </section>
 
@@ -56,6 +58,9 @@ export default async function HardPage() {
         </h2>
         <p className="text-xs text-[var(--color-fg-muted)] mb-4">
           cells = peak_fraction (fraction of the relevant hardware ceiling). FAIL = solution written but missed correctness. ERR = no solution produced. <span className="text-[var(--color-warn)]">★</span> = annotation attached. <span className="text-[var(--color-fg-bright)]">click any cell to open the full transcript viewer</span> — every tool call, every reasoning step, the solution.py, the check.log.
+        </p>
+        <p className="text-xs text-[var(--color-bad)] mb-4 max-w-4xl leading-relaxed">
+          OpenCode rows are diagnostic only. We saw OpenCode/Z.ai runs terminate as early ERRs after hidden-reasoning budget exhaustion and other harness/provider issues; do not cite OpenCode as the primary model-quality signal. Prefer native-harness rows such as Claude Code and Droid when they exist.
         </p>
         <div className="overflow-x-auto box">
           <table className="term tabular text-xs sm:text-sm">
@@ -71,29 +76,42 @@ export default async function HardPage() {
               </tr>
             </thead>
             <tbody>
-              {lb.models.map((m) => (
-                <tr key={m.label}>
-                  <td className="sticky left-0 bg-[var(--color-bg)] text-[var(--color-fg-bright)] whitespace-nowrap">
-                    {shortLabel(m.label)}
-                    {m.effort ? (
-                      <span className="text-[var(--color-fg-muted)]">
-                        {" "}
-                        [{m.effort}]
-                      </span>
-                    ) : null}
-                  </td>
-                  {PROBLEMS.map((p) => {
-                    const cell = m.results[p.key]
-                    return (
-                      <td key={p.key} className="text-right">
-                        {renderCell(cell, annotations, hasViewer)}
+              {models.map((m, index) => (
+                <Fragment key={m.label}>
+                  {m.harness === "opencode" &&
+                  models[index - 1]?.harness !== "opencode" ? (
+                    <tr key="opencode-warning">
+                      <td
+                        colSpan={PROBLEMS.length + 2}
+                        className="sticky left-0 bg-[var(--color-bg)] text-[var(--color-bad)] uppercase tracking-normal"
+                      >
+                        OpenCode below: diagnostic / do not rank as primary evidence
                       </td>
-                    )
-                  })}
-                  <td className="text-right text-[var(--color-fg-bright)]">
-                    {m.pass_count}/{m.total_runs}
-                  </td>
-                </tr>
+                    </tr>
+                  ) : null}
+                  <tr>
+                    <td className="sticky left-0 bg-[var(--color-bg)] text-[var(--color-fg-bright)] whitespace-nowrap">
+                      {shortLabel(m.label)}
+                      {m.effort ? (
+                        <span className="text-[var(--color-fg-muted)]">
+                          {" "}
+                          [{m.effort}]
+                        </span>
+                      ) : null}
+                    </td>
+                    {PROBLEMS.map((p) => {
+                      const cell = m.results[p.key]
+                      return (
+                        <td key={p.key} className="text-right">
+                          {renderCell(cell, annotations, hasViewer)}
+                        </td>
+                      )
+                    })}
+                    <td className="text-right text-[var(--color-fg-bright)]">
+                      {m.pass_count}/{m.total_runs}
+                    </td>
+                  </tr>
+                </Fragment>
               ))}
             </tbody>
           </table>
@@ -272,8 +290,28 @@ export default async function HardPage() {
   )
 }
 
+function compareModelRows(
+  a: { harness: string; pass_count: number },
+  b: { harness: string; pass_count: number },
+) {
+  const priority: Record<string, number> = {
+    codex: 0,
+    claude: 1,
+    droid: 2,
+    kimi: 3,
+    opencode: 4,
+  }
+  const pa = priority[a.harness] ?? 5
+  const pb = priority[b.harness] ?? 5
+  if (pa !== pb) return pa - pb
+  return b.pass_count - a.pass_count
+}
+
 function shortLabel(label: string) {
   return label
+    .replace("droid/zai/glm-5.1 [2026-05-08]", "Droid GLM-5.1 [2026-05-08]")
+    .replace("opencode/zai/glm-5.1 [2026-05-08]", "OpenCode GLM-5.1 rerun [2026-05-08]")
+    .replace("opencode/zai/glm-5.1", "OpenCode GLM-5.1 original")
     .replace("opencode/openrouter-pinned/", "or/")
     .replace("opencode/", "")
     .replace("codex/", "")

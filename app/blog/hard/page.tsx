@@ -48,14 +48,13 @@ export default function KernelBenchHardPost() {
                 <tr className="border-b border-[var(--color-border)]/50"><td className="py-2 pr-4">qwen3.6-plus</td><td className="py-2 pr-2">0.431 ★</td><td className="py-2 pr-2">ERR</td><td className="py-2 pr-2">0.022</td><td className="py-2 pr-2">ERR</td><td className="py-2 pr-2">FAIL</td><td className="py-2 pr-2">0.040</td><td className="py-2 pr-2">0.125</td><td className="py-2">4/7</td></tr>
                 <tr className="border-b border-[var(--color-border)]/50"><td className="py-2 pr-4">glm-5.1</td><td className="py-2 pr-2">FAIL</td><td className="py-2 pr-2">0.005</td><td className="py-2 pr-2">ERR</td><td className="py-2 pr-2">0.125 ★</td><td className="py-2 pr-2">ERR</td><td className="py-2 pr-2">0.238</td><td className="py-2 pr-2">0.180</td><td className="py-2">4/7</td></tr>
                 <tr className="border-b border-[var(--color-border)]/50"><td className="py-2 pr-4">minimax-m2.7</td><td className="py-2 pr-2">ERR</td><td className="py-2 pr-2">ERR</td><td className="py-2 pr-2">FAIL</td><td className="py-2 pr-2">0.034</td><td className="py-2 pr-2">FAIL</td><td className="py-2 pr-2">0.076</td><td className="py-2 pr-2">0.030</td><td className="py-2">3/7</td></tr>
-                <tr className="border-b border-[var(--color-border)]/50"><td className="py-2 pr-4">qwen3.6-27b</td><td className="py-2 pr-2">ERR</td><td className="py-2 pr-2">FAIL</td><td className="py-2 pr-2">FAIL</td><td className="py-2 pr-2">ERR</td><td className="py-2 pr-2">FAIL</td><td className="py-2 pr-2">0.082</td><td className="py-2 pr-2">ERR</td><td className="py-2">1/7</td></tr>
-                <tr><td className="py-2 pr-4">qwen3.6-35b-a3b</td><td className="py-2 pr-2">ERR</td><td className="py-2 pr-2">ERR</td><td className="py-2 pr-2">ERR</td><td className="py-2 pr-2">ERR</td><td className="py-2 pr-2">ERR</td><td className="py-2 pr-2">ERR</td><td className="py-2 pr-2">ERR</td><td className="py-2">0/7</td></tr>
+                <tr><td className="py-2 pr-4">qwen3.6-27b</td><td className="py-2 pr-2">ERR</td><td className="py-2 pr-2">FAIL</td><td className="py-2 pr-2">FAIL</td><td className="py-2 pr-2">ERR</td><td className="py-2 pr-2">FAIL</td><td className="py-2 pr-2">0.082</td><td className="py-2 pr-2">ERR</td><td className="py-2">1/7</td></tr>
               </tbody>
             </table>
           </div>
 
           <p className="leading-relaxed mb-6">
-            <strong>GPT-5.5 at extra-high reasoning is the only model that solved every problem.</strong> Claude Opus 4.7 max ate one FAIL on sonic_moe but earned the highest peak fraction on the deck — 0.602 on paged attention, with a real Triton FlashDecoding-style kernel. Kimi K2.6 was the surprise of the run: 6/7 PASS at a much lower API cost than the top tier, including the only PASS where it took the deck-leading peak (0.220 on w4a16). Qwen 3.6 35B-A3B never got a single tool call through — its only OpenRouter providers don&apos;t advertise tool-use, so the agent harness couldn&apos;t reach it. That&apos;s an honest <code>0/7</code>: not a capability failure, an infrastructure ceiling.
+            <strong>GPT-5.5 at extra-high reasoning is the only model that solved every problem.</strong> Claude Opus 4.7 max ate one FAIL on sonic_moe but earned the highest peak fraction on the deck — 0.602 on paged attention, with a real Triton FlashDecoding-style kernel. Kimi K2.6 was the surprise of the run: 6/7 PASS at a much lower API cost than the top tier, including the only PASS where it took the deck-leading peak (0.220 on w4a16). The blocked Qwen 3.6 35B-A3B row was removed from the public table because its available providers did not expose a usable autonomous tool endpoint.
           </p>
 
           <figure className="my-8">
@@ -326,7 +325,7 @@ Norm:   each block normalizes its chunk using global (max, sum).
           </p>
 
           <p className="leading-relaxed mb-6">
-            One model in the matrix (qwen3.6-35b-a3b) has no Alibaba-served endpoint on OpenRouter; only AtlasCloud and Parasail serve it, both fp8. We added them to the provider order, then discovered neither advertises tool-use capability — the agent harness can&apos;t reach the model at all. That&apos;s the <code>0/7 ERR</code> row in the leaderboard. Infrastructure block, not capability gap. Documented and skipped.
+            Qwen 3.6 35B-A3B has no Alibaba-served endpoint on OpenRouter; only AtlasCloud and Parasail served it during the sweep, both fp8. We added them to the provider order, then discovered neither advertised tool-use capability, so the agent harness could not reach the model at all. That infrastructure-blocked row is documented in the repo logs but omitted from the public table.
           </p>
 
           <h3 className="text-xl font-bold mt-8 mb-4">Workspace leak fix</h3>

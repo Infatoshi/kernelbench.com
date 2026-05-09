@@ -2,7 +2,7 @@
 
 Hardware: **RTX PRO 6000 Blackwell Workstation** (sm_120, 96 GB GDDR7, 1.8 TB/s peak DRAM bandwidth).
 
-**12 models × 7 problems = 84 runs.** Cells show `peak_fraction` of the published throughput peak (1.0 = saturating the relevant tensor-core or memory bandwidth limit) when the model produced a correct solution; `FAIL` if a solution was written but failed correctness; `ERR` if no solution was produced.
+**11 evaluated rows × 7 problems = 77 runs shown.** Cells show `peak_fraction` of the published throughput peak (1.0 = saturating the relevant tensor-core or memory bandwidth limit) when the model produced a correct solution; `FAIL` if a solution was written but failed correctness; `ERR` if no solution was produced. The infrastructure-blocked `qwen3.6-35b-a3b` row is omitted from the public grid because no usable tool endpoint was available.
 
 Annotations (`★`) attached to specific cells live in `results/annotations/<run_id>.yaml`. Two cell verdicts mean the cell number doesn't measure what the problem name implies — see the **Benchmark design flaws** section below.
 
@@ -21,19 +21,18 @@ Annotations (`★`) attached to specific cells live in `results/annotations/<run
 | zai/glm-5.1 | FAIL | 0.005 | ERR | 0.125 ★ | ERR | 0.238 | 0.180 | 4/7 |
 | or/minimax/minimax-m2.7 | ERR | ERR | FAIL | 0.034 | FAIL | 0.076 | 0.030 | 3/7 |
 | or/qwen/qwen3.6-27b | ERR | FAIL | FAIL | ERR | FAIL | 0.082 | ERR | 1/7 |
-| or/qwen/qwen3.6-35b-a3b | ERR | ERR | ERR | ERR | ERR | ERR | ERR | 0/7 |
 
 ## Per-problem ceilings
 
 | problem | best peak | best model | n correct |
 |---|---|---|---|
-| 01_fp8_gemm | 0.534 | claude-opus-4-7 [max] | 5/12 |
-| 02_kda_cutlass | 0.032 | gpt-5.5 [xhigh] | 6/12 |
-| 03_paged_attention | 0.602 | claude-opus-4-7 [max] | 6/12 |
-| 04_kahan_softmax | 0.363 | gpt-5.5 [xhigh] | 9/12 |
-| 05_topk_bitonic | 0.042 | gpt-5.5 [xhigh] | 5/12 |
-| 06_sonic_moe_swiglu | 0.251 | gpt-5.5 [xhigh] | 10/12 |
-| 07_w4a16_gemm | 0.220 | kimi-k2.6 | 10/12 |
+| 01_fp8_gemm | 0.534 | claude-opus-4-7 [max] | 5/11 |
+| 02_kda_cutlass | 0.032 | gpt-5.5 [xhigh] | 6/11 |
+| 03_paged_attention | 0.602 | claude-opus-4-7 [max] | 6/11 |
+| 04_kahan_softmax | 0.363 | gpt-5.5 [xhigh] | 9/11 |
+| 05_topk_bitonic | 0.042 | gpt-5.5 [xhigh] | 5/11 |
+| 06_sonic_moe_swiglu | 0.251 | gpt-5.5 [xhigh] | 10/11 |
+| 07_w4a16_gemm | 0.220 | kimi-k2.6 | 10/11 |
 
 ## Benchmark design flaws — read these before citing numbers
 
@@ -69,4 +68,3 @@ These flaws were discovered post-hoc by reading the high-peak solutions. We're p
 - `results/annotations/SCHEMA.md` — annotation file format spec.
 - `outputs/runs/<run_id>/` — per-run artifacts (transcripts, solution.py, check.log, result.json). Local only; gitignored.
 - `DEVLOG.md` — running record of design decisions, dead ends, and lessons.
-
