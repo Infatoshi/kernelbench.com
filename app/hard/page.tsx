@@ -100,7 +100,14 @@ export default async function HardPage() {
           </table>
         </div>
         <p className="text-[10px] sm:text-xs text-[var(--color-fg-muted)] mt-2 max-w-4xl leading-relaxed">
-          OpenCode note: we saw runs consume reasoning-token limits before taking
+          OpenCode note: we saw{" "}
+          <Link
+            href="/runs?harness=opencode"
+            className="underline underline-offset-2 decoration-[var(--color-bad)] hover:text-[var(--color-bad)]"
+          >
+            runs
+          </Link>{" "}
+          consume reasoning-token limits before taking
           useful actions, which prevented some models from performing. This was
           less of an issue with the other harnesses, so OpenCode rows are best
           read as diagnostic.

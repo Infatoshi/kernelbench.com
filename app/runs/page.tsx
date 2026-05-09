@@ -14,6 +14,12 @@ type RunRow = {
   elapsed_seconds: number | null
 }
 
+type RunsIndexProps = {
+  searchParams?: Promise<{
+    harness?: string | string[]
+  }>
+}
+
 async function loadAllRuns(): Promise<RunRow[]> {
   const lb = await loadLeaderboard()
   const viewerEntries = new Set<string>()
@@ -70,25 +76,49 @@ function statusCell(r: RunRow) {
   }
   if (r.has_solution)
     return <span className="text-[var(--color-fg-dim)]">FAIL</span>
-  return <span className="text-[var(--color-fg-dim)] opacity-60">ERR</span>
+  return <span className="text-[var(--color-bad)]">ERR</span>
 }
 
-export default async function RunsIndex() {
-  const runs = await loadAllRuns()
+function harnessClass(harness: string) {
+  return harness === "opencode"
+    ? "text-[var(--color-bad)]"
+    : "text-[var(--color-fg-muted)]"
+}
+
+export default async function RunsIndex({ searchParams }: RunsIndexProps) {
+  const allRuns = await loadAllRuns()
+  const params = searchParams ? await searchParams : {}
+  const rawHarness = Array.isArray(params.harness)
+    ? params.harness[0]
+    : params.harness
+  const harnessFilter = rawHarness?.trim()
+  const runs = harnessFilter
+    ? allRuns.filter((r) => r.harness === harnessFilter)
+    : allRuns
 
   const passes = runs.filter((r) => r.correct).length
   const fails = runs.filter((r) => !r.correct && r.has_solution).length
   const errs = runs.filter((r) => !r.correct && !r.has_solution).length
+  const title = harnessFilter ? `${harnessFilter} runs` : "all runs"
 
   return (
     <div className="space-y-8">
       <section>
         <h1 className="prompt cursor text-3xl font-bold text-[var(--color-fg-bright)] glow mb-3">
-          all runs
+          {title}
         </h1>
         <p className="text-sm text-[var(--color-fg-muted)] mb-4">
           {runs.length} runs · {passes} pass · {fails} fail · {errs} err · sorted by peak_fraction desc
         </p>
+        {harnessFilter ? (
+          <p className="text-xs text-[var(--color-fg-muted)] mb-4">
+            active filter:{" "}
+            <span className={harnessClass(harnessFilter)}>
+              harness={harnessFilter}
+            </span>{" "}
+            · <a href="/runs">clear</a>
+          </p>
+        ) : null}
         <p className="text-[var(--color-fg)] leading-relaxed max-w-3xl text-sm">
           One row per (model, problem) cell. Click any row to open the full transcript viewer — every tool call, every reasoning step, the model&apos;s solution.py, the check.log, the result.json. The viewer is the same one we use locally to audit runs, just themed for the site.
         </p>
@@ -126,7 +156,7 @@ export default async function RunsIndex() {
                     {shortModel(r.harness, r.model, r.effort)}
                   </a>
                 </td>
-                <td className="text-[var(--color-fg-muted)]">{r.harness}</td>
+                <td className={harnessClass(r.harness)}>{r.harness}</td>
                 <td className="text-[var(--color-fg-muted)]">
                   {r.elapsed_seconds !== null
                     ? `${Math.round(r.elapsed_seconds / 60)}m`
