@@ -4,6 +4,16 @@ A running record of decisions, dead ends, and lessons. Newest entries on top. Th
 
 ---
 
+## 2026-05-14 - Leaderboard split after non-pass audit
+
+After a per-run audit of every non-pass cell, `/hard` now renders two leaderboard sections instead of one flat table. The serious comparison section keeps rows where audited non-passes are normal benchmark outcomes: correctness failures, build failures, full 2700s timeouts, or explicit invalid/reward-hack behavior. Current serious rows are GPT-5.5, Claude Opus 4.7, Claude Code GLM-5.1 on Z.ai, Droid GLM-5.1, and the two DeepSeek OpenCode rows.
+
+Rows moved to diagnostic/needs-rerun have at least one non-pass that is not a clean model attempt: API/provider errors, auth/setup failures, harness adapter failures, hidden reasoning-token exhaustion before writing `solution.py`, or unknown early stops with no checkable artifact. That includes both older OpenCode/Z.ai GLM-5.1 rows, the OpenRouter-pinned Qwen/MiMo/MiniMax rows, and Kimi K2.6. Kimi is demoted despite being otherwise interesting because problems 09/10 ended in 401 authentication errors after only 4-5 seconds; its 6/9 raw pass total is not directly comparable until those cells are rerun.
+
+DeepSeek through OpenCode is intentionally not blanket-demoted: the audited DeepSeek non-passes were ordinary solution bugs or full-budget timeouts with artifacts, not API/setup failures. Droid is kept serious because the documented May 8 smoke tests confirmed the custom Z.ai/Factory route was wired correctly; its four `ERR` cells were 45-minute incomplete runs with no `solution.py`, not endpoint failures.
+
+---
+
 ## 2026-05-14 — Z.ai GLM-5.1 Claude Code rerun with corrected Anthropic endpoint
 
 Shuyan confirmed Z.ai's internal Claude Code eval config: disable experimental betas, set very high retry and output-token ceilings, disallow plan/user-question tools, and map every Claude Code alias including Haiku / Explore / subagents to `glm-5.1`. `scripts/run_hard.sh` now bakes those defaults into the `zai-claude` harness against `https://api.z.ai/api/anthropic`, and `scripts/rerun_zai_claude_glm51.sh` records the nine-problem CUDA rerun command.

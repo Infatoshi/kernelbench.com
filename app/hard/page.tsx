@@ -1,7 +1,12 @@
 import Link from "next/link"
 import { readdir } from "node:fs/promises"
 import { join } from "node:path"
-import { loadLeaderboard, loadAnnotations, loadBaselines } from "@/lib/data"
+import {
+  loadLeaderboard,
+  loadAnnotations,
+  loadBaselines,
+  type Model,
+} from "@/lib/data"
 
 async function loadAvailableViewers(): Promise<Set<string>> {
   try {
@@ -28,6 +33,34 @@ const PROBLEMS = [
   { key: "10_patch_embed_conv3d_gemm", short: "10 patch" },
 ]
 
+const PRIMARY_MODEL_LABELS = new Set([
+  "codex/gpt-5.5 [xhigh]",
+  "claude/claude-opus-4-7 [max]",
+  "zai-claude/glm-5.1 [2026-05-13]",
+  "droid/zai/glm-5.1 [2026-05-08]",
+  "opencode/deepseek/deepseek-v4-flash",
+  "opencode/deepseek/deepseek-v4-pro",
+])
+
+const DIAGNOSTIC_AUDIT_NOTES: Record<string, string> = {
+  "kimi/kimi-k2.6":
+    "Problems 09/10 aborted in 4-5s with 401 auth errors; 01 is a reward-hack failure.",
+  "opencode/openrouter-pinned/xiaomi/mimo-v2.5-pro":
+    "Problem 03 ended at provider/reasoning length with no solution; 02 is a real solution failure.",
+  "opencode/openrouter-pinned/qwen/qwen3.6-max-preview":
+    "Problems 03/10 are no-solution provider or unknown early-stop cells.",
+  "opencode/openrouter-pinned/qwen/qwen3.6-plus":
+    "Problems 02/04 are harness/setup or unknown early-stop cells.",
+  "opencode/zai/glm-5.1":
+    "Problems 03/05 hit hidden reasoning-token limits before writing solution.py; 01 timed out after regressing a passing attempt.",
+  "opencode/zai/glm-5.1 [2026-05-08]":
+    "Problems 03/05/07/09 hit hidden reasoning-token limits with no solution.py; 01 timed out broken.",
+  "opencode/openrouter-pinned/minimax/minimax-m2.7":
+    "Problem 01 has no checkable artifact; remaining non-passes mix timeout and invalid/forbidden-op solution failures.",
+  "opencode/openrouter-pinned/qwen/qwen3.6-27b":
+    "Multiple no-solution/API/unknown cells; raw pass count is not comparable.",
+}
+
 export default async function HardPage() {
   const [lb, annotations, hasViewer, baselines] = await Promise.all([
     loadLeaderboard(),
@@ -36,6 +69,8 @@ export default async function HardPage() {
     loadBaselines(),
   ])
   const models = [...lb.models].sort(compareModelRows)
+  const primaryModels = models.filter((m) => PRIMARY_MODEL_LABELS.has(m.label))
+  const diagnosticModels = models.filter((m) => !PRIMARY_MODEL_LABELS.has(m.label))
 
   return (
     <div className="space-y-12">
@@ -47,7 +82,7 @@ export default async function HardPage() {
           14 model-harness sweeps × 9 problems · RTX PRO 6000 Blackwell · sm_120 · 96 GB GDDR7 · 1.8 TB/s
         </p>
         <p className="text-[var(--color-fg)] leading-relaxed max-w-3xl">
-          A focused successor to KernelBench v3. One Blackwell GPU, nine hand-designed problems, real coding-agent CLIs as the harness. The original public board swept twelve frontier model-harness pairs; the May 8 Z.ai rerun added fresh GLM-5.1 rows for OpenCode and Droid, and the May 13 rerun adds GLM-5.1 through Claude Code on Z.ai's Anthropic-compatible endpoint. Only GPT-5.5 xhigh solved every problem. Treat Droid and Claude Code as the serious GLM-5.1 rerun signals; OpenCode rows are retained for transparency but demoted because its provider adapter produced unstable early ERRs. Problems 09 (multi-axis RoPE pre-attention) and 10 (Conv3d-as-GEMM patch embedding) were added in the second sweep round; problem 10 is the harder differentiator.
+          A focused successor to KernelBench v3. One Blackwell GPU, nine hand-designed problems, real coding-agent CLIs as the harness. The original public board swept twelve frontier model-harness pairs; the May 8 Z.ai rerun added fresh GLM-5.1 rows for OpenCode and Droid, and the May 13 rerun adds GLM-5.1 through Claude Code on Z.ai's Anthropic-compatible endpoint. Only GPT-5.5 xhigh solved every problem. The leaderboard now separates primary comparable sweeps from diagnostic rows where audit found API/auth/provider/adapter no-results. Treat Droid and Claude Code as the serious GLM-5.1 rerun signals; the older OpenCode/Z.ai rows are retained for transparency but demoted. Problems 09 (multi-axis RoPE pre-attention) and 10 (Conv3d-as-GEMM patch embedding) were added in the second sweep round; problem 10 is the harder differentiator.
         </p>
       </section>
 
@@ -58,59 +93,53 @@ export default async function HardPage() {
         <p className="text-xs text-[var(--color-fg-muted)] mb-4">
           cells = peak_fraction (fraction of the relevant hardware ceiling). FAIL = solution written but missed correctness. ERR = no solution produced. INVALID = benchmark file mutation or other scoring-invalid behavior. <span className="text-[var(--color-warn)]">★</span> = annotation attached. <span className="text-[var(--color-fg-bright)]">click any cell to open the full transcript viewer</span> — every tool call, every reasoning step, the solution.py, the check.log.
         </p>
-        <div className="overflow-x-auto box">
-          <table className="term tabular text-xs sm:text-sm">
-            <thead>
-              <tr>
-                <th className="sticky left-0 bg-[var(--color-bg)]">model</th>
-                {PROBLEMS.map((p) => (
-                  <th key={p.key} className="text-right">
-                    {p.short}
-                  </th>
-                ))}
-                <th className="text-right">PASS</th>
-              </tr>
-            </thead>
-            <tbody>
-              {models.map((m) => (
-                <tr key={m.label}>
-                  <td className="sticky left-0 bg-[var(--color-bg)] text-[var(--color-fg-bright)] whitespace-nowrap">
-                    {shortLabel(m.label)}
-                    {m.effort ? (
-                      <span className="text-[var(--color-fg-muted)]">
-                        {" "}
-                        [{m.effort}]
-                      </span>
-                    ) : null}
-                  </td>
-                  {PROBLEMS.map((p) => {
-                    const cell = m.results[p.key]
-                    return (
-                      <td key={p.key} className="text-right">
-                        {renderCell(cell, annotations, hasViewer)}
-                      </td>
-                    )
-                  })}
-                  <td className="text-right text-[var(--color-fg-bright)]">
-                    {m.pass_count}/{m.total_runs}
-                  </td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
+        <div className="space-y-8">
+          <div>
+            <h3 className="text-sm font-bold text-[var(--color-fg-bright)] mb-2">
+              serious comparison
+            </h3>
+            <p className="text-[10px] sm:text-xs text-[var(--color-fg-muted)] mb-2 max-w-4xl leading-relaxed">
+              Audited non-passes here are model/check failures, full-budget timeouts,
+              or explicit invalid behavior. Raw pass totals are comparable within this
+              section.
+            </p>
+            <LeaderboardTable
+              models={primaryModels}
+              annotations={annotations}
+              hasViewer={hasViewer}
+            />
+          </div>
+
+          <div>
+            <h3 className="text-sm font-bold text-[var(--color-fg-bright)] mb-2">
+              diagnostic / needs rerun
+            </h3>
+            <p className="text-[10px] sm:text-xs text-[var(--color-fg-muted)] mb-2 max-w-4xl leading-relaxed">
+              Rows retained for transparency, but at least one non-pass was an
+              auth/API/provider/adapter/setup no-result rather than a clean model
+              attempt. Do not rank these pass totals against the serious table.
+            </p>
+            <LeaderboardTable
+              models={diagnosticModels}
+              annotations={annotations}
+              hasViewer={hasViewer}
+              auditNotes={DIAGNOSTIC_AUDIT_NOTES}
+            />
+          </div>
         </div>
         <p className="text-[10px] sm:text-xs text-[var(--color-fg-muted)] mt-2 max-w-4xl leading-relaxed">
-          OpenCode note: we saw{" "}
+          Audit note: DeepSeek through OpenCode stayed in the serious section because
+          its non-passes were normal correctness/build failures or full-budget
+          timeouts. The older OpenCode/Z.ai rows were demoted because hidden
+          reasoning-token limits produced no-solution cells before useful actions.
+          Inspect the{" "}
           <Link
             href="/runs?harness=opencode"
             className="underline underline-offset-2 decoration-[var(--color-bad)] hover:text-[var(--color-bad)]"
           >
             runs
           </Link>{" "}
-          consume reasoning-token limits before taking
-          useful actions, which prevented some models from performing. This was
-          less of an issue with the other harnesses, so OpenCode rows are best
-          read as diagnostic.
+          for the raw transcripts.
         </p>
       </section>
 
@@ -282,6 +311,69 @@ export default async function HardPage() {
           DEVLOG.md
         </Link>
       </section>
+    </div>
+  )
+}
+
+function LeaderboardTable({
+  models,
+  annotations,
+  hasViewer,
+  auditNotes,
+}: {
+  models: Model[]
+  annotations: Map<string, { verdict: string }>
+  hasViewer: Set<string>
+  auditNotes?: Record<string, string>
+}) {
+  const showNotes = Boolean(auditNotes)
+  return (
+    <div className="overflow-x-auto box">
+      <table className="term tabular text-xs sm:text-sm">
+        <thead>
+          <tr>
+            <th className="sticky left-0 bg-[var(--color-bg)]">model</th>
+            {PROBLEMS.map((p) => (
+              <th key={p.key} className="text-right">
+                {p.short}
+              </th>
+            ))}
+            <th className="text-right">PASS</th>
+            {showNotes ? <th>audit note</th> : null}
+          </tr>
+        </thead>
+        <tbody>
+          {models.map((m) => (
+            <tr key={m.label}>
+              <td className="sticky left-0 bg-[var(--color-bg)] text-[var(--color-fg-bright)] whitespace-nowrap">
+                {shortLabel(m.label)}
+                {m.effort ? (
+                  <span className="text-[var(--color-fg-muted)]">
+                    {" "}
+                    [{m.effort}]
+                  </span>
+                ) : null}
+              </td>
+              {PROBLEMS.map((p) => {
+                const cell = m.results[p.key]
+                return (
+                  <td key={p.key} className="text-right">
+                    {renderCell(cell, annotations, hasViewer)}
+                  </td>
+                )
+              })}
+              <td className="text-right text-[var(--color-fg-bright)]">
+                {m.pass_count}/{m.total_runs}
+              </td>
+              {showNotes ? (
+                <td className="min-w-72 max-w-md whitespace-normal text-[10px] sm:text-xs text-[var(--color-fg-muted)] leading-relaxed">
+                  {auditNotes?.[m.label] ?? "Unclassified row; kept diagnostic until audited."}
+                </td>
+              ) : null}
+            </tr>
+          ))}
+        </tbody>
+      </table>
     </div>
   )
 }
