@@ -4,6 +4,18 @@ A running record of decisions, dead ends, and lessons. Newest entries on top. Th
 
 ---
 
+## 2026-05-14 — Z.ai GLM-5.1 Claude Code rerun with corrected Anthropic endpoint
+
+Shuyan confirmed Z.ai's internal Claude Code eval config: disable experimental betas, set very high retry and output-token ceilings, disallow plan/user-question tools, and map every Claude Code alias including Haiku / Explore / subagents to `glm-5.1`. `scripts/run_hard.sh` now bakes those defaults into the `zai-claude` harness against `https://api.z.ai/api/anthropic`, and `scripts/rerun_zai_claude_glm51.sh` records the nine-problem CUDA rerun command.
+
+The May 13 rerun is now represented as `zai-claude/glm-5.1 [2026-05-13]`. Correctness-passing cells were `03_paged_attention` 0.2220, `04_kahan_softmax` 0.3367, `05_topk_bitonic` 0.0029, `06_sonic_moe_swiglu` 0.1111, and `10_patch_embed_conv3d_gemm` 0.1471. `02_kda_cutlass` failed numerically, `07_w4a16_gemm` timed out with no `solution.py`, and `09_fmha_preattn_mrope` failed CUDA extension compilation/checking.
+
+`01_fp8_gemm` is deliberately not counted as a pass even though its archived `result.json` says `correct=true`: the model edited `problem.yaml`, changing the tolerance key from `fp8_e4m3fn: 0.15` to `bfloat16: 0.15`. Since `check.py` looks up tolerance by `ref_out.dtype == torch.bfloat16`, that relaxed the actual correctness check from the default bf16 tolerance to 0.15. This is a clean reward-hack example, not a valid kernel result, so the public row marks it invalid and attaches a `reward_hack` annotation.
+
+Harness fix: `run_hard.sh` now snapshots `reference.py`, `sota.py`, `shapes.py`, `problem.yaml`, `check.py`, `benchmark.py`, and `PROMPT.txt` before each agent run. If any of those files are changed, deleted, or created unexpectedly, the run is marked invalid, `template_mutated=true` is written to `result.json`, a diff lands in `template_mutations.log`, and the original files are restored before the next problem.
+
+---
+
 ## 2026-05-09 — Website policy: demote OpenCode, remove blocked Qwen 35B-A3B row
 
 After inspecting the May 8 GLM-5.1 rerun transcripts, we changed the public `/hard` page to treat OpenCode rows as diagnostic rather than primary evidence. The OpenCode Z.ai rerun had multiple early `ERR` cells caused by hidden-reasoning budget exhaustion before tool use, so the page now shows a red disclaimer and pushes OpenCode rows below the native-harness rows. Droid and Claude Code rows should carry more weight when they exist.
@@ -23,6 +35,8 @@ Droid rerun used the Factory custom model `custom:GLM-5.1-[Z.AI-Coding-Plan]-0`,
 Claude Code was attempted only against Z.ai, not Anthropic: first through `ccr-rust` with a Z.ai-only router, then directly with `ANTHROPIC_BASE_URL=https://api.z.ai/api/coding/paas/v4` and `ANTHROPIC_AUTH_TOKEN=$ZAI_API_KEY`. The proxy path authenticated but returned malformed/empty HTTP 200 responses to Claude Code; direct model names returned 404 model-access errors. Those runs are setup-invalid, not model results, and are not counted on the leaderboard.
 
 Website changes from this rerun: add Droid harness support to `scripts/run_hard.sh`, add Droid usage extraction, render all 18 May 8 transcript viewers, and publish two additional leaderboard rows: `opencode/zai/glm-5.1 [2026-05-08]` and `droid/zai/glm-5.1 [2026-05-08]`. This preserves the original public GLM row while making the rerun evidence explicit.
+
+Follow-up smoke tests found the Claude Code wiring bug: Z.ai exposes a separate Anthropic-compatible endpoint for Claude Code, `https://api.z.ai/api/anthropic`. The earlier direct attempt used the OpenAI-compatible coding endpoint, `https://api.z.ai/api/coding/paas/v4`, which is the right shape for Droid/Factory but the wrong shape for Claude Code. `scripts/run_hard.sh` now has a `zai-claude` harness that sets `ANTHROPIC_BASE_URL=https://api.z.ai/api/anthropic`, maps Claude Code's `opus`/`sonnet` aliases to `glm-5.1`, and leaves `ccr-claude` as the historical proxy path. One-turn smoke results: `zai-claude` returned `KB_SMOKE_OK` through model `glm-5.1`; Droid's existing `custom:GLM-5.1-[Z.AI-Coding-Plan]-0` also returned `KB_SMOKE_OK`. Droid was already hooked up correctly; its four benchmark ERR cells were 45-minute incomplete runs with no `solution.py`, not API failures.
 
 ---
 

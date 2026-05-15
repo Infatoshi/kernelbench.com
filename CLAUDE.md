@@ -12,7 +12,7 @@ For the why behind the design, read [`benchmarks/hard/DEVLOG.md`](./benchmarks/h
 │   ├── page.tsx                 / landing
 │   ├── hard/page.tsx            /hard leaderboard + ceilings + rubric leaks
 │   ├── v3/page.tsx              /v3 client-side filterable explorer
-│   ├── runs/page.tsx            /runs index of 100 transcript viewers
+│   ├── runs/page.tsx            /runs index of committed transcript viewers
 │   ├── blog/{,v3,hard}/page.tsx writeups
 │   ├── layout.tsx               nav, footer, metadata
 │   ├── globals.css              hacker theme (phosphor green, JetBrains Mono, CRT scanlines)
@@ -20,7 +20,7 @@ For the why behind the design, read [`benchmarks/hard/DEVLOG.md`](./benchmarks/h
 ├── lib/data.ts                  reads benchmarks/hard/results/{leaderboard,problem_baselines}.json
 │                                + YAML annotations from the filesystem at build time
 ├── public/
-│   ├── runs/<run_id>.html       100 themed transcript viewers (~18 MB)
+│   ├── runs/<run_id>.html       themed transcript viewers
 │   ├── blog-hard/*.png          5 matplotlib plots embedded in /blog/hard
 │   ├── blog-v3/*.png            6 plots embedded in /blog/v3
 │   └── data/v3/                 v3 results.csv + per-cell solution.py / reference.py
@@ -29,9 +29,9 @@ For the why behind the design, read [`benchmarks/hard/DEVLOG.md`](./benchmarks/h
 │   │   ├── DEVLOG.md            decisions and dead ends — START HERE for context
 │   │   ├── CLAUDE.md            instructions for editing this benchmark specifically
 │   │   ├── results/
-│   │   │   ├── leaderboard.json         12 models × 7 problems, schema-versioned
+│   │   │   ├── leaderboard.json         14 model-harness sweeps × 9 problems, schema-versioned
 │   │   │   ├── problem_baselines.json   eager/compiled/SOTA timings per problem
-│   │   │   ├── annotations/             30 per-cell YAML notes
+│   │   │   ├── annotations/             36 per-cell YAML notes
 │   │   │   └── annotations/SCHEMA.md    annotation file format
 │   │   ├── problems/0X_<name>/   reference.py, check.py, benchmark.py, problem.yaml, sota.py
 │   │   ├── src/eval/             timing, correctness, roofline, hardware peaks
@@ -77,7 +77,7 @@ npm run dev
 # http://localhost:3000
 ```
 
-### Regenerate the 100 transcript viewers
+### Regenerate transcript viewers
 
 If `outputs/runs/` (gitignored, lives on the GPU machine at `~/cuda/KernelBench-Hard/outputs/runs/`) has new transcripts, regenerate the public viewers:
 
@@ -117,7 +117,7 @@ Just create `benchmarks/hard/results/annotations/<run_id>.yaml` matching the sch
 
 - Hardware: I'm not on a GPU. Anything that runs CUDA needs to happen on `~/cuda/KernelBench-Hard/` on the GPU machine. The website repo at `/home/infatoshi/work/kernelbench.com/` is just the sources + committed result data.
 - Standalone repos: don't push to `Infatoshi/KernelBench-Hard` or `Infatoshi/KernelBench-v3` directly. Push to `Infatoshi/kernelbench.com`. The standalones are mirrors.
-- `outputs/runs/` is local-only and gitignored. The 100 transcripts live on the GPU machine, not in this repo. Only the rendered HTMLs in `public/runs/` ship publicly.
+- `outputs/runs/` is local-only and gitignored. The raw transcripts live on the GPU machine, not in this repo. Only the rendered HTMLs in `public/runs/` ship publicly.
 - The user's `~/.claude/skills/` directory was deleted (mirror lives at `~/2nd-brain/references/skills/anvil/claude/`). Don't expect skills to be available.
 
 ## When to update this file

@@ -16,7 +16,7 @@ This is the codex-style equivalent of `CLAUDE.md`. Read [`CLAUDE.md`](./CLAUDE.m
 - Website at root (Next.js 16, Tailwind v4, JetBrains Mono, phosphor green on near-black).
 - `benchmarks/hard/` — KernelBench-Hard suite (subtree of `Infatoshi/KernelBench-Hard`).
 - `benchmarks/v3/` — KernelBench v3 suite (subtree of `Infatoshi/KernelBench-v3`).
-- `public/runs/<run_id>.html` — 100 themed transcript viewers, committed.
+- `public/runs/<run_id>.html` — themed transcript viewers, committed.
 - `public/blog-hard/*.png` — 5 matplotlib plots embedded in the v-Hard writeup.
 - `public/data/v3/` — v3 results.csv + per-cell solution.py / reference.py.
 

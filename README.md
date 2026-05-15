@@ -12,7 +12,7 @@ This is the canonical monorepo: it ships both the public website and the benchma
 ├── lib/data.ts             Reads benchmark data from benchmarks/ at build time
 ├── public/                 Website static assets
 ├── benchmarks/
-│   ├── hard/             Latest (2026-04). Single Blackwell, 7 problems, 12 models.
+│   ├── hard/             Latest (2026-04). Single Blackwell, 9 problems, 14 model-harness sweeps.
 │   │   ├── DEVLOG.md       Decisions, dead ends, lessons.
 │   │   ├── LEADERBOARD.md  Human-readable cross-model grid + rubric-leak footnotes.
 │   │   ├── results/

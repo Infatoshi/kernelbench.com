@@ -17,7 +17,7 @@ See [SPEC.md](./SPEC.md) for methodology. See [README.md](./README.md) for the m
 - **uv only.** No bare `python`, no `pip`. Use `uv run ...`, `uv add ...`, `uv pip install ...`.
 - **Before committing:** `uv run ruff check . --fix && uv run pytest`.
 - **Never edit `problems/*/solution.py`**. Those files are agent output; they're gitignored for a reason. If you need to inspect one, read it from `outputs/runs/<run>/<problem>/solution.py`.
-- **Never modify `problems/*/reference.py`, `check.py`, `benchmark.py`, `problem.yaml`, `shapes.py`, or `PROMPT.txt`** once a sweep has been published. Those define the benchmark — changing them invalidates prior results.
+- **Never modify `problems/*/reference.py`, `check.py`, `benchmark.py`, `problem.yaml`, `shapes.py`, or `PROMPT.txt`** once a sweep has been published. Those define the benchmark — changing them invalidates prior results. `scripts/run_hard.sh` snapshots these files and marks the run invalid if an agent changes them.
 - **torch.compile fix.** torch 2.11.0+cu130 has a broken inductor CSE typing annotation that breaks the compile baseline. Run `./scripts/patch_torch.sh` after every `uv sync`.
 
 ## Repo layout
@@ -82,6 +82,27 @@ done
 # Everything (this is what sweep.sh does)
 ./scripts/sweep.sh
 ```
+
+### Z.ai GLM-5.1 via Claude Code
+
+For a canonical GLM-5.1 rerun through Claude Code, use the `zai-claude`
+harness, not OpenCode. Z.ai's Anthropic-compatible Claude Code endpoint is
+`https://api.z.ai/api/anthropic`; the OpenAI-compatible coding endpoint is for
+Droid/Factory.
+
+`scripts/run_hard.sh` sets the Z.ai-recommended Claude Code defaults in the
+`zai-claude` branch:
+
+```bash
+CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS=1
+CLAUDE_CODE_MAX_RETRIES=1000000
+CLAUDE_CODE_MAX_OUTPUT_TOKENS=128000
+ZAI_CLAUDE_HAIKU_MODEL=glm-5.1
+```
+
+All Claude Code aliases should map to `glm-5.1`, including Haiku / Explore /
+subagent calls. The harness also passes `--disallowedTools ExitPlanMode
+EnterPlanMode AskUserQuestion` for this route.
 
 ## Interpreting results
 

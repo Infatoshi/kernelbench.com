@@ -44,10 +44,10 @@ export default async function HardPage() {
           kernelbench hard
         </h1>
         <p className="text-sm text-[var(--color-fg-muted)] mb-6">
-          13 model-harness sweeps × 9 problems · RTX PRO 6000 Blackwell · sm_120 · 96 GB GDDR7 · 1.8 TB/s
+          14 model-harness sweeps × 9 problems · RTX PRO 6000 Blackwell · sm_120 · 96 GB GDDR7 · 1.8 TB/s
         </p>
         <p className="text-[var(--color-fg)] leading-relaxed max-w-3xl">
-          A focused successor to KernelBench v3. One Blackwell GPU, nine hand-designed problems, real coding-agent CLIs as the harness. The original public board swept twelve frontier model-harness pairs; the May 8 Z.ai rerun adds fresh GLM-5.1 rows for OpenCode and Droid. Only GPT-5.5 xhigh solved every problem. Treat Droid and Claude Code as the serious GLM-5.1 rerun signals; OpenCode rows are retained for transparency but demoted because its provider adapter produced unstable early ERRs. Problems 09 (multi-axis RoPE pre-attention) and 10 (Conv3d-as-GEMM patch embedding) were added in the second sweep round; problem 10 is the harder differentiator.
+          A focused successor to KernelBench v3. One Blackwell GPU, nine hand-designed problems, real coding-agent CLIs as the harness. The original public board swept twelve frontier model-harness pairs; the May 8 Z.ai rerun added fresh GLM-5.1 rows for OpenCode and Droid, and the May 13 rerun adds GLM-5.1 through Claude Code on Z.ai's Anthropic-compatible endpoint. Only GPT-5.5 xhigh solved every problem. Treat Droid and Claude Code as the serious GLM-5.1 rerun signals; OpenCode rows are retained for transparency but demoted because its provider adapter produced unstable early ERRs. Problems 09 (multi-axis RoPE pre-attention) and 10 (Conv3d-as-GEMM patch embedding) were added in the second sweep round; problem 10 is the harder differentiator.
         </p>
       </section>
 
@@ -56,7 +56,7 @@ export default async function HardPage() {
           # leaderboard
         </h2>
         <p className="text-xs text-[var(--color-fg-muted)] mb-4">
-          cells = peak_fraction (fraction of the relevant hardware ceiling). FAIL = solution written but missed correctness. ERR = no solution produced. <span className="text-[var(--color-warn)]">★</span> = annotation attached. <span className="text-[var(--color-fg-bright)]">click any cell to open the full transcript viewer</span> — every tool call, every reasoning step, the solution.py, the check.log.
+          cells = peak_fraction (fraction of the relevant hardware ceiling). FAIL = solution written but missed correctness. ERR = no solution produced. INVALID = benchmark file mutation or other scoring-invalid behavior. <span className="text-[var(--color-warn)]">★</span> = annotation attached. <span className="text-[var(--color-fg-bright)]">click any cell to open the full transcript viewer</span> — every tool call, every reasoning step, the solution.py, the check.log.
         </p>
         <div className="overflow-x-auto box">
           <table className="term tabular text-xs sm:text-sm">
@@ -260,7 +260,7 @@ export default async function HardPage() {
           <Bullet>Real coding-agent CLIs as the harness — Claude Code, codex CLI, Kimi CLI, opencode, Droid — not a custom KernelBench agent loop.</Bullet>
           <Bullet>Wall-clock budgets, not turn limits. 45 min/run.</Bullet>
           <Bullet>peak_fraction grounded in physical hardware ceilings instead of raw speedup ratios.</Bullet>
-          <Bullet>Per-cell annotations with verdict, pull quotes from solution.py, and an &ldquo;implication&rdquo; statement. 30 annotations as of launch, with fresh Z.ai rerun viewers added on May 8.</Bullet>
+          <Bullet>Per-cell annotations with verdict, pull quotes from solution.py, and an &ldquo;implication&rdquo; statement. 36 annotations, including the May 13 Claude Code GLM-5.1 reward-hack example.</Bullet>
         </ul>
       </section>
 
@@ -293,9 +293,10 @@ function compareModelRows(
   const priority: Record<string, number> = {
     codex: 0,
     claude: 1,
-    droid: 2,
-    kimi: 3,
-    opencode: 4,
+    "zai-claude": 2,
+    droid: 3,
+    kimi: 4,
+    opencode: 5,
   }
   const pa = priority[a.harness] ?? 5
   const pb = priority[b.harness] ?? 5
@@ -305,6 +306,7 @@ function compareModelRows(
 
 function shortLabel(label: string) {
   return label
+    .replace("zai-claude/glm-5.1 [2026-05-13]", "Claude Code GLM-5.1 [2026-05-13]")
     .replace("droid/zai/glm-5.1 [2026-05-08]", "Droid GLM-5.1 [2026-05-08]")
     .replace("opencode/zai/glm-5.1 [2026-05-08]", "OpenCode GLM-5.1 rerun [2026-05-08]")
     .replace("opencode/zai/glm-5.1", "OpenCode GLM-5.1 original")
@@ -322,6 +324,7 @@ function renderCell(
         correct: boolean
         has_solution: boolean
         peak_fraction: number | null
+        invalid_reason?: string
       }
     | undefined,
   annotations: Map<string, { verdict: string }>,
@@ -343,8 +346,16 @@ function renderCell(
     ) : (
       <span>{inner}</span>
     )
+  const annot = annotations.get(cell.run_id)
+  if (cell.invalid_reason || annot?.verdict === "reward_hack") {
+    return wrap(
+      <>
+        <span className="cell-fail">INVALID</span>
+        <span className="ml-1 text-[var(--color-warn)]">★</span>
+      </>,
+    )
+  }
   if (cell.correct) {
-    const annot = annotations.get(cell.run_id)
     const star =
       annot && annot.verdict === "rubric_leak" ? (
         <span className="text-[var(--color-warn)]">★</span>

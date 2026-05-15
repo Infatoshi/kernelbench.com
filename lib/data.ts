@@ -13,6 +13,8 @@ export type Cell = {
   has_solution: boolean
   peak_fraction: number | null
   elapsed_seconds?: number | null
+  session_complete?: boolean
+  invalid_reason?: string
 }
 
 export type Model = {
