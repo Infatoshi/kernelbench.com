@@ -4,6 +4,65 @@ A running record of decisions, dead ends, and lessons. Newest entries on top. Th
 
 ---
 
+## 2026-05-28 - Queue-safe finish rerun promoted
+
+Finished the interrupted classified rerun with Anvil's GPU free after reboot.
+Run group:
+
+```text
+kbh_hard_finish_resume_20260528_040335
+```
+
+The targeted resume launched 23 rows and drained cleanly: 23 manifest rows, 23
+`result.json` rows, 0 running, and 0 exited-without-result. It reran the known
+bad/missing CUDA cells for Codex GPT-5.5 xhigh, Claude Opus 4.7 max, Cursor
+Composer 2.5 Fast, native Gemini 3.5 Flash, and OpenCode Z.ai GLM-5.1. The
+merged website summary uses the May 23 classified direct-Gemini sweep as the
+base and replaces matching cells with the May 28 artifacts.
+
+Preflight before launch passed for Codex, Claude, OpenCode GLM, Cursor Agent,
+and native Gemini. Z.ai-Claude still failed the tiny preflight and OpenRouter
+remained out of scope, so Qwen/OpenRouter Gemini were not part of this finish
+rerun. OpenCode/Z.ai GLM repeated provider early-stops on six CUDA cells and
+remains diagnostic.
+
+Promoted summary:
+
+```text
+benchmarks/hard/results/fresh/kbh_hard_finish_resume_20260528_040335.summary.latest.json
+```
+
+Imported into `benchmarks/hard/results/leaderboard.json` with tag
+`2026-05-28 finish`. The `/hard` page treats the fresh Codex, Claude, Cursor,
+and Gemini rows as primary comparable rows; fresh OpenCode/Z.ai and the retained
+Z.ai-Claude diagnostics stay in the diagnostic table.
+
+---
+
+## 2026-05-23 - Guarded parallel sweep preview importer
+
+The Anvil rerun now emits a flattened `summary.json` with per-cell wall time,
+token usage, cache/reasoning tokens where exposed, and GPU queue metrics. The
+website has a repeatable preview importer:
+
+```bash
+npm run import:hard-summary -- \
+  --input benchmarks/hard/results/fresh/<summary>.json \
+  --output benchmarks/hard/results/leaderboard.fresh-preview.json \
+  --tag "2026-05-23 guarded"
+```
+
+This intentionally writes a preview leaderboard instead of replacing the public
+`leaderboard.json`. If the preview is promoted later, `/hard` will treat rows
+tagged `2026-05-23 guarded` as primary comparable rows and the cell tooltip will
+surface agent wall time, total/check/benchmark time, output tokens per second,
+cache/reasoning tokens, cost when known, check/benchmark exit codes, and GPU
+lock wait/active time.
+For local review without swapping files, build with
+`KERNELBENCH_HARD_LEADERBOARD=benchmarks/hard/results/leaderboard.fresh-preview.json`.
+
+---
+
 ## 2026-05-14 - Leaderboard split after non-pass audit
 
 After a per-run audit of every non-pass cell, `/hard` now renders two leaderboard sections instead of one flat table. The serious comparison section keeps rows where audited non-passes are normal benchmark outcomes: correctness failures, build failures, full 2700s timeouts, or explicit invalid/reward-hack behavior. Current serious rows are GPT-5.5, Claude Opus 4.7, Claude Code GLM-5.1 on Z.ai, Droid GLM-5.1, and the two DeepSeek OpenCode rows.

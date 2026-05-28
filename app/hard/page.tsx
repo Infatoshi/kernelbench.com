@@ -42,6 +42,13 @@ const PRIMARY_MODEL_LABELS = new Set([
   "opencode/deepseek/deepseek-v4-pro",
 ])
 
+const FRESH_PRIMARY_PREFIXES = [
+  "codex/gpt-5.5 [2026-05-28 finish",
+  "claude/claude-opus-4-7 [2026-05-28 finish",
+  "cursor/composer-2.5-fast [2026-05-28 finish",
+  "gemini/gemini-3.5-flash [2026-05-28 finish",
+]
+
 const DIAGNOSTIC_AUDIT_NOTES: Record<string, string> = {
   "kimi/kimi-k2.6":
     "Problems 09/10 aborted in 4-5s with 401 auth errors; 01 is a reward-hack failure.",
@@ -55,10 +62,21 @@ const DIAGNOSTIC_AUDIT_NOTES: Record<string, string> = {
     "Problems 03/05 hit hidden reasoning-token limits before writing solution.py; 01 timed out after regressing a passing attempt.",
   "opencode/zai/glm-5.1 [2026-05-08]":
     "Problems 03/05/07/09 hit hidden reasoning-token limits with no solution.py; 01 timed out broken.",
+  "opencode/zai/glm-5.1 [2026-05-28 finish]":
+    "May 28 retry confirmed six CUDA cells still end as provider early-stops; only the inherited 04 pass remains.",
+  "zai-claude/glm-5.1 [2026-05-28 finish]":
+    "Z.ai Claude route was unavailable in May 28 preflight; cells are retained from the May 23 diagnostic run.",
   "opencode/openrouter-pinned/minimax/minimax-m2.7":
     "Problem 01 has no checkable artifact; remaining non-passes mix timeout and invalid/forbidden-op solution failures.",
   "opencode/openrouter-pinned/qwen/qwen3.6-27b":
     "Multiple no-solution/API/unknown cells; raw pass count is not comparable.",
+}
+
+function isPrimaryModel(m: Model) {
+  return (
+    PRIMARY_MODEL_LABELS.has(m.label) ||
+    FRESH_PRIMARY_PREFIXES.some((prefix) => m.label.startsWith(prefix))
+  )
 }
 
 export default async function HardPage() {
@@ -69,8 +87,8 @@ export default async function HardPage() {
     loadBaselines(),
   ])
   const models = [...lb.models].sort(compareModelRows)
-  const primaryModels = models.filter((m) => PRIMARY_MODEL_LABELS.has(m.label))
-  const diagnosticModels = models.filter((m) => !PRIMARY_MODEL_LABELS.has(m.label))
+  const primaryModels = models.filter(isPrimaryModel)
+  const diagnosticModels = models.filter((m) => !isPrimaryModel(m))
 
   return (
     <div className="space-y-12">
@@ -79,10 +97,10 @@ export default async function HardPage() {
           kernelbench hard
         </h1>
         <p className="text-sm text-[var(--color-fg-muted)] mb-6">
-          14 model-harness sweeps × 9 problems · RTX PRO 6000 Blackwell · sm_120 · 96 GB GDDR7 · 1.8 TB/s
+          Original 9-problem board + May 28 CUDA finish rerun · RTX PRO 6000 Blackwell · sm_120 · 96 GB GDDR7 · 1.8 TB/s
         </p>
         <p className="text-[var(--color-fg)] leading-relaxed max-w-3xl">
-          A focused successor to KernelBench v3. One Blackwell GPU, nine hand-designed problems, real coding-agent CLIs as the harness. The original public board swept twelve frontier model-harness pairs; the May 8 Z.ai rerun added fresh GLM-5.1 rows for OpenCode and Droid, and the May 13 rerun adds GLM-5.1 through Claude Code on Z.ai's Anthropic-compatible endpoint. Only GPT-5.5 xhigh solved every problem. The leaderboard now separates primary comparable sweeps from diagnostic rows where audit found API/auth/provider/adapter no-results. Treat Droid and Claude Code as the serious GLM-5.1 rerun signals; the older OpenCode/Z.ai rows are retained for transparency but demoted. Problems 09 (multi-axis RoPE pre-attention) and 10 (Conv3d-as-GEMM patch embedding) were added in the second sweep round; problem 10 is the harder differentiator.
+          A focused successor to KernelBench v3. One Blackwell GPU, nine hand-designed problems, real coding-agent CLIs as the harness. The original public board swept twelve frontier model-harness pairs; the May 8 Z.ai rerun added fresh GLM-5.1 rows for OpenCode and Droid, and the May 13 rerun adds GLM-5.1 through Claude Code on Z.ai's Anthropic-compatible endpoint. The May 28 finish rerun adds queue-safe seven-problem CUDA rows for Codex, Claude, Cursor Agent, and native Gemini. The leaderboard separates primary comparable sweeps from diagnostic rows where audit found API/auth/provider/adapter no-results.
         </p>
       </section>
 
@@ -92,6 +110,7 @@ export default async function HardPage() {
         </h2>
         <p className="text-xs text-[var(--color-fg-muted)] mb-4">
           cells = peak_fraction (fraction of the relevant hardware ceiling). FAIL = solution written but missed correctness. ERR = no solution produced. INVALID = benchmark file mutation or other scoring-invalid behavior. <span className="text-[var(--color-warn)]">★</span> = annotation attached. <span className="text-[var(--color-fg-bright)]">click any cell to open the full transcript viewer</span> — every tool call, every reasoning step, the solution.py, the check.log.
+          {" "}Fresh sweep cells include wall time, token usage, cache/reasoning tokens, and GPU queue mode in the cell tooltip when present.
         </p>
         <div className="space-y-8">
           <div>
@@ -130,8 +149,8 @@ export default async function HardPage() {
         <p className="text-[10px] sm:text-xs text-[var(--color-fg-muted)] mt-2 max-w-4xl leading-relaxed">
           Audit note: DeepSeek through OpenCode stayed in the serious section because
           its non-passes were normal correctness/build failures or full-budget
-          timeouts. The older OpenCode/Z.ai rows were demoted because hidden
-          reasoning-token limits produced no-solution cells before useful actions.
+          timeouts. OpenCode/Z.ai rows remain diagnostic because repeated hidden
+          reasoning/provider early-stops produced no-solution cells before useful actions.
           Inspect the{" "}
           <Link
             href="/runs?harness=opencode"
@@ -398,6 +417,8 @@ function compareModelRows(
 
 function shortLabel(label: string) {
   return label
+    .replace("openrouter-google-ai-studio/google/", "or-google/")
+    .replace("openrouter-alibaba/qwen/", "or-qwen/")
     .replace("zai-claude/glm-5.1 [2026-05-13]", "Claude Code GLM-5.1 [2026-05-13]")
     .replace("droid/zai/glm-5.1 [2026-05-08]", "Droid GLM-5.1 [2026-05-08]")
     .replace("opencode/zai/glm-5.1 [2026-05-08]", "OpenCode GLM-5.1 rerun [2026-05-08]")
@@ -415,7 +436,32 @@ function renderCell(
         run_id: string
         correct: boolean
         has_solution: boolean
+        failure_reason?: string | null
+        retryable_infra_failure?: boolean | null
+        minimum_useful_output_tokens?: number | null
         peak_fraction: number | null
+        elapsed_seconds?: number | null
+        total_elapsed_seconds?: number | null
+        check_elapsed_seconds?: number | null
+        benchmark_elapsed_seconds?: number | null
+        check_exit_code?: number | null
+        benchmark_exit_code?: number | null
+        output_tokens_per_second?: number | null
+        usage?: {
+          input_tokens?: number | null
+          output_tokens?: number | null
+          cache_read_tokens?: number | null
+          cache_creation_tokens?: number | null
+          reasoning_tokens?: number | null
+          total_cost_usd?: number | null
+        }
+        session_complete?: boolean
+        harness_exit_code?: number | null
+        agent_cuda_disabled?: boolean
+        gpu_queue_mode?: string | null
+        gpu_lock_calls?: number | null
+        gpu_lock_wait_seconds_total?: number | null
+        gpu_lock_active_seconds_total?: number | null
         invalid_reason?: string
       }
     | undefined,
@@ -426,17 +472,18 @@ function renderCell(
   const viewerUrl = hasViewer.has(cell.run_id)
     ? `/runs/${cell.run_id}.html`
     : null
+  const title = cellTitle(cell, Boolean(viewerUrl))
   const wrap = (inner: React.ReactNode) =>
     viewerUrl ? (
       <a
         href={viewerUrl}
         className="no-underline hover:text-[var(--color-accent)]"
-        title="open transcript viewer"
+        title={title}
       >
         {inner}
       </a>
     ) : (
-      <span>{inner}</span>
+      <span title={title}>{inner}</span>
     )
   const annot = annotations.get(cell.run_id)
   if (cell.invalid_reason || annot?.verdict === "reward_hack") {
@@ -462,8 +509,115 @@ function renderCell(
       </>,
     )
   }
+  if (cell.failure_reason === "provider_rate_limited") {
+    return wrap(<span className="cell-err">RATE</span>)
+  }
+  if (cell.failure_reason === "provider_early_stop") {
+    return wrap(<span className="cell-err">EARLY</span>)
+  }
+  if (cell.failure_reason === "timeout") {
+    return wrap(<span className="cell-err">TIME</span>)
+  }
+  if (cell.failure_reason === "no_solution") {
+    return wrap(<span className="cell-err">NO SOL</span>)
+  }
   if (cell.has_solution) return wrap(<span className="cell-fail">FAIL</span>)
   return wrap(<span className="cell-err">ERR</span>)
+}
+
+function cellTitle(
+  cell: {
+    run_id: string
+    failure_reason?: string | null
+    retryable_infra_failure?: boolean | null
+    minimum_useful_output_tokens?: number | null
+    elapsed_seconds?: number | null
+    total_elapsed_seconds?: number | null
+    check_elapsed_seconds?: number | null
+    benchmark_elapsed_seconds?: number | null
+    check_exit_code?: number | null
+    benchmark_exit_code?: number | null
+    output_tokens_per_second?: number | null
+    usage?: {
+      input_tokens?: number | null
+      output_tokens?: number | null
+      cache_read_tokens?: number | null
+      cache_creation_tokens?: number | null
+      reasoning_tokens?: number | null
+      total_cost_usd?: number | null
+    }
+    session_complete?: boolean
+    harness_exit_code?: number | null
+    agent_cuda_disabled?: boolean
+    gpu_queue_mode?: string | null
+    gpu_lock_calls?: number | null
+    gpu_lock_wait_seconds_total?: number | null
+    gpu_lock_active_seconds_total?: number | null
+  },
+  hasViewer: boolean,
+) {
+  const usage = cell.usage ?? {}
+  const parts = [
+    cell.run_id,
+    hasViewer ? "click to open transcript viewer" : "transcript viewer unavailable",
+    cell.failure_reason ? `failure ${cell.failure_reason}` : null,
+    cell.retryable_infra_failure ? "retryable infra failure" : null,
+    cell.minimum_useful_output_tokens != null
+      ? `min useful output ${fmtInt(cell.minimum_useful_output_tokens)} tok`
+      : null,
+    cell.session_complete === false ? "session incomplete" : null,
+    cell.harness_exit_code != null ? `exit ${cell.harness_exit_code}` : null,
+    cell.elapsed_seconds != null ? `agent ${fmtDuration(cell.elapsed_seconds)}` : null,
+    cell.total_elapsed_seconds != null
+      ? `total ${fmtDuration(cell.total_elapsed_seconds)}`
+      : null,
+    cell.check_elapsed_seconds != null
+      ? `check ${fmtDuration(cell.check_elapsed_seconds)}`
+      : null,
+    cell.check_exit_code != null ? `check exit ${cell.check_exit_code}` : null,
+    cell.benchmark_elapsed_seconds != null
+      ? `bench ${fmtDuration(cell.benchmark_elapsed_seconds)}`
+      : null,
+    cell.benchmark_exit_code != null
+      ? `bench exit ${cell.benchmark_exit_code}`
+      : null,
+    usage.input_tokens != null ? `in ${fmtInt(usage.input_tokens)} tok` : null,
+    usage.output_tokens != null ? `out ${fmtInt(usage.output_tokens)} tok` : null,
+    usage.cache_read_tokens != null
+      ? `cache read ${fmtInt(usage.cache_read_tokens)} tok`
+      : null,
+    usage.cache_creation_tokens != null
+      ? `cache write ${fmtInt(usage.cache_creation_tokens)} tok`
+      : null,
+    usage.reasoning_tokens != null
+      ? `reasoning ${fmtInt(usage.reasoning_tokens)} tok`
+      : null,
+    cell.output_tokens_per_second != null
+      ? `${cell.output_tokens_per_second.toFixed(1)} out tok/s`
+      : null,
+    usage.total_cost_usd != null ? `$${usage.total_cost_usd.toFixed(4)}` : null,
+    cell.gpu_queue_mode ? `queue ${cell.gpu_queue_mode}` : null,
+    cell.gpu_lock_calls != null ? `GPU lock calls ${cell.gpu_lock_calls}` : null,
+    cell.gpu_lock_wait_seconds_total != null
+      ? `GPU lock wait ${fmtDuration(cell.gpu_lock_wait_seconds_total)}`
+      : null,
+    cell.gpu_lock_active_seconds_total != null
+      ? `GPU lock active ${fmtDuration(cell.gpu_lock_active_seconds_total)}`
+      : null,
+    cell.agent_cuda_disabled ? "agent CUDA disabled" : null,
+  ]
+  return parts.filter(Boolean).join("\n")
+}
+
+function fmtDuration(seconds: number) {
+  if (seconds < 60) return `${seconds}s`
+  const min = Math.floor(seconds / 60)
+  const sec = seconds % 60
+  return `${min}m ${sec}s`
+}
+
+function fmtInt(n: number) {
+  return new Intl.NumberFormat("en-US").format(n)
 }
 
 function LeakCard({

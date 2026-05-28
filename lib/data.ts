@@ -11,9 +11,32 @@ export type Cell = {
   run_id: string
   correct: boolean
   has_solution: boolean
+  failure_reason?: string | null
+  retryable_infra_failure?: boolean | null
+  minimum_useful_output_tokens?: number | null
   peak_fraction: number | null
   elapsed_seconds?: number | null
+  total_elapsed_seconds?: number | null
+  check_elapsed_seconds?: number | null
+  benchmark_elapsed_seconds?: number | null
+  check_exit_code?: number | null
+  benchmark_exit_code?: number | null
+  output_tokens_per_second?: number | null
+  usage?: {
+    input_tokens?: number | null
+    output_tokens?: number | null
+    cache_read_tokens?: number | null
+    cache_creation_tokens?: number | null
+    reasoning_tokens?: number | null
+    total_cost_usd?: number | null
+  }
   session_complete?: boolean
+  harness_exit_code?: number | null
+  agent_cuda_disabled?: boolean
+  gpu_queue_mode?: string | null
+  gpu_lock_calls?: number | null
+  gpu_lock_wait_seconds_total?: number | null
+  gpu_lock_active_seconds_total?: number | null
   invalid_reason?: string
 }
 
@@ -47,6 +70,12 @@ export type Leaderboard = {
       ranked_passes: { model: string; peak_fraction: number }[]
     }
   >
+  generated_from_summary?: {
+    input: string
+    tag: string
+    imported_rows: number
+    generated_at: string
+  }
 }
 
 export type Annotation = {
@@ -90,7 +119,11 @@ export async function loadBaselines(): Promise<ProblemBaselines | null> {
 }
 
 export async function loadLeaderboard(): Promise<Leaderboard> {
-  const path = join(REPO_ROOT, "benchmarks/hard/results/leaderboard.json")
+  const path = join(
+    REPO_ROOT,
+    process.env.KERNELBENCH_HARD_LEADERBOARD ??
+      "benchmarks/hard/results/leaderboard.json",
+  )
   const text = await readFile(path, "utf-8")
   return JSON.parse(text)
 }
