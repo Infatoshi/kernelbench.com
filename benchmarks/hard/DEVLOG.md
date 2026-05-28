@@ -4,6 +4,47 @@ A running record of decisions, dead ends, and lessons. Newest entries on top. Th
 
 ---
 
+## 2026-05-28 - Opus 4.8 and Grok Build addendum
+
+Added Anvil `grok` CLI support using model `grok-build` and the top-level
+headless streaming JSON route. Also added a Grok transcript viewer parser so
+the public run links render instead of falling through the Claude parser.
+
+Run group:
+
+```text
+kbh_opus48_grok_full_20260528_125852
+```
+
+The addendum drained cleanly after the old launcher exposed a wait bug:
+14 manifest rows, 14 `result.json` rows, 0 running, and 0 exited-without-result.
+The launcher has since been fixed to keep child jobs waitable. Claude Opus 4.8
+used `--effort max` with fast mode disabled. Grok Build completed all seven
+rows through the new harness path.
+
+Claude Opus 4.8 passed six of seven CUDA rows plus KDA correctness:
+`01_fp8_gemm` 0.5332, `03_paged_attention` 0.6517, `04_kahan_softmax` 0.3517,
+`05_topk_bitonic` 0.0462, `06_sonic_moe_swiglu` 0.2507, and
+`07_w4a16_gemm` 0.1127. `02_kda_cutlass` passed correctness but timed out in
+the benchmark phase.
+
+Grok Build passed `04_kahan_softmax` at 0.0373 and passed KDA correctness but
+timed out in benchmark. The remaining Grok rows wrote checkable solutions that
+failed correctness.
+
+Promoted raw and merged summaries:
+
+```text
+benchmarks/hard/results/fresh/kbh_opus48_grok_full_20260528_125852.summary.raw.json
+benchmarks/hard/results/fresh/kbh_opus48_grok_full_20260528_125852.summary.latest.json
+```
+
+Imported only the 14-row raw summary into `leaderboard.json` with tag
+`2026-05-28 opus48-grok`; importing the merged latest summary would re-tag the
+May 28 finish rows under the addendum label.
+
+---
+
 ## 2026-05-28 - Queue-safe finish rerun promoted
 
 Finished the interrupted classified rerun with Anvil's GPU free after reboot.

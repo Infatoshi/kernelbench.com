@@ -45,8 +45,10 @@ const PRIMARY_MODEL_LABELS = new Set([
 const FRESH_PRIMARY_PREFIXES = [
   "codex/gpt-5.5 [2026-05-28 finish",
   "claude/claude-opus-4-7 [2026-05-28 finish",
+  "claude/claude-opus-4-8 [2026-05-28 opus48-grok",
   "cursor/composer-2.5-fast [2026-05-28 finish",
   "gemini/gemini-3.5-flash [2026-05-28 finish",
+  "grok/grok-build [2026-05-28 opus48-grok",
 ]
 
 const DIAGNOSTIC_AUDIT_NOTES: Record<string, string> = {
@@ -100,7 +102,7 @@ export default async function HardPage() {
           Original 9-problem board + May 28 CUDA finish rerun · RTX PRO 6000 Blackwell · sm_120 · 96 GB GDDR7 · 1.8 TB/s
         </p>
         <p className="text-[var(--color-fg)] leading-relaxed max-w-3xl">
-          A focused successor to KernelBench v3. One Blackwell GPU, nine hand-designed problems, real coding-agent CLIs as the harness. The original public board swept twelve frontier model-harness pairs; the May 8 Z.ai rerun added fresh GLM-5.1 rows for OpenCode and Droid, and the May 13 rerun adds GLM-5.1 through Claude Code on Z.ai's Anthropic-compatible endpoint. The May 28 finish rerun adds queue-safe seven-problem CUDA rows for Codex, Claude, Cursor Agent, and native Gemini. The leaderboard separates primary comparable sweeps from diagnostic rows where audit found API/auth/provider/adapter no-results.
+          A focused successor to KernelBench v3. One Blackwell GPU, nine hand-designed problems, real coding-agent CLIs as the harness. The original public board swept twelve frontier model-harness pairs; the May 8 Z.ai rerun added fresh GLM-5.1 rows for OpenCode and Droid, and the May 13 rerun adds GLM-5.1 through Claude Code on Z.ai's Anthropic-compatible endpoint. The May 28 finish rerun adds queue-safe seven-problem CUDA rows for Codex, Claude, Cursor Agent, and native Gemini; the same-day addendum adds Claude Opus 4.8 and Grok Build. The leaderboard separates primary comparable sweeps from diagnostic rows where audit found API/auth/provider/adapter no-results.
         </p>
       </section>
 

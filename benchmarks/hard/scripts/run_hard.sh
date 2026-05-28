@@ -9,6 +9,7 @@
 #   ./scripts/run_hard.sh codex gpt-5.5 problems/01_fp8_gemm xhigh
 #   ./scripts/run_hard.sh kimi kimi-k2.6 problems/01_fp8_gemm
 #   ./scripts/run_hard.sh droid glm-5.1 problems/01_fp8_gemm
+#   ./scripts/run_hard.sh grok grok-build problems/01_fp8_gemm max
 #   ./scripts/run_hard.sh zai-claude glm-5.1 problems/01_fp8_gemm
 #   ./scripts/run_hard.sh ccr-claude glm-5.1 problems/01_fp8_gemm
 #
@@ -32,21 +33,55 @@ fi
 
 HARNESS="${1:?Usage: $0 <harness> <model> <problem_dir> [reasoning_effort]}"
 MODEL="${2:?model required}"
-PROBLEM_DIR="${3:?problem_dir required}"
+SOURCE_PROBLEM_DIR="${3:?problem_dir required}"
 REASONING_EFFORT="${4:-}"
+CLAUDE_KBH_SETTINGS="${CLAUDE_KBH_SETTINGS:-{\"fastMode\":false,\"alwaysThinkingEnabled\":true}}"
 
-PROBLEM_DIR="$(cd "$PROBLEM_DIR" && pwd)"
-PROBLEM_NAME="$(basename "$PROBLEM_DIR")"
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+SOURCE_PROBLEM_DIR="$(cd "$SOURCE_PROBLEM_DIR" && pwd)"
+PROBLEM_NAME="$(basename "$SOURCE_PROBLEM_DIR")"
 
 TIMESTAMP="$(date +%Y%m%d_%H%M%S)"
 MODEL_SLUG="$(echo "$MODEL" | tr '/:[] ' '_')"
-RUN_DIR="${REPO_ROOT}/outputs/runs/${TIMESTAMP}_${HARNESS}_${MODEL_SLUG}_${PROBLEM_NAME}"
-mkdir -p "$RUN_DIR"
+RUN_DIR_BASE="${REPO_ROOT}/outputs/runs/${TIMESTAMP}_${HARNESS}_${MODEL_SLUG}_${PROBLEM_NAME}"
+mkdir -p "$REPO_ROOT/outputs/runs"
+RUN_DIR=""
+for attempt in $(seq 0 999); do
+    if [ "$attempt" -eq 0 ]; then
+        candidate="$RUN_DIR_BASE"
+    else
+        candidate="${RUN_DIR_BASE}_$$_${attempt}"
+    fi
+    if mkdir "$candidate" 2>/dev/null; then
+        RUN_DIR="$candidate"
+        break
+    fi
+done
+if [ -z "$RUN_DIR" ]; then
+    echo "failed to allocate unique run directory for $RUN_DIR_BASE" >&2
+    exit 1
+fi
+RUN_ID="$(basename "$RUN_DIR")"
+RUN_GROUP="${KBH_RUN_GROUP:-}"
 
 # Wall clock budget: 45 minutes per run. Override via BUDGET_SECONDS env var
 # (e.g. BUDGET_SECONDS=300 for a quick smoke test).
 BUDGET_SECONDS="${BUDGET_SECONDS:-2700}"
+CHECK_TIMEOUT_SECONDS="${KBH_CHECK_TIMEOUT_SECONDS:-180}"
+BENCHMARK_TIMEOUT_SECONDS="${KBH_BENCHMARK_TIMEOUT_SECONDS:-1800}"
+export KBH_GPU_LOCK_WAIT_TIMEOUT_SECONDS="${KBH_GPU_LOCK_WAIT_TIMEOUT_SECONDS:-7200}"
+MIN_USEFUL_OUTPUT_TOKENS="${KBH_MIN_USEFUL_OUTPUT_TOKENS:-5000}"
+
+# Optional mode for concurrent smoke sweeps: agents can edit/reason in parallel
+# while the harness-owned post-run check.py/benchmark.py path is the only CUDA
+# consumer. This is more reliable than trying to intercept every absolute
+# .venv/bin/python path an agent may discover.
+AGENT_CUDA_DISABLED=false
+GPU_QUEUE_MODE="path_wrapper_gpu_lock"
+if [ "${KBH_DISABLE_AGENT_CUDA:-0}" = "1" ]; then
+    AGENT_CUDA_DISABLED=true
+    GPU_QUEUE_MODE="agent_phase_cuda_guard_harness_gpu_lock"
+fi
 
 # --- Load the per-problem prompt ------------------------------------------
 #
@@ -55,14 +90,24 @@ BUDGET_SECONDS="${BUDGET_SECONDS:-2700}"
 # message. The harness sends this directly as the prompt to the agent. No
 # system/user split, no preamble concatenation.
 
-PROMPT_FILE="${PROBLEM_DIR}/PROMPT.txt"
+PROMPT_FILE="${SOURCE_PROBLEM_DIR}/PROMPT.txt"
 if [ ! -f "$PROMPT_FILE" ]; then
     echo "PROMPT.txt missing for $PROBLEM_NAME" >&2
     exit 1
 fi
 PROMPT="$(cat "$PROMPT_FILE")"
+if [ "${KBH_DISABLE_AGENT_CUDA:-0}" = "1" ]; then
+    PROMPT="${PROMPT}
 
-# --- Clean the problem workspace of any prior solution --------------------
+Parallel sweep note: CUDA is intentionally unavailable during your editing
+phase so many models can work at once without contaminating GPU timings. Do not
+spend time running check.py, benchmark.py, nvidia-smi, ncu, nsys, nvcc, or CUDA
+profiling commands. Focus on writing the best final solution.py you can. The
+harness will run check.py and benchmark.py after your session under the GPU
+lock and archive those logs."
+fi
+
+# --- Create an isolated per-run problem workspace -------------------------
 # problem.yaml and shapes.py stay in the workspace because check.py and
 # benchmark.py import them at runtime; the prompt does not direct the model
 # to read them.
@@ -75,15 +120,279 @@ is_template() {
     return 1
 }
 
-shopt -s nullglob dotglob
-for f in "$PROBLEM_DIR"/*; do
-    base="$(basename "$f")"
-    [[ "$base" == "." || "$base" == ".." ]] && continue
-    if ! is_template "$base"; then
-        rm -rf "$f"
+WORKSPACE_ROOT="$RUN_DIR/repo"
+PROBLEM_DIR="$WORKSPACE_ROOT/problems/$PROBLEM_NAME"
+mkdir -p "$PROBLEM_DIR"
+
+PROMPT="${PROMPT}
+
+Workspace isolation note: you are already running inside the archive-local
+problem workspace, ${PROBLEM_DIR}. Write the final answer to solution.py in the
+current directory only. Do not write to ${SOURCE_PROBLEM_DIR} or to the source
+repository's problems/ tree."
+
+# check.py and benchmark.py derive REPO_ROOT as parents[2]. Keep that shape
+# while sharing src/. Copy project metadata so agents can mutate dependencies
+# inside their disposable workspace without touching the source repo.
+ln -s "$REPO_ROOT/src" "$WORKSPACE_ROOT/src"
+cp -p "$REPO_ROOT/pyproject.toml" "$WORKSPACE_ROOT/pyproject.toml"
+cp -p "$REPO_ROOT/uv.lock" "$WORKSPACE_ROOT/uv.lock"
+if [ -e "$REPO_ROOT/.python-version" ]; then
+    cp -p "$REPO_ROOT/.python-version" "$WORKSPACE_ROOT/.python-version"
+fi
+
+for t in "${TEMPLATE_FILES[@]}"; do
+    if [ -e "$SOURCE_PROBLEM_DIR/$t" ]; then
+        cp -p "$SOURCE_PROBLEM_DIR/$t" "$PROBLEM_DIR/$t"
     fi
 done
-shopt -u nullglob dotglob
+
+# --- Per-run GPU/cache isolation -----------------------------------------
+#
+# Agent reasoning and file editing can happen in parallel. CUDA-facing work
+# should be serialized so agent-internal check.py/benchmark.py/profiling runs
+# do not contaminate each other's timing or Torch extension builds.
+REAL_UV="$(command -v uv)"
+REAL_PYTHON="$(command -v python3 || command -v python)"
+REAL_NVIDIA_SMI="$(command -v nvidia-smi || true)"
+REAL_NCU="$(command -v ncu || true)"
+REAL_NSYS="$(command -v nsys || true)"
+REAL_NVCC="$(command -v nvcc || true)"
+REAL_TIMEOUT="$(command -v timeout)"
+REAL_UV_FALLBACK="$REAL_UV"
+REAL_PYTHON_FALLBACK="$REAL_PYTHON"
+LOCK_WRAPPER_DIR="$RUN_DIR/bin"
+AGENT_GUARD_DIR="$RUN_DIR/agent_guard"
+mkdir -p "$LOCK_WRAPPER_DIR" "$RUN_DIR/cache/torch_extensions" \
+    "$RUN_DIR/cache/triton" "$RUN_DIR/cache/cuda" "$RUN_DIR/tmp" \
+    "$AGENT_GUARD_DIR"
+
+export KBH_GPU_LOCK="${KBH_GPU_LOCK:-$REPO_ROOT/outputs/gpu.lock}"
+export KBH_GPU_LOCK_LOG="$RUN_DIR/gpu_lock.log"
+export TORCH_EXTENSIONS_DIR="$RUN_DIR/cache/torch_extensions"
+export TRITON_CACHE_DIR="$RUN_DIR/cache/triton"
+export CUDA_CACHE_PATH="$RUN_DIR/cache/cuda"
+export TMPDIR="$RUN_DIR/tmp"
+export TEMP="$RUN_DIR/tmp"
+export TMP="$RUN_DIR/tmp"
+export RUN_DIR REAL_UV REAL_PYTHON REAL_NVIDIA_SMI REAL_NCU REAL_NSYS REAL_NVCC \
+    REAL_UV_FALLBACK REAL_PYTHON_FALLBACK AGENT_GUARD_DIR
+
+cat > "$AGENT_GUARD_DIR/sitecustomize.py" <<'PY'
+"""Block accidental CUDA use during parallel agent-edit phases.
+
+The harness-owned post-run check.py/benchmark.py path runs without
+KBH_AGENT_PHASE and is still allowed to use the GPU under outputs/gpu.lock.
+"""
+from __future__ import annotations
+
+import builtins
+import importlib
+import os
+
+
+if os.environ.get("KBH_AGENT_PHASE") == "1":
+    _orig_import_module = importlib.import_module
+    _orig_import = builtins.__import__
+    _orig_torch_device = None
+
+    def _patch_torch(mod):
+        global _orig_torch_device
+        try:
+            if _orig_torch_device is None:
+                _orig_torch_device = mod.device
+            cuda = getattr(mod, "cuda", None)
+            def _blocked(*args, **kwargs):
+                raise RuntimeError(
+                    "CUDA is disabled during KernelBench parallel agent phase; "
+                    "the harness will run check.py and benchmark.py after generation."
+                )
+
+            def _mentions_cuda(value):
+                try:
+                    if isinstance(value, str):
+                        return value.startswith("cuda")
+                    if getattr(value, "type", None) == "cuda":
+                        return True
+                except Exception:
+                    pass
+                return False
+
+            if cuda is not None:
+                cuda.is_available = lambda: False
+                cuda.device_count = lambda: 0
+                cuda.current_device = _blocked
+                cuda.get_device_name = _blocked
+                cuda.get_device_capability = _blocked
+                cuda.init = _blocked
+                cuda.synchronize = _blocked
+            mod.device = lambda *args, **kwargs: (
+                _blocked() if args and _mentions_cuda(args[0])
+                else _orig_torch_device(*args, **kwargs)
+            )
+            if not getattr(mod, "_kbh_agent_cuda_patched", False):
+                tensor_to = mod.Tensor.to
+                module_to = mod.nn.Module.to
+
+                def guarded_tensor_to(self, *args, **kwargs):
+                    if any(_mentions_cuda(arg) for arg in args) or _mentions_cuda(kwargs.get("device")):
+                        _blocked()
+                    return tensor_to(self, *args, **kwargs)
+
+                def guarded_module_to(self, *args, **kwargs):
+                    if any(_mentions_cuda(arg) for arg in args) or _mentions_cuda(kwargs.get("device")):
+                        _blocked()
+                    return module_to(self, *args, **kwargs)
+
+                mod.Tensor.to = guarded_tensor_to
+                mod.Tensor.cuda = lambda self, *args, **kwargs: _blocked()
+                mod.nn.Module.to = guarded_module_to
+                mod.nn.Module.cuda = lambda self, *args, **kwargs: _blocked()
+                mod._kbh_agent_cuda_patched = True
+            os.environ["CUDA_VISIBLE_DEVICES"] = ""
+        except Exception:
+            pass
+        return mod
+
+    def _guarded_import_module(name, package=None):
+        mod = _orig_import_module(name, package)
+        if name == "torch" or name.startswith("torch."):
+            torch = _orig_import_module("torch")
+            _patch_torch(torch)
+        return mod
+
+    def _guarded_import(name, globals=None, locals=None, fromlist=(), level=0):
+        mod = _orig_import(name, globals, locals, fromlist, level)
+        if name == "torch" or name.startswith("torch."):
+            torch = _orig_import("torch")
+            _patch_torch(torch)
+        return mod
+
+    importlib.import_module = _guarded_import_module
+    builtins.__import__ = _guarded_import
+PY
+
+AGENT_CUDA_ENV=()
+if [ "${KBH_DISABLE_AGENT_CUDA:-0}" = "1" ]; then
+    AGENT_CUDA_ENV=(
+        env
+        CUDA_VISIBLE_DEVICES=
+        KBH_AGENT_PHASE=1
+        PYTHONPATH="$AGENT_GUARD_DIR${PYTHONPATH:+:$PYTHONPATH}"
+    )
+fi
+
+cat > "$LOCK_WRAPPER_DIR/gpu-lock-exec" <<'EOF'
+#!/bin/bash
+set -euo pipefail
+name="$1"
+real="$2"
+shift 2
+if [ -z "$real" ]; then
+    echo "$name is unavailable" >&2
+    exit 127
+fi
+real_abs="$(readlink -f "$real" 2>/dev/null || printf '%s' "$real")"
+case "$name" in
+    uv)
+        fallback="${REAL_UV_FALLBACK:-}"
+        ;;
+    python|python3)
+        fallback="${REAL_PYTHON_FALLBACK:-}"
+        ;;
+    *)
+        fallback=""
+        ;;
+esac
+if [ -n "${RUN_DIR:-}" ] && [[ "$real_abs" == "${RUN_DIR}/bin/"* ]] && [ -n "$fallback" ]; then
+    real="$fallback"
+fi
+if [ "${KBH_GPU_LOCK_HELD:-0}" = "1" ]; then
+    exec "$real" "$@"
+fi
+if [ "${KBH_AGENT_PHASE:-0}" = "1" ]; then
+    case "$name" in
+        uv|python|python3)
+            exec "$real" "$@"
+            ;;
+    esac
+fi
+owner_file="${KBH_GPU_LOCK}.owner"
+if [ -f "$owner_file" ]; then
+    IFS=$'\t' read -r owner_pid owner_run_dir < "$owner_file" || true
+    if [ "${owner_run_dir:-}" = "${RUN_DIR:-}" ] && kill -0 "${owner_pid:-}" 2>/dev/null; then
+        exec "$real" "$@"
+    fi
+fi
+{
+    printf '%s wait pid=%s cmd=%s args=%q\n' "$(date -Is)" "$$" "$name" "$*" >&3
+    lock_wait_timeout="${KBH_GPU_LOCK_WAIT_TIMEOUT_SECONDS:-}"
+    if [ -n "$lock_wait_timeout" ] && [ "$lock_wait_timeout" != "0" ]; then
+        if ! flock -x -w "$lock_wait_timeout" 9; then
+            printf '%s lock_timeout pid=%s cmd=%s wait_timeout_s=%s\n' \
+                "$(date -Is)" "$$" "$name" "$lock_wait_timeout" >&3
+            exit 124
+        fi
+    else
+        flock -x 9
+    fi
+    start="$(date +%s)"
+    printf '%s\t%s\n' "$$" "${RUN_DIR:-}" > "$owner_file"
+    printf '%s start pid=%s cmd=%s\n' "$(date -Is)" "$$" "$name" >&3
+    set +e
+    export KBH_GPU_LOCK_HELD=1
+    "$real" "$@"
+    status=$?
+    set -e
+    if [ -f "$owner_file" ] && IFS=$'\t' read -r current_owner _ < "$owner_file" && [ "$current_owner" = "$$" ]; then
+        rm -f "$owner_file"
+    fi
+    printf '%s end pid=%s cmd=%s status=%s elapsed_s=%s\n' \
+        "$(date -Is)" "$$" "$name" "$status" "$(($(date +%s) - start))" >&3
+    exit "$status"
+} 3>>"$KBH_GPU_LOCK_LOG" 9>"$KBH_GPU_LOCK"
+EOF
+chmod +x "$LOCK_WRAPPER_DIR/gpu-lock-exec"
+
+cat > "$LOCK_WRAPPER_DIR/uv" <<'EOF'
+#!/bin/bash
+exec "$RUN_DIR/bin/gpu-lock-exec" uv "${REAL_UV:-$REAL_UV_FALLBACK}" "$@"
+EOF
+cat > "$LOCK_WRAPPER_DIR/python" <<'EOF'
+#!/bin/bash
+exec "$RUN_DIR/bin/gpu-lock-exec" python "${REAL_PYTHON:-$REAL_PYTHON_FALLBACK}" "$@"
+EOF
+cat > "$LOCK_WRAPPER_DIR/python3" <<'EOF'
+#!/bin/bash
+exec "$RUN_DIR/bin/gpu-lock-exec" python3 "${REAL_PYTHON:-$REAL_PYTHON_FALLBACK}" "$@"
+EOF
+cat > "$LOCK_WRAPPER_DIR/nvidia-smi" <<'EOF'
+#!/bin/bash
+exec "$RUN_DIR/bin/gpu-lock-exec" nvidia-smi "$REAL_NVIDIA_SMI" "$@"
+EOF
+cat > "$LOCK_WRAPPER_DIR/ncu" <<'EOF'
+#!/bin/bash
+exec "$RUN_DIR/bin/gpu-lock-exec" ncu "$REAL_NCU" "$@"
+EOF
+cat > "$LOCK_WRAPPER_DIR/nsys" <<'EOF'
+#!/bin/bash
+exec "$RUN_DIR/bin/gpu-lock-exec" nsys "$REAL_NSYS" "$@"
+EOF
+cat > "$LOCK_WRAPPER_DIR/nvcc" <<'EOF'
+#!/bin/bash
+exec "$RUN_DIR/bin/gpu-lock-exec" nvcc "$REAL_NVCC" "$@"
+EOF
+chmod +x "$LOCK_WRAPPER_DIR"/uv "$LOCK_WRAPPER_DIR"/python \
+    "$LOCK_WRAPPER_DIR"/python3 "$LOCK_WRAPPER_DIR"/nvidia-smi \
+    "$LOCK_WRAPPER_DIR"/ncu "$LOCK_WRAPPER_DIR"/nsys "$LOCK_WRAPPER_DIR"/nvcc
+export PATH="$LOCK_WRAPPER_DIR:$PATH"
+
+run_gpu_locked_timeout() {
+    local lock_name="$1"
+    local timeout_seconds="$2"
+    shift 2
+    "$RUN_DIR/bin/gpu-lock-exec" "$lock_name" "$REAL_TIMEOUT" "$timeout_seconds" "$@"
+}
 
 # Snapshot immutable problem files. Agents may make a mess in the problem
 # directory, but changing benchmark definitions invalidates the run and must not
@@ -154,12 +463,14 @@ echo "Harness:    $HARNESS"
 echo "Model:      $MODEL"
 echo "Effort:     ${REASONING_EFFORT:-<default>}"
 echo "Problem:    $PROBLEM_NAME"
+echo "Source:     $SOURCE_PROBLEM_DIR"
 echo "Workspace:  $PROBLEM_DIR"
 echo "Archive:    $RUN_DIR"
 echo "Budget:     ${BUDGET_SECONDS}s"
 echo "========================================"
 
 START_TIME=$(date +%s)
+STARTED_AT="$(date -Is)"
 HARNESS_EXIT=0
 
 case "$HARNESS" in
@@ -168,14 +479,15 @@ case "$HARNESS" in
         if [ -n "$REASONING_EFFORT" ]; then
             EFFORT_ARG=(--effort "$REASONING_EFFORT")
         fi
-        timeout "$BUDGET_SECONDS" claude \
+        ( cd "$PROBLEM_DIR" && timeout "$BUDGET_SECONDS" claude \
             --dangerously-skip-permissions \
             --print --verbose \
             --output-format stream-json \
+            --settings "$CLAUDE_KBH_SETTINGS" \
             --model "$MODEL" \
             "${EFFORT_ARG[@]}" \
             --add-dir "$PROBLEM_DIR" \
-            -p "$PROMPT" \
+            -p "$PROMPT" ) \
             > "$LOG_FILE" 2> "$STDERR_FILE" || HARNESS_EXIT=$?
         ;;
 
@@ -183,15 +495,16 @@ case "$HARNESS" in
         # Claude Code routed via ccr-rust to a non-Anthropic provider.
         # Assumes ccr-rust is running locally and ANTHROPIC_BASE_URL points at it.
         # Model name is the upstream lab's model ID (glm-5.1, deepseek-v4-flash, etc.).
-        timeout "$BUDGET_SECONDS" \
+        ( cd "$PROBLEM_DIR" && timeout "$BUDGET_SECONDS" \
             env ANTHROPIC_BASE_URL="${CCR_BASE_URL:-http://127.0.0.1:3456}" \
             claude \
                 --dangerously-skip-permissions \
                 --print --verbose \
                 --output-format stream-json \
+                --settings "$CLAUDE_KBH_SETTINGS" \
                 --model "$MODEL" \
                 --add-dir "$PROBLEM_DIR" \
-                -p "$PROMPT" \
+                -p "$PROMPT" ) \
             > "$LOG_FILE" 2> "$STDERR_FILE" || HARNESS_EXIT=$?
         ;;
 
@@ -206,7 +519,7 @@ case "$HARNESS" in
         fi
         ZAI_CLAUDE_ALIAS="${ZAI_CLAUDE_ALIAS:-opus}"
         ZAI_CLAUDE_HAIKU_MODEL="${ZAI_CLAUDE_HAIKU_MODEL:-$MODEL}"
-        timeout "$BUDGET_SECONDS" \
+        ( cd "$PROBLEM_DIR" && timeout "$BUDGET_SECONDS" \
             env \
                 ANTHROPIC_AUTH_TOKEN="$ZAI_API_KEY" \
                 ANTHROPIC_BASE_URL="https://api.z.ai/api/anthropic" \
@@ -221,10 +534,11 @@ case "$HARNESS" in
                 --dangerously-skip-permissions \
                 --print --verbose \
                 --output-format stream-json \
+                --settings "$CLAUDE_KBH_SETTINGS" \
                 --model "$ZAI_CLAUDE_ALIAS" \
                 --disallowedTools ExitPlanMode EnterPlanMode AskUserQuestion \
                 --add-dir "$PROBLEM_DIR" \
-                -p "$PROMPT" \
+                -p "$PROMPT" ) \
             > "$LOG_FILE" 2> "$STDERR_FILE" || HARNESS_EXIT=$?
         ;;
 
@@ -283,24 +597,68 @@ case "$HARNESS" in
             > "$LOG_FILE" 2> "$STDERR_FILE" || HARNESS_EXIT=$?
         ;;
 
+    gemini)
+        # Gemini CLI. No --cwd flag, so cd into PROBLEM_DIR.
+        ( cd "$PROBLEM_DIR" && timeout "$BUDGET_SECONDS" gemini \
+            --skip-trust \
+            -m "$MODEL" \
+            --approval-mode yolo \
+            -o stream-json \
+            -p "$PROMPT" \
+            </dev/null > "$LOG_FILE" 2> "$STDERR_FILE" ) || HARNESS_EXIT=$?
+        ;;
+
+    cursor)
+        # Cursor Agent CLI is installed as `agent` on Anvil.
+        timeout "$BUDGET_SECONDS" "${AGENT_CUDA_ENV[@]}" agent \
+            --trust \
+            --yolo \
+            --print \
+            --output-format stream-json \
+            --model "$MODEL" \
+            --workspace "$PROBLEM_DIR" \
+            "$PROMPT" \
+            > "$LOG_FILE" 2> "$STDERR_FILE" || HARNESS_EXIT=$?
+        ;;
+
+    grok)
+        # Grok Build CLI is installed as `grok` on Anvil. Use the top-level
+        # headless path because `grok agent` does not accept --cwd/output flags.
+        EFFORT_ARG=()
+        if [ -n "$REASONING_EFFORT" ]; then
+            EFFORT_ARG=(--effort "$REASONING_EFFORT")
+        fi
+        timeout "$BUDGET_SECONDS" "${AGENT_CUDA_ENV[@]}" grok \
+            --cwd "$PROBLEM_DIR" \
+            --always-approve \
+            --permission-mode bypassPermissions \
+            --no-memory \
+            --output-format streaming-json \
+            --model "$MODEL" \
+            "${EFFORT_ARG[@]}" \
+            -p "$PROMPT" \
+            > "$LOG_FILE" 2> "$STDERR_FILE" || HARNESS_EXIT=$?
+        ;;
+
     opencode)
         # OpenCode SST with custom OpenAI-shape providers (deepseek, zai, minimax).
         # Provider/model pair encoded as MODEL="provider/model-id" e.g.
         # "deepseek/deepseek-v4-pro" or "zai/glm-5.1".
-        ( cd "$PROBLEM_DIR" && timeout "$BUDGET_SECONDS" opencode run \
+        ( cd "$PROBLEM_DIR" && timeout "$BUDGET_SECONDS" "${AGENT_CUDA_ENV[@]}" opencode run \
             --pure --format json -m "$MODEL" "$PROMPT" \
             </dev/null > "$LOG_FILE" 2> "$STDERR_FILE" ) || HARNESS_EXIT=$?
         ;;
 
     *)
         echo "Unknown harness: $HARNESS" >&2
-        echo "Supported: claude, zai-claude, ccr-claude, codex, kimi, droid, opencode" >&2
+        echo "Supported: claude, zai-claude, ccr-claude, codex, kimi, droid, gemini, cursor, grok, opencode" >&2
         exit 1
         ;;
 esac
 
-END_TIME=$(date +%s)
-ELAPSED=$((END_TIME - START_TIME))
+HARNESS_END_TIME=$(date +%s)
+HARNESS_FINISHED_AT="$(date -Is)"
+ELAPSED=$((HARNESS_END_TIME - START_TIME))
 
 # --- Detect whether the harness session ran to completion ----------------
 #
@@ -309,6 +667,7 @@ ELAPSED=$((END_TIME - START_TIME))
 #   claude / zai-claude / ccr-claude:  {"type":"result"} (final summary with usage)
 #   codex:                {"payload":{"type":"task_complete"}}
 #   cursor:               {"type":"result"} (final usage block)
+#   grok:                 {"type":"end"}
 #   droid:                exit code only; stream has init/message/error events
 #   kimi:                 no canonical terminal event — treat exit code as truth
 #
@@ -323,8 +682,13 @@ fi
 
 SESSION_COMPLETE=true
 case "$HARNESS" in
-    claude|zai-claude|ccr-claude|cursor)
+    claude|zai-claude|ccr-claude|cursor|gemini)
         if ! grep -q '"type":"result"' "$CHECK_FILE" 2>/dev/null; then
+            SESSION_COMPLETE=false
+        fi
+        ;;
+    grok)
+        if ! grep -q '"type":"end"' "$CHECK_FILE" 2>/dev/null; then
             SESSION_COMPLETE=false
         fi
         ;;
@@ -371,7 +735,11 @@ if [ "$TEMPLATE_MUTATED" = "false" ] && [ "$HAS_SOLUTION" = "true" ]; then
     BENCH_LOG="$RUN_DIR/benchmark.log"
 
     echo "Running check.py..."
-    (cd "$PROBLEM_DIR" && timeout 180 uv run python check.py) > "$CHECK_LOG" 2>&1 || true
+    CHECK_START_TIME=$(date +%s)
+    CHECK_EXIT_CODE=0
+    (cd "$PROBLEM_DIR" && run_gpu_locked_timeout check.py "$CHECK_TIMEOUT_SECONDS" uv run python check.py) > "$CHECK_LOG" 2>&1 || CHECK_EXIT_CODE=$?
+    CHECK_END_TIME=$(date +%s)
+    CHECK_ELAPSED=$((CHECK_END_TIME - CHECK_START_TIME))
 
     if ! detect_template_mutation "after check.py"; then
         TEMPLATE_MUTATED=true
@@ -385,7 +753,11 @@ if [ "$TEMPLATE_MUTATED" = "false" ] && [ "$HAS_SOLUTION" = "true" ]; then
         # Some problems (KDA chunked recurrence, large-vocab softmax, sonic-MoE)
         # have references that loop in Python, so 20 perf trials × 4 variants ×
         # 5 shapes can take 5-10 min. Generous budget.
-        (cd "$PROBLEM_DIR" && timeout 1800 uv run python benchmark.py) > "$BENCH_LOG" 2>&1 || true
+        BENCH_START_TIME=$(date +%s)
+        BENCH_EXIT_CODE=0
+        (cd "$PROBLEM_DIR" && run_gpu_locked_timeout benchmark.py "$BENCHMARK_TIMEOUT_SECONDS" uv run python benchmark.py) > "$BENCH_LOG" 2>&1 || BENCH_EXIT_CODE=$?
+        BENCH_END_TIME=$(date +%s)
+        BENCH_ELAPSED=$((BENCH_END_TIME - BENCH_START_TIME))
         if ! detect_template_mutation "after benchmark.py"; then
             TEMPLATE_MUTATED=true
             CORRECT=false
@@ -398,24 +770,220 @@ if [ "$TEMPLATE_MUTATED" = "false" ] && [ "$HAS_SOLUTION" = "true" ]; then
     fi
 fi
 
+CHECK_ELAPSED="${CHECK_ELAPSED:-null}"
+BENCH_ELAPSED="${BENCH_ELAPSED:-null}"
+CHECK_EXIT_CODE="${CHECK_EXIT_CODE:-null}"
+BENCH_EXIT_CODE="${BENCH_EXIT_CODE:-null}"
+FINISH_TIME=$(date +%s)
+FINISHED_AT="$(date -Is)"
+TOTAL_ELAPSED=$((FINISH_TIME - START_TIME))
+
 # Extract token usage from the transcript so we have an apples-to-apples
 # count for cost comparison even when the harness uses a coding-plan billing
 # (which hides per-call USD).
-USAGE_JSON="$(uv run --quiet python "$REPO_ROOT/scripts/extract_usage.py" "$RUN_DIR" "$HARNESS" 2>/dev/null || echo '{}')"
+USAGE_JSON="$(
+    KBH_GPU_LOCK_HELD=1 uv run --quiet python \
+        "$REPO_ROOT/scripts/extract_usage.py" "$RUN_DIR" "$HARNESS" 2>/dev/null || echo '{}'
+)"
+OUTPUT_TOKENS_PER_SECOND="$(USAGE_JSON="$USAGE_JSON" ELAPSED="$ELAPSED" KBH_GPU_LOCK_HELD=1 uv run --quiet python - <<'PY'
+import json
+import os
+
+try:
+    usage = json.loads(os.environ["USAGE_JSON"])
+except json.JSONDecodeError:
+    usage = {}
+elapsed = int(os.environ["ELAPSED"])
+out = usage.get("output_tokens")
+if isinstance(out, (int, float)) and elapsed > 0:
+    print(out / elapsed)
+else:
+    print("null")
+PY
+)"
+
+CLASSIFICATION_JSON="$(
+    USAGE_JSON="$USAGE_JSON" \
+    CORRECT="$CORRECT" \
+    TEMPLATE_MUTATED="$TEMPLATE_MUTATED" \
+    HAS_SOLUTION="$HAS_SOLUTION" \
+    SESSION_COMPLETE="$SESSION_COMPLETE" \
+    HARNESS_EXIT="$HARNESS_EXIT" \
+    CHECK_EXIT_CODE="$CHECK_EXIT_CODE" \
+    BENCH_EXIT_CODE="$BENCH_EXIT_CODE" \
+    LOG_FILE="$LOG_FILE" \
+    STDERR_FILE="$STDERR_FILE" \
+    MIN_USEFUL_OUTPUT_TOKENS="$MIN_USEFUL_OUTPUT_TOKENS" \
+    KBH_GPU_LOCK_HELD=1 uv run --quiet python - <<'PY'
+import json
+import os
+import re
+from pathlib import Path
+
+
+def as_bool(value: str) -> bool:
+    return value == "true"
+
+
+def as_int(value: str | None) -> int | None:
+    if value in (None, "", "null"):
+        return None
+    try:
+        return int(value)
+    except ValueError:
+        return None
+
+
+def read_tail(path: str, limit: int = 200_000) -> str:
+    try:
+        p = Path(path)
+        if not p.exists():
+            return ""
+        data = p.read_bytes()
+        return data[-limit:].decode("utf-8", errors="replace")
+    except OSError:
+        return ""
+
+
+usage = json.loads(os.environ.get("USAGE_JSON") or "{}")
+output_tokens = usage.get("output_tokens")
+if not isinstance(output_tokens, (int, float)):
+    output_tokens = None
+
+correct = as_bool(os.environ["CORRECT"])
+template_mutated = as_bool(os.environ["TEMPLATE_MUTATED"])
+has_solution = as_bool(os.environ["HAS_SOLUTION"])
+session_complete = as_bool(os.environ["SESSION_COMPLETE"])
+harness_exit = as_int(os.environ.get("HARNESS_EXIT")) or 0
+check_exit = as_int(os.environ.get("CHECK_EXIT_CODE"))
+bench_exit = as_int(os.environ.get("BENCH_EXIT_CODE"))
+minimum = int(os.environ.get("MIN_USEFUL_OUTPUT_TOKENS") or "500")
+provider_failure_window = not has_solution
+
+text = "\n".join(
+    [
+        read_tail(os.environ.get("LOG_FILE", "")),
+        read_tail(os.environ.get("STDERR_FILE", "")),
+    ]
+).lower()
+
+insufficient_credits = bool(
+    re.search(
+        r"insufficient[_ -]?credits|out[_ -]?of[_ -]?credits|"
+        r"\\bcredits?\\s+(?:balance|remaining)\\b|\\bpayment required\\b|"
+        r"\\baccount\\s+overage\\b|add more using",
+        text,
+    )
+)
+rate_limited = bool(
+    re.search(
+        r"rate[_ -]?limit|\\b429\\b|quota|resource_exhausted|session limit",
+        text,
+    )
+)
+
+reason = "pass"
+retryable = False
+if correct and bench_exit in (None, 0):
+    reason = "pass"
+elif correct and bench_exit == 124:
+    reason = "benchmark_timeout"
+    retryable = True
+elif correct and bench_exit not in (None, 0):
+    reason = "benchmark_failed"
+elif template_mutated:
+    reason = "template_mutated"
+elif provider_failure_window and insufficient_credits:
+    reason = "provider_insufficient_credits"
+    retryable = False
+elif provider_failure_window and rate_limited:
+    reason = "provider_rate_limited"
+    retryable = True
+elif harness_exit == 124:
+    reason = "timeout"
+    retryable = not has_solution
+elif not session_complete:
+    reason = "incomplete_session"
+    retryable = True
+elif not has_solution and output_tokens is not None and output_tokens < minimum:
+    reason = "provider_early_stop"
+    retryable = True
+elif not has_solution:
+    reason = "no_solution"
+    retryable = False
+elif check_exit == 124:
+    reason = "check_timeout"
+    retryable = True
+elif check_exit not in (None, 0):
+    reason = "check_failed"
+elif bench_exit == 124:
+    reason = "benchmark_timeout"
+    retryable = True
+elif bench_exit not in (None, 0):
+    reason = "benchmark_failed"
+elif harness_exit != 0:
+    reason = "harness_error"
+    retryable = True
+else:
+    reason = "check_failed"
+
+print(
+    json.dumps(
+        {
+            "failure_reason": reason,
+            "retryable_infra_failure": retryable,
+            "minimum_useful_output_tokens": minimum,
+        },
+        separators=(",", ":"),
+    )
+)
+PY
+)"
+FAILURE_REASON="$(CLASSIFICATION_JSON="$CLASSIFICATION_JSON" KBH_GPU_LOCK_HELD=1 uv run --quiet python - <<'PY'
+import json
+import os
+print(json.loads(os.environ["CLASSIFICATION_JSON"])["failure_reason"])
+PY
+)"
+RETRYABLE_INFRA_FAILURE="$(CLASSIFICATION_JSON="$CLASSIFICATION_JSON" KBH_GPU_LOCK_HELD=1 uv run --quiet python - <<'PY'
+import json
+import os
+print("true" if json.loads(os.environ["CLASSIFICATION_JSON"])["retryable_infra_failure"] else "false")
+PY
+)"
 
 cat > "$RUN_DIR/result.json" <<JSON
 {
+    "run_id": "$RUN_ID",
+    "run_group": "$RUN_GROUP",
     "problem": "$PROBLEM_NAME",
     "harness": "$HARNESS",
     "model": "$MODEL",
     "reasoning_effort": "$REASONING_EFFORT",
+    "started_at": "$STARTED_AT",
+    "harness_finished_at": "$HARNESS_FINISHED_AT",
+    "finished_at": "$FINISHED_AT",
+    "start_epoch": $START_TIME,
+    "harness_end_epoch": $HARNESS_END_TIME,
+    "end_epoch": $FINISH_TIME,
     "has_solution": $HAS_SOLUTION,
     "correct": $CORRECT,
+    "failure_reason": "$FAILURE_REASON",
+    "retryable_infra_failure": $RETRYABLE_INFRA_FAILURE,
+    "minimum_useful_output_tokens": $MIN_USEFUL_OUTPUT_TOKENS,
     "peak_fraction": $SCORE,
     "template_mutated": $TEMPLATE_MUTATED,
     "elapsed_seconds": $ELAPSED,
+    "total_elapsed_seconds": $TOTAL_ELAPSED,
+    "check_elapsed_seconds": $CHECK_ELAPSED,
+    "benchmark_elapsed_seconds": $BENCH_ELAPSED,
+    "check_exit_code": $CHECK_EXIT_CODE,
+    "benchmark_exit_code": $BENCH_EXIT_CODE,
     "harness_exit_code": $HARNESS_EXIT,
     "session_complete": $SESSION_COMPLETE,
+    "agent_cuda_disabled": $AGENT_CUDA_DISABLED,
+    "gpu_queue_mode": "$GPU_QUEUE_MODE",
+    "output_tokens_per_second": $OUTPUT_TOKENS_PER_SECOND,
     "usage": $USAGE_JSON
 }
 JSON
@@ -456,6 +1024,10 @@ elif [ "$TEMPLATE_MUTATED" = "true" ]; then
     STATUS="INVALID (problem files changed)"
 elif $HAS_SOLUTION; then
     STATUS="FAIL (check failed)"
+elif [ "$RETRYABLE_INFRA_FAILURE" = "true" ]; then
+    STATUS="INFRA ($FAILURE_REASON)"
+else
+    STATUS="ERR ($FAILURE_REASON)"
 fi
 
 echo "========================================"

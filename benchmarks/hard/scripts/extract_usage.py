@@ -8,10 +8,11 @@ Emits a JSON object on stdout with normalized fields:
     cache_creation_tokens, reasoning_tokens, total_cost_usd
 
 Any field that is not reported by the given harness is null. The point is a
-single uniform shape across claude / codex / kimi / droid / opencode so result.json
-aggregation is cheap downstream. Coding-plan billing on the CLI does not
-expose per-token cost; transcripts still report the raw token counts, which
-is what matters for cross-model comparison.
+single uniform shape across claude / zai-claude / codex / kimi / droid /
+gemini / cursor / grok / opencode so result.json aggregation is cheap
+downstream. Coding-plan billing on the CLI does not expose per-token cost;
+transcripts still report the raw token counts, which is what matters for
+cross-model comparison.
 """
 from __future__ import annotations
 
@@ -29,9 +30,11 @@ def _read_jsonl(p: Path) -> list[dict]:
         if not line:
             continue
         try:
-            out.append(json.loads(line))
+            obj = json.loads(line)
         except json.JSONDecodeError:
             continue
+        if isinstance(obj, dict):
+            out.append(obj)
     return out
 
 
@@ -160,6 +163,38 @@ def _droid(events: list[dict]) -> dict:
     return _empty()
 
 
+def _gemini(events: list[dict]) -> dict:
+    """Gemini CLI stream-json: terminal `{"type":"result"}` carries `stats`."""
+    for e in reversed(events):
+        if e.get("type") == "result":
+            s = e.get("stats", {}) or {}
+            return {
+                "input_tokens": s.get("input_tokens"),
+                "output_tokens": s.get("output_tokens"),
+                "cache_read_tokens": s.get("cached"),
+                "cache_creation_tokens": None,
+                "reasoning_tokens": None,
+                "total_cost_usd": None,
+            }
+    return _empty()
+
+
+def _cursor(events: list[dict]) -> dict:
+    """Cursor Agent stream-json: terminal `{"type":"result"}` carries usage."""
+    for e in reversed(events):
+        if e.get("type") == "result":
+            u = e.get("usage", {}) or {}
+            return {
+                "input_tokens": u.get("inputTokens"),
+                "output_tokens": u.get("outputTokens"),
+                "cache_read_tokens": u.get("cacheReadTokens"),
+                "cache_creation_tokens": u.get("cacheWriteTokens"),
+                "reasoning_tokens": None,
+                "total_cost_usd": None,
+            }
+    return _empty()
+
+
 def _empty() -> dict:
     return {
         "input_tokens": None,
@@ -178,12 +213,18 @@ def extract(run_dir: Path, harness: str) -> dict:
             events = _read_jsonl(run_dir / "transcript.jsonl")
         return _codex(events)
     transcript = _read_jsonl(run_dir / "transcript.jsonl")
-    if harness in ("claude", "ccr-claude", "kimi", "cursor"):
+    if harness in ("claude", "zai-claude", "ccr-claude", "kimi"):
         return _claude_or_kimi(transcript)
     if harness == "droid":
         return _droid(transcript)
     if harness == "opencode":
         return _opencode(transcript)
+    if harness == "gemini":
+        return _gemini(transcript)
+    if harness == "cursor":
+        return _cursor(transcript)
+    if harness == "grok":
+        return _empty()
     return _empty()
 
 

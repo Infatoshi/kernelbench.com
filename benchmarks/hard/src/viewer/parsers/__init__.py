@@ -10,7 +10,7 @@ from src.viewer.events import Session
 def sniff(path: Path) -> str:
     """Detect the harness format from the first non-empty JSONL line.
 
-    Returns one of: "claude" | "codex" | "kimi" | "cursor" | "droid".
+    Returns one of: "claude" | "codex" | "kimi" | "cursor" | "droid" | "grok".
     Falls back to file-extension hints, then raises if undecidable.
     """
     if path.suffix == ".txt":
@@ -68,6 +68,10 @@ def sniff(path: Path) -> str:
                     and ("sessionID" in obj or "part" in obj):
                 return "opencode"
 
+            # Grok Build CLI streaming JSON: token deltas as {type: thought|text, data}.
+            if obj.get("type") in {"thought", "text", "end"} and ("data" in obj or "stopReason" in obj):
+                return "grok"
+
             return "claude"  # fallback
 
     raise ValueError(f"could not sniff format of {path}")
@@ -93,4 +97,7 @@ def parse(path: Path) -> Session:
     if fmt == "opencode":
         from src.viewer.parsers import opencode
         return opencode.parse(path)
+    if fmt == "grok":
+        from src.viewer.parsers import grok
+        return grok.parse(path)
     raise ValueError(f"unknown format {fmt!r}")
