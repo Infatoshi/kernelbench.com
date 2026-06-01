@@ -11,15 +11,36 @@ const mono = JetBrains_Mono({
 
 export const metadata: Metadata = {
   metadataBase: new URL("https://kernelbench.com"),
-  title: "KernelBench",
+  title: "KernelBench: GPU Kernel Engineering Benchmarks",
   description:
-    "GPU kernel engineering benchmarks for autonomous LLM coding agents. v3 (multi-GPU, 2026-Q1) and Hard (single Blackwell, 2026-Q2).",
+    "Open GPU kernel engineering benchmarks, repositories, transcripts, and datasets for evaluating autonomous coding agents.",
+  authors: [{ name: "Elliot Arledge", url: "https://elliotarledge.com" }],
+  creator: "Elliot Arledge",
+  publisher: "KernelBench",
+  keywords: [
+    "GPU kernels",
+    "CUDA",
+    "benchmark",
+    "coding agents",
+    "LLM evaluation",
+    "KernelBench",
+  ],
   openGraph: {
-    title: "KernelBench",
+    title: "KernelBench: GPU Kernel Engineering Benchmarks",
     description:
-      "GPU kernel engineering benchmarks for autonomous LLM coding agents.",
+      "Open GPU kernel engineering benchmarks, repositories, transcripts, and datasets for autonomous coding agents.",
     url: "https://kernelbench.com",
     siteName: "KernelBench",
+  },
+  other: {
+    citation_title:
+      "KernelBench: GPU Kernel Engineering Benchmarks for Autonomous Coding Agents",
+    citation_author: "Arledge, Elliot",
+    citation_publication_date: "2026",
+    citation_online_date: "2026",
+    citation_fulltext_html_url: "https://kernelbench.com",
+    citation_keywords:
+      "GPU kernels; CUDA; autonomous coding agents; LLM evaluation; benchmark",
   },
 }
 
@@ -60,6 +81,7 @@ function Header() {
             <a href="/v3">v3</a>
             <a href="/hard">hard</a>
             <a href="/runs">runs</a>
+            <a href="/#cite">cite</a>
             <a href="/blog">blog</a>
             <a
               href="https://github.com/Infatoshi/kernelbench.com"

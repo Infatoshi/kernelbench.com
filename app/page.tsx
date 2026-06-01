@@ -3,6 +3,60 @@ import Link from "next/link"
 const HUGGING_FACE_LOGO =
   "https://huggingface.co/front/assets/huggingface_logo-noborder.svg"
 
+const citationGraph = {
+  "@context": "https://schema.org",
+  "@graph": [
+    {
+      "@type": "WebSite",
+      "@id": "https://kernelbench.com/#website",
+      name: "KernelBench",
+      url: "https://kernelbench.com",
+      author: {
+        "@type": "Person",
+        name: "Elliot Arledge",
+        url: "https://elliotarledge.com",
+      },
+      description:
+        "Open GPU kernel engineering benchmarks for autonomous coding agents.",
+      citation: [
+        "https://github.com/Infatoshi/kernelbench.com",
+        "https://github.com/Infatoshi/KernelBench-v3",
+        "https://github.com/Infatoshi/KernelBench-Hard",
+        "https://huggingface.co/datasets/Infatoshi/kernelbench-v3-runs",
+        "https://huggingface.co/datasets/Infatoshi/kernelbench-hard-runs",
+      ],
+    },
+    {
+      "@type": "Dataset",
+      "@id": "https://huggingface.co/datasets/Infatoshi/kernelbench-hard-runs",
+      name: "KernelBench Hard runs",
+      url: "https://huggingface.co/datasets/Infatoshi/kernelbench-hard-runs",
+      creator: { "@type": "Person", name: "Elliot Arledge" },
+    },
+    {
+      "@type": "Dataset",
+      "@id": "https://huggingface.co/datasets/Infatoshi/kernelbench-v3-runs",
+      name: "KernelBench v3 runs",
+      url: "https://huggingface.co/datasets/Infatoshi/kernelbench-v3-runs",
+      creator: { "@type": "Person", name: "Elliot Arledge" },
+    },
+    {
+      "@type": "SoftwareSourceCode",
+      "@id": "https://github.com/Infatoshi/KernelBench-Hard",
+      name: "KernelBench Hard",
+      codeRepository: "https://github.com/Infatoshi/KernelBench-Hard",
+      author: { "@type": "Person", name: "Elliot Arledge" },
+    },
+    {
+      "@type": "SoftwareSourceCode",
+      "@id": "https://github.com/Infatoshi/KernelBench-v3",
+      name: "KernelBench v3",
+      codeRepository: "https://github.com/Infatoshi/KernelBench-v3",
+      author: { "@type": "Person", name: "Elliot Arledge" },
+    },
+  ],
+}
+
 const benchmarks = [
   {
     href: "/hard",
@@ -34,6 +88,10 @@ const benchmarks = [
 export default function HomePage() {
   return (
     <div className="space-y-12">
+      <script
+        type="application/ld+json"
+        dangerouslySetInnerHTML={{ __html: JSON.stringify(citationGraph) }}
+      />
       <h1 className="sr-only">KernelBench benchmarks</h1>
       <section aria-label="Benchmarks" className="space-y-4">
         {benchmarks.map((benchmark) => (
@@ -139,6 +197,90 @@ export default function HomePage() {
         </ul>
       </section>
 
+      <section id="cite" className="citation-box scroll-mt-24">
+        <div>
+          <p className="text-xs uppercase tracking-wide text-[var(--color-fg-muted)] mb-2">
+            Citation
+          </p>
+          <h2 className="text-xl font-semibold text-[var(--color-fg-bright)]">
+            Cite KernelBench
+          </h2>
+          <p className="mt-3 text-sm leading-relaxed text-[var(--color-fg)] max-w-3xl">
+            If you use these results, cite the website for the public benchmark
+            view, the relevant benchmark repository for problem definitions and
+            harness code, and the Hugging Face dataset for the run transcripts.
+          </p>
+        </div>
+
+        <div className="citation-links">
+          <ArtifactLink href="https://kernelbench.com" label="Website" />
+          <ArtifactLink
+            href="https://github.com/Infatoshi/kernelbench.com"
+            label="Website repository"
+          />
+          <ArtifactLink
+            href="https://github.com/Infatoshi/KernelBench-Hard"
+            label="Hard repository"
+          />
+          <ArtifactLink
+            href="https://github.com/Infatoshi/KernelBench-v3"
+            label="v3 repository"
+          />
+          <ArtifactLink
+            href="https://huggingface.co/datasets/Infatoshi/kernelbench-hard-runs"
+            label="Hard HF dataset"
+          />
+          <ArtifactLink
+            href="https://huggingface.co/datasets/Infatoshi/kernelbench-v3-runs"
+            label="v3 HF dataset"
+          />
+        </div>
+
+        <pre className="bibtex-block">
+{`@misc{arledge2026kernelbench,
+  title        = {KernelBench: GPU Kernel Engineering Benchmarks for Autonomous Coding Agents},
+  author       = {Arledge, Elliot},
+  year         = {2026},
+  howpublished = {\\url{https://kernelbench.com}},
+  note         = {Website, benchmark results, transcript viewers, and citation index}
+}
+
+@misc{arledge2026kernelbenchhard,
+  title        = {KernelBench Hard},
+  author       = {Arledge, Elliot},
+  year         = {2026},
+  howpublished = {\\url{https://github.com/Infatoshi/KernelBench-Hard}},
+  note         = {CUDA benchmark suite, harness, results, and annotations}
+}
+
+@misc{arledge2026kernelbenchv3,
+  title        = {KernelBench v3},
+  author       = {Arledge, Elliot},
+  year         = {2026},
+  howpublished = {\\url{https://github.com/Infatoshi/KernelBench-v3}},
+  note         = {Multi-GPU benchmark suite, harness, and result artifacts}
+}
+
+@misc{arledge2026kernelbenchhardruns,
+  title        = {KernelBench Hard Runs},
+  author       = {Arledge, Elliot},
+  year         = {2026},
+  publisher    = {Hugging Face},
+  howpublished = {\\url{https://huggingface.co/datasets/Infatoshi/kernelbench-hard-runs}},
+  note         = {Run transcripts, solutions, checks, timing, and cost metadata}
+}
+
+@misc{arledge2026kernelbenchv3runs,
+  title        = {KernelBench v3 Runs},
+  author       = {Arledge, Elliot},
+  year         = {2026},
+  publisher    = {Hugging Face},
+  howpublished = {\\url{https://huggingface.co/datasets/Infatoshi/kernelbench-v3-runs}},
+  note         = {Run artifacts and benchmark result data}
+}`}
+        </pre>
+      </section>
+
       <section className="box p-6">
         <h2 className="text-lg font-semibold text-[var(--color-fg-bright)] mb-2">
           Contact
@@ -155,6 +297,14 @@ export default function HomePage() {
         </p>
       </section>
     </div>
+  )
+}
+
+function ArtifactLink({ href, label }: { href: string; label: string }) {
+  return (
+    <a href={href} target="_blank" rel="noreferrer" className="artifact-link">
+      {label}
+    </a>
   )
 }
 
