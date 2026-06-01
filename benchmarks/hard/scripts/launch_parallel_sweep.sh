@@ -36,6 +36,10 @@ if [ "${KBH_USE_DIRECT_GEMINI:-0}" = "1" ]; then
     ROWS+=("gemini_gemini35flash|gemini|gemini-3.5-flash|")
 fi
 
+if [ "${KBH_USE_MINIMAX_M3_CLAUDE:-0}" = "1" ]; then
+    ROWS+=("minimax_m3_claude|minimax-claude|MiniMax-M3|")
+fi
+
 if [ "${KBH_SKIP_OPENROUTER:-0}" = "1" ]; then
     FILTERED_ROWS=()
     for row in "${ROWS[@]}"; do

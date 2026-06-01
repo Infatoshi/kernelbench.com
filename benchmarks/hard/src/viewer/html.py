@@ -2,15 +2,11 @@
 
 Produces a single .html with embedded CSS+JS and event content. Loads Prism.js
 from CDN for syntax highlighting (no offline-mode for v1).
-
-Set KB_VIEWER_THEME=phosphor to render with the kernelbench.com hacker theme
-(phosphor green on near-black, JetBrains Mono, CRT scanlines).
 """
 from __future__ import annotations
 
 import html as html_mod
 import json
-import os
 from pathlib import Path
 
 from src.viewer.events import Event, Session
@@ -125,114 +121,6 @@ PRISM_HEAD = """
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/prismjs@1.29.0/themes/prism-tomorrow.min.css">
 <script src="https://cdn.jsdelivr.net/npm/prismjs@1.29.0/components/prism-core.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/prismjs@1.29.0/plugins/autoloader/prism-autoloader.min.js"></script>
-"""
-
-PHOSPHOR_FONT = """
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&display=swap" rel="stylesheet">
-"""
-
-PHOSPHOR_OVERRIDE_CSS = """
-/* kernelbench.com hacker theme override — phosphor green on near-black */
-:root {
-  --kb-bg: #0a0d0a;
-  --kb-bg-soft: #0d110d;
-  --kb-bg-soft2: #101410;
-  --kb-fg: #4ade80;
-  --kb-fg-bright: #86efac;
-  --kb-fg-dim: #166534;
-  --kb-fg-muted: #15803d;
-  --kb-accent: #fbbf24;
-  --kb-warn: #fb923c;
-  --kb-bad: #f87171;
-  --kb-border: #14532d;
-}
-* { font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Monaco, monospace !important; }
-body {
-  background: var(--kb-bg) !important;
-  color: var(--kb-fg) !important;
-  font-feature-settings: "ss01", "ss02", "calt";
-}
-/* CRT scanline overlay */
-body::before {
-  content: ""; position: fixed; inset: 0; z-index: 50; pointer-events: none;
-  background: repeating-linear-gradient(to bottom,
-    rgba(0,0,0,0) 0px, rgba(0,0,0,0) 2px,
-    rgba(0,0,0,0.06) 3px, rgba(0,0,0,0) 4px);
-  opacity: 0.5;
-}
-::selection { background: var(--kb-fg); color: var(--kb-bg); }
-a { color: var(--kb-fg-bright); text-decoration: underline; text-decoration-color: var(--kb-fg-dim); text-underline-offset: 3px; }
-a:hover { color: var(--kb-accent); text-decoration-color: var(--kb-accent); }
-
-header {
-  background: var(--kb-bg-soft2) !important;
-  border-bottom: 1px solid var(--kb-border) !important;
-  color: var(--kb-fg) !important;
-}
-header .title { color: var(--kb-fg-bright) !important; font-weight: 700 !important; }
-header .meta { color: var(--kb-fg-muted) !important; }
-header .meta b { color: var(--kb-fg) !important; }
-header a { color: var(--kb-fg-bright) !important; }
-
-.event {
-  background: var(--kb-bg-soft) !important;
-  border-left-color: var(--kb-border) !important;
-}
-.event .role { color: var(--kb-fg-muted) !important; }
-.event[data-role="user"] { border-left-color: #4dc4ff !important; }
-.event[data-role="user"] .role { color: #4dc4ff !important; }
-.event[data-role="assistant"] { border-left-color: var(--kb-fg-bright) !important; }
-.event[data-role="assistant"] .role { color: var(--kb-fg-bright) !important; }
-.event[data-role="tool"] { border-left-color: var(--kb-accent) !important; }
-.event[data-role="tool"] .role { color: var(--kb-accent) !important; }
-.event[data-role="system"] { border-left-color: var(--kb-fg-dim) !important; }
-.event[data-role="system"] .role { color: var(--kb-fg-muted) !important; }
-.event[data-role="error"] { background: #1b0808 !important; border-left-color: var(--kb-bad) !important; }
-.event[data-role="error"] .role { color: var(--kb-bad) !important; }
-.event[data-role="compaction"] { background: #1b1308 !important; border-left-color: var(--kb-warn) !important; }
-.event[data-role="compaction"] .role { color: var(--kb-warn) !important; }
-
-/* Subagent block */
-.subagent-block { background: var(--kb-bg-soft) !important; border-color: var(--kb-border) !important; border-left-color: var(--kb-fg-muted) !important; }
-.subagent-block > summary { color: var(--kb-fg) !important; }
-.subagent-block > summary:hover { background: var(--kb-bg-soft2) !important; }
-.subagent-block[open] > summary { background: var(--kb-bg-soft2) !important; border-bottom-color: var(--kb-border) !important; }
-.subagent-block > summary::before { border-left-color: var(--kb-fg-muted) !important; }
-.subagent-inner .event { background: var(--kb-bg-soft2) !important; }
-
-/* Code blocks */
-pre { background: #060808 !important; border: 1px solid var(--kb-border); }
-
-/* Summary / token / tabs */
-.usage { color: var(--kb-fg-muted) !important; }
-.usage b { color: var(--kb-fg) !important; }
-.summary-card { background: var(--kb-bg-soft) !important; border-color: var(--kb-border) !important; }
-.summary-card .k { color: var(--kb-fg-muted) !important; }
-.summary-card .v { color: var(--kb-fg-bright) !important; }
-.token-bar { background: var(--kb-border) !important; }
-.tab-bar { border-bottom-color: var(--kb-border) !important; }
-.tab { background: var(--kb-bg-soft) !important; border-color: var(--kb-border) !important; color: var(--kb-fg-muted) !important; }
-.tab.active { background: var(--kb-bg-soft2) !important; color: var(--kb-fg-bright) !important; }
-.tab-pane { background: var(--kb-bg-soft2) !important; border-color: var(--kb-border) !important; }
-.collapsible { background: var(--kb-bg-soft) !important; border-color: var(--kb-border) !important; }
-.collapsible summary { color: var(--kb-fg-muted) !important; }
-.incomplete-banner { background: #1b0808 !important; border-color: var(--kb-bad) !important; color: #fca5a5 !important; }
-
-/* Site nav strip prepended above the viewer */
-.kb-site-nav {
-  background: var(--kb-bg-soft2);
-  border-bottom: 1px solid var(--kb-border);
-  padding: 10px 24px;
-  display: flex;
-  gap: 18px;
-  align-items: baseline;
-  font-size: 13px;
-}
-.kb-site-nav a { color: var(--kb-fg-bright); text-decoration: none; }
-.kb-site-nav a:hover { color: var(--kb-accent); }
-.kb-site-nav .kb-brand { font-weight: 700; }
 """
 
 JS = """
@@ -500,115 +388,6 @@ def _read_artifact(run_dir: Path, name: str) -> str | None:
     return None
 
 
-VERDICT_COLORS = {
-    "clean": ("#86efac", "#0d2814"),          # green / dark green bg
-    "rubric_leak": ("#fb923c", "#2a1408"),    # warn orange / dark
-    "reward_hack": ("#f87171", "#2a0808"),    # red / dark
-    "interesting": ("#60a5fa", "#0a1428"),    # blue / dark
-    "bug": ("#a3a3a3", "#1f1f1f"),            # gray / dark
-}
-
-
-def _render_annotation(run_id: str) -> str | None:
-    """Load benchmarks/hard/results/annotations/<run_id>.yaml (path overridable
-    via KB_ANNOTATIONS_DIR) and render it as a tab body. Returns None if no
-    annotation exists for this run."""
-    annot_dir = os.environ.get("KB_ANNOTATIONS_DIR")
-    if not annot_dir:
-        return None
-    yaml_path = Path(annot_dir) / f"{run_id}.yaml"
-    if not yaml_path.exists():
-        return None
-    try:
-        import yaml  # type: ignore
-        data = yaml.safe_load(yaml_path.read_text())
-    except Exception:
-        return None
-    if not isinstance(data, dict):
-        return None
-
-    verdict = (data.get("verdict") or "clean").lower()
-    fg, bg = VERDICT_COLORS.get(verdict, VERDICT_COLORS["clean"])
-    summary = data.get("summary") or ""
-    implication = data.get("implication") or ""
-    quotes = data.get("quotes") or []
-    auditor = data.get("auditor") or {}
-
-    auditor_line = ""
-    if auditor:
-        a_model = auditor.get("model", "?")
-        a_eff = auditor.get("effort", "")
-        auditor_line = (
-            f'<div style="font-size:11px;color:#15803d;margin-top:6px;">'
-            f'audited by <b>{_esc(a_model)}</b>'
-            f'{f" [{_esc(a_eff)}]" if a_eff else ""}'
-            f'</div>'
-        )
-
-    parts = []
-    parts.append(
-        f'<div style="display:inline-block;padding:4px 12px;border-radius:4px;'
-        f'background:{bg};color:{fg};font-weight:700;letter-spacing:0.05em;'
-        f'text-transform:uppercase;font-size:13px;margin-bottom:14px;">'
-        f'{_esc(verdict.replace("_", " "))}</div>'
-    )
-    if summary:
-        parts.append(
-            f'<div style="font-size:14px;line-height:1.6;margin-bottom:18px;">'
-            f'{_esc(summary)}</div>'
-        )
-
-    if quotes:
-        parts.append(
-            '<div style="font-size:11px;text-transform:uppercase;letter-spacing:0.06em;'
-            'color:#15803d;margin-bottom:8px;">pull quotes</div>'
-        )
-        for q in quotes:
-            anchor = q.get("anchor") or q.get("file") or ""
-            lines = q.get("lines")
-            if lines and isinstance(lines, list):
-                if len(lines) == 1:
-                    anchor_str = f"{q.get('file','solution.py')}:{lines[0]}"
-                else:
-                    anchor_str = f"{q.get('file','solution.py')}:{lines[0]}-{lines[-1]}"
-            else:
-                anchor_str = anchor
-            label = q.get("label") or ""
-            text = q.get("text") or ""
-            lang = "python" if str(anchor_str).endswith(".py") or "solution" in str(anchor_str) else "text"
-            parts.append('<div style="margin-bottom:14px;">')
-            parts.append(
-                f'<div style="font-size:12px;color:#86efac;font-weight:600;margin-bottom:4px;">'
-                f'{_esc(label)} '
-                f'<span style="color:#15803d;font-weight:400;font-family:ui-monospace,monospace;">'
-                f'@ {_esc(anchor_str)}</span></div>'
-            )
-            parts.append(_render_code(text, lang))
-            parts.append('</div>')
-
-    if implication:
-        parts.append(
-            '<div style="font-size:11px;text-transform:uppercase;letter-spacing:0.06em;'
-            'color:#15803d;margin-top:18px;margin-bottom:8px;">implication</div>'
-        )
-        parts.append(
-            f'<div style="font-size:14px;line-height:1.6;color:#fbbf24;'
-            f'border-left:3px solid #fbbf24;padding-left:12px;">{_esc(implication)}</div>'
-        )
-
-    if auditor_line:
-        parts.append(auditor_line)
-    else:
-        parts.append(
-            '<div style="font-size:11px;color:#15803d;margin-top:18px;">'
-            'audited by hand — see <a href="https://github.com/Infatoshi/kernelbench.com/'
-            'tree/master/benchmarks/hard/results/annotations" style="color:#86efac;">'
-            'results/annotations/</a> for the full schema.</div>'
-        )
-
-    return "".join(parts)
-
-
 def render(run_dir: Path, session: Session, out_path: Path | None = None) -> Path:
     """Generate index.html in run_dir and return its path."""
     run_dir = Path(run_dir)
@@ -667,9 +446,6 @@ def render(run_dir: Path, session: Session, out_path: Path | None = None) -> Pat
     tabs: list[tuple[str, str, str]] = []  # (id, label, html)
     if solution:
         tabs.append(("tab-solution", "solution.py", _render_code(solution, "python")))
-    annotation_html = _render_annotation(run_dir.name)
-    if annotation_html:
-        tabs.append(("tab-reward-hack", "reward hack", annotation_html))
     if final_text:
         tabs.append(("tab-final", "final answer", f'<div style="white-space:pre-wrap">{_esc(final_text)}</div>'))
     if bench_log:
@@ -694,20 +470,6 @@ def render(run_dir: Path, session: Session, out_path: Path | None = None) -> Pat
 
     title = f"{session.harness} / {session.model or '?'}"
 
-    phosphor = os.environ.get("KB_VIEWER_THEME", "").lower() == "phosphor"
-    extra_head = (PHOSPHOR_FONT + f"<style>{PHOSPHOR_OVERRIDE_CSS}</style>") if phosphor else ""
-    site_nav = (
-        '<div class="kb-site-nav">'
-        '<a href="/" class="kb-brand">./kernelbench</a>'
-        '<a href="/hard">hard</a>'
-        '<a href="/v3">v3</a>'
-        '<a href="/runs">runs</a>'
-        '<span style="margin-left:auto;color:#15803d">'
-        f'{_esc(session.harness)} · {_esc(session.model or "?")}'
-        '</span>'
-        '</div>'
-    ) if phosphor else ""
-
     html_doc = f"""<!doctype html>
 <html lang="en">
 <head>
@@ -715,10 +477,8 @@ def render(run_dir: Path, session: Session, out_path: Path | None = None) -> Pat
   <title>{_esc(title)} — KernelBench-Hard</title>
   {PRISM_HEAD}
   <style>{CSS}</style>
-  {extra_head}
 </head>
 <body>
-  {site_nav}
   <header>
     <span class="title">{_esc(title)}</span>
     <span class="meta">session: <b>{_esc(session.session_id or '?')}</b></span>

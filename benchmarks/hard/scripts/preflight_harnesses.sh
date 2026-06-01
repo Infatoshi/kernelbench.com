@@ -38,6 +38,10 @@ if [ "${KBH_USE_DIRECT_GEMINI:-0}" = "1" ]; then
     ROWS+=("gemini_gemini35flash|gemini|gemini-3.5-flash|")
 fi
 
+if [ "${KBH_USE_MINIMAX_M3_CLAUDE:-0}" = "1" ]; then
+    ROWS+=("minimax_m3_claude|minimax-claude|MiniMax-M3|")
+fi
+
 if [ "${KBH_SKIP_OPENROUTER:-0}" = "1" ]; then
     FILTERED_ROWS=()
     for row in "${ROWS[@]}"; do
@@ -85,17 +89,17 @@ run_one() {
                 echo "ZAI_API_KEY missing" > "$log"
                 exit_code=2
             else
-                timeout "$TIMEOUT_SECONDS" env \
-                    ANTHROPIC_AUTH_TOKEN="$ZAI_API_KEY" \
-                    ANTHROPIC_BASE_URL="https://api.z.ai/api/anthropic" \
-                    API_TIMEOUT_MS="${API_TIMEOUT_MS:-300000}" \
-                    CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS="${CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS:-1}" \
-                    CLAUDE_CODE_MAX_RETRIES="${CLAUDE_CODE_MAX_RETRIES:-3}" \
-                    CLAUDE_CODE_MAX_OUTPUT_TOKENS="${CLAUDE_CODE_MAX_OUTPUT_TOKENS:-4096}" \
-                    ANTHROPIC_DEFAULT_HAIKU_MODEL="$model" \
-                    ANTHROPIC_DEFAULT_SONNET_MODEL="$model" \
-                    ANTHROPIC_DEFAULT_OPUS_MODEL="$model" \
-                    claude \
+                (
+                    export ANTHROPIC_AUTH_TOKEN="$ZAI_API_KEY"
+                    export ANTHROPIC_BASE_URL="https://api.z.ai/api/anthropic"
+                    export API_TIMEOUT_MS="${API_TIMEOUT_MS:-300000}"
+                    export CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS="${CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS:-1}"
+                    export CLAUDE_CODE_MAX_RETRIES="${CLAUDE_CODE_MAX_RETRIES:-3}"
+                    export CLAUDE_CODE_MAX_OUTPUT_TOKENS="${CLAUDE_CODE_MAX_OUTPUT_TOKENS:-4096}"
+                    export ANTHROPIC_DEFAULT_HAIKU_MODEL="$model"
+                    export ANTHROPIC_DEFAULT_SONNET_MODEL="$model"
+                    export ANTHROPIC_DEFAULT_OPUS_MODEL="$model"
+                    timeout "$TIMEOUT_SECONDS" claude \
                         --dangerously-skip-permissions \
                         --print --verbose \
                         --output-format stream-json \
@@ -103,7 +107,36 @@ run_one() {
                         --model "${ZAI_CLAUDE_ALIAS:-opus}" \
                         --disallowedTools ExitPlanMode EnterPlanMode AskUserQuestion \
                         -p "$PROMPT" \
-                    > "$log" 2>&1 || exit_code=$?
+                    > "$log" 2>&1
+                ) || exit_code=$?
+            fi
+            ;;
+        minimax-claude)
+            if [ -z "${MINIMAX_API_KEY:-}" ]; then
+                echo "MINIMAX_API_KEY missing" > "$log"
+                exit_code=2
+            else
+                (
+                    export ANTHROPIC_AUTH_TOKEN="$MINIMAX_API_KEY"
+                    export ANTHROPIC_BASE_URL="${MINIMAX_ANTHROPIC_BASE_URL:-https://api.minimax.io/anthropic}"
+                    export API_TIMEOUT_MS="${API_TIMEOUT_MS:-300000}"
+                    export CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC="${CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC:-1}"
+                    export CLAUDE_CODE_MAX_RETRIES="${CLAUDE_CODE_MAX_RETRIES:-3}"
+                    export CLAUDE_CODE_MAX_OUTPUT_TOKENS="${CLAUDE_CODE_MAX_OUTPUT_TOKENS:-4096}"
+                    export ANTHROPIC_MODEL="$model"
+                    export ANTHROPIC_DEFAULT_HAIKU_MODEL="$model"
+                    export ANTHROPIC_DEFAULT_SONNET_MODEL="$model"
+                    export ANTHROPIC_DEFAULT_OPUS_MODEL="$model"
+                    timeout "$TIMEOUT_SECONDS" claude \
+                        --dangerously-skip-permissions \
+                        --print --verbose \
+                        --output-format stream-json \
+                        --settings "$CLAUDE_KBH_SETTINGS" \
+                        --model "${MINIMAX_CLAUDE_ALIAS:-opus}" \
+                        --disallowedTools ExitPlanMode EnterPlanMode AskUserQuestion \
+                        -p "$PROMPT" \
+                    > "$log" 2>&1
+                ) || exit_code=$?
             fi
             ;;
         codex)

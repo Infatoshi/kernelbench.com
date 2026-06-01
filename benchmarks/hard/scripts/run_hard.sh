@@ -11,6 +11,7 @@
 #   ./scripts/run_hard.sh droid glm-5.1 problems/01_fp8_gemm
 #   ./scripts/run_hard.sh grok grok-build problems/01_fp8_gemm max
 #   ./scripts/run_hard.sh zai-claude glm-5.1 problems/01_fp8_gemm
+#   ./scripts/run_hard.sh minimax-claude MiniMax-M3 problems/01_fp8_gemm
 #   ./scripts/run_hard.sh ccr-claude glm-5.1 problems/01_fp8_gemm
 #
 # Archives everything to outputs/runs/<ts>_<harness>_<model>_<problem>/.
@@ -519,23 +520,55 @@ case "$HARNESS" in
         fi
         ZAI_CLAUDE_ALIAS="${ZAI_CLAUDE_ALIAS:-opus}"
         ZAI_CLAUDE_HAIKU_MODEL="${ZAI_CLAUDE_HAIKU_MODEL:-$MODEL}"
-        ( cd "$PROBLEM_DIR" && timeout "$BUDGET_SECONDS" \
-            env \
-                ANTHROPIC_AUTH_TOKEN="$ZAI_API_KEY" \
-                ANTHROPIC_BASE_URL="https://api.z.ai/api/anthropic" \
-                API_TIMEOUT_MS="${API_TIMEOUT_MS:-3000000}" \
-                CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS="${CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS:-1}" \
-                CLAUDE_CODE_MAX_RETRIES="${CLAUDE_CODE_MAX_RETRIES:-1000000}" \
-                CLAUDE_CODE_MAX_OUTPUT_TOKENS="${CLAUDE_CODE_MAX_OUTPUT_TOKENS:-128000}" \
-                ANTHROPIC_DEFAULT_HAIKU_MODEL="$ZAI_CLAUDE_HAIKU_MODEL" \
-                ANTHROPIC_DEFAULT_SONNET_MODEL="$MODEL" \
-                ANTHROPIC_DEFAULT_OPUS_MODEL="$MODEL" \
-            claude \
+        ( cd "$PROBLEM_DIR" && \
+            export ANTHROPIC_AUTH_TOKEN="$ZAI_API_KEY" && \
+            export ANTHROPIC_BASE_URL="https://api.z.ai/api/anthropic" && \
+            export API_TIMEOUT_MS="${API_TIMEOUT_MS:-3000000}" && \
+            export CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS="${CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS:-1}" && \
+            export CLAUDE_CODE_MAX_RETRIES="${CLAUDE_CODE_MAX_RETRIES:-1000000}" && \
+            export CLAUDE_CODE_MAX_OUTPUT_TOKENS="${CLAUDE_CODE_MAX_OUTPUT_TOKENS:-128000}" && \
+            export ANTHROPIC_DEFAULT_HAIKU_MODEL="$ZAI_CLAUDE_HAIKU_MODEL" && \
+            export ANTHROPIC_DEFAULT_SONNET_MODEL="$MODEL" && \
+            export ANTHROPIC_DEFAULT_OPUS_MODEL="$MODEL" && \
+            timeout "$BUDGET_SECONDS" claude \
                 --dangerously-skip-permissions \
                 --print --verbose \
                 --output-format stream-json \
                 --settings "$CLAUDE_KBH_SETTINGS" \
                 --model "$ZAI_CLAUDE_ALIAS" \
+                --disallowedTools ExitPlanMode EnterPlanMode AskUserQuestion \
+                --add-dir "$PROBLEM_DIR" \
+                -p "$PROMPT" ) \
+            > "$LOG_FILE" 2> "$STDERR_FILE" || HARNESS_EXIT=$?
+        ;;
+
+    minimax-claude)
+        # Claude Code routed directly to MiniMax's Anthropic-compatible endpoint.
+        # Requires MINIMAX_API_KEY in the environment or ~/.env_vars. Keep this
+        # separate from the normal `claude` harness so Opus defaults stay intact.
+        if [ -z "${MINIMAX_API_KEY:-}" ]; then
+            echo "MINIMAX_API_KEY is required for minimax-claude" >&2
+            exit 1
+        fi
+        MINIMAX_CLAUDE_ALIAS="${MINIMAX_CLAUDE_ALIAS:-opus}"
+        MINIMAX_CLAUDE_HAIKU_MODEL="${MINIMAX_CLAUDE_HAIKU_MODEL:-$MODEL}"
+        ( cd "$PROBLEM_DIR" && \
+            export ANTHROPIC_AUTH_TOKEN="$MINIMAX_API_KEY" && \
+            export ANTHROPIC_BASE_URL="${MINIMAX_ANTHROPIC_BASE_URL:-https://api.minimax.io/anthropic}" && \
+            export API_TIMEOUT_MS="${API_TIMEOUT_MS:-3000000}" && \
+            export CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC="${CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC:-1}" && \
+            export CLAUDE_CODE_MAX_RETRIES="${CLAUDE_CODE_MAX_RETRIES:-1000000}" && \
+            export CLAUDE_CODE_MAX_OUTPUT_TOKENS="${CLAUDE_CODE_MAX_OUTPUT_TOKENS:-128000}" && \
+            export ANTHROPIC_MODEL="$MODEL" && \
+            export ANTHROPIC_DEFAULT_HAIKU_MODEL="$MINIMAX_CLAUDE_HAIKU_MODEL" && \
+            export ANTHROPIC_DEFAULT_SONNET_MODEL="$MODEL" && \
+            export ANTHROPIC_DEFAULT_OPUS_MODEL="$MODEL" && \
+            timeout "$BUDGET_SECONDS" claude \
+                --dangerously-skip-permissions \
+                --print --verbose \
+                --output-format stream-json \
+                --settings "$CLAUDE_KBH_SETTINGS" \
+                --model "$MINIMAX_CLAUDE_ALIAS" \
                 --disallowedTools ExitPlanMode EnterPlanMode AskUserQuestion \
                 --add-dir "$PROBLEM_DIR" \
                 -p "$PROMPT" ) \
@@ -651,7 +684,7 @@ case "$HARNESS" in
 
     *)
         echo "Unknown harness: $HARNESS" >&2
-        echo "Supported: claude, zai-claude, ccr-claude, codex, kimi, droid, gemini, cursor, grok, opencode" >&2
+        echo "Supported: claude, zai-claude, minimax-claude, ccr-claude, codex, kimi, droid, gemini, cursor, grok, opencode" >&2
         exit 1
         ;;
 esac
@@ -814,130 +847,7 @@ CLASSIFICATION_JSON="$(
     LOG_FILE="$LOG_FILE" \
     STDERR_FILE="$STDERR_FILE" \
     MIN_USEFUL_OUTPUT_TOKENS="$MIN_USEFUL_OUTPUT_TOKENS" \
-    KBH_GPU_LOCK_HELD=1 uv run --quiet python - <<'PY'
-import json
-import os
-import re
-from pathlib import Path
-
-
-def as_bool(value: str) -> bool:
-    return value == "true"
-
-
-def as_int(value: str | None) -> int | None:
-    if value in (None, "", "null"):
-        return None
-    try:
-        return int(value)
-    except ValueError:
-        return None
-
-
-def read_tail(path: str, limit: int = 200_000) -> str:
-    try:
-        p = Path(path)
-        if not p.exists():
-            return ""
-        data = p.read_bytes()
-        return data[-limit:].decode("utf-8", errors="replace")
-    except OSError:
-        return ""
-
-
-usage = json.loads(os.environ.get("USAGE_JSON") or "{}")
-output_tokens = usage.get("output_tokens")
-if not isinstance(output_tokens, (int, float)):
-    output_tokens = None
-
-correct = as_bool(os.environ["CORRECT"])
-template_mutated = as_bool(os.environ["TEMPLATE_MUTATED"])
-has_solution = as_bool(os.environ["HAS_SOLUTION"])
-session_complete = as_bool(os.environ["SESSION_COMPLETE"])
-harness_exit = as_int(os.environ.get("HARNESS_EXIT")) or 0
-check_exit = as_int(os.environ.get("CHECK_EXIT_CODE"))
-bench_exit = as_int(os.environ.get("BENCH_EXIT_CODE"))
-minimum = int(os.environ.get("MIN_USEFUL_OUTPUT_TOKENS") or "500")
-provider_failure_window = not has_solution
-
-text = "\n".join(
-    [
-        read_tail(os.environ.get("LOG_FILE", "")),
-        read_tail(os.environ.get("STDERR_FILE", "")),
-    ]
-).lower()
-
-insufficient_credits = bool(
-    re.search(
-        r"insufficient[_ -]?credits|out[_ -]?of[_ -]?credits|"
-        r"\\bcredits?\\s+(?:balance|remaining)\\b|\\bpayment required\\b|"
-        r"\\baccount\\s+overage\\b|add more using",
-        text,
-    )
-)
-rate_limited = bool(
-    re.search(
-        r"rate[_ -]?limit|\\b429\\b|quota|resource_exhausted|session limit",
-        text,
-    )
-)
-
-reason = "pass"
-retryable = False
-if correct and bench_exit in (None, 0):
-    reason = "pass"
-elif correct and bench_exit == 124:
-    reason = "benchmark_timeout"
-    retryable = True
-elif correct and bench_exit not in (None, 0):
-    reason = "benchmark_failed"
-elif template_mutated:
-    reason = "template_mutated"
-elif provider_failure_window and insufficient_credits:
-    reason = "provider_insufficient_credits"
-    retryable = False
-elif provider_failure_window and rate_limited:
-    reason = "provider_rate_limited"
-    retryable = True
-elif harness_exit == 124:
-    reason = "timeout"
-    retryable = not has_solution
-elif not session_complete:
-    reason = "incomplete_session"
-    retryable = True
-elif not has_solution and output_tokens is not None and output_tokens < minimum:
-    reason = "provider_early_stop"
-    retryable = True
-elif not has_solution:
-    reason = "no_solution"
-    retryable = False
-elif check_exit == 124:
-    reason = "check_timeout"
-    retryable = True
-elif check_exit not in (None, 0):
-    reason = "check_failed"
-elif bench_exit == 124:
-    reason = "benchmark_timeout"
-    retryable = True
-elif bench_exit not in (None, 0):
-    reason = "benchmark_failed"
-elif harness_exit != 0:
-    reason = "harness_error"
-    retryable = True
-else:
-    reason = "check_failed"
-
-print(
-    json.dumps(
-        {
-            "failure_reason": reason,
-            "retryable_infra_failure": retryable,
-            "minimum_useful_output_tokens": minimum,
-        },
-        separators=(",", ":"),
-    )
-)
-PY
+    KBH_GPU_LOCK_HELD=1 uv run --quiet python scripts/classify_run.py
 )"
 FAILURE_REASON="$(CLASSIFICATION_JSON="$CLASSIFICATION_JSON" KBH_GPU_LOCK_HELD=1 uv run --quiet python - <<'PY'
 import json

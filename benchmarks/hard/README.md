@@ -4,6 +4,10 @@ Surgical GPU kernel benchmark. 7 carefully-chosen problems, frontier coding agen
 
 Sibling project to [KernelBench-v3](https://github.com/Infatoshi/KernelBench-v3) (volume-oriented; local open-weight models). Hard is for frontier-model harnesses on a small, high-signal deck.
 
+## PR policy
+
+This repository is published for transparency: it documents the exact prompts, harnesses, traces, kernels, and scoring code I use to evaluate models. It is not an open benchmark track, and I am not accepting PRs that change the problems, hardware target, scoring, prompts, or results. Issues and forks are welcome for discussion or independent experiments, but the canonical repo stays fixed so the published comparisons remain reproducible.
+
 ## Problem deck
 
 | # | Problem | Hardware | What it tests |
@@ -34,6 +38,8 @@ One harness per model, each pinned to the highest-fidelity native endpoint.
 | GPT-5.5 xhigh | `codex` (`-c model_reasoning_effort="xhigh"`) | OpenAI direct (npm `@openai/codex`) |
 | Kimi K2.6 | `kimi` | Moonshot direct (api.moonshot.cn) |
 | GLM-5.1 | `opencode zai/glm-5.1` | Z.AI direct (api.z.ai) |
+| GLM-5.1 | `zai-claude glm-5.1` | Z.AI Anthropic-compatible endpoint (`api.z.ai/api/anthropic`) |
+| GLM-5.1 | `droid custom:GLM-5.1-[Z.AI-Coding-Plan]-0` | Z.AI OpenAI-compatible coding endpoint via Factory |
 | Minimax M2.7 | `opencode openrouter-pinned/minimax/minimax-m2.7` | OpenRouter pinned to Minimax lab (fp8) |
 | DeepSeek V4 Pro | `opencode deepseek/deepseek-v4-pro` | DeepSeek direct (api.deepseek.com) |
 | DeepSeek V4 Flash | `opencode deepseek/deepseek-v4-flash` | DeepSeek direct (api.deepseek.com) |

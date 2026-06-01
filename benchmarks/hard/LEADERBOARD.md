@@ -2,7 +2,7 @@
 
 Hardware: **RTX PRO 6000 Blackwell Workstation** (sm_120, 96 GB GDDR7, 1.8 TB/s peak DRAM bandwidth).
 
-**11 evaluated rows × 7 problems = 77 runs shown.** Cells show `peak_fraction` of the published throughput peak (1.0 = saturating the relevant tensor-core or memory bandwidth limit) when the model produced a correct solution; `FAIL` if a solution was written but failed correctness; `ERR` if no solution was produced. The infrastructure-blocked `qwen3.6-35b-a3b` row is omitted from the public grid because no usable tool endpoint was available.
+**12 evaluated rows × 7 problems = 84 runs shown.** Cells show `peak_fraction` of the published throughput peak (1.0 = saturating the relevant tensor-core or memory bandwidth limit) when the model produced a correct solution; `FAIL` if a solution was written but failed correctness; `ERR` if no solution was produced. The infrastructure-blocked `qwen3.6-35b-a3b` row is omitted from the public grid because no usable tool endpoint was available.
 
 Annotations (`★`) attached to specific cells live in `results/annotations/<run_id>.yaml`. Two cell verdicts mean the cell number doesn't measure what the problem name implies — see the **Benchmark design flaws** section below.
 
@@ -11,6 +11,7 @@ Annotations (`★`) attached to specific cells live in `results/annotations/<run
 | model | 01 | 02 | 03 | 04 | 05 | 06 | 07 | pass |
 |---|---|---|---|---|---|---|---|---|
 | gpt-5.5 [xhigh] | 0.423 ★ | 0.032 | 0.497 | 0.363 ★ | 0.042 | 0.251 | 0.159 | 7/7 |
+| minimax-claude/MiniMax-M3 [2026-06-01] | 0.533 ★ | PASS | 0.029 | 0.236 ★ | 0.043 ★ | 0.254 ★ | 0.108 | 7/7 |
 | claude-opus-4-7 [max] | 0.534 ★ | PASS | 0.602 ★ | 0.317 ★ | 0.020 | FAIL | 0.184 | 6/7 |
 | kimi-k2.6 | FAIL | 0.022 | 0.432 | 0.118 ★ | 0.014 | 0.161 | 0.220 | 6/7 |
 | or/xiaomi/mimo-v2.5-pro | 0.434 ★ | FAIL | ERR | 0.121 ★ | 0.017 | 0.211 | 0.137 | 5/7 |
@@ -26,13 +27,13 @@ Annotations (`★`) attached to specific cells live in `results/annotations/<run
 
 | problem | best peak | best model | n correct |
 |---|---|---|---|
-| 01_fp8_gemm | 0.534 | claude-opus-4-7 [max] | 5/11 |
-| 02_kda_cutlass | 0.032 | gpt-5.5 [xhigh] | 6/11 |
-| 03_paged_attention | 0.602 | claude-opus-4-7 [max] | 6/11 |
-| 04_kahan_softmax | 0.363 | gpt-5.5 [xhigh] | 9/11 |
-| 05_topk_bitonic | 0.042 | gpt-5.5 [xhigh] | 5/11 |
-| 06_sonic_moe_swiglu | 0.251 | gpt-5.5 [xhigh] | 10/11 |
-| 07_w4a16_gemm | 0.220 | kimi-k2.6 | 10/11 |
+| 01_fp8_gemm | 0.534 | claude-opus-4-7 [max] | 6/12 |
+| 02_kda_cutlass | 0.032 | gpt-5.5 [xhigh] | 7/12 |
+| 03_paged_attention | 0.602 | claude-opus-4-7 [max] | 7/12 |
+| 04_kahan_softmax | 0.363 | gpt-5.5 [xhigh] | 10/12 |
+| 05_topk_bitonic | 0.043 | minimax-claude/MiniMax-M3 [2026-06-01] | 6/12 |
+| 06_sonic_moe_swiglu | 0.254 | minimax-claude/MiniMax-M3 [2026-06-01] | 11/12 |
+| 07_w4a16_gemm | 0.220 | kimi-k2.6 | 11/12 |
 
 ## Benchmark design flaws — read these before citing numbers
 
@@ -40,7 +41,7 @@ Two of the seven problems have insufficient guardrails to enforce the algorithmi
 
 ### 01 fp8_gemm — bf16 dressup
 
-Every passing solution at peak fraction ≥ 0.4 (claude-opus-4-7 0.534, mimo-v2.5-pro 0.434, qwen3.6-plus 0.431, qwen3.6-max-preview 0.429, gpt-5.5 0.423) casts the fp8 inputs to bf16 inside the kernel and runs a bf16 GEMM. Both the opus and gpt-5.5 solutions explicitly pin to `cutlass::arch::Sm80` (Ampere) — they don't touch SM120 FP8 tensor cores at all.
+Every passing solution at peak fraction ≥ 0.4 (claude-opus-4-7 0.534, MiniMax-M3 0.533, mimo-v2.5-pro 0.434, qwen3.6-plus 0.431, qwen3.6-max-preview 0.429, gpt-5.5 0.423) casts the fp8 inputs to bf16 inside the kernel and runs a bf16 GEMM. Opus, MiniMax-M3, and gpt-5.5 explicitly pin to `cutlass::arch::Sm80` (Ampere) — they don't touch SM120 FP8 tensor cores at all.
 
 This is technically valid because the reference computes `x.to(bf16) @ w.to(bf16)`, so the model's bf16 GEMM matches reference arithmetic. But the problem name is FP8 GEMM and the prompt suggests using SM120 FP8 tensor cores. The peak fractions on this row reflect bf16 kernel optimization quality on fp8-typed inputs, not FP8 tensor core skill.
 

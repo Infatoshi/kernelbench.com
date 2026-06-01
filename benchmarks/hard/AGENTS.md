@@ -48,6 +48,9 @@ Provider-credit detection must stay credit-specific; do not match plain
 Provider credit/rate classifications should only apply to rows without a
 solution; successful sessions may quote old run logs or result JSON in the
 transcript, and those quotes are not provider failures.
+Provider credit/rate detection must read explicit CLI/API error events and
+stderr only, not arbitrary assistant text or tool outputs; models can read
+AGENTS.md, `run_hard.sh`, and old artifacts containing those trigger words.
 When `KBH_DISABLE_AGENT_CUDA=1`, agent-phase `uv`/`python`/`python3` probes
 bypass the lock because CUDA is hidden and guarded; harness-owned
 `check.py`/`benchmark.py` still lock normally.
@@ -118,6 +121,7 @@ uv run python scripts/summarize_runs.py --run-group <name>
 High-priority rows:
 
 ```bash
+./scripts/run_hard.sh minimax-claude MiniMax-M3 problems/01_fp8_gemm
 ./scripts/run_hard.sh opencode openrouter-alibaba/qwen/qwen3.7-max problems/01_fp8_gemm
 ./scripts/run_hard.sh opencode openrouter-google-ai-studio/google/gemini-3.5-flash problems/01_fp8_gemm
 ./scripts/run_hard.sh cursor composer-2.5 problems/01_fp8_gemm
@@ -128,6 +132,14 @@ High-priority rows:
 Claude Code runs explicitly pass `--settings
 '{"fastMode":false,"alwaysThinkingEnabled":true}'`. Opus comparability also
 requires `--effort max`.
+MiniMax M3 through Claude Code uses harness `minimax-claude`, model
+`MiniMax-M3`, and MiniMax's Anthropic-compatible endpoint
+`https://api.minimax.io/anthropic`. Put `export MINIMAX_API_KEY=...` in
+Anvil's `~/.env_vars`; do not put it in repo files. Enable it in broad
+preflight/sweeps with `KBH_USE_MINIMAX_M3_CLAUDE=1`.
+Do not pass provider API keys with `timeout env KEY=... claude`; that puts the
+key in process argv. Export secrets inside the subshell before invoking
+`timeout claude` instead.
 
 As of 2026-05-22, Qwen 3.7 Max passed a 300 second `01_fp8_gemm` smoke via
 OpenCode/Alibaba (`correct=true`, `peak_fraction=0.4257`). Gemini 3.5 Flash and
