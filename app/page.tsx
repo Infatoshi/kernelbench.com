@@ -4,18 +4,15 @@ export default function HomePage() {
   return (
     <div className="space-y-12">
       <section>
-        <pre className="text-[var(--color-fg-bright)] text-[10px] sm:text-xs leading-tight overflow-x-auto mb-6 select-none">
-{` _   __                    _ ____                  _
-| | / /__ _ __ _ __   ___| | __ )  ___ _ __   ___| |__
-| |/ / _ \\ '__| '_ \\ / _ \\ |  _ \\ / _ \\ '_ \\ / __| '_ \\
-|   <  __/ |  | | | |  __/ | |_) |  __/ | | | (__| | | |
-|_|\\_\\___|_|  |_| |_|\\___|_|____/ \\___|_| |_|\\___|_| |_|`}
-        </pre>
-        <h1 className="prompt cursor text-2xl sm:text-3xl font-bold text-[var(--color-fg-bright)] glow mb-4">
-          gpu kernel benchmarks for autonomous coding agents
+        <h1 className="text-3xl sm:text-4xl font-semibold tracking-tight text-[var(--color-fg-bright)] mb-4">
+          GPU kernel benchmarks for autonomous coding agents
         </h1>
         <p className="text-[var(--color-fg)] leading-relaxed max-w-3xl">
-          Two benchmarks. One question: <em className="text-[var(--color-fg-bright)] not-italic">when you point a frontier model at modern GPU primitives and let it iterate, what does it actually produce?</em> Real CLI harnesses (Claude Code, codex, Kimi, opencode), real workspaces, real correctness checks, real wall-clock budgets. peak_fraction grounded in physical hardware ceilings, not gameable speedup ratios.
+          Two benchmarks. One question: when you point a frontier model at
+          modern GPU primitives and let it iterate, what does it actually
+          produce? The runs use real CLI harnesses, real workspaces, correctness
+          checks, wall-clock budgets, and a roofline-based score grounded in
+          hardware ceilings.
         </p>
       </section>
 
@@ -24,17 +21,18 @@ export default function HomePage() {
           href="/hard"
           className="block box p-6 no-underline hover:border-[var(--color-fg-bright)] transition-colors"
         >
-          <div className="text-xs text-[var(--color-accent)] mb-2">[ latest ]</div>
-          <h2 className="text-xl font-bold text-[var(--color-fg-bright)] mb-3">
+          <div className="text-xs uppercase tracking-wide text-[var(--color-fg-muted)] mb-2">Latest</div>
+          <h2 className="text-xl font-semibold text-[var(--color-fg-bright)] mb-3">
             Hard <span className="text-[var(--color-fg-muted)] text-sm">2026-04</span>
           </h2>
           <p className="text-sm text-[var(--color-fg)] mb-4">
-            9 hand-designed problems · 22 model-harness sweeps · single Blackwell SM120 · forensic audit of every high-peak run · rubric leaks and reward hacks documented inline · <span className="text-[var(--color-fg-bright)]">click any cell on the leaderboard to open the full transcript viewer for that run</span>
+            Small hard CUDA deck · curated model comparison · single Blackwell
+            SM120 · clickable transcript viewers for scored runs.
           </p>
           <div className="grid grid-cols-4 gap-3 text-xs tabular">
-            <Stat label="problems" value="9" />
-            <Stat label="sweeps" value="22" />
-            <Stat label="runs" value="182" />
+            <Stat label="scored columns" value="8" />
+            <Stat label="models shown" value="13" />
+            <Stat label="GPU" value="SM120" />
             <Stat label="best peak" value="0.722" emphasize />
           </div>
         </Link>
@@ -43,8 +41,8 @@ export default function HomePage() {
           href="/v3"
           className="block box p-6 no-underline hover:border-[var(--color-fg-bright)] transition-colors"
         >
-          <div className="text-xs text-[var(--color-fg-muted)] mb-2">[ archive ]</div>
-          <h2 className="text-xl font-bold text-[var(--color-fg-bright)] mb-3">
+          <div className="text-xs uppercase tracking-wide text-[var(--color-fg-muted)] mb-2">Archive</div>
+          <h2 className="text-xl font-semibold text-[var(--color-fg-bright)] mb-3">
             v3 <span className="text-[var(--color-fg-muted)] text-sm">2026-02</span>
           </h2>
           <p className="text-sm text-[var(--color-fg)] mb-4">
@@ -59,8 +57,8 @@ export default function HomePage() {
       </section>
 
       <section className="space-y-6">
-        <h2 className="text-xl font-bold text-[var(--color-fg-bright)] glow">
-          # design principles
+        <h2 className="text-xl font-semibold text-[var(--color-fg-bright)]">
+          Design principles
         </h2>
         <ul className="space-y-3 text-sm leading-relaxed list-none pl-0">
           <Bullet>
@@ -87,8 +85,8 @@ export default function HomePage() {
       </section>
 
       <section className="box p-6">
-        <h2 className="text-lg font-bold text-[var(--color-fg-bright)] mb-2">
-          # contact
+        <h2 className="text-lg font-semibold text-[var(--color-fg-bright)] mb-2">
+          Contact
         </h2>
         <p className="text-sm text-[var(--color-fg)] leading-relaxed">
           Open to inquiries — collaborations, model evals, custom benchmark builds, kernel-engineering consulting, anything kernel-adjacent.
@@ -132,7 +130,7 @@ function Stat({
 function Bullet({ children }: { children: React.ReactNode }) {
   return (
     <li className="flex gap-3">
-      <span className="text-[var(--color-accent)] shrink-0">&gt;</span>
+      <span className="text-[var(--color-fg-muted)] shrink-0">•</span>
       <span>{children}</span>
     </li>
   )

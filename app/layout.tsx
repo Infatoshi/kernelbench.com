@@ -44,10 +44,10 @@ function Header() {
   return (
     <header className="border-b border-[var(--color-border)]">
       <div className="container mx-auto max-w-5xl px-4 sm:px-6 py-4 flex items-center justify-between gap-6">
-        <a href="/" className="font-bold text-[var(--color-fg-bright)] no-underline">
-          ./kernelbench
+        <a href="/" className="font-semibold text-[var(--color-fg-bright)] no-underline">
+          KernelBench
         </a>
-        <nav className="flex items-center gap-5 text-sm">
+        <nav className="flex items-center gap-5 text-sm text-[var(--color-fg-muted)]">
           <a href="/v3">v3</a>
           <a href="/hard">hard</a>
           <a href="/runs">runs</a>

@@ -32,16 +32,16 @@ const PROBLEMS = [
   { key: "10_patch_embed_conv3d_gemm", short: "10 patch" },
 ]
 
-const PRIMARY_MODEL_LABELS = new Set([
+const VISIBLE_MODEL_LABELS = new Set([
   "codex/gpt-5.5 [xhigh]",
   "claude/claude-opus-4-7 [max]",
-  "zai-claude/glm-5.1 [2026-05-13]",
-  "droid/zai/glm-5.1 [2026-05-08]",
+  "kimi/kimi-k2.6",
+  "opencode/openrouter-pinned/xiaomi/mimo-v2.5-pro",
   "opencode/deepseek/deepseek-v4-flash",
   "opencode/deepseek/deepseek-v4-pro",
 ])
 
-const FRESH_PRIMARY_PREFIXES = [
+const VISIBLE_MODEL_PREFIXES = [
   "codex/gpt-5.5 [2026-05-28 finish",
   "claude/claude-opus-4-7 [2026-05-28 finish",
   "claude/claude-opus-4-8 [2026-05-28 opus48-grok",
@@ -51,33 +51,10 @@ const FRESH_PRIMARY_PREFIXES = [
   "minimax-claude/MiniMax-M3 [2026-06-01",
 ]
 
-const DIAGNOSTIC_AUDIT_NOTES: Record<string, string> = {
-  "kimi/kimi-k2.6":
-    "Problems 09/10 aborted in 4-5s with 401 auth errors; 01 is a reward-hack failure.",
-  "opencode/openrouter-pinned/xiaomi/mimo-v2.5-pro":
-    "Problem 03 ended at provider/reasoning length with no solution; 02 is a real solution failure.",
-  "opencode/openrouter-pinned/qwen/qwen3.6-max-preview":
-    "Problems 03/10 are no-solution provider or unknown early-stop cells.",
-  "opencode/openrouter-pinned/qwen/qwen3.6-plus":
-    "Problem 02 is a harness/setup or unknown early-stop cell.",
-  "opencode/zai/glm-5.1":
-    "Problems 03/05 hit hidden reasoning-token limits before writing solution.py; 01 timed out after regressing a passing attempt.",
-  "opencode/zai/glm-5.1 [2026-05-08]":
-    "Problems 03/05/07/09 hit hidden reasoning-token limits with no solution.py; 01 timed out broken.",
-  "opencode/zai/glm-5.1 [2026-05-28 finish]":
-    "May 28 retry confirmed all six CUDA cells still end as provider early-stops.",
-  "zai-claude/glm-5.1 [2026-05-28 finish]":
-    "Z.ai Claude route was unavailable in May 28 preflight; cells are retained from the May 23 diagnostic run.",
-  "opencode/openrouter-pinned/minimax/minimax-m2.7":
-    "Problem 01 has no checkable artifact; remaining non-scored cells mix timeout and invalid/forbidden-op solution failures.",
-  "opencode/openrouter-pinned/qwen/qwen3.6-27b":
-    "Multiple no-solution/API/unknown cells; raw scored count is not comparable.",
-}
-
-function isPrimaryModel(m: Model) {
+function isVisibleModel(m: Model) {
   return (
-    PRIMARY_MODEL_LABELS.has(m.label) ||
-    FRESH_PRIMARY_PREFIXES.some((prefix) => m.label.startsWith(prefix))
+    VISIBLE_MODEL_LABELS.has(m.label) ||
+    VISIBLE_MODEL_PREFIXES.some((prefix) => m.label.startsWith(prefix))
   )
 }
 
@@ -89,86 +66,62 @@ export default async function HardPage() {
     loadBaselines(),
   ])
   const models = [...lb.models].sort(compareModelRows)
-  const primaryModels = models.filter(isPrimaryModel)
-  const diagnosticModels = models.filter((m) => !isPrimaryModel(m))
+  const visibleModels = models.filter(isVisibleModel)
 
   return (
     <div className="space-y-12">
       <section>
-        <h1 className="prompt cursor text-3xl font-bold text-[var(--color-fg-bright)] glow mb-4">
-          kernelbench hard
+        <h1 className="text-3xl font-semibold tracking-tight text-[var(--color-fg-bright)] mb-3">
+          KernelBench Hard
         </h1>
         <p className="text-sm text-[var(--color-fg-muted)] mb-6">
-          Current 8-problem board + May 28 CUDA finish rerun · RTX PRO 6000 Blackwell · sm_120 · 96 GB GDDR7 · 1.8 TB/s
+          Current scored CUDA board · RTX PRO 6000 Blackwell · sm_120 · 96 GB GDDR7 · 1.8 TB/s
         </p>
         <p className="text-[var(--color-fg)] leading-relaxed max-w-3xl">
-          A focused successor to KernelBench v3. One Blackwell GPU, eight hand-designed problems, real coding-agent CLIs as the harness. The original public board swept twelve frontier model-harness pairs; the May 8 Z.ai rerun added fresh GLM-5.1 rows for OpenCode and Droid, and the May 13 rerun adds GLM-5.1 through Claude Code on Z.ai's Anthropic-compatible endpoint. The May 28 finish rerun adds queue-safe six-problem CUDA rows for Codex, Claude, Cursor Agent, and native Gemini; the same-day addendum adds Claude Opus 4.8 and Grok Build. The leaderboard separates primary comparable sweeps from diagnostic rows where audit found API/auth/provider/adapter no-results.
+          A focused successor to KernelBench v3. One Blackwell GPU, a small set
+          of hard CUDA kernel problems, and real coding-agent CLIs as the harness.
+          The table below keeps the comparable model rows visible and leaves
+          one-off diagnostic rows in the source data.
+        </p>
+        <p className="mt-4 text-sm text-[var(--color-fg-muted)] max-w-3xl leading-relaxed">
+          Problem IDs are stable, not consecutive: 04 was retired after the
+          Kahan-softmax rubric leak, and 08 is a deferred Metal problem. The
+          scored CUDA columns are 01, 02, 03, 05, 06, 07, 09, and 10.
         </p>
       </section>
 
       <section>
-        <h2 className="text-xl font-bold text-[var(--color-fg-bright)] mb-4 glow">
-          # leaderboard
+        <h2 className="text-xl font-semibold text-[var(--color-fg-bright)] mb-3">
+          Leaderboard
         </h2>
-        <p className="text-xs text-[var(--color-fg-muted)] mb-4">
-          cells = peak_fraction (fraction of the relevant hardware ceiling). BENCH = correctness passed but benchmark timing did not finish, so the cell is unscored. NO PERF = correctness passed but no peak_fraction was recorded. FAIL = solution written but missed correctness. ERR = no solution produced. INVALID = benchmark file mutation or other scoring-invalid behavior. <span className="text-[var(--color-warn)]">★</span> = annotation attached. <span className="text-[var(--color-fg-bright)]">click any cell to open the full transcript viewer</span> — every tool call, every reasoning step, the solution.py, the check.log.
-          {" "}Fresh sweep cells include wall time, token usage, cache/reasoning tokens, and GPU queue mode in the cell tooltip when present.
+        <p className="text-sm text-[var(--color-fg-muted)] mb-4 max-w-4xl leading-relaxed">
+          Cells show <code>peak_fraction</code>, the fraction of the relevant
+          hardware ceiling reached by a correct kernel. Click a cell to open the
+          transcript when one is available. <span className="text-[var(--color-warn)]">★</span>{" "}
+          marks an annotation.
         </p>
-        <div className="space-y-8">
-          <div>
-            <h3 className="text-sm font-bold text-[var(--color-fg-bright)] mb-2">
-              serious comparison
-            </h3>
-            <p className="text-[10px] sm:text-xs text-[var(--color-fg-muted)] mb-2 max-w-4xl leading-relaxed">
-              Audited non-scored cells here are model/check failures, full-budget timeouts,
-              or explicit invalid behavior. Raw scored totals are comparable within this
-              section.
-            </p>
-            <LeaderboardTable
-              models={primaryModels}
-              annotations={annotations}
-              hasViewer={hasViewer}
-            />
-          </div>
-
-          <div>
-            <h3 className="text-sm font-bold text-[var(--color-fg-bright)] mb-2">
-              diagnostic / needs rerun
-            </h3>
-            <p className="text-[10px] sm:text-xs text-[var(--color-fg-muted)] mb-2 max-w-4xl leading-relaxed">
-              Rows retained for transparency, but at least one non-pass was an
-              auth/API/provider/adapter/setup no-result rather than a clean model
-              attempt. Do not rank these scored totals against the serious table.
-            </p>
-            <LeaderboardTable
-              models={diagnosticModels}
-              annotations={annotations}
-              hasViewer={hasViewer}
-              auditNotes={DIAGNOSTIC_AUDIT_NOTES}
-            />
-          </div>
-        </div>
-        <p className="text-[10px] sm:text-xs text-[var(--color-fg-muted)] mt-2 max-w-4xl leading-relaxed">
-          Audit note: DeepSeek through OpenCode stayed in the serious section because
-          its non-scored cells were normal correctness/build failures or full-budget
-          timeouts. OpenCode/Z.ai rows remain diagnostic because repeated hidden
-          reasoning/provider early-stops produced no-solution cells before useful actions.
-          Inspect the{" "}
+        <LeaderboardTable
+          models={visibleModels}
+          annotations={annotations}
+          hasViewer={hasViewer}
+        />
+        <p className="text-xs text-[var(--color-fg-muted)] mt-3 max-w-4xl leading-relaxed">
+          Full historical and diagnostic rows are still available in{" "}
           <Link
-            href="/runs?harness=opencode"
-            className="underline underline-offset-2 decoration-[var(--color-bad)] hover:text-[var(--color-bad)]"
+            href="https://github.com/Infatoshi/KernelBench-Hard/blob/master/results/leaderboard.json"
+            className="underline underline-offset-2"
           >
-            runs
-          </Link>{" "}
-          for the raw transcripts.
+            leaderboard.json
+          </Link>
+          .
         </p>
       </section>
 
       <section>
-        <h2 className="text-xl font-bold text-[var(--color-fg-bright)] mb-4 glow">
-          # per-problem ceilings
+        <h2 className="text-xl font-semibold text-[var(--color-fg-bright)] mb-3">
+          Per-problem ceilings
         </h2>
-        <p className="text-xs text-[var(--color-fg-muted)] mb-3">
+        <p className="text-sm text-[var(--color-fg-muted)] mb-3 max-w-4xl leading-relaxed">
           eager / compiled = PyTorch reference timings. SOTA = the existing best-known kernel
           for the problem (vLLM paged attention, fbgemm grouped GEMM, etc.) when one exists
           on this hardware. best peak = the model that pushed furthest above the
@@ -230,8 +183,8 @@ export default async function HardPage() {
       </section>
 
       <section>
-        <h2 className="text-xl font-bold text-[var(--color-fg-bright)] mb-4 glow">
-          # rubric leaks
+        <h2 className="text-xl font-semibold text-[var(--color-fg-bright)] mb-3">
+          Rubric caveat
         </h2>
         <p className="text-[var(--color-fg)] leading-relaxed mb-4 max-w-3xl">
           One row in the leaderboard promises something the benchmark doesn&apos;t actually measure. It&apos;s marked{" "}
@@ -278,8 +231,8 @@ export default async function HardPage() {
       </section>
 
       <section>
-        <h2 className="text-xl font-bold text-[var(--color-fg-bright)] mb-4 glow">
-          # what changed from v3
+        <h2 className="text-xl font-semibold text-[var(--color-fg-bright)] mb-3">
+          What changed from v3
         </h2>
         <ul className="space-y-2 text-sm leading-relaxed list-none pl-0 max-w-3xl">
           <Bullet>One GPU instead of three. RTX PRO 6000 Blackwell (sm_120, 96 GB GDDR7, 1.8 TB/s).</Bullet>
@@ -317,40 +270,30 @@ function LeaderboardTable({
   models,
   annotations,
   hasViewer,
-  auditNotes,
 }: {
   models: Model[]
   annotations: Map<string, { verdict: string }>
   hasViewer: Set<string>
-  auditNotes?: Record<string, string>
 }) {
-  const showNotes = Boolean(auditNotes)
   return (
     <div className="overflow-x-auto box">
       <table className="term tabular text-xs sm:text-sm">
         <thead>
           <tr>
-            <th className="sticky left-0 bg-[var(--color-bg)]">model</th>
+            <th className="sticky left-0 bg-[var(--color-surface-muted)]">model</th>
             {PROBLEMS.map((p) => (
               <th key={p.key} className="text-right">
                 {p.short}
               </th>
             ))}
             <th className="text-right">SCORED</th>
-            {showNotes ? <th>audit note</th> : null}
           </tr>
         </thead>
         <tbody>
           {models.map((m) => (
             <tr key={m.label}>
-              <td className="sticky left-0 bg-[var(--color-bg)] text-[var(--color-fg-bright)] whitespace-nowrap">
+              <td className="sticky left-0 bg-[var(--color-surface)] text-[var(--color-fg-bright)] whitespace-nowrap">
                 {shortLabel(m.label)}
-                {m.effort ? (
-                  <span className="text-[var(--color-fg-muted)]">
-                    {" "}
-                    [{m.effort}]
-                  </span>
-                ) : null}
               </td>
               {PROBLEMS.map((p) => {
                 const cell = m.results[p.key]
@@ -363,11 +306,6 @@ function LeaderboardTable({
               <td className="text-right text-[var(--color-fg-bright)]">
                 {m.pass_count}/{m.total_runs}
               </td>
-              {showNotes ? (
-                <td className="min-w-72 max-w-md whitespace-normal text-[10px] sm:text-xs text-[var(--color-fg-muted)] leading-relaxed">
-                  {auditNotes?.[m.label] ?? "Unclassified row; kept diagnostic until audited."}
-                </td>
-              ) : null}
             </tr>
           ))}
         </tbody>
@@ -377,26 +315,39 @@ function LeaderboardTable({
 }
 
 function compareModelRows(
-  a: { harness: string; pass_count: number },
-  b: { harness: string; pass_count: number },
+  a: { label: string; pass_count: number; total_runs: number; results: Model["results"] },
+  b: { label: string; pass_count: number; total_runs: number; results: Model["results"] },
 ) {
-  const priority: Record<string, number> = {
-    codex: 0,
-    claude: 1,
-    "zai-claude": 2,
-    "minimax-claude": 3,
-    droid: 4,
-    kimi: 5,
-    opencode: 6,
-  }
-  const pa = priority[a.harness] ?? 6
-  const pb = priority[b.harness] ?? 6
-  if (pa !== pb) return pa - pb
-  return b.pass_count - a.pass_count
+  if (b.pass_count !== a.pass_count) return b.pass_count - a.pass_count
+  const bRate = b.total_runs ? b.pass_count / b.total_runs : 0
+  const aRate = a.total_runs ? a.pass_count / a.total_runs : 0
+  if (bRate !== aRate) return bRate - aRate
+  const peakDiff = bestPeak(b.results) - bestPeak(a.results)
+  if (peakDiff !== 0) return peakDiff
+  return shortLabel(a.label).localeCompare(shortLabel(b.label))
+}
+
+function bestPeak(results: Model["results"]) {
+  return Math.max(
+    -1,
+    ...Object.values(results).map((cell) => cell.peak_fraction ?? -1),
+  )
 }
 
 function shortLabel(label: string) {
   return label
+    .replace("codex/gpt-5.5 [2026-05-28 finish xhigh]", "GPT-5.5 [2026-05-28]")
+    .replace("codex/gpt-5.5 [xhigh]", "GPT-5.5 [xhigh]")
+    .replace("claude/claude-opus-4-7 [2026-05-28 finish max]", "Claude Opus 4.7 [2026-05-28]")
+    .replace("claude/claude-opus-4-8 [2026-05-28 opus48-grok max]", "Claude Opus 4.8 [2026-05-28]")
+    .replace("claude/claude-opus-4-7 [max]", "Claude Opus 4.7 [max]")
+    .replace("cursor/composer-2.5-fast [2026-05-28 finish]", "Composer 2.5 Fast [2026-05-28]")
+    .replace("gemini/gemini-3.5-flash [2026-05-28 finish]", "Gemini 3.5 Flash [2026-05-28]")
+    .replace("grok/grok-build [2026-05-28 opus48-grok max]", "Grok Build [2026-05-28]")
+    .replace("kimi/kimi-k2.6", "Kimi K2.6")
+    .replace("opencode/openrouter-pinned/xiaomi/mimo-v2.5-pro", "MiMo v2.5 Pro")
+    .replace("opencode/deepseek/deepseek-v4-flash", "DeepSeek V4 Flash")
+    .replace("opencode/deepseek/deepseek-v4-pro", "DeepSeek V4 Pro")
     .replace("openrouter-google-ai-studio/google/", "or-google/")
     .replace("openrouter-alibaba/qwen/", "or-qwen/")
     .replace("zai-claude/glm-5.1 [2026-05-13]", "Claude Code GLM-5.1 [2026-05-13]")
@@ -632,7 +583,9 @@ function LeakCard({
 }) {
   return (
     <div className="box p-5">
-      <h3 className="text-[var(--color-warn)] font-bold mb-3">★ {title}</h3>
+      <h3 className="text-[var(--color-warn)] font-semibold mb-3">
+        Caveat: {title}
+      </h3>
       <div className="grid grid-cols-2 sm:grid-cols-3 gap-x-4 gap-y-1 text-xs tabular mb-4">
         {cluster.map((c) => (
           <div key={c.model} className="flex justify-between">
@@ -649,7 +602,7 @@ function LeakCard({
 function Bullet({ children }: { children: React.ReactNode }) {
   return (
     <li className="flex gap-3">
-      <span className="text-[var(--color-accent)] shrink-0">&gt;</span>
+      <span className="text-[var(--color-fg-muted)] shrink-0">•</span>
       <span>{children}</span>
     </li>
   )
