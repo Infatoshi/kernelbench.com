@@ -9,7 +9,7 @@ const citationGraph = {
     {
       "@type": "WebSite",
       "@id": "https://kernelbench.com/#website",
-      name: "KernelBench",
+      name: "kernelbench.com",
       url: "https://kernelbench.com",
       author: {
         "@type": "Person",
@@ -17,7 +17,7 @@ const citationGraph = {
         url: "https://elliotarledge.com",
       },
       description:
-        "Open GPU kernel engineering benchmarks for autonomous coding agents.",
+        "Open agentic GPU kernel benchmark results, run transcripts, source repositories, and datasets.",
       citation: [
         "https://github.com/Infatoshi/kernelbench.com",
         "https://github.com/Infatoshi/KernelBench-v3",
@@ -29,28 +29,28 @@ const citationGraph = {
     {
       "@type": "Dataset",
       "@id": "https://huggingface.co/datasets/Infatoshi/kernelbench-hard-runs",
-      name: "KernelBench Hard runs",
+      name: "KernelBench-Hard run artifacts",
       url: "https://huggingface.co/datasets/Infatoshi/kernelbench-hard-runs",
       creator: { "@type": "Person", name: "Elliot Arledge" },
     },
     {
       "@type": "Dataset",
       "@id": "https://huggingface.co/datasets/Infatoshi/kernelbench-v3-runs",
-      name: "KernelBench v3 runs",
+      name: "KernelBench-v3 run artifacts",
       url: "https://huggingface.co/datasets/Infatoshi/kernelbench-v3-runs",
       creator: { "@type": "Person", name: "Elliot Arledge" },
     },
     {
       "@type": "SoftwareSourceCode",
       "@id": "https://github.com/Infatoshi/KernelBench-Hard",
-      name: "KernelBench Hard",
+      name: "Hard result suite repository",
       codeRepository: "https://github.com/Infatoshi/KernelBench-Hard",
       author: { "@type": "Person", name: "Elliot Arledge" },
     },
     {
       "@type": "SoftwareSourceCode",
       "@id": "https://github.com/Infatoshi/KernelBench-v3",
-      name: "KernelBench v3",
+      name: "v3 result suite repository",
       codeRepository: "https://github.com/Infatoshi/KernelBench-v3",
       author: { "@type": "Person", name: "Elliot Arledge" },
     },
@@ -74,7 +74,7 @@ const benchmarks = [
     href: "/v3",
     title: "v3",
     description:
-      "43-58 problems per GPU, 10 models, RTX 3090, H100, B200, four difficulty levels, and the original KernelBench agent loop.",
+      "43-58 problems per GPU, 10 models, RTX 3090, H100, B200, four difficulty levels, and a custom v3 agent loop.",
     stats: [
       ["problems", "43-58"],
       ["GPUs", "3"],
@@ -92,14 +92,14 @@ export default function HomePage() {
         type="application/ld+json"
         dangerouslySetInnerHTML={{ __html: JSON.stringify(citationGraph) }}
       />
-      <h1 className="sr-only">KernelBench benchmarks</h1>
+      <h1 className="sr-only">Agentic GPU kernel benchmark results</h1>
       <section aria-label="Benchmarks" className="space-y-4">
         {benchmarks.map((benchmark) => (
           <article key={benchmark.href} className="benchmark-card">
             <Link
               href={benchmark.href}
               className="benchmark-main no-underline"
-              aria-label={`Open KernelBench ${benchmark.title}`}
+              aria-label={`Open ${benchmark.title} benchmark`}
             >
               <div className="flex flex-col gap-5 sm:flex-row sm:items-start sm:justify-between">
                 <div className="max-w-2xl">
@@ -136,7 +136,7 @@ export default function HomePage() {
                 target="_blank"
                 rel="noreferrer"
                 className="hf-link no-underline"
-                aria-label={`Open KernelBench ${benchmark.title} runs on Hugging Face`}
+                aria-label={`Open ${benchmark.title} benchmark runs on Hugging Face`}
               >
                 <img
                   src={HUGGING_FACE_LOGO}
@@ -203,12 +203,14 @@ export default function HomePage() {
             Citation
           </p>
           <h2 className="text-xl font-semibold text-[var(--color-fg-bright)]">
-            Cite KernelBench
+            Cite this benchmark suite
           </h2>
           <p className="mt-3 text-sm leading-relaxed text-[var(--color-fg)] max-w-3xl">
             If you use these results, cite the website for the public benchmark
             view, the relevant benchmark repository for problem definitions and
             harness code, and the Hugging Face dataset for the run transcripts.
+            This is a results and artifact site, not Stanford&apos;s original
+            KernelBench benchmark.
           </p>
         </div>
 
@@ -237,32 +239,32 @@ export default function HomePage() {
         </div>
 
         <pre className="bibtex-block">
-{`@misc{arledge2026kernelbench,
-  title        = {KernelBench: GPU Kernel Engineering Benchmarks for Autonomous Coding Agents},
+{`@misc{arledge2026kernelbenchcom,
+  title        = {kernelbench.com: Agentic GPU Kernel Benchmark Results and Run Artifacts},
   author       = {Arledge, Elliot},
   year         = {2026},
   howpublished = {\\url{https://kernelbench.com}},
   note         = {Website, benchmark results, transcript viewers, and citation index}
 }
 
-@misc{arledge2026kernelbenchhard,
-  title        = {KernelBench Hard},
+@misc{arledge2026hard,
+  title        = {Hard: Agentic CUDA Kernel Result Suite},
   author       = {Arledge, Elliot},
   year         = {2026},
   howpublished = {\\url{https://github.com/Infatoshi/KernelBench-Hard}},
   note         = {CUDA benchmark suite, harness, results, and annotations}
 }
 
-@misc{arledge2026kernelbenchv3,
-  title        = {KernelBench v3},
+@misc{arledge2026v3,
+  title        = {v3: Multi-GPU Agentic Kernel Result Suite},
   author       = {Arledge, Elliot},
   year         = {2026},
   howpublished = {\\url{https://github.com/Infatoshi/KernelBench-v3}},
   note         = {Multi-GPU benchmark suite, harness, and result artifacts}
 }
 
-@misc{arledge2026kernelbenchhardruns,
-  title        = {KernelBench Hard Runs},
+@misc{arledge2026hardruns,
+  title        = {KernelBench-Hard Run Artifacts},
   author       = {Arledge, Elliot},
   year         = {2026},
   publisher    = {Hugging Face},
@@ -270,8 +272,8 @@ export default function HomePage() {
   note         = {Run transcripts, solutions, checks, timing, and cost metadata}
 }
 
-@misc{arledge2026kernelbenchv3runs,
-  title        = {KernelBench v3 Runs},
+@misc{arledge2026v3runs,
+  title        = {KernelBench-v3 Run Artifacts},
   author       = {Arledge, Elliot},
   year         = {2026},
   publisher    = {Hugging Face},

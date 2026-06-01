@@ -10,7 +10,7 @@ export default function KernelBenchV3Post() {
         </Link>
 
         <article className="max-w-none">
-          <h1 className="text-4xl font-bold mb-6">KernelBench v3: Rebuilding a GPU Kernel Benchmark from First Principles</h1>
+          <h1 className="text-4xl font-bold mb-6">v3: Rebuilding a GPU Kernel Benchmark from First Principles</h1>
 
           <p className="text-[var(--color-fg-muted)] mb-12">
             How discovering the original KernelBench was exploitable led to building a focused, cost-effective benchmark for evaluating LLM kernel engineering on modern architectures.
@@ -98,7 +98,7 @@ export default function KernelBenchV3Post() {
             <strong>GPT-5.4 and Gemini 3 Flash lead on correctness across GPUs, while Gemini 3 Flash offers the best cost-effectiveness.</strong> What matters is not average speedup - a metric easily gamed - but whether models can produce kernels that are both correct and faster than PyTorch. On that measure, the frontier is clear: Level 4 pass rates collapse across all models. Genuine kernel engineering on novel architectures remains beyond current capabilities.
           </p>
 
-          <h2 className="text-2xl font-bold mt-12 mb-6">The Problem with KernelBench</h2>
+          <h2 className="text-2xl font-bold mt-12 mb-6">The Problem with Stanford KernelBench</h2>
 
           <p className="leading-relaxed mb-6">
             KernelBench, released by Stanford's Scaling Intelligence Lab, promised to evaluate whether LLMs could write optimized CUDA kernels. The premise was compelling: give a model a PyTorch reference implementation, ask it to write faster CUDA code, and measure the speedup. The benchmark included 250 problems across multiple difficulty levels.
@@ -399,7 +399,7 @@ kv = self.kv_b_proj(self.kv_a_layernorm(compressed_kv))
           <h2 className="text-2xl font-bold mt-12 mb-6">Future Work</h2>
 
           <p className="leading-relaxed mb-6">
-            KernelBench v3 currently evaluates single-GPU kernels. The roadmap includes:
+            v3 currently evaluates single-GPU kernels. The roadmap includes:
           </p>
 
           <ul className="space-y-2 mb-8 list-disc list-inside text-[var(--color-fg-muted)]">

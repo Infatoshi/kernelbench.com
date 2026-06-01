@@ -1,4 +1,4 @@
-// Data loaders for KernelBench. Source of truth lives in this monorepo
+// Data loaders for the public benchmark result pages. Source of truth lives in this monorepo
 // under benchmarks/<version>/. The website reads from the local filesystem
 // at build time — no network fetch needed since data and site ship together.
 

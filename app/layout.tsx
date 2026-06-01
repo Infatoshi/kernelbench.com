@@ -11,30 +11,30 @@ const mono = JetBrains_Mono({
 
 export const metadata: Metadata = {
   metadataBase: new URL("https://kernelbench.com"),
-  title: "KernelBench: GPU Kernel Engineering Benchmarks",
+  title: "kernelbench.com: Agentic GPU Kernel Benchmark Results",
   description:
-    "Open GPU kernel engineering benchmarks, repositories, transcripts, and datasets for evaluating autonomous coding agents.",
+    "Open agentic GPU kernel benchmark results, repositories, transcripts, and datasets.",
   authors: [{ name: "Elliot Arledge", url: "https://elliotarledge.com" }],
   creator: "Elliot Arledge",
-  publisher: "KernelBench",
+  publisher: "kernelbench.com",
   keywords: [
     "GPU kernels",
     "CUDA",
     "benchmark",
     "coding agents",
     "LLM evaluation",
-    "KernelBench",
+    "agentic GPU kernels",
   ],
   openGraph: {
-    title: "KernelBench: GPU Kernel Engineering Benchmarks",
+    title: "kernelbench.com: Agentic GPU Kernel Benchmark Results",
     description:
-      "Open GPU kernel engineering benchmarks, repositories, transcripts, and datasets for autonomous coding agents.",
+      "Open agentic GPU kernel benchmark results, repositories, transcripts, and datasets.",
     url: "https://kernelbench.com",
-    siteName: "KernelBench",
+    siteName: "kernelbench.com",
   },
   other: {
     citation_title:
-      "KernelBench: GPU Kernel Engineering Benchmarks for Autonomous Coding Agents",
+      "kernelbench.com: Agentic GPU Kernel Benchmark Results and Run Artifacts",
     citation_author: "Arledge, Elliot",
     citation_publication_date: "2026",
     citation_online_date: "2026",
@@ -73,8 +73,11 @@ function Header() {
   return (
     <header className="border-b border-[var(--color-border)]">
       <div className="container mx-auto max-w-5xl px-4 sm:px-6 py-4 flex flex-wrap items-center justify-between gap-x-6 gap-y-3">
-        <a href="/" className="font-semibold text-[var(--color-fg-bright)] no-underline">
-          KernelBench
+        <a
+          href="/"
+          className="font-semibold text-[var(--color-fg-bright)] no-underline"
+        >
+          kernelbench.com
         </a>
         <div className="ml-auto flex items-center gap-3 sm:gap-5">
           <nav className="flex items-center gap-3 sm:gap-5 text-sm text-[var(--color-fg-muted)]">

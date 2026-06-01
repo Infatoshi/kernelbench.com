@@ -145,7 +145,7 @@ export default function V3Page() {
     <div className="space-y-12">
       <section>
         <h1 className="prompt cursor text-3xl font-bold text-[var(--color-fg-bright)] glow mb-4">
-          kernelbench v3
+          v3
         </h1>
         <p className="text-sm text-[var(--color-fg-muted)] mb-6">
           10 models · RTX 3090 + H100 + B200 · 4 difficulty levels · 2071 evaluations

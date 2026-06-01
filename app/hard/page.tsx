@@ -72,13 +72,13 @@ export default async function HardPage() {
     <div className="space-y-12">
       <section>
         <h1 className="text-3xl font-semibold tracking-tight text-[var(--color-fg-bright)] mb-3">
-          KernelBench Hard
+          Hard
         </h1>
         <p className="text-sm text-[var(--color-fg-muted)] mb-6">
           Current scored CUDA board · RTX PRO 6000 Blackwell · sm_120 · 96 GB GDDR7 · 1.8 TB/s
         </p>
         <p className="text-[var(--color-fg)] leading-relaxed max-w-3xl">
-          A focused successor to KernelBench v3. One Blackwell GPU, a small set
+          A focused successor to the v3 suite. One Blackwell GPU, a small set
           of hard CUDA kernel problems, and real coding-agent CLIs as the harness.
           The table below keeps the comparable model rows visible and leaves
           one-off diagnostic rows in the source data.
@@ -237,7 +237,7 @@ export default async function HardPage() {
         <ul className="space-y-2 text-sm leading-relaxed list-none pl-0 max-w-3xl">
           <Bullet>One GPU instead of three. RTX PRO 6000 Blackwell (sm_120, 96 GB GDDR7, 1.8 TB/s).</Bullet>
           <Bullet>A small hand-designed problem deck instead of 43-58. Per-trial L2 flush, 30-trial median, 10 warmup absorbing torch.compile CUDA-graph capture and Triton autotune.</Bullet>
-          <Bullet>Real coding-agent CLIs as the harness — Claude Code, codex CLI, Kimi CLI, opencode, Droid — not a custom KernelBench agent loop.</Bullet>
+          <Bullet>Real coding-agent CLIs as the harness: Claude Code, codex CLI, Kimi CLI, opencode, Droid. This is not a custom v3 agent loop.</Bullet>
           <Bullet>Wall-clock budgets, not turn limits. 45 min/run.</Bullet>
           <Bullet>peak_fraction grounded in physical hardware ceilings instead of raw speedup ratios.</Bullet>
           <Bullet>Per-cell annotations with verdict, pull quotes from solution.py, and an &ldquo;implication&rdquo; statement, including the May 13 Claude Code GLM-5.1 reward-hack example.</Bullet>
