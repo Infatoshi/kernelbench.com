@@ -49,6 +49,7 @@ const FRESH_PRIMARY_PREFIXES = [
   "cursor/composer-2.5-fast [2026-05-28 finish",
   "gemini/gemini-3.5-flash [2026-05-28 finish",
   "grok/grok-build [2026-05-28 opus48-grok",
+  "minimax-claude/MiniMax-M3 [2026-06-01",
 ]
 
 const DIAGNOSTIC_AUDIT_NOTES: Record<string, string> = {
@@ -407,12 +408,13 @@ function compareModelRows(
     codex: 0,
     claude: 1,
     "zai-claude": 2,
-    droid: 3,
-    kimi: 4,
-    opencode: 5,
+    "minimax-claude": 3,
+    droid: 4,
+    kimi: 5,
+    opencode: 6,
   }
-  const pa = priority[a.harness] ?? 5
-  const pb = priority[b.harness] ?? 5
+  const pa = priority[a.harness] ?? 6
+  const pb = priority[b.harness] ?? 6
   if (pa !== pb) return pa - pb
   return b.pass_count - a.pass_count
 }
@@ -425,6 +427,7 @@ function shortLabel(label: string) {
     .replace("droid/zai/glm-5.1 [2026-05-08]", "Droid GLM-5.1 [2026-05-08]")
     .replace("opencode/zai/glm-5.1 [2026-05-08]", "OpenCode GLM-5.1 rerun [2026-05-08]")
     .replace("opencode/zai/glm-5.1", "OpenCode GLM-5.1 original")
+    .replace("minimax-claude/MiniMax-M3", "MiniMax M3")
     .replace("opencode/openrouter-pinned/", "or/")
     .replace("opencode/", "")
     .replace("codex/", "")
