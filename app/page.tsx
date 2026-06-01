@@ -1,85 +1,140 @@
 import Link from "next/link"
 
+const HUGGING_FACE_LOGO =
+  "https://huggingface.co/front/assets/huggingface_logo-noborder.svg"
+
+const benchmarks = [
+  {
+    href: "/hard",
+    title: "Hard",
+    description:
+      "Small hard CUDA deck, curated frontier-model comparison, single Blackwell SM120, clickable transcript viewers for scored runs.",
+    stats: [
+      ["problems", "8"],
+      ["models", "13"],
+      ["GPU", "SM120"],
+    ],
+    hfHref: "https://huggingface.co/datasets/Infatoshi/kernelbench-hard-runs",
+  },
+  {
+    href: "/v3",
+    title: "v3",
+    description:
+      "43-58 problems per GPU, 10 models, RTX 3090, H100, B200, four difficulty levels, and the original KernelBench agent loop.",
+    stats: [
+      ["problems", "43-58"],
+      ["GPUs", "3"],
+      ["models", "10"],
+      ["evaluations", "1500+"],
+    ],
+    hfHref: "https://huggingface.co/datasets/Infatoshi/kernelbench-v3-runs",
+  },
+]
+
 export default function HomePage() {
   return (
     <div className="space-y-12">
-      <section>
-        <h1 className="text-3xl sm:text-4xl font-semibold tracking-tight text-[var(--color-fg-bright)] mb-4">
-          GPU kernel benchmarks for autonomous coding agents
-        </h1>
-        <p className="text-[var(--color-fg)] leading-relaxed max-w-3xl">
-          Two benchmarks. One question: when you point a frontier model at
-          modern GPU primitives and let it iterate, what does it actually
-          produce? The runs use real CLI harnesses, real workspaces, correctness
-          checks, wall-clock budgets, and a roofline-based score grounded in
-          hardware ceilings.
-        </p>
+      <h1 className="sr-only">KernelBench benchmarks</h1>
+      <section aria-label="Benchmarks" className="space-y-4">
+        {benchmarks.map((benchmark) => (
+          <article key={benchmark.href} className="benchmark-card">
+            <Link
+              href={benchmark.href}
+              className="benchmark-main no-underline"
+              aria-label={`Open KernelBench ${benchmark.title}`}
+            >
+              <div className="flex flex-col gap-5 sm:flex-row sm:items-start sm:justify-between">
+                <div className="max-w-2xl">
+                  <h2 className="text-2xl sm:text-3xl font-semibold tracking-tight text-[var(--color-fg-bright)]">
+                    {benchmark.title}
+                  </h2>
+                  <p className="mt-3 text-sm sm:text-base text-[var(--color-fg)] leading-relaxed">
+                    {benchmark.description}
+                  </p>
+                </div>
+                <span className="benchmark-open" aria-hidden="true">
+                  <svg
+                    viewBox="0 0 24 24"
+                    fill="none"
+                    stroke="currentColor"
+                    strokeLinecap="round"
+                    strokeLinejoin="round"
+                    strokeWidth="1.8"
+                  >
+                    <path d="M7 17 17 7" />
+                    <path d="M9 7h8v8" />
+                  </svg>
+                </span>
+              </div>
+              <div className="mt-6 grid grid-cols-2 gap-3 sm:grid-cols-4">
+                {benchmark.stats.map(([label, value]) => (
+                  <Stat key={label} label={label} value={value} />
+                ))}
+              </div>
+            </Link>
+            <div className="benchmark-footer">
+              <a
+                href={benchmark.hfHref}
+                target="_blank"
+                rel="noreferrer"
+                className="hf-link no-underline"
+                aria-label={`Open KernelBench ${benchmark.title} runs on Hugging Face`}
+              >
+                <img
+                  src={HUGGING_FACE_LOGO}
+                  alt=""
+                  width="22"
+                  height="22"
+                  loading="lazy"
+                />
+                <span>Hugging Face runs</span>
+              </a>
+            </div>
+          </article>
+        ))}
       </section>
 
-      <section className="grid sm:grid-cols-2 gap-6">
-        <Link
-          href="/hard"
-          className="block box p-6 no-underline hover:border-[var(--color-fg-bright)] transition-colors"
-        >
-          <div className="text-xs uppercase tracking-wide text-[var(--color-fg-muted)] mb-2">Latest</div>
-          <h2 className="text-xl font-semibold text-[var(--color-fg-bright)] mb-3">
-            Hard <span className="text-[var(--color-fg-muted)] text-sm">2026-04</span>
-          </h2>
-          <p className="text-sm text-[var(--color-fg)] mb-4">
-            Small hard CUDA deck · curated model comparison · single Blackwell
-            SM120 · clickable transcript viewers for scored runs.
-          </p>
-          <div className="grid grid-cols-4 gap-3 text-xs tabular">
-            <Stat label="scored columns" value="8" />
-            <Stat label="models shown" value="13" />
-            <Stat label="GPU" value="SM120" />
-            <Stat label="best peak" value="0.722" emphasize />
-          </div>
-        </Link>
-
-        <Link
-          href="/v3"
-          className="block box p-6 no-underline hover:border-[var(--color-fg-bright)] transition-colors"
-        >
-          <div className="text-xs uppercase tracking-wide text-[var(--color-fg-muted)] mb-2">Archive</div>
-          <h2 className="text-xl font-semibold text-[var(--color-fg-bright)] mb-3">
-            v3 <span className="text-[var(--color-fg-muted)] text-sm">2026-02</span>
-          </h2>
-          <p className="text-sm text-[var(--color-fg)] mb-4">
-            43-58 problems per GPU · 10 models · RTX 3090 + H100 + B200 · 4 difficulty levels · custom KernelBench agent loop
-          </p>
-          <div className="grid grid-cols-3 gap-3 text-xs tabular">
-            <Stat label="GPUs" value="3" />
-            <Stat label="models" value="10" />
-            <Stat label="evaluations" value="1500+" />
-          </div>
-        </Link>
-      </section>
-
-      <section className="space-y-6">
+      <section className="space-y-5">
         <h2 className="text-xl font-semibold text-[var(--color-fg-bright)]">
           Design principles
         </h2>
         <ul className="space-y-3 text-sm leading-relaxed list-none pl-0">
           <Bullet>
-            <strong className="text-[var(--color-fg-bright)]">peak_fraction over speedup ratio.</strong>{" "}
-            speedups are easy to game (slow the baseline, inflate the ratio). peak_fraction is grounded in physical limits — fraction of relevant tensor-core or DRAM bandwidth ceiling the kernel actually achieved. harder to game, more honest.
+            <strong className="text-[var(--color-fg-bright)]">
+              Percent of theoretical maximum, not speedup over PyTorch.
+            </strong>{" "}
+            Scores are grounded in hardware ceilings instead of baseline quirks.
           </Bullet>
           <Bullet>
-            <strong className="text-[var(--color-fg-bright)]">real coding-agent CLIs as the harness.</strong>{" "}
-            no custom benchmark agent loop. each model runs through whatever its native developer-facing CLI is — claude code for anthropic, codex for openai, kimi cli for moonshot, opencode for everyone else. matches how engineers actually use these tools.
+            <strong className="text-[var(--color-fg-bright)]">
+              Modern coding-agent harnesses.
+            </strong>{" "}
+            Runs use Claude Code, Codex CLI, Cursor, Gemini CLI, Kimi CLI,
+            OpenCode, Grok, and MiniMax where those are the natural interfaces.
           </Bullet>
           <Bullet>
-            <strong className="text-[var(--color-fg-bright)]">wall-clock budgets.</strong>{" "}
-            45 min per (model, problem) run. models with verbose tool-use patterns aren&apos;t penalized just for being chatty; they trade exploration for kernel-iteration time within the budget.
+            <strong className="text-[var(--color-fg-bright)]">
+              Public transcript viewers.
+            </strong>{" "}
+            Browse{" "}
+            <Link href="/runs" className="underlined-link">
+              the run index
+            </Link>{" "}
+            or open{" "}
+            <Link
+              href="/runs/20260601_124343_minimax-claude_MiniMax-M3_07_w4a16_gemm.html"
+              className="underlined-link"
+            >
+              a scored Hard run
+            </Link>{" "}
+            to inspect tool calls, solution files, checks, timing, and costs.
           </Bullet>
           <Bullet>
-            <strong className="text-[var(--color-fg-bright)]">forensic audit of high-peak runs.</strong>{" "}
-            every cell where a model scored above ~10% peak gets its solution.py read by a human. reward hacks, rubric leaks, and exemplary kernels all annotated in the source repo with verdict + pull quotes.
-          </Bullet>
-          <Bullet>
-            <strong className="text-[var(--color-fg-bright)]">publish the flaws.</strong>{" "}
-            when the rubric leaks, the leak goes in the leaderboard. five frontier models all taking the same bf16 shortcut on FP8 GEMM is a result, not a bug to quietly fix.
+            <strong className="text-[var(--color-fg-bright)]">
+              Judge-assisted audit.
+            </strong>{" "}
+            A judge model helps flag reward hacking, rubric leaks, and suspicious
+            shortcuts for human review.
           </Bullet>
         </ul>
       </section>
@@ -89,7 +144,8 @@ export default function HomePage() {
           Contact
         </h2>
         <p className="text-sm text-[var(--color-fg)] leading-relaxed">
-          Open to inquiries — collaborations, model evals, custom benchmark builds, kernel-engineering consulting, anything kernel-adjacent.
+          Open to inquiries: collaborations, model evals, custom benchmark
+          builds, kernel-engineering consulting, anything kernel-adjacent.
         </p>
         <p className="text-sm text-[var(--color-fg)] leading-relaxed mt-2">
           Reach out:{" "}
@@ -102,25 +158,11 @@ export default function HomePage() {
   )
 }
 
-function Stat({
-  label,
-  value,
-  emphasize,
-}: {
-  label: string
-  value: string
-  emphasize?: boolean
-}) {
+function Stat({ label, value }: { label: string; value: string }) {
   return (
-    <div>
+    <div className="stat-box">
       <div className="text-[var(--color-fg-muted)]">{label}</div>
-      <div
-        className={
-          emphasize
-            ? "text-[var(--color-accent)] font-bold text-lg"
-            : "text-[var(--color-fg-bright)] font-bold text-lg"
-        }
-      >
+      <div className="text-[var(--color-fg-bright)] font-semibold text-lg">
         {value}
       </div>
     </div>
