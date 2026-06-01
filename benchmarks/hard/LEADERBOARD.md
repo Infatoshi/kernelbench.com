@@ -11,26 +11,26 @@ Annotations (`★`) attached to specific cells live in `results/annotations/<run
 | model | 01 | 02 | 03 | 04 | 05 | 06 | 07 | 09 | 10 | scored |
 |---|---|---|---|---|---|---|---|---|---|---|
 | gpt-5.5 [xhigh] | 0.423 ★ | 0.032 | 0.497 ★ | 0.363 ★ | 0.042 | 0.251 ★ | 0.159 ★ | 0.666 | 0.248 ★ | 9/9 |
-| claude-opus-4-7 [max] | 0.534 ★ | NO PERF | 0.602 ★ | 0.317 ★ | 0.020 | FAIL | 0.184 ★ | 0.722 ★ | 0.212 | 7/9 |
+| claude-opus-4-7 [max] | 0.534 ★ | 0.033 | 0.602 ★ | 0.317 ★ | 0.020 | FAIL | 0.184 ★ | 0.722 ★ | 0.212 | 8/9 |
 | deepseek/deepseek-v4-flash | FAIL | 0.009 | 0.167 ★ | 0.138 ★ | FAIL | 0.083 | 0.134 ★ | 0.577 | 0.196 | 7/9 |
 | deepseek/deepseek-v4-pro | FAIL | FAIL | 0.027 | 0.101 ★ | 0.011 | 0.108 ★ | 0.125 ★ | 0.667 | 0.232 | 7/9 |
 | or/xiaomi/mimo-v2.5-pro | 0.434 ★ | FAIL | ERR | 0.121 ★ | 0.017 | 0.211 ★ | 0.137 ★ | 0.516 | 0.190 | 7/9 |
-| claude-opus-4-8 [2026-05-28 opus48-grok max] | 0.533 | BENCH | 0.652 | 0.352 | 0.046 | 0.251 | 0.113 | - | - | 6/7 |
+| claude-opus-4-8 [2026-05-28 opus48-grok max] | 0.533 | 0.117 | 0.652 | 0.352 | 0.046 | 0.251 | 0.113 | - | - | 7/7 |
 | kimi-k2.6 | FAIL | 0.022 | 0.432 ★ | 0.118 ★ | 0.014 | 0.161 ★ | 0.220 ★ | ERR | ERR | 6/9 |
-| MiniMax M3 [2026-06-01] | 0.533 ★ | BENCH | 0.029 | 0.236 ★ | 0.043 ★ | 0.254 ★ | 0.108 | - | - | 6/7 |
+| MiniMax M3 [2026-06-01] | 0.533 ★ | 0.111 | 0.029 | 0.236 ★ | 0.043 ★ | 0.254 ★ | 0.108 | - | - | 7/7 |
 | or/qwen/qwen3.6-max-preview | 0.429 ★ | 0.011 | ERR | 0.077 | FAIL | 0.004 | 0.110 ★ | 0.395 | ERR | 6/9 |
 | zai/glm-5.1 | FAIL | 0.005 | ERR | 0.125 ★ | ERR | 0.238 ★ | 0.180 ★ | 0.589 | 0.182 | 6/9 |
-| claude-opus-4-7 [2026-05-28 finish max] | 0.524 | BENCH | 0.026 | FAIL | 0.045 | 0.247 | 0.100 | - | - | 5/7 |
-| gpt-5.5 [2026-05-28 finish xhigh] | 0.537 | BENCH | 0.664 | 0.113 | FAIL | 0.254 | 0.095 | - | - | 5/7 |
+| claude-opus-4-7 [2026-05-28 finish max] | 0.524 | 0.117 | 0.026 | FAIL | 0.045 | 0.247 | 0.100 | - | - | 6/7 |
+| gpt-5.5 [2026-05-28 finish xhigh] | 0.537 | 0.009 | 0.664 | 0.113 | FAIL | 0.254 | 0.095 | - | - | 6/7 |
 | droid/zai/glm-5.1 [2026-05-08] | 0.414 | ERR | 0.252 | 0.234 | ERR | 0.149 | 0.086 | ERR | ERR | 5/9 |
 | gemini/gemini-3.5-flash [2026-05-28 finish] | FAIL | FAIL | 0.225 | 0.081 | 0.010 | 0.183 | 0.077 | - | - | 5/7 |
 | or/qwen/qwen3.6-plus | 0.431 ★ | ERR | 0.022 | ERR | FAIL | 0.040 | 0.125 ★ | 0.569 | FAIL ★ | 5/9 |
 | zai-glm-5.1 [2026-05-13] | INVALID ★ | FAIL | 0.222 | 0.337 | 0.003 | 0.111 | ERR | FAIL | 0.147 | 5/9 |
-| cursor/composer-2.5-fast [2026-05-28 finish] | FAIL | BENCH | 0.625 | 0.315 | 0.032 | FAIL | 0.119 | - | - | 4/7 |
+| cursor/composer-2.5-fast [2026-05-28 finish] | FAIL | 0.069 | 0.625 | 0.315 | 0.032 | FAIL | 0.119 | - | - | 5/7 |
 | or/minimax/minimax-m2.7 | ERR | ERR | FAIL | 0.034 | FAIL | 0.076 | 0.030 | 0.113 | FAIL ★ | 4/9 |
 | or/qwen/qwen3.6-27b | ERR | FAIL | FAIL | ERR | FAIL | 0.082 | ERR | 0.436 | 0.105 | 3/9 |
-| zai/glm-5.1 [2026-05-08] | FAIL | NO PERF | ERR | 0.056 | ERR | 0.215 | ERR | ERR | 0.174 | 3/9 |
-| grok/grok-build [2026-05-28 opus48-grok max] | FAIL | BENCH | FAIL | 0.037 | FAIL | FAIL | FAIL | - | - | 1/7 |
+| zai/glm-5.1 [2026-05-08] | FAIL | 0.003 | ERR | 0.056 | ERR | 0.215 | ERR | ERR | 0.174 | 4/9 |
+| grok/grok-build [2026-05-28 opus48-grok max] | FAIL | 0.118 | FAIL | 0.037 | FAIL | FAIL | FAIL | - | - | 2/7 |
 | zai/glm-5.1 [2026-05-28 finish] | ERR | ERR | ERR | 0.039 | ERR | ERR | ERR | - | - | 1/7 |
 | zai-glm-5.1 [2026-05-28 finish] | ERR | ERR | ERR | ERR | ERR | ERR | ERR | - | - | 0/7 |
 
@@ -39,7 +39,7 @@ Annotations (`★`) attached to specific cells live in `results/annotations/<run
 | problem | best peak | best model | n scored |
 |---|---|---|---|
 | 01_fp8_gemm | 0.537 | gpt-5.5 [2026-05-28 finish xhigh] | 10/23 |
-| 02_kda_cutlass | 0.032 | gpt-5.5 [xhigh] | 5/23 |
+| 02_kda_cutlass | 0.118 | grok/grok-build [2026-05-28 opus48-grok max] | 13/23 |
 | 03_paged_attention | 0.664 | gpt-5.5 [2026-05-28 finish xhigh] | 14/23 |
 | 04_kahan_softmax | 0.363 | gpt-5.5 [xhigh] | 19/23 |
 | 05_topk_bitonic | 0.046 | claude-opus-4-8 [2026-05-28 opus48-grok max] | 11/23 |

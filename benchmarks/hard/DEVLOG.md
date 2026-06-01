@@ -4,6 +4,46 @@ A running record of decisions, dead ends, and lessons. Newest entries on top. Th
 
 ---
 
+## 2026-06-01 - KDA benchmark backfill
+
+The KDA benchmark timeouts were not lost submissions. The archived
+`solution.py` files were present and correctness-passing; the old
+`benchmark.py` measured eager + `torch.compile(reference)` diagnostics before
+timing the submitted solution, and the compile path could consume the whole
+1800s post-run benchmark budget.
+
+Fixes:
+
+- `02_kda_cutlass/benchmark.py` now times and prints the solution score first.
+  Eager/compiled/SOTA reference diagnostics are opt-in via
+  `KBH_KDA_BENCHMARK_BASELINES=1`.
+- `scripts/run_hard.sh` gives KDA a 7200s benchmark backstop by default
+  (`KBH_BENCHMARK_TIMEOUT_02_KDA_CUTLASS_SECONDS` overrides it) and records the
+  check/benchmark timeout values in future `result.json` files.
+- Backfilled every archived correctness-passing/no-score KDA row from its
+  submitted kernel under `outputs/gpu.lock`; `results/leaderboard.json` now has
+  zero `correct=true` cells without a numeric `peak_fraction`.
+
+Backfilled KDA scores:
+
+```text
+grok/grok-build [2026-05-28 opus48-grok max]       0.1184
+claude/claude-opus-4-7 [2026-05-28 finish max]    0.1166
+claude/claude-opus-4-8 [2026-05-28 opus48-grok]   0.1165
+minimax-claude/MiniMax-M3 [2026-06-01]            0.1114
+cursor/composer-2.5-fast [2026-05-28 finish]      0.0690
+claude/claude-opus-4-7 [max]                      0.0330
+codex/gpt-5.5 [2026-05-28 finish xhigh]           0.0095
+opencode/zai/glm-5.1 [2026-05-08]                 0.0030
+```
+
+Note: the Z.ai Claude FP8 row from 2026-05-13 remains invalid despite having a
+numeric archived benchmark, because that run modified `problem.yaml` tolerance.
+The leaderboard backfill intentionally skips cells that were already marked
+invalid.
+
+---
+
 ## 2026-06-01 - MiniMax M3 Claude Code full sweep
 
 Full CUDA-track sweep through the direct Claude Code route:
@@ -12,13 +52,14 @@ Full CUDA-track sweep through the direct Claude Code route:
 kbh_minimax_m3_claude_full_20260601_105827
 ```
 
-MiniMax M3 produced correct solutions on all seven problems. Six benchmarked
-successfully; `02_kda_cutlass` passed correctness but its benchmark hit the
-1800s benchmark timeout. Published row:
+MiniMax M3 produced correct solutions on all seven problems. The original
+`02_kda_cutlass` post-run benchmark hit the old 1800s timeout, but the archived
+submission later backfilled successfully after the KDA benchmark fix. Published
+row:
 
 ```text
 01_fp8_gemm          0.5334
-02_kda_cutlass       PASS, benchmark_timeout
+02_kda_cutlass       0.1114
 03_paged_attention   0.0286
 04_kahan_softmax     0.2364
 05_topk_bitonic      0.0433

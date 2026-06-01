@@ -4,6 +4,7 @@ ROOT = Path(__file__).resolve().parents[1]
 RUN_HARD = ROOT / "scripts" / "run_hard.sh"
 LAUNCH_PARALLEL = ROOT / "scripts" / "launch_parallel_sweep.sh"
 CLASSIFICATION = ROOT / "src" / "harness" / "classification.py"
+KDA_BENCHMARK = ROOT / "problems" / "02_kda_cutlass" / "benchmark.py"
 
 
 def test_post_run_timeout_starts_inside_gpu_lock() -> None:
@@ -12,6 +13,21 @@ def test_post_run_timeout_starts_inside_gpu_lock() -> None:
     assert "run_gpu_locked_timeout benchmark.py" in script
     assert "timeout 180 uv run python check.py" not in script
     assert "timeout 1800 uv run python benchmark.py" not in script
+
+
+def test_kda_has_longer_benchmark_timeout_backstop() -> None:
+    script = RUN_HARD.read_text()
+    assert 'PROBLEM_NAME" = "02_kda_cutlass' in script
+    assert "KBH_BENCHMARK_TIMEOUT_02_KDA_CUTLASS_SECONDS" in script
+    assert "benchmark_timeout_seconds" in script
+
+
+def test_kda_benchmark_scores_solution_before_optional_baselines() -> None:
+    benchmark = KDA_BENCHMARK.read_text()
+    assert "KBH_KDA_BENCHMARK_BASELINES" in benchmark
+    assert "Solution first" in benchmark
+    assert benchmark.index("ms_sol = time_fn") < benchmark.index("if not include_baselines")
+    assert benchmark.index("if not include_baselines") < benchmark.index("torch.compile")
 
 
 def test_run_archives_are_allocated_atomically() -> None:
