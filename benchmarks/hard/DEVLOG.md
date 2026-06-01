@@ -4,6 +4,38 @@ A running record of decisions, dead ends, and lessons. Newest entries on top. Th
 
 ---
 
+## 2026-06-01 - Removed Kahan softmax from the active deck
+
+`04_kahan_softmax` has been removed from the benchmark surface. The problem was
+too easy to satisfy with a plain fast softmax under the existing tolerance, so
+it rewarded the shortcut instead of forcing compensated summation. Current
+scripts, machine-readable results, baselines, annotations, and leaderboard docs
+no longer include it. Historical DEVLOG discussion is intentionally preserved
+below as audit context for why the problem was removed.
+
+## 2026-06-01 - Benchmark scoring is solution-first by default
+
+KDA exposed a general harness risk: reference diagnostics can be slower than the
+submitted kernel, so timing eager / `torch.compile(reference)` / SOTA before the
+solution can turn a valid submission into a post-run benchmark timeout. The
+default benchmark path now measures the submitted solution first for every
+problem. Reference diagnostics are still available, but only when explicitly
+requested.
+
+Fixes:
+
+- Every `problems/*/benchmark.py` now times and prints `variant=solution` before
+  any eager, compiled, or SOTA diagnostic.
+- Eager / compiled / SOTA diagnostics are opt-in via
+  `KBH_BENCHMARK_BASELINES=1`; KDA also keeps the legacy
+  `KBH_KDA_BENCHMARK_BASELINES=1` alias.
+- `src/eval/timing.py` now emits `benchmark_event` lines around each variant
+  (`variant_start`, `variant_end`, `variant_error`) so future audits can split
+  solution, eager, compiled, and SOTA wall time directly from `benchmark.log`.
+- During `KBH_DISABLE_AGENT_CUDA=1` agent phases, `nvidia-smi` and `nvcc` now
+  pass through without taking the GPU lock, while `ncu` and `nsys` fail fast.
+  Harness-owned `check.py` and `benchmark.py` still run under `outputs/gpu.lock`.
+
 ## 2026-06-01 - KDA benchmark backfill
 
 The KDA benchmark timeouts were not lost submissions. The archived

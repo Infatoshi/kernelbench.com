@@ -34,7 +34,6 @@ declare -a PROBLEMS=(
     "problems/01_fp8_gemm"
     "problems/02_kda_cutlass"
     "problems/03_paged_attention"
-    "problems/04_kahan_softmax"
     "problems/05_topk_bitonic"
     "problems/06_sonic_moe_swiglu"
     "problems/07_w4a16_gemm"

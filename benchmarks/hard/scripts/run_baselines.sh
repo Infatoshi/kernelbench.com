@@ -2,9 +2,9 @@
 # Run benchmark.py for every problem, parse the per-variant output, and emit
 # results/problem_baselines.json with reference + SOTA timings.
 #
-# benchmark.py already runs four variants per shape (eager, compiled, sota,
-# solution). We only need to capture eager + compiled + sota — the solution
-# column is whatever happens to be in the workspace.
+# benchmark.py defaults to solution-first scoring. This script opts into
+# reference diagnostics so it can capture eager + compiled + sota rows. The
+# solution column is whatever happens to be in the workspace.
 #
 # To get a benchmarkable solution.py (some scripts crash without one), we
 # write a stub that re-exports from reference.py. The solution numbers are
@@ -35,7 +35,7 @@ cleanup() {
 trap cleanup EXIT
 
 declare -a problems=(
-    01_fp8_gemm 02_kda_cutlass 03_paged_attention 04_kahan_softmax
+    01_fp8_gemm 02_kda_cutlass 03_paged_attention
     05_topk_bitonic 06_sonic_moe_swiglu 07_w4a16_gemm
 )
 
@@ -69,7 +69,7 @@ from reference import Model, get_inputs, get_init_inputs  # noqa: F401
 EOF
 
     echo "==> running $p (timeout 5 min)"
-    raw=$(cd "$pdir" && timeout 300 uv run python benchmark.py 2>&1 || true)
+    raw=$(cd "$pdir" && KBH_BENCHMARK_BASELINES=1 timeout 300 uv run python benchmark.py 2>&1 || true)
     # Save raw output for debugging
     mkdir -p results/raw_baselines
     echo "$raw" > "results/raw_baselines/$p.txt"

@@ -1,6 +1,6 @@
 # KernelBench-Hard
 
-Surgical GPU kernel benchmark. 7 carefully-chosen problems, frontier coding agents, roofline-based metric (achieved TFLOPS or GB/s vs hardware peak). Link-don't-spoil problem briefs: agents receive repo/paper URLs, not source snippets.
+Surgical GPU kernel benchmark. 6 active CUDA problems, frontier coding agents, roofline-based metric (achieved TFLOPS or GB/s vs hardware peak). Link-don't-spoil problem briefs: agents receive repo/paper URLs, not source snippets.
 
 Sibling project to [KernelBench-v3](https://github.com/Infatoshi/KernelBench-v3) (volume-oriented; local open-weight models). Hard is for frontier-model harnesses on a small, high-signal deck.
 
@@ -15,7 +15,6 @@ This repository is published for transparency: it documents the exact prompts, h
 | 01 | FP8 e4m3 GEMM (off-alignment shapes) | RTX PRO 6000 (SM120) | Tensor-core GEMM, epilogue fusion |
 | 02 | KDA (Kimi Delta Attention) via CUTLASS CuTe | RTX PRO 6000 | Novel attention from paper, CUTLASS 4.x |
 | 03 | Paged Attention decode | RTX PRO 6000 | Indirect indexing, pointer chasing |
-| 04 | Kahan-corrected Softmax | RTX PRO 6000 | Floating-point error awareness |
 | 05 | TopK with bitonic sort | RTX PRO 6000 | Small-output, comparator networks |
 | 06 | Sonic-MoE up-projection: grouped GEMM + fused SwiGLU | RTX PRO 6000 | Megakernel, load balancing, variable-length |
 | 07 | W4A16 weight-only GEMM (AWQ/GPTQ-style) | RTX PRO 6000 | Bit unpack, quantization, memory-bound decode |
@@ -44,7 +43,7 @@ One harness per model, each pinned to the highest-fidelity native endpoint.
 | DeepSeek V4 Pro | `opencode deepseek/deepseek-v4-pro` | DeepSeek direct (api.deepseek.com) |
 | DeepSeek V4 Flash | `opencode deepseek/deepseek-v4-flash` | DeepSeek direct (api.deepseek.com) |
 
-7 models × 7 problems = **49 agent-runs per sweep** (~37 GPU-hours at 45min/run).
+Each configured sweep runs its selected model matrix across the 6 active CUDA problems. At a 45min cap, budget about 0.75 GPU-hours per queued run.
 
 > **Codex binary note.** The harness uses the npm-distributed `@openai/codex` (currently `0.125.0`) installed at `~/.local/node-*/bin/codex`. The shell has `codex` aliased to a locally-built rust binary, but aliases don't expand inside non-interactive scripts, so the harness picks up the npm version automatically via PATH. To upgrade in the future: `npm install -g @openai/codex`.
 
@@ -65,7 +64,7 @@ uv sync
 # Run a single problem through a single harness
 ./scripts/run_hard.sh claude claude-opus-4-7 problems/01_fp8_gemm
 
-# Full sweep (active matrix × all 7 CUDA problems)
+# Full sweep (active matrix × all 6 active CUDA problems)
 ./scripts/sweep.sh
 
 # Plot roofline for a completed run

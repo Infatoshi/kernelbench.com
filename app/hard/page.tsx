@@ -25,7 +25,6 @@ const PROBLEMS = [
   { key: "01_fp8_gemm", short: "01 fp8" },
   { key: "02_kda_cutlass", short: "02 kda" },
   { key: "03_paged_attention", short: "03 paged" },
-  { key: "04_kahan_softmax", short: "04 kahan" },
   { key: "05_topk_bitonic", short: "05 topk" },
   { key: "06_sonic_moe_swiglu", short: "06 moe" },
   { key: "07_w4a16_gemm", short: "07 w4a16" },
@@ -60,13 +59,13 @@ const DIAGNOSTIC_AUDIT_NOTES: Record<string, string> = {
   "opencode/openrouter-pinned/qwen/qwen3.6-max-preview":
     "Problems 03/10 are no-solution provider or unknown early-stop cells.",
   "opencode/openrouter-pinned/qwen/qwen3.6-plus":
-    "Problems 02/04 are harness/setup or unknown early-stop cells.",
+    "Problem 02 is a harness/setup or unknown early-stop cell.",
   "opencode/zai/glm-5.1":
     "Problems 03/05 hit hidden reasoning-token limits before writing solution.py; 01 timed out after regressing a passing attempt.",
   "opencode/zai/glm-5.1 [2026-05-08]":
     "Problems 03/05/07/09 hit hidden reasoning-token limits with no solution.py; 01 timed out broken.",
   "opencode/zai/glm-5.1 [2026-05-28 finish]":
-    "May 28 retry confirmed six CUDA cells still end as provider early-stops; only the inherited 04 pass remains.",
+    "May 28 retry confirmed all six CUDA cells still end as provider early-stops.",
   "zai-claude/glm-5.1 [2026-05-28 finish]":
     "Z.ai Claude route was unavailable in May 28 preflight; cells are retained from the May 23 diagnostic run.",
   "opencode/openrouter-pinned/minimax/minimax-m2.7":
@@ -100,10 +99,10 @@ export default async function HardPage() {
           kernelbench hard
         </h1>
         <p className="text-sm text-[var(--color-fg-muted)] mb-6">
-          Original 9-problem board + May 28 CUDA finish rerun · RTX PRO 6000 Blackwell · sm_120 · 96 GB GDDR7 · 1.8 TB/s
+          Current 8-problem board + May 28 CUDA finish rerun · RTX PRO 6000 Blackwell · sm_120 · 96 GB GDDR7 · 1.8 TB/s
         </p>
         <p className="text-[var(--color-fg)] leading-relaxed max-w-3xl">
-          A focused successor to KernelBench v3. One Blackwell GPU, nine hand-designed problems, real coding-agent CLIs as the harness. The original public board swept twelve frontier model-harness pairs; the May 8 Z.ai rerun added fresh GLM-5.1 rows for OpenCode and Droid, and the May 13 rerun adds GLM-5.1 through Claude Code on Z.ai's Anthropic-compatible endpoint. The May 28 finish rerun adds queue-safe seven-problem CUDA rows for Codex, Claude, Cursor Agent, and native Gemini; the same-day addendum adds Claude Opus 4.8 and Grok Build. The leaderboard separates primary comparable sweeps from diagnostic rows where audit found API/auth/provider/adapter no-results.
+          A focused successor to KernelBench v3. One Blackwell GPU, eight hand-designed problems, real coding-agent CLIs as the harness. The original public board swept twelve frontier model-harness pairs; the May 8 Z.ai rerun added fresh GLM-5.1 rows for OpenCode and Droid, and the May 13 rerun adds GLM-5.1 through Claude Code on Z.ai's Anthropic-compatible endpoint. The May 28 finish rerun adds queue-safe six-problem CUDA rows for Codex, Claude, Cursor Agent, and native Gemini; the same-day addendum adds Claude Opus 4.8 and Grok Build. The leaderboard separates primary comparable sweeps from diagnostic rows where audit found API/auth/provider/adapter no-results.
         </p>
       </section>
 
@@ -235,7 +234,7 @@ export default async function HardPage() {
           # rubric leaks
         </h2>
         <p className="text-[var(--color-fg)] leading-relaxed mb-4 max-w-3xl">
-          Two cells in the leaderboard promise something the benchmark doesn&apos;t actually measure. They&apos;re marked{" "}
+          One row in the leaderboard promises something the benchmark doesn&apos;t actually measure. It&apos;s marked{" "}
           <span className="text-[var(--color-warn)]">★</span> for a reason.
         </p>
 
@@ -267,37 +266,14 @@ export default async function HardPage() {
             }
           />
 
-          <LeakCard
-            title="04 kahan_softmax — Kahan compensation skipped"
-            cluster={[
-              { model: "gpt-5.5 [xhigh]", peak: "0.363" },
-              { model: "claude-opus-4-7 [max]", peak: "0.317" },
-              { model: "deepseek-v4-flash", peak: "0.138" },
-              { model: "glm-5.1", peak: "0.125" },
-              { model: "mimo-v2.5-pro", peak: "0.121" },
-              { model: "kimi-k2.6", peak: "0.118" },
-            ]}
-            body={
-              <>
-                Six of seven passing solutions skipped the Kahan compensated
-                summation entirely. Only{" "}
-                <span className="text-[var(--color-fg-bright)]">deepseek-v4-pro</span>
-                {" "}— the lowest passing peak at 0.101 — actually implemented the
-                algorithm the problem name describes. Compensated summation has real
-                overhead, naive softmax fits within tolerance, and the rubric leaks.
-                The model whose docstring explicitly states &ldquo;Numerically tight
-                softmax with Kahan compensated summation&rdquo; is the model that
-                loses the cell.
-              </>
-            }
-          />
         </div>
 
         <p className="text-sm text-[var(--color-fg-muted)] mt-6 max-w-3xl leading-relaxed">
-          Both leaks are fixable in a few hours of problem-design work. Publishing without
-          fixing because (a) every iteration surfaces the next leak — diminishing returns,
-          and (b) the leaks ARE the finding. &ldquo;Five frontier models all took the same
-          bf16 shortcut on FP8 GEMM&rdquo; is itself a headline.
+          This leak is fixable with a few hours of problem-design work: tighten
+          tolerance until bf16-via-cast and real fp8-tensor-core math diverge, or
+          add a static-analysis check for the cast pattern. Keeping the caveat visible
+          is still useful because &ldquo;five frontier models all took the same bf16
+          shortcut on FP8 GEMM&rdquo; is itself a finding.
         </p>
       </section>
 
@@ -307,11 +283,11 @@ export default async function HardPage() {
         </h2>
         <ul className="space-y-2 text-sm leading-relaxed list-none pl-0 max-w-3xl">
           <Bullet>One GPU instead of three. RTX PRO 6000 Blackwell (sm_120, 96 GB GDDR7, 1.8 TB/s).</Bullet>
-          <Bullet>Seven hand-designed problems instead of 43-58. Per-trial L2 flush, 30-trial median, 10 warmup absorbing torch.compile CUDA-graph capture and Triton autotune.</Bullet>
+          <Bullet>A small hand-designed problem deck instead of 43-58. Per-trial L2 flush, 30-trial median, 10 warmup absorbing torch.compile CUDA-graph capture and Triton autotune.</Bullet>
           <Bullet>Real coding-agent CLIs as the harness — Claude Code, codex CLI, Kimi CLI, opencode, Droid — not a custom KernelBench agent loop.</Bullet>
           <Bullet>Wall-clock budgets, not turn limits. 45 min/run.</Bullet>
           <Bullet>peak_fraction grounded in physical hardware ceilings instead of raw speedup ratios.</Bullet>
-          <Bullet>Per-cell annotations with verdict, pull quotes from solution.py, and an &ldquo;implication&rdquo; statement. 36 annotations, including the May 13 Claude Code GLM-5.1 reward-hack example.</Bullet>
+          <Bullet>Per-cell annotations with verdict, pull quotes from solution.py, and an &ldquo;implication&rdquo; statement, including the May 13 Claude Code GLM-5.1 reward-hack example.</Bullet>
         </ul>
       </section>
 
