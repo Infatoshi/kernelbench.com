@@ -1,6 +1,7 @@
 import type { Metadata } from "next"
 import { JetBrains_Mono } from "next/font/google"
 import "./globals.css"
+import { ThemeToggle } from "./theme-toggle"
 
 const mono = JetBrains_Mono({
   subsets: ["latin"],
@@ -28,7 +29,14 @@ export default function RootLayout({
   children: React.ReactNode
 }) {
   return (
-    <html lang="en" className={mono.variable}>
+    <html lang="en" className={mono.variable} data-theme="dark" suppressHydrationWarning>
+      <head>
+        <script
+          dangerouslySetInnerHTML={{
+            __html: `try{var t=localStorage.getItem("kb-theme");document.documentElement.dataset.theme=t==="light"?"light":"dark"}catch(e){document.documentElement.dataset.theme="dark"}`,
+          }}
+        />
+      </head>
       <body className="min-h-screen">
         <Header />
         <main className="container mx-auto px-4 sm:px-6 max-w-5xl py-10">
@@ -43,23 +51,26 @@ export default function RootLayout({
 function Header() {
   return (
     <header className="border-b border-[var(--color-border)]">
-      <div className="container mx-auto max-w-5xl px-4 sm:px-6 py-4 flex items-center justify-between gap-6">
+      <div className="container mx-auto max-w-5xl px-4 sm:px-6 py-4 flex flex-wrap items-center justify-between gap-x-6 gap-y-3">
         <a href="/" className="font-semibold text-[var(--color-fg-bright)] no-underline">
           KernelBench
         </a>
-        <nav className="flex items-center gap-5 text-sm text-[var(--color-fg-muted)]">
-          <a href="/v3">v3</a>
-          <a href="/hard">hard</a>
-          <a href="/runs">runs</a>
-          <a href="/blog">blog</a>
-          <a
-            href="https://github.com/Infatoshi/kernelbench.com"
-            target="_blank"
-            rel="noreferrer"
-          >
-            github
-          </a>
-        </nav>
+        <div className="ml-auto flex items-center gap-3 sm:gap-5">
+          <nav className="flex items-center gap-3 sm:gap-5 text-sm text-[var(--color-fg-muted)]">
+            <a href="/v3">v3</a>
+            <a href="/hard">hard</a>
+            <a href="/runs">runs</a>
+            <a href="/blog">blog</a>
+            <a
+              href="https://github.com/Infatoshi/kernelbench.com"
+              target="_blank"
+              rel="noreferrer"
+            >
+              github
+            </a>
+          </nav>
+          <ThemeToggle />
+        </div>
       </div>
     </header>
   )
