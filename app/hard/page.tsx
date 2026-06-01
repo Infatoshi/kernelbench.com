@@ -70,9 +70,9 @@ const DIAGNOSTIC_AUDIT_NOTES: Record<string, string> = {
   "zai-claude/glm-5.1 [2026-05-28 finish]":
     "Z.ai Claude route was unavailable in May 28 preflight; cells are retained from the May 23 diagnostic run.",
   "opencode/openrouter-pinned/minimax/minimax-m2.7":
-    "Problem 01 has no checkable artifact; remaining non-passes mix timeout and invalid/forbidden-op solution failures.",
+    "Problem 01 has no checkable artifact; remaining non-scored cells mix timeout and invalid/forbidden-op solution failures.",
   "opencode/openrouter-pinned/qwen/qwen3.6-27b":
-    "Multiple no-solution/API/unknown cells; raw pass count is not comparable.",
+    "Multiple no-solution/API/unknown cells; raw scored count is not comparable.",
 }
 
 function isPrimaryModel(m: Model) {
@@ -112,7 +112,7 @@ export default async function HardPage() {
           # leaderboard
         </h2>
         <p className="text-xs text-[var(--color-fg-muted)] mb-4">
-          cells = peak_fraction (fraction of the relevant hardware ceiling). FAIL = solution written but missed correctness. ERR = no solution produced. INVALID = benchmark file mutation or other scoring-invalid behavior. <span className="text-[var(--color-warn)]">★</span> = annotation attached. <span className="text-[var(--color-fg-bright)]">click any cell to open the full transcript viewer</span> — every tool call, every reasoning step, the solution.py, the check.log.
+          cells = peak_fraction (fraction of the relevant hardware ceiling). BENCH = correctness passed but benchmark timing did not finish, so the cell is unscored. NO PERF = correctness passed but no peak_fraction was recorded. FAIL = solution written but missed correctness. ERR = no solution produced. INVALID = benchmark file mutation or other scoring-invalid behavior. <span className="text-[var(--color-warn)]">★</span> = annotation attached. <span className="text-[var(--color-fg-bright)]">click any cell to open the full transcript viewer</span> — every tool call, every reasoning step, the solution.py, the check.log.
           {" "}Fresh sweep cells include wall time, token usage, cache/reasoning tokens, and GPU queue mode in the cell tooltip when present.
         </p>
         <div className="space-y-8">
@@ -121,8 +121,8 @@ export default async function HardPage() {
               serious comparison
             </h3>
             <p className="text-[10px] sm:text-xs text-[var(--color-fg-muted)] mb-2 max-w-4xl leading-relaxed">
-              Audited non-passes here are model/check failures, full-budget timeouts,
-              or explicit invalid behavior. Raw pass totals are comparable within this
+              Audited non-scored cells here are model/check failures, full-budget timeouts,
+              or explicit invalid behavior. Raw scored totals are comparable within this
               section.
             </p>
             <LeaderboardTable
@@ -139,7 +139,7 @@ export default async function HardPage() {
             <p className="text-[10px] sm:text-xs text-[var(--color-fg-muted)] mb-2 max-w-4xl leading-relaxed">
               Rows retained for transparency, but at least one non-pass was an
               auth/API/provider/adapter/setup no-result rather than a clean model
-              attempt. Do not rank these pass totals against the serious table.
+              attempt. Do not rank these scored totals against the serious table.
             </p>
             <LeaderboardTable
               models={diagnosticModels}
@@ -151,7 +151,7 @@ export default async function HardPage() {
         </div>
         <p className="text-[10px] sm:text-xs text-[var(--color-fg-muted)] mt-2 max-w-4xl leading-relaxed">
           Audit note: DeepSeek through OpenCode stayed in the serious section because
-          its non-passes were normal correctness/build failures or full-budget
+          its non-scored cells were normal correctness/build failures or full-budget
           timeouts. OpenCode/Z.ai rows remain diagnostic because repeated hidden
           reasoning/provider early-stops produced no-solution cells before useful actions.
           Inspect the{" "}
@@ -185,7 +185,7 @@ export default async function HardPage() {
                 <th className="text-right">SOTA ms</th>
                 <th className="text-right">best peak</th>
                 <th>best model</th>
-                <th className="text-right">n pass</th>
+                <th className="text-right">n scored</th>
               </tr>
             </thead>
             <tbody>
@@ -360,7 +360,7 @@ function LeaderboardTable({
                 {p.short}
               </th>
             ))}
-            <th className="text-right">PASS</th>
+            <th className="text-right">SCORED</th>
             {showNotes ? <th>audit note</th> : null}
           </tr>
         </thead>
@@ -507,9 +507,17 @@ function renderCell(
         <span className="text-[var(--color-fg-bright)]">★</span>
       ) : null
     const pf = cell.peak_fraction
+    const value =
+      pf !== null ? (
+        pf.toFixed(3)
+      ) : cell.failure_reason === "benchmark_timeout" ? (
+        <span className="cell-err">BENCH</span>
+      ) : (
+        <span className="cell-err">NO PERF</span>
+      )
     return wrap(
       <>
-        {pf !== null ? pf.toFixed(3) : "PASS"}
+        {value}
         {star ? <span className="ml-1">{star}</span> : null}
       </>,
     )
@@ -533,6 +541,8 @@ function renderCell(
 function cellTitle(
   cell: {
     run_id: string
+    correct: boolean
+    peak_fraction: number | null
     failure_reason?: string | null
     retryable_infra_failure?: boolean | null
     minimum_useful_output_tokens?: number | null
@@ -562,10 +572,20 @@ function cellTitle(
   hasViewer: boolean,
 ) {
   const usage = cell.usage ?? {}
+  const status =
+    cell.failure_reason === "pass"
+      ? null
+      : cell.correct && cell.failure_reason === "benchmark_timeout"
+        ? "benchmark timed out after correctness passed"
+        : cell.correct && cell.failure_reason
+          ? `status ${cell.failure_reason}`
+          : cell.failure_reason
+            ? `failure ${cell.failure_reason}`
+            : null
   const parts = [
     cell.run_id,
     hasViewer ? "click to open transcript viewer" : "transcript viewer unavailable",
-    cell.failure_reason ? `failure ${cell.failure_reason}` : null,
+    status,
     cell.retryable_infra_failure ? "retryable infra failure" : null,
     cell.minimum_useful_output_tokens != null
       ? `min useful output ${fmtInt(cell.minimum_useful_output_tokens)} tok`

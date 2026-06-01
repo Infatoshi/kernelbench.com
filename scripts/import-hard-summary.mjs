@@ -39,7 +39,7 @@ const models = [...byLabel.values()].map((model) => {
   const cells = Object.values(model.results)
   return {
     ...model,
-    pass_count: cells.filter((cell) => cell.correct).length,
+    pass_count: cells.filter(isScoredCell).length,
     total_runs: cells.length,
   }
 })
@@ -104,7 +104,7 @@ function perProblem(problems, models) {
         const cell = model.results[problem]
         if (!cell) continue
         attempted.push(cell)
-        if (cell.correct) {
+        if (isScoredCell(cell)) {
           passes.push({
             model: model.label,
             peak_fraction: cell.peak_fraction,
@@ -127,6 +127,10 @@ function perProblem(problems, models) {
       ]
     }),
   )
+}
+
+function isScoredCell(cell) {
+  return cell.correct && typeof cell.peak_fraction === "number"
 }
 
 function modelLabel(row, tag) {

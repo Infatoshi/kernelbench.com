@@ -10,6 +10,7 @@ type RunRow = {
   effort: string
   correct: boolean
   has_solution: boolean
+  failure_reason: string | null
   peak_fraction: number | null
   elapsed_seconds: number | null
 }
@@ -44,12 +45,13 @@ async function loadAllRuns(): Promise<RunRow[]> {
         effort: m.effort,
         correct: cell.correct,
         has_solution: cell.has_solution,
+        failure_reason: cell.failure_reason ?? null,
         peak_fraction: cell.peak_fraction,
         elapsed_seconds: cell.elapsed_seconds ?? null,
       })
     }
   }
-  // Sort by peak_fraction desc, with PASS-without-peak before FAIL/ERR
+  // Sort by scored peak_fraction desc, with correctness-only no-perf rows before FAIL/ERR.
   out.sort((a, b) => {
     const ap = a.correct ? a.peak_fraction ?? -0.5 : a.has_solution ? -1 : -2
     const bp = b.correct ? b.peak_fraction ?? -0.5 : b.has_solution ? -1 : -2
@@ -71,7 +73,9 @@ function statusCell(r: RunRow) {
         {r.peak_fraction.toFixed(3)}
       </span>
     ) : (
-      <span className="text-[var(--color-fg-bright)]">PASS</span>
+      <span className="text-[var(--color-bad)]">
+        {r.failure_reason === "benchmark_timeout" ? "BENCH" : "NO PERF"}
+      </span>
     )
   }
   if (r.has_solution)
@@ -96,7 +100,8 @@ export default async function RunsIndex({ searchParams }: RunsIndexProps) {
     ? allRuns.filter((r) => r.harness === harnessFilter)
     : allRuns
 
-  const passes = runs.filter((r) => r.correct).length
+  const scored = runs.filter((r) => r.correct && r.peak_fraction !== null).length
+  const noPerf = runs.filter((r) => r.correct && r.peak_fraction === null).length
   const fails = runs.filter((r) => !r.correct && r.has_solution).length
   const errs = runs.filter((r) => !r.correct && !r.has_solution).length
   const title = harnessFilter ? `${harnessFilter} runs` : "all runs"
@@ -108,7 +113,7 @@ export default async function RunsIndex({ searchParams }: RunsIndexProps) {
           {title}
         </h1>
         <p className="text-sm text-[var(--color-fg-muted)] mb-4">
-          {runs.length} runs · {passes} pass · {fails} fail · {errs} err · sorted by peak_fraction desc
+          {runs.length} runs · {scored} scored · {noPerf} no perf · {fails} fail · {errs} err · sorted by peak_fraction desc
         </p>
         {harnessFilter ? (
           <p className="text-xs text-[var(--color-fg-muted)] mb-4">

@@ -19,7 +19,7 @@ export default function KernelBenchHardPost() {
           <h2 className="text-2xl font-bold mt-12 mb-6">Results at a Glance</h2>
 
           <p className="leading-relaxed mb-6">
-            12 models across 7 problems on a single RTX PRO 6000 Blackwell Workstation (sm_120, 96 GB GDDR7, 1.8 TB/s peak DRAM bandwidth). Cells are <code>peak_fraction</code> — the fraction of the relevant tensor-core or memory-bandwidth ceiling the kernel actually achieved. <code>FAIL</code> means a solution was written but missed the correctness gate; <code>ERR</code> means no solution was produced. <code>★</code> marks cells that have a per-run annotation in the source repo.
+            12 models across 7 problems on a single RTX PRO 6000 Blackwell Workstation (sm_120, 96 GB GDDR7, 1.8 TB/s peak DRAM bandwidth). Cells are <code>peak_fraction</code> — the fraction of the relevant tensor-core or memory-bandwidth ceiling the kernel actually achieved. <code>NO PERF</code> means correctness passed but no <code>peak_fraction</code> was recorded, so the cell is unscored. <code>FAIL</code> means a solution was written but missed the correctness gate; <code>ERR</code> means no solution was produced. <code>★</code> marks cells that have a per-run annotation in the source repo.
           </p>
 
           <div className="overflow-x-auto mb-6 text-sm">
@@ -34,12 +34,12 @@ export default function KernelBenchHardPost() {
                   <th className="text-left py-2 pr-2">05 topk</th>
                   <th className="text-left py-2 pr-2">06 moe</th>
                   <th className="text-left py-2 pr-2">07 w4a16</th>
-                  <th className="text-left py-2">PASS</th>
+                  <th className="text-left py-2">SCORED</th>
                 </tr>
               </thead>
               <tbody className="text-[var(--color-fg-muted)] font-mono text-xs">
                 <tr className="border-b border-[var(--color-border)]/50"><td className="py-2 pr-4 font-semibold text-[var(--color-fg)]">gpt-5.5 [xhigh]</td><td className="py-2 pr-2">0.423 ★</td><td className="py-2 pr-2">0.032</td><td className="py-2 pr-2">0.497</td><td className="py-2 pr-2">0.363 ★</td><td className="py-2 pr-2">0.042</td><td className="py-2 pr-2">0.251</td><td className="py-2 pr-2">0.159</td><td className="py-2 text-[var(--color-fg)]">7/7</td></tr>
-                <tr className="border-b border-[var(--color-border)]/50"><td className="py-2 pr-4 font-semibold text-[var(--color-fg)]">claude-opus-4-7 [max]</td><td className="py-2 pr-2">0.534 ★</td><td className="py-2 pr-2">PASS</td><td className="py-2 pr-2">0.602 ★</td><td className="py-2 pr-2">0.317 ★</td><td className="py-2 pr-2">0.020</td><td className="py-2 pr-2">FAIL</td><td className="py-2 pr-2">0.184</td><td className="py-2 text-[var(--color-fg)]">6/7</td></tr>
+                <tr className="border-b border-[var(--color-border)]/50"><td className="py-2 pr-4 font-semibold text-[var(--color-fg)]">claude-opus-4-7 [max]</td><td className="py-2 pr-2">0.534 ★</td><td className="py-2 pr-2">NO PERF</td><td className="py-2 pr-2">0.602 ★</td><td className="py-2 pr-2">0.317 ★</td><td className="py-2 pr-2">0.020</td><td className="py-2 pr-2">FAIL</td><td className="py-2 pr-2">0.184</td><td className="py-2 text-[var(--color-fg)]">5/7</td></tr>
                 <tr className="border-b border-[var(--color-border)]/50"><td className="py-2 pr-4 font-semibold text-[var(--color-fg)]">kimi-k2.6</td><td className="py-2 pr-2">FAIL</td><td className="py-2 pr-2">0.022</td><td className="py-2 pr-2">0.432</td><td className="py-2 pr-2">0.118 ★</td><td className="py-2 pr-2">0.014</td><td className="py-2 pr-2">0.161</td><td className="py-2 pr-2">0.220</td><td className="py-2 text-[var(--color-fg)]">6/7</td></tr>
                 <tr className="border-b border-[var(--color-border)]/50"><td className="py-2 pr-4">mimo-v2.5-pro</td><td className="py-2 pr-2">0.434 ★</td><td className="py-2 pr-2">FAIL</td><td className="py-2 pr-2">ERR</td><td className="py-2 pr-2">0.121 ★</td><td className="py-2 pr-2">0.017</td><td className="py-2 pr-2">0.211</td><td className="py-2 pr-2">0.137</td><td className="py-2">5/7</td></tr>
                 <tr className="border-b border-[var(--color-border)]/50"><td className="py-2 pr-4">qwen3.6-max-preview</td><td className="py-2 pr-2">0.429 ★</td><td className="py-2 pr-2">0.011</td><td className="py-2 pr-2">ERR</td><td className="py-2 pr-2">0.077</td><td className="py-2 pr-2">FAIL</td><td className="py-2 pr-2">0.004</td><td className="py-2 pr-2">0.110</td><td className="py-2">5/7</td></tr>
@@ -54,7 +54,7 @@ export default function KernelBenchHardPost() {
           </div>
 
           <p className="leading-relaxed mb-6">
-            <strong>GPT-5.5 at extra-high reasoning is the only model that solved every problem.</strong> Claude Opus 4.7 max ate one FAIL on sonic_moe but earned the highest peak fraction on the deck — 0.602 on paged attention, with a real Triton FlashDecoding-style kernel. Kimi K2.6 was the surprise of the run: 6/7 PASS at a much lower API cost than the top tier, including the only PASS where it took the deck-leading peak (0.220 on w4a16). The blocked Qwen 3.6 35B-A3B row was removed from the public table because its available providers did not expose a usable autonomous tool endpoint.
+            <strong>GPT-5.5 at extra-high reasoning is the only model that scored every problem.</strong> Claude Opus 4.7 max ate one FAIL on sonic_moe and one no-perf KDA cell, but earned the highest peak fraction on the deck — 0.602 on paged attention, with a real Triton FlashDecoding-style kernel. Kimi K2.6 was the surprise of the run: 6/7 scored at a much lower API cost than the top tier, including the only cell where it took the deck-leading peak (0.220 on w4a16). The blocked Qwen 3.6 35B-A3B row was removed from the public table because its available providers did not expose a usable autonomous tool endpoint.
           </p>
 
           <figure className="my-8">
@@ -74,14 +74,14 @@ export default function KernelBenchHardPost() {
           <figure className="my-8">
             <Image
               src="/blog-hard/pass_count_by_model.png"
-              alt="pass count by model"
+              alt="scored count by model"
               width={1300}
               height={870}
               className="w-full h-auto rounded"
               unoptimized
             />
             <figcaption className="text-xs text-[var(--color-fg-muted)] mt-2">
-              Pass count tier ranking. The amber bar (gpt-5.5 xhigh) is the only 7/7 on the deck.
+              Scored-count tier ranking. The amber bar (gpt-5.5 xhigh) is the only 7/7 scored row on the deck.
             </figcaption>
           </figure>
 
@@ -94,12 +94,12 @@ export default function KernelBenchHardPost() {
                   <th className="text-left py-2 pr-4">Problem</th>
                   <th className="text-left py-2 pr-4">Best peak</th>
                   <th className="text-left py-2 pr-4">Best model</th>
-                  <th className="text-left py-2">N correct</th>
+                  <th className="text-left py-2">N scored</th>
                 </tr>
               </thead>
               <tbody className="text-[var(--color-fg-muted)]">
                 <tr className="border-b border-[var(--color-border)]/50"><td className="py-2 pr-4 font-medium">01 fp8_gemm</td><td className="py-2 pr-4 font-mono">0.534</td><td className="py-2 pr-4">claude-opus-4-7 [max]</td><td className="py-2">5/12</td></tr>
-                <tr className="border-b border-[var(--color-border)]/50"><td className="py-2 pr-4 font-medium">02 kda_cutlass</td><td className="py-2 pr-4 font-mono">0.032</td><td className="py-2 pr-4">gpt-5.5 [xhigh]</td><td className="py-2">6/12</td></tr>
+                <tr className="border-b border-[var(--color-border)]/50"><td className="py-2 pr-4 font-medium">02 kda_cutlass</td><td className="py-2 pr-4 font-mono">0.032</td><td className="py-2 pr-4">gpt-5.5 [xhigh]</td><td className="py-2">5/12</td></tr>
                 <tr className="border-b border-[var(--color-border)]/50"><td className="py-2 pr-4 font-medium">03 paged_attention</td><td className="py-2 pr-4 font-mono">0.602</td><td className="py-2 pr-4">claude-opus-4-7 [max]</td><td className="py-2">6/12</td></tr>
                 <tr className="border-b border-[var(--color-border)]/50"><td className="py-2 pr-4 font-medium">04 kahan_softmax</td><td className="py-2 pr-4 font-mono">0.363</td><td className="py-2 pr-4">gpt-5.5 [xhigh]</td><td className="py-2">9/12</td></tr>
                 <tr className="border-b border-[var(--color-border)]/50"><td className="py-2 pr-4 font-medium">05 topk_bitonic</td><td className="py-2 pr-4 font-mono">0.042</td><td className="py-2 pr-4">gpt-5.5 [xhigh]</td><td className="py-2">5/12</td></tr>
@@ -337,7 +337,7 @@ Norm:   each block normalizes its chunk using global (max, sum).
           <h3 className="text-xl font-bold mt-8 mb-4">N=1 and variance</h3>
 
           <p className="leading-relaxed mb-6">
-            Every cell is a single trial. We saw two reversals on the same (model, problem) within 24 hours during the initial sweeps — DeepSeek Flash on TopK regressed from PASS to FAIL day-over-day under the same prompt; Qwen 3.6 27B&apos;s shakedown was 0/7, a same-day rerun was 1/7. LLM nondeterminism is real on this benchmark and N=1 isn&apos;t enough for any cell&apos;s value to be load-bearing alone. Future official runs will report N≥2 with variance bands.
+            Every cell is a single trial. We saw two reversals on the same (model, problem) within 24 hours during the initial sweeps — DeepSeek Flash on TopK regressed from scored to FAIL day-over-day under the same prompt; Qwen 3.6 27B&apos;s shakedown was 0/7, a same-day rerun was 1/7. LLM nondeterminism is real on this benchmark and N=1 isn&apos;t enough for any cell&apos;s value to be load-bearing alone. Future official runs will report N≥2 with variance bands.
           </p>
 
           <h2 className="text-2xl font-bold mt-12 mb-6">What Comes Next</h2>
