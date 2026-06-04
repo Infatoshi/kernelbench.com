@@ -45,6 +45,7 @@ const VISIBLE_MODEL_PREFIXES = [
   "codex/gpt-5.5 [2026-05-28 finish",
   "claude/claude-opus-4-7 [2026-05-28 finish",
   "claude/claude-opus-4-8 [2026-05-28 opus48-grok",
+  "claude/claude-opus-4-6 [2026-06-04 opus46",
   "cursor/composer-2.5-fast [2026-05-28 finish",
   "gemini/gemini-3.5-flash [2026-05-28 finish",
   "grok/grok-build [2026-05-28 opus48-grok",
@@ -340,6 +341,7 @@ function shortLabel(label: string) {
     .replace("codex/gpt-5.5 [xhigh]", "GPT-5.5 [xhigh]")
     .replace("claude/claude-opus-4-7 [2026-05-28 finish max]", "Claude Opus 4.7 [2026-05-28]")
     .replace("claude/claude-opus-4-8 [2026-05-28 opus48-grok max]", "Claude Opus 4.8 [2026-05-28]")
+    .replace("claude/claude-opus-4-6 [2026-06-04 opus46 max]", "Claude Opus 4.6 [2026-06-04]")
     .replace("claude/claude-opus-4-7 [max]", "Claude Opus 4.7 [max]")
     .replace("cursor/composer-2.5-fast [2026-05-28 finish]", "Composer 2.5 Fast [2026-05-28]")
     .replace("gemini/gemini-3.5-flash [2026-05-28 finish]", "Gemini 3.5 Flash [2026-05-28]")

@@ -4,6 +4,34 @@ A running record of decisions, dead ends, and lessons. Newest entries on top. Th
 
 ---
 
+## 2026-06-04 - Claude Opus 4.6 Claude Code full sweep
+
+Ran a six-problem active CUDA sweep through Claude Code with
+`claude-opus-4-6` at `--effort max`.
+
+Run group:
+
+```text
+kbh_claude_opus46_full_20260604_122513
+```
+
+Published row:
+
+```text
+01_fp8_gemm          0.4589
+02_kda_cutlass       0.1162
+03_paged_attention   0.6474
+05_topk_bitonic      0.0459
+06_sonic_moe_swiglu  0.2563
+07_w4a16_gemm        0.1988
+```
+
+All six cells passed correctness. The row is visible on `/hard` as
+`Claude Opus 4.6 [2026-06-04]`, and the six transcript viewers were rendered
+into `public/runs/`.
+
+---
+
 ## 2026-06-01 - Removed Kahan softmax from the active deck
 
 `04_kahan_softmax` has been removed from the benchmark surface. The problem was
