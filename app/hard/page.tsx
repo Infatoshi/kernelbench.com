@@ -98,11 +98,12 @@ export default async function HardPage() {
         <p className="text-sm text-[var(--color-fg-muted)] mb-4 max-w-4xl leading-relaxed">
           Cells show <code>peak_fraction</code>, the fraction of the relevant
           hardware ceiling reached by a correct kernel. Click a cell to open the
-          transcript when one is available. Stars mark hand annotations:
-          {" "}<span className="text-[var(--color-warn)]">★</span> means a caveat
-          or unusual verdict changes how to read the score, and{" "}
-          <span className="text-[var(--color-fg-bright)]">★</span> means the cell
-          was audited clean.
+          transcript when one is available. Blue underlined values are the
+          visible winner for that problem. Annotation badges mark caveats:
+          {" "}<span className="annotation-badge annotation-badge-bad">!</span>
+          {" "}invalid or reward-hack results, and{" "}
+          <span className="annotation-badge annotation-badge-warn">!</span>
+          {" "}scores with a rubric leak, bug, or unusual interpretation.
         </p>
         <LeaderboardTable
           models={visibleModels}
@@ -192,7 +193,7 @@ export default async function HardPage() {
         </h2>
         <p className="text-[var(--color-fg)] leading-relaxed mb-4 max-w-3xl">
           One row in the leaderboard promises something the benchmark doesn&apos;t actually measure. It&apos;s marked{" "}
-          <span className="text-[var(--color-warn)]">★</span> for a reason.
+          <span className="annotation-badge annotation-badge-warn">!</span> for a reason.
         </p>
 
         <div className="space-y-6">
@@ -279,6 +280,8 @@ function LeaderboardTable({
   annotations: Map<string, { verdict: string; summary?: string }>
   hasViewer: Set<string>
 }) {
+  const winners = findVisibleWinners(models)
+
   return (
     <div className="overflow-x-auto box">
       <table className="term tabular text-xs sm:text-sm">
@@ -303,7 +306,12 @@ function LeaderboardTable({
                 const cell = m.results[p.key]
                 return (
                   <td key={p.key} className="text-right">
-                    {renderCell(cell, annotations, hasViewer)}
+                    {renderCell(
+                      cell,
+                      annotations,
+                      hasViewer,
+                      winners.get(p.key) === cell?.run_id,
+                    )}
                   </td>
                 )
               })}
@@ -316,6 +324,26 @@ function LeaderboardTable({
       </table>
     </div>
   )
+}
+
+function findVisibleWinners(models: Model[]) {
+  const winners = new Map<string, string>()
+  for (const p of PROBLEMS) {
+    let bestRunId: string | null = null
+    let bestPeak = -Infinity
+    for (const m of models) {
+      const cell = m.results[p.key]
+      if (!cell?.correct || cell.peak_fraction == null || cell.invalid_reason) {
+        continue
+      }
+      if (cell.peak_fraction > bestPeak) {
+        bestPeak = cell.peak_fraction
+        bestRunId = cell.run_id
+      }
+    }
+    if (bestRunId) winners.set(p.key, bestRunId)
+  }
+  return winners
 }
 
 function compareModelRows(
@@ -404,13 +432,14 @@ function renderCell(
     | undefined,
   annotations: Map<string, { verdict: string; summary?: string }>,
   hasViewer: Set<string>,
+  isWinner: boolean,
 ) {
   if (!cell) return <span className="cell-err">-</span>
   const viewerUrl = hasViewer.has(cell.run_id)
     ? `/runs/${cell.run_id}.html`
     : null
   const annot = annotations.get(cell.run_id)
-  const title = cellTitle(cell, Boolean(viewerUrl), annot)
+  const title = cellTitle(cell, Boolean(viewerUrl), annot, isWinner)
   const wrap = (inner: React.ReactNode) =>
     viewerUrl ? (
       <a
@@ -427,21 +456,24 @@ function renderCell(
     return wrap(
       <>
         <span className="cell-fail">INVALID</span>
-        <span className="ml-1 text-[var(--color-warn)]" title="annotated caveat">★</span>
+        <AnnotationBadge severity="bad" label="invalid or reward hack" />
       </>,
     )
   }
   if (cell.correct) {
-    const star =
+    const badge =
       annot && ["rubric_leak", "bug", "interesting"].includes(annot.verdict) ? (
-        <span className="text-[var(--color-warn)]" title={`annotated ${annot.verdict}`}>★</span>
-      ) : annot && annot.verdict === "clean" ? (
-        <span className="text-[var(--color-fg-bright)]" title="audited clean">★</span>
+        <AnnotationBadge
+          severity={annot.verdict === "bug" ? "bad" : "warn"}
+          label={`annotated ${annot.verdict}`}
+        />
       ) : null
     const pf = cell.peak_fraction
     const value =
       pf !== null ? (
-        pf.toFixed(3)
+        <span className={isWinner ? "cell-winner" : undefined}>
+          {pf.toFixed(3)}
+        </span>
       ) : cell.failure_reason === "benchmark_timeout" ? (
         <span className="cell-err">BENCH</span>
       ) : (
@@ -450,7 +482,7 @@ function renderCell(
     return wrap(
       <>
         {value}
-        {star ? <span className="ml-1">{star}</span> : null}
+        {badge}
       </>,
     )
   }
@@ -468,6 +500,24 @@ function renderCell(
   }
   if (cell.has_solution) return wrap(<span className="cell-fail">FAIL</span>)
   return wrap(<span className="cell-err">ERR</span>)
+}
+
+function AnnotationBadge({
+  severity,
+  label,
+}: {
+  severity: "bad" | "warn"
+  label: string
+}) {
+  return (
+    <span
+      className={`annotation-badge annotation-badge-${severity}`}
+      title={label}
+      aria-label={label}
+    >
+      !
+    </span>
+  )
 }
 
 function cellTitle(
@@ -503,6 +553,7 @@ function cellTitle(
   },
   hasViewer: boolean,
   annotation?: { verdict: string; summary?: string },
+  isWinner?: boolean,
 ) {
   const usage = cell.usage ?? {}
   const status =
@@ -518,6 +569,7 @@ function cellTitle(
   const parts = [
     cell.run_id,
     hasViewer ? "click to open transcript viewer" : "transcript viewer unavailable",
+    isWinner ? "visible winner for this problem" : null,
     status,
     cell.retryable_infra_failure ? "retryable infra failure" : null,
     cell.minimum_useful_output_tokens != null
