@@ -481,7 +481,7 @@ function renderCell(
     const pf = cell.peak_fraction
     const value =
       pf !== null ? (
-        <span className={isWinner ? "cell-winner" : undefined}>
+        <span className={isWinner ? "cell-score cell-winner" : "cell-score"}>
           {pf.toFixed(3)}
         </span>
       ) : cell.failure_reason === "benchmark_timeout" ? (
