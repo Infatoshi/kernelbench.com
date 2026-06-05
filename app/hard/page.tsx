@@ -434,7 +434,7 @@ function renderCell(
   hasViewer: Set<string>,
   isWinner: boolean,
 ) {
-  if (!cell) return <span className="cell-err">-</span>
+  if (!cell) return <span className="cell-missing">-</span>
   const viewerUrl = hasViewer.has(cell.run_id)
     ? `/runs/${cell.run_id}.html`
     : null
@@ -455,7 +455,7 @@ function renderCell(
   if (cell.invalid_reason || annot?.verdict === "reward_hack") {
     return wrap(
       <>
-        <span className="cell-fail">INVALID</span>
+        <span className="cell-invalid">INVALID</span>
         <AnnotationBadge severity="bad" label="invalid or reward hack" />
       </>,
     )
