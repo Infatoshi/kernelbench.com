@@ -98,8 +98,11 @@ export default async function HardPage() {
         <p className="text-sm text-[var(--color-fg-muted)] mb-4 max-w-4xl leading-relaxed">
           Cells show <code>peak_fraction</code>, the fraction of the relevant
           hardware ceiling reached by a correct kernel. Click a cell to open the
-          transcript when one is available. <span className="text-[var(--color-warn)]">★</span>{" "}
-          marks an annotation.
+          transcript when one is available. Stars mark hand annotations:
+          {" "}<span className="text-[var(--color-warn)]">★</span> means a caveat
+          or unusual verdict changes how to read the score, and{" "}
+          <span className="text-[var(--color-fg-bright)]">★</span> means the cell
+          was audited clean.
         </p>
         <LeaderboardTable
           models={visibleModels}
@@ -273,7 +276,7 @@ function LeaderboardTable({
   hasViewer,
 }: {
   models: Model[]
-  annotations: Map<string, { verdict: string }>
+  annotations: Map<string, { verdict: string; summary?: string }>
   hasViewer: Set<string>
 }) {
   return (
@@ -399,14 +402,15 @@ function renderCell(
         invalid_reason?: string
       }
     | undefined,
-  annotations: Map<string, { verdict: string }>,
+  annotations: Map<string, { verdict: string; summary?: string }>,
   hasViewer: Set<string>,
 ) {
   if (!cell) return <span className="cell-err">-</span>
   const viewerUrl = hasViewer.has(cell.run_id)
     ? `/runs/${cell.run_id}.html`
     : null
-  const title = cellTitle(cell, Boolean(viewerUrl))
+  const annot = annotations.get(cell.run_id)
+  const title = cellTitle(cell, Boolean(viewerUrl), annot)
   const wrap = (inner: React.ReactNode) =>
     viewerUrl ? (
       <a
@@ -419,21 +423,20 @@ function renderCell(
     ) : (
       <span title={title}>{inner}</span>
     )
-  const annot = annotations.get(cell.run_id)
   if (cell.invalid_reason || annot?.verdict === "reward_hack") {
     return wrap(
       <>
         <span className="cell-fail">INVALID</span>
-        <span className="ml-1 text-[var(--color-warn)]">★</span>
+        <span className="ml-1 text-[var(--color-warn)]" title="annotated caveat">★</span>
       </>,
     )
   }
   if (cell.correct) {
     const star =
-      annot && annot.verdict === "rubric_leak" ? (
-        <span className="text-[var(--color-warn)]">★</span>
+      annot && ["rubric_leak", "bug", "interesting"].includes(annot.verdict) ? (
+        <span className="text-[var(--color-warn)]" title={`annotated ${annot.verdict}`}>★</span>
       ) : annot && annot.verdict === "clean" ? (
-        <span className="text-[var(--color-fg-bright)]">★</span>
+        <span className="text-[var(--color-fg-bright)]" title="audited clean">★</span>
       ) : null
     const pf = cell.peak_fraction
     const value =
@@ -499,6 +502,7 @@ function cellTitle(
     gpu_lock_active_seconds_total?: number | null
   },
   hasViewer: boolean,
+  annotation?: { verdict: string; summary?: string },
 ) {
   const usage = cell.usage ?? {}
   const status =
@@ -559,6 +563,8 @@ function cellTitle(
       ? `GPU lock active ${fmtDuration(cell.gpu_lock_active_seconds_total)}`
       : null,
     cell.agent_cuda_disabled ? "agent CUDA disabled" : null,
+    annotation ? `annotation ${annotation.verdict}` : null,
+    annotation?.summary ? `annotation summary: ${annotation.summary}` : null,
   ]
   return parts.filter(Boolean).join("\n")
 }
