@@ -75,7 +75,7 @@ export default async function HardPage() {
         <h1 className="text-3xl font-semibold tracking-tight text-[var(--color-fg-bright)] mb-3">
           Hard
         </h1>
-        <p className="text-sm text-[var(--color-fg-muted)] mb-6">
+        <p className="text-sm text-[var(--color-fg)] mb-6">
           Current scored CUDA board · RTX PRO 6000 Blackwell · sm_120 · 96 GB GDDR7 · 1.8 TB/s
         </p>
         <p className="text-[var(--color-fg)] leading-relaxed max-w-3xl">
@@ -84,7 +84,7 @@ export default async function HardPage() {
           The table below keeps the comparable model rows visible and leaves
           one-off diagnostic rows in the source data.
         </p>
-        <p className="mt-4 text-sm text-[var(--color-fg-muted)] max-w-3xl leading-relaxed">
+        <p className="mt-4 text-sm text-[var(--color-fg)] max-w-3xl leading-relaxed">
           Problem IDs are stable, not consecutive: 04 was retired after the
           Kahan-softmax rubric leak, and 08 is a deferred Metal problem. The
           scored CUDA columns are 01, 02, 03, 05, 06, 07, 09, and 10.
@@ -95,7 +95,7 @@ export default async function HardPage() {
         <h2 className="text-xl font-semibold text-[var(--color-fg-bright)] mb-3">
           Leaderboard
         </h2>
-        <p className="text-sm text-[var(--color-fg-muted)] mb-4 max-w-4xl leading-relaxed">
+        <p className="text-sm text-[var(--color-fg)] mb-4 max-w-4xl leading-relaxed">
           Cells show <code>peak_fraction</code>, the fraction of the relevant
           hardware ceiling reached by a correct kernel. Click a cell to open the
           transcript when one is available. Blue underlined values are the
@@ -110,7 +110,7 @@ export default async function HardPage() {
           annotations={annotations}
           hasViewer={hasViewer}
         />
-        <p className="text-xs text-[var(--color-fg-muted)] mt-3 max-w-4xl leading-relaxed">
+        <p className="text-xs text-[var(--color-fg)] mt-3 max-w-4xl leading-relaxed">
           Full historical and diagnostic rows are still available in{" "}
           <Link
             href="https://github.com/Infatoshi/KernelBench-Hard/blob/master/results/leaderboard.json"
@@ -126,7 +126,7 @@ export default async function HardPage() {
         <h2 className="text-xl font-semibold text-[var(--color-fg-bright)] mb-3">
           Per-problem ceilings
         </h2>
-        <p className="text-sm text-[var(--color-fg-muted)] mb-3 max-w-4xl leading-relaxed">
+        <p className="text-sm text-[var(--color-fg)] mb-3 max-w-4xl leading-relaxed">
           eager / compiled = PyTorch reference timings. SOTA = the existing best-known kernel
           for the problem (vLLM paged attention, fbgemm grouped GEMM, etc.) when one exists
           on this hardware. best peak = the model that pushed furthest above the
@@ -150,26 +150,36 @@ export default async function HardPage() {
                 const pp = lb.per_problem[p.key]
                 const bl = baselines?.problems[p.key] ?? {}
                 const fmtMs = (t: { ms: number } | undefined) =>
-                  t ? t.ms.toFixed(3) : "—"
+                  t ? (
+                    <span className="table-value">{t.ms.toFixed(3)}</span>
+                  ) : (
+                    <span className="cell-missing">-</span>
+                  )
                 return (
                   <tr key={p.key}>
                     <td>{p.key}</td>
-                    <td className="text-right text-[var(--color-fg-muted)]">
+                    <td className="text-right">
                       {fmtMs(bl.eager)}
                     </td>
-                    <td className="text-right text-[var(--color-fg-muted)]">
+                    <td className="text-right">
                       {fmtMs(bl.compiled)}
                     </td>
-                    <td className="text-right text-[var(--color-fg-muted)]">
+                    <td className="text-right">
                       {fmtMs(bl.sota)}
                     </td>
                     <td className="text-right text-[var(--color-fg-bright)]">
-                      {pp.best_peak_fraction
-                        ? pp.best_peak_fraction.toFixed(3)
-                        : "-"}
+                      {pp.best_peak_fraction ? (
+                        pp.best_peak_fraction.toFixed(3)
+                      ) : (
+                        <span className="cell-missing">-</span>
+                      )}
                     </td>
-                    <td className="text-[var(--color-fg-muted)]">
-                      {pp.best_model ? shortLabel(pp.best_model) : "-"}
+                    <td>
+                      {pp.best_model ? (
+                        <span className="table-value">{shortLabel(pp.best_model)}</span>
+                      ) : (
+                        <span className="cell-missing">-</span>
+                      )}
                     </td>
                     <td className="text-right">
                       {pp.n_passed}/{pp.n_attempted}
@@ -181,7 +191,7 @@ export default async function HardPage() {
           </table>
         </div>
         {!baselines && (
-          <p className="text-xs text-[var(--color-fg-dim)] mt-2">
+          <p className="text-xs text-[var(--color-fg)] mt-2">
             (baseline timings not yet generated — run scripts/run_baselines.sh in benchmarks/hard/)
           </p>
         )}
@@ -226,7 +236,7 @@ export default async function HardPage() {
 
         </div>
 
-        <p className="text-sm text-[var(--color-fg-muted)] mt-6 max-w-3xl leading-relaxed">
+        <p className="text-sm text-[var(--color-fg)] mt-6 max-w-3xl leading-relaxed">
           This leak is fixable with a few hours of problem-design work: tighten
           tolerance until bf16-via-cast and real fp8-tensor-core math diverge, or
           add a static-analysis check for the cast pattern. Keeping the caveat visible
@@ -249,7 +259,7 @@ export default async function HardPage() {
         </ul>
       </section>
 
-      <section className="text-sm text-[var(--color-fg-muted)] border-t border-[var(--color-border)] pt-6">
+      <section className="text-sm text-[var(--color-fg)] border-t border-[var(--color-border)] pt-6">
         Source data:{" "}
         <Link href="https://github.com/Infatoshi/KernelBench-Hard">
           github.com/Infatoshi/KernelBench-Hard
@@ -649,7 +659,7 @@ function LeakCard({
       <div className="grid grid-cols-2 sm:grid-cols-3 gap-x-4 gap-y-1 text-xs tabular mb-4">
         {cluster.map((c) => (
           <div key={c.model} className="flex justify-between">
-            <span className="text-[var(--color-fg-muted)]">{c.model}</span>
+            <span className="text-[var(--color-fg)]">{c.model}</span>
             <span className="text-[var(--color-fg-bright)]">{c.peak}</span>
           </div>
         ))}
@@ -662,7 +672,7 @@ function LeakCard({
 function Bullet({ children }: { children: React.ReactNode }) {
   return (
     <li className="flex gap-3">
-      <span className="text-[var(--color-fg-muted)] shrink-0">•</span>
+      <span className="text-[var(--color-fg)] shrink-0">•</span>
       <span>{children}</span>
     </li>
   )
