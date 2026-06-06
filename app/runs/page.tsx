@@ -83,6 +83,22 @@ function statusCell(r: RunRow) {
   return <span className="text-[var(--color-bad)]">ERR</span>
 }
 
+function harnessLabel(harness: string) {
+  const labels: Record<string, string> = {
+    claude: "claude code",
+    codex: "codex",
+    opencode: "opencode",
+    droid: "droid",
+    kimi: "kimi",
+    cursor: "cursor",
+    gemini: "gemini-cli",
+    grok: "grok build",
+    "zai-claude": "claude code",
+    "minimax-claude": "claude code",
+  }
+  return labels[harness] ?? harness
+}
+
 function harnessClass(harness: string) {
   return harness === "opencode"
     ? "text-[var(--color-bad)]"
@@ -104,7 +120,7 @@ export default async function RunsIndex({ searchParams }: RunsIndexProps) {
   const noPerf = runs.filter((r) => r.correct && r.peak_fraction === null).length
   const fails = runs.filter((r) => !r.correct && r.has_solution).length
   const errs = runs.filter((r) => !r.correct && !r.has_solution).length
-  const title = harnessFilter ? `${harnessFilter} runs` : "all runs"
+  const title = harnessFilter ? `${harnessLabel(harnessFilter)} runs` : "all runs"
 
   return (
     <div className="space-y-8">
@@ -119,7 +135,7 @@ export default async function RunsIndex({ searchParams }: RunsIndexProps) {
           <p className="text-xs text-[var(--color-fg-muted)] mb-4">
             active filter:{" "}
             <span className={harnessClass(harnessFilter)}>
-              harness={harnessFilter}
+              harness={harnessLabel(harnessFilter)}
             </span>{" "}
             · <a href="/runs">clear</a>
           </p>
@@ -161,7 +177,9 @@ export default async function RunsIndex({ searchParams }: RunsIndexProps) {
                     {shortModel(r.harness, r.model, r.effort)}
                   </a>
                 </td>
-                <td className={harnessClass(r.harness)}>{r.harness}</td>
+                <td className={harnessClass(r.harness)}>
+                  {harnessLabel(r.harness)}
+                </td>
                 <td className="text-[var(--color-fg-muted)]">
                   {r.elapsed_seconds !== null
                     ? `${Math.round(r.elapsed_seconds / 60)}m`

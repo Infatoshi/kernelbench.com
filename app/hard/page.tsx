@@ -422,7 +422,7 @@ export default async function HardPage() {
         <ul className="space-y-2 text-sm leading-relaxed list-none pl-0 max-w-3xl">
           <Bullet>One GPU instead of three. RTX PRO 6000 Blackwell (sm_120, 96 GB GDDR7, 1.8 TB/s).</Bullet>
           <Bullet>A small hand-designed problem deck instead of 43-58. Per-trial L2 flush, 30-trial median, 10 warmup absorbing torch.compile CUDA-graph capture and Triton autotune.</Bullet>
-          <Bullet>Real coding-agent CLIs as the harness: Claude Code, codex CLI, Kimi CLI, opencode, Droid. This is not a custom v3 agent loop.</Bullet>
+          <Bullet>Real coding-agent CLIs as the harness: claude code, codex, opencode, droid, kimi, cursor, gemini-cli, grok build. This is not a custom v3 agent loop.</Bullet>
           <Bullet>Wall-clock budgets, not turn limits. 45 min/run.</Bullet>
           <Bullet>peak_fraction grounded in physical hardware ceilings instead of raw speedup ratios.</Bullet>
           <Bullet>Per-cell annotations with verdict, pull quotes from solution.py, and an &ldquo;implication&rdquo; statement, including the May 13 Claude Code GLM-5.1 reward-hack example.</Bullet>
@@ -654,9 +654,19 @@ function shortLabel(label: string) {
 }
 
 function harnessLabel(harness: string) {
-  return harness
-    .replace("zai-claude", "claude-code/zai")
-    .replace("minimax-claude", "claude-code/minimax")
+  const labels: Record<string, string> = {
+    claude: "claude code",
+    codex: "codex",
+    opencode: "opencode",
+    droid: "droid",
+    kimi: "kimi",
+    cursor: "cursor",
+    gemini: "gemini-cli",
+    grok: "grok build",
+    "zai-claude": "claude code",
+    "minimax-claude": "claude code",
+  }
+  return labels[harness] ?? harness
 }
 
 function renderCell(

@@ -4,6 +4,16 @@ A running record of decisions, dead ends, and lessons. Newest entries on top. Th
 
 ---
 
+## 2026-06-05 - Canonical harness labels
+
+Normalized public harness labels to the intended option set: claude code,
+codex, opencode, droid, kimi, cursor, gemini-cli, and grok build. Internal run
+IDs still preserve provider-specific raw harness names such as `zai-claude`,
+but the leaderboard and runs table display them as the canonical harness
+family instead of inventing extra table options.
+
+---
+
 ## 2026-06-05 - Leaderboard harness identity cleanup
 
 Updated `/hard` so the visible table treats harness as part of the row
