@@ -604,17 +604,18 @@ function findVisibleWinners(models: Model[]) {
   return winners
 }
 
-function compareModelRows(
-  a: { label: string; pass_count: number; total_runs: number; results: Model["results"] },
-  b: { label: string; pass_count: number; total_runs: number; results: Model["results"] },
-) {
+function compareModelRows(a: Model, b: Model) {
+  const labelDiff = shortLabel(a.label).localeCompare(shortLabel(b.label))
+  if (labelDiff !== 0) return labelDiff
+  const harnessDiff = harnessLabel(a.harness).localeCompare(harnessLabel(b.harness))
+  if (harnessDiff !== 0) return harnessDiff
   if (b.pass_count !== a.pass_count) return b.pass_count - a.pass_count
   const bRate = b.total_runs ? b.pass_count / b.total_runs : 0
   const aRate = a.total_runs ? a.pass_count / a.total_runs : 0
   if (bRate !== aRate) return bRate - aRate
   const peakDiff = bestPeak(b.results) - bestPeak(a.results)
   if (peakDiff !== 0) return peakDiff
-  return shortLabel(a.label).localeCompare(shortLabel(b.label))
+  return a.label.localeCompare(b.label)
 }
 
 function bestPeak(results: Model["results"]) {
@@ -645,6 +646,8 @@ function shortLabel(label: string) {
     .replace("droid/zai/glm-5.1 [2026-05-08]", "GLM-5.1")
     .replace("opencode/zai/glm-5.1 [2026-05-08]", "GLM-5.1")
     .replace("opencode/zai/glm-5.1", "GLM-5.1")
+    .replace("minimax-claude/MiniMax-M3 [2026-06-01]", "MiniMax M3")
+    .replace("minimax-claude/MiniMax-M3 [2026-06-01 max]", "MiniMax M3")
     .replace("minimax-claude/MiniMax-M3", "MiniMax M3")
     .replace("opencode/openrouter-pinned/", "or/")
     .replace("opencode/", "")

@@ -4,6 +4,14 @@ A running record of decisions, dead ends, and lessons. Newest entries on top. Th
 
 ---
 
+## 2026-06-05 - Alphabetical model grouping
+
+Changed the public `/hard` row order to group rows by displayed model name
+alphabetically, with canonical harness label as the secondary sort. This keeps
+same-model harness variants adjacent instead of scattering them by score.
+
+---
+
 ## 2026-06-05 - Canonical harness labels
 
 Normalized public harness labels to the intended option set: claude code,
