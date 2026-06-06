@@ -52,6 +52,103 @@ const VISIBLE_MODEL_PREFIXES = [
   "minimax-claude/MiniMax-M3 [2026-06-01",
 ]
 
+const FP8_CONSTRAINT_FIXED_RUNS = [
+  {
+    model: "Claude Opus 4.6",
+    route: "claude",
+    result: "FAIL",
+    elapsed: "18.5m",
+    note: "large_input stress failed, max_abs_diff=4",
+  },
+  {
+    model: "Claude Opus 4.7",
+    route: "claude",
+    result: "FAIL",
+    elapsed: "21.6m",
+    note: "check_failed under real FP8 constraint",
+  },
+  {
+    model: "Claude Opus 4.8",
+    route: "claude",
+    result: "FAIL",
+    elapsed: "41.8m",
+    note: "large_input K=4127 failed, max_abs_diff=4",
+  },
+  {
+    model: "GPT-5.5",
+    route: "codex",
+    result: "FAIL",
+    elapsed: "6.8m",
+    note: "nominal tolerance failed on first fixed run",
+  },
+  {
+    model: "DeepSeek V4 Flash",
+    route: "opencode",
+    result: "FAIL",
+    elapsed: "4.1m",
+    note: "nominal tolerance failed, max_abs_diff around 0.53",
+  },
+  {
+    model: "DeepSeek V4 Pro",
+    route: "opencode",
+    result: "FAIL",
+    elapsed: "5.9m",
+    note: "first run had Triton fp8 load cast error",
+  },
+  {
+    model: "OpenCode GLM-5.1",
+    route: "opencode",
+    result: "EARLY",
+    elapsed: "11.5m",
+    note: "provider early-stop/no solution on opencode route",
+  },
+  {
+    model: "Kimi K2.6",
+    route: "kimi",
+    result: "ERR",
+    elapsed: "4s",
+    note: "invalid or expired API key",
+  },
+  {
+    model: "MiniMax/Qwen/MiMo via OpenRouter",
+    route: "opencode",
+    result: "ERR",
+    elapsed: "1-2s",
+    note: "provider_insufficient_credits",
+  },
+]
+
+const FP8_RECOVERY_RUNS = [
+  {
+    model: "GLM-5.1",
+    route: "zai-claude",
+    result: "FAIL",
+    elapsed: "11.0m",
+    note: "direct ZAI route worked, nominal max_abs_diff=0.5625",
+  },
+  {
+    model: "DeepSeek V4 Pro",
+    route: "opencode",
+    result: "FAIL",
+    elapsed: "9.8m",
+    note: "second attempt reached verifier, nominal max_abs_diff=0.539",
+  },
+  {
+    model: "DeepSeek V4 Flash",
+    route: "opencode",
+    result: "FAIL",
+    elapsed: "3.2m",
+    note: "second attempt reached verifier, nominal max_abs_diff=0.539",
+  },
+  {
+    model: "GPT-5.5",
+    route: "codex",
+    result: "FAIL",
+    elapsed: "8.1m",
+    note: "Triton resource failure: 147456B shared memory > 101376B limit",
+  },
+]
+
 function isVisibleModel(m: Model) {
   return (
     VISIBLE_MODEL_LABELS.has(m.label) ||
@@ -247,6 +344,73 @@ export default async function HardPage() {
 
       <section>
         <h2 className="text-xl font-semibold text-[var(--color-fg-bright)] mb-3">
+          FP8 constraint rerun
+        </h2>
+        <p className="text-sm text-[var(--color-fg)] mb-4 max-w-4xl leading-relaxed">
+          On June 5, 2026, the FP8 GEMM verifier was tightened to reject the
+          bf16-dressup shortcut and require an FP8-looking execution path. The
+          earlier 01 scores above remain useful historical data, but this rerun
+          is the cleaner answer to the caveat: once the shortcut is blocked,
+          every available model either fails correctness, fails the provider
+          path, or cannot run because of credits/key issues.
+        </p>
+
+        <div className="grid gap-4 lg:grid-cols-2">
+          <div className="box overflow-x-auto">
+            <h3 className="text-sm font-semibold text-[var(--color-fg-bright)] mb-3">
+              Fixed-tolerance rerun
+            </h3>
+            <Fp8ConstraintTable rows={FP8_CONSTRAINT_FIXED_RUNS} />
+          </div>
+          <div className="box overflow-x-auto">
+            <h3 className="text-sm font-semibold text-[var(--color-fg-bright)] mb-3">
+              Recovery smokes
+            </h3>
+            <Fp8ConstraintTable rows={FP8_RECOVERY_RUNS} />
+          </div>
+        </div>
+
+        <p className="text-xs text-[var(--color-fg-muted)] mt-4 max-w-4xl leading-relaxed">
+          DeepSeek Pro&apos;s 354s first-run failure was not Triton spending 354s
+          compiling. The agent used 354s generating code, then the verifier
+          failed in 3s because Triton rejected an integer zero fallback on an
+          fp8 load. The direct ZAI GLM-5.1 route was usable and produced a
+          solution; it failed numeric tolerance rather than credits or auth.
+        </p>
+
+        <div className="grid gap-4 mt-5 lg:grid-cols-3">
+          <Figure
+            src="/blog-hard/fp8-constraint-rerun/fp8_token_burn_stacked.png"
+            alt="Stacked token burn for FP8 constraint rerun"
+            caption="Token burn by model on the FP8 constraint run."
+          />
+          <Figure
+            src="/blog-hard/fp8-constraint-rerun/fp8_tokens_vs_effective_peak.png"
+            alt="Tokens versus effective peak for FP8 constraint rerun"
+            caption="All effective peaks collapse to zero under the strict verifier."
+          />
+          <Figure
+            src="/blog-hard/fp8-constraint-rerun/fp8_cost_before_outcome.png"
+            alt="Cost before outcome for FP8 constraint rerun"
+            caption="Spend and wall time before each failing outcome."
+          />
+        </div>
+
+        <p className="text-xs text-[var(--color-fg)] mt-4 max-w-4xl leading-relaxed">
+          Raw summaries are committed as{" "}
+          <Link href="/blog-hard/fp8-constraint-rerun/fixed-tolerance-summary.json">
+            fixed-tolerance-summary.json
+          </Link>
+          {" "}and{" "}
+          <Link href="/blog-hard/fp8-constraint-rerun/recovery-smokes-summary.json">
+            recovery-smokes-summary.json
+          </Link>
+          .
+        </p>
+      </section>
+
+      <section>
+        <h2 className="text-xl font-semibold text-[var(--color-fg-bright)] mb-3">
           What changed from v3
         </h2>
         <ul className="space-y-2 text-sm leading-relaxed list-none pl-0 max-w-3xl">
@@ -278,6 +442,80 @@ export default async function HardPage() {
         </Link>
       </section>
     </div>
+  )
+}
+
+function Fp8ConstraintTable({
+  rows,
+}: {
+  rows: {
+    model: string
+    route: string
+    result: string
+    elapsed: string
+    note: string
+  }[]
+}) {
+  return (
+    <table className="term tabular text-xs">
+      <thead>
+        <tr>
+          <th>model</th>
+          <th>route</th>
+          <th>outcome</th>
+          <th className="text-right">elapsed</th>
+          <th>note</th>
+        </tr>
+      </thead>
+      <tbody>
+        {rows.map((r) => (
+          <tr key={`${r.model}-${r.route}`}>
+            <td className="text-[var(--color-fg-bright)] whitespace-nowrap">
+              {r.model}
+            </td>
+            <td className="text-[var(--color-fg-muted)] whitespace-nowrap">
+              {r.route}
+            </td>
+            <td>
+              <span
+                className={
+                  r.result === "FAIL" ? "cell-fail" : "cell-err"
+                }
+              >
+                {r.result}
+              </span>
+            </td>
+            <td className="text-right text-[var(--color-fg-muted)] whitespace-nowrap">
+              {r.elapsed}
+            </td>
+            <td className="min-w-64">{r.note}</td>
+          </tr>
+        ))}
+      </tbody>
+    </table>
+  )
+}
+
+function Figure({
+  src,
+  alt,
+  caption,
+}: {
+  src: string
+  alt: string
+  caption: string
+}) {
+  return (
+    <figure className="box">
+      <img
+        src={src}
+        alt={alt}
+        className="w-full border border-[var(--color-border)]"
+      />
+      <figcaption className="text-xs text-[var(--color-fg-muted)] mt-2 leading-relaxed">
+        {caption}
+      </figcaption>
+    </figure>
   )
 }
 

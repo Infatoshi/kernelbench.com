@@ -4,6 +4,35 @@ A running record of decisions, dead ends, and lessons. Newest entries on top. Th
 
 ---
 
+## 2026-06-05 - FP8 GEMM constraint rerun
+
+Added a follow-up section to `/hard` for the FP8 GEMM bf16-dressup caveat.
+The June 5 KernelBench-Mega rerun tightened `01_fp8_gemm` so the verifier
+rejects bf16 operand upcasts and requires an FP8-looking execution path.
+
+Run groups:
+
+```text
+kbm_fp8_constraint_fixed_tol_20260605_135454
+kbm_fp8_recovery_smokes_20260605_142006
+```
+
+Under that constraint, every reachable model failed to produce a correct
+kernel. The strongest Claude rows reached the stress cases but failed numeric
+tolerance; DeepSeek and GLM produced nominal-tolerance failures; GPT-5.5's
+second smoke hit a Triton shared-memory resource limit; Kimi had an invalid key;
+and the OpenRouter-pinned rows failed for insufficient credits. This confirms
+the original leaderboard's 01 row should be read as a bf16 shortcut artifact,
+not Blackwell FP8 tensor-core skill.
+
+Committed public artifacts:
+
+- `public/blog-hard/fp8-constraint-rerun/fixed-tolerance-summary.json`
+- `public/blog-hard/fp8-constraint-rerun/recovery-smokes-summary.json`
+- token/cost/performance PNGs for the FP8 constraint diagrams
+
+---
+
 ## 2026-06-04 - Claude Opus 4.6 Claude Code full sweep
 
 Ran a six-problem active CUDA sweep through Claude Code with
