@@ -4,6 +4,15 @@ A running record of decisions, dead ends, and lessons. Newest entries on top. Th
 
 ---
 
+## 2026-06-05 - Dark themed public matplotlib figures
+
+Regenerated the public v3, Hard, and FP8 rerun matplotlib PNGs with a dark
+theme matching the site. The new shared generator is
+`benchmarks/site/generate_dark_plots.py`; it reads committed CSV/JSON data and
+keeps the existing public filenames stable.
+
+---
+
 ## 2026-06-05 - Alphabetical model grouping
 
 Changed the public `/hard` row order to group rows by displayed model name
