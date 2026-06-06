@@ -4,6 +4,17 @@ A running record of decisions, dead ends, and lessons. Newest entries on top. Th
 
 ---
 
+## 2026-06-05 - Leaderboard harness identity cleanup
+
+Updated `/hard` so the visible table treats harness as part of the row
+identity. Date/campaign labels are no longer shown as model variants, and
+same-model same-harness reruns are collapsed to the most trustworthy visible
+row. Distinct harnesses still remain separate, so GLM-5.1 through OpenCode,
+Droid, and Claude Code-compatible Z.ai can be compared without implying that
+they are duplicate model rows.
+
+---
+
 ## 2026-06-05 - FP8 GEMM constraint rerun
 
 Added a follow-up section to `/hard` for the FP8 GEMM bf16-dressup caveat.

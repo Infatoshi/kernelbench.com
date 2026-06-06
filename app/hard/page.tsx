@@ -33,17 +33,18 @@ const PROBLEMS = [
 ]
 
 const VISIBLE_MODEL_LABELS = new Set([
-  "codex/gpt-5.5 [xhigh]",
-  "claude/claude-opus-4-7 [max]",
+  "codex/gpt-5.5 [2026-05-28 finish xhigh]",
+  "claude/claude-opus-4-7 [2026-05-28 finish max]",
   "kimi/kimi-k2.6",
   "opencode/openrouter-pinned/xiaomi/mimo-v2.5-pro",
   "opencode/deepseek/deepseek-v4-flash",
   "opencode/deepseek/deepseek-v4-pro",
+  "opencode/zai/glm-5.1",
+  "droid/zai/glm-5.1 [2026-05-08]",
+  "zai-claude/glm-5.1 [2026-05-13]",
 ])
 
 const VISIBLE_MODEL_PREFIXES = [
-  "codex/gpt-5.5 [2026-05-28 finish",
-  "claude/claude-opus-4-7 [2026-05-28 finish",
   "claude/claude-opus-4-8 [2026-05-28 opus48-grok",
   "claude/claude-opus-4-6 [2026-06-04 opus46",
   "cursor/composer-2.5-fast [2026-05-28 finish",
@@ -178,8 +179,9 @@ export default async function HardPage() {
         <p className="text-[var(--color-fg)] leading-relaxed max-w-3xl">
           A focused successor to the v3 suite. One Blackwell GPU, a small set
           of hard CUDA kernel problems, and real coding-agent CLIs as the harness.
-          The table below keeps the comparable model rows visible and leaves
-          one-off diagnostic rows in the source data.
+          The table below keeps one trusted row for same-harness reruns, while
+          preserving distinct harness routes as separate rows. One-off diagnostic
+          rows stay in the source data.
         </p>
         <p className="mt-4 text-sm text-[var(--color-fg)] max-w-3xl leading-relaxed">
           Problem IDs are stable, not consecutive: 04 was retired after the
@@ -201,6 +203,10 @@ export default async function HardPage() {
           {" "}invalid or reward-hack results, and{" "}
           <span className="annotation-badge annotation-badge-warn">!</span>
           {" "}scores with a rubric leak, bug, or unusual interpretation.
+          The harness column is part of the identity: GLM-5.1 through OpenCode,
+          Droid, and Claude Code-compatible Z.ai are separate measurements, but
+          repeated runs through the same harness are collapsed to the most
+          trustworthy row we currently have.
         </p>
         <LeaderboardTable
           models={visibleModels}
@@ -536,6 +542,7 @@ function LeaderboardTable({
         <thead>
           <tr>
             <th className="sticky left-0 bg-[var(--color-surface-muted)]">model</th>
+            <th>harness</th>
             {PROBLEMS.map((p) => (
               <th key={p.key} className="text-right">
                 {p.short}
@@ -549,6 +556,9 @@ function LeaderboardTable({
             <tr key={m.label}>
               <td className="sticky left-0 bg-[var(--color-surface)] text-[var(--color-fg-bright)] whitespace-nowrap">
                 {shortLabel(m.label)}
+              </td>
+              <td className="text-[var(--color-fg-muted)] whitespace-nowrap">
+                {harnessLabel(m.harness)}
               </td>
               {PROBLEMS.map((p) => {
                 const cell = m.results[p.key]
@@ -616,31 +626,37 @@ function bestPeak(results: Model["results"]) {
 
 function shortLabel(label: string) {
   return label
-    .replace("codex/gpt-5.5 [2026-05-28 finish xhigh]", "GPT-5.5 [2026-05-28]")
-    .replace("codex/gpt-5.5 [xhigh]", "GPT-5.5 [xhigh]")
-    .replace("claude/claude-opus-4-7 [2026-05-28 finish max]", "Claude Opus 4.7 [2026-05-28]")
-    .replace("claude/claude-opus-4-8 [2026-05-28 opus48-grok max]", "Claude Opus 4.8 [2026-05-28]")
-    .replace("claude/claude-opus-4-6 [2026-06-04 opus46 max]", "Claude Opus 4.6 [2026-06-04]")
+    .replace("codex/gpt-5.5 [2026-05-28 finish xhigh]", "GPT-5.5")
+    .replace("codex/gpt-5.5 [xhigh]", "GPT-5.5")
+    .replace("claude/claude-opus-4-7 [2026-05-28 finish max]", "Claude Opus 4.7")
+    .replace("claude/claude-opus-4-8 [2026-05-28 opus48-grok max]", "Claude Opus 4.8")
+    .replace("claude/claude-opus-4-6 [2026-06-04 opus46 max]", "Claude Opus 4.6")
     .replace("claude/claude-opus-4-7 [max]", "Claude Opus 4.7 [max]")
-    .replace("cursor/composer-2.5-fast [2026-05-28 finish]", "Composer 2.5 Fast [2026-05-28]")
-    .replace("gemini/gemini-3.5-flash [2026-05-28 finish]", "Gemini 3.5 Flash [2026-05-28]")
-    .replace("grok/grok-build [2026-05-28 opus48-grok max]", "Grok Build [2026-05-28]")
+    .replace("cursor/composer-2.5-fast [2026-05-28 finish]", "Composer 2.5 Fast")
+    .replace("gemini/gemini-3.5-flash [2026-05-28 finish]", "Gemini 3.5 Flash")
+    .replace("grok/grok-build [2026-05-28 opus48-grok max]", "Grok Build")
     .replace("kimi/kimi-k2.6", "Kimi K2.6")
     .replace("opencode/openrouter-pinned/xiaomi/mimo-v2.5-pro", "MiMo v2.5 Pro")
     .replace("opencode/deepseek/deepseek-v4-flash", "DeepSeek V4 Flash")
     .replace("opencode/deepseek/deepseek-v4-pro", "DeepSeek V4 Pro")
     .replace("openrouter-google-ai-studio/google/", "or-google/")
     .replace("openrouter-alibaba/qwen/", "or-qwen/")
-    .replace("zai-claude/glm-5.1 [2026-05-13]", "Claude Code GLM-5.1 [2026-05-13]")
-    .replace("droid/zai/glm-5.1 [2026-05-08]", "Droid GLM-5.1 [2026-05-08]")
-    .replace("opencode/zai/glm-5.1 [2026-05-08]", "OpenCode GLM-5.1 rerun [2026-05-08]")
-    .replace("opencode/zai/glm-5.1", "OpenCode GLM-5.1 original")
+    .replace("zai-claude/glm-5.1 [2026-05-13]", "GLM-5.1")
+    .replace("droid/zai/glm-5.1 [2026-05-08]", "GLM-5.1")
+    .replace("opencode/zai/glm-5.1 [2026-05-08]", "GLM-5.1")
+    .replace("opencode/zai/glm-5.1", "GLM-5.1")
     .replace("minimax-claude/MiniMax-M3", "MiniMax M3")
     .replace("opencode/openrouter-pinned/", "or/")
     .replace("opencode/", "")
     .replace("codex/", "")
     .replace("claude/", "")
     .replace("kimi/", "")
+}
+
+function harnessLabel(harness: string) {
+  return harness
+    .replace("zai-claude", "claude-code/zai")
+    .replace("minimax-claude", "claude-code/minimax")
 }
 
 function renderCell(
