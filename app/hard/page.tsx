@@ -30,8 +30,6 @@ const PROBLEMS = [
   { key: "05_topk_bitonic", label: "TopK Bitonic" },
   { key: "06_sonic_moe_swiglu", label: "Sonic MoE SwiGLU" },
   { key: "07_w4a16_gemm", label: "W4A16 GEMM" },
-  { key: "09_fmha_preattn_mrope", label: "FMHA + MRoPE" },
-  { key: "10_patch_embed_conv3d_gemm", label: "Patch Embed Conv3D" },
 ]
 
 const VISIBLE_MODEL_LABELS = new Set([
@@ -188,7 +186,7 @@ export default async function HardPage() {
         <p className="mt-4 text-sm text-[var(--color-fg)] max-w-3xl leading-relaxed">
           Problem IDs are stable, not consecutive: 04 was retired after the
           Kahan-softmax rubric leak, and 08 is a deferred Metal problem. The
-          scored CUDA columns are 01, 02, 03, 05, 06, 07, 09, and 10.
+          scored CUDA columns are 01, 02, 03, 05, 06, and 07.
         </p>
       </section>
 
