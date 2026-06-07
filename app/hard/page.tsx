@@ -197,10 +197,11 @@ export default async function HardPage() {
         </h2>
         <p className="text-sm text-[var(--color-fg)] mb-4 max-w-4xl leading-relaxed">
           One row is one trusted model/harness/problem run. <code>speed of light</code>
-          is <code>peak_fraction</code> as a hardware-ceiling percentage. The file
-          chips jump to the problem reference and the run&apos;s submitted solution;
-          the conversation chip opens the transcript viewer. Blue bars mark the
-          visible winner for that problem. Annotation badges mark caveats:
+          is <code>peak_fraction</code> as a hardware-ceiling percentage. Reference
+          chips jump to <code>Infatoshi/KernelBench-Hard</code>; solution chips
+          open the run viewer&apos;s submitted <code>solution.py</code> tab. The
+          conversation chip opens the transcript viewer. Blue bars mark the visible
+          winner for that problem. Annotation badges mark caveats:
           {" "}<span className="annotation-badge annotation-badge-bad">!</span>
           {" "}invalid or reward-hack results, and{" "}
           <span className="annotation-badge annotation-badge-warn">!</span>
@@ -805,7 +806,7 @@ function ReferenceChip({ problem }: { problem: string }) {
   return (
     <a
       className="link-chip"
-      href={`https://github.com/Infatoshi/kernelbench.com/blob/master/benchmarks/hard/problems/${problem}/reference.py`}
+      href={`https://github.com/Infatoshi/KernelBench-Hard/blob/master/problems/${problem}/reference.py`}
     >
       reference
     </a>
