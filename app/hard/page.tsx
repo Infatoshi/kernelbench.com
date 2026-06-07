@@ -8,6 +8,7 @@ import {
   type Cell,
   type Model,
 } from "@/lib/data"
+import { LeaderboardTable, type HardRunRecord } from "./leaderboard-table"
 
 async function loadAvailableViewers(): Promise<Set<string>> {
   try {
@@ -169,10 +170,10 @@ export default async function HardPage() {
   const visibleModels = models.filter(isVisibleModel)
 
   return (
-    <div className="space-y-12">
+    <div className="hard-page space-y-12">
       <section>
         <h1 className="text-3xl font-semibold tracking-tight text-[var(--color-fg-bright)] mb-3">
-          Hard
+          hard
         </h1>
         <p className="text-sm text-[var(--color-fg)] mb-6">
           Current scored CUDA board · RTX PRO 6000 Blackwell · sm_120 · 96 GB GDDR7 · 1.8 TB/s
@@ -193,14 +194,14 @@ export default async function HardPage() {
 
       <section>
         <h2 className="text-xl font-semibold text-[var(--color-fg-bright)] mb-3">
-          Leaderboard
+          leaderboard
         </h2>
         <p className="text-sm text-[var(--color-fg)] mb-4 max-w-4xl leading-relaxed">
           One row is one trusted model/harness/problem run. <code>speed of light</code>
           is <code>peak_fraction</code> as a hardware-ceiling percentage. Reference
           chips jump to <code>Infatoshi/KernelBench-Hard</code>; solution chips
           open the run viewer&apos;s submitted <code>solution.py</code> tab. The
-          conversation chip opens the transcript viewer. Blue bars mark the visible
+          conversation chip opens the transcript viewer. Accent bars mark the visible
           winner for that problem. Annotation badges mark caveats:
           {" "}<span className="annotation-badge annotation-badge-bad">!</span>
           {" "}invalid or reward-hack results, and{" "}
@@ -230,7 +231,7 @@ export default async function HardPage() {
 
       <section>
         <h2 className="text-xl font-semibold text-[var(--color-fg-bright)] mb-3">
-          Per-problem ceilings
+          per-problem ceilings
         </h2>
         <p className="text-sm text-[var(--color-fg)] mb-3 max-w-4xl leading-relaxed">
           eager / compiled = PyTorch reference timings. SOTA = the existing best-known kernel
@@ -305,7 +306,7 @@ export default async function HardPage() {
 
       <section>
         <h2 className="text-xl font-semibold text-[var(--color-fg-bright)] mb-3">
-          Rubric caveat
+          rubric caveat
         </h2>
         <p className="text-[var(--color-fg)] leading-relaxed mb-4 max-w-3xl">
           One row in the leaderboard promises something the benchmark doesn&apos;t actually measure. It&apos;s marked{" "}
@@ -353,7 +354,7 @@ export default async function HardPage() {
 
       <section>
         <h2 className="text-xl font-semibold text-[var(--color-fg-bright)] mb-3">
-          FP8 constraint rerun
+          fp8 constraint rerun
         </h2>
         <p className="text-sm text-[var(--color-fg)] mb-4 max-w-4xl leading-relaxed">
           On June 5, 2026, the FP8 GEMM verifier was tightened to reject the
@@ -420,7 +421,7 @@ export default async function HardPage() {
 
       <section>
         <h2 className="text-xl font-semibold text-[var(--color-fg-bright)] mb-3">
-          What changed from v3
+          what changed from v3
         </h2>
         <ul className="space-y-2 text-sm leading-relaxed list-none pl-0 max-w-3xl">
           <Bullet>One GPU instead of three. RTX PRO 6000 Blackwell (sm_120, 96 GB GDDR7, 1.8 TB/s).</Bullet>
@@ -540,59 +541,22 @@ function LeaderboardMetricsTable({
   const winners = findVisibleWinners(models)
   const rows = buildRunRows(models, annotations, hasViewer, winners)
 
-  return (
-    <div className="box">
-      <table className="term leaderboard-runs tabular text-xs">
-        <thead>
-          <tr>
-            <th>model</th>
-            <th>harness</th>
-            <th>problem</th>
-            <th>date</th>
-            <th>compiled</th>
-            <th>correct</th>
-            <th>speed of light</th>
-            <th>tokens</th>
-            <th>runtime</th>
-            <th>files</th>
-            <th>conversation</th>
-          </tr>
-        </thead>
-        <tbody>
-          {rows.map((row) => (
-            <tr key={row.key}>
-              <td className="leaderboard-model">{row.model}</td>
-              <td className="text-[var(--color-fg-muted)]">{row.harness}</td>
-              <td className="text-[var(--color-fg-bright)]">{row.problem}</td>
-              <td>{row.date}</td>
-              <td>{row.compiled}</td>
-              <td>{row.correct}</td>
-              <td>{row.speed}</td>
-              <td>{row.tokens}</td>
-              <td>{row.runtime}</td>
-              <td>{row.files}</td>
-              <td>{row.conversation}</td>
-            </tr>
-          ))}
-        </tbody>
-      </table>
-    </div>
-  )
+  return <LeaderboardTable rows={rows} />
 }
 
-type RunRow = {
-  key: string
-  model: string
-  harness: string
-  problem: string
-  date: React.ReactNode
-  compiled: React.ReactNode
-  correct: React.ReactNode
-  speed: React.ReactNode
-  tokens: React.ReactNode
-  runtime: React.ReactNode
-  files: React.ReactNode
-  conversation: React.ReactNode
+type RunStatusTone = "good" | "bad" | "warn" | "muted"
+
+type RunStatus = HardRunRecord["compiled"]
+
+type RunRow = HardRunRecord
+
+function status(
+  label: string,
+  tone: RunStatusTone,
+  annotationSeverity?: "bad" | "warn",
+  annotationLabel?: string,
+): RunStatus {
+  return { label, tone, annotationSeverity, annotationLabel }
 }
 
 function buildRunRows(
@@ -608,49 +572,117 @@ function buildRunRows(
       const model = shortLabel(m.label)
       const harness = harnessLabel(m.harness)
       if (!cell) {
-        rows.push({
-          key: `${m.label}:${p.key}:missing`,
-          model,
-          harness,
-          problem: p.label,
-          date: <span className="cell-missing">-</span>,
-          compiled: <StatusPill tone="muted">no run</StatusPill>,
-          correct: <StatusPill tone="muted">no run</StatusPill>,
-          speed: <span className="cell-missing">-</span>,
-          tokens: <span className="cell-missing">-</span>,
-          runtime: <span className="cell-missing">-</span>,
-          files: <ReferenceChip problem={p.key} />,
-          conversation: <span className="cell-missing">-</span>,
-        })
+        rows.push(missingRunRow(model, harness, p))
         continue
       }
 
       const annot = annotations.get(cell.run_id)
       const isWinner = winners.get(p.key) === cell.run_id
       const title = cellTitle(cell, hasViewer.has(cell.run_id), annot, isWinner)
+      const usage = cell.usage ?? {}
+      const runAt = runDateParts(cell.run_id)
+      const hasRunViewer = hasViewer.has(cell.run_id)
+      const compiled = compiledStatus(cell)
+      const correct = correctnessStatus(cell, annot)
+      const note = annot?.summary || cell.failure_reason || "run details"
+      const cacheTokens =
+        (usage.cache_read_tokens ?? 0) + (usage.cache_creation_tokens ?? 0)
       rows.push({
         key: cell.run_id,
+        runId: cell.run_id,
         model,
         harness,
         problem: p.label,
-        date: runDate(cell.run_id),
-        compiled: renderCompiled(cell),
-        correct: renderCorrectness(cell, annot),
-        speed: renderSpeed(cell, isWinner),
-        tokens: renderTokens(cell),
-        runtime: renderRuntime(cell),
-        files: renderFileLinks(p.key, cell, hasViewer, title),
-        conversation: renderConversation(
-          cell,
-          annot,
-          hasViewer,
-          title,
-          `${m.pass_count}/${m.total_runs}`,
-        ),
+        problemKey: p.key,
+        date: runAt.date,
+        time: runAt.time,
+        compiled,
+        correct,
+        peakFraction: cell.peak_fraction,
+        speedPct: cell.peak_fraction == null ? null : cell.peak_fraction * 100,
+        isWinner,
+        outputTokens: usage.output_tokens ?? null,
+        reasoningTokens: usage.reasoning_tokens ?? null,
+        cacheTokens,
+        inputTokens: usage.input_tokens ?? null,
+        costUsd: usage.total_cost_usd ?? null,
+        outputTokensPerSecond: cell.output_tokens_per_second ?? null,
+        elapsedSeconds: cell.elapsed_seconds ?? null,
+        checkSeconds: cell.check_elapsed_seconds ?? null,
+        benchmarkSeconds: cell.benchmark_elapsed_seconds ?? null,
+        totalSeconds: cell.total_elapsed_seconds ?? null,
+        gpuWaitSeconds: cell.gpu_lock_wait_seconds_total ?? null,
+        gpuActiveSeconds: cell.gpu_lock_active_seconds_total ?? null,
+        referenceUrl: referenceUrlFor(p.key),
+        solutionUrl: hasRunViewer ? `/runs/${cell.run_id}.html#tab-solution` : null,
+        transcriptUrl: hasRunViewer ? `/runs/${cell.run_id}.html` : null,
+        scored: `${m.pass_count}/${m.total_runs}`,
+        note,
+        title,
+        tokenTitle: tokenTitle(cell),
+        runtimeTitle: runtimeTitle(cell),
+        searchText: [
+          model,
+          harness,
+          p.label,
+          p.key,
+          cell.run_id,
+          compiled.label,
+          correct.label,
+          note,
+          annot?.verdict,
+          annot?.summary,
+          `scored ${m.pass_count}/${m.total_runs}`,
+        ]
+          .filter(Boolean)
+          .join(" "),
       })
     }
   }
   return rows
+}
+
+function missingRunRow(
+  model: string,
+  harness: string,
+  problem: { key: string; label: string },
+): RunRow {
+  return {
+    key: `${model}:${harness}:${problem.key}:missing`,
+    runId: null,
+    model,
+    harness,
+    problem: problem.label,
+    problemKey: problem.key,
+    date: null,
+    time: null,
+    compiled: status("no run", "muted"),
+    correct: status("no run", "muted"),
+    peakFraction: null,
+    speedPct: null,
+    isWinner: false,
+    outputTokens: null,
+    reasoningTokens: null,
+    cacheTokens: null,
+    inputTokens: null,
+    costUsd: null,
+    outputTokensPerSecond: null,
+    elapsedSeconds: null,
+    checkSeconds: null,
+    benchmarkSeconds: null,
+    totalSeconds: null,
+    gpuWaitSeconds: null,
+    gpuActiveSeconds: null,
+    referenceUrl: referenceUrlFor(problem.key),
+    solutionUrl: null,
+    transcriptUrl: null,
+    scored: "0/0",
+    note: "no run",
+    title: "no run",
+    tokenTitle: "",
+    runtimeTitle: "",
+    searchText: `${model} ${harness} ${problem.label} ${problem.key} no run`,
+  }
 }
 
 function findVisibleWinners(models: Model[]) {
@@ -671,6 +703,47 @@ function findVisibleWinners(models: Model[]) {
     if (bestRunId) winners.set(p.key, bestRunId)
   }
   return winners
+}
+
+function correctnessStatus(
+  cell: Cell,
+  annot?: { verdict: string; summary?: string },
+): RunStatus {
+  if (cell.invalid_reason || annot?.verdict === "reward_hack") {
+    return status("invalid", "bad", "bad", "invalid or reward hack")
+  }
+  if (cell.correct) {
+    if (annot && ["rubric_leak", "bug", "interesting"].includes(annot.verdict)) {
+      return status(
+        "pass",
+        "good",
+        annot.verdict === "bug" ? "bad" : "warn",
+        `annotated ${annot.verdict}`,
+      )
+    }
+    return status("pass", "good")
+  }
+  if (cell.failure_reason === "provider_rate_limited") return status("rate", "bad")
+  if (cell.failure_reason === "provider_early_stop") return status("early", "warn")
+  if (cell.failure_reason === "timeout") return status("time", "warn")
+  if (cell.failure_reason === "no_solution") return status("no sol", "bad")
+  if (cell.has_solution) return status("fail", "bad")
+  return status("err", "bad")
+}
+
+function compiledStatus(cell: Cell): RunStatus {
+  if (!cell.has_solution) return status("no sol", "muted")
+  if (cell.check_exit_code === 0 || cell.benchmark_exit_code === 0) {
+    return status("yes", "good")
+  }
+  if (cell.check_exit_code != null || cell.benchmark_exit_code != null) {
+    return status("failed", "bad")
+  }
+  return status("unknown", "warn")
+}
+
+function referenceUrlFor(problem: string) {
+  return `https://github.com/Infatoshi/KernelBench-Hard/blob/master/problems/${problem}/reference.py`
 }
 
 function renderCorrectness(
@@ -824,14 +897,23 @@ function StatusPill({
 }
 
 function runDate(runId: string) {
-  const m = runId.match(/^(\d{4})(\d{2})(\d{2})_(\d{2})(\d{2})(\d{2})/)
-  if (!m) return <span className="cell-missing">-</span>
+  const parts = runDateParts(runId)
+  if (!parts.date || !parts.time) return <span className="cell-missing">-</span>
   return (
     <div className="stacked-cell">
-      <span>{`${m[1]}-${m[2]}-${m[3]}`}</span>
-      <span>{`${m[4]}:${m[5]}:${m[6]}`}</span>
+      <span>{parts.date}</span>
+      <span>{parts.time}</span>
     </div>
   )
+}
+
+function runDateParts(runId: string) {
+  const m = runId.match(/^(\d{4})(\d{2})(\d{2})_(\d{2})(\d{2})(\d{2})/)
+  if (!m) return { date: null, time: null }
+  return {
+    date: `${m[1]}-${m[2]}-${m[3]}`,
+    time: `${m[4]}:${m[5]}:${m[6]}`,
+  }
 }
 
 function fmtCompact(value: number | null | undefined) {
