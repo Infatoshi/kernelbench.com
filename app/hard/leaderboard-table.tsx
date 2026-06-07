@@ -257,12 +257,6 @@ function SpeedCell({ row }: { row: HardRunRecord }) {
           {row.speedPct.toFixed(1)}%
         </span>
       </div>
-      <div className="speed-bar" title={`peak_fraction ${row.peakFraction.toFixed(4)}`}>
-        <div
-          className={row.isWinner ? "speed-fill speed-fill-winner" : "speed-fill"}
-          style={{ width: `${Math.min(100, Math.max(0, row.speedPct))}%` }}
-        />
-      </div>
     </div>
   )
 }
