@@ -20,6 +20,8 @@ export type HardRunRecord = {
   time: string | null
   compiled: HardRunStatus
   correct: HardRunStatus
+  rewardHack: boolean
+  explanation: string | null
   peakFraction: number | null
   speedPct: number | null
   isWinner: boolean
@@ -71,7 +73,7 @@ export function LeaderboardTable({ rows }: { rows: HardRunRecord[] }) {
         return false
       }
       return fuzzyMatch(normalizedQuery, row.searchText)
-    })
+    }).sort(compareRunRows)
   }, [filters, normalizedQuery, rows])
 
   const reset = () => {
@@ -126,6 +128,8 @@ export function LeaderboardTable({ rows }: { rows: HardRunRecord[] }) {
               <th>date</th>
               <th>compiled</th>
               <th>correct</th>
+              <th>reward hacking</th>
+              <th>explanation</th>
               <th>speed of light</th>
               <th>tokens</th>
               <th>runtime</th>
@@ -154,6 +158,26 @@ export function LeaderboardTable({ rows }: { rows: HardRunRecord[] }) {
                 </td>
                 <td>
                   <StatusPill status={row.correct} />
+                </td>
+                <td>
+                  <span
+                    className={
+                      row.rewardHack
+                        ? "status-pill status-pill-bad"
+                        : "status-pill status-pill-muted"
+                    }
+                  >
+                    {row.rewardHack ? "yes" : "no"}
+                  </span>
+                </td>
+                <td>
+                  {row.explanation ? (
+                    <div className="leaderboard-explanation" title={row.explanation}>
+                      {row.explanation}
+                    </div>
+                  ) : (
+                    <span className="cell-missing">-</span>
+                  )}
                 </td>
                 <td>
                   <SpeedCell row={row} />
@@ -231,18 +255,7 @@ function FilterSelect({
 
 function StatusPill({ status }: { status: HardRunStatus }) {
   return (
-    <>
-      <span className={`status-pill status-pill-${status.tone}`}>{status.label}</span>
-      {status.annotationSeverity ? (
-        <span
-          className={`annotation-badge annotation-badge-${status.annotationSeverity}`}
-          title={status.annotationLabel}
-          aria-label={status.annotationLabel}
-        >
-          !
-        </span>
-      ) : null}
-    </>
+    <span className={`status-pill status-pill-${status.tone}`}>{status.label}</span>
   )
 }
 
@@ -300,6 +313,14 @@ function outcomeBucket(row: HardRunRecord) {
   if (row.correct.label === "no run") return "no run"
   if (["rate", "early", "time", "err"].includes(row.correct.label)) return "infra"
   return "fail"
+}
+
+function compareRunRows(a: HardRunRecord, b: HardRunRecord) {
+  const problemDiff = a.problemKey.localeCompare(b.problemKey)
+  if (problemDiff !== 0) return problemDiff
+  const modelDiff = a.model.localeCompare(b.model)
+  if (modelDiff !== 0) return modelDiff
+  return a.harness.localeCompare(b.harness)
 }
 
 function fuzzyMatch(query: string, value: string) {

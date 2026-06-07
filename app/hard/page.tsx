@@ -581,6 +581,8 @@ function buildRunRows(
       const compiled = compiledStatus(cell)
       const correct = correctnessStatus(cell, annot)
       const note = annot?.summary || cell.failure_reason || "run details"
+      const rewardHack = annot?.verdict === "reward_hack"
+      const explanation = annot?.summary || cell.invalid_reason || cell.failure_reason || null
       const cacheTokens =
         (usage.cache_read_tokens ?? 0) + (usage.cache_creation_tokens ?? 0)
       rows.push({
@@ -594,6 +596,8 @@ function buildRunRows(
         time: runAt.time,
         compiled,
         correct,
+        rewardHack,
+        explanation,
         peakFraction: cell.peak_fraction,
         speedPct: cell.peak_fraction == null ? null : cell.peak_fraction * 100,
         isWinner,
@@ -625,6 +629,8 @@ function buildRunRows(
           cell.run_id,
           compiled.label,
           correct.label,
+          rewardHack ? "reward hacking" : "no reward hacking",
+          explanation,
           note,
           annot?.verdict,
           annot?.summary,
@@ -654,6 +660,8 @@ function missingRunRow(
     time: null,
     compiled: status("no run", "muted"),
     correct: status("no run", "muted"),
+    rewardHack: false,
+    explanation: null,
     peakFraction: null,
     speedPct: null,
     isWinner: false,
