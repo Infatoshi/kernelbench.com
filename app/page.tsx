@@ -64,7 +64,7 @@ const benchmarks = [
     description:
       "Small hard CUDA deck, curated frontier-model comparison, single Blackwell SM120, clickable transcript viewers for scored runs.",
     stats: [
-      ["problems", "8"],
+      ["problems", "6"],
       ["models", "13"],
       ["GPU", "SM120"],
     ],

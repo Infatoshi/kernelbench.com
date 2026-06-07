@@ -186,30 +186,20 @@ export default async function HardPage() {
         <p className="mt-4 text-sm text-[var(--color-fg)] max-w-3xl leading-relaxed">
           Problem IDs are stable, not consecutive: 04 was retired after the
           Kahan-softmax rubric leak, and 08 is a deferred Metal problem. The
-          scored CUDA columns are 01, 02, 03, 05, 06, and 07.
+          scored CUDA columns are 01, 02, 03, 05, 06, and 07. For more on the
+          dev and design decisions on this bench, see the{" "}
+          <Link href="/blog/hard">blog post</Link>.
+        </p>
+        <p className="mt-3 text-xs text-[var(--color-fg-muted)] max-w-3xl leading-relaxed">
+          Browse the{" "}
+          <Link href="/runs" className="underline underline-offset-2">
+            run index
+          </Link>
+          {" "}for transcripts, submitted solutions, checks, timing, and costs.
         </p>
       </section>
 
       <section>
-        <h2 className="text-xl font-semibold text-[var(--color-fg-bright)] mb-3">
-          leaderboard
-        </h2>
-        <p className="text-sm text-[var(--color-fg)] mb-4 max-w-4xl leading-relaxed">
-          One row is one trusted model/harness/problem run. <code>speed of light</code>
-          is <code>peak_fraction</code> as a hardware-ceiling percentage. Reference
-          chips jump to <code>Infatoshi/KernelBench-Hard</code>; solution chips
-          open the run viewer&apos;s submitted <code>solution.py</code> tab. The
-          conversation chip opens the transcript viewer. Accent bars mark the visible
-          winner for that problem. Annotation badges mark caveats:
-          {" "}<span className="annotation-badge annotation-badge-bad">!</span>
-          {" "}invalid or reward-hack results, and{" "}
-          <span className="annotation-badge annotation-badge-warn">!</span>
-          {" "}scores with a rubric leak, bug, or unusual interpretation.
-          The harness column is part of the identity: GLM-5.1 through OpenCode,
-          Droid, and Claude Code-compatible Z.ai are separate measurements, but
-          repeated runs through the same harness are collapsed to the most
-          trustworthy row we currently have.
-        </p>
         <LeaderboardMetricsTable
           models={visibleModels}
           annotations={annotations}
@@ -447,6 +437,14 @@ export default async function HardPage() {
         {" · "}
         <Link href="https://github.com/Infatoshi/KernelBench-Hard/blob/master/DEVLOG.md">
           DEVLOG.md
+        </Link>
+        {" · "}
+        <Link href="/runs">
+          runs
+        </Link>
+        {" · "}
+        <Link href="/#cite">
+          citation
         </Link>
       </section>
     </div>

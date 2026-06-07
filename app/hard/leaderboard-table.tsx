@@ -137,7 +137,7 @@ export function LeaderboardTable({ rows }: { rows: HardRunRecord[] }) {
             {filteredRows.map((row) => (
               <tr key={row.key}>
                 <td className="leaderboard-model">{row.model}</td>
-                <td className="leaderboard-muted">{row.harness}</td>
+                <td className="leaderboard-harness">{row.harness}</td>
                 <td className="leaderboard-problem">{row.problem}</td>
                 <td>
                   {row.date ? (

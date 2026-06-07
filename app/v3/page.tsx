@@ -2,6 +2,7 @@
 
 import { useState, useEffect, useMemo } from "react"
 import Image from "next/image"
+import Link from "next/link"
 
 interface Row {
   model: string
@@ -158,6 +159,15 @@ export default function V3Page() {
           <code>mean(softmax(x)) == 1.0</code>), v3 was rebuilt from scratch with
           adaptive baselines, multi-seed correctness, modern architectures (DeepSeek
           MLA, MoE, FP8/INT4 GEMM, GatedDeltaNet), and tracked cost per evaluation.
+          For more on the dev and design decisions on this bench, see the{" "}
+          <Link href="/blog/v3">blog post</Link>.
+        </p>
+        <p className="mt-3 text-xs text-[var(--color-fg-muted)] max-w-3xl leading-relaxed">
+          Browse the{" "}
+          <Link href="/runs" className="underline underline-offset-2">
+            run index
+          </Link>
+          {" "}for transcript viewers and run artifacts.
         </p>
       </section>
 
@@ -346,6 +356,21 @@ export default function V3Page() {
             showing first 1000 of {sorted.length.toLocaleString()} matching rows. apply filters to narrow.
           </p>
         )}
+      </section>
+
+      <section className="text-sm text-[var(--color-fg)] border-t border-[var(--color-border)] pt-6">
+        Source data:{" "}
+        <Link href="https://github.com/Infatoshi/KernelBench-v3">
+          github.com/Infatoshi/KernelBench-v3
+        </Link>
+        {" · "}
+        <Link href="/runs">
+          runs
+        </Link>
+        {" · "}
+        <Link href="/#cite">
+          citation
+        </Link>
       </section>
     </div>
   )
