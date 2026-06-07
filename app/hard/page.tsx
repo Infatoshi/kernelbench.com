@@ -731,7 +731,12 @@ function correctnessStatus(
 
 function compiledStatus(cell: Cell): RunStatus {
   if (!cell.has_solution) return status("no sol", "muted")
-  if (cell.check_exit_code === 0 || cell.benchmark_exit_code === 0) {
+  if (
+    cell.correct ||
+    cell.peak_fraction != null ||
+    cell.check_exit_code === 0 ||
+    cell.benchmark_exit_code === 0
+  ) {
     return status("yes", "good")
   }
   if (cell.check_exit_code != null || cell.benchmark_exit_code != null) {
@@ -781,7 +786,12 @@ function renderCorrectness(
 
 function renderCompiled(cell: Cell) {
   if (!cell.has_solution) return <StatusPill tone="muted">no sol</StatusPill>
-  if (cell.check_exit_code === 0 || cell.benchmark_exit_code === 0) {
+  if (
+    cell.correct ||
+    cell.peak_fraction != null ||
+    cell.check_exit_code === 0 ||
+    cell.benchmark_exit_code === 0
+  ) {
     return <StatusPill tone="good">yes</StatusPill>
   }
   if (cell.check_exit_code != null || cell.benchmark_exit_code != null) {
