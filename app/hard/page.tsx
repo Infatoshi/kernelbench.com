@@ -612,16 +612,16 @@ function shortLabel(label: string) {
 
 function harnessLabel(harness: string) {
   const labels: Record<string, string> = {
-    claude: "claude code",
+    claude: "Claude Code",
     codex: "codex",
-    opencode: "opencode",
+    opencode: "Opencode",
     droid: "droid",
     kimi: "kimi",
     cursor: "cursor",
-    gemini: "gemini-cli",
-    grok: "grok build",
-    "zai-claude": "claude code",
-    "minimax-claude": "claude code",
+    gemini: "Gemini CLI",
+    grok: "Grok Build",
+    "zai-claude": "Claude Code",
+    "minimax-claude": "Claude Code",
   }
   return labels[harness] ?? harness
 }
