@@ -23,14 +23,14 @@ async function loadAvailableViewers(): Promise<Set<string>> {
 }
 
 const PROBLEMS = [
-  { key: "01_fp8_gemm", short: "01 fp8" },
-  { key: "02_kda_cutlass", short: "02 kda" },
-  { key: "03_paged_attention", short: "03 paged" },
-  { key: "05_topk_bitonic", short: "05 topk" },
-  { key: "06_sonic_moe_swiglu", short: "06 moe" },
-  { key: "07_w4a16_gemm", short: "07 w4a16" },
-  { key: "09_fmha_preattn_mrope", short: "09 mrope" },
-  { key: "10_patch_embed_conv3d_gemm", short: "10 patch" },
+  { key: "01_fp8_gemm", label: "FP8 GEMM" },
+  { key: "02_kda_cutlass", label: "KDA CUTLASS" },
+  { key: "03_paged_attention", label: "Paged Attention" },
+  { key: "05_topk_bitonic", label: "TopK Bitonic" },
+  { key: "06_sonic_moe_swiglu", label: "Sonic MoE SwiGLU" },
+  { key: "07_w4a16_gemm", label: "W4A16 GEMM" },
+  { key: "09_fmha_preattn_mrope", label: "FMHA + MRoPE" },
+  { key: "10_patch_embed_conv3d_gemm", label: "Patch Embed Conv3D" },
 ]
 
 const VISIBLE_MODEL_LABELS = new Set([
@@ -263,7 +263,7 @@ export default async function HardPage() {
                   )
                 return (
                   <tr key={p.key}>
-                    <td>{p.key}</td>
+                    <td>{p.label}</td>
                     <td className="text-right">
                       {fmtMs(bl.eager)}
                     </td>
@@ -612,7 +612,7 @@ function buildRunRows(
           key: `${m.label}:${p.key}:missing`,
           model,
           harness,
-          problem: p.key,
+          problem: p.label,
           date: <span className="cell-missing">-</span>,
           compiled: <StatusPill tone="muted">no run</StatusPill>,
           correct: <StatusPill tone="muted">no run</StatusPill>,
@@ -632,7 +632,7 @@ function buildRunRows(
         key: cell.run_id,
         model,
         harness,
-        problem: p.key,
+        problem: p.label,
         date: runDate(cell.run_id),
         compiled: renderCompiled(cell),
         correct: renderCorrectness(cell, annot),

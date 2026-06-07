@@ -60,7 +60,7 @@ export default function RootLayout({
       </head>
       <body className="min-h-screen">
         <Header />
-        <main className="container mx-auto px-4 sm:px-6 max-w-5xl py-10">
+        <main className="container mx-auto px-4 sm:px-6 max-w-7xl py-10">
           {children}
         </main>
         <Footer />
@@ -72,7 +72,7 @@ export default function RootLayout({
 function Header() {
   return (
     <header className="border-b border-[var(--color-border)]">
-      <div className="container mx-auto max-w-5xl px-4 sm:px-6 py-4 flex flex-wrap items-center justify-between gap-x-6 gap-y-3">
+      <div className="container mx-auto max-w-7xl px-4 sm:px-6 py-4 flex flex-wrap items-center justify-between gap-x-6 gap-y-3">
         <a
           href="/"
           className="font-semibold text-[var(--color-fg-bright)] no-underline"
@@ -104,7 +104,7 @@ function Header() {
 function Footer() {
   return (
     <footer className="border-t border-[var(--color-border)] mt-16">
-      <div className="container mx-auto max-w-5xl px-4 sm:px-6 py-6 text-xs text-[var(--color-fg-muted)] flex flex-col sm:flex-row gap-2 sm:items-center sm:justify-between">
+      <div className="container mx-auto max-w-7xl px-4 sm:px-6 py-6 text-xs text-[var(--color-fg-muted)] flex flex-col sm:flex-row gap-2 sm:items-center sm:justify-between">
         <span>
           built by{" "}
           <a href="https://elliotarledge.com">elliot arledge</a>
