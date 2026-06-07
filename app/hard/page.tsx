@@ -4,8 +4,10 @@ import { join } from "node:path"
 import {
   loadLeaderboard,
   loadAnnotations,
+  loadRunAudits,
   type Cell,
   type Model,
+  type RunAudit,
 } from "@/lib/data"
 import { LeaderboardTable, type HardRunRecord } from "./leaderboard-table"
 
@@ -60,9 +62,10 @@ function isVisibleModel(m: Model) {
 }
 
 export default async function HardPage() {
-  const [lb, annotations, hasViewer] = await Promise.all([
+  const [lb, annotations, audits, hasViewer] = await Promise.all([
     loadLeaderboard(),
     loadAnnotations(),
+    loadRunAudits(),
     loadAvailableViewers(),
   ])
   const models = [...lb.models].sort(compareModelRows)
@@ -83,6 +86,7 @@ export default async function HardPage() {
         <LeaderboardMetricsTable
           models={visibleModels}
           annotations={annotations}
+          audits={audits}
           hasViewer={hasViewer}
         />
         <p className="text-xs text-[var(--color-fg)] mt-3 max-w-4xl leading-relaxed">
@@ -109,14 +113,16 @@ export default async function HardPage() {
 function LeaderboardMetricsTable({
   models,
   annotations,
+  audits,
   hasViewer,
 }: {
   models: Model[]
   annotations: Map<string, { verdict: string; summary?: string }>
+  audits: Map<string, RunAudit>
   hasViewer: Set<string>
 }) {
-  const winners = findVisibleWinners(models)
-  const rows = buildRunRows(models, annotations, hasViewer, winners)
+  const winners = findVisibleWinners(models, annotations, audits)
+  const rows = buildRunRows(models, annotations, audits, hasViewer, winners)
 
   return <LeaderboardTable rows={rows} />
 }
@@ -139,6 +145,7 @@ function status(
 function buildRunRows(
   models: Model[],
   annotations: Map<string, { verdict: string; summary?: string }>,
+  audits: Map<string, RunAudit>,
   hasViewer: Set<string>,
   winners: Map<string, string>,
 ): RunRow[] {
@@ -154,16 +161,18 @@ function buildRunRows(
       }
 
       const annot = annotations.get(cell.run_id)
+      const audit = audits.get(cell.run_id)
       const isWinner = winners.get(p.key) === cell.run_id
-      const title = cellTitle(cell, hasViewer.has(cell.run_id), annot, isWinner)
+      const title = cellTitle(cell, hasViewer.has(cell.run_id), annot, isWinner, audit)
       const usage = cell.usage ?? {}
       const runAt = runDateParts(cell.run_id)
       const hasRunViewer = hasViewer.has(cell.run_id)
       const compiled = compiledStatus(cell)
-      const correct = correctnessStatus(cell, annot)
-      const note = annot?.summary || cell.failure_reason || "run details"
-      const rewardHack = annot?.verdict === "reward_hack"
-      const explanation = annot?.summary || cell.invalid_reason || cell.failure_reason || null
+      const correct = correctnessStatus(cell, annot, audit)
+      const note = audit?.summary || annot?.summary || cell.failure_reason || "run details"
+      const auditFlags = auditFlagsFor(annot, audit)
+      const explanation =
+        audit?.summary || annot?.summary || cell.invalid_reason || cell.failure_reason || null
       const cacheTokens =
         (usage.cache_read_tokens ?? 0) + (usage.cache_creation_tokens ?? 0)
       rows.push({
@@ -177,7 +186,7 @@ function buildRunRows(
         time: runAt.time,
         compiled,
         correct,
-        rewardHack,
+        auditFlags,
         explanation,
         peakFraction: cell.peak_fraction,
         speedPct: cell.peak_fraction == null ? null : cell.peak_fraction * 100,
@@ -210,7 +219,7 @@ function buildRunRows(
           cell.run_id,
           compiled.label,
           correct.label,
-          rewardHack ? "reward hacking" : "no reward hacking",
+          auditFlags.join(" "),
           explanation,
           note,
           annot?.verdict,
@@ -241,7 +250,7 @@ function missingRunRow(
     time: null,
     compiled: status("no run", "muted"),
     correct: status("no run", "muted"),
-    rewardHack: false,
+    auditFlags: [],
     explanation: null,
     peakFraction: null,
     speedPct: null,
@@ -270,7 +279,11 @@ function missingRunRow(
   }
 }
 
-function findVisibleWinners(models: Model[]) {
+function findVisibleWinners(
+  models: Model[],
+  annotations: Map<string, { verdict: string; summary?: string }>,
+  audits: Map<string, RunAudit>,
+) {
   const winners = new Map<string, string>()
   for (const p of PROBLEMS) {
     let bestRunId: string | null = null
@@ -278,6 +291,9 @@ function findVisibleWinners(models: Model[]) {
     for (const m of models) {
       const cell = m.results[p.key]
       if (!cell?.correct || cell.peak_fraction == null || cell.invalid_reason) {
+        continue
+      }
+      if (isInvalidAudit(annotations.get(cell.run_id), audits.get(cell.run_id))) {
         continue
       }
       if (cell.peak_fraction > bestPeak) {
@@ -293,16 +309,20 @@ function findVisibleWinners(models: Model[]) {
 function correctnessStatus(
   cell: Cell,
   annot?: { verdict: string; summary?: string },
+  audit?: RunAudit,
 ): RunStatus {
-  if (cell.invalid_reason || annot?.verdict === "reward_hack") {
-    return status("invalid", "bad", "bad", "invalid or reward hack")
+  if (cell.invalid_reason || isInvalidAudit(annot, audit)) {
+    return status("invalid", "bad", "bad", "invalid or quarantined")
   }
   if (cell.correct) {
-    if (annot && ["rubric_leak", "bug", "interesting"].includes(annot.verdict)) {
+    if (
+      annot &&
+      ["rubric_leak", "bug", "interesting", "contamination"].includes(annot.verdict)
+    ) {
       return status(
         "pass",
         "good",
-        annot.verdict === "bug" ? "bad" : "warn",
+        annot.verdict === "bug" || annot.verdict === "contamination" ? "bad" : "warn",
         `annotated ${annot.verdict}`,
       )
     }
@@ -314,6 +334,27 @@ function correctnessStatus(
   if (cell.failure_reason === "no_solution") return status("no sol", "bad")
   if (cell.has_solution) return status("fail", "bad")
   return status("err", "bad")
+}
+
+function auditFlagsFor(
+  annot: { verdict: string; summary?: string } | undefined,
+  audit: RunAudit | undefined,
+) {
+  const flags = new Set<string>()
+  for (const flag of audit?.flags ?? []) flags.add(flag)
+  if (annot && annot.verdict !== "clean") flags.add(annot.verdict)
+  return [...flags]
+}
+
+function isInvalidAudit(
+  annot: { verdict: string; summary?: string } | undefined,
+  audit: RunAudit | undefined,
+) {
+  return (
+    audit?.invalid ||
+    annot?.verdict === "reward_hack" ||
+    annot?.verdict === "contamination"
+  )
 }
 
 function compiledStatus(cell: Cell): RunStatus {
@@ -783,6 +824,7 @@ function cellTitle(
   hasViewer: boolean,
   annotation?: { verdict: string; summary?: string },
   isWinner?: boolean,
+  audit?: RunAudit,
 ) {
   const usage = cell.usage ?? {}
   const status =
@@ -846,6 +888,8 @@ function cellTitle(
     cell.agent_cuda_disabled ? "agent CUDA disabled" : null,
     annotation ? `annotation ${annotation.verdict}` : null,
     annotation?.summary ? `annotation summary: ${annotation.summary}` : null,
+    audit?.flags.length ? `audit flags ${audit.flags.join(", ")}` : null,
+    audit?.summary ? audit.summary : null,
   ]
   return parts.filter(Boolean).join("\n")
 }

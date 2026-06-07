@@ -82,9 +82,29 @@ export type Annotation = {
   run_id: string
   model: string
   problem: string
-  verdict: "clean" | "rubric_leak" | "reward_hack" | "interesting" | "bug"
+  verdict:
+    | "clean"
+    | "rubric_leak"
+    | "reward_hack"
+    | "contamination"
+    | "interesting"
+    | "bug"
   summary: string
   implication?: string
+}
+
+export type AuditFlag =
+  | "contamination"
+  | "reward_hack"
+  | "rubric_leak"
+  | "bug"
+  | "interesting"
+
+export type RunAudit = {
+  flags: AuditFlag[]
+  summary: string
+  evidence: string[]
+  invalid: boolean
 }
 
 export type VariantTiming = {
@@ -143,6 +163,100 @@ export async function loadAnnotations(): Promise<Map<string, Annotation>> {
     // Missing annotations dir is non-fatal — cells just don't get the marker.
   }
   return map
+}
+
+export async function loadRunAudits(): Promise<Map<string, RunAudit>> {
+  const map = new Map<string, RunAudit>()
+  const dir = join(REPO_ROOT, "public/runs")
+  try {
+    const entries = await readdir(dir)
+    for (const name of entries) {
+      if (!name.endsWith(".html")) continue
+      const runId = name.slice(0, -5)
+      const text = await readFile(join(dir, name), "utf-8")
+      const audit = auditRunViewer(runId, text)
+      if (audit.flags.length) map.set(runId, audit)
+    }
+  } catch {
+    // Missing run viewers are non-fatal.
+  }
+  return map
+}
+
+function auditRunViewer(runId: string, html: string): RunAudit {
+  const flags = new Set<AuditFlag>()
+  const evidence = new Set<string>()
+
+  const add = (flag: AuditFlag, item: string) => {
+    flags.add(flag)
+    if (evidence.size < 5) evidence.add(item)
+  }
+
+  if (
+    /Read <span class="filepath">\/home\/infatoshi\/\.claude\/projects\/[^<]*\/memory\//.test(
+      html,
+    )
+  ) {
+    add("contamination", "read private Claude project memory")
+  }
+  if (
+    /Read <span class="filepath">\/home\/infatoshi\/\.codex\/memories\//.test(html)
+  ) {
+    add("contamination", "read private Codex memory")
+  }
+
+  const priorArtifact =
+    /\/home\/infatoshi\/(?:benchmarks|cuda)\/KernelBench-Hard\/outputs\/runs\/([^/<\s]+)\/([^<"\s]*(?:solution\.py|result\.json|benchmark\.log|transcript\.jsonl)[^<"\s]*)/g
+  for (const match of html.matchAll(priorArtifact)) {
+    const seenRunId = match[1]
+    const path = match[2]
+    if (seenRunId !== runId && !path.includes("/repo/.venv/")) {
+      add("contamination", `read prior run artifact ${seenRunId}/${shortAuditPath(path)}`)
+    }
+  }
+
+  if (
+    /Read <span class="filepath">\/home\/infatoshi\/benchmarks\/KernelBench-Hard\/LEADERBOARD\.md<\/span>/.test(
+      html,
+    ) ||
+    /"file_path":\s*"\/home\/infatoshi\/benchmarks\/KernelBench-Hard\/LEADERBOARD\.md"/.test(
+      html,
+    )
+  ) {
+    add("contamination", "read historical LEADERBOARD.md")
+  }
+
+  if (
+    /(Write|Edit) <span class="filepath">\/home\/infatoshi\/benchmarks\/KernelBench-Hard\/outputs\/runs\/[^<]*\/repo\/(?:problems\/[^/]+\/(?:problem\.yaml|check\.py|benchmark\.py|reference\.py|shapes\.py)|src\/eval\/[^<]+)<\/span>/.test(
+      html,
+    ) ||
+    /(Write|Edit) <span class="filepath">\/home\/infatoshi\/benchmarks\/KernelBench-Hard\/src\/eval\/[^<]+<\/span>/.test(
+      html,
+    )
+  ) {
+    add("reward_hack", "edited benchmark or judge file")
+  }
+
+  const flagList = [...flags]
+  return {
+    flags: flagList,
+    summary: auditSummary(flagList, [...evidence]),
+    evidence: [...evidence],
+    invalid: flagList.includes("contamination") || flagList.includes("reward_hack"),
+  }
+}
+
+function shortAuditPath(path: string) {
+  const parts = path.split("/")
+  return parts.slice(-2).join("/")
+}
+
+function auditSummary(flags: AuditFlag[], evidence: string[]) {
+  if (!flags.length) return ""
+  const prefix = flags.includes("reward_hack")
+    ? "quarantined: benchmark/judge tampering"
+    : "quarantined: prior-state contamination"
+  return evidence.length ? `${prefix}; ${evidence.join("; ")}` : prefix
 }
 
 // Tiny YAML subset parser. We control the schema (results/annotations/SCHEMA.md)

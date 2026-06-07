@@ -20,7 +20,7 @@ export type HardRunRecord = {
   time: string | null
   compiled: HardRunStatus
   correct: HardRunStatus
-  rewardHack: boolean
+  auditFlags: string[]
   explanation: string | null
   peakFraction: number | null
   speedPct: number | null
@@ -61,7 +61,7 @@ type SortKey =
   | "date"
   | "compiled"
   | "correct"
-  | "rewardHack"
+  | "audit"
   | "explanation"
   | "speed"
   | "tokens"
@@ -144,7 +144,7 @@ export function LeaderboardTable({ rows }: { rows: HardRunRecord[] }) {
               <SortableTh label="date" sortKey="date" active={sort} onSort={setSortKey} />
               <SortableTh label="compiled" sortKey="compiled" active={sort} onSort={setSortKey} />
               <SortableTh label="correct" sortKey="correct" active={sort} onSort={setSortKey} />
-              <SortableTh label="reward hacking" sortKey="rewardHack" active={sort} onSort={setSortKey} />
+              <SortableTh label="audit" sortKey="audit" active={sort} onSort={setSortKey} />
               <SortableTh label="explanation" sortKey="explanation" active={sort} onSort={setSortKey} />
               <SortableTh label="SOL" sortKey="speed" active={sort} onSort={setSortKey} />
               <SortableTh label="tokens" sortKey="tokens" active={sort} onSort={setSortKey} />
@@ -175,16 +175,8 @@ export function LeaderboardTable({ rows }: { rows: HardRunRecord[] }) {
                 <td className={sortCellClass("correct", sort)}>
                   <StatusPill status={row.correct} />
                 </td>
-                <td className={sortCellClass("rewardHack", sort)}>
-                  <span
-                    className={
-                      row.rewardHack
-                        ? "status-pill status-pill-bad"
-                        : "status-pill status-pill-muted"
-                    }
-                  >
-                    {row.rewardHack ? "yes" : "no"}
-                  </span>
+                <td className={sortCellClass("audit", sort)}>
+                  <AuditCell row={row} />
                 </td>
                 <td className={sortCellClass("explanation", sort)}>
                   {row.explanation ? (
@@ -362,7 +354,41 @@ function RuntimeCell({ row }: { row: HardRunRecord }) {
   )
 }
 
+function AuditCell({ row }: { row: HardRunRecord }) {
+  if (row.auditFlags.length === 0) {
+    return <span className="audit-chip audit-chip-clean">clean</span>
+  }
+  return (
+    <div className="chip-row">
+      {row.auditFlags.map((flag) => (
+        <span
+          key={flag}
+          className={`audit-chip audit-chip-${auditTone(flag)}`}
+          title={row.explanation ?? flag}
+        >
+          {auditLabel(flag)}
+        </span>
+      ))}
+    </div>
+  )
+}
+
+function auditTone(flag: string) {
+  if (flag === "reward_hack" || flag === "contamination" || flag === "bug") {
+    return "bad"
+  }
+  if (flag === "rubric_leak" || flag === "interesting") return "warn"
+  return "muted"
+}
+
+function auditLabel(flag: string) {
+  return flag.replaceAll("_", " ")
+}
+
 function outcomeBucket(row: HardRunRecord) {
+  if (row.auditFlags.includes("contamination") || row.auditFlags.includes("reward_hack")) {
+    return "fail"
+  }
   if (row.correct.label === "pass") return "pass"
   if (row.correct.label === "no run") return "no run"
   if (["rate", "early", "time", "err"].includes(row.correct.label)) return "infra"
@@ -393,8 +419,8 @@ function sortValue(row: HardRunRecord, key: SortKey) {
       return row.compiled.label
     case "correct":
       return row.correct.label
-    case "rewardHack":
-      return row.rewardHack ? 1 : 0
+    case "audit":
+      return row.auditFlags.length ? row.auditFlags.join(" ") : "clean"
     case "explanation":
       return row.explanation
     case "speed":
