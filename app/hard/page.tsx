@@ -196,12 +196,11 @@ export default async function HardPage() {
           Leaderboard
         </h2>
         <p className="text-sm text-[var(--color-fg)] mb-4 max-w-4xl leading-relaxed">
-          Rows show one metric at a time, so problem is a normal column instead
-          of a wide pivot. <code>peak_fraction</code> is the fraction of the
-          relevant hardware ceiling reached by a correct kernel. Click a run id
-          or linked metric to open the transcript when one is available. Blue
-          underlined peak values are the visible winner for that problem.
-          Annotation badges mark caveats:
+          One row is one trusted model/harness/problem run. <code>speed of light</code>
+          is <code>peak_fraction</code> as a hardware-ceiling percentage. The file
+          chips jump to the problem reference and the run&apos;s submitted solution;
+          the conversation chip opens the transcript viewer. Blue bars mark the
+          visible winner for that problem. Annotation badges mark caveats:
           {" "}<span className="annotation-badge annotation-badge-bad">!</span>
           {" "}invalid or reward-hack results, and{" "}
           <span className="annotation-badge annotation-badge-warn">!</span>
@@ -538,30 +537,40 @@ function LeaderboardMetricsTable({
   hasViewer: Set<string>
 }) {
   const winners = findVisibleWinners(models)
-  const rows = buildMetricRows(models, annotations, hasViewer, winners)
+  const rows = buildRunRows(models, annotations, hasViewer, winners)
 
   return (
     <div className="box">
-      <table className="term leaderboard-metrics tabular text-xs">
+      <table className="term leaderboard-runs tabular text-xs">
         <thead>
           <tr>
-            <th>problem</th>
             <th>model</th>
             <th>harness</th>
-            <th>metric</th>
-            <th>value</th>
-            <th>run</th>
+            <th>problem</th>
+            <th>date</th>
+            <th>compiled</th>
+            <th>correct</th>
+            <th>speed of light</th>
+            <th>tokens</th>
+            <th>runtime</th>
+            <th>files</th>
+            <th>conversation</th>
           </tr>
         </thead>
         <tbody>
           {rows.map((row) => (
             <tr key={row.key}>
-              <td className="text-[var(--color-fg-bright)]">{row.problem}</td>
-              <td>{row.model}</td>
+              <td className="leaderboard-model">{row.model}</td>
               <td className="text-[var(--color-fg-muted)]">{row.harness}</td>
-              <td className="text-[var(--color-fg-muted)]">{row.metric}</td>
-              <td>{row.value}</td>
-              <td>{row.runLink}</td>
+              <td className="text-[var(--color-fg-bright)]">{row.problem}</td>
+              <td>{row.date}</td>
+              <td>{row.compiled}</td>
+              <td>{row.correct}</td>
+              <td>{row.speed}</td>
+              <td>{row.tokens}</td>
+              <td>{row.runtime}</td>
+              <td>{row.files}</td>
+              <td>{row.conversation}</td>
             </tr>
           ))}
         </tbody>
@@ -570,38 +579,47 @@ function LeaderboardMetricsTable({
   )
 }
 
-type MetricRow = {
+type RunRow = {
   key: string
-  problem: string
   model: string
   harness: string
-  metric: string
-  value: React.ReactNode
-  runLink: React.ReactNode
+  problem: string
+  date: React.ReactNode
+  compiled: React.ReactNode
+  correct: React.ReactNode
+  speed: React.ReactNode
+  tokens: React.ReactNode
+  runtime: React.ReactNode
+  files: React.ReactNode
+  conversation: React.ReactNode
 }
 
-function buildMetricRows(
+function buildRunRows(
   models: Model[],
   annotations: Map<string, { verdict: string; summary?: string }>,
   hasViewer: Set<string>,
   winners: Map<string, string>,
-): MetricRow[] {
-  const rows: MetricRow[] = []
+): RunRow[] {
+  const rows: RunRow[] = []
   for (const m of models) {
     for (const p of PROBLEMS) {
       const cell = m.results[p.key]
-      const base = {
-        problem: p.key,
-        model: shortLabel(m.label),
-        harness: harnessLabel(m.harness),
-      }
+      const model = shortLabel(m.label)
+      const harness = harnessLabel(m.harness)
       if (!cell) {
         rows.push({
-          ...base,
-          key: `${m.label}:${p.key}:status`,
-          metric: "status",
-          value: <span className="cell-missing">NO RUN</span>,
-          runLink: <span className="cell-missing">-</span>,
+          key: `${m.label}:${p.key}:missing`,
+          model,
+          harness,
+          problem: p.key,
+          date: <span className="cell-missing">-</span>,
+          compiled: <StatusPill tone="muted">no run</StatusPill>,
+          correct: <StatusPill tone="muted">no run</StatusPill>,
+          speed: <span className="cell-missing">-</span>,
+          tokens: <span className="cell-missing">-</span>,
+          runtime: <span className="cell-missing">-</span>,
+          files: <ReferenceChip problem={p.key} />,
+          conversation: <span className="cell-missing">-</span>,
         })
         continue
       }
@@ -609,46 +627,26 @@ function buildMetricRows(
       const annot = annotations.get(cell.run_id)
       const isWinner = winners.get(p.key) === cell.run_id
       const title = cellTitle(cell, hasViewer.has(cell.run_id), annot, isWinner)
-      const add = (metric: string, value: React.ReactNode) => {
-        const displayValue = value ?? <span className="cell-missing">-</span>
-        rows.push({
-          ...base,
-          key: `${cell.run_id}:${metric}`,
-          metric,
-          value: linkMetric(cell, hasViewer, title, displayValue),
-          runLink: runLink(cell, hasViewer, title),
-        })
-      }
-
-      add("status", renderStatus(cell, annot))
-      add("peak_fraction", renderPeak(cell, isWinner))
-      add("correct", fmtBool(cell.correct))
-      add("has_solution", fmtBool(cell.has_solution))
-      add("failure_reason", fmtMaybe(cell.failure_reason))
-      add("retryable_infra_failure", fmtMaybeBool(cell.retryable_infra_failure))
-      add("minimum_useful_output_tokens", fmtMaybeInt(cell.minimum_useful_output_tokens))
-      add("elapsed_seconds", fmtMaybeDuration(cell.elapsed_seconds))
-      add("total_elapsed_seconds", fmtMaybeDuration(cell.total_elapsed_seconds))
-      add("check_elapsed_seconds", fmtMaybeDuration(cell.check_elapsed_seconds))
-      add("benchmark_elapsed_seconds", fmtMaybeDuration(cell.benchmark_elapsed_seconds))
-      add("check_exit_code", fmtMaybeInt(cell.check_exit_code))
-      add("benchmark_exit_code", fmtMaybeInt(cell.benchmark_exit_code))
-      add("session_complete", fmtMaybeBool(cell.session_complete))
-      add("harness_exit_code", fmtMaybeInt(cell.harness_exit_code))
-      add("agent_cuda_disabled", fmtMaybeBool(cell.agent_cuda_disabled))
-      add("gpu_queue_mode", fmtMaybe(cell.gpu_queue_mode))
-      add("gpu_lock_calls", fmtMaybeInt(cell.gpu_lock_calls))
-      add("gpu_lock_wait_seconds_total", fmtMaybeDuration(cell.gpu_lock_wait_seconds_total))
-      add("gpu_lock_active_seconds_total", fmtMaybeDuration(cell.gpu_lock_active_seconds_total))
-      add("output_tokens_per_second", fmtMaybeFixed(cell.output_tokens_per_second, 1))
-      add("usage.input_tokens", fmtMaybeInt(cell.usage?.input_tokens))
-      add("usage.output_tokens", fmtMaybeInt(cell.usage?.output_tokens))
-      add("usage.cache_read_tokens", fmtMaybeInt(cell.usage?.cache_read_tokens))
-      add("usage.cache_creation_tokens", fmtMaybeInt(cell.usage?.cache_creation_tokens))
-      add("usage.reasoning_tokens", fmtMaybeInt(cell.usage?.reasoning_tokens))
-      add("usage.total_cost_usd", fmtMaybeUsd(cell.usage?.total_cost_usd))
-      add("annotation", annot ? `${annot.verdict}${annot.summary ? `: ${annot.summary}` : ""}` : null)
-      add("model_scored", `${m.pass_count}/${m.total_runs}`)
+      rows.push({
+        key: cell.run_id,
+        model,
+        harness,
+        problem: p.key,
+        date: runDate(cell.run_id),
+        compiled: renderCompiled(cell),
+        correct: renderCorrectness(cell, annot),
+        speed: renderSpeed(cell, isWinner),
+        tokens: renderTokens(cell),
+        runtime: renderRuntime(cell),
+        files: renderFileLinks(p.key, cell, hasViewer, title),
+        conversation: renderConversation(
+          cell,
+          annot,
+          hasViewer,
+          title,
+          `${m.pass_count}/${m.total_runs}`,
+        ),
+      })
     }
   }
   return rows
@@ -674,14 +672,14 @@ function findVisibleWinners(models: Model[]) {
   return winners
 }
 
-function renderStatus(
+function renderCorrectness(
   cell: Cell,
   annot?: { verdict: string; summary?: string },
 ) {
   if (cell.invalid_reason || annot?.verdict === "reward_hack") {
     return (
       <>
-        <span className="cell-invalid">INVALID</span>
+        <StatusPill tone="bad">invalid</StatusPill>
         <AnnotationBadge severity="bad" label="invalid or reward hack" />
       </>
     )
@@ -696,83 +694,188 @@ function renderStatus(
       ) : null
     return (
       <>
-        <span className="cell-clean">PASS</span>
+        <StatusPill tone="good">pass</StatusPill>
         {badge}
       </>
     )
   }
-  if (cell.failure_reason === "provider_rate_limited") return <span className="cell-err">RATE</span>
-  if (cell.failure_reason === "provider_early_stop") return <span className="cell-err">EARLY</span>
-  if (cell.failure_reason === "timeout") return <span className="cell-err">TIME</span>
-  if (cell.failure_reason === "no_solution") return <span className="cell-err">NO SOL</span>
-  if (cell.has_solution) return <span className="cell-fail">FAIL</span>
-  return <span className="cell-err">ERR</span>
+  if (cell.failure_reason === "provider_rate_limited") return <StatusPill tone="bad">rate</StatusPill>
+  if (cell.failure_reason === "provider_early_stop") return <StatusPill tone="warn">early</StatusPill>
+  if (cell.failure_reason === "timeout") return <StatusPill tone="warn">time</StatusPill>
+  if (cell.failure_reason === "no_solution") return <StatusPill tone="bad">no sol</StatusPill>
+  if (cell.has_solution) return <StatusPill tone="bad">fail</StatusPill>
+  return <StatusPill tone="bad">err</StatusPill>
 }
 
-function renderPeak(cell: Cell, isWinner: boolean) {
+function renderCompiled(cell: Cell) {
+  if (!cell.has_solution) return <StatusPill tone="muted">no sol</StatusPill>
+  if (cell.check_exit_code === 0 || cell.benchmark_exit_code === 0) {
+    return <StatusPill tone="good">yes</StatusPill>
+  }
+  if (cell.check_exit_code != null || cell.benchmark_exit_code != null) {
+    return <StatusPill tone="bad">failed</StatusPill>
+  }
+  return <StatusPill tone="warn">unknown</StatusPill>
+}
+
+function renderSpeed(cell: Cell, isWinner: boolean) {
   if (cell.peak_fraction == null) return <span className="cell-missing">-</span>
+  const pct = cell.peak_fraction * 100
   return (
-    <span className={isWinner ? "cell-score cell-winner" : "cell-score"}>
-      {cell.peak_fraction.toFixed(3)}
-    </span>
+    <div className="speed-cell">
+      <div className="speed-readout">
+        <span className={isWinner ? "cell-score cell-winner" : "cell-score"}>
+          {pct.toFixed(1)}%
+        </span>
+      </div>
+      <div className="speed-bar" title={`peak_fraction ${cell.peak_fraction.toFixed(4)}`}>
+        <div
+          className={isWinner ? "speed-fill speed-fill-winner" : "speed-fill"}
+          style={{ width: `${Math.min(100, Math.max(0, pct))}%` }}
+        />
+      </div>
+    </div>
   )
 }
 
-function linkMetric(
+function renderTokens(cell: Cell) {
+  const usage = cell.usage ?? {}
+  return (
+    <div className="stacked-cell" title={tokenTitle(cell)}>
+      <span>out {fmtCompact(usage.output_tokens)}</span>
+      <span>think {fmtCompact(usage.reasoning_tokens)}</span>
+      <span>cache {fmtCompact((usage.cache_read_tokens ?? 0) + (usage.cache_creation_tokens ?? 0))}</span>
+    </div>
+  )
+}
+
+function renderRuntime(cell: Cell) {
+  return (
+    <div className="stacked-cell" title={runtimeTitle(cell)}>
+      <span>agent {fmtMaybeDurationText(cell.elapsed_seconds)}</span>
+      <span>check {fmtMaybeDurationText(cell.check_elapsed_seconds)}</span>
+      <span>bench {fmtMaybeDurationText(cell.benchmark_elapsed_seconds)}</span>
+    </div>
+  )
+}
+
+function renderFileLinks(problem: string, cell: Cell, hasViewer: Set<string>, title: string) {
+  return (
+    <div className="chip-row">
+      <ReferenceChip problem={problem} />
+      {hasViewer.has(cell.run_id) ? (
+        <a className="link-chip" href={`/runs/${cell.run_id}.html#tab-solution`} title={title}>
+          solution
+        </a>
+      ) : (
+        <span className="link-chip link-chip-muted">solution</span>
+      )}
+    </div>
+  )
+}
+
+function renderConversation(
   cell: Cell,
+  annot: { verdict: string; summary?: string } | undefined,
   hasViewer: Set<string>,
   title: string,
-  value: React.ReactNode,
+  scored: string,
 ) {
-  if (!hasViewer.has(cell.run_id)) return <span title={title}>{value}</span>
+  const note = annot?.summary || cell.failure_reason || "run details"
   return (
-    <a href={`/runs/${cell.run_id}.html`} className="no-underline" title={title}>
-      {value}
+    <div className="conversation-cell">
+      <div className="chip-row">
+        {hasViewer.has(cell.run_id) ? (
+          <a className="link-chip" href={`/runs/${cell.run_id}.html`} title={title}>
+            transcript
+          </a>
+        ) : (
+          <span className="link-chip link-chip-muted">transcript</span>
+        )}
+        <span className="link-chip link-chip-muted">{scored}</span>
+      </div>
+      <div className="conversation-note" title={note}>
+        {note}
+      </div>
+    </div>
+  )
+}
+
+function ReferenceChip({ problem }: { problem: string }) {
+  return (
+    <a
+      className="link-chip"
+      href={`https://github.com/Infatoshi/kernelbench.com/blob/master/benchmarks/hard/problems/${problem}/reference.py`}
+    >
+      reference
     </a>
   )
 }
 
-function runLink(cell: Cell, hasViewer: Set<string>, title: string) {
-  if (!hasViewer.has(cell.run_id)) {
-    return (
-      <span className="text-[var(--color-fg-muted)]" title={title}>
-        {cell.run_id}
-      </span>
-    )
-  }
+function StatusPill({
+  tone,
+  children,
+}: {
+  tone: "good" | "bad" | "warn" | "muted"
+  children: React.ReactNode
+}) {
+  return <span className={`status-pill status-pill-${tone}`}>{children}</span>
+}
+
+function runDate(runId: string) {
+  const m = runId.match(/^(\d{4})(\d{2})(\d{2})_(\d{2})(\d{2})(\d{2})/)
+  if (!m) return <span className="cell-missing">-</span>
   return (
-    <a href={`/runs/${cell.run_id}.html`} title={title}>
-      {cell.run_id}
-    </a>
+    <div className="stacked-cell">
+      <span>{`${m[1]}-${m[2]}-${m[3]}`}</span>
+      <span>{`${m[4]}:${m[5]}:${m[6]}`}</span>
+    </div>
   )
 }
 
-function fmtBool(value: boolean) {
-  return value ? "true" : "false"
+function fmtCompact(value: number | null | undefined) {
+  if (value == null) return "-"
+  if (Math.abs(value) >= 1_000_000) return `${(value / 1_000_000).toFixed(1)}m`
+  if (Math.abs(value) >= 1_000) return `${(value / 1_000).toFixed(1)}k`
+  return fmtInt(value)
 }
 
-function fmtMaybe(value: string | null | undefined) {
-  return value ?? <span className="cell-missing">-</span>
+function fmtMaybeDurationText(value: number | null | undefined) {
+  return value == null ? "-" : fmtDuration(value)
 }
 
-function fmtMaybeBool(value: boolean | null | undefined) {
-  return value == null ? <span className="cell-missing">-</span> : fmtBool(value)
+function tokenTitle(cell: Cell) {
+  const usage = cell.usage ?? {}
+  return [
+    usage.input_tokens != null ? `input ${fmtInt(usage.input_tokens)}` : null,
+    usage.output_tokens != null ? `output ${fmtInt(usage.output_tokens)}` : null,
+    usage.reasoning_tokens != null ? `reasoning ${fmtInt(usage.reasoning_tokens)}` : null,
+    usage.cache_read_tokens != null ? `cache read ${fmtInt(usage.cache_read_tokens)}` : null,
+    usage.cache_creation_tokens != null
+      ? `cache write ${fmtInt(usage.cache_creation_tokens)}`
+      : null,
+    usage.total_cost_usd != null ? `cost $${usage.total_cost_usd.toFixed(4)}` : null,
+    cell.output_tokens_per_second != null
+      ? `${cell.output_tokens_per_second.toFixed(1)} out tok/s`
+      : null,
+  ].filter(Boolean).join("\n")
 }
 
-function fmtMaybeInt(value: number | null | undefined) {
-  return value == null ? <span className="cell-missing">-</span> : fmtInt(value)
-}
-
-function fmtMaybeFixed(value: number | null | undefined, digits: number) {
-  return value == null ? <span className="cell-missing">-</span> : value.toFixed(digits)
-}
-
-function fmtMaybeDuration(value: number | null | undefined) {
-  return value == null ? <span className="cell-missing">-</span> : fmtDuration(value)
-}
-
-function fmtMaybeUsd(value: number | null | undefined) {
-  return value == null ? <span className="cell-missing">-</span> : `$${value.toFixed(4)}`
+function runtimeTitle(cell: Cell) {
+  return [
+    cell.total_elapsed_seconds != null ? `total ${fmtDuration(cell.total_elapsed_seconds)}` : null,
+    cell.elapsed_seconds != null ? `agent ${fmtDuration(cell.elapsed_seconds)}` : null,
+    cell.check_elapsed_seconds != null ? `check ${fmtDuration(cell.check_elapsed_seconds)}` : null,
+    cell.benchmark_elapsed_seconds != null
+      ? `benchmark ${fmtDuration(cell.benchmark_elapsed_seconds)}`
+      : null,
+    cell.gpu_lock_wait_seconds_total != null
+      ? `GPU wait ${fmtDuration(cell.gpu_lock_wait_seconds_total)}`
+      : null,
+    cell.gpu_lock_active_seconds_total != null
+      ? `GPU active ${fmtDuration(cell.gpu_lock_active_seconds_total)}`
+      : null,
+  ].filter(Boolean).join("\n")
 }
 
 function compareModelRows(a: Model, b: Model) {
