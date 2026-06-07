@@ -118,32 +118,6 @@ export default async function HardPage() {
         </p>
       </section>
 
-      <section className="text-sm text-[var(--color-fg)] border-t border-[var(--color-border)] pt-6">
-        Source data:{" "}
-        <Link href="https://github.com/Infatoshi/KernelBench-Hard">
-          github.com/Infatoshi/KernelBench-Hard
-        </Link>
-        {" · "}
-        <Link href="https://github.com/Infatoshi/KernelBench-Hard/blob/master/results/leaderboard.json">
-          leaderboard.json
-        </Link>
-        {" · "}
-        <Link href="https://github.com/Infatoshi/KernelBench-Hard/tree/master/results/annotations">
-          annotations/
-        </Link>
-        {" · "}
-        <Link href="https://github.com/Infatoshi/KernelBench-Hard/blob/master/DEVLOG.md">
-          DEVLOG.md
-        </Link>
-        {" · "}
-        <Link href="/runs">
-          runs
-        </Link>
-        {" · "}
-        <Link href="/#cite">
-          citation
-        </Link>
-      </section>
     </div>
   )
 }
