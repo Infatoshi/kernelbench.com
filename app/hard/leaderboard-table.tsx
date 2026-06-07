@@ -292,9 +292,10 @@ function SortableTh({
         onClick={() => onSort(sortKey)}
       >
         <span>{label}</span>
-        <span className="sort-indicator" aria-hidden="true">
-          {isActive ? (active.dir === "asc" ? "↑" : "↓") : "↕"}
-        </span>
+        <span
+          className={`sort-indicator sort-indicator-${isActive ? active.dir : "idle"}`}
+          aria-hidden="true"
+        />
       </button>
     </th>
   )

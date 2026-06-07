@@ -77,20 +77,6 @@ export default async function HardPage() {
         <p className="text-sm text-[var(--color-fg)] mb-6">
           Current scored CUDA board · RTX PRO 6000 Blackwell · sm_120 · 96 GB GDDR7 · 1.8 TB/s
         </p>
-        <p className="text-[var(--color-fg)] leading-relaxed max-w-3xl">
-          A focused successor to the v3 suite. One Blackwell GPU, a small set
-          of hard CUDA kernel problems, and real coding-agent CLIs as the harness.
-          The table below keeps one trusted record for same-harness reruns, while
-          preserving distinct harness routes as separate records. One-off diagnostic
-          rows stay in the source data.
-        </p>
-        <p className="mt-4 text-sm text-[var(--color-fg)] max-w-3xl leading-relaxed">
-          Problem IDs are stable, not consecutive: 04 was retired after the
-          Kahan-softmax rubric leak, and 08 is a deferred Metal problem. The
-          scored CUDA columns are 01, 02, 03, 05, 06, and 07. For more on the
-          dev and design decisions on this bench, see the{" "}
-          <Link href="/blog/hard">blog post</Link>.
-        </p>
         <p className="mt-3 text-xs text-[var(--color-fg-muted)] max-w-3xl leading-relaxed">
           Browse the{" "}
           <Link href="/runs" className="underline underline-offset-2">
