@@ -146,7 +146,7 @@ export function LeaderboardTable({ rows }: { rows: HardRunRecord[] }) {
               <SortableTh label="correct" sortKey="correct" active={sort} onSort={setSortKey} />
               <SortableTh label="reward hacking" sortKey="rewardHack" active={sort} onSort={setSortKey} />
               <SortableTh label="explanation" sortKey="explanation" active={sort} onSort={setSortKey} />
-              <SortableTh label="speed of light" sortKey="speed" active={sort} onSort={setSortKey} />
+              <SortableTh label="SOL" sortKey="speed" active={sort} onSort={setSortKey} />
               <SortableTh label="tokens" sortKey="tokens" active={sort} onSort={setSortKey} />
               <SortableTh label="runtime" sortKey="runtime" active={sort} onSort={setSortKey} />
               <th>files</th>
@@ -321,7 +321,7 @@ function SpeedCell({ row }: { row: HardRunRecord }) {
     <div className="speed-cell">
       <div className="speed-readout">
         <span className={row.isWinner ? "cell-score cell-winner" : "cell-score"}>
-          {row.speedPct.toFixed(1)}%
+          {Math.round(row.speedPct)}%
         </span>
       </div>
     </div>
