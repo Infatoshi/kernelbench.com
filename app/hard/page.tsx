@@ -75,14 +75,7 @@ export default async function HardPage() {
           hard
         </h1>
         <p className="text-sm text-[var(--color-fg)] mb-6">
-          Current scored CUDA board · RTX PRO 6000 Blackwell · sm_120 · 96 GB GDDR7 · 1.8 TB/s
-        </p>
-        <p className="mt-3 text-xs text-[var(--color-fg-muted)] max-w-3xl leading-relaxed">
-          Browse the{" "}
-          <Link href="/runs" className="underline underline-offset-2">
-            run index
-          </Link>
-          {" "}for transcripts, submitted solutions, checks, timing, and costs.
+          RTX PRO 6000 Blackwell (sm120)
         </p>
       </section>
 
@@ -93,7 +86,12 @@ export default async function HardPage() {
           hasViewer={hasViewer}
         />
         <p className="text-xs text-[var(--color-fg)] mt-3 max-w-4xl leading-relaxed">
-          Full historical and diagnostic rows are still available in{" "}
+          Browse the{" "}
+          <Link href="/runs" className="underline underline-offset-2">
+            run index
+          </Link>
+          {" "}for transcripts, submitted solutions, checks, timing, and costs.
+          {" "}Full historical and diagnostic rows are still available in{" "}
           <Link
             href="https://github.com/Infatoshi/KernelBench-Hard/blob/master/results/leaderboard.json"
             className="underline underline-offset-2"

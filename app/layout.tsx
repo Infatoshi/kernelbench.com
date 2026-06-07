@@ -1,7 +1,6 @@
 import type { Metadata } from "next"
 import { JetBrains_Mono } from "next/font/google"
 import "./globals.css"
-import { ThemeToggle } from "./theme-toggle"
 
 const mono = JetBrains_Mono({
   subsets: ["latin"],
@@ -50,14 +49,7 @@ export default function RootLayout({
   children: React.ReactNode
 }) {
   return (
-    <html lang="en" className={mono.variable} data-theme="dark" suppressHydrationWarning>
-      <head>
-        <script
-          dangerouslySetInnerHTML={{
-            __html: `try{var t=localStorage.getItem("kb-theme");document.documentElement.dataset.theme=t==="light"?"light":"dark"}catch(e){document.documentElement.dataset.theme="dark"}`,
-          }}
-        />
-      </head>
+    <html lang="en" className={mono.variable} data-theme="dark">
       <body className="min-h-screen">
         <Header />
         <main className="container mx-auto px-4 sm:px-6 max-w-7xl py-10">
@@ -101,7 +93,6 @@ function Header() {
               </svg>
             </a>
           </nav>
-          <ThemeToggle />
         </div>
       </div>
     </header>
