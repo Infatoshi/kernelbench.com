@@ -54,17 +54,34 @@ type FilterState = {
   outcome: string
 }
 
+type SortKey =
+  | "model"
+  | "harness"
+  | "problem"
+  | "date"
+  | "compiled"
+  | "correct"
+  | "rewardHack"
+  | "explanation"
+  | "speed"
+  | "tokens"
+  | "runtime"
+
+type SortState = {
+  key: SortKey
+  dir: "asc" | "desc"
+}
+
 export function LeaderboardTable({ rows }: { rows: HardRunRecord[] }) {
-  const [query, setQuery] = useState("")
   const [filters, setFilters] = useState<FilterState>({
     problem: "all",
     harness: "all",
     outcome: "all",
   })
+  const [sort, setSort] = useState<SortState>({ key: "problem", dir: "asc" })
 
   const problems = useMemo(() => unique(rows.map((r) => r.problem)), [rows])
   const harnesses = useMemo(() => unique(rows.map((r) => r.harness)), [rows])
-  const normalizedQuery = query.trim().toLowerCase()
   const filteredRows = useMemo(() => {
     return rows.filter((row) => {
       if (filters.problem !== "all" && row.problem !== filters.problem) return false
@@ -72,27 +89,26 @@ export function LeaderboardTable({ rows }: { rows: HardRunRecord[] }) {
       if (filters.outcome !== "all" && outcomeBucket(row) !== filters.outcome) {
         return false
       }
-      return fuzzyMatch(normalizedQuery, row.searchText)
-    }).sort(compareRunRows)
-  }, [filters, normalizedQuery, rows])
+      return true
+    }).sort((a, b) => compareRunRows(a, b, sort))
+  }, [filters, rows, sort])
 
   const reset = () => {
-    setQuery("")
     setFilters({ problem: "all", harness: "all", outcome: "all" })
+    setSort({ key: "problem", dir: "asc" })
+  }
+
+  const setSortKey = (key: SortKey) => {
+    setSort((current) =>
+      current.key === key
+        ? { key, dir: current.dir === "asc" ? "desc" : "asc" }
+        : { key, dir: "asc" },
+    )
   }
 
   return (
     <div className="leaderboard-panel">
       <div className="leaderboard-controls" aria-label="leaderboard filters">
-        <label className="finder-field">
-          <span>find</span>
-          <input
-            value={query}
-            onChange={(event) => setQuery(event.target.value)}
-            placeholder="fuzzy find runs, models, problems..."
-            type="search"
-          />
-        </label>
         <FilterSelect
           label="problem"
           value={filters.problem}
@@ -122,17 +138,17 @@ export function LeaderboardTable({ rows }: { rows: HardRunRecord[] }) {
         <table className="term leaderboard-runs tabular text-xs">
           <thead>
             <tr>
-              <th>model</th>
-              <th>harness</th>
-              <th>problem</th>
-              <th>date</th>
-              <th>compiled</th>
-              <th>correct</th>
-              <th>reward hacking</th>
-              <th>explanation</th>
-              <th>speed of light</th>
-              <th>tokens</th>
-              <th>runtime</th>
+              <SortableTh label="model" sortKey="model" active={sort} onSort={setSortKey} />
+              <SortableTh label="harness" sortKey="harness" active={sort} onSort={setSortKey} />
+              <SortableTh label="problem" sortKey="problem" active={sort} onSort={setSortKey} />
+              <SortableTh label="date" sortKey="date" active={sort} onSort={setSortKey} />
+              <SortableTh label="compiled" sortKey="compiled" active={sort} onSort={setSortKey} />
+              <SortableTh label="correct" sortKey="correct" active={sort} onSort={setSortKey} />
+              <SortableTh label="reward hacking" sortKey="rewardHack" active={sort} onSort={setSortKey} />
+              <SortableTh label="explanation" sortKey="explanation" active={sort} onSort={setSortKey} />
+              <SortableTh label="speed of light" sortKey="speed" active={sort} onSort={setSortKey} />
+              <SortableTh label="tokens" sortKey="tokens" active={sort} onSort={setSortKey} />
+              <SortableTh label="runtime" sortKey="runtime" active={sort} onSort={setSortKey} />
               <th>files</th>
               <th>conversation</th>
             </tr>
@@ -140,10 +156,10 @@ export function LeaderboardTable({ rows }: { rows: HardRunRecord[] }) {
           <tbody>
             {filteredRows.map((row) => (
               <tr key={row.key}>
-                <td className="leaderboard-model">{row.model}</td>
-                <td className="leaderboard-harness">{row.harness}</td>
-                <td className="leaderboard-problem">{row.problem}</td>
-                <td>
+                <td className={sortCellClass("model", sort, "leaderboard-model")}>{row.model}</td>
+                <td className={sortCellClass("harness", sort, "leaderboard-harness")}>{row.harness}</td>
+                <td className={sortCellClass("problem", sort, "leaderboard-problem")}>{row.problem}</td>
+                <td className={sortCellClass("date", sort)}>
                   {row.date ? (
                     <div className="stacked-cell">
                       <span>{row.date}</span>
@@ -153,13 +169,13 @@ export function LeaderboardTable({ rows }: { rows: HardRunRecord[] }) {
                     <span className="cell-missing">-</span>
                   )}
                 </td>
-                <td>
+                <td className={sortCellClass("compiled", sort)}>
                   <StatusPill status={row.compiled} />
                 </td>
-                <td>
+                <td className={sortCellClass("correct", sort)}>
                   <StatusPill status={row.correct} />
                 </td>
-                <td>
+                <td className={sortCellClass("rewardHack", sort)}>
                   <span
                     className={
                       row.rewardHack
@@ -170,7 +186,7 @@ export function LeaderboardTable({ rows }: { rows: HardRunRecord[] }) {
                     {row.rewardHack ? "yes" : "no"}
                   </span>
                 </td>
-                <td>
+                <td className={sortCellClass("explanation", sort)}>
                   {row.explanation ? (
                     <div className="leaderboard-explanation" title={row.explanation}>
                       {row.explanation}
@@ -179,13 +195,13 @@ export function LeaderboardTable({ rows }: { rows: HardRunRecord[] }) {
                     <span className="cell-missing">-</span>
                   )}
                 </td>
-                <td>
+                <td className={sortCellClass("speed", sort)}>
                   <SpeedCell row={row} />
                 </td>
-                <td>
+                <td className={sortCellClass("tokens", sort)}>
                   <TokenCell row={row} />
                 </td>
-                <td>
+                <td className={sortCellClass("runtime", sort)}>
                   <RuntimeCell row={row} />
                 </td>
                 <td>
@@ -253,6 +269,43 @@ function FilterSelect({
   )
 }
 
+function SortableTh({
+  label,
+  sortKey,
+  active,
+  onSort,
+}: {
+  label: string
+  sortKey: SortKey
+  active: SortState
+  onSort: (key: SortKey) => void
+}) {
+  const isActive = active.key === sortKey
+  return (
+    <th
+      className={isActive ? "sort-column-active sort-header-active" : undefined}
+      aria-sort={isActive ? (active.dir === "asc" ? "ascending" : "descending") : "none"}
+    >
+      <button
+        type="button"
+        className="sort-header-button"
+        onClick={() => onSort(sortKey)}
+      >
+        <span>{label}</span>
+        <span className="sort-indicator" aria-hidden="true">
+          {isActive ? (active.dir === "asc" ? "↑" : "↓") : "↕"}
+        </span>
+      </button>
+    </th>
+  )
+}
+
+function sortCellClass(key: SortKey, active: SortState, extra = "") {
+  return [extra, active.key === key ? "sort-column-active" : null]
+    .filter(Boolean)
+    .join(" ")
+}
+
 function StatusPill({ status }: { status: HardRunStatus }) {
   return (
     <span className={`status-pill status-pill-${status.tone}`}>{status.label}</span>
@@ -315,7 +368,9 @@ function outcomeBucket(row: HardRunRecord) {
   return "fail"
 }
 
-function compareRunRows(a: HardRunRecord, b: HardRunRecord) {
+function compareRunRows(a: HardRunRecord, b: HardRunRecord, sort: SortState) {
+  const primary = compareSortValue(sortValue(a, sort.key), sortValue(b, sort.key))
+  if (primary !== 0) return sort.dir === "asc" ? primary : -primary
   const problemDiff = a.problemKey.localeCompare(b.problemKey)
   if (problemDiff !== 0) return problemDiff
   const modelDiff = a.model.localeCompare(b.model)
@@ -323,22 +378,39 @@ function compareRunRows(a: HardRunRecord, b: HardRunRecord) {
   return a.harness.localeCompare(b.harness)
 }
 
-function fuzzyMatch(query: string, value: string) {
-  if (!query) return true
-  const haystack = value.toLowerCase()
-  if (haystack.includes(query)) return true
-  const parts = query.split(/\s+/).filter(Boolean)
-  return parts.every((part) => fuzzyPart(part, haystack))
+function sortValue(row: HardRunRecord, key: SortKey) {
+  switch (key) {
+    case "model":
+      return row.model
+    case "harness":
+      return row.harness
+    case "problem":
+      return row.problemKey
+    case "date":
+      return row.date && row.time ? `${row.date} ${row.time}` : null
+    case "compiled":
+      return row.compiled.label
+    case "correct":
+      return row.correct.label
+    case "rewardHack":
+      return row.rewardHack ? 1 : 0
+    case "explanation":
+      return row.explanation
+    case "speed":
+      return row.speedPct
+    case "tokens":
+      return (row.outputTokens ?? 0) + (row.reasoningTokens ?? 0)
+    case "runtime":
+      return row.elapsedSeconds
+  }
 }
 
-function fuzzyPart(query: string, haystack: string) {
-  let cursor = 0
-  for (const char of query) {
-    cursor = haystack.indexOf(char, cursor)
-    if (cursor === -1) return false
-    cursor += 1
-  }
-  return true
+function compareSortValue(a: string | number | null, b: string | number | null) {
+  if (a == null && b == null) return 0
+  if (a == null) return 1
+  if (b == null) return -1
+  if (typeof a === "number" && typeof b === "number") return a - b
+  return String(a).localeCompare(String(b))
 }
 
 function unique(values: string[]) {
