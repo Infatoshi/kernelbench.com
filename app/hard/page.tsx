@@ -5,6 +5,7 @@ import {
   loadLeaderboard,
   loadAnnotations,
   loadBaselines,
+  type Cell,
   type Model,
 } from "@/lib/data"
 
@@ -179,8 +180,8 @@ export default async function HardPage() {
         <p className="text-[var(--color-fg)] leading-relaxed max-w-3xl">
           A focused successor to the v3 suite. One Blackwell GPU, a small set
           of hard CUDA kernel problems, and real coding-agent CLIs as the harness.
-          The table below keeps one trusted row for same-harness reruns, while
-          preserving distinct harness routes as separate rows. One-off diagnostic
+          The table below keeps one trusted record for same-harness reruns, while
+          preserving distinct harness routes as separate records. One-off diagnostic
           rows stay in the source data.
         </p>
         <p className="mt-4 text-sm text-[var(--color-fg)] max-w-3xl leading-relaxed">
@@ -195,10 +196,12 @@ export default async function HardPage() {
           Leaderboard
         </h2>
         <p className="text-sm text-[var(--color-fg)] mb-4 max-w-4xl leading-relaxed">
-          Cells show <code>peak_fraction</code>, the fraction of the relevant
-          hardware ceiling reached by a correct kernel. Click a cell to open the
-          transcript when one is available. Blue underlined values are the
-          visible winner for that problem. Annotation badges mark caveats:
+          Rows show one metric at a time, so problem is a normal column instead
+          of a wide pivot. <code>peak_fraction</code> is the fraction of the
+          relevant hardware ceiling reached by a correct kernel. Click a run id
+          or linked metric to open the transcript when one is available. Blue
+          underlined peak values are the visible winner for that problem.
+          Annotation badges mark caveats:
           {" "}<span className="annotation-badge annotation-badge-bad">!</span>
           {" "}invalid or reward-hack results, and{" "}
           <span className="annotation-badge annotation-badge-warn">!</span>
@@ -208,7 +211,7 @@ export default async function HardPage() {
           repeated runs through the same harness are collapsed to the most
           trustworthy row we currently have.
         </p>
-        <LeaderboardTable
+        <LeaderboardMetricsTable
           models={visibleModels}
           annotations={annotations}
           hasViewer={hasViewer}
@@ -525,7 +528,7 @@ function Figure({
   )
 }
 
-function LeaderboardTable({
+function LeaderboardMetricsTable({
   models,
   annotations,
   hasViewer,
@@ -535,53 +538,120 @@ function LeaderboardTable({
   hasViewer: Set<string>
 }) {
   const winners = findVisibleWinners(models)
+  const rows = buildMetricRows(models, annotations, hasViewer, winners)
 
   return (
-    <div className="overflow-x-auto box">
-      <table className="term tabular text-xs sm:text-sm">
+    <div className="box">
+      <table className="term leaderboard-metrics tabular text-xs">
         <thead>
           <tr>
-            <th className="sticky left-0 bg-[var(--color-surface-muted)]">model</th>
+            <th>problem</th>
+            <th>model</th>
             <th>harness</th>
-            {PROBLEMS.map((p) => (
-              <th key={p.key} className="text-right">
-                {p.short}
-              </th>
-            ))}
-            <th className="text-right">SCORED</th>
+            <th>metric</th>
+            <th>value</th>
+            <th>run</th>
           </tr>
         </thead>
         <tbody>
-          {models.map((m) => (
-            <tr key={m.label}>
-              <td className="sticky left-0 bg-[var(--color-surface)] text-[var(--color-fg-bright)] whitespace-nowrap">
-                {shortLabel(m.label)}
-              </td>
-              <td className="text-[var(--color-fg-muted)] whitespace-nowrap">
-                {harnessLabel(m.harness)}
-              </td>
-              {PROBLEMS.map((p) => {
-                const cell = m.results[p.key]
-                return (
-                  <td key={p.key} className="text-right">
-                    {renderCell(
-                      cell,
-                      annotations,
-                      hasViewer,
-                      winners.get(p.key) === cell?.run_id,
-                    )}
-                  </td>
-                )
-              })}
-              <td className="text-right text-[var(--color-fg-bright)]">
-                {m.pass_count}/{m.total_runs}
-              </td>
+          {rows.map((row) => (
+            <tr key={row.key}>
+              <td className="text-[var(--color-fg-bright)]">{row.problem}</td>
+              <td>{row.model}</td>
+              <td className="text-[var(--color-fg-muted)]">{row.harness}</td>
+              <td className="text-[var(--color-fg-muted)]">{row.metric}</td>
+              <td>{row.value}</td>
+              <td>{row.runLink}</td>
             </tr>
           ))}
         </tbody>
       </table>
     </div>
   )
+}
+
+type MetricRow = {
+  key: string
+  problem: string
+  model: string
+  harness: string
+  metric: string
+  value: React.ReactNode
+  runLink: React.ReactNode
+}
+
+function buildMetricRows(
+  models: Model[],
+  annotations: Map<string, { verdict: string; summary?: string }>,
+  hasViewer: Set<string>,
+  winners: Map<string, string>,
+): MetricRow[] {
+  const rows: MetricRow[] = []
+  for (const m of models) {
+    for (const p of PROBLEMS) {
+      const cell = m.results[p.key]
+      const base = {
+        problem: p.key,
+        model: shortLabel(m.label),
+        harness: harnessLabel(m.harness),
+      }
+      if (!cell) {
+        rows.push({
+          ...base,
+          key: `${m.label}:${p.key}:status`,
+          metric: "status",
+          value: <span className="cell-missing">NO RUN</span>,
+          runLink: <span className="cell-missing">-</span>,
+        })
+        continue
+      }
+
+      const annot = annotations.get(cell.run_id)
+      const isWinner = winners.get(p.key) === cell.run_id
+      const title = cellTitle(cell, hasViewer.has(cell.run_id), annot, isWinner)
+      const add = (metric: string, value: React.ReactNode) => {
+        const displayValue = value ?? <span className="cell-missing">-</span>
+        rows.push({
+          ...base,
+          key: `${cell.run_id}:${metric}`,
+          metric,
+          value: linkMetric(cell, hasViewer, title, displayValue),
+          runLink: runLink(cell, hasViewer, title),
+        })
+      }
+
+      add("status", renderStatus(cell, annot))
+      add("peak_fraction", renderPeak(cell, isWinner))
+      add("correct", fmtBool(cell.correct))
+      add("has_solution", fmtBool(cell.has_solution))
+      add("failure_reason", fmtMaybe(cell.failure_reason))
+      add("retryable_infra_failure", fmtMaybeBool(cell.retryable_infra_failure))
+      add("minimum_useful_output_tokens", fmtMaybeInt(cell.minimum_useful_output_tokens))
+      add("elapsed_seconds", fmtMaybeDuration(cell.elapsed_seconds))
+      add("total_elapsed_seconds", fmtMaybeDuration(cell.total_elapsed_seconds))
+      add("check_elapsed_seconds", fmtMaybeDuration(cell.check_elapsed_seconds))
+      add("benchmark_elapsed_seconds", fmtMaybeDuration(cell.benchmark_elapsed_seconds))
+      add("check_exit_code", fmtMaybeInt(cell.check_exit_code))
+      add("benchmark_exit_code", fmtMaybeInt(cell.benchmark_exit_code))
+      add("session_complete", fmtMaybeBool(cell.session_complete))
+      add("harness_exit_code", fmtMaybeInt(cell.harness_exit_code))
+      add("agent_cuda_disabled", fmtMaybeBool(cell.agent_cuda_disabled))
+      add("gpu_queue_mode", fmtMaybe(cell.gpu_queue_mode))
+      add("gpu_lock_calls", fmtMaybeInt(cell.gpu_lock_calls))
+      add("gpu_lock_wait_seconds_total", fmtMaybeDuration(cell.gpu_lock_wait_seconds_total))
+      add("gpu_lock_active_seconds_total", fmtMaybeDuration(cell.gpu_lock_active_seconds_total))
+      add("output_tokens_per_second", fmtMaybeFixed(cell.output_tokens_per_second, 1))
+      add("usage.input_tokens", fmtMaybeInt(cell.usage?.input_tokens))
+      add("usage.output_tokens", fmtMaybeInt(cell.usage?.output_tokens))
+      add("usage.cache_read_tokens", fmtMaybeInt(cell.usage?.cache_read_tokens))
+      add("usage.cache_creation_tokens", fmtMaybeInt(cell.usage?.cache_creation_tokens))
+      add("usage.reasoning_tokens", fmtMaybeInt(cell.usage?.reasoning_tokens))
+      add("usage.total_cost_usd", fmtMaybeUsd(cell.usage?.total_cost_usd))
+      add("annotation", annot ? `${annot.verdict}${annot.summary ? `: ${annot.summary}` : ""}` : null)
+      add("model_scored", `${m.pass_count}/${m.total_runs}`)
+    }
+  }
+  return rows
 }
 
 function findVisibleWinners(models: Model[]) {
@@ -602,6 +672,107 @@ function findVisibleWinners(models: Model[]) {
     if (bestRunId) winners.set(p.key, bestRunId)
   }
   return winners
+}
+
+function renderStatus(
+  cell: Cell,
+  annot?: { verdict: string; summary?: string },
+) {
+  if (cell.invalid_reason || annot?.verdict === "reward_hack") {
+    return (
+      <>
+        <span className="cell-invalid">INVALID</span>
+        <AnnotationBadge severity="bad" label="invalid or reward hack" />
+      </>
+    )
+  }
+  if (cell.correct) {
+    const badge =
+      annot && ["rubric_leak", "bug", "interesting"].includes(annot.verdict) ? (
+        <AnnotationBadge
+          severity={annot.verdict === "bug" ? "bad" : "warn"}
+          label={`annotated ${annot.verdict}`}
+        />
+      ) : null
+    return (
+      <>
+        <span className="cell-clean">PASS</span>
+        {badge}
+      </>
+    )
+  }
+  if (cell.failure_reason === "provider_rate_limited") return <span className="cell-err">RATE</span>
+  if (cell.failure_reason === "provider_early_stop") return <span className="cell-err">EARLY</span>
+  if (cell.failure_reason === "timeout") return <span className="cell-err">TIME</span>
+  if (cell.failure_reason === "no_solution") return <span className="cell-err">NO SOL</span>
+  if (cell.has_solution) return <span className="cell-fail">FAIL</span>
+  return <span className="cell-err">ERR</span>
+}
+
+function renderPeak(cell: Cell, isWinner: boolean) {
+  if (cell.peak_fraction == null) return <span className="cell-missing">-</span>
+  return (
+    <span className={isWinner ? "cell-score cell-winner" : "cell-score"}>
+      {cell.peak_fraction.toFixed(3)}
+    </span>
+  )
+}
+
+function linkMetric(
+  cell: Cell,
+  hasViewer: Set<string>,
+  title: string,
+  value: React.ReactNode,
+) {
+  if (!hasViewer.has(cell.run_id)) return <span title={title}>{value}</span>
+  return (
+    <a href={`/runs/${cell.run_id}.html`} className="no-underline" title={title}>
+      {value}
+    </a>
+  )
+}
+
+function runLink(cell: Cell, hasViewer: Set<string>, title: string) {
+  if (!hasViewer.has(cell.run_id)) {
+    return (
+      <span className="text-[var(--color-fg-muted)]" title={title}>
+        {cell.run_id}
+      </span>
+    )
+  }
+  return (
+    <a href={`/runs/${cell.run_id}.html`} title={title}>
+      {cell.run_id}
+    </a>
+  )
+}
+
+function fmtBool(value: boolean) {
+  return value ? "true" : "false"
+}
+
+function fmtMaybe(value: string | null | undefined) {
+  return value ?? <span className="cell-missing">-</span>
+}
+
+function fmtMaybeBool(value: boolean | null | undefined) {
+  return value == null ? <span className="cell-missing">-</span> : fmtBool(value)
+}
+
+function fmtMaybeInt(value: number | null | undefined) {
+  return value == null ? <span className="cell-missing">-</span> : fmtInt(value)
+}
+
+function fmtMaybeFixed(value: number | null | undefined, digits: number) {
+  return value == null ? <span className="cell-missing">-</span> : value.toFixed(digits)
+}
+
+function fmtMaybeDuration(value: number | null | undefined) {
+  return value == null ? <span className="cell-missing">-</span> : fmtDuration(value)
+}
+
+function fmtMaybeUsd(value: number | null | undefined) {
+  return value == null ? <span className="cell-missing">-</span> : `$${value.toFixed(4)}`
 }
 
 function compareModelRows(a: Model, b: Model) {
