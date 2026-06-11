@@ -69,7 +69,10 @@ export default async function HardPage() {
     loadAvailableViewers(),
   ])
   const models = [...lb.models].sort(compareModelRows)
-  const visibleModels = models.filter(isVisibleModel)
+  // The v2 containerized sweep is already a curated single-environment run, so
+  // it bypasses the v1 hand-picked visibility allowlist and shows every row.
+  const isV2 = (lb as { environment?: string }).environment === "v2_containerized"
+  const visibleModels = isV2 ? models : models.filter(isVisibleModel)
 
   return (
     <div className="hard-page space-y-12">
