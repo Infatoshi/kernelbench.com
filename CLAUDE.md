@@ -33,6 +33,13 @@ Other commands: `kb run <harness> <model> <problem>` (one problem), `kb dev`
 - API keys live in `~/.env_vars` (KIMI_API_KEY, ZAI_API_KEY, MINIMAX_API_KEY,
   OPENROUTER_API_KEY, OPENAI_API_KEY, GEMINI_API_KEY, CLAUDE_CODE_OAUTH_TOKEN).
   To bench a new model: drop its key in `~/.env_vars`, then `kb sweep`.
+- **If `kb sweep` prints `STOP: ... needs $X_API_KEY`**, the key is missing —
+  ask the human for it, append `export X_API_KEY=...` to `~/.env_vars`, rerun.
+  `kb` preflights the key before launching so you get one clear message, not
+  six failed runs.
+- Benching a **brand-new provider** (no harness yet) needs a harness branch:
+  copy the `kimi-claude` block in `scripts/run_hard.sh` (Claude-Code → the
+  provider's Anthropic-compatible endpoint) and add the row. Not a one-liner.
 - Before a GPU sweep: `nvidia-smi` (the box is shared).
 
 ## Harnesses (run via `uv run kbh run <harness> <model> <problem> [effort]`)
