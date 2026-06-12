@@ -1503,6 +1503,124 @@ case "$HARNESS" in
         fi
         ;;
 
+    deepseek-claude)
+        # Claude Code routed to DeepSeek Anthropic-compatible endpoint.
+        # Requires DEEPSEEK_API_KEY. Pass MODEL=deepseek-v4-pro (claude-opus
+        # alias maps to v4-pro server-side) or deepseek-v4-flash.
+        if [ -z "${DEEPSEEK_API_KEY:-}" ]; then
+            echo "DEEPSEEK_API_KEY is required for deepseek-claude" >&2
+            exit 1
+        fi
+        DEEPSEEK_CLAUDE_ALIAS="${DEEPSEEK_CLAUDE_ALIAS:-opus}"
+        DEEPSEEK_CLAUDE_HAIKU_MODEL="${DEEPSEEK_CLAUDE_HAIKU_MODEL:-$MODEL}"
+        if [ "$KBH_AGENT_CONTAINER" = "1" ]; then
+            CLAUDE_CONTAINER_ENV_NAMES=(
+                ANTHROPIC_BASE_URL API_TIMEOUT_MS
+                CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC
+                CLAUDE_CODE_MAX_RETRIES CLAUDE_CODE_MAX_OUTPUT_TOKENS
+                ANTHROPIC_MODEL
+                ANTHROPIC_DEFAULT_HAIKU_MODEL ANTHROPIC_DEFAULT_SONNET_MODEL
+                ANTHROPIC_DEFAULT_OPUS_MODEL
+            )
+            CLAUDE_CONTAINER_EXTRA_CLAUDE_ARGS=(--disallowedTools ExitPlanMode EnterPlanMode AskUserQuestion)
+            ( export ANTHROPIC_AUTH_TOKEN="$DEEPSEEK_API_KEY" && \
+                export ANTHROPIC_BASE_URL="${DEEPSEEK_ANTHROPIC_BASE_URL:-https://api.deepseek.com/anthropic}" && \
+                export API_TIMEOUT_MS="${API_TIMEOUT_MS:-3000000}" && \
+                export CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC="${CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC:-1}" && \
+                export CLAUDE_CODE_MAX_RETRIES="${CLAUDE_CODE_MAX_RETRIES:-1000000}" && \
+                export CLAUDE_CODE_MAX_OUTPUT_TOKENS="${CLAUDE_CODE_MAX_OUTPUT_TOKENS:-128000}" && \
+                export ANTHROPIC_MODEL="$MODEL" && \
+                export ANTHROPIC_DEFAULT_HAIKU_MODEL="$DEEPSEEK_CLAUDE_HAIKU_MODEL" && \
+                export ANTHROPIC_DEFAULT_SONNET_MODEL="$MODEL" && \
+                export ANTHROPIC_DEFAULT_OPUS_MODEL="$MODEL" && \
+                run_claude_container "" "$DEEPSEEK_CLAUDE_ALIAS" 0 ) \
+                > "$LOG_FILE" 2> "$STDERR_FILE" || HARNESS_EXIT=$?
+            CLAUDE_CONTAINER_ENV_NAMES=()
+            CLAUDE_CONTAINER_EXTRA_CLAUDE_ARGS=()
+        else
+        ( cd "$PROBLEM_DIR" && \
+            export ANTHROPIC_AUTH_TOKEN="$DEEPSEEK_API_KEY" && \
+            export ANTHROPIC_BASE_URL="${DEEPSEEK_ANTHROPIC_BASE_URL:-https://api.deepseek.com/anthropic}" && \
+            export API_TIMEOUT_MS="${API_TIMEOUT_MS:-3000000}" && \
+            export CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC="${CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC:-1}" && \
+            export CLAUDE_CODE_MAX_RETRIES="${CLAUDE_CODE_MAX_RETRIES:-1000000}" && \
+            export CLAUDE_CODE_MAX_OUTPUT_TOKENS="${CLAUDE_CODE_MAX_OUTPUT_TOKENS:-128000}" && \
+            export ANTHROPIC_MODEL="$MODEL" && \
+            export ANTHROPIC_DEFAULT_HAIKU_MODEL="$DEEPSEEK_CLAUDE_HAIKU_MODEL" && \
+            export ANTHROPIC_DEFAULT_SONNET_MODEL="$MODEL" && \
+            export ANTHROPIC_DEFAULT_OPUS_MODEL="$MODEL" && \
+            timeout "$BUDGET_SECONDS" claude \
+                --dangerously-skip-permissions \
+                --print --verbose \
+                --output-format stream-json \
+                --settings "$CLAUDE_KBH_SETTINGS" \
+                --model "$DEEPSEEK_CLAUDE_ALIAS" \
+                --disallowedTools ExitPlanMode EnterPlanMode AskUserQuestion \
+                --add-dir "$PROBLEM_DIR" \
+                -p "$PROMPT" ) \
+            > "$LOG_FILE" 2> "$STDERR_FILE" || HARNESS_EXIT=$?
+        fi
+        ;;
+
+    qwen-claude)
+        # Claude Code routed to Alibaba DashScope (Model Studio, Intl/Singapore)
+        # Anthropic-compatible endpoint. Requires DASHSCOPE_API_KEY (Model Studio
+        # key). Pass MODEL=qwen3-max.
+        if [ -z "${DASHSCOPE_API_KEY:-}" ]; then
+            echo "DASHSCOPE_API_KEY is required for qwen-claude" >&2
+            exit 1
+        fi
+        QWEN_CLAUDE_ALIAS="${QWEN_CLAUDE_ALIAS:-opus}"
+        QWEN_CLAUDE_HAIKU_MODEL="${QWEN_CLAUDE_HAIKU_MODEL:-$MODEL}"
+        if [ "$KBH_AGENT_CONTAINER" = "1" ]; then
+            CLAUDE_CONTAINER_ENV_NAMES=(
+                ANTHROPIC_BASE_URL API_TIMEOUT_MS
+                CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC
+                CLAUDE_CODE_MAX_RETRIES CLAUDE_CODE_MAX_OUTPUT_TOKENS
+                ANTHROPIC_MODEL
+                ANTHROPIC_DEFAULT_HAIKU_MODEL ANTHROPIC_DEFAULT_SONNET_MODEL
+                ANTHROPIC_DEFAULT_OPUS_MODEL
+            )
+            CLAUDE_CONTAINER_EXTRA_CLAUDE_ARGS=(--disallowedTools ExitPlanMode EnterPlanMode AskUserQuestion)
+            ( export ANTHROPIC_AUTH_TOKEN="$DASHSCOPE_API_KEY" && \
+                export ANTHROPIC_BASE_URL="${QWEN_ANTHROPIC_BASE_URL:-https://dashscope-intl.aliyuncs.com/apps/anthropic}" && \
+                export API_TIMEOUT_MS="${API_TIMEOUT_MS:-3000000}" && \
+                export CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC="${CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC:-1}" && \
+                export CLAUDE_CODE_MAX_RETRIES="${CLAUDE_CODE_MAX_RETRIES:-1000000}" && \
+                export CLAUDE_CODE_MAX_OUTPUT_TOKENS="${CLAUDE_CODE_MAX_OUTPUT_TOKENS:-128000}" && \
+                export ANTHROPIC_MODEL="$MODEL" && \
+                export ANTHROPIC_DEFAULT_HAIKU_MODEL="$QWEN_CLAUDE_HAIKU_MODEL" && \
+                export ANTHROPIC_DEFAULT_SONNET_MODEL="$MODEL" && \
+                export ANTHROPIC_DEFAULT_OPUS_MODEL="$MODEL" && \
+                run_claude_container "" "$QWEN_CLAUDE_ALIAS" 0 ) \
+                > "$LOG_FILE" 2> "$STDERR_FILE" || HARNESS_EXIT=$?
+            CLAUDE_CONTAINER_ENV_NAMES=()
+            CLAUDE_CONTAINER_EXTRA_CLAUDE_ARGS=()
+        else
+        ( cd "$PROBLEM_DIR" && \
+            export ANTHROPIC_AUTH_TOKEN="$DASHSCOPE_API_KEY" && \
+            export ANTHROPIC_BASE_URL="${QWEN_ANTHROPIC_BASE_URL:-https://dashscope-intl.aliyuncs.com/apps/anthropic}" && \
+            export API_TIMEOUT_MS="${API_TIMEOUT_MS:-3000000}" && \
+            export CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC="${CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC:-1}" && \
+            export CLAUDE_CODE_MAX_RETRIES="${CLAUDE_CODE_MAX_RETRIES:-1000000}" && \
+            export CLAUDE_CODE_MAX_OUTPUT_TOKENS="${CLAUDE_CODE_MAX_OUTPUT_TOKENS:-128000}" && \
+            export ANTHROPIC_MODEL="$MODEL" && \
+            export ANTHROPIC_DEFAULT_HAIKU_MODEL="$QWEN_CLAUDE_HAIKU_MODEL" && \
+            export ANTHROPIC_DEFAULT_SONNET_MODEL="$MODEL" && \
+            export ANTHROPIC_DEFAULT_OPUS_MODEL="$MODEL" && \
+            timeout "$BUDGET_SECONDS" claude \
+                --dangerously-skip-permissions \
+                --print --verbose \
+                --output-format stream-json \
+                --settings "$CLAUDE_KBH_SETTINGS" \
+                --model "$QWEN_CLAUDE_ALIAS" \
+                --disallowedTools ExitPlanMode EnterPlanMode AskUserQuestion \
+                --add-dir "$PROBLEM_DIR" \
+                -p "$PROMPT" ) \
+            > "$LOG_FILE" 2> "$STDERR_FILE" || HARNESS_EXIT=$?
+        fi
+        ;;
+
     codex)
         EFFORT_ARG=()
         if [ -n "$REASONING_EFFORT" ]; then
@@ -1672,7 +1790,7 @@ case "$HARNESS" in
 
     *)
         echo "Unknown harness: $HARNESS" >&2
-        echo "Supported: claude, zai-claude, minimax-claude, kimi-claude, ccr-claude, codex, kimi, droid, gemini, cursor, grok, opencode, opencode-nemotron, nvcf-nemotron" >&2
+        echo "Supported: claude, zai-claude, minimax-claude, kimi-claude, deepseek-claude, qwen-claude, ccr-claude, codex, kimi, droid, gemini, cursor, grok, opencode, opencode-nemotron, nvcf-nemotron" >&2
         exit 1
         ;;
 esac
@@ -1703,7 +1821,7 @@ fi
 
 SESSION_COMPLETE=true
 case "$HARNESS" in
-    claude|zai-claude|minimax-claude|kimi-claude|ccr-claude|cursor|gemini)
+    claude|zai-claude|minimax-claude|kimi-claude|deepseek-claude|qwen-claude|ccr-claude|cursor|gemini)
         if ! grep -q '"type":"result"' "$CHECK_FILE" 2>/dev/null; then
             SESSION_COMPLETE=false
         fi

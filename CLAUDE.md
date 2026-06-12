@@ -47,8 +47,15 @@ Other commands: `kb run <harness> <model> <problem>` (one problem), `kb dev`
 - Native CLIs: `claude`, `codex`, `cursor`, `gemini`, `grok`, `opencode`.
 - Claude-Code-routed providers (most reliable): `zai-claude` (GLM via
   api.z.ai/api/anthropic), `minimax-claude`, `kimi-claude` (Kimi via
-  api.moonshot.ai/anthropic, model `kimi-k2.7-code`). These mirror each other;
+  api.moonshot.ai/anthropic, model `kimi-k2.7-code`), `deepseek-claude`
+  (DeepSeek via api.deepseek.com/anthropic, model `deepseek-v4-pro` or
+  `deepseek-v4-flash`), `qwen-claude` (Qwen via DashScope Model Studio
+  Intl, dashscope-intl.aliyuncs.com/apps/anthropic, model `qwen3-max` —
+  needs DASHSCOPE_API_KEY, which we do not have yet). These mirror each other;
   to add one, copy the `kimi-claude` branch in `scripts/run_hard.sh`.
+  Rationale: opencode is a strong harness but its `@ai-sdk/openai-compatible`
+  transport stalls intermittently (~1/3-1/2 of sessions); routing these models
+  through Claude Code to the provider Anthropic endpoint bypasses that adapter.
 - Always container mode (`KBH_AGENT_CONTAINER=1`): isolated per-run workspace,
   native GPU, sessions overlap while GPU commands serialize through the lock.
 
