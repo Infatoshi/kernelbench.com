@@ -20,4 +20,4 @@ done
 fail=0
 for i in "${!pids[@]}"; do wait "${pids[$i]}" || fail=$((fail+1)); echo "[$(date -Is)] EXIT ${PROBLEMS[$i]}" >> "$LOG"; done
 echo "[$(date -Is)] SWEEP DONE fail=$fail" | tee -a "$LOG"
-echo "Next: just publish   (then: git push to deploy)"
+echo "Next: kb publish   (then: kb deploy)"

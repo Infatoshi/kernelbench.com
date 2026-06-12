@@ -39,4 +39,4 @@ for rid in $RIDS; do
     uv run python -m src.viewer "outputs/runs/$rid" --out "$REPO_ROOT/public/runs/$rid.html" >/dev/null 2>&1 && n=$((n+1)) || echo "  WARN viewer failed: $rid"
 done
 echo "  generated $n viewers"
-echo "done. review, then: git push (or: just deploy \"msg\")"
+echo "done. review, then: git push (or: kb deploy \"msg\")"

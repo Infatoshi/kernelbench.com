@@ -19,17 +19,20 @@ benchmarks/v3/             KernelBench-v3 eval
 justfile                   `just` recipes (see below)
 ```
 
-## Run a sweep (the common task)
+## Run a sweep (the common task) — use the `kb` CLI (on PATH, runs from any cwd)
 
-From the repo root on Anvil:
 ```
-just sweep kimi-claude kimi-k2.7-code     # all 6 problems, parallel containers, 2700s
-just publish                              # rebuild leaderboard + viewers from archives
-git push                                  # deploy to kernelbench.com (Vercel auto-builds)
+kb sweep kimi-claude kimi-k2.7-code       # all 6 problems, parallel containers, 2700s
+kb publish                                # rebuild leaderboard + viewers from archives
+kb deploy "bench kimi k2.7"               # publish + commit + push (Vercel auto-builds)
 ```
+Other commands: `kb run <harness> <model> <problem>` (one problem), `kb dev`
+(preview, view from Mac via Tailscale anvil:3000), `kb build`, `kb audit <run_id>`,
+`kb help`. The CLI lives at `bin/kb` (symlinked to ~/.local/bin/kb).
+
 - API keys live in `~/.env_vars` (KIMI_API_KEY, ZAI_API_KEY, MINIMAX_API_KEY,
   OPENROUTER_API_KEY, OPENAI_API_KEY, GEMINI_API_KEY, CLAUDE_CODE_OAUTH_TOKEN).
-  To bench a new model: drop its key in `~/.env_vars`, then `just sweep`.
+  To bench a new model: drop its key in `~/.env_vars`, then `kb sweep`.
 - Before a GPU sweep: `nvidia-smi` (the box is shared).
 
 ## Harnesses (run via `uv run kbh run <harness> <model> <problem> [effort]`)
