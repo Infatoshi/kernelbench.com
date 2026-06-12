@@ -79,19 +79,20 @@ npm run dev
 
 ### Regenerate transcript viewers
 
-If `outputs/runs/` (gitignored, lives on the GPU machine at `~/cuda/KernelBench-Hard/outputs/runs/`) has new transcripts, regenerate the public viewers:
+Raw run dirs are gitignored and live on the GPU machine at `anvil-lan:~/benchmarks/KernelBench-Hard/outputs/runs/` (NOT `~/cuda/...`). Generate there, then rsync back — the local Mac has no transcripts:
 
 ```bash
-cd benchmarks/hard
-RUN_SRC=/path/to/outputs/runs
-ANNOT_DIR=$(pwd)/results/annotations
-for d in "$RUN_SRC"/*/; do
-  [ -f "$d/transcript.jsonl" ] || continue
+# on anvil-lan, in ~/benchmarks/KernelBench-Hard
+mkdir -p /tmp/kb_viewers
+for d in outputs/runs/<run_id_glob>/; do
   rid=$(basename "$d")
-  KB_VIEWER_THEME=phosphor KB_ANNOTATIONS_DIR="$ANNOT_DIR" \
-    uv run --quiet python -m src.viewer "$d" --out ../../public/runs/"$rid".html
+  uv run --quiet python -m src.viewer "$d" --out /tmp/kb_viewers/"$rid".html
 done
+# back on the Mac, repo root
+rsync -a anvil-lan:/tmp/kb_viewers/ public/runs/
 ```
+
+The viewer also writes `<run_id>_solution.py.txt` beside each HTML when the run has a `solution.py` — commit both. Keep `benchmarks/hard/src/viewer/` in sync with anvil's copy before generating (the NGC-banner sniff fix and gemini parser were once uncommitted drift on anvil; the monorepo is canonical now). There is no `KB_VIEWER_THEME`/`KB_ANNOTATIONS_DIR` support — the NVIDIA site theme is hardcoded in `html.py`, and annotations only surface on the `/hard` page, not in viewers.
 
 ### Regenerate baseline timings
 
@@ -115,7 +116,7 @@ Just create `benchmarks/hard/results/annotations/<run_id>.yaml` matching the sch
 
 ## Things I should not assume
 
-- Hardware: I'm not on a GPU. Anything that runs CUDA needs to happen on `~/cuda/KernelBench-Hard/` on the GPU machine. The website repo at `/home/infatoshi/work/kernelbench.com/` is just the sources + committed result data.
+- Hardware: I'm not on a GPU. Anything that runs CUDA needs to happen on `anvil-lan:~/benchmarks/KernelBench-Hard/`. The website repo at `/home/infatoshi/work/kernelbench.com/` is just the sources + committed result data.
 - Standalone repos: don't push to `Infatoshi/KernelBench-Hard` or `Infatoshi/KernelBench-v3` directly. Push to `Infatoshi/kernelbench.com`. The standalones are mirrors.
 - `outputs/runs/` is local-only and gitignored. The raw transcripts live on the GPU machine, not in this repo. Only the rendered HTMLs in `public/runs/` ship publicly.
 - The user's `~/.claude/skills/` directory was deleted (mirror lives at `~/2nd-brain/references/skills/anvil/claude/`). Don't expect skills to be available.
