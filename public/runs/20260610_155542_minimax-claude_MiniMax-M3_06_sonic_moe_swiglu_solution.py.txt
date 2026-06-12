@@ -1,0 +1,184 @@
+"""Grouped GEMM + fused SwiGLU up-projection for MoE.
+
+Strategy:
+- Concatenate W_gate and W_up into a single (E, H, 2I) weight tensor so the
+  per-expert matmul becomes a single GEMM with N=2I. This halves the dot
+  issue overhead vs two separate dots.
+- One Triton kernel handles all experts; grid = (E, NUM_M_TILES, NUM_N_TILES).
+- BLOCK_M / BLOCK_N / BLOCK_K / num_warps / num_stages tuned per shape.
+
+Interface matches reference.py: Model, get_inputs, get_init_inputs.
+"""
+from __future__ import annotations
+
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+OP_TYPE = "grouped_gemm_swiglu"
+SUPPORTED_PRECISIONS = ["bf16"]
+HARDWARE_REQUIRED = ["RTX_PRO_6000", "H100", "B200"]
+
+
+# ---------------------------------------------------------------------------
+# Triton kernel
+# ---------------------------------------------------------------------------
+@triton.jit
+def _grouped_gemm_swiglu_kernel(
+    x_ptr,            # (T_perm, H) bf16
+    wc_ptr,           # (E, H, 2I) bf16, concatenated W_gate || W_up
+    off_ptr,          # (E+1,) int32
+    out_ptr,          # (T_perm, I) bf16
+    H, I,
+    stride_xm, stride_xk,
+    stride_we, stride_wh, stride_wn,
+    stride_om, stride_on,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,    # I-tile size; GEMM N is 2*BLOCK_N
+    BLOCK_K: tl.constexpr,
+):
+    eid = tl.program_id(0)
+    pid_m = tl.program_id(1)
+    pid_n = tl.program_id(2)
+
+    start = tl.load(off_ptr + eid)
+    end = tl.load(off_ptr + eid + 1)
+    n_e = end - start
+    m_off = pid_m * BLOCK_M
+    if m_off >= n_e:
+        return
+
+    m_idx = m_off + tl.arange(0, BLOCK_M)
+    n_idx = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    k_idx = tl.arange(0, BLOCK_K)
+
+    m_mask = m_idx < n_e
+    n_mask = n_idx < I
+
+    wc_base = wc_ptr + eid * stride_we
+    x_offs = (start + m_idx[:, None]) * stride_xm
+
+    gate_acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    up_acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    for k in range(0, H, BLOCK_K):
+        k_mask = (k + k_idx) < H
+        x_block = tl.load(x_ptr + x_offs + (k + k_idx)[None, :] * stride_xk,
+                          mask=m_mask[:, None] & k_mask[None, :], other=0.0)
+        wg_block = tl.load(wc_base + (n_idx[None, :] * stride_wn) + (k + k_idx)[:, None] * stride_wh,
+                           mask=k_mask[:, None] & n_mask[None, :], other=0.0)
+        wu_block = tl.load(wc_base + ((I + n_idx[None, :]) * stride_wn) + (k + k_idx)[:, None] * stride_wh,
+                           mask=k_mask[:, None] & n_mask[None, :], other=0.0)
+        gate_acc = tl.dot(x_block, wg_block, gate_acc)
+        up_acc = tl.dot(x_block, wu_block, up_acc)
+
+    silu = gate_acc * tl.sigmoid(gate_acc)
+    out = silu * up_acc
+    tl.store(out_ptr + (start + m_idx[:, None]) * stride_om + n_idx[None, :] * stride_on,
+             out.to(tl.bfloat16), mask=m_mask[:, None] & n_mask[None, :])
+
+
+# ---------------------------------------------------------------------------
+# Model
+# ---------------------------------------------------------------------------
+class Model(nn.Module):
+    """Up-projection of a top-K MoE FFN with fused SwiGLU."""
+
+    def __init__(self, T_total: int, H: int, I: int, E: int, K: int):  # noqa: E741
+        super().__init__()
+        self.T_total = T_total
+        self.H = H
+        self.I = I
+        self.E = E
+        self.K = K
+        self.W_gate = nn.Parameter(torch.empty(E, H, I, dtype=torch.bfloat16))
+        self.W_up = nn.Parameter(torch.empty(E, H, I, dtype=torch.bfloat16))
+        nn.init.normal_(self.W_gate, std=0.02)
+        nn.init.normal_(self.W_up, std=0.02)
+
+        self._wc_cache: torch.Tensor | None = None
+        self._cached_W_ids: tuple | None = None
+
+    def _fused_weight(self) -> torch.Tensor:
+        sig = (self.W_gate.data_ptr(), self.W_up.data_ptr(),
+               self.W_gate.shape, self.W_up.shape)
+        if self._wc_cache is None or sig != self._cached_W_ids:
+            self._wc_cache = torch.cat([self.W_gate, self.W_up], dim=-1).contiguous()
+            self._cached_W_ids = sig
+        return self._wc_cache
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        expert_offsets: torch.Tensor,
+    ) -> torch.Tensor:
+        T_perm, H = hidden_states.shape
+        out = torch.empty(T_perm, self.I, dtype=torch.bfloat16, device=hidden_states.device)
+
+        if self.I >= 4096:
+            BLOCK_M, BLOCK_N, BLOCK_K = 64, 128, 32
+            num_warps, num_stages = 4, 3
+        elif self.I >= 1536:
+            BLOCK_M, BLOCK_N, BLOCK_K = 128, 64, 32
+            num_warps, num_stages = 4, 3
+        else:
+            BLOCK_M, BLOCK_N, BLOCK_K = 64, 64, 32
+            num_warps, num_stages = 4, 3
+
+        NUM_M_TILES = triton.cdiv(self.T_total * self.K // self.E, BLOCK_M)
+        NUM_N_TILES = triton.cdiv(self.I, BLOCK_N)
+        # Per-expert may have +1 token, so use ceil of max
+        max_n_e = (expert_offsets[1:] - expert_offsets[:-1]).max().item()
+        NUM_M_TILES = triton.cdiv(max_n_e, BLOCK_M)
+
+        wc = self._fused_weight()
+        grid = (self.E, NUM_M_TILES, NUM_N_TILES)
+        _grouped_gemm_swiglu_kernel[grid](
+            hidden_states,
+            wc,
+            expert_offsets,
+            out,
+            H, self.I,
+            hidden_states.stride(0), hidden_states.stride(1),
+            wc.stride(0), wc.stride(1), wc.stride(2),
+            out.stride(0), out.stride(1),
+            BLOCK_M=BLOCK_M,
+            BLOCK_N=BLOCK_N,
+            BLOCK_K=BLOCK_K,
+            num_warps=num_warps,
+            num_stages=num_stages,
+        )
+        return out
+
+
+# ---------------------------------------------------------------------------
+# Module-level shape shims
+# ---------------------------------------------------------------------------
+T_total = 32768
+H = 4096
+I = 1536  # noqa: E741
+E = 128
+K = 8
+
+
+def _build_routing(T_total: int, E: int, K: int, device: str = "cpu") -> torch.Tensor:
+    T_perm = T_total * K
+    base = T_perm // E
+    rem = T_perm - base * E
+    counts = torch.full((E,), base, dtype=torch.int32, device=device)
+    counts[:rem] += 1
+    offsets = torch.zeros(E + 1, dtype=torch.int32, device=device)
+    offsets[1:] = torch.cumsum(counts, dim=0)
+    return offsets
+
+
+def get_inputs():
+    T_perm = T_total * K
+    hidden_states = torch.randn(T_perm, H, dtype=torch.bfloat16) * 0.1
+    expert_offsets = _build_routing(T_total, E, K)
+    return [hidden_states, expert_offsets]
+
+
+def get_init_inputs():
+    return [T_total, H, I, E, K]

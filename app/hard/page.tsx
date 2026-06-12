@@ -377,7 +377,7 @@ function compiledStatus(cell: Cell): RunStatus {
 }
 
 function referenceUrlFor(problem: string) {
-  return `https://github.com/Infatoshi/KernelBench-Hard/blob/master/problems/${problem}/reference.py`
+  return `/code?f=${encodeURIComponent(`/data/hard/references/${problem}_reference.py.txt`)}`
 }
 
 function renderCorrectness(
@@ -516,10 +516,7 @@ function renderConversation(
 
 function ReferenceChip({ problem }: { problem: string }) {
   return (
-    <a
-      className="link-chip"
-      href={`https://github.com/Infatoshi/KernelBench-Hard/blob/master/problems/${problem}/reference.py`}
-    >
+    <a className="link-chip" href={referenceUrlFor(problem)}>
       reference
     </a>
   )

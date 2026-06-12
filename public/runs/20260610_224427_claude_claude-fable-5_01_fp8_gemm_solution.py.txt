@@ -1,0 +1,462 @@
+"""FP8-activation x BF16-weight GEMM for SM120 (RTX PRO 6000).
+
+Strategy (measured on this GPU):
+  - f16xf16->f32 mma.sync peak ~548 TF; fp8 mma is 2x but weight must stay
+    >=fp16 precision to pass the small_input/small_weight stress tolerances,
+    so the multiply runs in fp16.
+  - x (fp8 e4m3) stays packed in smem; ldmatrix.x4 over a b16 view +
+    cvt.rn.f16x2.e4m3x2 unpack feeds the mma. The resulting k-interleave is
+    compensated by pre-permuting the weight's K columns (offline, cached).
+  - w (bf16 param) is converted once to fp16, k-permuted, zero-padded to
+    K%64==0, cached; cache invalidated via weight._version.
+  - Multi-stage cp.async pipeline (4 stages), 128x128x64 CTA tile, 8 warps.
+  - K=4127 shape: x is repacked per-call into a 16B-aligned zero-padded
+    buffer, then the aligned kernel runs (4127 is odd: rows would otherwise
+    be unaligned for cp.async).
+  - M=32 decode shape: split-K variant (DRAM-bound on weight reads),
+    f32 partials + small reduce kernel.
+"""
+import os
+
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+OP_TYPE = "gemm"
+SUPPORTED_PRECISIONS = ["fp8_e4m3"]
+HARDWARE_REQUIRED = ["RTX_PRO_6000", "H100", "B200"]
+
+_CUDA_SRC = r"""
+#include <cuda.h>
+#include <cuda_fp16.h>
+#include <cstdint>
+#include <ATen/cuda/CUDAContext.h>
+
+#define CP_ASYNC_CG(dst, src) \
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" :: "r"(dst), "l"(src))
+#define CP_ASYNC_COMMIT asm volatile("cp.async.commit_group;\n" ::)
+#define CP_ASYNC_WAIT(n) asm volatile("cp.async.wait_group %0;\n" :: "n"(n))
+
+__device__ __forceinline__ uint32_t smem_addr(const void* p) {
+    uint32_t a;
+    asm("{ .reg .u64 u; cvta.to.shared.u64 u, %1; cvt.u32.u64 %0, u; }" : "=r"(a) : "l"(p));
+    return a;
+}
+
+__device__ __forceinline__ void ldmatrix_x4(uint32_t& r0, uint32_t& r1, uint32_t& r2, uint32_t& r3,
+                                            uint32_t addr) {
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+                 : "=r"(r0), "=r"(r1), "=r"(r2), "=r"(r3) : "r"(addr));
+}
+
+__device__ __forceinline__ void cvt_e4m3x4(uint32_t packed, uint32_t& lo, uint32_t& hi) {
+    asm volatile("{\n"
+                 ".reg .b16 l16, h16;\n"
+                 "mov.b32 {l16, h16}, %2;\n"
+                 "cvt.rn.f16x2.e4m3x2 %0, l16;\n"
+                 "cvt.rn.f16x2.e4m3x2 %1, h16;\n"
+                 "}\n" : "=r"(lo), "=r"(hi) : "r"(packed));
+}
+
+__device__ __forceinline__ void mma_16816(float* d, const uint32_t* a, const uint32_t* b) {
+    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
+                 "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+                 : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
+                 : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
+}
+
+__device__ __forceinline__ uint32_t cvt_bf16x2(float hi, float lo) {
+    uint32_t r;
+    asm volatile("cvt.rn.bf16x2.f32 %0, %1, %2;\n" : "=r"(r) : "f"(hi), "f"(lo));
+    return r;
+}
+
+// ---- smem layouts (BK = 64) ----
+// A tile: BM x 64 fp8. Two m-rows share a 128B smem row; 16B chunks XOR-swizzled.
+__device__ __forceinline__ uint32_t sa_off(int m, int c) {  // c: 16B chunk 0..3
+    return (m >> 1) * 128 + (m & 1) * 64 + ((c ^ ((m >> 1) & 3)) << 4);
+}
+// B tile: BN x 64 f16 = BN x 128B rows; 8 chunks XOR-swizzled.
+__device__ __forceinline__ uint32_t sb_off(int n, int c) {  // c: 16B chunk 0..7
+    return n * 128 + ((c ^ (n & 7)) << 4);
+}
+
+template <int BM, int BN, int WGM, int WGN, int STAGES, bool SPLIT_OUT>
+__global__ void __launch_bounds__(WGM * WGN * 32, 1)
+gemm_kernel(const uint8_t* __restrict__ A, const half* __restrict__ B,
+            __nv_bfloat16* __restrict__ C, float* __restrict__ Cpart,
+            int M, int N, int K, int ktiles_per_split, int grid_m, int grid_n,
+            int group_m) {
+    constexpr int BK = 64;
+    constexpr int NTHREADS = WGM * WGN * 32;
+    constexpr int WM = BM / WGM;          // warp tile m
+    constexpr int WN = BN / WGN;          // warp tile n
+    constexpr int MT = WM / 16;           // m16 tiles per warp
+    constexpr int NT = WN / 8;            // n8 tiles per warp
+    constexpr int A_BYTES = BM * BK;      // fp8
+    constexpr int B_BYTES = BN * BK * 2;  // f16
+    constexpr int A_CHUNKS = A_BYTES / 16;
+    constexpr int B_CHUNKS = B_BYTES / 16;
+    static_assert(NT % 2 == 0, "B ldmatrix covers 2 n-tiles");
+
+    extern __shared__ uint8_t smem[];
+    uint8_t* sA = smem;                       // STAGES * A_BYTES
+    uint8_t* sB = smem + STAGES * A_BYTES;    // STAGES * B_BYTES
+
+    // ---- tile coords with grouped rasterization ----
+    int pid = blockIdx.x;
+    int num_in_group = group_m * grid_n;
+    int gid = pid / num_in_group;
+    int first_m = gid * group_m;
+    int gsz = min(grid_m - first_m, group_m);
+    int pid_m = first_m + (pid % gsz);
+    int pid_n = (pid % num_in_group) / gsz;
+    int m0 = pid_m * BM;
+    int n0 = pid_n * BN;
+
+    int kt0 = blockIdx.z * ktiles_per_split;          // first k-tile of this split
+    int ktiles = min(ktiles_per_split, K / BK - kt0); // tiles this CTA handles
+
+    int tid = threadIdx.x;
+    int warp = tid >> 5;
+    int lane = tid & 31;
+    int wm = (warp / WGN) * WM;
+    int wn = (warp % WGN) * WN;
+
+    // ---- cp.async issue helper ----
+    const uint8_t* a_src_base = A + (int64_t)m0 * K + kt0 * BK;
+    const half* b_src_base = B + (int64_t)n0 * K + kt0 * BK;
+
+    auto issue_stage = [&](int kt, int slot) {
+        uint8_t* sa = sA + slot * A_BYTES;
+        uint8_t* sb = sB + slot * B_BYTES;
+        const uint8_t* ag = a_src_base + kt * BK;
+        const half* bg = b_src_base + kt * BK;
+        #pragma unroll
+        for (int i = 0; i < (A_CHUNKS + NTHREADS - 1) / NTHREADS; i++) {
+            int id = i * NTHREADS + tid;
+            if (A_CHUNKS % NTHREADS == 0 || id < A_CHUNKS) {
+                int m = id >> 2, c = id & 3;
+                CP_ASYNC_CG(smem_addr(sa + sa_off(m, c)), ag + (int64_t)m * K + c * 16);
+            }
+        }
+        #pragma unroll
+        for (int i = 0; i < (B_CHUNKS + NTHREADS - 1) / NTHREADS; i++) {
+            int id = i * NTHREADS + tid;
+            if (B_CHUNKS % NTHREADS == 0 || id < B_CHUNKS) {
+                int n = id >> 3, c = id & 7;
+                CP_ASYNC_CG(smem_addr(sb + sb_off(n, c)), bg + (int64_t)n * K + c * 8);
+            }
+        }
+    };
+
+    // ---- prologue ----
+    #pragma unroll
+    for (int s = 0; s < STAGES - 1; s++) {
+        if (s < ktiles) issue_stage(s, s);
+        CP_ASYNC_COMMIT;
+    }
+    CP_ASYNC_WAIT(STAGES - 2);
+    __syncthreads();
+
+    // ---- fragment load helpers ----
+    uint32_t araw[MT][4];     // packed fp8, covers k32 (2 k-steps)
+    uint32_t afrag[2][MT][4]; // f16x2, [buf][mt][reg]
+    uint32_t bfrag[2][NT][2];
+
+    auto lda_raw = [&](int slot, int k32) {
+        uint8_t* sa = sA + slot * A_BYTES;
+        #pragma unroll
+        for (int mt = 0; mt < MT; mt++) {
+            int row = wm + mt * 16 + (lane & 15);
+            int c = k32 * 2 + (lane >> 4);
+            ldmatrix_x4(araw[mt][0], araw[mt][1], araw[mt][2], araw[mt][3],
+                        smem_addr(sa + sa_off(row, c)));
+        }
+    };
+    auto cvt_a = [&](int buf, int kk) {  // kk parity selects raw half
+        int h = (kk & 1) * 2;
+        #pragma unroll
+        for (int mt = 0; mt < MT; mt++) {
+            cvt_e4m3x4(araw[mt][h + 0], afrag[buf][mt][0], afrag[buf][mt][2]);
+            cvt_e4m3x4(araw[mt][h + 1], afrag[buf][mt][1], afrag[buf][mt][3]);
+        }
+    };
+    auto ldb = [&](int buf, int slot, int kk) {
+        uint8_t* sb = sB + slot * B_BYTES;
+        #pragma unroll
+        for (int j = 0; j < NT / 2; j++) {
+            int sel = lane >> 3;
+            int row = wn + j * 16 + (sel >> 1) * 8 + (lane & 7);
+            int c = kk * 2 + (sel & 1);
+            ldmatrix_x4(bfrag[buf][2 * j][0], bfrag[buf][2 * j][1],
+                        bfrag[buf][2 * j + 1][0], bfrag[buf][2 * j + 1][1],
+                        smem_addr(sb + sb_off(row, c)));
+        }
+    };
+
+    float acc[MT][NT][4];
+    #pragma unroll
+    for (int mt = 0; mt < MT; mt++)
+        #pragma unroll
+        for (int nt = 0; nt < NT; nt++)
+            #pragma unroll
+            for (int i = 0; i < 4; i++) acc[mt][nt][i] = 0.f;
+
+    int slot = 0;
+    lda_raw(slot, 0);
+    cvt_a(0, 0);
+    ldb(0, slot, 0);
+
+    for (int kt = 0; kt < ktiles; kt++) {
+        #pragma unroll
+        for (int kk = 0; kk < 4; kk++) {
+            int cur = kk & 1, nxt = cur ^ 1;
+            int nslot = (slot + 1 == STAGES) ? 0 : slot + 1;
+            // prefetch next step's fragments
+            if (kk == 1) lda_raw(slot, 1);
+            if (kk == 3) {
+                lda_raw(nslot, 0);
+                cvt_a(nxt, 0);
+                ldb(nxt, nslot, 0);
+            } else {
+                cvt_a(nxt, kk + 1);
+                ldb(nxt, slot, kk + 1);
+            }
+            if (kk == 0) {
+                if (kt + STAGES - 1 < ktiles) issue_stage(kt + STAGES - 1, (slot + STAGES - 1) % STAGES);
+                CP_ASYNC_COMMIT;
+            }
+            #pragma unroll
+            for (int mt = 0; mt < MT; mt++)
+                #pragma unroll
+                for (int nt = 0; nt < NT; nt++)
+                    mma_16816(acc[mt][nt], afrag[cur][mt], bfrag[cur][nt]);
+            if (kk == 2) {
+                CP_ASYNC_WAIT(STAGES - 2);
+                __syncthreads();
+            }
+        }
+        slot = (slot + 1 == STAGES) ? 0 : slot + 1;
+    }
+
+    // ---- epilogue ----
+    if (SPLIT_OUT) {
+        // f32 partials: Cpart[z, m, n], no smem staging (skinny shapes)
+        float* out = Cpart + (int64_t)blockIdx.z * M * N;
+        #pragma unroll
+        for (int mt = 0; mt < MT; mt++) {
+            #pragma unroll
+            for (int nt = 0; nt < NT; nt++) {
+                int r = m0 + wm + mt * 16 + (lane >> 2);
+                int cidx = n0 + wn + nt * 8 + (lane & 3) * 2;
+                float2* p0 = reinterpret_cast<float2*>(out + (int64_t)r * N + cidx);
+                float2* p1 = reinterpret_cast<float2*>(out + (int64_t)(r + 8) * N + cidx);
+                *p0 = make_float2(acc[mt][nt][0], acc[mt][nt][1]);
+                *p1 = make_float2(acc[mt][nt][2], acc[mt][nt][3]);
+            }
+        }
+    } else {
+        // stage bf16 tile in smem (padded rows), then coalesced 16B stores
+        constexpr int PAD = 8;                 // halves
+        constexpr int LDS = BN + PAD;          // halves per row
+        __syncthreads();
+        uint16_t* stage = reinterpret_cast<uint16_t*>(smem);
+        #pragma unroll
+        for (int mt = 0; mt < MT; mt++) {
+            #pragma unroll
+            for (int nt = 0; nt < NT; nt++) {
+                int r = wm + mt * 16 + (lane >> 2);
+                int cidx = wn + nt * 8 + (lane & 3) * 2;
+                uint32_t lohi0 = cvt_bf16x2(acc[mt][nt][1], acc[mt][nt][0]);
+                uint32_t lohi1 = cvt_bf16x2(acc[mt][nt][3], acc[mt][nt][2]);
+                *reinterpret_cast<uint32_t*>(stage + r * LDS + cidx) = lohi0;
+                *reinterpret_cast<uint32_t*>(stage + (r + 8) * LDS + cidx) = lohi1;
+            }
+        }
+        __syncthreads();
+        constexpr int SEGS = BN * 2 / 16;       // 16B segments per row
+        constexpr int TOTAL = BM * SEGS;
+        #pragma unroll
+        for (int i = 0; i < TOTAL / NTHREADS; i++) {
+            int id = i * NTHREADS + tid;
+            int r = id / SEGS, seg = id % SEGS;
+            uint4 v = *reinterpret_cast<uint4*>(stage + r * LDS + seg * 8);
+            *reinterpret_cast<uint4*>(
+                reinterpret_cast<uint16_t*>(C) + (int64_t)(m0 + r) * N + n0 + seg * 8) = v;
+        }
+    }
+}
+
+__global__ void reduce_splits(const float* __restrict__ part, __nv_bfloat16* __restrict__ out,
+                              int64_t mn, int splits) {
+    int64_t i = (int64_t)(blockIdx.x) * blockDim.x + threadIdx.x;
+    int64_t stride = (int64_t)gridDim.x * blockDim.x;
+    for (; i * 4 < mn; i += stride) {
+        float4 s = reinterpret_cast<const float4*>(part)[i];
+        for (int z = 1; z < splits; z++) {
+            float4 v = reinterpret_cast<const float4*>(part + z * mn)[i];
+            s.x += v.x; s.y += v.y; s.z += v.z; s.w += v.w;
+        }
+        uint32_t lo = cvt_bf16x2(s.y, s.x);
+        uint32_t hi = cvt_bf16x2(s.w, s.z);
+        reinterpret_cast<uint2*>(out)[i] = make_uint2(lo, hi);
+    }
+}
+
+// ---------------- host launchers ----------------
+static inline int cdiv(int a, int b) { return (a + b - 1) / b; }
+
+template <int BM, int BN, int WGM, int WGN, int STAGES, bool SPLIT_OUT>
+void launch_cfg(const torch::Tensor& A, const torch::Tensor& B, torch::Tensor& C,
+                torch::Tensor* Cpart, int M, int N, int K, int splits, int group_m,
+                cudaStream_t stream) {
+    constexpr int BK = 64;
+    int grid_m = cdiv(M, BM), grid_n = cdiv(N, BN);
+    int ktiles = K / BK;
+    int ktiles_per_split = cdiv(ktiles, splits);
+    dim3 grid(grid_m * grid_n, 1, splits);
+    constexpr int smem = STAGES * (BM * BK + BN * BK * 2);
+    constexpr int nthreads = WGM * WGN * 32;
+    auto kfn = gemm_kernel<BM, BN, WGM, WGN, STAGES, SPLIT_OUT>;
+    static bool attr_set = false;
+    if (!attr_set) {
+        cudaFuncSetAttribute(kfn, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+        attr_set = true;
+    }
+    kfn<<<grid, nthreads, smem, stream>>>(
+        A.data_ptr<uint8_t>(), reinterpret_cast<const half*>(B.data_ptr()),
+        SPLIT_OUT ? nullptr : reinterpret_cast<__nv_bfloat16*>(C.data_ptr()),
+        SPLIT_OUT ? Cpart->data_ptr<float>() : nullptr,
+        M, N, K, ktiles_per_split, grid_m, grid_n, group_m);
+}
+
+void gemm_main(torch::Tensor A, torch::Tensor B, torch::Tensor C,
+               int64_t M, int64_t N, int64_t K, int64_t group_m, int64_t cfg) {
+    auto stream = at::cuda::getCurrentCUDAStream().stream();
+    int m = (int)M, n = (int)N, k = (int)K, g = (int)group_m;
+    switch (cfg) {
+    case 0: launch_cfg<128, 128, 2, 4, 4, false>(A, B, C, nullptr, m, n, k, 1, g, stream); break;
+    case 1: launch_cfg<128, 64, 2, 2, 3, false>(A, B, C, nullptr, m, n, k, 1, g, stream); break;
+    case 2: launch_cfg<128, 128, 4, 2, 4, false>(A, B, C, nullptr, m, n, k, 1, g, stream); break;
+    case 3: launch_cfg<128, 64, 4, 1, 3, false>(A, B, C, nullptr, m, n, k, 1, g, stream); break;
+    case 4: launch_cfg<64, 64, 2, 2, 4, false>(A, B, C, nullptr, m, n, k, 1, g, stream); break;
+    }
+}
+
+void gemm_skinny(torch::Tensor A, torch::Tensor B, torch::Tensor C, torch::Tensor Cpart,
+                 int64_t M, int64_t N, int64_t K, int64_t splits) {
+    auto stream = at::cuda::getCurrentCUDAStream().stream();
+    launch_cfg<32, 64, 2, 4, 4, true>(A, B, C, &Cpart, (int)M, (int)N, (int)K, (int)splits,
+                                      1, stream);
+    int64_t mn = M * N;
+    int64_t nb = (mn / 4 + 255) / 256;
+    int blocks = (int)(nb > 1024 ? 1024 : nb);
+    reduce_splits<<<blocks, 256, 0, stream>>>(Cpart.data_ptr<float>(),
+                                              reinterpret_cast<__nv_bfloat16*>(C.data_ptr()),
+                                              mn, (int)splits);
+}
+"""
+
+_CPP_SRC = """
+#include <ATen/cuda/CUDAContext.h>
+void gemm_main(torch::Tensor A, torch::Tensor B, torch::Tensor C,
+               int64_t M, int64_t N, int64_t K, int64_t group_m, int64_t cfg);
+void gemm_skinny(torch::Tensor A, torch::Tensor B, torch::Tensor C, torch::Tensor Cpart,
+                 int64_t M, int64_t N, int64_t K, int64_t splits);
+"""
+
+_ext = None
+
+
+def _get_ext():
+    global _ext
+    if _ext is None:
+        os.environ.setdefault("TORCH_CUDA_ARCH_LIST", "12.0a")
+        _ext = load_inline(
+            name="fp8w16_gemm_v2",
+            cpp_sources=[_CPP_SRC],
+            cuda_sources=[_CUDA_SRC],
+            functions=["gemm_main", "gemm_skinny"],
+            extra_cuda_cflags=["-arch=sm_120a", "-O3", "-std=c++17", "--ptxas-options=-v", "-lineinfo"],
+            extra_cflags=["-O3"],
+            verbose=False,
+        )
+    return _ext
+
+
+# semantic k slot s reads physical fp8 col perm[s] (within each 16-col group)
+_PERM16 = torch.tensor([0, 1, 4, 5, 8, 9, 12, 13, 2, 3, 6, 7, 10, 11, 14, 15])
+
+_MAIN_CFG = int(os.environ.get("FP8_MAIN_CFG", "0"))
+_GROUP_M = int(os.environ.get("FP8_GROUP_M", "16"))
+
+
+def _prep_weight(w: torch.Tensor, K_pad: int) -> torch.Tensor:
+    """bf16 (N, K) -> fp16 (N, K_pad), zero-padded, K-permuted per 16-group."""
+    N, K = w.shape
+    w16 = torch.zeros(N, K_pad, dtype=torch.float16, device=w.device)
+    w16[:, :K] = w.to(torch.float16)
+    perm = (_PERM16.to(w.device).repeat(K_pad // 16)
+            + torch.arange(0, K_pad, 16, device=w.device).repeat_interleave(16))
+    return w16[:, perm].contiguous()
+
+
+class Model(nn.Module):
+    def __init__(self, M: int, N: int, K: int):
+        super().__init__()
+        self.M, self.N, self.K = M, N, K
+        self.weight = nn.Parameter(torch.empty(N, K, dtype=torch.bfloat16))
+        nn.init.normal_(self.weight, std=0.02)
+        self.K_pad = (K + 63) // 64 * 64
+        self._wprep = None
+        self._wver = None
+        self._xpad = None
+        self._cpart = None
+
+    def _weight_prepped(self) -> torch.Tensor:
+        ver = self.weight._version
+        if self._wprep is None or self._wver != ver:
+            self._wprep = _prep_weight(self.weight.detach(), self.K_pad)
+            self._wver = ver
+        return self._wprep
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        M, N, K = self.M, self.N, self.K
+        if (x.dtype != torch.float8_e4m3fn or x.shape != (M, K) or not x.is_cuda
+                or M % 32 != 0 or N % 64 != 0):
+            return x.to(torch.bfloat16) @ self.weight.T  # fallback
+
+        ext = _get_ext()
+        w = self._weight_prepped()
+
+        xb = x.view(torch.uint8)
+        if K != self.K_pad:
+            if self._xpad is None:
+                self._xpad = torch.zeros(M, self.K_pad, dtype=torch.uint8, device=x.device)
+            self._xpad[:, :K].copy_(xb)
+            xb = self._xpad
+
+        out = torch.empty(M, N, dtype=torch.bfloat16, device=x.device)
+        if M >= 128:
+            ext.gemm_main(xb, w, out, M, N, self.K_pad, _GROUP_M, _MAIN_CFG)
+        else:
+            splits = 8
+            if self._cpart is None:
+                self._cpart = torch.empty(splits, M, N, dtype=torch.float32, device=x.device)
+            ext.gemm_skinny(xb, w, out, self._cpart, M, N, self.K_pad, splits)
+        return out
+
+
+M = 4096
+N = 4096
+K = 4096
+
+
+def get_inputs():
+    x = (torch.rand(M, K) * 8 - 4).to(torch.float8_e4m3fn)
+    return [x]
+
+
+def get_init_inputs():
+    return [M, N, K]

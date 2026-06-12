@@ -319,10 +319,12 @@ export default function V3Page() {
                   <td className="whitespace-nowrap">
                     {r.solution_link ? (
                       <a
-                        href={r.solution_link.replace(
-                          "/data/kernelbench-v3/",
-                          "/data/v3/",
-                        )}
+                        href={`/code?f=${encodeURIComponent(
+                          r.solution_link.replace(
+                            "/data/kernelbench-v3/",
+                            "/data/v3/",
+                          ),
+                        )}`}
                         target="_blank"
                         rel="noreferrer"
                         className="text-[var(--color-fg-bright)] no-underline hover:text-[var(--color-accent)] mr-2"
@@ -333,10 +335,12 @@ export default function V3Page() {
                     ) : null}
                     {r.baseline_link ? (
                       <a
-                        href={r.baseline_link.replace(
-                          "/data/kernelbench-v3/",
-                          "/data/v3/",
-                        )}
+                        href={`/code?f=${encodeURIComponent(
+                          r.baseline_link.replace(
+                            "/data/kernelbench-v3/",
+                            "/data/v3/",
+                          ),
+                        )}`}
                         target="_blank"
                         rel="noreferrer"
                         className="text-[var(--color-fg-muted)] no-underline hover:text-[var(--color-accent)]"
