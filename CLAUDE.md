@@ -63,6 +63,11 @@ Other commands: `kb run <harness> <model> <problem>` (one problem), `kb dev`
 - Reward-hack verdicts come from `results/annotations/<run_id>.yaml`; every
   passing/failing headline cell should be audited (read the solution.py) before
   publishing. The template-mutation guard auto-flags grader tampering.
+- `kb lint <run_id|--all>` is a static reward-hack TRIPWIRE: scans solution.py
+  for the patterns we have caught by hand (input-identity memoization,
+  stack/check.py sniffing, backend mutation, zero-kernel wrappers) plus surfaces
+  template_mutated from result.json. HACK = near-certain, FLAG = review. It is a
+  pointer for a human audit, NOT an auto-reject. Run it before publishing.
 - `04_kahan_softmax` was removed from the deck (rewarded skipping Kahan); do not
   re-add.
 - See `benchmarks/hard/DEVLOG.md` for the full journey and `SPEC.md` for
