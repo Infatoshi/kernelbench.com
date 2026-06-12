@@ -89,6 +89,7 @@ export type Annotation = {
     | "contamination"
     | "interesting"
     | "bug"
+    | "harness_limited"
   summary: string
   implication?: string
 }

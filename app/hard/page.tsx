@@ -331,6 +331,8 @@ function correctnessStatus(
     }
     return status("pass", "good")
   }
+  if (annot?.verdict === "harness_limited")
+    return status("infra", "warn", "warn", "harness-limited")
   if (cell.failure_reason === "provider_rate_limited") return status("rate", "bad")
   if (cell.failure_reason === "provider_early_stop") return status("early", "warn")
   if (cell.failure_reason === "timeout") return status("time", "warn")
