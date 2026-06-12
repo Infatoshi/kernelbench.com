@@ -1,0 +1,553 @@
+"""Custom CUDA top-k over the last dim.
+
+Hybrid strategy with preallocated buffers in the Model:
+  * k == 1: warp-reduction argmax.
+  * batch == 1: single CUB DeviceRadixSort over the row, then copy top-k.
+  * batch > 1: CUB BlockRadixSort per 1024-element chunk, then merge per-chunk
+    top-k lists in shared memory.
+"""
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+
+CPP_SOURCE = r'''
+#include <torch/extension.h>
+#include <vector>
+
+void topk_argmax_forward(torch::Tensor input, int64_t k,
+                         torch::Tensor values, torch::Tensor indices,
+                         torch::Tensor tmp_vals, torch::Tensor tmp_idx);
+
+void topk_single_row_forward(torch::Tensor input, int64_t k,
+                             torch::Tensor values, torch::Tensor indices,
+                             torch::Tensor sorted_vals, torch::Tensor sorted_idx,
+                             torch::Tensor idx_in, torch::Tensor temp_storage);
+
+void topk_batched_forward(torch::Tensor input, int64_t k,
+                          torch::Tensor values, torch::Tensor indices,
+                          torch::Tensor tmp_vals, torch::Tensor tmp_idx);
+'''
+
+CUDA_SOURCE = r'''
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <cfloat>
+#include <cstdint>
+#include <vector>
+#include <cub/block/block_radix_sort.cuh>
+#include <cub/device/device_radix_sort.cuh>
+
+constexpr int BLOCK_THREADS = 256;
+constexpr int CHUNK_SIZE = 1024;
+constexpr int ITEMS_PER_THREAD = CHUNK_SIZE / BLOCK_THREADS;   // 4
+constexpr int K_MAX = 64;
+constexpr int ARGMAX_CHUNK = 4096;
+
+// -----------------------------------------------------------------------------
+// Bitonic sort for small runtime-sized arrays of float+int64.
+// -----------------------------------------------------------------------------
+__device__ __forceinline__ void bitonic_sort_descending_runtime(float* __restrict__ vals,
+                                                                 int64_t* __restrict__ idx,
+                                                                 int N) {
+    for (int kk = 2; kk <= N; kk <<= 1) {
+        for (int j = kk >> 1; j > 0; j >>= 1) {
+            for (int i = threadIdx.x; i < N; i += blockDim.x) {
+                if ((i & j) == 0) {
+                    int ixj = i ^ j;
+                    bool up = (i & kk) != 0;
+                    float vi = vals[i];
+                    float vj = vals[ixj];
+                    bool swap = up ? (vi > vj) : (vi < vj);
+                    if (swap) {
+                        vals[i] = vj;
+                        vals[ixj] = vi;
+                        int64_t ii = idx[i];
+                        int64_t ij = idx[ixj];
+                        idx[i] = ij;
+                        idx[ixj] = ii;
+                    }
+                }
+            }
+            __syncthreads();
+        }
+    }
+}
+
+// -----------------------------------------------------------------------------
+// k == 1: argmax per chunk, then merge per row.
+// -----------------------------------------------------------------------------
+__global__ void argmax_chunk_kernel(const float* __restrict__ input,
+                                    int batch, int n,
+                                    float* __restrict__ out_vals,
+                                    int64_t* __restrict__ out_idx,
+                                    int blocks_per_row) {
+    int row = blockIdx.x;
+    int chunk = blockIdx.y;
+    int tid = threadIdx.x;
+    if (row >= batch) return;
+
+    int chunk_start = chunk * ARGMAX_CHUNK;
+    int chunk_end = min(chunk_start + ARGMAX_CHUNK, n);
+    const float* row_ptr = input + row * n;
+
+    float local_max = -FLT_MAX;
+    int64_t local_idx = 0;
+    for (int i = chunk_start + tid; i < chunk_end; i += blockDim.x) {
+        float v = row_ptr[i];
+        if (v > local_max) {
+            local_max = v;
+            local_idx = i;
+        }
+    }
+
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        float other_val = __shfl_xor_sync(0xffffffff, local_max, offset);
+        int64_t other_idx = __shfl_xor_sync(0xffffffff, local_idx, offset);
+        if (other_val > local_max) {
+            local_max = other_val;
+            local_idx = other_idx;
+        }
+    }
+
+    __shared__ float warp_max[BLOCK_THREADS / 32];
+    __shared__ int64_t warp_idx[BLOCK_THREADS / 32];
+    int lane = tid & 31;
+    int warp_id = tid >> 5;
+    if (lane == 0) {
+        warp_max[warp_id] = local_max;
+        warp_idx[warp_id] = local_idx;
+    }
+    __syncthreads();
+
+    if (tid < (BLOCK_THREADS / 32)) {
+        local_max = warp_max[tid];
+        local_idx = warp_idx[tid];
+    } else {
+        local_max = -FLT_MAX;
+        local_idx = 0;
+    }
+    __syncthreads();
+
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        float other_val = __shfl_xor_sync(0xffffffff, local_max, offset);
+        int64_t other_idx = __shfl_xor_sync(0xffffffff, local_idx, offset);
+        if (other_val > local_max) {
+            local_max = other_val;
+            local_idx = other_idx;
+        }
+    }
+
+    if (tid == 0) {
+        int out_offset = row * blocks_per_row + chunk;
+        out_vals[out_offset] = local_max;
+        out_idx[out_offset] = local_idx;
+    }
+}
+
+__global__ void argmax_merge_kernel(const float* __restrict__ in_vals,
+                                    const int64_t* __restrict__ in_idx,
+                                    int batch, int blocks_per_row,
+                                    float* __restrict__ out_vals,
+                                    int64_t* __restrict__ out_idx) {
+    int row = blockIdx.x;
+    int tid = threadIdx.x;
+    if (row >= batch) return;
+
+    float local_max = -FLT_MAX;
+    int64_t local_idx = 0;
+    int in_offset = row * blocks_per_row;
+    for (int i = tid; i < blocks_per_row; i += blockDim.x) {
+        float v = in_vals[in_offset + i];
+        if (v > local_max) {
+            local_max = v;
+            local_idx = in_idx[in_offset + i];
+        }
+    }
+
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        float other_val = __shfl_xor_sync(0xffffffff, local_max, offset);
+        int64_t other_idx = __shfl_xor_sync(0xffffffff, local_idx, offset);
+        if (other_val > local_max) {
+            local_max = other_val;
+            local_idx = other_idx;
+        }
+    }
+
+    __shared__ float warp_max[BLOCK_THREADS / 32];
+    __shared__ int64_t warp_idx[BLOCK_THREADS / 32];
+    int lane = tid & 31;
+    int warp_id = tid >> 5;
+    if (lane == 0) {
+        warp_max[warp_id] = local_max;
+        warp_idx[warp_id] = local_idx;
+    }
+    __syncthreads();
+
+    if (tid < (BLOCK_THREADS / 32)) {
+        local_max = warp_max[tid];
+        local_idx = warp_idx[tid];
+    } else {
+        local_max = -FLT_MAX;
+        local_idx = 0;
+    }
+    __syncthreads();
+
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        float other_val = __shfl_xor_sync(0xffffffff, local_max, offset);
+        int64_t other_idx = __shfl_xor_sync(0xffffffff, local_idx, offset);
+        if (other_val > local_max) {
+            local_max = other_val;
+            local_idx = other_idx;
+        }
+    }
+
+    if (tid == 0) {
+        out_vals[row] = local_max;
+        out_idx[row] = local_idx;
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Level 1 chunk sort: CUB BlockRadixSort for batch > 1.
+// -----------------------------------------------------------------------------
+__global__ void topk_chunk_kernel(const float* __restrict__ input,
+                                  int batch, int n, int k,
+                                  float* __restrict__ out_vals,
+                                  int64_t* __restrict__ out_idx,
+                                  int blocks_per_row) {
+    using BlockRadixSort = cub::BlockRadixSort<float, BLOCK_THREADS, ITEMS_PER_THREAD, int64_t>;
+    __shared__ typename BlockRadixSort::TempStorage temp_storage;
+
+    int row = blockIdx.x;
+    int chunk = blockIdx.y;
+    int tid = threadIdx.x;
+    if (row >= batch) return;
+
+    int chunk_start = chunk * CHUNK_SIZE;
+    int chunk_end = min(chunk_start + CHUNK_SIZE, n);
+    const float* row_ptr = input + row * n;
+
+    float thread_keys[ITEMS_PER_THREAD];
+    int64_t thread_values[ITEMS_PER_THREAD];
+
+    #pragma unroll
+    for (int i = 0; i < ITEMS_PER_THREAD; ++i) {
+        int pos = chunk_start + tid + i * BLOCK_THREADS;
+        if (pos < chunk_end) {
+            thread_keys[i] = row_ptr[pos];
+            thread_values[i] = pos;
+        } else {
+            thread_keys[i] = -FLT_MAX;
+            thread_values[i] = 0;
+        }
+    }
+
+    BlockRadixSort(temp_storage).SortDescendingBlockedToStriped(thread_keys, thread_values);
+
+    if (tid < k) {
+        int out_offset = row * blocks_per_row * k + chunk * k;
+        out_vals[out_offset + tid] = thread_keys[0];
+        out_idx[out_offset + tid] = thread_values[0];
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Level 2 merge per-chunk top-k lists into the final top-k.
+// -----------------------------------------------------------------------------
+__global__ void topk_merge_kernel(const float* __restrict__ in_vals,
+                                  const int64_t* __restrict__ in_idx,
+                                  int batch, int blocks_per_row, int k,
+                                  float* __restrict__ out_vals,
+                                  int64_t* __restrict__ out_idx) {
+    extern __shared__ char smem[];
+    int row = blockIdx.x;
+    int tid = threadIdx.x;
+    if (row >= batch) return;
+
+    int total = blocks_per_row * k;
+    int N = 1;
+    while (N < total) N <<= 1;
+
+    float* svals = reinterpret_cast<float*>(smem);
+    int64_t* sidx = reinterpret_cast<int64_t*>(smem + N * sizeof(float));
+
+    int in_offset = row * blocks_per_row * k;
+    for (int i = tid; i < N; i += blockDim.x) {
+        if (i < total) {
+            svals[i] = in_vals[in_offset + i];
+            sidx[i] = in_idx[in_offset + i];
+        } else {
+            svals[i] = -FLT_MAX;
+            sidx[i] = 0;
+        }
+    }
+    __syncthreads();
+
+    bitonic_sort_descending_runtime(svals, sidx, N);
+
+    for (int i = tid; i < k; i += blockDim.x) {
+        out_vals[row * k + i] = svals[i];
+        out_idx[row * k + i] = sidx[i];
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Copy first k elements after a full-row sort (batch == 1 path).
+// -----------------------------------------------------------------------------
+__global__ void copy_topk_kernel(const float* __restrict__ sorted_vals,
+                                 const int64_t* __restrict__ sorted_idx,
+                                 int n, int k,
+                                 float* __restrict__ out_vals,
+                                 int64_t* __restrict__ out_idx) {
+    int tid = threadIdx.x;
+    for (int i = tid; i < k; i += blockDim.x) {
+        out_vals[i] = sorted_vals[i];
+        out_idx[i] = sorted_idx[i];
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Exported Python-callable entry points (buffers are preallocated by Model).
+// -----------------------------------------------------------------------------
+void topk_argmax_forward(torch::Tensor input, int64_t k,
+                         torch::Tensor values, torch::Tensor indices,
+                         torch::Tensor tmp_vals, torch::Tensor tmp_idx) {
+    int batch = input.size(0);
+    int n = input.size(1);
+    int blocks_per_row = (n + ARGMAX_CHUNK - 1) / ARGMAX_CHUNK;
+
+    if (blocks_per_row == 1) {
+        dim3 grid(batch, 1);
+        argmax_chunk_kernel<<<grid, BLOCK_THREADS>>>(
+            input.data_ptr<float>(), batch, n,
+            values.data_ptr<float>(), indices.data_ptr<int64_t>(), 1);
+    } else {
+        dim3 grid1(batch, blocks_per_row);
+        argmax_chunk_kernel<<<grid1, BLOCK_THREADS>>>(
+            input.data_ptr<float>(), batch, n,
+            tmp_vals.data_ptr<float>(), tmp_idx.data_ptr<int64_t>(), blocks_per_row);
+
+        argmax_merge_kernel<<<batch, BLOCK_THREADS>>>(
+            tmp_vals.data_ptr<float>(), tmp_idx.data_ptr<int64_t>(),
+            batch, blocks_per_row,
+            values.data_ptr<float>(), indices.data_ptr<int64_t>());
+    }
+}
+
+void topk_single_row_forward(torch::Tensor input, int64_t k,
+                             torch::Tensor values, torch::Tensor indices,
+                             torch::Tensor sorted_vals, torch::Tensor sorted_idx,
+                             torch::Tensor idx_in, torch::Tensor temp_storage) {
+    int n = input.size(1);
+    int kk = static_cast<int>(k);
+
+    size_t temp_bytes = temp_storage.numel();
+    cub::DeviceRadixSort::SortPairsDescending(
+        temp_storage.data_ptr<uint8_t>(), temp_bytes,
+        input.data_ptr<float>(), sorted_vals.data_ptr<float>(),
+        idx_in.data_ptr<int64_t>(), sorted_idx.data_ptr<int64_t>(),
+        n);
+
+    copy_topk_kernel<<<1, BLOCK_THREADS>>>(
+        sorted_vals.data_ptr<float>(), sorted_idx.data_ptr<int64_t>(),
+        n, kk,
+        values.data_ptr<float>(), indices.data_ptr<int64_t>());
+}
+
+void topk_batched_forward(torch::Tensor input, int64_t k,
+                          torch::Tensor values, torch::Tensor indices,
+                          torch::Tensor tmp_vals, torch::Tensor tmp_idx) {
+    int batch = input.size(0);
+    int n = input.size(1);
+    int kk = static_cast<int>(k);
+    int blocks_per_row = (n + CHUNK_SIZE - 1) / CHUNK_SIZE;
+
+    dim3 grid1(batch, blocks_per_row);
+    topk_chunk_kernel<<<grid1, BLOCK_THREADS>>>(
+        input.data_ptr<float>(), batch, n, kk,
+        tmp_vals.data_ptr<float>(), tmp_idx.data_ptr<int64_t>(), blocks_per_row);
+
+    int total = blocks_per_row * kk;
+    int merge_N = 1;
+    while (merge_N < total) merge_N <<= 1;
+    size_t merge_smem = static_cast<size_t>(merge_N) * (sizeof(float) + sizeof(int64_t));
+
+    cudaFuncSetAttribute(topk_merge_kernel,
+                         cudaFuncAttributeMaxDynamicSharedMemorySize,
+                         static_cast<int>(merge_smem));
+
+    topk_merge_kernel<<<batch, BLOCK_THREADS, merge_smem>>>(
+        tmp_vals.data_ptr<float>(), tmp_idx.data_ptr<int64_t>(),
+        batch, blocks_per_row, kk,
+        values.data_ptr<float>(), indices.data_ptr<int64_t>());
+}
+
+// Fallback convenience function (not used by Model, but kept for parity).
+std::vector<torch::Tensor> topk_forward(torch::Tensor input, int64_t k) {
+    int batch = input.size(0);
+    int n = input.size(1);
+    auto values = torch::empty({batch, static_cast<int64_t>(k)}, input.options());
+    auto indices = torch::empty({batch, static_cast<int64_t>(k)},
+                                torch::dtype(torch::kInt64).device(input.device()));
+
+    if (k == 1) {
+        int blocks_per_row = (n + ARGMAX_CHUNK - 1) / ARGMAX_CHUNK;
+        auto tmp_vals = blocks_per_row > 1
+                            ? torch::empty({batch, blocks_per_row}, input.options())
+                            : torch::Tensor();
+        auto tmp_idx = blocks_per_row > 1
+                            ? torch::empty({batch, blocks_per_row},
+                                           torch::dtype(torch::kInt64).device(input.device()))
+                            : torch::Tensor();
+        topk_argmax_forward(input, k, values, indices, tmp_vals, tmp_idx);
+    } else if (batch == 1) {
+        auto sorted_vals = torch::empty_like(input);
+        auto sorted_idx = torch::empty({batch, n}, torch::dtype(torch::kInt64).device(input.device()));
+        auto idx_in = torch::arange(n, torch::dtype(torch::kInt64).device(input.device()))
+                          .unsqueeze(0)
+                          .expand({batch, n})
+                          .contiguous();
+
+        size_t temp_bytes = 0;
+        cub::DeviceRadixSort::SortPairsDescending(
+            nullptr, temp_bytes,
+            input.data_ptr<float>(), sorted_vals.data_ptr<float>(),
+            idx_in.data_ptr<int64_t>(), sorted_idx.data_ptr<int64_t>(),
+            n);
+        auto temp_storage = torch::empty({static_cast<int64_t>(temp_bytes)},
+                                         torch::dtype(torch::kUInt8).device(input.device()));
+        topk_single_row_forward(input, k, values, indices,
+                                sorted_vals, sorted_idx, idx_in, temp_storage);
+    } else {
+        int blocks_per_row = (n + CHUNK_SIZE - 1) / CHUNK_SIZE;
+        auto tmp_vals = torch::empty({batch, blocks_per_row, k}, input.options());
+        auto tmp_idx = torch::empty({batch, blocks_per_row, k},
+                                    torch::dtype(torch::kInt64).device(input.device()));
+        topk_batched_forward(input, k, values, indices, tmp_vals, tmp_idx);
+    }
+
+    return {values, indices};
+}
+'''
+
+
+def _load_kernel():
+    return load_inline(
+        name="topk_prealloc_sm120",
+        cpp_sources=CPP_SOURCE,
+        cuda_sources=CUDA_SOURCE,
+        functions=[
+            "topk_forward",
+            "topk_argmax_forward",
+            "topk_single_row_forward",
+            "topk_batched_forward",
+        ],
+        extra_cuda_cflags=[
+            "-O3",
+            "--use_fast_math",
+            "-gencode", "arch=compute_120,code=sm_120",
+        ],
+        verbose=False,
+    )
+
+
+_topk_cuda = _load_kernel()
+
+
+class Model(nn.Module):
+    """Top-k over the last dim of a 2D tensor.
+
+    Input:
+        x: (batch, n) fp32
+    Output:
+        values:  (batch, k) fp32, sorted descending
+        indices: (batch, k) int64, into the last dim of x
+    """
+
+    def __init__(self, batch: int, n: int, k: int):
+        super().__init__()
+        self.batch, self.n, self.k = batch, n, k
+        self.register_buffer("_dummy", torch.zeros(1))
+
+        device = torch.device("cuda:0")
+
+        self.values = torch.empty(batch, k, dtype=torch.float32, device=device)
+        self.indices = torch.empty(batch, k, dtype=torch.int64, device=device)
+
+        if k == 1:
+            blocks_per_row = (n + 4096 - 1) // 4096
+            if blocks_per_row > 1:
+                self.tmp_vals = torch.empty(batch, blocks_per_row, dtype=torch.float32, device=device)
+                self.tmp_idx = torch.empty(batch, blocks_per_row, dtype=torch.int64, device=device)
+            else:
+                self.tmp_vals = torch.empty(0, device=device)
+                self.tmp_idx = torch.empty(0, device=device)
+            self.fn = _topk_cuda.topk_argmax_forward
+        elif batch == 1:
+            self.sorted_vals = torch.empty_like(torch.empty(batch, n, dtype=torch.float32, device=device))
+            self.sorted_idx = torch.empty(batch, n, dtype=torch.int64, device=device)
+            self.idx_in = torch.arange(n, dtype=torch.int64, device=device).unsqueeze(0).expand(batch, n).contiguous()
+
+            # Compute CUB temp storage size once.
+            tmp = torch.empty(batch, n, dtype=torch.float32, device=device)
+            sorted_vals = torch.empty_like(tmp)
+            sorted_idx = torch.empty(batch, n, dtype=torch.int64, device=device)
+            idx_in = self.idx_in.clone()
+            temp_bytes = torch.utils.cpp_extension.load_inline(
+                name="temp_size_query",
+                cpp_sources="",
+                cuda_sources=r'''
+#include <torch/extension.h>
+#include <cub/device/device_radix_sort.cuh>
+int64_t temp_size(torch::Tensor input, torch::Tensor idx_in) {
+    size_t temp_bytes = 0;
+    cub::DeviceRadixSort::SortPairsDescending(
+        nullptr, temp_bytes,
+        input.data_ptr<float>(), static_cast<float*>(nullptr),
+        idx_in.data_ptr<int64_t>(), static_cast<int64_t*>(nullptr),
+        input.size(1));
+    return static_cast<int64_t>(temp_bytes);
+}
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) { m.def("temp_size", &temp_size); }
+''',
+                functions=["temp_size"],
+                extra_cuda_cflags=["-O3", "-gencode", "arch=compute_120,code=sm_120"],
+                verbose=False,
+            ).temp_size(tmp, idx_in)
+
+            self.temp_storage = torch.empty(temp_bytes, dtype=torch.uint8, device=device)
+            self.fn = _topk_cuda.topk_single_row_forward
+        else:
+            blocks_per_row = (n + 1024 - 1) // 1024
+            self.tmp_vals = torch.empty(batch, blocks_per_row, k, dtype=torch.float32, device=device)
+            self.tmp_idx = torch.empty(batch, blocks_per_row, k, dtype=torch.int64, device=device)
+            self.fn = _topk_cuda.topk_batched_forward
+
+    def forward(self, x: torch.Tensor):
+        if self.k == 1:
+            self.fn(x, self.k, self.values, self.indices, self.tmp_vals, self.tmp_idx)
+        elif self.batch == 1:
+            self.fn(x, self.k, self.values, self.indices,
+                    self.sorted_vals, self.sorted_idx, self.idx_in, self.temp_storage)
+        else:
+            self.fn(x, self.k, self.values, self.indices, self.tmp_vals, self.tmp_idx)
+        return self.values, self.indices
+
+
+def get_inputs():
+    x = torch.randn(batch, n, dtype=torch.float32)
+    return [x]
+
+
+def get_init_inputs():
+    return [batch, n, k]
+
+
+batch = 64
+n = 8192
+k = 8

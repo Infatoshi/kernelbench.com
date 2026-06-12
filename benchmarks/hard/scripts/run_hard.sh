@@ -13,6 +13,7 @@
 #   ./scripts/run_hard.sh zai-claude glm-5.1 problems/01_fp8_gemm
 #   ./scripts/run_hard.sh minimax-claude MiniMax-M3 problems/01_fp8_gemm
 #   ./scripts/run_hard.sh ccr-claude glm-5.1 problems/01_fp8_gemm
+#   ./scripts/run_hard.sh opencode-nemotron nvidia/nemotron-3-ultra-550b-a55b problems/01_fp8_gemm
 #
 # Archives everything to outputs/runs/<ts>_<harness>_<model>_<problem>/.
 
@@ -37,9 +38,28 @@ MODEL="${2:?model required}"
 SOURCE_PROBLEM_DIR="${3:?problem_dir required}"
 REASONING_EFFORT="${4:-}"
 CLAUDE_KBH_SETTINGS="${CLAUDE_KBH_SETTINGS:-{\"fastMode\":false,\"alwaysThinkingEnabled\":true}}"
+KBH_AGENT_CONTAINER="${KBH_AGENT_CONTAINER:-0}"
+KBH_AGENT_CONTAINER_IMAGE="${KBH_AGENT_CONTAINER_IMAGE:-nvcr.io/nvidia/tensorrt-llm/release:latest}"
+KBH_AGENT_CONTAINER_NETWORK="${KBH_AGENT_CONTAINER_NETWORK:-bridge}"
+KBH_AGENT_CONTAINER_CUDA_HOME="${KBH_AGENT_CONTAINER_CUDA_HOME:-/usr/local/cuda-13.2}"
+KBH_AGENT_CONTAINER_CLAUDE_BIN="${KBH_AGENT_CONTAINER_CLAUDE_BIN:-$HOME/.local/share/claude/versions/2.1.150}"
+KBH_AGENT_CONTAINER_CODEX_NODE="${KBH_AGENT_CONTAINER_CODEX_NODE:-$HOME/.local/node-v22.14.0-linux-x64}"
+KBH_AGENT_CONTAINER_OPENCODE_BIN="${KBH_AGENT_CONTAINER_OPENCODE_BIN:-$HOME/.opencode/bin/opencode}"
+KBH_AGENT_CONTAINER_DROID_BIN="${KBH_AGENT_CONTAINER_DROID_BIN:-$HOME/.local/bin/droid}"
+KBH_AGENT_CONTAINER_CURSOR_DIR="${KBH_AGENT_CONTAINER_CURSOR_DIR:-$HOME/.local/share/cursor-agent/versions/2026.05.27-fe9a6e2}"
+KBH_AGENT_CONTAINER_GROK_DIR="${KBH_AGENT_CONTAINER_GROK_DIR:-$HOME/.grok}"
+KBH_AGENT_CONTAINER_GEMINI_DIR="${KBH_AGENT_CONTAINER_GEMINI_DIR:-/usr/lib/node_modules/@google/gemini-cli}"
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 SOURCE_PROBLEM_DIR="$(cd "$SOURCE_PROBLEM_DIR" && pwd)"
+
+# Shared across container runs so the workspace uv env (same uv.lock as host
+# scoring) does not re-download wheels or managed pythons every run.
+KBH_AGENT_CONTAINER_UV_CACHE="${KBH_AGENT_CONTAINER_UV_CACHE:-$REPO_ROOT/outputs/container_uv_cache}"
+# Pre-warmed opencode home (clean, migrated sqlite DB, no host session data).
+# Built once via scripts/warm_opencode_home.sh; copied into each run's
+# agent_home so opencode does not redo its DB migration inside the budget.
+KBH_OPENCODE_HOME_TEMPLATE="${KBH_OPENCODE_HOME_TEMPLATE:-$REPO_ROOT/outputs/opencode_home_template}"
 PROBLEM_NAME="$(basename "$SOURCE_PROBLEM_DIR")"
 
 TIMESTAMP="$(date +%Y%m%d_%H%M%S)"
@@ -64,6 +84,16 @@ if [ -z "$RUN_DIR" ]; then
 fi
 RUN_ID="$(basename "$RUN_DIR")"
 RUN_GROUP="${KBH_RUN_GROUP:-}"
+NVCF_PROXY_PID=""
+NVCF_PROXY_BASE_URL=""
+
+cleanup() {
+    if [ -n "${NVCF_PROXY_PID:-}" ] && kill -0 "$NVCF_PROXY_PID" 2>/dev/null; then
+        kill "$NVCF_PROXY_PID" 2>/dev/null || true
+        wait "$NVCF_PROXY_PID" 2>/dev/null || true
+    fi
+}
+trap cleanup EXIT
 
 # Wall clock budget: 45 minutes per run. Override via BUDGET_SECONDS env var
 # (e.g. BUDGET_SECONDS=300 for a quick smoke test).
@@ -86,6 +116,16 @@ GPU_QUEUE_MODE="path_wrapper_gpu_lock"
 if [ "${KBH_DISABLE_AGENT_CUDA:-0}" = "1" ]; then
     AGENT_CUDA_DISABLED=true
     GPU_QUEUE_MODE="agent_phase_cuda_guard_harness_gpu_lock"
+fi
+if [ "$KBH_AGENT_CONTAINER" = "1" ]; then
+    if [ "${KBH_AGENT_CONTAINER_SESSION_LOCK:-0}" = "1" ]; then
+        # Legacy: the whole agent session holds the GPU lock (fully serial).
+        GPU_QUEUE_MODE="agent_container_native_profiling_harness_gpu_lock"
+    else
+        # Default: sessions run in parallel; in-container GPU-facing commands
+        # serialize per-command through the shared lock, like host sweeps.
+        GPU_QUEUE_MODE="agent_container_native_profiling_path_wrapper_gpu_lock"
+    fi
 fi
 
 # --- Load the per-problem prompt ------------------------------------------
@@ -129,17 +169,38 @@ WORKSPACE_ROOT="$RUN_DIR/repo"
 PROBLEM_DIR="$WORKSPACE_ROOT/problems/$PROBLEM_NAME"
 mkdir -p "$PROBLEM_DIR"
 
+if [ "$KBH_AGENT_CONTAINER" = "1" ]; then
+    PROMPT_WORKSPACE_DIR="/workspace/problems/$PROBLEM_NAME"
+    PROMPT_SOURCE_NOTE="The source repository's problems/ tree is not mounted."
+else
+    PROMPT_WORKSPACE_DIR="$PROBLEM_DIR"
+    PROMPT_SOURCE_NOTE="Do not write to ${SOURCE_PROBLEM_DIR} or to the source repository's problems/ tree."
+fi
 PROMPT="${PROMPT}
 
 Workspace isolation note: you are already running inside the archive-local
-problem workspace, ${PROBLEM_DIR}. Write the final answer to solution.py in the
-current directory only. Do not write to ${SOURCE_PROBLEM_DIR} or to the source
-repository's problems/ tree."
+problem workspace, ${PROMPT_WORKSPACE_DIR}. Write the final answer to
+solution.py in the current directory only. ${PROMPT_SOURCE_NOTE}"
+if [ "$KBH_AGENT_CONTAINER" = "1" ]; then
+    PROMPT="${PROMPT}
+
+Container note: inside this run, the visible workspace path is
+/workspace/problems/${PROBLEM_NAME}. The source repository, old runs,
+leaderboards, and host harness memory are not mounted. Container network mode is
+${KBH_AGENT_CONTAINER_NETWORK}. Run all Python through \`uv run ...\` so you use
+the workspace uv environment; it is built from the same uv.lock as the official
+scoring environment. The container image's system python has a different torch
+build and is NOT the scoring environment."
+fi
 
 # check.py and benchmark.py derive REPO_ROOT as parents[2]. Keep that shape
 # while sharing src/. Copy project metadata so agents can mutate dependencies
 # inside their disposable workspace without touching the source repo.
-ln -s "$REPO_ROOT/src" "$WORKSPACE_ROOT/src"
+if [ "$KBH_AGENT_CONTAINER" = "1" ]; then
+    cp -a "$REPO_ROOT/src" "$WORKSPACE_ROOT/src"
+else
+    ln -s "$REPO_ROOT/src" "$WORKSPACE_ROOT/src"
+fi
 cp -p "$REPO_ROOT/pyproject.toml" "$WORKSPACE_ROOT/pyproject.toml"
 cp -p "$REPO_ROOT/uv.lock" "$WORKSPACE_ROOT/uv.lock"
 if [ -e "$REPO_ROOT/.python-version" ]; then
@@ -163,6 +224,7 @@ REAL_NVIDIA_SMI="$(command -v nvidia-smi || true)"
 REAL_NCU="$(command -v ncu || true)"
 REAL_NSYS="$(command -v nsys || true)"
 REAL_NVCC="$(command -v nvcc || true)"
+REAL_DOCKER="$(command -v docker || true)"
 REAL_TIMEOUT="$(command -v timeout)"
 REAL_UV_FALLBACK="$REAL_UV"
 REAL_PYTHON_FALLBACK="$REAL_PYTHON"
@@ -172,7 +234,12 @@ mkdir -p "$LOCK_WRAPPER_DIR" "$RUN_DIR/cache/torch_extensions" \
     "$RUN_DIR/cache/triton" "$RUN_DIR/cache/cuda" "$RUN_DIR/tmp" \
     "$AGENT_GUARD_DIR"
 
-export KBH_GPU_LOCK="${KBH_GPU_LOCK:-$REPO_ROOT/outputs/gpu.lock}"
+# The lock lives in its own directory so container runs can bind-mount just
+# the lock (flock is on the inode, so host and container commands serialize
+# against each other) without exposing the rest of outputs/.
+KBH_GPU_LOCK_DIR="${KBH_GPU_LOCK_DIR:-$REPO_ROOT/outputs/gpu_lock}"
+mkdir -p "$KBH_GPU_LOCK_DIR"
+export KBH_GPU_LOCK="${KBH_GPU_LOCK:-$KBH_GPU_LOCK_DIR/gpu.lock}"
 export KBH_GPU_LOCK_LOG="$RUN_DIR/gpu_lock.log"
 export TORCH_EXTENSIONS_DIR="$RUN_DIR/cache/torch_extensions"
 export TRITON_CACHE_DIR="$RUN_DIR/cache/triton"
@@ -396,11 +463,749 @@ chmod +x "$LOCK_WRAPPER_DIR"/uv "$LOCK_WRAPPER_DIR"/python \
     "$LOCK_WRAPPER_DIR"/ncu "$LOCK_WRAPPER_DIR"/nsys "$LOCK_WRAPPER_DIR"/nvcc
 export PATH="$LOCK_WRAPPER_DIR:$PATH"
 
+# Container-side lock wrappers. Mounted at /kbh/bin (first on PATH) inside
+# agent containers so in-container GPU-facing commands take the same host
+# flock per-command. Real binaries resolve lazily from a PATH that excludes
+# /kbh/bin, so the wrappers never recurse into themselves.
+CONTAINER_LOCK_BIN="$RUN_DIR/cbin"
+if [ "$KBH_AGENT_CONTAINER" = "1" ]; then
+    mkdir -p "$CONTAINER_LOCK_BIN"
+    cp "$LOCK_WRAPPER_DIR/gpu-lock-exec" "$CONTAINER_LOCK_BIN/gpu-lock-exec"
+    for tool in uv python python3 nvidia-smi nvcc ncu nsys; do
+        cat > "$CONTAINER_LOCK_BIN/$tool" <<CWRAP
+#!/bin/bash
+real="\$(PATH="/usr/local/cuda-host/bin:/opt/node/bin:/usr/local/bin:/usr/bin:/bin:/usr/local/cuda/bin:/opt/nvidia/nsight-compute:/opt/nvidia/nsight-systems/bin" command -v $tool || true)"
+exec /kbh/bin/gpu-lock-exec $tool "\$real" "\$@"
+CWRAP
+        chmod +x "$CONTAINER_LOCK_BIN/$tool"
+    done
+    chmod +x "$CONTAINER_LOCK_BIN/gpu-lock-exec"
+fi
+
 run_gpu_locked_timeout() {
     local lock_name="$1"
     local timeout_seconds="$2"
     shift 2
-    "$RUN_DIR/bin/gpu-lock-exec" "$lock_name" "$REAL_TIMEOUT" "$timeout_seconds" "$@"
+    "$RUN_DIR/bin/gpu-lock-exec" "$lock_name" "$REAL_TIMEOUT" \
+        --kill-after="${KBH_TIMEOUT_KILL_AFTER_SECONDS:-30}s" "${timeout_seconds}s" "$@"
+}
+
+run_docker_locked_timeout() {
+    local lock_name="$1"
+    local timeout_seconds="$2"
+    local cidfile="$3"
+    shift 3
+    rm -f "$cidfile"
+    # Optional stall watchdog: when KBH_STALL_WATCH_LOG is set, kill the
+    # container if that file stops growing for KBH_STALL_SECONDS. Guards
+    # against the opencode OpenAI-compatible adapter hang (DEVLOG 2026-06-09)
+    # where a session goes permanently silent mid-stream. The threshold must
+    # exceed the longest legitimate silent reasoning phase (deepseek-v4-pro
+    # was observed thinking quietly for 400s+).
+    local watcher_pid=""
+    if [ -n "${KBH_STALL_WATCH_LOG:-}" ] && [ "${KBH_STALL_SECONDS:-0}" -gt 0 ]; then
+        (
+            while true; do
+                sleep 30
+                [ -s "$cidfile" ] || continue
+                local_cid="$(cat "$cidfile" 2>/dev/null)" || continue
+                "$REAL_DOCKER" inspect "$local_cid" >/dev/null 2>&1 || break
+                now="$(date +%s)"
+                mt="$(stat -c %Y "$KBH_STALL_WATCH_LOG" 2>/dev/null || echo "$now")"
+                if [ $((now - mt)) -ge "$KBH_STALL_SECONDS" ]; then
+                    printf '%s stall_watchdog killed %s after %ss of silence (%s)\n' \
+                        "$(date -Is)" "$local_cid" "$KBH_STALL_SECONDS" "$lock_name" \
+                        >> "$RUN_DIR/stall_watchdog.log"
+                    "$REAL_DOCKER" rm -f "$local_cid" >/dev/null 2>&1 || true
+                    break
+                fi
+            done
+        ) &
+        watcher_pid=$!
+    fi
+    set +e
+    if [ "${KBH_AGENT_CONTAINER_SESSION_LOCK:-0}" = "1" ]; then
+        # Legacy fully-serial mode: the session itself holds the GPU lock.
+        run_gpu_locked_timeout "$lock_name" "$timeout_seconds" "$REAL_DOCKER" "$@"
+    else
+        # Parallel mode: sessions overlap; the container's own GPU-facing
+        # commands serialize per-command via the mounted /kbh/bin wrappers.
+        "$REAL_TIMEOUT" --kill-after="${KBH_TIMEOUT_KILL_AFTER_SECONDS:-30}s" \
+            "${timeout_seconds}s" "$REAL_DOCKER" "$@"
+    fi
+    local status=$?
+    set -e
+    if [ -n "$watcher_pid" ]; then
+        kill "$watcher_pid" 2>/dev/null || true
+        wait "$watcher_pid" 2>/dev/null || true
+    fi
+    if [ -s "$cidfile" ]; then
+        "$REAL_DOCKER" rm -f "$(cat "$cidfile")" >/dev/null 2>&1 || true
+        rm -f "$cidfile"
+    fi
+    return "$status"
+}
+
+start_nvcf_proxy() {
+    if [ -z "${NGC_API_KEY:-${NVIDIA_API_KEY:-${NVCF_API_KEY:-}}}" ]; then
+        echo "NGC_API_KEY, NVIDIA_API_KEY, or NVCF_API_KEY is required for nvcf-nemotron" >&2
+        return 1
+    fi
+
+    local proxy_log="$RUN_DIR/nvcf_proxy.log"
+    KBH_GPU_LOCK_HELD=1 uv run python "$REPO_ROOT/scripts/nvcf_openai_proxy.py" \
+        --host 127.0.0.1 --port 0 > "$proxy_log" 2>&1 &
+    NVCF_PROXY_PID=$!
+
+    local base_url=""
+    for _ in $(seq 1 100); do
+        if ! kill -0 "$NVCF_PROXY_PID" 2>/dev/null; then
+            echo "NVCF proxy exited before startup; see $proxy_log" >&2
+            return 1
+        fi
+        base_url="$(grep -oE 'http://127\.0\.0\.1:[0-9]+' "$proxy_log" | tail -1 || true)"
+        if [ -n "$base_url" ]; then
+            NVCF_PROXY_BASE_URL="$base_url"
+            return 0
+        fi
+        sleep 0.1
+    done
+    echo "Timed out waiting for NVCF proxy startup; see $proxy_log" >&2
+    return 1
+}
+
+write_nvcf_opencode_config() {
+    local base_url="$1"
+    local config_home="$RUN_DIR/opencode_config"
+    mkdir -p "$config_home/opencode"
+    cat > "$config_home/opencode/opencode.json" <<JSON
+{
+  "\$schema": "https://opencode.ai/config.json",
+  "permission": {
+    "external_directory": "deny"
+  },
+  "provider": {
+    "nvcf-nemotron": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "NVIDIA NVCF Nemotron",
+      "options": {
+        "baseURL": "${base_url}/v1",
+        "apiKey": "nvcf-proxy"
+      },
+      "models": {
+        "nemotron-3-ultra": {
+          "name": "Nemotron 3 Ultra via NVCF",
+          "limit": {
+            "context": 200000,
+            "output": 4096
+          },
+          "tools": true
+        }
+      }
+    }
+  }
+}
+JSON
+    printf '%s\n' "$config_home"
+}
+
+
+write_openrouter_deepinfra_opencode_config() {
+    if [ -z "${OPENROUTER_API_KEY:-}" ]; then
+        echo "OPENROUTER_API_KEY is required for opencode-nemotron" >&2
+        return 1
+    fi
+
+    local model="$1"
+    local config_home="$RUN_DIR/opencode_openrouter_deepinfra_config"
+    mkdir -p "$config_home/opencode"
+    cat > "$config_home/opencode/opencode.json" <<JSON
+{
+  "\$schema": "https://opencode.ai/config.json",
+  "permission": {
+    "external_directory": "deny"
+  },
+  "provider": {
+    "openrouter-deepinfra": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "OpenRouter DeepInfra",
+      "options": {
+        "baseURL": "https://openrouter.ai/api/v1",
+        "apiKey": "${OPENROUTER_API_KEY}",
+        "headers": {
+          "HTTP-Referer": "https://kernelbench.com",
+          "X-Title": "KernelBench-Hard"
+        },
+        "extraBody": {
+          "provider": {
+            "order": ["DeepInfra"],
+            "allow_fallbacks": false
+          }
+        }
+      },
+      "models": {
+        "${model}": {
+          "name": "NVIDIA Nemotron 3 Ultra via OpenRouter DeepInfra",
+          "limit": {
+            "context": 262144,
+            "output": 16384
+          },
+          "tools": true
+        }
+      }
+    }
+  }
+}
+JSON
+    printf '%s\n' "$config_home"
+}
+
+prepare_claude_container_home() {
+    # $1: copy Anthropic credentials (1, default) or not (0). Claude-compat
+    # reroutes (Z.ai / MiniMax) authenticate via ANTHROPIC_AUTH_TOKEN and must
+    # NOT carry Anthropic credentials, so a mapping failure errors out instead
+    # of silently spending against the real Anthropic API.
+    local copy_credentials="${1:-1}"
+    local home_dir="$RUN_DIR/agent_home"
+    mkdir -p "$home_dir/.claude"
+    chmod 700 "$home_dir" "$home_dir/.claude"
+    if [ "$copy_credentials" = "1" ] && [ -f "$HOME/.claude/.credentials.json" ]; then
+        cp -p "$HOME/.claude/.credentials.json" "$home_dir/.claude/.credentials.json"
+    fi
+    printf '{}\n' > "$home_dir/.claude.json"
+    printf '%s\n' "$home_dir"
+}
+
+# Claude-compat container support: routes export these variables in their
+# launch subshell, then list the NAMES here so docker passes them through
+# without putting secret values on the docker CLI argv (ps-visible).
+CLAUDE_CONTAINER_ENV_NAMES=()
+CLAUDE_CONTAINER_EXTRA_CLAUDE_ARGS=()
+
+prepare_codex_container_home() {
+    local home_dir="$RUN_DIR/agent_home"
+    mkdir -p "$home_dir/.codex"
+    if [ -f "$HOME/.codex/auth.json" ]; then
+        cp -p "$HOME/.codex/auth.json" "$home_dir/.codex/auth.json"
+    fi
+    cat > "$home_dir/.codex/config.toml" <<'EOF'
+model = "gpt-5.5"
+model_reasoning_effort = "low"
+
+[projects."/workspace/problems"]
+trust_level = "trusted"
+EOF
+    printf '%s\n' "$home_dir"
+}
+
+prepare_opencode_container_home() {
+    local home_dir="$RUN_DIR/agent_home"
+    mkdir -p "$home_dir"
+    if [ -d "$KBH_OPENCODE_HOME_TEMPLATE" ]; then
+        cp -a "$KBH_OPENCODE_HOME_TEMPLATE/." "$home_dir/"
+    fi
+    if [ -f "$HOME/.config/opencode/opencode.json" ]; then
+        mkdir -p "$home_dir/.config/opencode"
+        cp -p "$HOME/.config/opencode/opencode.json" "$home_dir/.config/opencode/opencode.json"
+    fi
+    # Route-specific config override (opencode-nemotron writes an archive-local
+    # config pinned to DeepInfra). Without this the container runs the default
+    # config, the provider is missing, and the session dies instantly.
+    if [ -n "${KBH_OPENCODE_CONFIG_FILE:-}" ] && [ -f "$KBH_OPENCODE_CONFIG_FILE" ]; then
+        mkdir -p "$home_dir/.config/opencode"
+        cp -p "$KBH_OPENCODE_CONFIG_FILE" "$home_dir/.config/opencode/opencode.json"
+    fi
+    printf '%s\n' "$home_dir"
+}
+
+prepare_droid_container_home() {
+    local home_dir="$RUN_DIR/agent_home"
+    mkdir -p "$home_dir/.factory"
+    for f in auth.json auth.v2.file auth.v2.key settings.json; do
+        if [ -f "$HOME/.factory/$f" ]; then
+            cp -p "$HOME/.factory/$f" "$home_dir/.factory/$f"
+        fi
+    done
+    printf '%s\n' "$home_dir"
+}
+
+prepare_cursor_container_home() {
+    local home_dir="$RUN_DIR/agent_home"
+    if [ -f "$HOME/.config/cursor/auth.json" ]; then
+        mkdir -p "$home_dir/.config/cursor"
+        cp -p "$HOME/.config/cursor/auth.json" "$home_dir/.config/cursor/auth.json"
+    fi
+    if [ -f "$HOME/.cursor/cli-config.json" ]; then
+        mkdir -p "$home_dir/.cursor"
+        cp -p "$HOME/.cursor/cli-config.json" "$home_dir/.cursor/cli-config.json"
+    fi
+    if [ -f "$HOME/.cursor/agent-cli-state.json" ]; then
+        mkdir -p "$home_dir/.cursor"
+        cp -p "$HOME/.cursor/agent-cli-state.json" "$home_dir/.cursor/agent-cli-state.json"
+    fi
+    printf '%s\n' "$home_dir"
+}
+
+check_container_basics() {
+    if [ -z "$REAL_DOCKER" ]; then
+        echo "docker is required for KBH_AGENT_CONTAINER=1" >&2
+        return 127
+    fi
+    if [ ! -d "$KBH_AGENT_CONTAINER_CUDA_HOME" ]; then
+        echo "CUDA toolkit missing for container mode: $KBH_AGENT_CONTAINER_CUDA_HOME" >&2
+        return 127
+    fi
+    if [ ! -x "$REAL_UV" ]; then
+        echo "uv binary missing for container mode: $REAL_UV" >&2
+        return 127
+    fi
+    mkdir -p "$KBH_AGENT_CONTAINER_UV_CACHE"
+}
+
+run_claude_container() {
+    local effort="$1"
+    local model_arg="${2:-$MODEL}"
+    local copy_credentials="${3:-1}"
+    local agent_home
+    agent_home="$(prepare_claude_container_home "$copy_credentials")"
+    local cidfile="$RUN_DIR/claude_container.cid"
+    check_container_basics || return $?
+    if [ ! -x "$KBH_AGENT_CONTAINER_CLAUDE_BIN" ]; then
+        echo "Claude binary missing for container mode: $KBH_AGENT_CONTAINER_CLAUDE_BIN" >&2
+        return 127
+    fi
+    if [ ! -d "$KBH_AGENT_CONTAINER_CUDA_HOME" ]; then
+        echo "CUDA toolkit missing for container mode: $KBH_AGENT_CONTAINER_CUDA_HOME" >&2
+        return 127
+    fi
+    local -a effort_arg=()
+    if [ -n "$effort" ]; then
+        effort_arg=(--effort "$effort")
+    fi
+    local -a extra_env_args=()
+    local env_name
+    for env_name in ${CLAUDE_CONTAINER_ENV_NAMES[@]+"${CLAUDE_CONTAINER_ENV_NAMES[@]}"}; do
+        extra_env_args+=(-e "$env_name")
+    done
+    local -a docker_args=(
+        run --rm
+        --cidfile "$cidfile"
+        --gpus all
+        --network "$KBH_AGENT_CONTAINER_NETWORK"
+        --cap-add CAP_PERFMON
+        --security-opt no-new-privileges
+        --shm-size 2g
+        --user "$(id -u):$(id -g)"
+        -e HOME=/home/agent
+        -e USER=agent
+        -e NVIDIA_DRIVER_CAPABILITIES=compute,utility
+        -e BASH_ENV=
+        -e ENV=
+        -e ANTHROPIC_API_KEY
+        -e ANTHROPIC_AUTH_TOKEN
+        -e CLAUDE_CODE_OAUTH_TOKEN
+        ${extra_env_args[@]+"${extra_env_args[@]}"}
+        -e CUDA_HOME=/usr/local/cuda-host
+        -e UV_CACHE_DIR=/uv-cache
+        -e UV_PYTHON_INSTALL_DIR=/uv-cache/python
+        -e RUN_DIR=/kbh
+        -e KBH_GPU_LOCK=/kbh/lock/gpu.lock
+        -e KBH_GPU_LOCK_LOG=/home/agent/gpu_lock_container.log
+        -e PATH=/kbh/bin:/usr/local/cuda-host/bin:/usr/local/bin:/usr/bin:/bin
+        -v "$WORKSPACE_ROOT:/workspace:rw"
+        -v "$agent_home:/home/agent:rw"
+        -v "$KBH_AGENT_CONTAINER_CUDA_HOME:/usr/local/cuda-host:ro"
+        -v "$KBH_AGENT_CONTAINER_CLAUDE_BIN:/usr/local/bin/claude:ro"
+        -v "$REAL_UV:/usr/local/bin/uv:ro"
+        -v "$KBH_AGENT_CONTAINER_UV_CACHE:/uv-cache:rw"
+        -v "$CONTAINER_LOCK_BIN:/kbh/bin:ro"
+        -v "$KBH_GPU_LOCK_DIR:/kbh/lock:rw"
+        -w "/workspace/problems/$PROBLEM_NAME"
+        "$KBH_AGENT_CONTAINER_IMAGE"
+        claude
+        --dangerously-skip-permissions
+        --print --verbose
+        --output-format stream-json
+        --no-session-persistence
+        --settings "$CLAUDE_KBH_SETTINGS"
+        --model "$model_arg"
+        "${effort_arg[@]}"
+        ${CLAUDE_CONTAINER_EXTRA_CLAUDE_ARGS[@]+"${CLAUDE_CONTAINER_EXTRA_CLAUDE_ARGS[@]}"}
+        --add-dir "/workspace/problems/$PROBLEM_NAME"
+        -p "$PROMPT"
+    )
+    run_docker_locked_timeout claude-container "$BUDGET_SECONDS" "$cidfile" "${docker_args[@]}"
+}
+
+run_codex_container() {
+    local effort="$1"
+    local agent_home
+    agent_home="$(prepare_codex_container_home)"
+    local cidfile="$RUN_DIR/codex_container.cid"
+    check_container_basics || return $?
+    if [ ! -x "$KBH_AGENT_CONTAINER_CODEX_NODE/bin/codex" ]; then
+        echo "Codex binary missing for container mode: $KBH_AGENT_CONTAINER_CODEX_NODE/bin/codex" >&2
+        return 127
+    fi
+    local -a effort_arg=()
+    if [ -n "$effort" ]; then
+        effort_arg=(-c "model_reasoning_effort=\"$effort\"")
+    fi
+    local -a docker_args=(
+        run --rm
+        --cidfile "$cidfile"
+        --gpus all
+        --network "$KBH_AGENT_CONTAINER_NETWORK"
+        --cap-add CAP_PERFMON
+        --security-opt no-new-privileges
+        --shm-size 2g
+        --user "$(id -u):$(id -g)"
+        -e HOME=/home/agent
+        -e USER=agent
+        -e NVIDIA_DRIVER_CAPABILITIES=compute,utility
+        -e BASH_ENV=
+        -e ENV=
+        -e OPENAI_API_KEY
+        -e CUDA_HOME=/usr/local/cuda-host
+        -e UV_CACHE_DIR=/uv-cache
+        -e UV_PYTHON_INSTALL_DIR=/uv-cache/python
+        -e RUN_DIR=/kbh
+        -e KBH_GPU_LOCK=/kbh/lock/gpu.lock
+        -e KBH_GPU_LOCK_LOG=/home/agent/gpu_lock_container.log
+        -e PATH=/kbh/bin:/usr/local/cuda-host/bin:/opt/node/bin:/usr/local/bin:/usr/bin:/bin
+        -v "$WORKSPACE_ROOT:/workspace:rw"
+        -v "$agent_home:/home/agent:rw"
+        -v "$KBH_AGENT_CONTAINER_CUDA_HOME:/usr/local/cuda-host:ro"
+        -v "$KBH_AGENT_CONTAINER_CODEX_NODE:/opt/node:ro"
+        -v "$REAL_UV:/usr/local/bin/uv:ro"
+        -v "$KBH_AGENT_CONTAINER_UV_CACHE:/uv-cache:rw"
+        -v "$CONTAINER_LOCK_BIN:/kbh/bin:ro"
+        -v "$KBH_GPU_LOCK_DIR:/kbh/lock:rw"
+        -w "/workspace/problems/$PROBLEM_NAME"
+        "$KBH_AGENT_CONTAINER_IMAGE"
+        /opt/node/bin/codex
+        exec
+        -m "$MODEL"
+        "${effort_arg[@]}"
+        --dangerously-bypass-approvals-and-sandbox
+        --skip-git-repo-check
+        -C "/workspace/problems/$PROBLEM_NAME"
+        "$PROMPT"
+    )
+    run_docker_locked_timeout codex-container "$BUDGET_SECONDS" "$cidfile" "${docker_args[@]}"
+}
+
+run_opencode_container() {
+    local opencode_model="${1:-$MODEL}"
+    local agent_home
+    agent_home="$(prepare_opencode_container_home)"
+    local cidfile="$RUN_DIR/opencode_container.cid"
+    check_container_basics || return $?
+    if [ ! -x "$KBH_AGENT_CONTAINER_OPENCODE_BIN" ]; then
+        echo "OpenCode binary missing for container mode: $KBH_AGENT_CONTAINER_OPENCODE_BIN" >&2
+        return 127
+    fi
+    local -a docker_args=(
+        run --rm
+        --cidfile "$cidfile"
+        --gpus all
+        --network "$KBH_AGENT_CONTAINER_NETWORK"
+        --cap-add CAP_PERFMON
+        --security-opt no-new-privileges
+        --shm-size 2g
+        --user "$(id -u):$(id -g)"
+        -e HOME=/home/agent
+        -e USER=agent
+        -e NVIDIA_DRIVER_CAPABILITIES=compute,utility
+        -e BASH_ENV=
+        -e ENV=
+        -e OPENAI_API_KEY
+        -e OPENROUTER_API_KEY
+        -e ZAI_API_KEY
+        -e DEEPSEEK_API_KEY
+        -e MINIMAX_API_KEY
+        -e GEMINI_API_KEY
+        -e CUDA_HOME=/usr/local/cuda-host
+        -e UV_CACHE_DIR=/uv-cache
+        -e UV_PYTHON_INSTALL_DIR=/uv-cache/python
+        -e RUN_DIR=/kbh
+        -e KBH_GPU_LOCK=/kbh/lock/gpu.lock
+        -e KBH_GPU_LOCK_LOG=/home/agent/gpu_lock_container.log
+        -e PATH=/kbh/bin:/usr/local/cuda-host/bin:/usr/local/bin:/usr/bin:/bin
+        -v "$WORKSPACE_ROOT:/workspace:rw"
+        -v "$agent_home:/home/agent:rw"
+        -v "$KBH_AGENT_CONTAINER_CUDA_HOME:/usr/local/cuda-host:ro"
+        -v "$KBH_AGENT_CONTAINER_OPENCODE_BIN:/usr/local/bin/opencode:ro"
+        -v "$REAL_UV:/usr/local/bin/uv:ro"
+        -v "$KBH_AGENT_CONTAINER_UV_CACHE:/uv-cache:rw"
+        -v "$CONTAINER_LOCK_BIN:/kbh/bin:ro"
+        -v "$KBH_GPU_LOCK_DIR:/kbh/lock:rw"
+        -w "/workspace/problems/$PROBLEM_NAME"
+        "$KBH_AGENT_CONTAINER_IMAGE"
+        opencode
+        run
+        --pure --format json -m "$opencode_model" "$PROMPT"
+    )
+    # The opencode OpenAI-compatible adapter intermittently hangs forever on
+    # reasoning streams (DEVLOG 2026-06-09). Supervise the session with the
+    # stall watchdog and retry a killed session with the remaining budget.
+    local stall_seconds="${KBH_OPENCODE_STALL_SECONDS:-900}"
+    local max_attempts=$(( ${KBH_OPENCODE_STALL_RETRIES:-2} + 1 ))
+    local attempt=1
+    local start_ts elapsed remaining status wd_before wd_after
+    start_ts="$(date +%s)"
+    while :; do
+        elapsed=$(( $(date +%s) - start_ts ))
+        remaining=$(( BUDGET_SECONDS - elapsed ))
+        if [ "$remaining" -le 60 ]; then
+            return 124
+        fi
+        wd_before=0
+        [ -f "$RUN_DIR/stall_watchdog.log" ] && wd_before="$(wc -l < "$RUN_DIR/stall_watchdog.log")"
+        status=0
+        KBH_STALL_WATCH_LOG="$LOG_FILE" KBH_STALL_SECONDS="$stall_seconds" \
+            run_docker_locked_timeout opencode-container "$remaining" "$cidfile" "${docker_args[@]}" \
+            || status=$?
+        wd_after=0
+        [ -f "$RUN_DIR/stall_watchdog.log" ] && wd_after="$(wc -l < "$RUN_DIR/stall_watchdog.log")"
+        if [ "$wd_after" -gt "$wd_before" ] && [ "$attempt" -lt "$max_attempts" ]; then
+            attempt=$(( attempt + 1 ))
+            continue
+        fi
+        return "$status"
+    done
+}
+
+run_droid_container() {
+    local effort="$1"
+    local agent_home
+    agent_home="$(prepare_droid_container_home)"
+    local cidfile="$RUN_DIR/droid_container.cid"
+    check_container_basics || return $?
+    if [ ! -x "$KBH_AGENT_CONTAINER_DROID_BIN" ]; then
+        echo "Droid binary missing for container mode: $KBH_AGENT_CONTAINER_DROID_BIN" >&2
+        return 127
+    fi
+    local -a effort_arg=()
+    if [ -n "$effort" ]; then
+        effort_arg=(--reasoning-effort "$effort")
+    fi
+    local -a docker_args=(
+        run --rm
+        --cidfile "$cidfile"
+        --gpus all
+        --network "$KBH_AGENT_CONTAINER_NETWORK"
+        --cap-add CAP_PERFMON
+        --security-opt no-new-privileges
+        --shm-size 2g
+        --user "$(id -u):$(id -g)"
+        -e HOME=/home/agent
+        -e USER=agent
+        -e NVIDIA_DRIVER_CAPABILITIES=compute,utility
+        -e BASH_ENV=
+        -e ENV=
+        -e FACTORY_API_KEY
+        -e DROID_API_KEY
+        -e CUDA_HOME=/usr/local/cuda-host
+        -e PATH=/kbh/bin:/usr/local/cuda-host/bin:/usr/local/bin:/usr/bin:/bin
+        -v "$WORKSPACE_ROOT:/workspace:rw"
+        -v "$agent_home:/home/agent:rw"
+        -v "$KBH_AGENT_CONTAINER_CUDA_HOME:/usr/local/cuda-host:ro"
+        -v "$KBH_AGENT_CONTAINER_DROID_BIN:/usr/local/bin/droid:ro"
+        -w "/workspace/problems/$PROBLEM_NAME"
+        "$KBH_AGENT_CONTAINER_IMAGE"
+        droid
+        exec
+        --output-format stream-json
+        --skip-permissions-unsafe
+        --cwd "/workspace/problems/$PROBLEM_NAME"
+        -m "$MODEL"
+        "${effort_arg[@]}"
+        "$PROMPT"
+    )
+    run_docker_locked_timeout droid-container "$BUDGET_SECONDS" "$cidfile" "${docker_args[@]}"
+}
+
+prepare_grok_container_home() {
+    local home_dir="$RUN_DIR/agent_home"
+    mkdir -p "$home_dir/.grok"
+    for f in auth.json agent_id installation_id config.toml settings.json; do
+        if [ -f "$HOME/.grok/$f" ]; then
+            cp -p "$HOME/.grok/$f" "$home_dir/.grok/$f"
+        fi
+    done
+    printf '%s\n' "$home_dir"
+}
+
+run_grok_container() {
+    local effort="$1"
+    local agent_home
+    agent_home="$(prepare_grok_container_home)"
+    local cidfile="$RUN_DIR/grok_container.cid"
+    check_container_basics || return $?
+    # ~/.grok/bin/grok is a version symlink into ../downloads/; mount the
+    # resolved file or the symlink dangles inside the container.
+    local grok_bin
+    grok_bin="$(readlink -f "$KBH_AGENT_CONTAINER_GROK_DIR/bin/grok" 2>/dev/null || true)"
+    if [ -z "$grok_bin" ] || [ ! -e "$grok_bin" ]; then
+        echo "Grok CLI missing for container mode: $KBH_AGENT_CONTAINER_GROK_DIR/bin/grok" >&2
+        return 127
+    fi
+    local -a effort_arg=()
+    if [ -n "$effort" ]; then
+        effort_arg=(--effort "$effort")
+    fi
+    local -a docker_args=(
+        run --rm
+        --cidfile "$cidfile"
+        --gpus all
+        --network "$KBH_AGENT_CONTAINER_NETWORK"
+        --cap-add CAP_PERFMON
+        --security-opt no-new-privileges
+        --shm-size 2g
+        --user "$(id -u):$(id -g)"
+        -e HOME=/home/agent
+        -e USER=agent
+        -e NVIDIA_DRIVER_CAPABILITIES=compute,utility
+        -e BASH_ENV=
+        -e ENV=
+        -e XAI_API_KEY
+        -e GROK_API_KEY
+        -e CUDA_HOME=/usr/local/cuda-host
+        -e UV_CACHE_DIR=/uv-cache
+        -e UV_PYTHON_INSTALL_DIR=/uv-cache/python
+        -e RUN_DIR=/kbh
+        -e KBH_GPU_LOCK=/kbh/lock/gpu.lock
+        -e KBH_GPU_LOCK_LOG=/home/agent/gpu_lock_container.log
+        -e PATH=/kbh/bin:/usr/local/cuda-host/bin:/opt/node/bin:/usr/local/bin:/usr/bin:/bin
+        -v "$WORKSPACE_ROOT:/workspace:rw"
+        -v "$agent_home:/home/agent:rw"
+        -v "$KBH_AGENT_CONTAINER_CUDA_HOME:/usr/local/cuda-host:ro"
+        -v "$KBH_AGENT_CONTAINER_CODEX_NODE:/opt/node:ro"
+        -v "$grok_bin:/opt/grok/bin/grok:ro"
+        -v "$KBH_AGENT_CONTAINER_GROK_DIR/bundled:/opt/grok/bundled:ro"
+        -v "$REAL_UV:/usr/local/bin/uv:ro"
+        -v "$KBH_AGENT_CONTAINER_UV_CACHE:/uv-cache:rw"
+        -v "$CONTAINER_LOCK_BIN:/kbh/bin:ro"
+        -v "$KBH_GPU_LOCK_DIR:/kbh/lock:rw"
+        -w "/workspace/problems/$PROBLEM_NAME"
+        "$KBH_AGENT_CONTAINER_IMAGE"
+        /opt/grok/bin/grok
+        --cwd "/workspace/problems/$PROBLEM_NAME"
+        --always-approve
+        --permission-mode bypassPermissions
+        --no-memory
+        --output-format streaming-json
+        --model "$MODEL"
+        "${effort_arg[@]}"
+        -p "$PROMPT"
+    )
+    run_docker_locked_timeout grok-container "$BUDGET_SECONDS" "$cidfile" "${docker_args[@]}"
+}
+
+run_gemini_container() {
+    local agent_home="$RUN_DIR/agent_home"
+    mkdir -p "$agent_home"
+    local cidfile="$RUN_DIR/gemini_container.cid"
+    check_container_basics || return $?
+    if [ ! -e "$KBH_AGENT_CONTAINER_GEMINI_DIR/bundle/gemini.js" ]; then
+        echo "Gemini CLI missing for container mode: $KBH_AGENT_CONTAINER_GEMINI_DIR/bundle/gemini.js" >&2
+        return 127
+    fi
+    local -a docker_args=(
+        run --rm
+        --cidfile "$cidfile"
+        --gpus all
+        --network "$KBH_AGENT_CONTAINER_NETWORK"
+        --cap-add CAP_PERFMON
+        --security-opt no-new-privileges
+        --shm-size 2g
+        --user "$(id -u):$(id -g)"
+        -e HOME=/home/agent
+        -e USER=agent
+        -e NVIDIA_DRIVER_CAPABILITIES=compute,utility
+        -e BASH_ENV=
+        -e ENV=
+        -e GEMINI_API_KEY
+        -e CUDA_HOME=/usr/local/cuda-host
+        -e UV_CACHE_DIR=/uv-cache
+        -e UV_PYTHON_INSTALL_DIR=/uv-cache/python
+        -e RUN_DIR=/kbh
+        -e KBH_GPU_LOCK=/kbh/lock/gpu.lock
+        -e KBH_GPU_LOCK_LOG=/home/agent/gpu_lock_container.log
+        -e PATH=/kbh/bin:/usr/local/cuda-host/bin:/opt/node/bin:/usr/local/bin:/usr/bin:/bin
+        -v "$WORKSPACE_ROOT:/workspace:rw"
+        -v "$agent_home:/home/agent:rw"
+        -v "$KBH_AGENT_CONTAINER_CUDA_HOME:/usr/local/cuda-host:ro"
+        -v "$KBH_AGENT_CONTAINER_CODEX_NODE:/opt/node:ro"
+        -v "$KBH_AGENT_CONTAINER_GEMINI_DIR:/opt/gemini-cli:ro"
+        -v "$REAL_UV:/usr/local/bin/uv:ro"
+        -v "$KBH_AGENT_CONTAINER_UV_CACHE:/uv-cache:rw"
+        -v "$CONTAINER_LOCK_BIN:/kbh/bin:ro"
+        -v "$KBH_GPU_LOCK_DIR:/kbh/lock:rw"
+        -w "/workspace/problems/$PROBLEM_NAME"
+        "$KBH_AGENT_CONTAINER_IMAGE"
+        /opt/node/bin/node /opt/gemini-cli/bundle/gemini.js
+        --skip-trust
+        -m "$MODEL"
+        --approval-mode yolo
+        -o stream-json
+        -p "$PROMPT"
+    )
+    run_docker_locked_timeout gemini-container "$BUDGET_SECONDS" "$cidfile" "${docker_args[@]}"
+}
+
+run_cursor_container() {
+    local agent_home
+    agent_home="$(prepare_cursor_container_home)"
+    local cidfile="$RUN_DIR/cursor_container.cid"
+    check_container_basics || return $?
+    if [ ! -x "$KBH_AGENT_CONTAINER_CURSOR_DIR/cursor-agent" ]; then
+        echo "Cursor Agent binary missing for container mode: $KBH_AGENT_CONTAINER_CURSOR_DIR/cursor-agent" >&2
+        return 127
+    fi
+    local -a docker_args=(
+        run --rm
+        --cidfile "$cidfile"
+        --gpus all
+        --network "$KBH_AGENT_CONTAINER_NETWORK"
+        --cap-add CAP_PERFMON
+        --security-opt no-new-privileges
+        --shm-size 2g
+        --user "$(id -u):$(id -g)"
+        -e HOME=/home/agent
+        -e USER=agent
+        -e NVIDIA_DRIVER_CAPABILITIES=compute,utility
+        -e BASH_ENV=
+        -e ENV=
+        -e CURSOR_API_KEY
+        -e CUDA_HOME=/usr/local/cuda-host
+        -e UV_CACHE_DIR=/uv-cache
+        -e UV_PYTHON_INSTALL_DIR=/uv-cache/python
+        -e RUN_DIR=/kbh
+        -e KBH_GPU_LOCK=/kbh/lock/gpu.lock
+        -e KBH_GPU_LOCK_LOG=/home/agent/gpu_lock_container.log
+        -e PATH=/kbh/bin:/usr/local/cuda-host/bin:/usr/local/bin:/usr/bin:/bin
+        -v "$WORKSPACE_ROOT:/workspace:rw"
+        -v "$agent_home:/home/agent:rw"
+        -v "$KBH_AGENT_CONTAINER_CUDA_HOME:/usr/local/cuda-host:ro"
+        -v "$KBH_AGENT_CONTAINER_CURSOR_DIR:/opt/cursor-agent:ro"
+        -v "$REAL_UV:/usr/local/bin/uv:ro"
+        -v "$KBH_AGENT_CONTAINER_UV_CACHE:/uv-cache:rw"
+        -v "$CONTAINER_LOCK_BIN:/kbh/bin:ro"
+        -v "$KBH_GPU_LOCK_DIR:/kbh/lock:rw"
+        -w "/workspace/problems/$PROBLEM_NAME"
+        "$KBH_AGENT_CONTAINER_IMAGE"
+        /opt/cursor-agent/cursor-agent
+        --trust
+        --yolo
+        --print
+        --output-format stream-json
+        --model "$MODEL"
+        --workspace "/workspace/problems/$PROBLEM_NAME"
+        "$PROMPT"
+    )
+    run_docker_locked_timeout cursor-container "$BUDGET_SECONDS" "$cidfile" "${docker_args[@]}"
 }
 
 # Snapshot immutable problem files. Agents may make a mess in the problem
@@ -488,16 +1293,21 @@ case "$HARNESS" in
         if [ -n "$REASONING_EFFORT" ]; then
             EFFORT_ARG=(--effort "$REASONING_EFFORT")
         fi
-        ( cd "$PROBLEM_DIR" && timeout "$BUDGET_SECONDS" claude \
-            --dangerously-skip-permissions \
-            --print --verbose \
-            --output-format stream-json \
-            --settings "$CLAUDE_KBH_SETTINGS" \
-            --model "$MODEL" \
-            "${EFFORT_ARG[@]}" \
-            --add-dir "$PROBLEM_DIR" \
-            -p "$PROMPT" ) \
-            > "$LOG_FILE" 2> "$STDERR_FILE" || HARNESS_EXIT=$?
+        if [ "$KBH_AGENT_CONTAINER" = "1" ]; then
+            run_claude_container "$REASONING_EFFORT" \
+                > "$LOG_FILE" 2> "$STDERR_FILE" || HARNESS_EXIT=$?
+        else
+            ( cd "$PROBLEM_DIR" && timeout "$BUDGET_SECONDS" claude \
+                --dangerously-skip-permissions \
+                --print --verbose \
+                --output-format stream-json \
+                --settings "$CLAUDE_KBH_SETTINGS" \
+                --model "$MODEL" \
+                "${EFFORT_ARG[@]}" \
+                --add-dir "$PROBLEM_DIR" \
+                -p "$PROMPT" ) \
+                > "$LOG_FILE" 2> "$STDERR_FILE" || HARNESS_EXIT=$?
+        fi
         ;;
 
     ccr-claude)
@@ -528,6 +1338,29 @@ case "$HARNESS" in
         fi
         ZAI_CLAUDE_ALIAS="${ZAI_CLAUDE_ALIAS:-opus}"
         ZAI_CLAUDE_HAIKU_MODEL="${ZAI_CLAUDE_HAIKU_MODEL:-$MODEL}"
+        if [ "$KBH_AGENT_CONTAINER" = "1" ]; then
+            CLAUDE_CONTAINER_ENV_NAMES=(
+                ANTHROPIC_BASE_URL API_TIMEOUT_MS
+                CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS
+                CLAUDE_CODE_MAX_RETRIES CLAUDE_CODE_MAX_OUTPUT_TOKENS
+                ANTHROPIC_DEFAULT_HAIKU_MODEL ANTHROPIC_DEFAULT_SONNET_MODEL
+                ANTHROPIC_DEFAULT_OPUS_MODEL
+            )
+            CLAUDE_CONTAINER_EXTRA_CLAUDE_ARGS=(--disallowedTools ExitPlanMode EnterPlanMode AskUserQuestion)
+            ( export ANTHROPIC_AUTH_TOKEN="$ZAI_API_KEY" && \
+                export ANTHROPIC_BASE_URL="https://api.z.ai/api/anthropic" && \
+                export API_TIMEOUT_MS="${API_TIMEOUT_MS:-3000000}" && \
+                export CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS="${CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS:-1}" && \
+                export CLAUDE_CODE_MAX_RETRIES="${CLAUDE_CODE_MAX_RETRIES:-1000000}" && \
+                export CLAUDE_CODE_MAX_OUTPUT_TOKENS="${CLAUDE_CODE_MAX_OUTPUT_TOKENS:-128000}" && \
+                export ANTHROPIC_DEFAULT_HAIKU_MODEL="$ZAI_CLAUDE_HAIKU_MODEL" && \
+                export ANTHROPIC_DEFAULT_SONNET_MODEL="$MODEL" && \
+                export ANTHROPIC_DEFAULT_OPUS_MODEL="$MODEL" && \
+                run_claude_container "" "$ZAI_CLAUDE_ALIAS" 0 ) \
+                > "$LOG_FILE" 2> "$STDERR_FILE" || HARNESS_EXIT=$?
+            CLAUDE_CONTAINER_ENV_NAMES=()
+            CLAUDE_CONTAINER_EXTRA_CLAUDE_ARGS=()
+        else
         ( cd "$PROBLEM_DIR" && \
             export ANTHROPIC_AUTH_TOKEN="$ZAI_API_KEY" && \
             export ANTHROPIC_BASE_URL="https://api.z.ai/api/anthropic" && \
@@ -548,6 +1381,7 @@ case "$HARNESS" in
                 --add-dir "$PROBLEM_DIR" \
                 -p "$PROMPT" ) \
             > "$LOG_FILE" 2> "$STDERR_FILE" || HARNESS_EXIT=$?
+        fi
         ;;
 
     minimax-claude)
@@ -560,6 +1394,31 @@ case "$HARNESS" in
         fi
         MINIMAX_CLAUDE_ALIAS="${MINIMAX_CLAUDE_ALIAS:-opus}"
         MINIMAX_CLAUDE_HAIKU_MODEL="${MINIMAX_CLAUDE_HAIKU_MODEL:-$MODEL}"
+        if [ "$KBH_AGENT_CONTAINER" = "1" ]; then
+            CLAUDE_CONTAINER_ENV_NAMES=(
+                ANTHROPIC_BASE_URL API_TIMEOUT_MS
+                CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC
+                CLAUDE_CODE_MAX_RETRIES CLAUDE_CODE_MAX_OUTPUT_TOKENS
+                ANTHROPIC_MODEL
+                ANTHROPIC_DEFAULT_HAIKU_MODEL ANTHROPIC_DEFAULT_SONNET_MODEL
+                ANTHROPIC_DEFAULT_OPUS_MODEL
+            )
+            CLAUDE_CONTAINER_EXTRA_CLAUDE_ARGS=(--disallowedTools ExitPlanMode EnterPlanMode AskUserQuestion)
+            ( export ANTHROPIC_AUTH_TOKEN="$MINIMAX_API_KEY" && \
+                export ANTHROPIC_BASE_URL="${MINIMAX_ANTHROPIC_BASE_URL:-https://api.minimax.io/anthropic}" && \
+                export API_TIMEOUT_MS="${API_TIMEOUT_MS:-3000000}" && \
+                export CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC="${CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC:-1}" && \
+                export CLAUDE_CODE_MAX_RETRIES="${CLAUDE_CODE_MAX_RETRIES:-1000000}" && \
+                export CLAUDE_CODE_MAX_OUTPUT_TOKENS="${CLAUDE_CODE_MAX_OUTPUT_TOKENS:-128000}" && \
+                export ANTHROPIC_MODEL="$MODEL" && \
+                export ANTHROPIC_DEFAULT_HAIKU_MODEL="$MINIMAX_CLAUDE_HAIKU_MODEL" && \
+                export ANTHROPIC_DEFAULT_SONNET_MODEL="$MODEL" && \
+                export ANTHROPIC_DEFAULT_OPUS_MODEL="$MODEL" && \
+                run_claude_container "" "$MINIMAX_CLAUDE_ALIAS" 0 ) \
+                > "$LOG_FILE" 2> "$STDERR_FILE" || HARNESS_EXIT=$?
+            CLAUDE_CONTAINER_ENV_NAMES=()
+            CLAUDE_CONTAINER_EXTRA_CLAUDE_ARGS=()
+        else
         ( cd "$PROBLEM_DIR" && \
             export ANTHROPIC_AUTH_TOKEN="$MINIMAX_API_KEY" && \
             export ANTHROPIC_BASE_URL="${MINIMAX_ANTHROPIC_BASE_URL:-https://api.minimax.io/anthropic}" && \
@@ -581,6 +1440,67 @@ case "$HARNESS" in
                 --add-dir "$PROBLEM_DIR" \
                 -p "$PROMPT" ) \
             > "$LOG_FILE" 2> "$STDERR_FILE" || HARNESS_EXIT=$?
+        fi
+        ;;
+
+    kimi-claude)
+        # Claude Code routed to Moonshot's Anthropic-compatible endpoint for
+        # Kimi K2.7 Code. Requires KIMI_API_KEY in the environment or
+        # ~/.env_vars. K2.7-Code forces thinking mode; CLAUDE_KBH_SETTINGS
+        # already sets alwaysThinkingEnabled, which the endpoint requires.
+        if [ -z "${KIMI_API_KEY:-}" ]; then
+            echo "KIMI_API_KEY is required for kimi-claude" >&2
+            exit 1
+        fi
+        KIMI_CLAUDE_ALIAS="${KIMI_CLAUDE_ALIAS:-opus}"
+        KIMI_CLAUDE_HAIKU_MODEL="${KIMI_CLAUDE_HAIKU_MODEL:-$MODEL}"
+        if [ "$KBH_AGENT_CONTAINER" = "1" ]; then
+            CLAUDE_CONTAINER_ENV_NAMES=(
+                ANTHROPIC_BASE_URL API_TIMEOUT_MS
+                CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC
+                CLAUDE_CODE_MAX_RETRIES CLAUDE_CODE_MAX_OUTPUT_TOKENS
+                ANTHROPIC_MODEL
+                ANTHROPIC_DEFAULT_HAIKU_MODEL ANTHROPIC_DEFAULT_SONNET_MODEL
+                ANTHROPIC_DEFAULT_OPUS_MODEL
+            )
+            CLAUDE_CONTAINER_EXTRA_CLAUDE_ARGS=(--disallowedTools ExitPlanMode EnterPlanMode AskUserQuestion)
+            ( export ANTHROPIC_AUTH_TOKEN="$KIMI_API_KEY" && \
+                export ANTHROPIC_BASE_URL="${KIMI_ANTHROPIC_BASE_URL:-https://api.moonshot.ai/anthropic}" && \
+                export API_TIMEOUT_MS="${API_TIMEOUT_MS:-3000000}" && \
+                export CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC="${CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC:-1}" && \
+                export CLAUDE_CODE_MAX_RETRIES="${CLAUDE_CODE_MAX_RETRIES:-1000000}" && \
+                export CLAUDE_CODE_MAX_OUTPUT_TOKENS="${CLAUDE_CODE_MAX_OUTPUT_TOKENS:-128000}" && \
+                export ANTHROPIC_MODEL="$MODEL" && \
+                export ANTHROPIC_DEFAULT_HAIKU_MODEL="$KIMI_CLAUDE_HAIKU_MODEL" && \
+                export ANTHROPIC_DEFAULT_SONNET_MODEL="$MODEL" && \
+                export ANTHROPIC_DEFAULT_OPUS_MODEL="$MODEL" && \
+                run_claude_container "" "$KIMI_CLAUDE_ALIAS" 0 ) \
+                > "$LOG_FILE" 2> "$STDERR_FILE" || HARNESS_EXIT=$?
+            CLAUDE_CONTAINER_ENV_NAMES=()
+            CLAUDE_CONTAINER_EXTRA_CLAUDE_ARGS=()
+        else
+        ( cd "$PROBLEM_DIR" && \
+            export ANTHROPIC_AUTH_TOKEN="$KIMI_API_KEY" && \
+            export ANTHROPIC_BASE_URL="${KIMI_ANTHROPIC_BASE_URL:-https://api.moonshot.ai/anthropic}" && \
+            export API_TIMEOUT_MS="${API_TIMEOUT_MS:-3000000}" && \
+            export CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC="${CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC:-1}" && \
+            export CLAUDE_CODE_MAX_RETRIES="${CLAUDE_CODE_MAX_RETRIES:-1000000}" && \
+            export CLAUDE_CODE_MAX_OUTPUT_TOKENS="${CLAUDE_CODE_MAX_OUTPUT_TOKENS:-128000}" && \
+            export ANTHROPIC_MODEL="$MODEL" && \
+            export ANTHROPIC_DEFAULT_HAIKU_MODEL="$KIMI_CLAUDE_HAIKU_MODEL" && \
+            export ANTHROPIC_DEFAULT_SONNET_MODEL="$MODEL" && \
+            export ANTHROPIC_DEFAULT_OPUS_MODEL="$MODEL" && \
+            timeout "$BUDGET_SECONDS" claude \
+                --dangerously-skip-permissions \
+                --print --verbose \
+                --output-format stream-json \
+                --settings "$CLAUDE_KBH_SETTINGS" \
+                --model "$KIMI_CLAUDE_ALIAS" \
+                --disallowedTools ExitPlanMode EnterPlanMode AskUserQuestion \
+                --add-dir "$PROBLEM_DIR" \
+                -p "$PROMPT" ) \
+            > "$LOG_FILE" 2> "$STDERR_FILE" || HARNESS_EXIT=$?
+        fi
         ;;
 
     codex)
@@ -588,22 +1508,32 @@ case "$HARNESS" in
         if [ -n "$REASONING_EFFORT" ]; then
             EFFORT_ARG=(-c "model_reasoning_effort=\"$REASONING_EFFORT\"")
         fi
-        timeout "$BUDGET_SECONDS" codex exec \
-            -m "$MODEL" \
-            "${EFFORT_ARG[@]}" \
-            --dangerously-bypass-approvals-and-sandbox \
-            --skip-git-repo-check \
-            -C "$PROBLEM_DIR" \
-            "$PROMPT" \
-            > "$LOG_FILE" 2> "$STDERR_FILE" || HARNESS_EXIT=$?
+        if [ "$KBH_AGENT_CONTAINER" = "1" ]; then
+            run_codex_container "$REASONING_EFFORT" \
+                > "$LOG_FILE" 2> "$STDERR_FILE" || HARNESS_EXIT=$?
+        else
+            timeout "$BUDGET_SECONDS" codex exec \
+                -m "$MODEL" \
+                "${EFFORT_ARG[@]}" \
+                --dangerously-bypass-approvals-and-sandbox \
+                --skip-git-repo-check \
+                -C "$PROBLEM_DIR" \
+                "$PROMPT" \
+                > "$LOG_FILE" 2> "$STDERR_FILE" || HARNESS_EXIT=$?
+        fi
 
         # Codex writes its rich session JSONL to ~/.codex/sessions/YYYY/MM/DD/
         # (local date). Locate by session_id printed to stderr — DO NOT pick the
         # most-recently-modified file, since codex 0.125.0 touches old session
         # files when scanning its thread state DB and that's misleading.
-        CODEX_SID=$(grep -oP 'session id: \K[0-9a-f-]+' "$STDERR_FILE" | head -1)
+        CODEX_SID=$(grep -h -oP 'session id: \K[0-9a-f-]+' "$STDERR_FILE" "$LOG_FILE" 2>/dev/null | head -1)
         if [ -n "$CODEX_SID" ]; then
-            CODEX_SESS=$(find "$HOME/.codex/sessions" -name "*${CODEX_SID}*.jsonl" 2>/dev/null | head -1)
+            if [ "$KBH_AGENT_CONTAINER" = "1" ]; then
+                CODEX_SEARCH_ROOT="$RUN_DIR/agent_home/.codex/sessions"
+            else
+                CODEX_SEARCH_ROOT="$HOME/.codex/sessions"
+            fi
+            CODEX_SESS=$(find "$CODEX_SEARCH_ROOT" -name "*${CODEX_SID}*.jsonl" 2>/dev/null | head -1)
             if [ -n "$CODEX_SESS" ]; then
                 cp "$CODEX_SESS" "$RUN_DIR/codex_session.jsonl"
                 echo "archived codex session: $CODEX_SESS -> $RUN_DIR/codex_session.jsonl"
@@ -628,18 +1558,27 @@ case "$HARNESS" in
         if [ -n "$REASONING_EFFORT" ]; then
             EFFORT_ARG=(--reasoning-effort "$REASONING_EFFORT")
         fi
-        timeout "$BUDGET_SECONDS" droid exec \
-            --output-format stream-json \
-            --skip-permissions-unsafe \
-            --cwd "$PROBLEM_DIR" \
-            -m "$MODEL" \
-            "${EFFORT_ARG[@]}" \
-            "$PROMPT" \
-            > "$LOG_FILE" 2> "$STDERR_FILE" || HARNESS_EXIT=$?
+        if [ "$KBH_AGENT_CONTAINER" = "1" ]; then
+            run_droid_container "$REASONING_EFFORT" \
+                > "$LOG_FILE" 2> "$STDERR_FILE" || HARNESS_EXIT=$?
+        else
+            timeout "$BUDGET_SECONDS" droid exec \
+                --output-format stream-json \
+                --skip-permissions-unsafe \
+                --cwd "$PROBLEM_DIR" \
+                -m "$MODEL" \
+                "${EFFORT_ARG[@]}" \
+                "$PROMPT" \
+                > "$LOG_FILE" 2> "$STDERR_FILE" || HARNESS_EXIT=$?
+        fi
         ;;
 
     gemini)
         # Gemini CLI. No --cwd flag, so cd into PROBLEM_DIR.
+        if [ "$KBH_AGENT_CONTAINER" = "1" ]; then
+            run_gemini_container \
+                > "$LOG_FILE" 2> "$STDERR_FILE" || HARNESS_EXIT=$?
+        else
         ( cd "$PROBLEM_DIR" && timeout "$BUDGET_SECONDS" gemini \
             --skip-trust \
             -m "$MODEL" \
@@ -647,19 +1586,25 @@ case "$HARNESS" in
             -o stream-json \
             -p "$PROMPT" \
             </dev/null > "$LOG_FILE" 2> "$STDERR_FILE" ) || HARNESS_EXIT=$?
+        fi
         ;;
 
     cursor)
         # Cursor Agent CLI is installed as `agent` on Anvil.
-        timeout "$BUDGET_SECONDS" "${AGENT_CUDA_ENV[@]}" agent \
-            --trust \
-            --yolo \
-            --print \
-            --output-format stream-json \
-            --model "$MODEL" \
-            --workspace "$PROBLEM_DIR" \
-            "$PROMPT" \
-            > "$LOG_FILE" 2> "$STDERR_FILE" || HARNESS_EXIT=$?
+        if [ "$KBH_AGENT_CONTAINER" = "1" ]; then
+            run_cursor_container \
+                > "$LOG_FILE" 2> "$STDERR_FILE" || HARNESS_EXIT=$?
+        else
+            timeout "$BUDGET_SECONDS" "${AGENT_CUDA_ENV[@]}" agent \
+                --trust \
+                --yolo \
+                --print \
+                --output-format stream-json \
+                --model "$MODEL" \
+                --workspace "$PROBLEM_DIR" \
+                "$PROMPT" \
+                > "$LOG_FILE" 2> "$STDERR_FILE" || HARNESS_EXIT=$?
+        fi
         ;;
 
     grok)
@@ -669,6 +1614,10 @@ case "$HARNESS" in
         if [ -n "$REASONING_EFFORT" ]; then
             EFFORT_ARG=(--effort "$REASONING_EFFORT")
         fi
+        if [ "$KBH_AGENT_CONTAINER" = "1" ]; then
+            run_grok_container "$REASONING_EFFORT" \
+                > "$LOG_FILE" 2> "$STDERR_FILE" || HARNESS_EXIT=$?
+        else
         timeout "$BUDGET_SECONDS" "${AGENT_CUDA_ENV[@]}" grok \
             --cwd "$PROBLEM_DIR" \
             --always-approve \
@@ -679,20 +1628,51 @@ case "$HARNESS" in
             "${EFFORT_ARG[@]}" \
             -p "$PROMPT" \
             > "$LOG_FILE" 2> "$STDERR_FILE" || HARNESS_EXIT=$?
+        fi
         ;;
 
     opencode)
         # OpenCode SST with custom OpenAI-shape providers (deepseek, zai, minimax).
         # Provider/model pair encoded as MODEL="provider/model-id" e.g.
         # "deepseek/deepseek-v4-pro" or "zai/glm-5.1".
-        ( cd "$PROBLEM_DIR" && timeout "$BUDGET_SECONDS" "${AGENT_CUDA_ENV[@]}" opencode run \
-            --pure --format json -m "$MODEL" "$PROMPT" \
+        if [ "$KBH_AGENT_CONTAINER" = "1" ]; then
+            run_opencode_container \
+                > "$LOG_FILE" 2> "$STDERR_FILE" || HARNESS_EXIT=$?
+        else
+            ( cd "$PROBLEM_DIR" && timeout "$BUDGET_SECONDS" "${AGENT_CUDA_ENV[@]}" opencode run \
+                --pure --format json -m "$MODEL" "$PROMPT" \
+                </dev/null > "$LOG_FILE" 2> "$STDERR_FILE" ) || HARNESS_EXIT=$?
+        fi
+        ;;
+
+    opencode-nemotron)
+        # Preferred Nemotron route: OpenCode speaks OpenAI-compatible APIs
+        # natively, while this archive-local config pins OpenRouter to
+        # DeepInfra and disables fallback provider drift.
+        OPENCODE_NEMOTRON_CONFIG_HOME="$(write_openrouter_deepinfra_opencode_config "$MODEL")"
+        OPENCODE_NEMOTRON_MODEL="openrouter-deepinfra/$MODEL"
+        if [ "$KBH_AGENT_CONTAINER" = "1" ]; then
+            KBH_OPENCODE_CONFIG_FILE="$OPENCODE_NEMOTRON_CONFIG_HOME/opencode/opencode.json"                 run_opencode_container "$OPENCODE_NEMOTRON_MODEL"                 > "$LOG_FILE" 2> "$STDERR_FILE" || HARNESS_EXIT=$?
+        else
+            ( cd "$PROBLEM_DIR" && timeout "$BUDGET_SECONDS" "${AGENT_CUDA_ENV[@]}"                 env XDG_CONFIG_HOME="$OPENCODE_NEMOTRON_CONFIG_HOME"                 opencode run --pure --format json -m "$OPENCODE_NEMOTRON_MODEL" "$PROMPT"                 </dev/null > "$LOG_FILE" 2> "$STDERR_FILE" ) || HARNESS_EXIT=$?
+        fi
+        ;;
+
+    nvcf-nemotron)
+        # Nemotron 3 Ultra through NVIDIA's NVCF function share. NVCF is not an
+        # OpenAI-compatible base URL, so run a per-archive localhost adapter and
+        # point an archive-local OpenCode config at it.
+        start_nvcf_proxy
+        NVCF_OPENCODE_CONFIG_HOME="$(write_nvcf_opencode_config "$NVCF_PROXY_BASE_URL")"
+        ( cd "$PROBLEM_DIR" && timeout "$BUDGET_SECONDS" "${AGENT_CUDA_ENV[@]}" \
+            env XDG_CONFIG_HOME="$NVCF_OPENCODE_CONFIG_HOME" \
+            opencode run --pure --format json -m "nvcf-nemotron/$MODEL" "$PROMPT" \
             </dev/null > "$LOG_FILE" 2> "$STDERR_FILE" ) || HARNESS_EXIT=$?
         ;;
 
     *)
         echo "Unknown harness: $HARNESS" >&2
-        echo "Supported: claude, zai-claude, minimax-claude, ccr-claude, codex, kimi, droid, gemini, cursor, grok, opencode" >&2
+        echo "Supported: claude, zai-claude, minimax-claude, kimi-claude, ccr-claude, codex, kimi, droid, gemini, cursor, grok, opencode, opencode-nemotron, nvcf-nemotron" >&2
         exit 1
         ;;
 esac
@@ -723,7 +1703,7 @@ fi
 
 SESSION_COMPLETE=true
 case "$HARNESS" in
-    claude|zai-claude|ccr-claude|cursor|gemini)
+    claude|zai-claude|minimax-claude|kimi-claude|ccr-claude|cursor|gemini)
         if ! grep -q '"type":"result"' "$CHECK_FILE" 2>/dev/null; then
             SESSION_COMPLETE=false
         fi
@@ -738,7 +1718,7 @@ case "$HARNESS" in
             SESSION_COMPLETE=false
         fi
         ;;
-    droid|kimi|opencode)
+    droid|kimi|opencode|opencode-nemotron|nvcf-nemotron)
         # No reliable terminal marker; trust the exit code.
         if [ "$HARNESS_EXIT" -ne 0 ]; then
             SESSION_COMPLETE=false
@@ -902,6 +1882,9 @@ cat > "$RUN_DIR/result.json" <<JSON
     "harness_exit_code": $HARNESS_EXIT,
     "session_complete": $SESSION_COMPLETE,
     "agent_cuda_disabled": $AGENT_CUDA_DISABLED,
+    "agent_container": $([ "$KBH_AGENT_CONTAINER" = "1" ] && echo true || echo false),
+    "agent_container_image": "$KBH_AGENT_CONTAINER_IMAGE",
+    "agent_container_network": "$KBH_AGENT_CONTAINER_NETWORK",
     "gpu_queue_mode": "$GPU_QUEUE_MODE",
     "output_tokens_per_second": $OUTPUT_TOKENS_PER_SECOND,
     "usage": $USAGE_JSON

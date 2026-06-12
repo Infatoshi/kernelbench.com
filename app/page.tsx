@@ -20,8 +20,8 @@ const citationGraph = {
         "Open agentic GPU kernel benchmark results, run transcripts, source repositories, and datasets.",
       citation: [
         "https://github.com/Infatoshi/kernelbench.com",
-        "https://github.com/Infatoshi/KernelBench-v3",
-        "https://github.com/Infatoshi/KernelBench-Hard",
+        "https://github.com/Infatoshi/kernelbench.com/tree/master/benchmarks/v3",
+        "https://github.com/Infatoshi/kernelbench.com/tree/master/benchmarks/hard",
         "https://huggingface.co/datasets/Infatoshi/kernelbench-v3-runs",
         "https://huggingface.co/datasets/Infatoshi/kernelbench-hard-runs",
       ],
@@ -42,16 +42,16 @@ const citationGraph = {
     },
     {
       "@type": "SoftwareSourceCode",
-      "@id": "https://github.com/Infatoshi/KernelBench-Hard",
+      "@id": "https://github.com/Infatoshi/kernelbench.com/tree/master/benchmarks/hard",
       name: "Hard result suite repository",
-      codeRepository: "https://github.com/Infatoshi/KernelBench-Hard",
+      codeRepository: "https://github.com/Infatoshi/kernelbench.com/tree/master/benchmarks/hard",
       author: { "@type": "Person", name: "Elliot Arledge" },
     },
     {
       "@type": "SoftwareSourceCode",
-      "@id": "https://github.com/Infatoshi/KernelBench-v3",
+      "@id": "https://github.com/Infatoshi/kernelbench.com/tree/master/benchmarks/v3",
       name: "v3 result suite repository",
-      codeRepository: "https://github.com/Infatoshi/KernelBench-v3",
+      codeRepository: "https://github.com/Infatoshi/kernelbench.com/tree/master/benchmarks/v3",
       author: { "@type": "Person", name: "Elliot Arledge" },
     },
   ],
@@ -221,11 +221,11 @@ export default function HomePage() {
             label="Website repository"
           />
           <ArtifactLink
-            href="https://github.com/Infatoshi/KernelBench-Hard"
+            href="https://github.com/Infatoshi/kernelbench.com/tree/master/benchmarks/hard"
             label="Hard repository"
           />
           <ArtifactLink
-            href="https://github.com/Infatoshi/KernelBench-v3"
+            href="https://github.com/Infatoshi/kernelbench.com/tree/master/benchmarks/v3"
             label="v3 repository"
           />
           <ArtifactLink
@@ -251,7 +251,7 @@ export default function HomePage() {
   title        = {Hard: Agentic CUDA Kernel Result Suite},
   author       = {Arledge, Elliot},
   year         = {2026},
-  howpublished = {\\url{https://github.com/Infatoshi/KernelBench-Hard}},
+  howpublished = {\\url{https://github.com/Infatoshi/kernelbench.com/tree/master/benchmarks/hard}},
   note         = {CUDA benchmark suite, harness, results, and annotations}
 }
 
@@ -259,7 +259,7 @@ export default function HomePage() {
   title        = {v3: Multi-GPU Agentic Kernel Result Suite},
   author       = {Arledge, Elliot},
   year         = {2026},
-  howpublished = {\\url{https://github.com/Infatoshi/KernelBench-v3}},
+  howpublished = {\\url{https://github.com/Infatoshi/kernelbench.com/tree/master/benchmarks/v3}},
   note         = {Multi-GPU benchmark suite, harness, and result artifacts}
 }
 

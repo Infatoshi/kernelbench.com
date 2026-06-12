@@ -76,18 +76,31 @@ def check_correctness(
     dtype = dtype or reference_out.dtype
     tol = tolerance_for_dtype(dtype, override)
 
+    if tol["atol"] == 0 and tol["rtol"] == 0:
+        if torch.equal(reference_out, solution_out):
+            return True, "ok (exact)"
+        n_diff = (reference_out != solution_out).sum().item()
+        return False, f"exact match required; {n_diff} elements differ"
+
     # Cast both to fp32 for the comparison to avoid dtype-specific allclose quirks
     ref_f = reference_out.float()
     sol_f = solution_out.float()
 
-    if tol["atol"] == 0 and tol["rtol"] == 0:
-        if torch.equal(ref_f, sol_f):
-            return True, "ok (exact)"
-        n_diff = (ref_f != sol_f).sum().item()
-        return False, f"exact match required; {n_diff} elements differ"
-
     if torch.allclose(ref_f, sol_f, atol=tol["atol"], rtol=tol["rtol"]):
         return True, f"ok (atol={tol['atol']}, rtol={tol['rtol']})"
 
-    max_diff = (ref_f - sol_f).abs().max().item()
-    return False, f"tolerance exceeded: max_abs_diff={max_diff:.6g} (atol={tol['atol']}, rtol={tol['rtol']})"
+    diff = (ref_f - sol_f).abs()
+    allowed = tol["atol"] + tol["rtol"] * ref_f.abs()
+    bad = diff > allowed
+    max_diff = diff.max().item()
+    max_rel = (diff / ref_f.abs().clamp_min(1e-30)).max().item()
+    n_bad = int(bad.sum().item())
+    worst_flat = int(diff.argmax().item())
+    worst_idx = tuple(int(i) for i in torch.unravel_index(torch.tensor(worst_flat), diff.shape))
+    return (
+        False,
+        "tolerance exceeded: "
+        f"max_abs_diff={max_diff:.6g} max_rel_diff={max_rel:.6g} "
+        f"bad={n_bad}/{diff.numel()} worst_idx={worst_idx} "
+        f"(atol={tol['atol']}, rtol={tol['rtol']})",
+    )

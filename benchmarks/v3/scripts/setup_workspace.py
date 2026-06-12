@@ -17,6 +17,7 @@ Example:
 from __future__ import annotations
 
 import argparse
+import re
 import shutil
 import sys
 from pathlib import Path
@@ -24,16 +25,18 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-from src.prompts import ARCH_B200, ARCH_H100, ARCH_RTX3090, PROFILING_TOOLS  # noqa: E402
+from src.prompts import ARCH_B200, ARCH_H100, ARCH_RTX3090, ARCH_RTX_PRO_6000, PROFILING_TOOLS  # noqa: E402
 
 ARCH_SECTIONS = {
     "rtx3090": ARCH_RTX3090,
+    "rtx_pro_6000": ARCH_RTX_PRO_6000,
     "h100": ARCH_H100,
     "b200": ARCH_B200,
 }
 
 HARDWARE_INFO = {
     "rtx3090": ("RTX 3090", 24, "Ampere SM86"),
+    "rtx_pro_6000": ("RTX PRO 6000 Blackwell Workstation", 96, "Blackwell SM120"),
     "h100": ("H100", 80, "Hopper SM90"),
     "b200": ("B200", 192, "Blackwell SM100"),
 }
@@ -54,10 +57,26 @@ def infer_level(problem_path: Path) -> int:
     return 2
 
 
-def build_claude_md(hardware: str, problem_name: str, level: int, reference_code: str) -> str:
+GATE_DESCRIPTIONS = {
+    "triton":    "Your solution MUST use Triton (@triton.jit). Raw CUDA / CUTLASS / PTX not accepted for this problem.",
+    "cutlass2":  "Your solution MUST use CUTLASS 2.x (device GEMM or CuTe layouts) -- `cutlass/gemm/device/gemm.h` etc. Triton not accepted.",
+    "cutlass3":  "Your solution MUST use CUTLASS 3.x or CuTe DSL (`cute::` namespace, collective builders). Triton not accepted.",
+    "cuda_wmma": "Your solution MUST use raw CUDA with nvcuda::wmma tensor-core APIs (`<mma.h>`). Triton not accepted.",
+    "ptx":       "Your solution MUST include inline PTX (`asm volatile` with mma.sync / wgmma / tcgen05). Triton not accepted.",
+    "cutile":    "Your solution MUST use cuTile (CUDA 13.x `cutile::` namespace).",
+    "no_triton": "Your solution MUST NOT use Triton. Any CUDA dialect (raw CUDA, CUTLASS, PTX, WMMA) is fine.",
+}
+
+
+def build_claude_md(hardware: str, problem_name: str, level: int, reference_code: str, framework_gate: str | None = None) -> str:
     """Build the CLAUDE.md that any agent harness will read."""
     gpu_name, vram, arch = HARDWARE_INFO[hardware]
     arch_section = ARCH_SECTIONS.get(hardware, "")
+
+    gate_text = ""
+    if framework_gate:
+        gate_rule = GATE_DESCRIPTIONS.get(framework_gate, f"Framework gated to: {framework_gate}")
+        gate_text = f"\n## Framework Requirement\n{gate_rule}\n"
 
     return f"""# KernelBench Task
 
@@ -99,6 +118,7 @@ Write an optimized CUDA kernel that is faster than the PyTorch reference impleme
 
 ## Difficulty
 Level {level} (1=basic ops, 2=fused ops, 3=architecture blocks, 4=novel/advanced)
+{gate_text}
 {arch_section}
 {PROFILING_TOOLS}
 """
@@ -148,17 +168,68 @@ def main():
             print(f"FAIL: max_diff={max_diff:.6f} (seed={seed})")
             sys.exit(1)
 
+    _emit_framework_label()
+
     print("PASS")
+
+
+def _emit_framework_label():
+    """Write framework.txt with the detected kernel framework used."""
+    import re
+    from pathlib import Path
+    patterns = [
+        ("ptx",       r"asm\\s+volatile|asm\\s*\\(|\\.ptx\\b|wgmma\\.mma_async|mma\\.sync|tcgen05\\."),
+        ("cutlass3",  r"\\bcute::|cutlass/gemm/collective|cutlass/gemm/kernel/sm(9|10)|cutlass::arch::Sm(9|10)"),
+        ("cutlass2",  r"cutlass/gemm/device/gemm|cutlass::gemm::device|cutlass::epilogue::thread"),
+        ("cuda_wmma", r"\\bnvcuda::wmma\\b|#include\\s*<mma\\.h>|wmma::fragment|wmma::mma_sync"),
+        ("cutile",    r"\\bcutile::|#include\\s*<cutile"),
+        ("triton",    r"import\\s+triton\\b|@triton\\.jit|triton\\.language\\b|\\btl\\.dot\\b"),
+        ("mlx",       r"import\\s+mlx\\b|mlx\\.core\\b|mx\\.fast\\."),
+        ("metal",     r"#include\\s*<metal_stdlib>|using\\s+namespace\\s+metal\\b|simdgroup_"),
+        ("cuda_raw",  r"torch\\.utils\\.cpp_extension\\.load_inline|__global__\\s+void|<<<[^>]+>>>"),
+    ]
+    try:
+        sol = Path("solution.py")
+        if not sol.exists():
+            return
+        code = sol.read_text()
+        label = "unknown"
+        for name, pat in patterns:
+            if re.search(pat, code):
+                label = name
+                break
+        Path("framework.txt").write_text(label + "\\n")
+    except Exception:
+        pass
 
 if __name__ == "__main__":
     main()
 '''
 
 
-BENCHMARK_SCRIPT = '''"""Benchmark -- measures speedup of solution vs reference."""
+BENCHMARK_SCRIPT = '''"""Benchmark -- measures speedup of solution vs adaptive reference baseline.
+
+Graded baseline: torch.compile(mode="reduce-overhead"), falling back to eager if
+compile raises or is <5% faster than eager. Eager timing is always printed as a
+supplementary number so regressions against raw PyTorch are visible.
+"""
 import statistics
 import sys
 import torch
+
+def _time_fn(fn, inputs, iters=30):
+    times = []
+    for _ in range(iters):
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        start.record()
+        with torch.no_grad():
+            fn(*inputs)
+        end.record()
+        torch.cuda.synchronize()
+        times.append(start.elapsed_time(end))
+    return statistics.median(times)
+
 
 def main():
     import reference
@@ -177,44 +248,45 @@ def main():
     torch.cuda.manual_seed_all(2026)
     inputs = [x.to(device) if isinstance(x, torch.Tensor) else x for x in reference.get_inputs()]
 
-    # Warmup
+    # Warmup eager
     for _ in range(5):
         with torch.no_grad():
             ref_model(*inputs)
             sol_model(*inputs)
     torch.cuda.synchronize()
 
-    # Time reference
-    ref_times = []
-    for _ in range(30):
-        start = torch.cuda.Event(enable_timing=True)
-        end = torch.cuda.Event(enable_timing=True)
-        start.record()
-        with torch.no_grad():
-            ref_model(*inputs)
-        end.record()
-        torch.cuda.synchronize()
-        ref_times.append(start.elapsed_time(end))
+    # Eager baseline (always measured)
+    eager_ms = _time_fn(ref_model, inputs)
 
-    # Time solution
-    sol_times = []
-    for _ in range(30):
-        start = torch.cuda.Event(enable_timing=True)
-        end = torch.cuda.Event(enable_timing=True)
-        start.record()
-        with torch.no_grad():
-            sol_model(*inputs)
-        end.record()
+    # Compiled baseline (adaptive): use it if it runs and is >=5% faster than eager
+    compiled_ms = None
+    baseline_mode = "eager"
+    try:
+        compiled_ref = torch.compile(ref_model, mode="reduce-overhead")
+        # Warmup / capture
+        for _ in range(5):
+            with torch.no_grad():
+                compiled_ref(*inputs)
         torch.cuda.synchronize()
-        sol_times.append(start.elapsed_time(end))
+        compiled_ms = _time_fn(compiled_ref, inputs)
+        if compiled_ms < eager_ms * 0.95:
+            baseline_mode = "compiled"
+    except Exception as e:
+        print(f"torch.compile fallback: {type(e).__name__}: {e}")
+        compiled_ms = None
 
-    ref_ms = statistics.median(ref_times)
-    sol_ms = statistics.median(sol_times)
+    ref_ms = compiled_ms if baseline_mode == "compiled" else eager_ms
+
+    # Solution
+    sol_ms = _time_fn(sol_model, inputs)
     speedup = ref_ms / sol_ms
 
-    print(f"Reference: {ref_ms:.3f}ms (median)")
+    print(f"Baseline:  {baseline_mode} ({ref_ms:.3f}ms)")
+    print(f"Eager:     {eager_ms:.3f}ms (median)")
+    if compiled_ms is not None:
+        print(f"Compiled:  {compiled_ms:.3f}ms (median)")
     print(f"Solution:  {sol_ms:.3f}ms (median)")
-    print(f"Speedup:   {speedup:.2f}x")
+    print(f"Speedup:   {speedup:.2f}x (vs {baseline_mode})")
 
     if speedup >= 1.0:
         print("RESULT: FASTER")
@@ -245,8 +317,14 @@ def setup_workspace(hardware: str, problem_path: Path, out_dir: Path | None = No
     # Read reference code for context
     reference_code = problem_path.read_text()
 
+    # Extract optional FRAMEWORK_GATE from the problem file
+    framework_gate = None
+    m = re.search(r'^FRAMEWORK_GATE\s*=\s*["\']([\w_]+)["\']', reference_code, re.MULTILINE)
+    if m:
+        framework_gate = m.group(1)
+
     # Write CLAUDE.md
-    claude_md = build_claude_md(hardware, problem_name, level, reference_code)
+    claude_md = build_claude_md(hardware, problem_name, level, reference_code, framework_gate)
     (workspace / "CLAUDE.md").write_text(claude_md)
 
     # Write check and benchmark scripts
@@ -277,7 +355,7 @@ def setup_all_workspaces(hardware: str, levels: list[int], out_dir: Path | None 
 
 def main():
     parser = argparse.ArgumentParser(description="Set up KernelBench workspace(s)")
-    parser.add_argument("hardware", choices=["rtx3090", "h100", "b200"])
+    parser.add_argument("hardware", choices=sorted(HARDWARE_INFO.keys()))
     parser.add_argument("problem", nargs="?", help="Path to a single problem .py file")
     parser.add_argument("--all", action="store_true", help="Set up all problems for this hardware")
     parser.add_argument("--levels", default="1,2,3,4", help="Comma-separated levels (default: 1,2,3,4)")

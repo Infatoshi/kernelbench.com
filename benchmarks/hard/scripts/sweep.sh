@@ -50,6 +50,14 @@ declare -a ACTIVE_MATRIX=(
     #   codex 0.125.0 dropped chat-API support so non-OpenAI labs can't use codex.
 )
 
+if [ "${KBH_USE_OPENROUTER_NEMOTRON:-0}" = "1" ]; then
+    ACTIVE_MATRIX+=("opencode-nemotron nvidia/nemotron-3-ultra-550b-a55b ")
+fi
+
+if [ "${KBH_USE_NVCF_NEMOTRON:-0}" = "1" ]; then
+    ACTIVE_MATRIX+=("nvcf-nemotron nemotron-3-ultra ")
+fi
+
 # NVIDIA GPU sweep. Metal problem 08 is deferred (M4 Max track not prioritized
 # for the first sweep). Order is outer=problem, inner=model so an early abort
 # leaves complete per-problem rows rather than complete per-model columns.

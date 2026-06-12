@@ -416,7 +416,7 @@ kv = self.kv_b_proj(self.kv_a_layernorm(compressed_kv))
           </p>
 
           <pre className="bg-[rgba(20,83,45,0.15)] p-4 rounded-lg overflow-x-auto mb-6">
-            <code>{`git clone https://github.com/Infatoshi/KernelBench-v3
+            <code>{`git clone https://github.com/Infatoshi/kernelbench.com/tree/master/benchmarks/v3
 cd KernelBench-v3
 uv sync
 uv run python bench.py run rtx3090 --models google/gemini-3-flash-preview --levels 1,2,3,4 --workers 4`}</code>
@@ -426,7 +426,7 @@ uv run python bench.py run rtx3090 --models google/gemini-3-flash-preview --leve
             <h3 className="text-xl font-bold mb-4">Resources</h3>
             <ul className="space-y-2 text-[var(--color-fg-muted)]">
               <li>
-                <Link href="https://github.com/Infatoshi/KernelBench-v3" className="text-[var(--color-fg-bright)] hover:underline">
+                <Link href="https://github.com/Infatoshi/kernelbench.com/tree/master/benchmarks/v3" className="text-[var(--color-fg-bright)] hover:underline">
                   GitHub Repository
                 </Link>
               </li>

@@ -16,6 +16,11 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_ROOT))
 
 from src.eval.correctness import check_correctness  # noqa: E402
+from src.eval.numeric_stress import (  # noqa: E402
+    numeric_stress_cases,
+    numeric_stress_context,
+    tolerance_for_case,
+)
 
 
 def _apply_shape(reference, shape):
@@ -67,20 +72,22 @@ def main():
         for seed in (42, 123, 456):
             torch.manual_seed(seed)
             torch.cuda.manual_seed_all(seed)
-            inputs = [t.to(device) if hasattr(t, "to") else t for t in reference.get_inputs()]
+            base_inputs = [t.to(device) if hasattr(t, "to") else t for t in reference.get_inputs()]
 
-            with torch.no_grad():
-                ref_out = ref_model(*inputs)
-                sol_out = sol_model(*inputs)
+            for case in numeric_stress_cases(meta.get("name", "")):
+                with numeric_stress_context(ref_model, sol_model, base_inputs, case) as inputs:
+                    with torch.no_grad():
+                        ref_out = ref_model(*inputs)
+                        sol_out = sol_model(*inputs)
 
-            ok, msg = check_correctness(
-                ref_out, sol_out,
-                dtype=ref_out.dtype,
-                override=tol_override,
-            )
-            if not ok:
-                print(f"FAIL: shape {shape_idx} {shape} seed {seed}: {msg}")
-                sys.exit(1)
+                ok, msg = check_correctness(
+                    ref_out, sol_out,
+                    dtype=ref_out.dtype,
+                    override=tolerance_for_case(tol_override, case),
+                )
+                if not ok:
+                    print(f"FAIL: shape {shape_idx} {shape} seed {seed} case {case.name}: {msg}")
+                    sys.exit(1)
 
     # --- Framework label (for stats) --------------------------------------
     _emit_framework_label()

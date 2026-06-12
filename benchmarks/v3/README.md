@@ -6,13 +6,16 @@ Inspired by the original [KernelBench](https://github.com/ScalingIntelligence/Ke
 
 ## Hardware Benchmarks
 
+| Benchmark        | GPU                    | Problems | Approach                   | Status             |
+| ---------------- | ---------------------- | -------- | -------------------------- | ------------------ |
+| **RTX3090Bench** | NVIDIA RTX 3090 (24GB) | 43       | CUDA C++ or Triton         | Tested             |
+| **M4MaxBench**   | Apple M4 Max (128GB)   | 63       | MLX                        | Tested             |
+| **H100Bench**    | NVIDIA H100 (80GB)     | 54       | CUDA/Triton/CUTLASS        | Coming soon        |
+| **B200Bench**    | NVIDIA B200 (192GB)    | 57       | CUDA/Triton/CUTLASS/CuTile | Coming soon        |
 
-| Benchmark        | GPU                    | Problems | Approach                   |
-| ---------------- | ---------------------- | -------- | -------------------------- |
-| **RTX3090Bench** | NVIDIA RTX 3090 (24GB) | 43       | CUDA C++ or Triton         |
-| **H100Bench**    | NVIDIA H100 (80GB)     | 54       | CUDA/Triton/CUTLASS        |
-| **B200Bench**    | NVIDIA B200 (192GB)    | 57       | CUDA/Triton/CUTLASS/CuTile |
-| **M4MaxBench**   | Apple M4 Max (128GB)   | 63       | MLX                        |
+Only RTX 3090 and Apple M4 Max have been evaluated end-to-end so far. H100 and B200 scaffolding exists but has not been run at scale — the author does not currently have sustained access to those GPUs.
+
+**Looking for sponsors**: open to compute credits (Modal, Lambda, CoreWeave, Together, Fireworks, etc.) and API credits (OpenAI, Anthropic, Google, xAI, Moonshot, Z.AI, Minimax, DeepSeek, Alibaba) to extend H100/B200 coverage and keep the leaderboard current as new models ship. Reach out if you'd like your lab's model or hardware represented.
 
 
 ## Quick Start

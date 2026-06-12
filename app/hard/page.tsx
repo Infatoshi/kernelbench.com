@@ -100,7 +100,7 @@ export default async function HardPage() {
           {" "}for transcripts, submitted solutions, checks, timing, and costs.
           {" "}Full historical and diagnostic rows are still available in{" "}
           <Link
-            href="https://github.com/Infatoshi/KernelBench-Hard/blob/master/results/leaderboard.json"
+            href="https://github.com/Infatoshi/kernelbench.com/blob/master/benchmarks/hard/results/leaderboard.json"
             className="underline underline-offset-2"
           >
             leaderboard.json

@@ -26,7 +26,11 @@ Notes / known biases not addressed here:
 """
 from __future__ import annotations
 
+import os
+import re
 import statistics
+import time
+from datetime import UTC, datetime
 
 import torch
 
@@ -43,6 +47,50 @@ def _l2_flush() -> None:
             _L2_FLUSH_BYTES // 4, dtype=torch.float32, device="cuda"
         )
     _l2_scratch.zero_()
+
+
+def benchmark_baselines_enabled(*aliases: str) -> bool:
+    """Return true when benchmark.py should run reference/SOTA diagnostics."""
+    env_names = ["KBH_BENCHMARK_BASELINES"]
+    for alias in aliases:
+        slug = re.sub(r"[^A-Za-z0-9]+", "_", alias).strip("_").upper()
+        if slug:
+            env_names.append(f"KBH_{slug}_BENCHMARK_BASELINES")
+    return any(os.environ.get(name) == "1" for name in env_names)
+
+
+def emit_benchmark_event(event: str, shape_idx: int, variant: str, **fields) -> None:
+    """Print a machine-readable wall-clock event for benchmark phase audits."""
+    parts = [
+        f"event={event}",
+        f"shape={shape_idx}",
+        f"variant={variant}",
+        f"ts={datetime.now(UTC).isoformat()}",
+    ]
+    for key, value in fields.items():
+        parts.append(f"{key}={value}")
+    print("benchmark_event " + " ".join(parts), flush=True)
+
+
+def time_variant(fn, inputs, *, shape_idx: int, variant: str, iters: int = 30, warmup: int = 10) -> float:
+    """Time one benchmark variant and emit start/end wall-clock markers."""
+    start = time.perf_counter()
+    emit_benchmark_event("variant_start", shape_idx, variant)
+    try:
+        ms = time_fn(fn, inputs, iters=iters, warmup=warmup)
+    except Exception as exc:
+        elapsed_s = f"{time.perf_counter() - start:.3f}"
+        emit_benchmark_event(
+            "variant_error",
+            shape_idx,
+            variant,
+            elapsed_s=elapsed_s,
+            error=type(exc).__name__,
+        )
+        raise
+    elapsed_s = f"{time.perf_counter() - start:.3f}"
+    emit_benchmark_event("variant_end", shape_idx, variant, elapsed_s=elapsed_s, ms=f"{ms:.6f}")
+    return ms
 
 
 def time_fn(fn, inputs, iters: int = 30, warmup: int = 10) -> float:

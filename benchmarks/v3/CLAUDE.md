@@ -3,10 +3,10 @@
 Last updated: 2026-04-08
 
 ## Snapshot
-- Repository: `/home/infatoshi/cuda/KernelBench-v3`
+- Repository: `/home/infatoshi/benchmarks/KernelBench-v3`
 - Branch: `master`
 - Remote: `origin https://github.com/Infatoshi/KernelBench-v3.git`
-- Local run artifacts: `/home/infatoshi/cuda/KernelBench-v3/outputs/batch_eval/`
+- Local run artifacts: `/home/infatoshi/benchmarks/KernelBench-v3/outputs/batch_eval/`
 - M4 Max benchmark: separate copy on macbook at `~/MetalBench`
 
 ## Non-Negotiable Project Rules
@@ -245,21 +245,20 @@ Each workspace contains: `reference.py`, `CLAUDE.md` (instructions), `check.py`,
 ### Harness Commands
 ```bash
 WS="workspaces/rtx3090/<problem_name>"
+PROMPT="Read CLAUDE.md, then optimize reference.py into solution.py. Run check.py to verify, then benchmark.py to measure speedup."
 
-# Claude Code (Claude Opus 4.6)
-claude --dangerously-skip-permissions --print --add-dir "$WS" \
-  -p "You are in $WS. Read CLAUDE.md, then optimize reference.py into solution.py. Run check.py to verify, then benchmark.py to measure speedup."
+# Claude Code (Claude Opus 4.6) -- stream-json for full transcript
+claude --dangerously-skip-permissions --print --verbose --output-format stream-json --add-dir "$WS" \
+  -p "You are in $WS. $PROMPT"
 
-# Codex CLI (GPT-5.4, GPT-5.4 high reasoning)
-codex exec -m gpt-5.4 --full-auto -C "$WS" \
-  "Read CLAUDE.md, then optimize reference.py into solution.py. Run check.py to verify, then benchmark.py to measure speedup."
+# Codex CLI (GPT-5.4) -- bypass sandbox (bwrap fails on this machine)
+codex exec -m gpt-5.4 --dangerously-bypass-approvals-and-sandbox --skip-git-repo-check -C "$WS" "$PROMPT"
 
-codex exec -m gpt-5.4 -c model_reasoning_effort=\"high\" --full-auto -C "$WS" \
-  "Read CLAUDE.md, then optimize reference.py into solution.py. Run check.py to verify, then benchmark.py to measure speedup."
+# Codex CLI (GPT-5.4 high reasoning)
+codex exec -m gpt-5.4 -c model_reasoning_effort=\"high\" --dangerously-bypass-approvals-and-sandbox --skip-git-repo-check -C "$WS" "$PROMPT"
 
-# Droid -- built-in models
-droid exec -m gemini-3.1-pro-preview --skip-permissions-unsafe --cwd "$WS" \
-  "Read CLAUDE.md, then optimize reference.py into solution.py. Run check.py to verify, then benchmark.py to measure speedup."
+# Droid -- stream-json for full transcript (reasoning + tool calls)
+droid exec -m gemini-3.1-pro-preview -o stream-json --skip-permissions-unsafe --cwd "$WS" "$PROMPT"
 
 droid exec -m kimi-k2.5 --skip-permissions-unsafe --cwd "$WS" \
   "Read CLAUDE.md, then optimize reference.py into solution.py. Run check.py to verify, then benchmark.py to measure speedup."
@@ -268,14 +267,9 @@ droid exec -m glm-5.1 --skip-permissions-unsafe --cwd "$WS" \
   "Read CLAUDE.md, then optimize reference.py into solution.py. Run check.py to verify, then benchmark.py to measure speedup."
 
 # Droid -- custom models via OpenRouter (configured in ~/.factory/settings.json)
-droid exec -m "custom:Qwen3.5-397B-[OpenRouter]-1" --skip-permissions-unsafe --cwd "$WS" \
-  "Read CLAUDE.md, then optimize reference.py into solution.py. Run check.py to verify, then benchmark.py to measure speedup."
-
-droid exec -m "custom:MiniMax-M2.7-[OpenRouter]-2" --skip-permissions-unsafe --cwd "$WS" \
-  "Read CLAUDE.md, then optimize reference.py into solution.py. Run check.py to verify, then benchmark.py to measure speedup."
-
-droid exec -m "custom:Grok-4.20-[OpenRouter]-3" --skip-permissions-unsafe --cwd "$WS" \
-  "Read CLAUDE.md, then optimize reference.py into solution.py. Run check.py to verify, then benchmark.py to measure speedup."
+droid exec -m "custom:Qwen3.5-397B-[OpenRouter]-1" -o stream-json --skip-permissions-unsafe --cwd "$WS" "$PROMPT"
+droid exec -m "custom:MiniMax-M2.7-[OpenRouter]-2" -o stream-json --skip-permissions-unsafe --cwd "$WS" "$PROMPT"
+droid exec -m "custom:Grok-4.20-[OpenRouter]-3" -o stream-json --skip-permissions-unsafe --cwd "$WS" "$PROMPT"
 ```
 
 ### Model-Harness Assignment

@@ -9,10 +9,10 @@ Emits a JSON object on stdout with normalized fields:
 
 Any field that is not reported by the given harness is null. The point is a
 single uniform shape across claude / zai-claude / minimax-claude / codex /
-kimi / droid / gemini / cursor / grok / opencode so result.json aggregation is
-cheap downstream. Coding-plan billing on the CLI does not expose per-token cost;
-transcripts still report the raw token counts, which is what matters for
-cross-model comparison.
+kimi / droid / gemini / cursor / grok / opencode / opencode-nemotron / nvcf-nemotron so result.json
+aggregation is cheap downstream. Coding-plan billing on the CLI does not expose
+per-token cost; transcripts still report the raw token counts, which is what
+matters for cross-model comparison.
 """
 from __future__ import annotations
 
@@ -213,11 +213,11 @@ def extract(run_dir: Path, harness: str) -> dict:
             events = _read_jsonl(run_dir / "transcript.jsonl")
         return _codex(events)
     transcript = _read_jsonl(run_dir / "transcript.jsonl")
-    if harness in ("claude", "zai-claude", "minimax-claude", "ccr-claude", "kimi"):
+    if harness in ("claude", "zai-claude", "minimax-claude", "kimi-claude", "ccr-claude", "kimi"):
         return _claude_or_kimi(transcript)
     if harness == "droid":
         return _droid(transcript)
-    if harness == "opencode":
+    if harness in ("opencode", "opencode-nemotron", "nvcf-nemotron"):
         return _opencode(transcript)
     if harness == "gemini":
         return _gemini(transcript)

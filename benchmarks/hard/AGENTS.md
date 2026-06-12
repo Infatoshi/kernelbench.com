@@ -9,17 +9,18 @@ Summary of the non-negotiables:
 - **uv only.** `uv run ...`, `uv add ...`, `uv pip install ...`. Never `pip` or bare `python`.
 - **Before committing:** `uv run ruff check . --fix && uv run pytest`.
 - **Do not edit `problems/*/solution.py`** — those are agent output.
-- **Do not modify `reference.py`, `check.py`, `benchmark.py`, `problem.yaml`, `shapes.py`, or `PROMPT.txt`** of an already-published problem; `scripts/run_hard.sh` invalidates and restores runs that change them.
+- **Do not modify `reference.py`, `check.py`, `benchmark.py`, `problem.yaml`, `shapes.py`, or `PROMPT.txt`** of an already-published problem unless intentionally versioning the benchmark/validation surface; `scripts/run_hard.sh` invalidates and restores runs where agents under test change them.
 - **Apply the torch 2.11 inductor CSE hotfix** via `./scripts/patch_torch.sh` after any `uv sync`.
 - **Z.ai GLM-5.1 Claude Code reruns:** use `zai-claude`; `scripts/run_hard.sh` sets `CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS=1`, `CLAUDE_CODE_MAX_RETRIES=1000000`, `CLAUDE_CODE_MAX_OUTPUT_TOKENS=128000`, and routes all Claude Code aliases, including Haiku / Explore / subagents, to `glm-5.1`.
-- **GPU work must go through `scripts/run_hard.sh`.** It creates archive-local workspaces, isolated CUDA/Triton/Torch caches, and a shared GPU lock so concurrent agent sweeps can edit in parallel while compile/check/benchmark work queues cleanly.
+- **GPU work must go through `uv run kbh run`.** It creates archive-local workspaces, isolated CUDA/Triton/Torch caches, and a shared GPU lock so concurrent agent sweeps can edit in parallel while compile/check/benchmark work queues cleanly.
+- **Correctness includes numeric stress.** `check.py` reruns canonical shapes/seeds under problem-specific small/large activation or weight scales via `src/eval/numeric_stress.py`; `benchmark.py` still measures only the canonical performance deck.
 
 ## Quick actions
 
 ```bash
 uv sync
 ./scripts/patch_torch.sh
-./scripts/run_hard.sh claude claude-opus-4-7 problems/01_fp8_gemm
+uv run kbh run claude claude-opus-4-7 problems/01_fp8_gemm
 ```
 
 ## Repo layout and adding a new problem
@@ -28,7 +29,7 @@ See `CLAUDE.md` — everything there is authoritative.
 
 ## Current sweep context
 
-Use `scripts/run_hard.sh` for all model evals. It stages each problem under
+Use `uv run kbh run` for all model evals. It currently delegates to `scripts/run_hard.sh` as the compatibility backend. It stages each problem under
 `outputs/runs/<run_id>/repo/problems/<problem_name>/`, copies immutable problem
 files, symlinks `src/`, copies project metadata, and sets per-run
 `TORCH_EXTENSIONS_DIR`, `TRITON_CACHE_DIR`, `CUDA_CACHE_PATH`, and temp dirs.
@@ -51,13 +52,22 @@ transcript, and those quotes are not provider failures.
 Provider credit/rate detection must read explicit CLI/API error events and
 stderr only, not arbitrary assistant text or tool outputs; models can read
 AGENTS.md, `run_hard.sh`, and old artifacts containing those trigger words.
-When `KBH_DISABLE_AGENT_CUDA=1`, agent-phase `uv`/`python`/`python3` probes
-bypass the lock because CUDA is hidden and guarded; harness-owned
+When `KBH_DISABLE_AGENT_CUDA=1`, agent-phase `uv`/`python`/`python3`,
+`nvidia-smi`, and `nvcc` probes bypass the lock because CUDA is hidden and
+guarded or the probe is harmless; `ncu` and `nsys` fail fast. Harness-owned
 `check.py`/`benchmark.py` still lock normally.
 The `check.py`/`benchmark.py` execution timeout must start after the GPU lock is
 acquired. Use `run_gpu_locked_timeout`; do not wrap `timeout` outside `uv run`
 or queued rows can fail while merely waiting for `outputs/gpu.lock`.
+`benchmark.py` must score `variant=solution` first. Eager / compiled / SOTA
+reference diagnostics are opt-in via `KBH_BENCHMARK_BASELINES=1` (or a
+per-problem alias) and emit `benchmark_event` start/end/error lines for audits.
 Transcript usage extraction also bypasses the lock; it is CPU-only post-processing.
+`check.py` numeric stress is part of official correctness and should stay on.
+`KBH_NUMERIC_STRESS=0` is for local debugging only, not sweeps or published
+backfills. These stress cases do not add hidden shapes; they rescale existing
+floating inputs/state to catch zero-output, cached-nominal, and loose-tolerance
+cheats.
 
 Before expensive sweeps, check:
 
@@ -121,12 +131,13 @@ uv run python scripts/summarize_runs.py --run-group <name>
 High-priority rows:
 
 ```bash
-./scripts/run_hard.sh minimax-claude MiniMax-M3 problems/01_fp8_gemm
-./scripts/run_hard.sh opencode openrouter-alibaba/qwen/qwen3.7-max problems/01_fp8_gemm
-./scripts/run_hard.sh opencode openrouter-google-ai-studio/google/gemini-3.5-flash problems/01_fp8_gemm
-./scripts/run_hard.sh cursor composer-2.5 problems/01_fp8_gemm
-./scripts/run_hard.sh cursor composer-2.5-fast problems/01_fp8_gemm
-./scripts/run_hard.sh grok grok-build problems/01_fp8_gemm max
+uv run kbh run minimax-claude MiniMax-M3 problems/01_fp8_gemm
+uv run kbh run opencode openrouter-alibaba/qwen/qwen3.7-max problems/01_fp8_gemm
+uv run kbh run opencode openrouter-google-ai-studio/google/gemini-3.5-flash problems/01_fp8_gemm
+uv run kbh run opencode-nemotron nvidia/nemotron-3-ultra-550b-a55b problems/01_fp8_gemm
+uv run kbh run cursor composer-2.5 problems/01_fp8_gemm
+uv run kbh run cursor composer-2.5-fast problems/01_fp8_gemm
+uv run kbh run grok grok-build problems/01_fp8_gemm max
 ```
 
 Claude Code runs explicitly pass `--settings
@@ -137,6 +148,7 @@ MiniMax M3 through Claude Code uses harness `minimax-claude`, model
 `https://api.minimax.io/anthropic`. Put `export MINIMAX_API_KEY=...` in
 Anvil's `~/.env_vars`; do not put it in repo files. Enable it in broad
 preflight/sweeps with `KBH_USE_MINIMAX_M3_CLAUDE=1`.
+Nemotron 3 Ultra's preferred scoring route is `opencode-nemotron nvidia/nemotron-3-ultra-550b-a55b`, which writes an archive-local OpenCode config for OpenRouter pinned to DeepInfra with `allow_fallbacks=false` and requires `OPENROUTER_API_KEY`. Enable it in broad preflight/sweeps with `KBH_USE_OPENROUTER_NEMOTRON=1`; target only that row with `KBH_USE_OPENROUTER_NEMOTRON=1 KBH_PREFLIGHT_ONLY=opencode_nemotron_ultra ./scripts/preflight_harnesses.sh`. Prefer OpenCode here because it speaks OpenAI-compatible APIs directly. Claude Code through CCR smoked once, but adds an Anthropic-router translation layer; Droid is not the native endpoint for this provider. The old `nvcf-nemotron nemotron-3-ultra` route is diagnostic only; NVCF Ultra was observed degrading/504ing and needs `NGC_API_KEY`, `NVIDIA_API_KEY`, or `NVCF_API_KEY`.
 Do not pass provider API keys with `timeout env KEY=... claude`; that puts the
 key in process argv. Export secrets inside the subshell before invoking
 `timeout claude` instead.

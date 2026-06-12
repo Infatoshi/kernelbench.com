@@ -15,6 +15,11 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_ROOT))
 
 from src.eval.correctness import check_correctness  # noqa: E402
+from src.eval.numeric_stress import (  # noqa: E402
+    numeric_stress_cases,
+    numeric_stress_context,
+    tolerance_for_case,
+)
 
 
 def main():
@@ -69,24 +74,32 @@ def main():
         for seed in (42, 123, 456):
             torch.manual_seed(seed)
             torch.cuda.manual_seed_all(seed)
-            inputs = [t.to(device) for t in reference.get_inputs()]
+            base_inputs = [t.to(device) for t in reference.get_inputs()]
 
-            with torch.no_grad():
-                ref_out = ref_model(*inputs)
-                sol_out = sol_model(*inputs)
+            for case in numeric_stress_cases(meta.get("name", "")):
+                with numeric_stress_context(ref_model, sol_model, base_inputs, case) as inputs:
+                    with torch.no_grad():
+                        ref_out = ref_model(*inputs)
+                        sol_out = sol_model(*inputs)
 
-            # Model returns (q_rot, k_rot). Check both.
-            if not (isinstance(ref_out, tuple) and isinstance(sol_out, tuple)
-                    and len(ref_out) == len(sol_out) == 2):
-                print(f"FAIL: expected (q_rot, k_rot) tuple from both models, "
-                      f"got ref={type(ref_out).__name__} sol={type(sol_out).__name__}")
-                sys.exit(1)
-
-            for name, r, s in zip(("q_rot", "k_rot"), ref_out, sol_out, strict=True):
-                ok, msg = check_correctness(r, s, dtype=r.dtype, override=tol_override)
-                if not ok:
-                    print(f"FAIL: shape {shape_idx} {shape} seed {seed} {name}: {msg}")
+                # Model returns (q_rot, k_rot). Check both.
+                if not (isinstance(ref_out, tuple) and isinstance(sol_out, tuple)
+                        and len(ref_out) == len(sol_out) == 2):
+                    print(f"FAIL: expected (q_rot, k_rot) tuple from both models, "
+                          f"got ref={type(ref_out).__name__} sol={type(sol_out).__name__}")
                     sys.exit(1)
+
+                for name, r, s in zip(("q_rot", "k_rot"), ref_out, sol_out, strict=True):
+                    ok, msg = check_correctness(
+                        r,
+                        s,
+                        dtype=r.dtype,
+                        override=tolerance_for_case(tol_override, case),
+                    )
+                    if not ok:
+                        print(f"FAIL: shape {shape_idx} {shape} seed {seed} "
+                              f"case {case.name} {name}: {msg}")
+                        sys.exit(1)
 
     # --- Framework label (for stats) --------------------------------------
     _emit_framework_label()

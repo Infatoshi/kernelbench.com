@@ -3,7 +3,9 @@ import pytest
 import torch
 
 from src.eval.correctness import check_correctness, tolerance_for_dtype
+from src.eval.report import long_rows, render_markdown
 from src.eval.roofline import compute_gbps, compute_tflops, peak_fraction
+from src.eval.timing import benchmark_baselines_enabled
 from src.hardware import get
 
 
@@ -73,3 +75,64 @@ def test_hardware_lookup():
     assert hw.sm == "sm_120a"
     assert hw.peak_bandwidth_gb_s == pytest.approx(1800.0)
     assert hw.peak_tflops_dense["fp8"] == pytest.approx(400.0)
+
+
+def test_benchmark_baselines_env_flags(monkeypatch):
+    monkeypatch.delenv("KBH_BENCHMARK_BASELINES", raising=False)
+    monkeypatch.delenv("KBH_KDA_BENCHMARK_BASELINES", raising=False)
+    assert not benchmark_baselines_enabled("KDA")
+
+    monkeypatch.setenv("KBH_KDA_BENCHMARK_BASELINES", "1")
+    assert benchmark_baselines_enabled("KDA")
+
+    monkeypatch.delenv("KBH_KDA_BENCHMARK_BASELINES", raising=False)
+    monkeypatch.setenv("KBH_BENCHMARK_BASELINES", "1")
+    assert benchmark_baselines_enabled("anything")
+
+
+def test_report_long_rows_keep_problem_as_column():
+    rows = long_rows(
+        [
+            {
+                "run_id": "run-a",
+                "problem": "01_fp8_gemm",
+                "harness": "codex",
+                "model": "gpt-5.5",
+                "reasoning_effort": "xhigh",
+                "correct": True,
+                "peak_fraction": 0.5,
+                "usage": {"output_tokens": 123},
+            },
+            {
+                "run_id": "run-b",
+                "problem": "01_fp8_gemm",
+                "harness": "codex",
+                "model": "gpt-5.5",
+                "reasoning_effort": "xhigh",
+                "correct": False,
+                "peak_fraction": 0.25,
+            },
+        ]
+    )
+
+    aggregate = [r for r in rows if r["scope"] == "aggregate"]
+    assert {
+        (r["problem"], r["harness"], r["model"], r["metric"], r["value"]) for r in aggregate
+    } == {
+        ("01_fp8_gemm", "codex", "gpt-5.5", "runs", "2"),
+        ("01_fp8_gemm", "codex", "gpt-5.5", "correct", "1"),
+        ("01_fp8_gemm", "codex", "gpt-5.5", "gmean_peak_fraction", "0.5"),
+    }
+
+    assert {
+        (r["run_id"], r["metric"], r["value"]) for r in rows if r["scope"] == "run"
+    } >= {
+        ("run-a", "correct", "True"),
+        ("run-a", "peak_fraction", "0.5"),
+        ("run-a", "usage.output_tokens", "123"),
+        ("run-b", "correct", "False"),
+    }
+
+    markdown = render_markdown(rows)
+    assert markdown.startswith("| problem | harness | model | reasoning_effort | run_id | scope | metric | value |")
+    assert "| 01_fp8_gemm | codex | gpt-5.5 | xhigh | run-a | run | usage.output_tokens | 123 |" in markdown

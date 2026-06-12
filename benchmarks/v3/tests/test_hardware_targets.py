@@ -5,6 +5,7 @@ from src.hardware import TARGETS, get_target, list_targets
 
 def test_all_targets_registered():
     assert "rtx3090" in TARGETS
+    assert "rtx_pro_6000" in TARGETS
     assert "h100" in TARGETS
     assert "b200" in TARGETS
     assert "m4max" in TARGETS
@@ -12,8 +13,9 @@ def test_all_targets_registered():
 
 def test_list_targets():
     names = list_targets()
-    assert len(names) == 4
+    assert len(names) == 5
     assert "rtx3090" in names
+    assert "rtx_pro_6000" in names
 
 
 def test_rtx3090_config():

@@ -364,8 +364,8 @@ export default function V3Page() {
 
       <section className="text-sm text-[var(--color-fg)] border-t border-[var(--color-border)] pt-6">
         Source data:{" "}
-        <Link href="https://github.com/Infatoshi/KernelBench-v3">
-          github.com/Infatoshi/KernelBench-v3
+        <Link href="https://github.com/Infatoshi/kernelbench.com/tree/master/benchmarks/v3">
+          github.com/Infatoshi/kernelbench.com
         </Link>
         {" · "}
         <Link href="/runs">

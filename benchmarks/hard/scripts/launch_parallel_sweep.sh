@@ -23,14 +23,24 @@ printf 'run_group\tname\tharness\tmodel\teffort\tproblem\tbudget\tpid\tlog\n' > 
 
 ROWS=(
     "codex_gpt55_xhigh|codex|gpt-5.5|xhigh"
-    "claude_opus47_max|claude|claude-opus-4-7|max"
+    "claude_opus48_max|claude|claude-opus-4-8|max"
     "zai_claude_glm51|zai-claude|glm-5.1|"
-    "opencode_glm51|opencode|zai/glm-5.1|"
     "cursor_composer25fast|cursor|composer-2.5-fast|"
     "grok_grokbuild_max|grok|grok-build|max"
     "opencode_qwen37max|opencode|openrouter-alibaba/qwen/qwen3.7-max|"
     "opencode_gemini35flash|opencode|openrouter-google-ai-studio/google/gemini-3.5-flash|"
+    "opencode_dsv4pro|opencode|deepseek/deepseek-v4-pro|"
+    "opencode_dsv4flash|opencode|deepseek/deepseek-v4-flash|"
+    "opencode_mimo|opencode|openrouter-pinned/xiaomi/mimo-v2.5-pro|"
+    "opencode_kimi|opencode|openrouter-moonshot/moonshotai/kimi-k2.6|"
 )
+
+# The opencode zai route intermittently hangs on GLM-5.1 reasoning streams
+# (DEVLOG 2026-06-09, opencode OpenAI-compatible adapter). GLM-5.1 is scored
+# via the zai-claude row; enable this diagnostic row only deliberately.
+if [ "${KBH_USE_OPENCODE_ZAI:-0}" = "1" ]; then
+    ROWS+=("opencode_glm51|opencode|zai/glm-5.1|")
+fi
 
 if [ "${KBH_USE_DIRECT_GEMINI:-0}" = "1" ]; then
     ROWS+=("gemini_gemini35flash|gemini|gemini-3.5-flash|")
@@ -40,11 +50,19 @@ if [ "${KBH_USE_MINIMAX_M3_CLAUDE:-0}" = "1" ]; then
     ROWS+=("minimax_m3_claude|minimax-claude|MiniMax-M3|")
 fi
 
+if [ "${KBH_USE_OPENROUTER_NEMOTRON:-0}" = "1" ]; then
+    ROWS+=("opencode_nemotron_ultra|opencode-nemotron|nvidia/nemotron-3-ultra-550b-a55b|")
+fi
+
+if [ "${KBH_USE_NVCF_NEMOTRON:-0}" = "1" ]; then
+    ROWS+=("nvcf_nemotron_ultra|nvcf-nemotron|nemotron-3-ultra|")
+fi
+
 if [ "${KBH_SKIP_OPENROUTER:-0}" = "1" ]; then
     FILTERED_ROWS=()
     for row in "${ROWS[@]}"; do
         IFS='|' read -r _name _harness model _effort <<< "$row"
-        if [[ "$model" == openrouter-* ]]; then
+        if [[ "$model" == openrouter-* || "$_harness" == opencode-nemotron ]]; then
             continue
         fi
         FILTERED_ROWS+=("$row")

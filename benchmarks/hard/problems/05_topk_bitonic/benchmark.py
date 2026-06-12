@@ -19,7 +19,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_ROOT))
 
 from src.eval.roofline import compute_gbps, compute_tflops, peak_fraction  # noqa: E402
-from src.eval.timing import time_fn  # noqa: E402
+from src.eval.timing import benchmark_baselines_enabled, time_variant  # noqa: E402
 from src.hardware import get as get_hw  # noqa: E402
 
 
@@ -42,12 +42,16 @@ def main():
     num_perf_trials = int(meta.get("num_perf_trials", 50))
 
     device = torch.device("cuda:0")
+    include_baselines = benchmark_baselines_enabled("05_TOPK_BITONIC")
 
-    try:
-        import sota as sota_mod
-        has_sota = sota_mod.is_available()
-    except Exception:
-        has_sota = False
+    has_sota = False
+    if include_baselines:
+        try:
+            import sota as sota_mod
+
+            has_sota = sota_mod.is_available()
+        except Exception:
+            has_sota = False
 
     sol_fractions: list[float] = []
 
@@ -71,38 +75,57 @@ def main():
         flops = _eval_formula(flops_formula, shape)
         bytes_moved = _eval_formula(bytes_formula, shape)
 
-        ms_eager = time_fn(ref_model, inputs, iters=num_perf_trials)
+        # Solution first. Baselines are diagnostics and stay opt-in so they
+        # cannot block scoring.
+        ms_sol = time_variant(
+            sol_model,
+            inputs,
+            shape_idx=shape_idx,
+            variant="solution",
+            iters=num_perf_trials,
+        )
+        tflops = compute_tflops(flops, ms_sol)
+        gbps = compute_gbps(bytes_moved, ms_sol)
+        print(
+            f"shape={shape_idx} variant=solution "
+            f"tflops={tflops:.3f} gbps={gbps:.3f} ms={ms_sol:.3f}",
+            flush=True,
+        )
 
-        try:
-            comp = torch.compile(ref_model, mode="reduce-overhead")
-            ms_comp = time_fn(comp, inputs, iters=num_perf_trials)
-        except Exception as e:
-            print(f"  [compile fallback] {type(e).__name__}: {e}")
-            ms_comp = None
+        if include_baselines:
+            ms_eager = time_variant(ref_model, inputs, shape_idx=shape_idx, variant="eager", iters=num_perf_trials)
 
-        ms_sota = None
-        if has_sota:
             try:
-                k_val = shape["k"]
-                def sota_fn(x, _k=k_val):
-                    return sota_mod.sota_forward(x, _k)
-                ms_sota = time_fn(sota_fn, inputs, iters=num_perf_trials)
+                comp = torch.compile(ref_model, mode="reduce-overhead")
+                ms_comp = time_variant(comp, inputs, shape_idx=shape_idx, variant="compiled", iters=num_perf_trials)
             except Exception as e:
-                print(f"  [sota unavailable] {type(e).__name__}: {e}")
+                print(f"  [compile fallback] {type(e).__name__}: {e}")
+                ms_comp = None
 
-        ms_sol = time_fn(sol_model, inputs, iters=num_perf_trials)
+            ms_sota = None
+            if has_sota:
+                try:
+                    k_val = shape["k"]
+                    def sota_fn(x, _k=k_val):
+                        return sota_mod.sota_forward(x, _k)
+                    ms_sota = time_variant(sota_fn, inputs, shape_idx=shape_idx, variant="sota", iters=num_perf_trials)
+                except Exception as e:
+                    print(f"  [sota unavailable] {type(e).__name__}: {e}")
 
-        for variant, ms in [
-            ("eager", ms_eager),
-            ("compiled", ms_comp),
-            ("sota", ms_sota),
-            ("solution", ms_sol),
-        ]:
-            if ms is None:
-                continue
-            tflops = compute_tflops(flops, ms)
-            gbps = compute_gbps(bytes_moved, ms)
-            print(f"shape={shape_idx} variant={variant} tflops={tflops:.3f} gbps={gbps:.3f} ms={ms:.3f}")
+            for variant, ms in [
+                ("eager", ms_eager),
+                ("compiled", ms_comp),
+                ("sota", ms_sota),
+            ]:
+                if ms is None:
+                    continue
+                tflops = compute_tflops(flops, ms)
+                gbps = compute_gbps(bytes_moved, ms)
+                print(
+                    f"shape={shape_idx} variant={variant} "
+                    f"tflops={tflops:.3f} gbps={gbps:.3f} ms={ms:.3f}",
+                    flush=True,
+                )
 
         sol_tflops = compute_tflops(flops, ms_sol)
         sol_gbps = compute_gbps(bytes_moved, ms_sol)

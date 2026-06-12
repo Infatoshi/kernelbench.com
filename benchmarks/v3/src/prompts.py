@@ -132,11 +132,59 @@ TOOLS (XML format):
 <tool_call><submit><solution_path>solution.py</solution_path></submit></tool_call>"""
 
 
+ARCH_RTX_PRO_6000 = """
+HARDWARE CAPABILITIES (RTX PRO 6000 Blackwell Workstation — SM120 / GB202 consumer Blackwell):
+- Compute capability 12.0. Consumer/workstation Blackwell, NOT the datacenter B200 (SM100).
+  SM120 and SM100 are distinct silicon with different tensor-core programming models.
+  * 96GB GDDR7 memory (~1.8 TB/s). No HBM, no NVLink, no NVSwitch, no MIG.
+  * 5th-gen tensor cores with FP4 (e2m1, nvf4, mxf4), FP6, FP8 (e4m3, e5m2), BF16, FP16, TF32, INT8.
+  * Block-scaled MMA variants (mxf4/mxf6/mxf8 with 32-element K-dim scales).
+  * Thread block clusters + distributed shared memory.
+  * TMA (bulk async copy) via `cp.async.bulk`, mbarrier sync.
+  * Uses standard `mma.sync` / `mma_async` with register-based accumulation.
+- NOT available on SM120 (these are SM100 B200-only features — do not try to emit these):
+  * tcgen05 instructions (`tcgen05.mma`, `tcgen05.ld/st`, `tcgen05.commit`, `tcgen05.fence`)
+  * Tensor Memory (TMEM) — SM120 uses SMEM+RMEM for accumulation as on SM80-SM90.
+  * 2-CTA MMA (CTA-pair MMA is SM100-only).
+- CUTLASS 4.x: arch::Sm120a; Blackwell CuTe atoms live under `cutlass/arch/mma_sm120*.h`. Use
+  example kernels under `examples/7*_blackwell_*` that target Sm120 rather than Sm100.
+- CUTLASS headers at `/opt/cutlass/include` (v4+).
+- CUDA 13 required (nvcc 13.x). Default PATH may still point at 12.8 — use
+  `/usr/local/cuda-13/bin/nvcc` or set `CUDA_HOME=/usr/local/cuda-13`.
+- Compile with: `-arch=sm_120a -I/opt/cutlass/include -std=c++17`
+- PyTorch 2.11+, Triton 3.6+ on CUDA 13.x. Triton's Blackwell codegen targets `mma` (not tcgen05).
+
+AVAILABLE KERNEL LIBRARIES (tested on SM120):
+- Working: PyTorch native, Triton `tl.dot`, torch.compile reduce-overhead, SDPA flash backend,
+  xformers memory_efficient_attention, bitsandbytes NF4, mamba-ssm selective_scan, FLA
+  (chunk_kda, chunk_linear_attn, gated_delta_rule), scattermoe, lightning-attn, liger-kernel,
+  flashinfer (CUDA_HOME must point at /usr/local/cuda-13).
+- Blocked: flash-attn prebuilt wheels (ABI mismatch vs torch 2.11 cu130), flash-attn-3
+  (no PyPI distribution on Blackwell yet).
+- CUTLASS Python CuTe DSL: `import cutlass.cute as cute`.
+
+OPTIMIZATION GUIDANCE (what actually applies on SM120):
+- For FP4/NVFP4/MXFP4 GEMM: use `mma.sync` block-scaled variants for `f16` accumulator,
+  with scale tensors in shared memory. CUTLASS exposes these via Sm120 CollectiveBuilder
+  with `OpClassBlockScaledTensorOp`.
+- For FP8 (e4m3): `mma.sync` f8f6f4 kind is the peak path; `torch._scaled_mm` is a fast way
+  to hit it from Python.
+- For BF16/FP16: plain `mma.sync` + `cp.async` double-buffered SMEM pipeline, or Triton
+  autotuned `tl.dot` (which lowers to the same instructions).
+- TMA (`cp.async.bulk`) is useful for large contiguous tile loads — same API as Hopper/SM90.
+- No TMEM, no tcgen05 — keep accumulators in registers as you would on Hopper.
+- Memory bandwidth is GDDR7-limited (~1.8 TB/s). Bandwidth-bound kernels won't match B200
+  HBM3e numbers (~8 TB/s), but compute-bound FP4/FP8 kernels are close to B200 perf.
+- CUTLASS references to study: examples with `Sm120` in their build config (not `Sm100`).
+"""
+
+
 def _get_arch_section(hardware_name: str) -> str:
     return {
         "rtx3090": ARCH_RTX3090,
         "h100": ARCH_H100,
         "b200": ARCH_B200,
+        "rtx_pro_6000": ARCH_RTX_PRO_6000,
     }.get(hardware_name, "")
 
 

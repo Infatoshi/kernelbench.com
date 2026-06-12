@@ -42,8 +42,12 @@ One harness per model, each pinned to the highest-fidelity native endpoint.
 | Minimax M2.7 | `opencode openrouter-pinned/minimax/minimax-m2.7` | OpenRouter pinned to Minimax lab (fp8) |
 | DeepSeek V4 Pro | `opencode deepseek/deepseek-v4-pro` | DeepSeek direct (api.deepseek.com) |
 | DeepSeek V4 Flash | `opencode deepseek/deepseek-v4-flash` | DeepSeek direct (api.deepseek.com) |
+| Nemotron 3 Ultra | `opencode-nemotron nvidia/nemotron-3-ultra-550b-a55b` | OpenCode via OpenRouter pinned to DeepInfra (bf16) |
+| Nemotron 3 Ultra diagnostic | `nvcf-nemotron nemotron-3-ultra` | NVIDIA NVCF shared function via local OpenAI-compatible proxy |
 
 Each configured sweep runs its selected model matrix across the 6 active CUDA problems. At a 45min cap, budget about 0.75 GPU-hours per queued run.
+
+Nemotron 3 Ultra is scored through `opencode-nemotron`, not Claude Code or Droid. OpenCode is the least distorted route because it speaks OpenAI-compatible APIs directly; Claude Code needs an Anthropic-compatible router layer for this model, and Droid is not the native endpoint for this provider. The `opencode-nemotron` harness writes an archive-local OpenCode config for each run, pins OpenRouter to DeepInfra with `allow_fallbacks=false`, and requires `OPENROUTER_API_KEY`. The NVCF route is kept only for diagnostics because the Ultra function was observed degrading/504ing.
 
 > **Codex binary note.** The harness uses the npm-distributed `@openai/codex` (currently `0.125.0`) installed at `~/.local/node-*/bin/codex`. The shell has `codex` aliased to a locally-built rust binary, but aliases don't expand inside non-interactive scripts, so the harness picks up the npm version automatically via PATH. To upgrade in the future: `npm install -g @openai/codex`.
 
@@ -62,7 +66,19 @@ uv sync
 ./scripts/patch_torch.sh
 
 # Run a single problem through a single harness
-./scripts/run_hard.sh claude claude-opus-4-7 problems/01_fp8_gemm
+uv run kbh run claude claude-opus-4-7 problems/01_fp8_gemm
+
+# Preferred Nemotron route, with OPENROUTER_API_KEY in the environment
+uv run kbh run opencode-nemotron nvidia/nemotron-3-ultra-550b-a55b problems/01_fp8_gemm
+
+# Targeted Nemotron route preflight, without running the rest of the matrix
+KBH_USE_OPENROUTER_NEMOTRON=1 KBH_PREFLIGHT_ONLY=opencode_nemotron_ultra ./scripts/preflight_harnesses.sh
+
+# Include Nemotron in broad sweeps/preflight
+KBH_USE_OPENROUTER_NEMOTRON=1 ./scripts/sweep.sh
+
+# Diagnostic Nemotron/NVCF route, with NGC_API_KEY in the environment
+uv run kbh run nvcf-nemotron nemotron-3-ultra problems/01_fp8_gemm
 
 # Full sweep (active matrix × all 6 active CUDA problems)
 ./scripts/sweep.sh

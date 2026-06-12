@@ -23,6 +23,11 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_ROOT))
 
 from src.eval.correctness import check_correctness  # noqa: E402
+from src.eval.numeric_stress import (  # noqa: E402
+    numeric_stress_cases,
+    numeric_stress_context,
+    tolerance_for_case,
+)
 
 
 def main():
@@ -68,57 +73,60 @@ def main():
         for seed in (42, 123, 456):
             torch.manual_seed(seed)
             torch.cuda.manual_seed_all(seed)
-            inputs = [t.to(device) for t in reference.get_inputs()]
+            base_inputs = [t.to(device) for t in reference.get_inputs()]
 
-            with torch.no_grad():
-                ref_values, ref_indices = ref_model(*inputs)
-                sol_out = sol_model(*inputs)
+            for case in numeric_stress_cases(meta.get("name", "")):
+                with numeric_stress_context(ref_model, sol_model, base_inputs, case) as inputs:
+                    with torch.no_grad():
+                        ref_values, ref_indices = ref_model(*inputs)
+                        sol_out = sol_model(*inputs)
 
-            if not (isinstance(sol_out, (tuple, list)) and len(sol_out) == 2):
-                print(f"FAIL: shape {shape_idx} {shape} seed {seed}: "
-                      f"solution must return (values, indices); got {type(sol_out)}")
-                sys.exit(1)
-            sol_values, sol_indices = sol_out
+                if not (isinstance(sol_out, (tuple, list)) and len(sol_out) == 2):
+                    print(f"FAIL: shape {shape_idx} {shape} seed {seed} case {case.name}: "
+                          f"solution must return (values, indices); got {type(sol_out)}")
+                    sys.exit(1)
+                sol_values, sol_indices = sol_out
 
-            # Shape checks
-            expected_shape = (shape["batch"], shape["k"])
-            if tuple(sol_values.shape) != expected_shape:
-                print(f"FAIL: shape {shape_idx} values shape {tuple(sol_values.shape)} "
-                      f"!= expected {expected_shape}")
-                sys.exit(1)
-            if tuple(sol_indices.shape) != expected_shape:
-                print(f"FAIL: shape {shape_idx} indices shape {tuple(sol_indices.shape)} "
-                      f"!= expected {expected_shape}")
-                sys.exit(1)
+                # Shape checks
+                expected_shape = (shape["batch"], shape["k"])
+                if tuple(sol_values.shape) != expected_shape:
+                    print(f"FAIL: shape {shape_idx} case {case.name} values shape "
+                          f"{tuple(sol_values.shape)} != expected {expected_shape}")
+                    sys.exit(1)
+                if tuple(sol_indices.shape) != expected_shape:
+                    print(f"FAIL: shape {shape_idx} case {case.name} indices shape "
+                          f"{tuple(sol_indices.shape)} != expected {expected_shape}")
+                    sys.exit(1)
 
-            # 1. Strict-ish values check (positional, both are sorted desc)
-            ok, msg = check_correctness(
-                ref_values.float(), sol_values.float(),
-                dtype=torch.float32,
-                override=tol_override,
-            )
-            if not ok:
-                print(f"FAIL: shape {shape_idx} {shape} seed {seed} values: {msg}")
-                sys.exit(1)
+                # 1. Strict-ish values check (positional, both are sorted desc)
+                ok, msg = check_correctness(
+                    ref_values.float(), sol_values.float(),
+                    dtype=torch.float32,
+                    override=tolerance_for_case(tol_override, case),
+                )
+                if not ok:
+                    print(f"FAIL: shape {shape_idx} {shape} seed {seed} "
+                          f"case {case.name} values: {msg}")
+                    sys.exit(1)
 
-            # 2. Lenient indices check: gather x at sol_indices, compare to ref_values.
-            # This handles ties without false negatives.
-            x = inputs[0]
-            sol_idx_long = sol_indices.to(torch.int64)
-            if sol_idx_long.min() < 0 or sol_idx_long.max() >= shape["n"]:
-                print(f"FAIL: shape {shape_idx} indices out of range "
-                      f"[{int(sol_idx_long.min())}, {int(sol_idx_long.max())}]")
-                sys.exit(1)
-            gathered = torch.gather(x, dim=-1, index=sol_idx_long)
-            ok, msg = check_correctness(
-                ref_values.float(), gathered.float(),
-                dtype=torch.float32,
-                override=tol_override,
-            )
-            if not ok:
-                print(f"FAIL: shape {shape_idx} {shape} seed {seed} indices "
-                      f"(gather mismatch): {msg}")
-                sys.exit(1)
+                # 2. Lenient indices check: gather x at sol_indices, compare to ref_values.
+                # This handles ties without false negatives.
+                x = inputs[0]
+                sol_idx_long = sol_indices.to(torch.int64)
+                if sol_idx_long.min() < 0 or sol_idx_long.max() >= shape["n"]:
+                    print(f"FAIL: shape {shape_idx} case {case.name} indices out of range "
+                          f"[{int(sol_idx_long.min())}, {int(sol_idx_long.max())}]")
+                    sys.exit(1)
+                gathered = torch.gather(x, dim=-1, index=sol_idx_long)
+                ok, msg = check_correctness(
+                    ref_values.float(), gathered.float(),
+                    dtype=torch.float32,
+                    override=tolerance_for_case(tol_override, case),
+                )
+                if not ok:
+                    print(f"FAIL: shape {shape_idx} {shape} seed {seed} "
+                          f"case {case.name} indices (gather mismatch): {msg}")
+                    sys.exit(1)
 
     _emit_framework_label()
     print("PASS")

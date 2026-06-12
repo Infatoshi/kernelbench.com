@@ -71,4 +71,4 @@ def list_targets() -> List[str]:
     return sorted(TARGETS.keys())
 
 
-from src.hardware import rtx3090, h100, b200, m4max  # noqa: E402, F401
+from src.hardware import rtx3090, rtx_pro_6000, h100, b200, m4max  # noqa: E402, F401

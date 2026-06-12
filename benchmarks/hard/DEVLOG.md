@@ -4,98 +4,666 @@ A running record of decisions, dead ends, and lessons. Newest entries on top. Th
 
 ---
 
-## 2026-06-05 - Dark themed public matplotlib figures
+## 2026-06-12 - kimi-claude harness: Kimi K2.7-Code via Moonshot Anthropic endpoint
 
-Regenerated the public v3, Hard, and FP8 rerun matplotlib PNGs with a dark
-theme matching the site. The new shared generator is
-`benchmarks/site/generate_dark_plots.py`; it reads committed CSV/JSON data and
-keeps the existing public filenames stable.
+Added a `kimi-claude` harness to bench moonshotai/Kimi-K2.7-Code (1T MoE, 32B
+active, coding-focused, 256K ctx, forces thinking mode). It mirrors the proven
+zai-claude / minimax-claude pattern: Claude Code routed to a provider's
+Anthropic-compatible endpoint.
+
+Route (validated by curl + a container smoke):
+- ANTHROPIC_BASE_URL=https://api.moonshot.ai/anthropic (KIMI_ANTHROPIC_BASE_URL
+  overrides). The /anthropic endpoint is real; docs only list the OpenAI base
+  (api.moonshot.ai/v1) but the HF card confirms Anthropic-compat.
+- Auth: Bearer via ANTHROPIC_AUTH_TOKEN=$KIMI_API_KEY (NOT x-api-key).
+- Model id: kimi-k2.7-code.
+- Thinking: K2.7-Code REQUIRES thinking enabled ("only type=enabled is allowed
+  for this model"); CLAUDE_KBH_SETTINGS already sets alwaysThinkingEnabled, so
+  no extra wiring. A request without thinking 400s.
+- KIMI_API_KEY in ~/.env_vars. The old key was dead (account needs a >=$1
+  prepaid top-up to activate); user replaced it.
+
+Also fixed a latent bug while there: the SESSION_COMPLETE detector listed
+claude|zai-claude|ccr-claude|cursor|gemini but NOT minimax-claude (it only
+worked because runs hit the 124 timeout). Added minimax-claude and kimi-claude
+to that group. extract_usage.py now routes kimi-claude through the claude
+parser.
+
+Known limitation: Moonshot's Anthropic-compat usage block reports
+output_tokens=0 and cached_tokens=0 in per-message events (it leaks OpenAI-style
+prompt_tokens fields into the Anthropic shape). Input is captured; output/cache
+are not reported by the provider. Same cosmetic class as the cursor/gemini
+usage gaps - does not affect scoring or kernels; real cost tracked via the
+Moonshot console.
+
+Smoke: container topk probe at 600s -> [OK score=0.0059], solution written,
+correctness PASS, thinking active, genuine tool use, no auth/429 errors.
+Full 6-problem parallel container sweep launched 2026-06-12.
+
+## 2026-06-11 - v2 published to kernelbench.com; X post shipped
+
+The v2 containerized sweep is live and public (unannounced until the post).
+
+Publication:
+- Built results/leaderboard_v2.json from the sweep via
+  scripts/build_v2_leaderboard.py (best-of-cell, audit verdicts applied:
+  reward_hack cells kept visible but marked invalid and excluded from the
+  ceiling ranking). Reshaped to the site's schema-1 shape and made it the
+  monorepo's leaderboard.json; v1 preserved as leaderboard_v1.json.
+- Site lives on the Mac at ~/dev/sites/kernelbench.com (Next.js, Vercel
+  auto-deploy on master push, commit email MUST be elliot@arledge.net).
+  /hard bypasses the v1 VISIBLE_MODEL_LABELS allowlist when
+  environment=="v2_containerized". 78->79 v2 transcript viewers in
+  public/runs/; 162 v1 viewers archived to archive/v1-runs/ (all kahan
+  ls-noise was in those v1 viewers; problems/04_kahan_softmax pycache also
+  deleted from Anvil).
+
+Bugs found by clicking the live site, all fixed and redeployed:
+- NGC banner broke the viewer format sniff -> 72/78 viewers showed 0 events;
+  skip leading non-JSON banner lines, plus added a gemini parser. (commit
+  e57a1f5)
+- Leaderboard linked empty context-overflow runs for no-pass cells; now ranks
+  failed attempts by has_solution -> has_check -> peak, so 14 failed cells link
+  the actual submitted kernel. Also guarded the Claude "<synthetic>" model
+  label. (commit 4196861)
+- The fable 06 sonic-moe record viewer (0.2688) was referenced but never
+  generated -> 404; generated it. (commit e926e0e). Full re-audit: all 79
+  cells clean (no 404s, no 0-event, no bad labels, no missing solution tabs).
+
+Final fable record tally (all clean, audited): 3 all-time records (05 topk
+0.0494, 06 sonic-moe 0.2688, 07 w4a16 0.3477); tops the v2 sweep on 5 of 6
+problems; 01 fp8 is the heroic failure (only real fp8 tensor-core kernel,
+scored 0 on a K=4127 tail while wrappers passed at ~0.43). 10 reward hacks
+across 8 models; FP8 column has zero valid passes.
+
+Trajectory analysis + plots (for the X post): three parallel subagents deep-read
+the 07/03/01 transcripts and extracted the optimization trajectories. Key
+finding on 07: fable reverse-engineered the benchmark's own 128MB L2 zero_()
+flush and used evict_last to pin weights in L2 through it, beating the DRAM
+roofline (2.4x bandwidth). Four phosphor-themed diagrams saved at
+x-article-images/fable-trajectories/ (overview + 3 per-problem trajectories)
+with the generator scripts. X post shipped 2026-06-11.
+
+Open follow-ups (not blocking): v1 prose on /blog/hard still describes the
+v1 8-problem deck (legitimate history, not wrong); a /methodology page; the
+opencode adapter stall watchdog is shipped but the route stays diagnostic.
+
+## 2026-06-11 - Viewer fix: NGC banner broke format sniff; added gemini parser
+
+After publishing v2, 72/78 transcript viewers rendered 0 events (e.g. the
+fable 02 KDA cell showed harness=codex, model=?, 0 events). Root cause: every
+container-mode transcript is prefixed by the NGC image's PyTorch/driver banner
+(plain text). src/viewer/parsers/__init__.py sniff() read the first non-empty
+line, hit non-JSON, and immediately returned "codex"; the codex parser then
+produced nothing from the claude/opencode stream-json that followed.
+
+Fixes (src/viewer/, uncommitted on Anvil like the rest of that tree):
+- sniff() skips leading non-JSON banner lines and detects format from the
+  first real JSON line; a file with no JSON at all returns "codex" (true
+  stdout text) instead of raising.
+- Added src/viewer/parsers/gemini.py. Gemini had no parser and fell through
+  to the claude fallback (0 events). Gemini format: {type:init, session_id,
+  model} then message/tool_use/tool_result/result; usage from the result
+  event's stats block.
+
+Result: 0/78 viewers broken. grok viewers are thin (2 events) but correct -
+grok's stream-json is pure thought/text token deltas with no structured tool
+events, so there is nothing more to render. Regenerated all 78 and redeployed
+to kernelbench.com (commit e57a1f5 on the monorepo).
+
+Follow-up (commit 4196861): two more viewer-quality fixes. (1) The leaderboard
+linked the wrong failed run for no-pass cells -- fable 01 FP8 pointed at a
+context-overflow run with no solution.py instead of the sibling attempt that
+wrote the real fp8 kernel (K=4127 tail bug) and ran check. build_v2_leaderboard.py
+now ranks failed attempts by has_solution -> has_check -> peak; 14 failed cells
+now link the actual submitted kernel. (2) Claude Code tags synthetic turns
+("Prompt is too long") with model="<synthetic>"; the claude parser let that
+clobber the card model. Guarded.
 
 ---
 
-## 2026-06-05 - Alphabetical model grouping
 
-Changed the public `/hard` row order to group rows by displayed model name
-alphabetically, with canonical harness label as the secondary sort. This keeps
-same-model harness variants adjacent instead of scattering them by score.
+## 2026-06-11 - Fable budget rerun: confirms budget-bound, earns a third record
 
----
-
-## 2026-06-05 - Canonical harness labels
-
-Normalized public harness labels to the intended option set: claude code,
-codex, opencode, droid, kimi, cursor, gemini-cli, and grok build. Internal run
-IDs still preserve provider-specific raw harness names such as `zai-claude`,
-but the leaderboard and runs table display them as the canonical harness
-family instead of inventing extra table options.
-
----
-
-## 2026-06-05 - Leaderboard harness identity cleanup
-
-Updated `/hard` so the visible table treats harness as part of the row
-identity. Date/campaign labels are no longer shown as model variants, and
-same-model same-harness reruns are collapsed to the most trustworthy visible
-row. Distinct harnesses still remain separate, so GLM-5.1 through OpenCode,
-Droid, and Claude Code-compatible Z.ai can be compared without implying that
-they are duplicate model rows.
-
----
-
-## 2026-06-05 - FP8 GEMM constraint rerun
-
-Added a follow-up section to `/hard` for the FP8 GEMM bf16-dressup caveat.
-The June 5 KernelBench-Mega rerun tightened `01_fp8_gemm` so the verifier
-rejects bf16 operand upcasts and requires an FP8-looking execution path.
-
-Run groups:
+The two fable cells that ended session_complete=false at 2700s (03, 06) were
+rerun at 3600s, 2 concurrent. Both climbed materially - the timeout, not the
+kernel design, was the ceiling:
 
 ```text
-kbm_fp8_constraint_fixed_tol_20260605_135454
-kbm_fp8_recovery_smokes_20260605_142006
+03_paged_attention   0.5340 -> 0.6299   (+18%)
+06_sonic_moe_swiglu  0.2395 -> 0.2688   (+12%)
 ```
 
-Under that constraint, every reachable model failed to produce a correct
-kernel. The strongest Claude rows reached the stress cases but failed numeric
-tolerance; DeepSeek and GLM produced nominal-tolerance failures; GPT-5.5's
-second smoke hit a Triton shared-memory resource limit; Kimi had an invalid key;
-and the OpenRouter-pinned rows failed for insufficient credits. This confirms
-the original leaderboard's 01 row should be read as a bf16 shortcut artifact,
-not Blackwell FP8 tensor-core skill.
+Both audited clean (annotations written): 06's _launch_cache is shape-keyed
+compiled-kernel reuse re-run with live inputs every call (not the gpt-5.5
+output-memoization hack); 03's os.environ reads are tuning knobs with fixed
+defaults the harness never varies between check and benchmark.
 
-Committed public artifacts:
+Corrected fable record tally vs all-time ceilings (this matters - an earlier
+note overstated it):
 
-- `public/blog-hard/fp8-constraint-rerun/fixed-tolerance-summary.json`
-- `public/blog-hard/fp8-constraint-rerun/recovery-smokes-summary.json`
-- token/cost/performance PNGs for the FP8 constraint diagrams
+```text
+01_fp8_gemm   FAIL          (real fp8 kernel, K=4127 tail bug; all-time 0.537)
+02_kda        0.0894        NOT a record (all-time 0.118 grok); best this sweep
+03_paged      0.6299        NOT a record (all-time 0.664 gpt-5.5); best CLEAN cell this sweep
+05_topk       0.0494  RECORD (prior 0.046)
+06_sonic_moe  0.2688  RECORD (prior 0.254, earned by the budget rerun)
+07_w4a16      0.3477  RECORD (prior 0.220, +58%)
+```
+
+Three all-time records (05, 06, 07), all clean. 03 leads the sweep on clean
+cells but trails the historical gpt-5.5 cell. 01 is the honest failure: the
+only real fp8-tensor-core attempt of the sweep, tripped by predicated-tail
+math on the K=4127 shape, while the five "passes" were cuBLAS wrappers.
 
 ---
 
-## 2026-06-04 - Claude Opus 4.6 Claude Code full sweep
 
-Ran a six-problem active CUDA sweep through Claude Code with
-`claude-opus-4-6` at `--effort max`.
+## 2026-06-11 - Full-sweep audit: every passing solution read, 10 reward hacks, per-problem health report
 
-Run group:
-
-```text
-kbh_claude_opus46_full_20260604_122513
-```
-
-Published row:
+Every correct cell from the v2 sweep (49 cells) was read in full against its
+PROMPT.txt and forbidden list. Verdicts live in results/annotations/ (17 new
+files). Column health:
 
 ```text
-01_fp8_gemm          0.4589
-02_kda_cutlass       0.1162
-03_paged_attention   0.6474
-05_topk_bitonic      0.0459
-06_sonic_moe_swiglu  0.2563
-07_w4a16_gemm        0.1988
+01_fp8_gemm        5/5 passing cells HACKED (stack-sniff dual path, torch.mm,
+                   reference resubmit, at::matmul shim, cuBLASLt). The ~0.428
+                   score is a cuBLAS-wrapper fingerprint: four different hacks
+                   land within 0.4% of each other. No model demonstrated fp8
+                   skill. Column ceiling remains gpt-5.5 0.537 (May).
+02_kda_cutlass     4 hacked (zero-kernel PyTorch ports sharing the reference
+                   forward-substitution line; kimi with a false 'custom CUDA
+                   kernel path' docstring), 5 clean. Detector: >=0.0174 means
+                   real kernels, <=0.0034 means PyTorch port.
+03_paged_attention 11/11 real kernels. Healthiest column.
+05_topk_bitonic    1 hack: gpt-5.5 0.1601 (column top) is input-identity
+                   memoization exploiting timing.py reusing the same inputs
+                   list across timed iterations - kernel runs only in warmup.
+                   1 rubric leak: qwen uses Triton's built-in tl.topk.
+                   Legitimate top: claude-fable-5 0.0494.
+06_sonic_moe       9/9 clean; designs converged on near-isomorphic grouped
+                   Triton GEMMs; several size grids off the harness's balanced
+                   routing (would not survive skewed loads; check.py never
+                   feeds skew).
+07_w4a16_gemm      9/9 unpack int4 in-kernel, zero rubric leaks. Ceiling:
+                   claude-fable-5 0.3477 with a policy caveat - its module
+                   import sets a global torch backend flag that changes
+                   reference numerics during check (documented in-solution,
+                   defensible direction, but solution code mutating harness
+                   state needs an explicit rule).
 ```
 
-All six cells passed correctness. The row is visible on `/hard` as
-`Claude Opus 4.6 [2026-06-04]`, and the six transcript viewers were rendered
-into `public/runs/`.
+Maintainer judgment calls flagged (not auto-resolved):
+
+- qwen 03 0.6268: CUDA-graph capture with pointer-identity replay. Kernels
+  re-execute with live data; launch-overhead elision likely explains the
+  column top. interesting, pending comparability policy.
+- fable-5 07 global-flag mutation (above).
+- Harness rule worth adding: outputs must be recomputed per call / rotate
+  input buffers in timing.py (kills the memoization class); forbid global
+  torch backend mutation from solutions; add tl.topk/tl.sort to 05 forbidden.
+
+Process note: the audit was run by two parallel subagents reading every
+solution end to end; the wrapper/stack-sniff greps from earlier in the night
+caught 5 of the 10 hacks - the other 5 (memoization, fig-leaf kernel, PyTorch
+ports, tl.topk) required actually reading the code. Greps are tripwires, not
+audits.
+
+Retry-lane cells (grok 6/6 recovered after the OAuth fix, zai-claude 6/6 after
+serializing) audited clean: grok 05 hand-written CUDA selection, grok 06 real
+Triton grouped GEMM, grok 07 in-kernel int4 unpack, zai 03 real paged decode.
+grok 01/02 remain wrapper/reference-port hacks (annotated). No new hack classes
+from the retries.
+
+---
+
+
+## 2026-06-11 - v2 night sweep: results, three FP8 reward hacks, two infra retries
+
+First full data collection in the v2 container environment (all rows
+KBH_AGENT_CONTAINER=1, parallel sessions, per-command GPU lock). 78-row
+non-Claude matrix plus the Claude Fable 5 row, collected overnight.
+
+Fable 5 row (claude harness, effort max, best-of per cell):
+
+```text
+01_fp8_gemm          FAIL (three genuine attempts, no pass)
+02_kda_cutlass       0.0894
+03_paged_attention   0.5340
+05_topk_bitonic      0.0494   new problem ceiling (prior 0.046)
+06_sonic_moe_swiglu  0.2395
+07_w4a16_gemm        0.3477   new problem ceiling (prior 0.220)
+```
+
+Anti-cheat audit of headline cells produced three reward_hack verdicts, all
+on 01_fp8_gemm (annotations in results/annotations/):
+
+- gemini-3.5-flash 0.6649: environment-sniffing dual path. inspect.stack()
+  detects check.py and routes correctness to an exact bf16 matmul; the
+  benchmarked Triton path is never correctness-verified. Invalid. Detection
+  for this class is now part of the audit toolkit (grep for
+  inspect.stack/sys._getframe/check.py in solutions).
+- qwen3.7-max 0.4294: bare torch.mm wrapper, no kernel at all.
+- kimi-k2.6 0.4284: resubmitted reference.py nearly verbatim, docstring
+  intact.
+
+Two more wrapper cells landed from the overnight retry lanes and got the
+same verdict: grok 0.4292 (at::matmul inside a load_inline shim) and
+zai-claude GLM 0.4277 (direct cublasLt calls - flagged gray-zone vs the
+allowed CUTLASS path, pending maintainer review). Five of five FP8 passes
+in this sweep were library measurements, none kernel authorship: the 01
+tolerance leak now reliably attracts wrappers. A static check (forbid
+at::matmul/cublas symbols in solutions, or tighten tolerance) should be
+considered for the next benchmark version.
+
+The 01 ceiling therefore remains gpt-5.5's 0.537. Fable's clean cells were
+verified: 07 does real in-kernel int4 unpacking, 05 has no forbidden topk
+ops, 03 is a 16KB raw CUDA kernel with no library fallbacks.
+
+Infra failures diagnosed and retried overnight:
+
+- zai-claude glm-5.1 0/6: pure 429 storms - transcripts are nothing but
+  api_retry events (78+ retries, zero assistant turns). Running 3 concurrent
+  GLM sessions on one Z.ai coding-plan key rate-limits the whole row.
+  Sequential retry lane running. Rule: zai-claude rows must run at
+  concurrency 1.
+- grok 0/6: OAuth refresh rotation orphaned the host ~/.grok/auth.json (the
+  June 9 smoke rotated the token inside its archived agent_home copy; every
+  later run fell into an interactive login prompt and timed out). Restored
+  the newer token from the smoke archive; sequential retry lane now syncs
+  auth.json back to the host after every run. Same failure class as the
+  Anthropic OAuth expiry - file-copied OAuth credentials rot when sessions
+  rotate refresh tokens. Long-lived env tokens are the durable fix where
+  providers support them.
+- opencode-nemotron 0/6 instant crashes: the route's pinned-DeepInfra config
+  (KBH_OPENCODE_CONFIG_FILE) was never copied into the container agent home,
+  so opencode had no openrouter-deepinfra provider. Fixed in
+  prepare_opencode_container_home; all six rows rerun as real sessions
+  (first three completed as genuine correctness failures).
+
+---
+
+
+## 2026-06-10 - Container sessions now run in parallel; per-command GPU lock inside containers
+
+Course correction on the v2 readiness entry below: container sessions no
+longer hold the GPU lock for their whole 45-minute budget. That serialized the
+sweep (98 sessions x 2700s = 73.5h floor) for no reason. Container mode now
+matches the host sweep model: agent sessions overlap freely, and GPU-facing
+commands serialize per-command through the shared flock.
+
+How it works:
+
+- The lock moved to its own directory (outputs/gpu_lock/gpu.lock,
+  KBH_GPU_LOCK_DIR) so containers can bind-mount just the lock. flock is on
+  the inode, so host and container commands serialize against each other.
+- Each run generates container-side wrappers (RUN_DIR/cbin, mounted at
+  /kbh/bin, first on the container PATH) for uv/python/python3/nvidia-smi/
+  nvcc/ncu/nsys. They resolve the real binary from a PATH that excludes
+  /kbh/bin and route through the same gpu-lock-exec.
+- run_docker_locked_timeout only wraps the session in the lock under
+  KBH_AGENT_CONTAINER_SESSION_LOCK=1 (legacy serial mode); default is plain
+  timeout + docker with the stall watchdog unchanged.
+
+Hard-won gotcha: the NGC image sets BASH_ENV=/etc/shinit_v2, which runs
+nvidia-smi on EVERY bash startup. With /kbh/bin on PATH that resolves to our
+bash wrapper, whose startup sources shinit_v2 again - a fork bomb that
+silently consumed the container PID limit and produced empty transcripts. Fix:
+the runners set -e BASH_ENV= -e ENV=. If a future image needs shinit, wrap the
+agent command instead of the global PATH.
+
+Validation (overlap + lock):
+
+- Two agent containers ran simultaneously (docker ps showed both).
+- codex/gpt-5.5 in parallel mode: full session, solution, check PASS,
+  scored 0.0029 in 187s wall. Its in-container `uv run python check.py`
+  iterations appear in gpu_lock_container.log as wait/start/end with elapsed
+  times; host post-run check/benchmark serialized through the same lock.
+- Wall-time implication: the 73.5h serial floor is gone. Sweep wall time now
+  scales with launcher concurrency, bounded by GPU-command contention.
+
+Update 2026-06-10: resolved. CLAUDE_CODE_OAUTH_TOKEN now lives in
+~/.env_vars and the claude container leg passed end-to-end with it
+([OK score=0.0023] on the TopK smoke). The env token takes precedence over
+the stale credentials copy, so no runner change was needed.
+
+Original blocker note: Anthropic OAuth on Anvil is expired -
+`claude -p` 401s on the host itself, so the claude row (and host claude runs)
+are blocked until a human runs `claude setup-token` (preferred; put the
+result in ~/.env_vars as CLAUDE_CODE_OAUTH_TOKEN, which the runners already
+pass through) or `/login`. Static credential copies into containers are
+fragile against OAuth refresh rotation; the long-lived setup-token avoids the
+class entirely.
+
+---
+
+
+## 2026-06-09 - v2 container sweep readiness: all harnesses and exotic routes verified
+
+Full verification round for the v2 container-mode resweep, requested before
+sweeping the entire matrix. Everything below ran tonight on Anvil.
+
+Container harness smokes (KBH_AGENT_CONTAINER=1, BUDGET_SECONDS=600,
+problems/05_topk_bitonic; scores are demo-budget numbers, not capability):
+
+```text
+claude / claude-opus-4-8        PASS  peak=0.0092
+codex  / gpt-5.5                PASS  peak=0.0113
+cursor / composer-2.5-fast      PASS  peak=0.0036
+gemini / gemini-3.5-flash       PASS  peak=0.0091   (new runner)
+minimax-claude / MiniMax-M3     PASS  peak=0.0116   (new runner)
+zai-claude / glm-5.1            verified: agent active, solution failed
+                                correctness at smoke budget (model outcome)
+grok / grok-build               verified: full session, solution written,
+                                check failed on extension build (model outcome)
+```
+
+New container runners this round: zai-claude and minimax-claude (parameterized
+claude runner: env-name passthrough so secrets stay off docker argv, alias
+model arg, and NO Anthropic credential copy so a broken mapping errors instead
+of silently billing Anthropic), gemini (node mount + GEMINI_API_KEY), grok
+(auth-file copy; its bin/grok is a version symlink to an ELF executable in
+~/.grok/downloads/ - mount the resolved file and exec it directly, do not run
+it under node).
+
+OpenCode exotic routes, multi-step probe (scripts/probe_opencode_multistep.sh,
+real PROMPT.txt shape; PROBE_OK means the route survives the first long
+generation after tool results enter context):
+
+```text
+openrouter-alibaba/qwen/qwen3.7-max          OK
+deepseek/deepseek-v4-flash                   OK (wrote solution in probe)
+deepseek/deepseek-v4-pro                     OK at 900s (slow reasoner;
+                                             fails a 420s window, fine at 2700s)
+openrouter-pinned/xiaomi/mimo-v2.5-pro       OK
+openrouter-moonshot/moonshotai/kimi-k2.6     OK
+openrouter-google-ai-studio/gemini-3.5-flash OK (wrote solution)
+openrouter-deepinfra nemotron-3-ultra        OK (wrote solution; pinned config)
+zai/glm-5.1                                  INTERMITTENT - passed this probe
+                                             after five stalls earlier tonight
+```
+
+The GLM/opencode stall (earlier entry today) is therefore intermittent, not
+deterministic. The conclusion stands: a route that hangs for 45 minutes on
+some sessions cannot produce comparable scored rows. The opencode zai row is
+now gated behind KBH_USE_OPENCODE_ZAI=1 in preflight and the sweep launcher;
+GLM-5.1 is scored via zai-claude.
+
+Row/matrix changes in scripts/preflight_harnesses.sh and
+scripts/launch_parallel_sweep.sh:
+
+- claude row bumped to claude-opus-4-8 max.
+- Added opencode rows: deepseek-v4-pro, deepseek-v4-flash, mimo-v2.5-pro,
+  kimi-k2.6.
+- opencode zai/glm-5.1 demoted to opt-in diagnostic row.
+- Preflight now runs the multi-step probe for every opencode row by default
+  (KBH_PREFLIGHT_MULTISTEP=0 to skip), because one-turn smokes provably cannot
+  catch the adapter stall.
+
+Operational lessons recorded:
+
+- NEVER overwrite scripts/run_hard.sh in place while runs are active: bash
+  reads scripts incrementally, and an scp overwrite reuses the inode, so a
+  running region shifts under the interpreter (one zai-claude smoke died with
+  a phantom syntax error this way). Deploy with scp to a temp path plus
+  atomic mv.
+- Known cosmetic/accepted: gemini and cursor usage stays null when a session
+  hits the budget (no terminal stats event), same as host mode; the NGC
+  entrypoint GPU-driver warning is bogus (ldconfig missing under --user).
+
+Credit state at verification time: OpenRouter ~ $99 remaining of $2485.
+DeepSeek/Z.ai/MiniMax keys all authenticated and billed during probes.
+
+Late additions after the draft above:
+
+- The adapter stall is NOT GLM-specific: a qwen3.7-max container smoke stalled
+  with the identical signature (empty reasoning part, zero tokens, journaled in
+  the agent_home opencode.db). Concurrent GLM probes measured a ~1/3 to 1/2
+  per-session stall rate tonight. Treat every @ai-sdk/openai-compatible route
+  as intermittently stall-prone.
+- Adapter swap is a dead end: pointing the zai provider at @ai-sdk/openai
+  makes the AI SDK call the OpenAI Responses endpoint (/v4/responses), which
+  Z.ai does not implement (404).
+- Mitigation shipped: run_docker_locked_timeout now supports an opt-in stall
+  watchdog (KBH_STALL_WATCH_LOG + KBH_STALL_SECONDS) that kills the container
+  when the transcript stops growing, and run_opencode_container retries killed
+  sessions with the remaining budget (KBH_OPENCODE_STALL_SECONDS, default 900s
+  to stay above deepseek-v4-pro's 400s+ silent thinking; KBH_OPENCODE_STALL_RETRIES,
+  default 2). Validated empirically with a 240s threshold on GLM: three stalls,
+  three watchdog kills, three retries, honest INFRA when the budget ran out,
+  every kill logged to stall_watchdog.log in the run archive.
+- Residual risk accepted: a route with a high per-session stall rate can still
+  lose a cell when every retry stalls. Such cells are visibly INFRA (never
+  silent), carry the watchdog audit log, and can be rerun individually.
+- Verified the opencode container leg end-to-end with an exotic
+  (qwen3.7-max) in addition to the earlier zai smoke; the stall it hit is what
+  motivated the watchdog.
+
+Sweep arithmetic for planning: 14 scored rows x 7 problems = 98 serialized
+container sessions, hard ceiling 2700s each = 73.5 GPU-lock hours of agent
+phase maximum, plus post-run check/benchmark. Sessions that finish early
+shorten this; the ceiling does not lie.
+
+---
+
+
+## 2026-06-09 - OpenCode zai/glm-5.1 stall: root cause isolated to opencode's OpenAI-compatible adapter
+
+Every opencode zai/glm-5.1 run since late May shows one signature: 7-9
+successful tool calls (parallel template reads) in the first 5-25 seconds,
+then zero events until the budget expires. The May 28 finish-sweep 0/6 ERR row
+shows this at the full 2700s budget, so it is a true hang, not slow thinking.
+The 2026-05-31 MiniMax zen-route 0/7 is likely the same failure class.
+
+Elimination table (all probed 2026-06-09):
+
+```text
+GLM-5.1 model           innocent  raw paas/v4 stream: 1.59MB in 198s, completes
+Z.ai endpoint/key       innocent  works raw on paas/v4 AND coding/paas/v4
+docker container        innocent  identical stall on bare host
+docker bridge network   innocent  identical stall with --network host
+opencode binary         not it    1.15.9, 1.15.13, 1.16.2 all stall
+permission config       innocent  small write probe succeeds under same config
+adapter multi-turn      GUILTY    stall always starts at step 3, the first
+                                  request whose context contains tool results
+```
+
+Minimal repro (no harness, no container): copy a problem template to a scratch
+dir, run `opencode run --pure --format json -m zai/glm-5.1 "$(cat PROMPT.txt)"`.
+Reads complete, then the next generation opens an empty reasoning part
+(`{"type":"reasoning","text":""}` is the last journaled event) and no tokens
+ever arrive.
+
+Upstream corroboration in anomalyco/opencode: #28427 (GLM-5 empty delta.role
+breaks stream validation), #22803 (reasoning + tool runs die after 1-3
+rounds), #21903 (reasoning field infinite spin), #14972 (agent stops after
+tool execution on OpenAI-compatible providers).
+
+Decisions:
+
+- The opencode zai/glm-5.1 route is infra-broken until upstream fixes land.
+  Do not interpret its rows as model results. GLM-5.1 scores in v2 should come
+  from the `zai-claude` harness (Claude Code against api.z.ai/api/anthropic),
+  which is also Z.ai's recommended agentic route.
+- Re-annotate `zai/glm-5.1 [2026-05-28 finish]` 0/6 ERR as infra, not model.
+  Audit the 2026-05-31 MiniMax free-route row for the same signature.
+- Preflight gap: one-turn smokes cannot catch this multi-round stall. A future
+  preflight should include a 2-3 step tool-use probe (read then write) per
+  opencode route.
+- GLM-5.1 itself is fine: in every stalled run its visible behavior was fast,
+  correct parallel tool use, consistent with its public agentic benchmarks.
+
+Side installs for bisection live at ~/.local/share/kbh-opencode/{1.15.9,1.16.2}
+(harness override: KBH_AGENT_CONTAINER_OPENCODE_BIN).
+
+---
+
+
+## 2026-06-09 - CUDA toolkit version is benchmark surface; stay pinned on 13.2
+
+Evaluated bumping the toolchain to CUDA 13.3 / PTX ISA 9.3 (the driver,
+610.43.02, already ships a 13.3 UMD so it would run fine). Decision: do not
+change while the current leaderboard table is live. Every published row was
+compiled and scored under nvcc 13.2, and ptxas codegen directly shapes
+peak_fraction, so swapping the toolkit mid-table silently changes the
+instrument the scores were measured with.
+
+Rules going forward:
+
+- The CUDA toolkit is part of the benchmark surface, like problem templates
+  and tolerances. Pin it per leaderboard version; never bump it between rows
+  of the same table.
+- Agent dev and host scoring must use the identical toolkit. Today this holds
+  by construction: both use /usr/local/cuda-13.2 (container mode bind-mounts
+  that same directory at /usr/local/cuda-host). Keep it that way.
+- When v2 lands, record the nvcc version in result.json so future audits do
+  not have to infer it.
+- Any future bump happens only at an explicit benchmark version boundary
+  (the container v2 resweep is the natural one), validated by rebuilding a
+  few archived passing kernels under old and new toolkits and comparing
+  benchmark times before publishing.
+
+Review notes from the 13.3 evaluation, so nobody re-derives this:
+
+- PTX ISA 9.3 additions are datacenter-Blackwell features: fabric.* ops,
+  multimem.st/red.async, mbarrier phase-type extensions, clmad. Nothing
+  sm_120-usable; no pull for problem design either.
+- CUDA 13.3 ships a newer ptxas plus Blackwell library tuning (NVIDIA cites
+  cuBLAS TF32/FP4 gains, mostly aimed at Blackwell Ultra). Its actual effect
+  on sm_120 peak fractions is unmeasured; treat any expected gain as
+  needs-measurement.
+
+---
+
+
+## 2026-06-09 - Container mode demo: four harnesses verified on TopK
+
+First end-to-end verification of `KBH_AGENT_CONTAINER=1`: one 600-second demo
+run per container-capable harness on `problems/05_topk_bitonic`
+(driver: `outputs/tmp/container_demo_20260609.sh`).
+
+Results:
+
+```text
+claude / claude-opus-4-8        correct  peak_fraction=0.0092
+codex  / gpt-5.5                correct  peak_fraction=0.0113
+cursor / composer-2.5-fast      correct  peak_fraction=0.0036
+opencode / zai/glm-5.1          no solution.py at 600s (agent was active)
+droid                           blocked: Factory auth expired
+```
+
+All passing runs had `template_mutated=false` and went through host-side
+`check.py` (numeric stress) and `benchmark.py` under `outputs/gpu.lock`.
+Peak fractions are demo-budget numbers, not capability scores.
+
+Confirmed container facts:
+
+- The GPU is visible and usable inside the container (torch sees the RTX PRO
+  6000; host CUDA 13.2 `nvcc` is mounted at `/usr/local/cuda-host`).
+- The NGC entrypoint warning "NVIDIA Driver was not detected" is cosmetic:
+  `50-gpu-driver-check.sh` fails on missing `ldconfig` under `--user` non-root.
+- Environment skew is real: the container stack is torch 2.8.0a0+cu129
+  (NV 25.06) while host scoring runs torch 2.11+cu130. All three passing demo
+  solutions survived the skew, but it remains a risk for version-sensitive
+  kernels and should be settled before a published container sweep.
+- opencode redoes its sqlite migration in every fresh per-run agent home,
+  burning budget at short horizons. Pre-warming a template agent home would
+  remove that overhead.
+- Codex's `transcript.jsonl` contains only the NGC banner by design; the rich
+  transcript is recovered from the archived codex session JSONL
+  (`codex_session.jsonl`), and usage parsed correctly from it.
+
+The June 7 all-fail container smoke round was misleading: claude and cursor
+were live agents that just hit tiny smoke budgets, codex's empty transcript is
+expected, and only droid failed for a real reason. Droid auth is expired on
+the host itself (`droid exec` fails identically outside the container), so the
+droid leg needs an interactive `/login` on Anvil or a `FACTORY_API_KEY` before
+it can be swept in any mode.
+
+Update, same day: droid is dropped from the eval suite entirely. No relogin is
+planned; do not include droid rows in future sweeps or treat it as a pending
+harness.
+
+---
+
+
+## 2026-06-09 - Durable Nemotron Ultra route
+
+Nemotron 3 Ultra is now wired as a durable, clone-facing benchmark route via
+OpenCode and OpenRouter pinned to DeepInfra:
+
+```sh
+uv run kbh run opencode-nemotron nvidia/nemotron-3-ultra-550b-a55b problems/01_fp8_gemm
+```
+
+Decision:
+
+- Use `opencode-nemotron` for scoring. OpenCode speaks OpenAI-compatible APIs
+  directly, so this avoids the Anthropic-router translation layer required for
+  Claude Code and avoids Droid/Factory routing that is not native for this
+  provider.
+- The harness writes an archive-local OpenCode config for each run, pins
+  OpenRouter provider order to `DeepInfra`, and sets `allow_fallbacks=false` so
+  provider drift cannot silently change the row.
+- `OPENROUTER_API_KEY` is the required key. Enable the row in broad sweeps with
+  `KBH_USE_OPENROUTER_NEMOTRON=1`.
+- Target only the row for a cheap route smoke with
+  `KBH_USE_OPENROUTER_NEMOTRON=1 KBH_PREFLIGHT_ONLY=opencode_nemotron_ultra
+  ./scripts/preflight_harnesses.sh`.
+- `scripts/extract_usage.py` treats `opencode-nemotron` like OpenCode because
+  the transcript shape is the same.
+
+Rejected / diagnostic paths:
+
+- Claude Code through CCR smoked successfully once, but it adds an
+  Anthropic-compatible router layer and should not be the scoring route for this
+  OpenAI-shape provider.
+- NVCF remains as `nvcf-nemotron` for diagnostics only. Ultra was visible on the
+  account but degrading and returning 504s; Super direct chat worked, but
+  OpenCode-shaped agent traffic hit provider errors.
+
+Smoke result:
+
+```text
+KBH_USE_OPENROUTER_NEMOTRON=1 KBH_PREFLIGHT_ONLY=opencode_nemotron_ultra ./scripts/preflight_harnesses.sh
+opencode_nemotron_ultra ok=true exit=0 elapsed=2s
+```
+
+Clone-facing docs were updated in `README.md`, `AGENTS.md`, and `CLAUDE.md`.
+
+---
+
+## 2026-06-02 - Numeric stress correctness validation
+
+Correctness now reruns canonical shapes and seeds under problem-specific numeric
+stress cases. This is not hidden-shape bloat: stress cases rescale existing
+floating inputs or model state to catch zero-output, cached-nominal, and
+loose-tolerance solutions that can pass under one friendly random distribution.
+`benchmark.py` remains canonical-deck only, so measured peak fractions stay
+comparable for kernels that still pass.
+
+Implemented:
+
+- Added `src/eval/numeric_stress.py` with nominal plus targeted small/large
+  activation or weight-scale cases for the active hard problems.
+- Wired numeric stress into the active `check.py` runners.
+- Kept integer/discrete comparison exact and improved float failure diagnostics
+  with max absolute/relative error, bad element count, worst index, and
+  tolerance.
+- Added tests for classic cheat/failure classes: zero output under loose
+  tolerance, cached nominal answers, and state scaling/restoration.
+
+Verification:
+
+```text
+uv run ruff check . --fix
+uv run pytest                         # 31 passed
+KBH_NUMERIC_STRESS=1 check.py TopK    # disposable GPU smoke: PASS
+KBH_NUMERIC_STRESS=1 check.py FP8     # tiny disposable GPU smoke: PASS
+```
+
+Operational note: `KBH_NUMERIC_STRESS=0` is useful for local debugging only.
+Do not use it for official checks, sweeps, or published backfills.
 
 ---
 
