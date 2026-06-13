@@ -79,3 +79,30 @@ Other commands: `kb run <harness> <model> <problem>` (one problem), `kb dev`
   re-add.
 - See `benchmarks/hard/DEVLOG.md` for the full journey and `SPEC.md` for
   methodology.
+
+## Publishing results: charts + write-ups (REQUIRED format)
+
+When you post benchmark results (X posts, blog, threads), two rules are not
+optional. They are what makes a post read as signal, not slop.
+
+- **Charts MUST use the website NVIDIA palette.** Import the shared theme,
+  never hardcode colors: `from kbh_theme import C, SERIES, apply` (module at
+  `x-article-images/kbh_theme.py`, mirrored on Mac at
+  `~/dev/sites/kernelbench.com/x-article-images/`). It copies the `:root`
+  tokens from `app/globals.css`: bg `#111111`, accent (NVIDIA green) `#76b900`,
+  fg `#eeeeee`/`#999999`, warn `#fbbf24`, bad `#fb7185`, grid `#242424`. Lead
+  bars with the green accent (the ceiling/subject); rose `#fb7185` = reward
+  hack (hatched), amber = warn, grey = fail, faded+dotted = real kernel that
+  bugged/timed out. `x-article-images/make_glm52_4way.py` is the canonical
+  example. If `globals.css` changes, update `kbh_theme.py` to match. Charts are
+  generated on Mac (matplotlib) and dragged into posts; PNGs are gitignored,
+  the `.py` scripts are tracked.
+- **Write-ups lead with the unique/interesting/inconsistent, not adjectives.**
+  "4/6 clean, strong showing, solid 2nd place" is filler. Before writing,
+  actually read 2-3 transcripts/solutions for the headline cells and surface
+  concrete findings: behavioral shifts (e.g. a model that stopped reward-hacking
+  the fp8 cell its predecessor cheated), metric artifacts (topk's ~0.02 ceiling
+  is launch-overhead-bound, not weakness - true for every model), what the
+  winning kernel actually did, profiling discipline that tracks the one win,
+  suspicious cross-model convergence. The qualitative read a leaderboard cell
+  cannot show is the whole point.
