@@ -23,14 +23,16 @@ for f in glob.glob(str(ROOT/"results/annotations/*.yaml")):
     if rid and ver:
         ann[rid.group(1)] = (ver.group(1), (summ.group(1) if summ else "")[:400])
 
-# collect v2 runs (2026-06-10 and 2026-06-11)
+# collect v2 runs: every run dated 2026-06-10 or later (v2 containerized era).
+# Date-gated instead of an enumerated list so new sweep dates are picked up
+# automatically (was hardcoded to 10/11/12 and silently dropped later sweeps).
+V2_EPOCH = "20260610"
 cells = defaultdict(dict)  # (harness,model,effort) -> problem -> list of result dicts
-for rj in glob.glob(str(ROOT/"outputs/runs/20260610_*/result.json")) + \
-          glob.glob(str(ROOT/"outputs/runs/20260611_*/result.json")) + \
-          glob.glob(str(ROOT/"outputs/runs/20260612_*/result.json")):
+for rj in glob.glob(str(ROOT/"outputs/runs/2026*/result.json")):
+    rid = os.path.basename(os.path.dirname(rj))
+    if rid[:8] < V2_EPOCH: continue
     try: r = json.load(open(rj))
     except: continue
-    rid = os.path.basename(os.path.dirname(rj))
     prob = None
     for p in PROBLEMS:
         if rid.endswith(p): prob = p
