@@ -81,6 +81,21 @@ def best_cell(runs):
         c["peak_fraction"] if c["peak_fraction"] is not None else -1,
     ))
 
+# Budget-generation hygiene: any model reswept under the uncapped campaign
+# (run_id >= the campaign launch) must show ONLY its uncapped cells - never a
+# best-of-both Frankenstein across the 45-min and unlimited-time generations.
+# Models with no uncapped run keep all their (45-min) cells as legacy.
+CAMPAIGN_EPOCH = "20260613_042249"
+for _key, _probs in cells.items():
+    _has_uncapped = any(c["run_id"][:15] >= CAMPAIGN_EPOCH
+                        for _lst in _probs.values() for c in _lst)
+    if not _has_uncapped:
+        continue
+    for _p in list(_probs.keys()):
+        _probs[_p] = [c for c in _probs[_p] if c["run_id"][:15] >= CAMPAIGN_EPOCH]
+        if not _probs[_p]:
+            del _probs[_p]
+
 models = []
 for (h,m,e), probs in sorted(cells.items()):
     label = f"{h}/{m}" + (f" [{e}]" if e else "")

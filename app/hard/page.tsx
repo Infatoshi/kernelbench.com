@@ -80,8 +80,15 @@ export default async function HardPage() {
         <h1 className="text-3xl font-semibold tracking-tight text-[var(--color-fg-bright)] mb-3">
           hard
         </h1>
-        <p className="text-sm text-[var(--color-fg)] mb-6">
+        <p className="text-sm text-[var(--color-fg)] mb-2">
           RTX PRO 6000 Blackwell (sm120)
+        </p>
+        <p className="text-xs text-[var(--color-fg-muted)] mb-6 max-w-4xl leading-relaxed">
+          Leading models (Opus 4.8, GPT-5.5, GLM-5.2, MiniMax-M3, Gemini 3.5
+          Flash, Kimi K2.7-Code) were reswept June 2026 with{" "}
+          <span className="text-[var(--color-fg)]">unlimited time per problem</span>;
+          earlier rows used the original 45-minute budget. Claude Fable 5 is
+          suspended and shown as a frozen 45-minute reference.
         </p>
       </section>
 
