@@ -4,6 +4,101 @@ A running record of decisions, dead ends, and lessons. Newest entries on top. Th
 
 ---
 
+## 2026-06-14 - 01_fp8_gemm was mis-specified three ways; fixed before the fp8 resweep
+
+While trying to hand-write a "real fp8 kernel nobody cracked," we discovered the
+fp8 problem could NOT be solved by a genuine fp8 kernel as specified. Root cause
+was three independent bugs, all now fixed. Lesson at the bottom — do not repeat.
+
+**Bug 1: the weight was bf16, not fp8.** reference.py stored
+`self.weight = nn.Parameter(..., dtype=torch.bfloat16)` and computed in bf16,
+even though the name/docstring/roofline all say fp8. Consequence: the only
+correct answer was a bf16 GEMM (bit-identical to the reference, 0.0000 error),
+which physically caps at ~0.5 of the fp8 roofline (bf16 tensor cores = half fp8
+rate). A real fp8 kernel must quantize the bf16 weight to fp8, injecting ~0.4
+max error that fails EVERY tolerance. So the "fp8" column actually measured
+"best bf16 GEMM," and the bf16-upcast solutions we annotated `rubric_leak` were
+in fact the ONLY valid answer (those annotations were unfair; the cuBLAS-wrapper
+and grader-tamper cells were still genuine reward hacks). Proven by isolating
+the numeric floor: bf16-upcast 0.0000 error; per-row fp8 weight-quant 0.444;
+per-128-block 0.413 — fp8 fails at 0.01, 0.15, and 0.30.
+Fix: weight is now genuinely fp8_e4m3 (normalized into the e4m3 range) + a
+per-output-channel `weight_scale` buffer (the standard scaled-fp8 layout). The
+reference upcasts the SAME fp8 operands -> a real fp8 x fp8 MMA matches it and
+can exceed 0.5; a bf16 upcast still passes but stays capped at ~0.41.
+
+**Bug 2: the 0.15 fp8 tolerance was dead.** correctness.py keys tolerance on the
+OUTPUT dtype (`dtype = reference_out.dtype`), which is bf16, so it used the bf16
+default atol/rtol = 0.01 and the `tolerance: fp8_e4m3fn: 0.15` override never
+applied. 0.01 is far too tight for fp8 accumulation-order noise (a legit fp8
+kernel drifts ~0.06-8 abs depending on input magnitude, mostly on near-zero
+outputs). Fix: key the override on `bfloat16` (the output dtype) = 0.2 nominal,
+and recalibrate the 01_fp8 numeric_stress tolerances to be magnitude-scaled
+(small_input 5e-4, large_input 12.0, small_weight 3e-3, rtol 5e-2) — measured
+empirically as fp8-MMA residual x ~1.5, rtol still catches gross error.
+
+**Bug 3: the roofline peaks were 2.5x too low.** src/hardware/rtx_pro_6000.py
+listed fp8 400 / bf16 200 / fp4 800 TFLOPS. Real Blackwell GB202 dense is fp8
+1000 / bf16 500 / fp4 2000 (NVIDIA headline 4000 fp4-sparse AI TOPS -> halve for
+dense, halve per precision step). Verified: cuBLAS hits fp8 773 / bf16 412 on
+4096^3 (77-82% of the corrected peaks). The too-low table produced
+peak_fraction > 1.0 for a real fp8 kernel and inflated EVERY published number by
+2.5x (rankings preserved; absolute values wrong). Fix: corrected the whole
+table to the NVIDIA dense spec (fp32 was also wrong: 12 -> 125 SIMT).
+
+Validation (experiments/fp8_ceiling, a real Triton fp8 MMA solution): check.py
+PASS on all 4 shapes x 3 seeds x 3 stress cases; benchmark peak_fraction 0.57
+(aligned) / 0.63 (up-proj) with NO cell > 1.0; bf16 baseline caps ~0.41. The
+problem now rewards genuine fp8.
+
+**LESSON (do not repeat) when adding a precision-specific problem:**
+1. The reference must actually COMPUTE in the target precision (store operands in
+   that dtype), not a higher-precision stand-in. If the reference is higher
+   precision than the problem name, the "intended" kernel can't match it.
+2. Tolerance is keyed on the OUTPUT dtype in correctness.py, not the input/
+   precision name. Put the override under the output dtype key (here bfloat16),
+   or it silently no-ops.
+3. ALWAYS sanity-check the roofline peak against a vendor-library measurement
+   (cuBLAS / torch._scaled_mm). If peak_fraction can exceed ~0.9 for cuBLAS or
+   >1.0 for any kernel, the peak is wrong.
+4. Before publishing a new problem, write a real kernel in the intended precision
+   and confirm it PASSES and scores < 1.0. We had shipped 01_fp8 without that.
+
+---
+
+## 2026-06-13 - qwen dropped from the resweep; uncapped campaign
+
+Decision: qwen3.7-max is NOT in the uncapped resweep. Why: the only working
+route for it is the `opencode` / OpenRouter (`@ai-sdk/openai-compatible`)
+adapter, which stalls intermittently (~1/3-1/2 of sessions; see 2026-06-09).
+The reliable alternative would be a `qwen-claude` harness (Claude Code -> the
+provider's Anthropic-compatible endpoint, the pattern that makes zai/minimax/
+kimi/deepseek reliable). For Qwen that endpoint is Alibaba DashScope Model
+Studio (Intl/Singapore: dashscope-intl.aliyuncs.com/apps/anthropic, model
+qwen3-max), which needs a DASHSCOPE_API_KEY we do not have. The `qwen-claude`
+branch is wired and preflight-stops cleanly on the missing key, so the day we
+get a Model Studio key it's one `kb sweep qwen-claude qwen3-max` away. Until
+then, a flaky-route qwen row would not be comparable, so we leave it out rather
+than publish an unreliable number.
+
+Uncapped resweep campaign (2026-06-13): with Fable 5 suspended (US-gov action;
+its 45-min rows are now a frozen legacy ceiling), we reswept the field with NO
+wall-clock cap (6h backstop only, to keep a hung native session from wedging a
+slot). Reliable models first via scripts/sweep_campaign.sh (K=8 concurrency,
+refill as jobs finish; RAM is the limit ~39G): claude-opus-4-8, gpt-5.5 xhigh,
+glm-5.2, MiniMax-M3, gemini-3.5-flash, grok-build. deepseek-claude added after
+a smoke (new harness, works). kimi-k2.7-code reswept separately. Early signal:
+uncapped time buys real gains on the grinder problems - opus paged-attention
+0.6706 beats Fable's old 0.6299 ceiling, opus kda 0.1380 beats 0.0894.
+
+Gotcha caught: 6 concurrent native `claude` (opus) sessions on ONE coding plan
+trip 401/429/rate_limit; one cell (07_w4a16) exhausted retries and got SIGTERM
+(143) at 19 min. The other 5 opus cells rode through it. Native claude/codex
+have no stall watchdog, so throttle opus concurrency on a single plan or expect
+the occasional rate-limit casualty (re-run those cells solo).
+
+---
+
 ## 2026-06-12 - kimi-claude harness: Kimi K2.7-Code via Moonshot Anthropic endpoint
 
 Added a `kimi-claude` harness to bench moonshotai/Kimi-K2.7-Code (1T MoE, 32B
