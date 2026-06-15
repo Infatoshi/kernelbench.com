@@ -4,6 +4,65 @@ A running record of decisions, dead ends, and lessons. Newest entries on top. Th
 
 ---
 
+## 2026-06-15 - the unlimited-time generation: shipped, audited, published
+
+Closed out the "everyone gets unlimited time" resweep into a clean, honest 8-model
+generation on kernelbench.com/hard, plus a public HF dataset of every kernel.
+
+**Final roster (9 rows):** 8 unlimited-time current models - Claude Opus 4.8,
+GPT-5.5 [xhigh], GLM-5.2, MiniMax-M3, Gemini 3.5 Flash, Kimi K2.7-Code, DeepSeek
+V4 Pro (deepseek-claude), Cursor Composer 2.5 - plus Claude Fable 5 as a labeled
+frozen 45-min legacy reference (suspended mid-run, US-gov; can't re-run, held 3
+ceilings). Everything else dropped.
+
+**What got dropped and why (sweepability is the gate):** a model is only kept if
+we can actually run it. Verified auth: claude/codex coding plans OK; zai/minimax/
+kimi/deepseek/gemini keys present; cursor logged in (composer sweepable!). NOT
+sweepable -> dropped: qwen3.7-max (needs DASHSCOPE key we don't have; only the
+flaky opencode/OpenRouter route), grok-build (OAuth expired, dies on re-login in
+headless), and the old opencode/OpenRouter legacy models (deepseek-v4-flash,
+mimo-v2.5-pro, kimi-k2.6, glm-5.1, nemotron). Stale 45-min rows next to
+unlimited-time rows are apples-to-oranges, so they go.
+
+**fp8 resweep - the headline:** after fixing 01_fp8_gemm to be genuinely fp8xfp8
+(see 2026-06-14 entry), reran the column. BEFORE the fix: 0 models ever wrote a
+real fp8 kernel (all bf16-upcast "leaks" or hacks). AFTER: 7 of 8 wrote a real
+fp8 tensor-core MMA kernel (Triton tl.dot on fp8); composer-2.5 (a small fast
+model) included. GLM-5.2 wrote a real fp8 kernel too, then bolted an
+output-memoization hack on top (data_ptr cache -> timed loop measures a lookup;
+caught by `kb lint`, verdict reward_hack, invalid). The fix did exactly what we
+hoped: making the problem honestly fp8 got models to do real fp8.
+
+**Roofline rescale, applied:** the 2.5x roofline correction only moves
+regime=compute problems (graded on TFLOPS). build_v2 rescales 02_kda + 06_sonic
+x0.4 for pre-fix runs; regime=memory problems (03_paged, 05_topk, 07_w4a16,
+graded on the unchanged 1.8 TB/s bandwidth) are untouched - so the headline
+records SURVIVED (GLM-5.2 paged-attn 0.677 new record, w4a16 0.321; Fable's
+frozen marks still top w4a16/sonic/topk).
+
+**Generation hygiene:** build_v2 has a CAMPAIGN_EPOCH filter - any model with an
+uncapped run (>= 20260613_042249) shows ONLY its uncapped cells, never a
+best-of-both Frankenstein across 45-min and unlimited budgets. Old fp8 runs
+(broken-problem) quarantined so the column uses only corrected-problem runs.
+
+**Survived an anvil meltdown** (2026-06-13): K=8 uncapped + 5 concurrent
+compile-heavy sessions -> load 645, OOM, SSH-dead. Recovered on its own,
+campaign+phase2 finished overnight, only grok lost. Lesson banked: uncapped
+compile-heavy sweeps run at K=2.
+
+**Published:** kernelbench.com/hard live (commits up to 56e4be8). Three
+NVIDIA-themed charts (board heatmap, fp8 redemption, per-problem champions) in
+~/dev/sites/kernelbench.com/x-article-images/unlimited-gen/. Public HF dataset of
+every submission (kernel code + metrics + audit verdicts):
+https://huggingface.co/datasets/Infatoshi/kernelbench-hard-submissions
+
+**Integrity note for future sessions:** we revised our OWN prior "rubric_leak"
+annotations once the fp8-spec bug proved the bf16 path had been the only valid
+answer - the data redrew the story. Audit every passing/leader cell before
+publishing; correct the record when evidence says you were wrong.
+
+---
+
 ## 2026-06-14 - 01_fp8_gemm was mis-specified three ways; fixed before the fp8 resweep
 
 While trying to hand-write a "real fp8 kernel nobody cracked," we discovered the
