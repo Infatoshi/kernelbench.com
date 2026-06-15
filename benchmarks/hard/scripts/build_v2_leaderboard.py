@@ -27,6 +27,19 @@ for f in glob.glob(str(ROOT/"results/annotations/*.yaml")):
 # Date-gated instead of an enumerated list so new sweep dates are picked up
 # automatically (was hardcoded to 10/11/12 and silently dropped later sweeps).
 V2_EPOCH = "20260610"
+# Roofline was corrected 2026-06-14 (peak_tflops 2.5x too low). Compute-regime
+# problems (graded on TFLOPS) scored before the fix need peak_fraction x0.4;
+# memory-regime problems (graded on bandwidth, unchanged) and post-fix runs do not.
+_ROOFLINE_FIX_EPOCH = "20260614_000000"
+_COMPUTE_RESCALE = {"02_kda_cutlass": 0.4, "06_sonic_moe_swiglu": 0.4}
+def _rescale_pf(pf, prob, rid):
+    if pf is None:
+        return None
+    f = _COMPUTE_RESCALE.get(prob)
+    if f is not None and rid[:15] < _ROOFLINE_FIX_EPOCH:
+        return pf * f
+    return pf
+
 cells = defaultdict(dict)  # (harness,model,effort) -> problem -> list of result dicts
 for rj in glob.glob(str(ROOT/"outputs/runs/2026*/result.json")):
     rid = os.path.basename(os.path.dirname(rj))
@@ -46,7 +59,7 @@ for rj in glob.glob(str(ROOT/"outputs/runs/2026*/result.json")):
         "run_id": rid, "correct": bool(r.get("correct")),
         "has_solution": has_sol_file or bool(r.get("has_solution")),
         "has_check": has_check,
-        "peak_fraction": r.get("peak_fraction"),
+        "peak_fraction": _rescale_pf(r.get("peak_fraction"), prob, rid),
         "elapsed_seconds": r.get("agent_wall_seconds") or r.get("total_elapsed_seconds"),
         "harness_exit_code": r.get("harness_exit_code"),
     })
