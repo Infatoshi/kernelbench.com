@@ -45,7 +45,7 @@ One harness per model, each pinned to the highest-fidelity native endpoint.
 | Nemotron 3 Ultra | `opencode-nemotron nvidia/nemotron-3-ultra-550b-a55b` | OpenCode via OpenRouter pinned to DeepInfra (bf16) |
 | Nemotron 3 Ultra diagnostic | `nvcf-nemotron nemotron-3-ultra` | NVIDIA NVCF shared function via local OpenAI-compatible proxy |
 
-Each configured sweep runs its selected model matrix across the 6 active CUDA problems. At a 45min cap, budget about 0.75 GPU-hours per queued run.
+Each configured sweep runs its selected model matrix across the 6 active CUDA problems. Generations are unlimited-time (each run goes until the model decides it is done, under a large `BUDGET_SECONDS` wall-clock ceiling), so per-run GPU time varies; budget by the ceiling you set.
 
 Nemotron 3 Ultra is scored through `opencode-nemotron`, not Claude Code or Droid. OpenCode is the least distorted route because it speaks OpenAI-compatible APIs directly; Claude Code needs an Anthropic-compatible router layer for this model, and Droid is not the native endpoint for this provider. The `opencode-nemotron` harness writes an archive-local OpenCode config for each run, pins OpenRouter to DeepInfra with `allow_fallbacks=false`, and requires `OPENROUTER_API_KEY`. The NVCF route is kept only for diagnostics because the Ultra function was observed degrading/504ing.
 

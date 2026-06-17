@@ -95,8 +95,10 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# Wall clock budget: 45 minutes per run. Override via BUDGET_SECONDS env var
-# (e.g. BUDGET_SECONDS=300 for a quick smoke test).
+# Wall-clock ceiling per run. Methodology is unlimited-time: the model runs until
+# it decides it is done, so real generations override this to a large value
+# (e.g. BUDGET_SECONDS=21600). 2700 is a fallback default; smoke-test with a small
+# override (e.g. BUDGET_SECONDS=300).
 BUDGET_SECONDS="${BUDGET_SECONDS:-2700}"
 CHECK_TIMEOUT_SECONDS="${KBH_CHECK_TIMEOUT_SECONDS:-180}"
 if [ "$PROBLEM_NAME" = "02_kda_cutlass" ]; then

@@ -18,7 +18,7 @@ v3 was 43 problems of grab-bag difficulty. Most were winnable by any frontier mo
 
 - No public leaderboard. We publish roofline plots and kernels, not a number that models compete on.
 - No "portable kernel" judging. SM120-specific optimizations are expected and good.
-- No multi-turn/multi-day agent loops. 45 minutes wall-clock, one shot.
+- One autonomous session, no human in the loop. Unlimited time: the model runs until it decides it is done, bounded only by a large wall-clock ceiling (not a turn cap). The original 45-minute one-shot cap is frozen legacy and not comparable to current unlimited-time generations.
 
 ## Metric
 

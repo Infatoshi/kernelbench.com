@@ -1,6 +1,6 @@
-# MK-Bench
+# KernelBench-Mega
 
-Megakernel-focused GPU benchmark scaffold. MK-Bench is the renamed KernelBench-Mega track: same native-harness, transcript, and roofline machinery, but starting with one full megakernel problem instead of the old operation-level Hard deck.
+Megakernel-focused GPU benchmark scaffold. KernelBench-Mega uses the same native-harness, transcript, and roofline machinery as KernelBench-Hard, but starts with one full megakernel problem instead of the old operation-level Hard deck.
 
 The first problem is a MegaQwen-style Qwen3-0.6B batch=1 decode-block megakernel on the RTX PRO 6000 Blackwell workstation.
 
@@ -14,7 +14,7 @@ This repository is published for transparency: it documents the exact prompts, h
 |---|---------|----------|---------------|
 | 01 | Qwen3-0.6B decode block megakernel | RTX PRO 6000 (SM120) | Whole-block fusion, B=1 decode, seq-len-scaled GQA attention, RoPE, RMSNorm, SwiGLU MLP, cooperative scheduling |
 
-Historical KernelBench-Hard-derived problem directories may still exist in this repo while the scaffold is being converted. They are not part of the active MK-Bench deck unless listed above or included by the sweep scripts.
+Historical KernelBench-Hard-derived problem directories may still exist in this repo while the scaffold is being converted. They are not part of the active KernelBench-Mega deck unless listed above or included by the sweep scripts.
 
 ## Hardware
 

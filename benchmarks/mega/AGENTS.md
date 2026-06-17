@@ -1,4 +1,4 @@
-# MK-Bench — Developer Instructions (codex / droid)
+# KernelBench-Mega — Developer Instructions (codex / droid)
 
 This is the codex / droid / cursor-agent equivalent of `CLAUDE.md`. Content is identical; format is plain markdown for any CLI.
 

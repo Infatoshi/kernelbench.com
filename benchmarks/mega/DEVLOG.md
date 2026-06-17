@@ -4,6 +4,143 @@ A running record of decisions, dead ends, and lessons. Newest entries on top. Th
 
 ---
 
+## 2026-06-17 — Problem 03 went W4A16 (int4 weights), because fp8 loses at decode
+
+Problem 03 (Kimi-Linear hybrid decode) started bf16, then the plan was to make
+the baseline fp8 to force quantization into play. Benchmarking killed that:
+`torch._scaled_mm` fp8 is a tensor-core compute path with ~7us fixed overhead
+and M-padding, so at batch-1 decode (memory-bound) it is *slower* than bf16.
+
+  fp8/bf16 overall speedup across the decode projection set:
+    M=1 (decode): 0.84x   M=8: 0.97x   M=32: 1.05x   M=128: 1.16x   M=256: 1.45x
+
+fp8 only pays at large batch. This also explains the dispersion runs where none
+of codex/opus/gemini took fp8 — at decode it is not a free win; the real win
+needs a hand-written fused dequant-GEMV, and stock fp8 makes it worse.
+
+The fix (Elliot's call): **W4A16** — int4 weights, group-128 asymmetric, bf16
+accumulation (the AWQ/GPTQ format OSS actually ships). At batch-1 it is a
+*memory-bound* dequant-GEMV, not a compute path, so the 4x weight-traffic
+reduction is realizable exactly where decode lives. Empirically grounded by
+Hard's own `07_w4a16_gemm` (`regime: memory`, M=1 bandwidth-bound) where models
+already wrote fused W4A16 GEMVs hitting 0.15-0.35 of peak DRAM bandwidth on
+SM120. Bonus: int4/bf16-acc needs no special tensor-core format, so it runs on
+any bf16 GPU (Ampere 3090, Hopper, Blackwell) — the benchmark can travel across
+GPU generations, and the speedup-over-baseline metric is already a same-GPU
+ratio so it ports with zero recalibration.
+
+Shape of the problem now:
+- Weights stored W4A16 (reuses Hard 07's exact pack/dequant; format in
+  reference.py). MoE experts quantized too (one int4 set per expert).
+- reference.py dequantizes naively in fp32 (oracle). baseline.py is bf16 +
+  batched-MoE but still *materializes* each bf16 weight (int4 read + bf16 write
+  + bf16 read = ~9x the traffic of fusion) — the floor, deliberately leaving the
+  fused dequant-GEMV on the table. Naive int4 is *slower* than plain bf16; int4
+  only pays with fusion, which is the whole test.
+- Correctness is cosine >= 0.98 of the next-token hidden + decode state vs the
+  oracle. The int4 quant noise is in both sides (same weights), so they match at
+  ~0.9999 — no tolerance loosening needed, unlike Hard 07 (which compares int4
+  against an un-quantized bf16 reference and had to loosen).
+- Forbidden now also bars prebuilt int4 kernels (bitsandbytes, torchao, marlin,
+  gptq/awq, exllama) so the model writes its own fused dequant-GEMV.
+- int4 buffers: 1068 MB vs 4273 MB bf16. Baseline floor ~5.6 ms/tok at ctx 2048.
+
+The "epic" target is now concrete: fused int4 dequant-GEMV + MLA absorption +
+KDA/MoE fusion, stacked. None of the three models stacked all of it in the bf16
+version; W4A16 makes quantization the central, realizable lever.
+
+---
+
+## 2026-06-16 — Problem 02: RL training megakernel (throughput-graded), v0
+
+Added `problems/02_rl_grid_ppo`, the first non-roofline problem on the deck. It
+asks for a from-scratch PPO training run (vectorized grid-foraging env + tiny
+MLP actor-critic + PPO update) made as fast as possible, graded on training
+throughput (environment steps per second), not FLOPS/bandwidth peak fraction.
+
+**Why this and not a standalone LLM training megakernel.** A fused fwd+bwd
+transformer block is low-signal: at frontier scale the training step is already
+a chain of big compute-bound GEMMs that cuBLAS/FlashAttention saturate, so there
+is nothing to fuse; the only people who care about fused training kernels are
+small-model fine-tuners, and Liger-Kernel already owns that. The training that
+*is* overhead-bound — tiny nets, millions of tiny steps, env↔learn ping-pong —
+is RL. So the "training megakernel" that matters lives inside the RL loop, which
+is exactly this problem. It also opens the train/infer/sim spread: problem 01 is
+memory-bound forward-only decode, this is throughput-bound full-loop training.
+
+**Why throughput, not roofline.** An RL step is control-flow / launch-overhead
+bound and has no clean FLOPS ceiling, so peak_fraction-vs-FLOPS is meaningless.
+Instead score `achieved_sps / peak_sps`, the same shape of number against a
+target ceiling. To keep it from confounding kernel speed with RL luck, the
+algorithm + hyperparameters + total step budget are fixed and seed-determined;
+"fastest time to train" then collapses to "fastest to run N steps" = SPS.
+
+**Correctness is the learned return level, not allclose.** A different kernel
+will never reproduce the reference trajectory bit-for-bit (RNG stream + float
+reduction order differ), so `check.py` trains both reference and solution from
+scratch on several seeds and requires the solution's final-window mean return to
+land in a band around the reference's, and to have climbed from its own early
+baseline. The env is tuned so a random policy scores ≈0.16 and a trained one
+≈3.96 (a ~25x gap), giving the band real signal. A no-op-fast-loop cheat is
+killed twice: the band (no learning → below floor) and a benchmark-side return
+floor (SPS only credited when the run actually learned, so a path that detects
+benchmark.py and skips the work cannot score). An easier-than-spec env is caught
+by the band's upper bound.
+
+**Kept self-contained.** `benchmark.py` is throughput-native and does not touch
+the shared `src/eval` roofline path, so problem 01 is untouched. No shared-infra
+edits in v0.
+
+**Known-provisional, by design (this is a v0 to find where the bench is
+imperfect).** `peak_sps=25e6` is a guess — the naive reference measured
+~0.8–1.5M SPS but only under heavy GPU contention (a separate 81GB job pinned
+the card at 100%), so both the floor and the ceiling need recalibration on an
+idle GPU against a real PufferLib/Brax-class fused baseline before any published
+sweep. The return band (±0.30/0.40, min-improvement 0.5) is loose on purpose for
+RL variance and unvalidated against an *independent* correct implementation —
+reference-as-solution passes trivially (same seed → same curve), which only
+proves the plumbing, not that a genuinely different fast solution lands in band.
+Smoke-testing codex on it next to surface the real failure modes.
+
+**Smoke test 1 — codex / gpt-5.5 xhigh (900s budget, contended GPU).** Passed,
+`correct=true`, `peak_fraction=0.315` (SPS ~7.9M vs the contended reference's
+~1.5M, ~5x). It took the honest path: a Triton kernel that fuses the entire
+32-step rollout — env step, policy forward, and a custom on-device RNG for
+action sampling — into one launch via `tl.static_range`, plus a hand-fused Adam
+step and torch.compile on the forward. Faithful PPO, full step schedule, learned
+to the reference return level (final 3.957 vs 3.956), no template mutation. Two
+validations fell out: (a) the band is the right call — codex's independent RNG
+reproduced the return level closely but not bit-exact (seed 2: 3.985 vs 3.998),
+which allclose would have failed; (b) the bench correctly rewards genuine fusion.
+
+What the honest run did *not* exercise, but a follow-up exploit probe confirmed:
+
+- **DEMONSTRATED HOLE — SPS is credited against the nominal budget, not actual
+  work.** A wrapper that runs *half* the iterations and pads the returned curve
+  to full length with the converged value passes `check.py` (it saturates by
+  ~iter 20, so the final-window mean stays in band and the curve still climbs
+  from the early baseline) and scores `peak_fraction=0.121` — 2x the honest
+  reference floor (0.059) for half the work. `benchmark.py` divides
+  `TOTAL_ENV_STEPS / wall_time`, trusting the solution to have run the budget.
+  This is the top thing to fix before publishing: the harness must own the
+  env-step accounting (count actual steps in the timed region), or at minimum
+  reject padded/constant tails and require exact curve length, or pivot the
+  metric to wall-clock-time-to-return-threshold.
+- **UNTESTED HOLE — only the outcome is pinned, not the algorithm.** The band
+  checks learned return, not that PPO (clip/GAE/stochastic sampling) was used.
+  On an env this learnable, a greedy or vanilla-PG or even a hand-coded
+  beeline-to-food controller could clear the band faster. A throughput metric
+  structurally rewards doing less; the env needs to be hard enough that only
+  real PPO converges, or the algorithm needs structural enforcement.
+- **CONTENTION / CALIBRATION.** codex's 3 timed trials spanned 6.08–7.88M SPS
+  (~30% spread) on the shared GPU; best-of-3 papers over it but the absolute
+  number is shaky. The contention-invariant signal is the *ratio* to the naive
+  reference (~5x), which argues for grading on speedup-over-reference rather than
+  fraction-of-a-guessed-ceiling — the reference floor is reproducible, peak_sps
+  is not. Recalibrate on an idle GPU regardless.
+
+---
+
 ## 2026-06-04 - KernelBench-Mega scaffold created
 
 KernelBench-Mega starts as a repo-shaped copy of KernelBench-Hard so it can keep

@@ -65,9 +65,10 @@ fi
 RUN_ID="$(basename "$RUN_DIR")"
 RUN_GROUP="${KBH_RUN_GROUP:-}"
 
-# Wall clock budget: 45 minutes per run. Override via BUDGET_SECONDS env var
-# (e.g. BUDGET_SECONDS=300 for a quick smoke test).
-BUDGET_SECONDS="${BUDGET_SECONDS:-2700}"
+# Wall-clock ceiling per run. Methodology is unlimited-time: the model runs until
+# it decides it is done. Default is a large 6h ceiling; smoke-test with a small
+# override (e.g. BUDGET_SECONDS=300).
+BUDGET_SECONDS="${BUDGET_SECONDS:-21600}"
 CHECK_TIMEOUT_SECONDS="${KBH_CHECK_TIMEOUT_SECONDS:-180}"
 if [ "$PROBLEM_NAME" = "02_kda_cutlass" ]; then
     BENCHMARK_TIMEOUT_SECONDS="${KBH_BENCHMARK_TIMEOUT_02_KDA_CUTLASS_SECONDS:-${KBH_BENCHMARK_TIMEOUT_SECONDS:-7200}}"
@@ -116,7 +117,7 @@ fi
 # problem.yaml and shapes.py stay in the workspace because check.py and
 # benchmark.py import them at runtime; the prompt does not direct the model
 # to read them.
-TEMPLATE_FILES=(reference.py sota.py shapes.py problem.yaml check.py benchmark.py PROMPT.txt)
+TEMPLATE_FILES=(reference.py sota.py shapes.py problem.yaml check.py benchmark.py PROMPT.txt baseline.py)
 is_template() {
     local n="$1"
     for t in "${TEMPLATE_FILES[@]}"; do
@@ -466,7 +467,7 @@ LOG_FILE="${RUN_DIR}/transcript.jsonl"
 STDERR_FILE="${RUN_DIR}/stderr.log"
 
 echo "========================================"
-echo "MK-BENCH RUN"
+echo "KERNELBENCH-MEGA RUN"
 echo "========================================"
 echo "Harness:    $HARNESS"
 echo "Model:      $MODEL"

@@ -62,7 +62,7 @@ SWEEP_LOG="outputs/runs/sweep_${SWEEP_TIMESTAMP}.log"
 mkdir -p "$(dirname "$SWEEP_LOG")"
 
 echo "========================================" | tee "$SWEEP_LOG"
-echo "MK-BENCH SWEEP" | tee -a "$SWEEP_LOG"
+echo "KERNELBENCH-MEGA SWEEP" | tee -a "$SWEEP_LOG"
 echo "Started: $(date)" | tee -a "$SWEEP_LOG"
 echo "Models:  ${#ACTIVE_MATRIX[@]}" | tee -a "$SWEEP_LOG"
 echo "Probs:   ${#CUDA_PROBLEMS[@]}" | tee -a "$SWEEP_LOG"

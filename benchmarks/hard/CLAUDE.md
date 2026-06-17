@@ -8,7 +8,7 @@ For the journey behind the current design, read [DEVLOG.md](./DEVLOG.md).
 
 ## What this repo is
 
-Small kernel benchmark. Frontier coding agents are given URLs to SOTA implementations (sonic-moe, flashinfer, marlin) and asked to write a competitive kernel on RTX PRO 6000 Blackwell (SM120) in 45 minutes. Roofline-graded. Published artifact is the best kernel per (problem × model × harness), plus the agent trace.
+Small kernel benchmark. Frontier coding agents are given URLs to SOTA implementations (sonic-moe, flashinfer, marlin) and asked to write a competitive kernel on RTX PRO 6000 Blackwell (SM120) with unlimited time (one autonomous session, runs until the model decides it is done, under a large wall-clock ceiling). Roofline-graded. Published artifact is the best kernel per (problem × model × harness), plus the agent trace.
 
 See [SPEC.md](./SPEC.md) for methodology. See [README.md](./README.md) for the model matrix and quick start.
 
@@ -280,4 +280,4 @@ Most likely causes:
 2. **CUDA_HOME pointing at 12.8** — harness script already sets `CUDA_HOME=/usr/local/cuda-13`; make sure you sourced it.
 3. **`sota.py` import fails** — the SOTA dep isn't installed. Check `problem.yaml` for the pinned version; install with `uv pip install <spec>`.
 4. **Agent CLI not authenticated** — `claude`, `codex`, `kimi` each need their own auth. Check `~/.env_vars` and each CLI's `info` / `whoami` command.
-5. **Agent ran out of budget before writing anything** — increase the `timeout 2700` in run_hard.sh or accept this as a failure mode worth recording.
+5. **Agent ran out of budget before writing anything** — raise `BUDGET_SECONDS` (the wall-clock ceiling; unlimited-time generations use a large value) or accept this as a failure mode worth recording.

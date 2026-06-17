@@ -1,14 +1,14 @@
-# MK-Bench: Design Specification
+# KernelBench-Mega: Design Specification
 
 Last updated: 2026-06-05.
 
 ## Purpose
 
-MK-Bench is a small, hand-curated GPU megakernel benchmark where frontier coding agents attempt to build large fused kernels on specific hardware. It inherits the KernelBench-Hard harness style, archive format, and roofline reporting, but its deck starts with one full megakernel problem instead of many operation-level kernels.
+KernelBench-Mega is a small, hand-curated GPU megakernel benchmark where frontier coding agents attempt to build large fused kernels on specific hardware. It inherits the KernelBench-Hard harness style, archive format, and roofline reporting, but its deck starts with one full megakernel problem instead of many operation-level kernels.
 
 ## Active Problem
 
-`problems/01_qwen3_decode_block` is the initial MK-Bench problem. It asks agents to implement one Qwen3-0.6B transformer block decode step for batch=1 and one new token, matching the dimensions and spirit of `Infatoshi/megaqwen`:
+`problems/01_qwen3_decode_block` is the initial KernelBench-Mega problem. It asks agents to implement one Qwen3-0.6B transformer block decode step for batch=1 and one new token, matching the dimensions and spirit of `Infatoshi/megaqwen`:
 
 - hidden size: 1024
 - intermediate size: 3072
