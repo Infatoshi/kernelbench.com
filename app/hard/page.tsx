@@ -65,6 +65,7 @@ const GPU_TARGETS = [
   {
     key: "rtx",
     label: "RTX PRO 6000",
+    runtime: "unlimited",
     file: "benchmarks/hard/results/leaderboard.json",
     blurb: (
       <>
@@ -79,6 +80,7 @@ const GPU_TARGETS = [
   {
     key: "h100",
     label: "H100 PCIe",
+    runtime: "limited",
     file: "benchmarks/hard/results/leaderboard.h100.json",
     blurb: (
       <>
@@ -92,6 +94,7 @@ const GPU_TARGETS = [
   {
     key: "b200",
     label: "B200",
+    runtime: "limited",
     file: "benchmarks/hard/results/leaderboard.b200.json",
     blurb: (
       <>
@@ -147,6 +150,17 @@ export default async function HardPage({
         </div>
         <p className="text-sm text-[var(--color-fg)] mb-2">
           {lb.hardware.name} ({lb.hardware.sm})
+          <span
+            className={
+              target.runtime === "unlimited"
+                ? "ml-2 text-xs font-semibold text-[var(--color-accent)]"
+                : "ml-2 text-xs font-semibold text-[var(--color-bad)]"
+            }
+          >
+            {target.runtime === "unlimited"
+              ? "● unlimited runtime"
+              : "● limited runtime (45-min budget)"}
+          </span>
         </p>
         <p className="text-xs text-[var(--color-fg-muted)] mb-6 max-w-4xl leading-relaxed">
           {target.blurb}
