@@ -704,11 +704,11 @@ case "$HARNESS" in
         ;;
 
     gemini)
-        # Gemini CLI. No --cwd flag, so cd into PROBLEM_DIR.
+        # Gemini CLI. No --cwd flag, so cd into PROBLEM_DIR. --yolo auto-approves
+        # tools + trusts the dir (the old --skip-trust flag is gone in gemini 0.36).
         ( cd "$PROBLEM_DIR" && timeout "$BUDGET_SECONDS" gemini \
-            --skip-trust \
+            --yolo \
             -m "$MODEL" \
-            --approval-mode yolo \
             -o stream-json \
             -p "$PROMPT" \
             </dev/null > "$LOG_FILE" 2> "$STDERR_FILE" ) || HARNESS_EXIT=$?
