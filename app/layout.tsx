@@ -74,6 +74,7 @@ function Header() {
         <div className="ml-auto flex items-center gap-3 sm:gap-5">
           <nav className="flex items-center gap-3 sm:gap-5 text-sm text-[var(--color-fg-muted)]">
             <a href="/hard">hard</a>
+            <a href="/mega">mega</a>
             <a href="/v3">v3</a>
             <a
               href="https://github.com/Infatoshi/kernelbench.com"

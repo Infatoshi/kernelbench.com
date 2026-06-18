@@ -4,6 +4,50 @@ A running record of decisions, dead ends, and lessons. Newest entries on top. Th
 
 ---
 
+## 2026-06-18 — Autonomous H100 cloud run + per-GPU leaderboard
+
+Ran codex/gpt-5.5 (xhigh) autonomously on problem 03 (W4A16 Kimi-Linear decode)
+on a brev H100, away from the local Blackwell workstation. Result: **5.62x
+geomean speedup** over the optimized-PyTorch baseline (2.18 ms/tok, 459 tok/s;
+6.09x at ctx 16384), self-terminated in 34 min well under a 3h budget.
+
+The journey is the point, and the transcript shows it: 15 benchmark runs, 37
+correctness checks, peak_fraction climbing 0.0 → 3.17 (first working fused
+version, already past launch reduction) → 4.53 → 5.48 → 5.85 plateau. It wrote
+**11 specialized Triton kernels** and visibly experimented with the hardest rung
+(three MoE-batching variants in the final file: `_w4_expert_same_x`,
+`_w4_expert_batch_x`, `_w4_expert_pair_same_x`), fused q/k/v/g into one 4-way
+GEMV, did MLA absorption in-kernel (`_kvb_score`/`_kvb_value`), fused the down
+projection with the routed weighted-sum, and hand-wrote the KDA conv +
+recurrence. My own hand solution stalled at 1.1x (launch-bound, 126 tiny
+kernels); codex crushed that by batching/fusing — the exact ladder the problem
+was designed to expose.
+
+**Reproducible cloud run (committed):** `scripts/cloud_bootstrap.sh` (on the
+box: uv + node + codex/claude CLIs + cu128 torch — R570-safe, skips the painful
+R580/cu130 driver upgrade since the decode problems are portable bf16/int4) and
+`scripts/cloud_launch.sh` (from anvil: rsync repo + auth [codex token / claude
+creds / env_vars], bootstrap, launch a detached run). Recipe: `brev create H100`
+→ `cloud_launch.sh` → ~8 min to a running journey. Bake a brev image from a
+bootstrapped box to get reprovision under a minute.
+
+**Per-GPU leaderboard:** the score for problem 03 is a speedup over baseline (a
+same-GPU ratio), so it ports across GPU generations with zero recalibration.
+`scripts/build_mega_leaderboard.py` scans run archives (requiring a per-run `gpu`
+marker, so legacy bf16 runs that share the `03` problem name are excluded) and
+emits `public/data/mega/results.csv` with a `gpu` column. `app/mega/page.tsx`
+reuses the proven `/v3` CSV + GPU-filter pattern to show RTX PRO 6000 Blackwell
+/ H100 / B200 categories. int4/bf16-acc needs no special tensor-core format, so
+the same problem runs on Ampere → Hopper → Blackwell.
+
+Gotchas hit: brev's short-lived auth token (a failed-auth `delete` reports a
+false "gone" — always re-verify `brev ls`); `brev org set`/`refresh` regenerate
+`~/.brev/ssh_config` and drop the active instance's host entry (do not switch
+orgs mid-run); zsh does not word-split unquoted vars used as commands (inline ssh
+or use arrays). Never `brev delete/stop/reset` an instance you do not own.
+
+---
+
 ## 2026-06-17 — Problem 03 went W4A16 (int4 weights), because fp8 loses at decode
 
 Problem 03 (Kimi-Linear hybrid decode) started bf16, then the plan was to make
