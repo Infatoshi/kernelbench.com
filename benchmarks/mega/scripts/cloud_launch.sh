@@ -23,6 +23,19 @@ PROBLEM="${3:-problems/03_kimi_linear_decode}"; BUDGET="${4:-10800}"
 S=(ssh -F "$HOME/.brev/ssh_config" -o StrictHostKeyChecking=no)
 HERE="$(cd "$(dirname "$0")/.." && pwd)"
 
+# brev's ssh_config periodically drops the host entry (DNS resolve fails). If the
+# box is unreachable, `brev refresh` rewrites the config. Self-heal up to 3x.
+ensure_reachable() {
+  for _ in 1 2 3; do
+    "${S[@]}" -o ConnectTimeout=15 "$NAME" true 2>/dev/null && return 0
+    echo "  (host unreachable -> brev refresh)"
+    "$HOME/.local/bin/brev" refresh >/dev/null 2>&1 || true
+    sleep 3
+  done
+  echo "ERROR: $NAME unreachable after brev refresh; check 'brev ls'"; exit 1
+}
+ensure_reachable
+
 echo "[1/3] rsync repo + auth -> $NAME"
 rsync -az -e "${S[*]}" --exclude outputs --exclude __pycache__ --exclude .venv --exclude '*.pyc' --exclude .git "$HERE/" "$NAME:mega/"
 "${S[@]}" "$NAME" "mkdir -p .codex .claude"
@@ -34,6 +47,7 @@ echo "[2/3] bootstrap"
 "${S[@]}" "$NAME" "bash ~/mega/scripts/cloud_bootstrap.sh"
 
 echo "[3/3] launch detached sweep (gpu=$GPU_LABEL budget=${BUDGET}s/model)"
+ensure_reachable
 "${S[@]}" "$NAME" "nohup env GPU_LABEL=$GPU_LABEL BUDGET_SECONDS=$BUDGET PROBLEM=$PROBLEM bash ~/mega/scripts/cloud_sweep.sh > ~/mega_sweep.log 2>&1 & echo launched sweep PID \$!"
 echo "Poll:   ${S[*]} $NAME 'tail -20 ~/mega_sweep.log'"
 echo "Pull:   rsync runs back, then 'uv run python scripts/build_mega_leaderboard.py'"
