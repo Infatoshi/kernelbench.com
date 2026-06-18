@@ -18,7 +18,6 @@ interface Row {
 export default function MegaPage() {
   const [data, setData] = useState<Row[]>([])
   const [loading, setLoading] = useState(true)
-  const [gpu, setGpu] = useState<string>("all")
 
   useEffect(() => {
     fetch("/data/mega/results.csv")
@@ -51,16 +50,13 @@ export default function MegaPage() {
       })
   }, [])
 
-  const gpus = useMemo(
-    () => [...new Set(data.map((d) => d.gpu))].filter(Boolean).sort(),
-    [data],
-  )
-
+  // Group rows by GPU, each group sorted by speedup descending.
   const sorted = useMemo(() => {
-    const filtered =
-      gpu === "all" ? data : data.filter((r) => r.gpu === gpu)
-    return [...filtered].sort((a, b) => (b.score ?? -1) - (a.score ?? -1))
-  }, [data, gpu])
+    return [...data].sort(
+      (a, b) =>
+        a.gpu.localeCompare(b.gpu) || (b.score ?? -1) - (a.score ?? -1),
+    )
+  }, [data])
 
   return (
     <div className="space-y-12">
@@ -92,36 +88,16 @@ export default function MegaPage() {
         <p className="text-xs text-[var(--color-fg-muted)] mb-4">
           {loading
             ? "loading..."
-            : `${sorted.length.toLocaleString()} runs${
-                gpu === "all" ? "" : ` · ${gpu}`
-              } · sorted by speedup vs PyTorch baseline`}
+            : `${sorted.length.toLocaleString()} runs · grouped by GPU, sorted by speedup vs PyTorch baseline`}
         </p>
-
-        <div className="grid sm:grid-cols-3 lg:grid-cols-6 gap-2 mb-4 text-xs">
-          <label className="block">
-            <div className="text-[var(--color-fg-muted)] mb-1">gpu</div>
-            <select
-              value={gpu}
-              onChange={(e) => setGpu(e.target.value)}
-              className="w-full bg-[var(--color-bg)] border border-[var(--color-border)] text-[var(--color-fg)] px-2 py-1 focus:outline-none focus:border-[var(--color-fg-bright)]"
-            >
-              <option value="all">all</option>
-              {gpus.map((g) => (
-                <option key={g} value={g}>
-                  {g}
-                </option>
-              ))}
-            </select>
-          </label>
-        </div>
 
         <div className="overflow-x-auto box max-h-[60vh]">
           <table className="term tabular text-xs sm:text-sm">
             <thead className="sticky top-0 bg-[var(--color-bg)]">
               <tr>
+                <th>gpu</th>
                 <th>model</th>
                 <th>harness</th>
-                {gpu === "all" ? <th>gpu</th> : null}
                 <th>problem</th>
                 <th title="speedup vs optimized-PyTorch baseline">speedup</th>
                 <th title="decode tokens per second">tok/s</th>
@@ -131,11 +107,13 @@ export default function MegaPage() {
             <tbody>
               {sorted.map((r, i) => (
                 <tr key={r.run_id || i}>
+                  <td className="text-[var(--color-accent)] whitespace-nowrap">
+                    {r.gpu}
+                  </td>
                   <td className="text-[var(--color-fg-bright)] whitespace-nowrap">
                     {r.model}
                   </td>
                   <td className="text-[var(--color-fg-muted)]">{r.harness}</td>
-                  {gpu === "all" ? <td>{r.gpu}</td> : null}
                   <td className="text-[var(--color-fg-muted)]">{r.problem}</td>
                   <td>
                     {r.score !== null ? (
