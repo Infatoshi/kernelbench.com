@@ -86,11 +86,11 @@ function statusCell(r: RunRow) {
 function harnessLabel(harness: string) {
   const labels: Record<string, string> = {
     claude: "Claude Code",
-    codex: "codex",
+    codex: "Codex",
     opencode: "Opencode",
     droid: "droid",
     kimi: "kimi",
-    cursor: "cursor",
+    cursor: "Cursor",
     gemini: "Gemini CLI",
     grok: "Grok Build",
     "zai-claude": "Claude Code",

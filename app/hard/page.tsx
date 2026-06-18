@@ -29,7 +29,7 @@ const PROBLEMS = [
   { key: "02_kda_cutlass", label: "KimiDeltaAttention CUTLASS" },
   { key: "03_paged_attention", label: "Paged Attention" },
   { key: "05_topk_bitonic", label: "TopK Bitonic" },
-  { key: "06_sonic_moe_swiglu", label: "Sonic MoE SwiGLU" },
+  { key: "06_sonic_moe_swiglu", label: "Sonic MoE" },
   { key: "07_w4a16_gemm", label: "W4A16 GEMM" },
 ]
 
@@ -718,11 +718,11 @@ function shortLabel(label: string) {
 function harnessLabel(harness: string) {
   const labels: Record<string, string> = {
     claude: "Claude Code",
-    codex: "codex",
+    codex: "Codex",
     opencode: "Opencode",
     droid: "droid",
     kimi: "kimi",
-    cursor: "cursor",
+    cursor: "Cursor",
     gemini: "Gemini CLI",
     grok: "Grok Build",
     "zai-claude": "Claude Code",
