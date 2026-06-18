@@ -95,7 +95,10 @@ function harnessLabel(harness: string) {
     grok: "Grok Build",
     "zai-claude": "Claude Code",
     "minimax-claude": "Claude Code",
+    "deepseek-claude": "Claude Code",
+    "kimi-claude": "Claude Code",
   }
+  if (harness.endsWith("-claude")) return "Claude Code"
   return labels[harness] ?? harness
 }
 

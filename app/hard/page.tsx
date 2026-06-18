@@ -26,7 +26,7 @@ async function loadAvailableViewers(): Promise<Set<string>> {
 
 const PROBLEMS = [
   { key: "01_fp8_gemm", label: "FP8 GEMM" },
-  { key: "02_kda_cutlass", label: "KDA CUTLASS" },
+  { key: "02_kda_cutlass", label: "KimiDeltaAttention CUTLASS" },
   { key: "03_paged_attention", label: "Paged Attention" },
   { key: "05_topk_bitonic", label: "TopK Bitonic" },
   { key: "06_sonic_moe_swiglu", label: "Sonic MoE SwiGLU" },
@@ -698,6 +698,16 @@ function shortLabel(label: string) {
     .replace("minimax-claude/MiniMax-M3 [2026-06-01]", "MiniMax M3")
     .replace("minimax-claude/MiniMax-M3 [2026-06-01 max]", "MiniMax M3")
     .replace("minimax-claude/MiniMax-M3", "MiniMax M3")
+    .replace("claude/claude-opus-4-8 [max]", "Claude Opus 4.8")
+    .replace("claude/claude-opus-4-8", "Claude Opus 4.8")
+    .replace("claude/claude-fable-5 [max]", "Claude Fable 5 [max]")
+    .replace("cursor/composer-2.5-fast", "Composer 2.5 Fast")
+    .replace("cursor/composer-2.5", "Composer 2.5")
+    .replace("gemini/gemini-3.5-flash", "Gemini 3.5 Flash")
+    .replace("gemini/gemini-3.1-pro-preview", "Gemini 3.1 Pro")
+    .replace("deepseek-claude/deepseek-v4-pro", "DeepSeek V4 Pro")
+    .replace("kimi-claude/kimi-k2.7-code", "Kimi K2.7-Code")
+    .replace("zai-claude/glm-5.2", "GLM-5.2")
     .replace("opencode/openrouter-pinned/", "or/")
     .replace("opencode/", "")
     .replace("codex/", "")
@@ -717,7 +727,12 @@ function harnessLabel(harness: string) {
     grok: "Grok Build",
     "zai-claude": "Claude Code",
     "minimax-claude": "Claude Code",
+    "deepseek-claude": "Claude Code",
+    "kimi-claude": "Claude Code",
   }
+  // Provider models routed through Claude Code (the "<provider>-claude" harnesses)
+  // are all just Claude Code; only the underlying model differs.
+  if (harness.endsWith("-claude")) return "Claude Code"
   return labels[harness] ?? harness
 }
 
