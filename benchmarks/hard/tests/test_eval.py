@@ -87,6 +87,17 @@ def test_hardware_lookup_h100():
     assert hw.peak_tflops_dense["bf16"] == pytest.approx(756.0)
 
 
+def test_hardware_lookup_b200():
+    hw = get("B200")
+    assert hw.sm == "sm_100a"
+    assert hw.vram_gb == 180
+    assert hw.peak_bandwidth_gb_s == pytest.approx(8000.0)
+    # B200 dense peaks; fp4 is double fp8, bf16 is half.
+    assert hw.peak_tflops_dense["fp8"] == pytest.approx(4500.0)
+    assert hw.peak_tflops_dense["bf16"] == pytest.approx(2250.0)
+    assert hw.peak_tflops_dense["fp4"] == pytest.approx(9000.0)
+
+
 def test_benchmark_baselines_env_flags(monkeypatch):
     monkeypatch.delenv("KBH_BENCHMARK_BASELINES", raising=False)
     monkeypatch.delenv("KBH_KDA_BENCHMARK_BASELINES", raising=False)

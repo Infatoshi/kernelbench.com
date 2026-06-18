@@ -1,0 +1,406 @@
+"""Custom CUDA top-k kernel using bitonic sort in shared memory.
+
+Design:
+  1. Tile kernel: each block loads a contiguous tile of TILE elements from a row,
+     sorts them descending with a bitonic network in shared memory, and writes the
+     top-k (value, index) pairs to a temporary buffer.
+  2. Merge kernel: repeatedly merge chunks of candidate arrays until each row has
+     a single top-k result.  All merge arrays are kept <= MAX_CANDIDATES so they
+     fit in one shared-memory bitonic sort.
+
+All temporary storage is pre-allocated in Model.__init__ so the timed forward
+path does no allocation.
+
+The implementation avoids the banned PyTorch selection / sorting helpers and
+attribute / ATen variants.
+"""
+import math
+
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+
+# ---------------------------------------------------------------------------
+# Tunables (mirrored as macros in the CUDA compilation flags)
+# ---------------------------------------------------------------------------
+TILE = 1024
+MAX_CANDIDATES = 1024
+
+
+# ---------------------------------------------------------------------------
+# C++ declarations (must be visible to pybind main.cpp)
+# ---------------------------------------------------------------------------
+_CPP_SOURCE = r"""
+#include <torch/extension.h>
+#include <vector>
+
+std::vector<torch::Tensor> topk_forward(
+    torch::Tensor input,
+    int k,
+    torch::Tensor out_vals,
+    torch::Tensor out_idxs,
+    torch::Tensor temp_a_vals,
+    torch::Tensor temp_a_idxs,
+    torch::Tensor temp_b_vals,
+    torch::Tensor temp_b_idxs
+);
+"""
+
+
+# ---------------------------------------------------------------------------
+# CUDA source
+# ---------------------------------------------------------------------------
+_CUDA_SOURCE = r"""
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <cfloat>
+#include <stdint.h>
+#include <algorithm>
+
+struct Item {
+    float val;
+    int idx;
+};
+
+// -------------------------------------------------------------------------
+// Bitonic sort of N items in shared memory, descending by value.
+// N must be a power of two and N == blockDim.x.
+// -------------------------------------------------------------------------
+__device__ __forceinline__ void bitonic_sort_desc(Item* s, int N) {
+    for (int k = 2; k <= N; k <<= 1) {
+        for (int j = k >> 1; j > 0; j >>= 1) {
+            int i = threadIdx.x;
+            int ixj = i ^ j;
+            if (ixj > i) {
+                bool desc = ((i & k) == 0);
+                Item a = s[i];
+                Item b = s[ixj];
+                if ((desc && a.val < b.val) || (!desc && a.val > b.val)) {
+                    s[i] = b;
+                    s[ixj] = a;
+                }
+            }
+            __syncthreads();
+        }
+    }
+}
+
+// -------------------------------------------------------------------------
+// Argmax kernel for k == 1.
+// -------------------------------------------------------------------------
+__global__ void argmax_kernel(
+    const float* __restrict__ input,
+    float* __restrict__ out_vals,
+    int64_t* __restrict__ out_idxs,
+    int batch, int n
+) {
+    int row = blockIdx.x;
+    const float* row_ptr = input + (size_t)row * n;
+
+    float best_val = -FLT_MAX;
+    int best_idx = -1;
+    for (int i = threadIdx.x; i < n; i += blockDim.x) {
+        float v = row_ptr[i];
+        if (v > best_val) {
+            best_val = v;
+            best_idx = i;
+        }
+    }
+
+    __shared__ float svals[1024];
+    __shared__ int sidxs[1024];
+    svals[threadIdx.x] = best_val;
+    sidxs[threadIdx.x] = best_idx;
+    __syncthreads();
+
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (threadIdx.x < s) {
+            if (svals[threadIdx.x + s] > svals[threadIdx.x]) {
+                svals[threadIdx.x] = svals[threadIdx.x + s];
+                sidxs[threadIdx.x] = sidxs[threadIdx.x + s];
+            }
+        }
+        __syncthreads();
+    }
+
+    if (threadIdx.x == 0) {
+        out_vals[row] = svals[0];
+        out_idxs[row] = (int64_t)sidxs[0];
+    }
+}
+
+// -------------------------------------------------------------------------
+// Pass 1: process a tile of TILE elements, output top-k to temp buffer.
+// Grid: (num_blocks_per_row, batch)
+// -------------------------------------------------------------------------
+__global__ void topk_tile_kernel(
+    const float* __restrict__ input,
+    float* __restrict__ temp_vals,
+    int* __restrict__ temp_idxs,
+    int batch, int n, int k, int num_blocks_per_row
+) {
+    const int row = blockIdx.y;
+    const int block_in_row = blockIdx.x;
+    if (row >= batch) return;
+
+    const int tile_start = block_in_row * TILE;
+    const size_t row_offset = (size_t)row * n;
+
+    __shared__ Item s[TILE];
+
+    for (int lane = threadIdx.x; lane < TILE; lane += blockDim.x) {
+        int pos = tile_start + lane;
+        Item it;
+        if (pos < n) {
+            it.val = input[row_offset + pos];
+            it.idx = pos;
+        } else {
+            it.val = -FLT_MAX;
+            it.idx = -1;
+        }
+        s[lane] = it;
+    }
+    __syncthreads();
+
+    bitonic_sort_desc(s, TILE);
+
+    const int temp_row_stride = num_blocks_per_row * k;
+    const size_t temp_base = (size_t)row * temp_row_stride + (size_t)block_in_row * k;
+    for (int lane = threadIdx.x; lane < k; lane += blockDim.x) {
+        temp_vals[temp_base + lane] = s[lane].val;
+        temp_idxs[temp_base + lane] = s[lane].idx;
+    }
+}
+
+// -------------------------------------------------------------------------
+// Merge kernel: sort a chunk of candidate items and write top-k.
+// Each block handles one chunk of up to `items_per_chunk` items.
+// Grid: (chunks_per_row, batch)
+// -------------------------------------------------------------------------
+__global__ void topk_merge_kernel(
+    const float* __restrict__ in_vals,
+    const int* __restrict__ in_idxs,
+    float* __restrict__ out_vals,
+    int* __restrict__ out_idxs,
+    int batch, int k, int row_stride, int chunks_per_row,
+    int items_per_chunk, int padded_items
+) {
+    const int row = blockIdx.y;
+    const int chunk = blockIdx.x;
+    if (row >= batch || chunk >= chunks_per_row) return;
+
+    const int chunk_start = chunk * items_per_chunk;
+    const int valid_items = min(items_per_chunk, row_stride - chunk_start);
+    const size_t in_base = (size_t)row * row_stride + chunk_start;
+
+    __shared__ Item s[MAX_CANDIDATES];
+
+    for (int lane = threadIdx.x; lane < padded_items; lane += blockDim.x) {
+        Item it;
+        if (lane < valid_items) {
+            it.val = in_vals[in_base + lane];
+            it.idx = in_idxs[in_base + lane];
+        } else {
+            it.val = -FLT_MAX;
+            it.idx = -1;
+        }
+        s[lane] = it;
+    }
+    __syncthreads();
+
+    bitonic_sort_desc(s, padded_items);
+
+    const size_t out_base = (size_t)row * row_stride + (size_t)chunk * k;
+    for (int lane = threadIdx.x; lane < k; lane += blockDim.x) {
+        out_vals[out_base + lane] = s[lane].val;
+        out_idxs[out_base + lane] = s[lane].idx;
+    }
+}
+
+// -------------------------------------------------------------------------
+// Final int32 -> int64 copy for indices (values are already correct).
+// -------------------------------------------------------------------------
+__global__ void copy_indices_kernel(
+    const int* __restrict__ in,
+    int64_t* __restrict__ out,
+    int n
+) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    out[i] = (int64_t)in[i];
+}
+
+// -------------------------------------------------------------------------
+// C++ entry point with pre-allocated outputs and temps.
+// -------------------------------------------------------------------------
+std::vector<torch::Tensor> topk_forward(
+    torch::Tensor input,
+    int k,
+    torch::Tensor out_vals,
+    torch::Tensor out_idxs,
+    torch::Tensor temp_a_vals,
+    torch::Tensor temp_a_idxs,
+    torch::Tensor temp_b_vals,
+    torch::Tensor temp_b_idxs
+) {
+    const int batch = input.size(0);
+    const int n = input.size(1);
+
+    if (k <= 0) {
+        return {out_vals, out_idxs};
+    }
+
+    // Fast path for k == 1.
+    if (k == 1) {
+        argmax_kernel<<<batch, 1024>>>(
+            input.data_ptr<float>(),
+            out_vals.data_ptr<float>(),
+            out_idxs.data_ptr<int64_t>(),
+            batch, n
+        );
+        return {out_vals, out_idxs};
+    }
+
+    const int num_blocks_per_row = (n + TILE - 1) / TILE;
+
+    // Pass 1: tile top-k -> temp_a.
+    dim3 grid1(num_blocks_per_row, batch);
+    dim3 block1(TILE);
+    topk_tile_kernel<<<grid1, block1>>>(
+        input.data_ptr<float>(),
+        temp_a_vals.data_ptr<float>(),
+        temp_a_idxs.data_ptr<int>(),
+        batch, n, k, num_blocks_per_row
+    );
+
+    // Hierarchical merge until one chunk per row remains.
+    torch::Tensor* cur_vals = &temp_a_vals;
+    torch::Tensor* cur_idxs = &temp_a_idxs;
+    torch::Tensor* next_vals = &temp_b_vals;
+    torch::Tensor* next_idxs = &temp_b_idxs;
+    int chunk_in = num_blocks_per_row;
+    const int row_stride = num_blocks_per_row * k;
+
+    while (chunk_in > 1) {
+        int merge_factor = (MAX_CANDIDATES / k);
+        if (merge_factor > chunk_in) merge_factor = chunk_in;
+        if (merge_factor < 1) merge_factor = 1;
+
+        int chunks_per_row = (chunk_in + merge_factor - 1) / merge_factor;
+        int items_per_chunk = merge_factor * k;
+        int padded_items = 1;
+        while (padded_items < items_per_chunk && padded_items < MAX_CANDIDATES) {
+            padded_items <<= 1;
+        }
+        if (padded_items > MAX_CANDIDATES) padded_items = MAX_CANDIDATES;
+
+        dim3 grid2(chunks_per_row, batch);
+        dim3 block2(padded_items);
+        topk_merge_kernel<<<grid2, block2>>>(
+            cur_vals->data_ptr<float>(),
+            cur_idxs->data_ptr<int>(),
+            next_vals->data_ptr<float>(),
+            next_idxs->data_ptr<int>(),
+            batch, k, row_stride, chunks_per_row,
+            items_per_chunk, padded_items
+        );
+
+        std::swap(cur_vals, next_vals);
+        std::swap(cur_idxs, next_idxs);
+        chunk_in = chunks_per_row;
+    }
+
+    // Final values copy and int32->int64 index copy.  cur_vals/cur_idxs are
+    // allocated with stride num_blocks*k, but only the first k columns are valid.
+    at::Tensor cur_vals_view = cur_vals->narrow(1, 0, k);
+    out_vals.copy_(cur_vals_view);
+    out_idxs.copy_(cur_idxs->narrow(1, 0, k).to(torch::kInt64));
+
+    return {out_vals, out_idxs};
+}
+"""
+
+
+# ---------------------------------------------------------------------------
+# Load / cache the extension
+# ---------------------------------------------------------------------------
+def _compile():
+    cflags = [
+        "-O3", "--use_fast_math",
+        "-gencode", "arch=compute_100,code=sm_100",
+        f"-DTILE={TILE}",
+        f"-DMAX_CANDIDATES={MAX_CANDIDATES}",
+    ]
+    return load_inline(
+        name="topk_bitonic_v2",
+        cpp_sources=_CPP_SOURCE,
+        cuda_sources=_CUDA_SOURCE,
+        functions=["topk_forward"],
+        extra_cuda_cflags=cflags,
+        verbose=False,
+    )
+
+
+_CACHED_EXT = None
+
+
+def _ext():
+    global _CACHED_EXT
+    if _CACHED_EXT is None:
+        _CACHED_EXT = _compile()
+    return _CACHED_EXT
+
+
+# ---------------------------------------------------------------------------
+# Model interface (same as reference.py)
+# ---------------------------------------------------------------------------
+class Model(nn.Module):
+    def __init__(self, batch: int, n: int, k: int):
+        super().__init__()
+        self.batch, self.n, self.k = batch, n, k
+        self.register_buffer("_dummy", torch.zeros(1))
+
+        # Pre-allocate temp storage so the timed forward path is allocation-free.
+        # Keep the buffers non-persistent so the reference state_dict still loads.
+        if k > 1:
+            num_blocks_per_row = (n + TILE - 1) // TILE
+            self.register_buffer("_temp_a_vals", torch.empty(batch, num_blocks_per_row * k, dtype=torch.float32), persistent=False)
+            self.register_buffer("_temp_a_idxs", torch.empty(batch, num_blocks_per_row * k, dtype=torch.int32), persistent=False)
+            self.register_buffer("_temp_b_vals", torch.empty(batch, num_blocks_per_row * k, dtype=torch.float32), persistent=False)
+            self.register_buffer("_temp_b_idxs", torch.empty(batch, num_blocks_per_row * k, dtype=torch.int32), persistent=False)
+
+    def forward(self, x: torch.Tensor):
+        if self.k == 1:
+            out_vals = torch.empty(self.batch, 1, dtype=x.dtype, device=x.device)
+            out_idxs = torch.empty(self.batch, 1, dtype=torch.int64, device=x.device)
+            return _ext().topk_forward(
+                x, self.k, out_vals, out_idxs,
+                torch.empty(0, device=x.device), torch.empty(0, device=x.device, dtype=torch.int32),
+                torch.empty(0, device=x.device), torch.empty(0, device=x.device, dtype=torch.int32),
+            )
+
+        out_vals = torch.empty(self.batch, self.k, dtype=x.dtype, device=x.device)
+        out_idxs = torch.empty(self.batch, self.k, dtype=torch.int64, device=x.device)
+        return _ext().topk_forward(
+            x, self.k, out_vals, out_idxs,
+            self._temp_a_vals, self._temp_a_idxs,
+            self._temp_b_vals, self._temp_b_idxs,
+        )
+
+
+# ---------------------------------------------------------------------------
+# Module-level shims (overwritten by check.py / benchmark.py)
+# ---------------------------------------------------------------------------
+batch = 64
+n = 8192
+k = 8
+
+
+def get_inputs():
+    x = torch.randn(batch, n, dtype=torch.float32)
+    return [x]
+
+
+def get_init_inputs():
+    return [batch, n, k]

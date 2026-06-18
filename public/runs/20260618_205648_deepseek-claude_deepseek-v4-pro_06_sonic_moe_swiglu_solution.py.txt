@@ -1,0 +1,385 @@
+"""Fused grouped GEMM + SwiGLU kernel for Sonic-MoE up-projection.
+
+Uses a Triton kernel with variable-length grouped GEMM: each expert gets a
+different number of tokens (determined by expert_offsets). The kernel fuses
+both GEMMs (gate and up) and the SwiGLU activation into a single epilogue.
+
+Autotuning is manual (not @triton.autotune) because the grid geometry depends
+on BLOCK_M, which changes across configs.  We benchmark a small set of configs
+on first call for every (H, I) shape pair and cache the winner.
+"""
+from __future__ import annotations
+
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+OP_TYPE = "grouped_gemm_swiglu"
+SUPPORTED_PRECISIONS = ["bf16"]
+HARDWARE_REQUIRED = ["RTX_PRO_6000", "H100", "B200"]
+
+
+# ---------------------------------------------------------------------------
+# Triton kernel (no autotune decorator — manual tuning below)
+# ---------------------------------------------------------------------------
+
+@triton.jit
+def _grouped_gemm_swiglu_kernel(
+    # Data pointers
+    x_ptr,
+    w_gate_ptr,
+    w_up_ptr,
+    offsets_ptr,
+    m_block_expert_ptr,               # [grid_0]  int32: expert index per M-tile
+    m_block_row_in_expert_ptr,        # [grid_0]  int32: which M-tile within expert
+    out_ptr,
+    # Strides — all constexpr so the compiler can optimise address math
+    stride_x_m: tl.constexpr,
+    stride_w_e: tl.constexpr,
+    stride_w_k: tl.constexpr,
+    stride_w_n: tl.constexpr,
+    stride_out_m: tl.constexpr,
+    # Dimensions
+    H: tl.constexpr,
+    I: tl.constexpr,
+    # Block sizes — constexpr so each config is a separately compiled specialisation
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+
+    # --- Identify the expert and token range for this M-tile ---
+    expert_idx = tl.load(m_block_expert_ptr + pid_m)
+    expert_start = tl.load(offsets_ptr + expert_idx)
+    expert_end = tl.load(offsets_ptr + expert_idx + 1)
+
+    m_block_in_expert = tl.load(m_block_row_in_expert_ptr + pid_m)
+    m_start = expert_start + m_block_in_expert * BLOCK_M
+
+    # --- Index vectors ---
+    m_offs = tl.arange(0, BLOCK_M)     # [BLOCK_M]
+    n_offs = tl.arange(0, BLOCK_N)     # [BLOCK_N]
+    k_offs_b = tl.arange(0, BLOCK_K)   # [BLOCK_K]
+
+    n_start = pid_n * BLOCK_N
+
+    # --- Masks ---
+    row_valid = (m_start + m_offs) < expert_end   # [BLOCK_M]
+    col_valid = (n_start + n_offs) < I             # [BLOCK_N]
+
+    # --- fp32 accumulators ---
+    acc_gate = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    acc_up   = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    # --- Per-expert weight base pointers ---
+    w_gate_e = w_gate_ptr + expert_idx * stride_w_e
+    w_up_e   = w_up_ptr   + expert_idx * stride_w_e
+
+    # --- Main GEMM loop over reduction dimension H ---
+    for k in range(0, H, BLOCK_K):
+        k_offs = k + k_offs_b
+        k_valid = k_offs < H
+
+        # x tile: (BLOCK_M, BLOCK_K)  — loads from hidden_states
+        x_ptrs = x_ptr + (m_start + m_offs[:, None]) * stride_x_m + k_offs[None, :]
+        x_mask = row_valid[:, None] & k_valid[None, :]
+        x = tl.load(x_ptrs, mask=x_mask, other=0.0)
+
+        # w_gate tile: (BLOCK_K, BLOCK_N)
+        wg_ptrs = w_gate_e + k_offs[:, None] * stride_w_k + (n_start + n_offs[None, :]) * stride_w_n
+        wg_mask = k_valid[:, None] & col_valid[None, :]
+        w_gate = tl.load(wg_ptrs, mask=wg_mask, other=0.0)
+
+        # w_up tile: (BLOCK_K, BLOCK_N)
+        wu_ptrs = w_up_e + k_offs[:, None] * stride_w_k + (n_start + n_offs[None, :]) * stride_w_n
+        w_up = tl.load(wu_ptrs, mask=wg_mask, other=0.0)
+
+        # Tensor-core MMA
+        acc_gate = tl.dot(x, w_gate, acc_gate)
+        acc_up   = tl.dot(x, w_up,   acc_up)
+
+    # --- Epilogue: fused SwiGLU ---
+    gate_fp32 = acc_gate.to(tl.float32)
+    up_fp32   = acc_up.to(tl.float32)
+    # SiLU(x) = x * sigmoid(x)
+    silu_gate = gate_fp32 * tl.sigmoid(gate_fp32)
+    result = (silu_gate * up_fp32).to(tl.bfloat16)
+
+    # --- Store output tile ---
+    out_ptrs = out_ptr + (m_start + m_offs[:, None]) * stride_out_m + (n_start + n_offs[None, :])
+    out_mask = row_valid[:, None] & col_valid[None, :]
+    tl.store(out_ptrs, result, mask=out_mask)
+
+
+# ---------------------------------------------------------------------------
+# Grid helper
+# ---------------------------------------------------------------------------
+
+def _cdiv(a: int, b: int) -> int:
+    return (a + b - 1) // b
+
+
+def _compute_grid_and_mapping(
+    expert_offsets: torch.Tensor,
+    I: int,
+    BLOCK_M: int,
+    BLOCK_N: int,
+) -> tuple[tuple, torch.Tensor, torch.Tensor]:
+    """Return (grid, m_block_expert, m_block_row_in_expert).
+
+    grid = (total_M_tiles, ceil(I / BLOCK_N)).
+    The two mapping tensors are int32 device tensors of length total_M_tiles.
+    """
+    cpu = expert_offsets.cpu()
+    E = cpu.shape[0] - 1
+    device = expert_offsets.device
+
+    exp_list: list[int] = []
+    row_list: list[int] = []
+
+    for e in range(E):
+        start = int(cpu[e].item())
+        end = int(cpu[e + 1].item())
+        n_e = end - start
+        if n_e <= 0:
+            continue
+        num_m = _cdiv(n_e, BLOCK_M)
+        for m in range(num_m):
+            exp_list.append(e)
+            row_list.append(m)
+
+    if not exp_list:
+        # Edge case: no tokens at all
+        exp_list = [0]
+        row_list = [0]
+
+    total_m = len(exp_list)
+    n_tiles = _cdiv(I, BLOCK_N)
+
+    m_exp = torch.tensor(exp_list, dtype=torch.int32, device=device)
+    m_row = torch.tensor(row_list, dtype=torch.int32, device=device)
+
+    return (total_m, n_tiles), m_exp, m_row
+
+
+# ---------------------------------------------------------------------------
+# Manual autotuning
+# ---------------------------------------------------------------------------
+
+_CONFIGS = [
+    # SM100 MMA works best with 128-wide tiles.  num_warps=8 (256 threads)
+    # keeps per-thread register count manageable while giving good occupancy.
+    # acc regs ≈ 2 × BLOCK_M × BLOCK_N / (num_warps × 32).
+    {"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 32,  "num_warps": 8},   # acc regs: 128
+    {"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 64,  "num_warps": 8},   # acc regs: 128
+    {"BLOCK_M": 128, "BLOCK_N": 64,  "BLOCK_K": 64,  "num_warps": 8},   # acc regs: 64
+    {"BLOCK_M": 64,  "BLOCK_N": 128, "BLOCK_K": 64,  "num_warps": 8},   # acc regs: 64
+]
+
+# Cache: key=(H, I) -> best config dict
+_best_cfg: dict[tuple, dict] = {}
+
+
+def _autotune(
+    H: int,
+    I: int,
+    x: torch.Tensor,
+    w_gate: torch.Tensor,
+    w_up: torch.Tensor,
+    offsets: torch.Tensor,
+    out: torch.Tensor,
+    stride_x_m: int,
+    stride_w_e: int,
+    stride_w_k: int,
+    stride_w_n: int,
+    stride_out_m: int,
+) -> dict:
+    """Benchmark all configs, cache the fastest, return it."""
+    key = (H, I)
+    if key in _best_cfg:
+        return _best_cfg[key]
+
+    warmup = 5
+    rep = 10
+
+    best_time = float("inf")
+    best = _CONFIGS[0]
+
+    for cfg in _CONFIGS:
+        blk_m = cfg["BLOCK_M"]
+        blk_n = cfg["BLOCK_N"]
+        blk_k = cfg["BLOCK_K"]
+        nw = cfg["num_warps"]
+
+        grid, m_exp, m_row = _compute_grid_and_mapping(offsets, I, blk_m, blk_n)
+
+        # Warm-up (also compiles the specialised kernel variant)
+        for _ in range(warmup):
+            _grouped_gemm_swiglu_kernel[grid](
+                x, w_gate, w_up, offsets,
+                m_exp, m_row, out,
+                stride_x_m, stride_w_e, stride_w_k, stride_w_n, stride_out_m,
+                H=H, I=I,
+                BLOCK_M=blk_m, BLOCK_N=blk_n, BLOCK_K=blk_k,
+                num_warps=nw,
+            )
+        torch.cuda.synchronize()
+
+        # Timed runs
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        start.record()
+        for _ in range(rep):
+            _grouped_gemm_swiglu_kernel[grid](
+                x, w_gate, w_up, offsets,
+                m_exp, m_row, out,
+                stride_x_m, stride_w_e, stride_w_k, stride_w_n, stride_out_m,
+                H=H, I=I,
+                BLOCK_M=blk_m, BLOCK_N=blk_n, BLOCK_K=blk_k,
+                num_warps=nw,
+            )
+        end.record()
+        torch.cuda.synchronize()
+        elapsed = start.elapsed_time(end) / rep
+
+        if elapsed < best_time:
+            best_time = elapsed
+            best = cfg
+
+    _best_cfg[key] = best
+    # Warm the best config's compiled kernel for subsequent calls
+    blk_m = best["BLOCK_M"]
+    blk_n = best["BLOCK_N"]
+    blk_k = best["BLOCK_K"]
+    nw = best["num_warps"]
+    grid, m_exp, m_row = _compute_grid_and_mapping(offsets, I, blk_m, blk_n)
+    for _ in range(2):
+        _grouped_gemm_swiglu_kernel[grid](
+            x, w_gate, w_up, offsets,
+            m_exp, m_row, out,
+            stride_x_m, stride_w_e, stride_w_k, stride_w_n, stride_out_m,
+            H=H, I=I,
+            BLOCK_M=blk_m, BLOCK_N=blk_n, BLOCK_K=blk_k,
+            num_warps=nw,
+        )
+    torch.cuda.synchronize()
+
+    return best
+
+
+# ---------------------------------------------------------------------------
+# Model
+# ---------------------------------------------------------------------------
+
+class Model(nn.Module):
+    """Up-projection of a top-K MoE FFN with fused SwiGLU.
+
+    Inputs at call time:
+      hidden_states:    (T_perm, H)  bf16, already permuted to expert order
+      expert_offsets:   (E+1,)       int32, prefix sums of token counts per expert
+                                     so expert e owns rows [offsets[e]:offsets[e+1]]
+                                     T_perm = T_total * K (each token visits K experts)
+
+    Output:
+      gated_up:         (T_perm, I)  bf16
+    """
+
+    def __init__(self, T_total: int, H: int, I: int, E: int, K: int):  # noqa: E741
+        super().__init__()
+        self.T_total = T_total
+        self.H = H
+        self.I = I
+        self.E = E
+        self.K = K
+        # Two weight tensors per expert: gate (E, H, I) and up (E, H, I).
+        self.W_gate = nn.Parameter(torch.empty(E, H, I, dtype=torch.bfloat16))
+        self.W_up = nn.Parameter(torch.empty(E, H, I, dtype=torch.bfloat16))
+        nn.init.normal_(self.W_gate, std=0.02)
+        nn.init.normal_(self.W_up, std=0.02)
+        # Guard to avoid re-autotuning if shape / weight ptrs haven't changed
+        self._tuned_for: tuple | None = None
+        self._best_cfg: dict | None = None
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,   # (T_perm, H) bf16
+        expert_offsets: torch.Tensor,  # (E+1,) int32
+    ) -> torch.Tensor:
+        T_perm, H = hidden_states.shape
+        I = self.I
+
+        # Strides
+        stride_x_m = hidden_states.stride(0)
+        stride_w_e = self.W_gate.stride(0)
+        stride_w_k = self.W_gate.stride(1)
+        stride_w_n = self.W_gate.stride(2)
+
+        out = torch.empty(T_perm, I, dtype=torch.bfloat16, device=hidden_states.device)
+        stride_out_m = out.stride(0)
+
+        # Coarse cache key — if the weight data pointer changed (new model
+        # instance), re-tune.
+        wgate_data = self.W_gate.data_ptr()
+        cache_key = (H, I, wgate_data)
+        if self._tuned_for != cache_key:
+            self._best_cfg = _autotune(
+                H, I,
+                hidden_states, self.W_gate, self.W_up, expert_offsets, out,
+                stride_x_m, stride_w_e, stride_w_k, stride_w_n, stride_out_m,
+            )
+            self._tuned_for = cache_key
+
+        cfg = self._best_cfg
+        blk_m = cfg["BLOCK_M"]
+        blk_n = cfg["BLOCK_N"]
+        blk_k = cfg["BLOCK_K"]
+        nw = cfg["num_warps"]
+
+        grid, m_exp, m_row = _compute_grid_and_mapping(expert_offsets, I, blk_m, blk_n)
+
+        _grouped_gemm_swiglu_kernel[grid](
+            hidden_states, self.W_gate, self.W_up, expert_offsets,
+            m_exp, m_row, out,
+            stride_x_m, stride_w_e, stride_w_k, stride_w_n, stride_out_m,
+            H=H, I=I,
+            BLOCK_M=blk_m, BLOCK_N=blk_n, BLOCK_K=blk_k,
+            num_warps=nw,
+        )
+
+        return out
+
+
+# ---------------------------------------------------------------------------
+# Module-level shape shims (rewritten by check.py / benchmark.py per shape)
+# ---------------------------------------------------------------------------
+T_total = 32768
+H = 4096
+I = 1536  # noqa: E741
+E = 128
+K = 8
+
+
+def _build_routing(T_total: int, E: int, K: int, device: str = "cpu") -> torch.Tensor:
+    """Round-robin-ish routing metadata: balanced offsets summing to T_total*K."""
+    T_perm = T_total * K
+    base = T_perm // E
+    rem = T_perm - base * E
+    counts = torch.full((E,), base, dtype=torch.int32, device=device)
+    counts[:rem] += 1
+    offsets = torch.zeros(E + 1, dtype=torch.int32, device=device)
+    offsets[1:] = torch.cumsum(counts, dim=0)
+    return offsets
+
+
+def get_inputs():
+    T_perm = T_total * K
+    hidden_states = torch.randn(T_perm, H, dtype=torch.bfloat16) * 0.1
+    expert_offsets = _build_routing(T_total, E, K)
+    return [hidden_states, expert_offsets]
+
+
+def get_init_inputs():
+    return [T_total, H, I, E, K]

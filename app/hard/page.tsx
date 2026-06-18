@@ -89,6 +89,20 @@ const GPU_TARGETS = [
       </>
     ),
   },
+  {
+    key: "b200",
+    label: "B200",
+    file: "benchmarks/hard/results/leaderboard.b200.json",
+    blurb: (
+      <>
+        The same eight models on a single NVIDIA B200 (SM100 Blackwell, HBM3e)
+        with the identical containerized harness and roofline grading; peak
+        fraction is measured against B200 dense peaks (fp8 4500, bf16 2250
+        TFLOPS), so the same kernel reads as a smaller fraction of a much higher
+        ceiling.
+      </>
+    ),
+  },
 ] as const
 
 export default async function HardPage({
