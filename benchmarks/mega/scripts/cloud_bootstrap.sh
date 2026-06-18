@@ -26,6 +26,11 @@ if ! command -v node >/dev/null 2>&1; then
 fi
 command -v codex >/dev/null 2>&1 || sudo npm i -g @openai/codex >/dev/null 2>&1
 command -v claude >/dev/null 2>&1 || sudo npm i -g @anthropic-ai/claude-code >/dev/null 2>&1
+# gemini CLI (gemini-3.5-flash harness; key via GEMINI_API_KEY in ~/.env_vars)
+command -v gemini >/dev/null 2>&1 || sudo npm i -g @google/gemini-cli >/dev/null 2>&1
+# cursor agent CLI (composer harness); auth rsynced separately as ~/.config/cursor + ~/.cursor
+command -v cursor-agent >/dev/null 2>&1 || command -v agent >/dev/null 2>&1 || \
+  curl -fsS https://cursor.com/install -fsS 2>/dev/null | bash >/dev/null 2>&1 || true
 
 # mega project with cu128 torch (R570-compatible)
 cd ~/mega

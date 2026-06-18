@@ -584,6 +584,70 @@ case "$HARNESS" in
             > "$LOG_FILE" 2> "$STDERR_FILE" || HARNESS_EXIT=$?
         ;;
 
+    kimi-claude)
+        # Claude Code routed to Moonshot's Anthropic-compatible endpoint for Kimi.
+        # Requires KIMI_API_KEY. Pass MODEL=kimi-k2.7-code.
+        if [ -z "${KIMI_API_KEY:-}" ]; then
+            echo "KIMI_API_KEY is required for kimi-claude" >&2
+            exit 1
+        fi
+        KIMI_CLAUDE_ALIAS="${KIMI_CLAUDE_ALIAS:-opus}"
+        KIMI_CLAUDE_HAIKU_MODEL="${KIMI_CLAUDE_HAIKU_MODEL:-$MODEL}"
+        ( cd "$PROBLEM_DIR" && \
+            export ANTHROPIC_AUTH_TOKEN="$KIMI_API_KEY" && \
+            export ANTHROPIC_BASE_URL="${KIMI_ANTHROPIC_BASE_URL:-https://api.moonshot.ai/anthropic}" && \
+            export API_TIMEOUT_MS="${API_TIMEOUT_MS:-3000000}" && \
+            export CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC="${CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC:-1}" && \
+            export CLAUDE_CODE_MAX_RETRIES="${CLAUDE_CODE_MAX_RETRIES:-1000000}" && \
+            export CLAUDE_CODE_MAX_OUTPUT_TOKENS="${CLAUDE_CODE_MAX_OUTPUT_TOKENS:-128000}" && \
+            export ANTHROPIC_MODEL="$MODEL" && \
+            export ANTHROPIC_DEFAULT_HAIKU_MODEL="$KIMI_CLAUDE_HAIKU_MODEL" && \
+            export ANTHROPIC_DEFAULT_SONNET_MODEL="$MODEL" && \
+            export ANTHROPIC_DEFAULT_OPUS_MODEL="$MODEL" && \
+            timeout "$BUDGET_SECONDS" claude \
+                --dangerously-skip-permissions \
+                --print --verbose \
+                --output-format stream-json \
+                --settings "$CLAUDE_KBH_SETTINGS" \
+                --model "$KIMI_CLAUDE_ALIAS" \
+                --disallowedTools ExitPlanMode EnterPlanMode AskUserQuestion \
+                --add-dir "$PROBLEM_DIR" \
+                -p "$PROMPT" ) \
+            > "$LOG_FILE" 2> "$STDERR_FILE" || HARNESS_EXIT=$?
+        ;;
+
+    deepseek-claude)
+        # Claude Code routed to DeepSeek's Anthropic-compatible endpoint.
+        # Requires DEEPSEEK_API_KEY. Pass MODEL=deepseek-v4-pro.
+        if [ -z "${DEEPSEEK_API_KEY:-}" ]; then
+            echo "DEEPSEEK_API_KEY is required for deepseek-claude" >&2
+            exit 1
+        fi
+        DEEPSEEK_CLAUDE_ALIAS="${DEEPSEEK_CLAUDE_ALIAS:-opus}"
+        DEEPSEEK_CLAUDE_HAIKU_MODEL="${DEEPSEEK_CLAUDE_HAIKU_MODEL:-$MODEL}"
+        ( cd "$PROBLEM_DIR" && \
+            export ANTHROPIC_AUTH_TOKEN="$DEEPSEEK_API_KEY" && \
+            export ANTHROPIC_BASE_URL="${DEEPSEEK_ANTHROPIC_BASE_URL:-https://api.deepseek.com/anthropic}" && \
+            export API_TIMEOUT_MS="${API_TIMEOUT_MS:-3000000}" && \
+            export CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC="${CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC:-1}" && \
+            export CLAUDE_CODE_MAX_RETRIES="${CLAUDE_CODE_MAX_RETRIES:-1000000}" && \
+            export CLAUDE_CODE_MAX_OUTPUT_TOKENS="${CLAUDE_CODE_MAX_OUTPUT_TOKENS:-128000}" && \
+            export ANTHROPIC_MODEL="$MODEL" && \
+            export ANTHROPIC_DEFAULT_HAIKU_MODEL="$DEEPSEEK_CLAUDE_HAIKU_MODEL" && \
+            export ANTHROPIC_DEFAULT_SONNET_MODEL="$MODEL" && \
+            export ANTHROPIC_DEFAULT_OPUS_MODEL="$MODEL" && \
+            timeout "$BUDGET_SECONDS" claude \
+                --dangerously-skip-permissions \
+                --print --verbose \
+                --output-format stream-json \
+                --settings "$CLAUDE_KBH_SETTINGS" \
+                --model "$DEEPSEEK_CLAUDE_ALIAS" \
+                --disallowedTools ExitPlanMode EnterPlanMode AskUserQuestion \
+                --add-dir "$PROBLEM_DIR" \
+                -p "$PROMPT" ) \
+            > "$LOG_FILE" 2> "$STDERR_FILE" || HARNESS_EXIT=$?
+        ;;
+
     codex)
         EFFORT_ARG=()
         if [ -n "$REASONING_EFFORT" ]; then
@@ -693,7 +757,7 @@ case "$HARNESS" in
 
     *)
         echo "Unknown harness: $HARNESS" >&2
-        echo "Supported: claude, zai-claude, minimax-claude, ccr-claude, codex, kimi, droid, gemini, cursor, grok, opencode" >&2
+        echo "Supported: claude, zai-claude, minimax-claude, kimi-claude, deepseek-claude, ccr-claude, codex, kimi, droid, gemini, cursor, grok, opencode" >&2
         exit 1
         ;;
 esac
@@ -724,7 +788,7 @@ fi
 
 SESSION_COMPLETE=true
 case "$HARNESS" in
-    claude|zai-claude|ccr-claude|cursor|gemini)
+    claude|zai-claude|minimax-claude|kimi-claude|deepseek-claude|ccr-claude|cursor|gemini)
         if ! grep -q '"type":"result"' "$CHECK_FILE" 2>/dev/null; then
             SESSION_COMPLETE=false
         fi

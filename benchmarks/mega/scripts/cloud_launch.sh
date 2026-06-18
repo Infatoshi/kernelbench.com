@@ -38,10 +38,13 @@ ensure_reachable
 
 echo "[1/3] rsync repo + auth -> $NAME"
 rsync -az -e "${S[*]}" --exclude outputs --exclude __pycache__ --exclude .venv --exclude '*.pyc' --exclude .git "$HERE/" "$NAME:mega/"
-"${S[@]}" "$NAME" "mkdir -p .codex .claude"
+"${S[@]}" "$NAME" "mkdir -p .codex .claude .config/cursor .cursor"
 rsync -az -e "${S[*]}" ~/.codex/auth.json "$NAME:.codex/auth.json"
 rsync -az -e "${S[*]}" ~/.claude/.credentials.json "$NAME:.claude/.credentials.json"
 rsync -az -e "${S[*]}" ~/.env_vars "$NAME:.env_vars"
+# cursor auth (composer harness); *-claude + gemini routes use ~/.env_vars keys only
+rsync -az -e "${S[*]}" ~/.config/cursor/auth.json "$NAME:.config/cursor/auth.json" 2>/dev/null || true
+rsync -az -e "${S[*]}" ~/.cursor/cli-config.json ~/.cursor/agent-cli-state.json "$NAME:.cursor/" 2>/dev/null || true
 
 echo "[2/3] bootstrap"
 "${S[@]}" "$NAME" "bash ~/mega/scripts/cloud_bootstrap.sh"
