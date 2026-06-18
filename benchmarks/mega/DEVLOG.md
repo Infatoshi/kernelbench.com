@@ -4,6 +4,42 @@ A running record of decisions, dead ends, and lessons. Newest entries on top. Th
 
 ---
 
+## 2026-06-18 — three-GPU leaderboard published (Blackwell / H100 / B200)
+
+Problem 03 (W4A16 Kimi-Linear decode) swept across three GPU generations, codex
++ opus on each, all published to /mega with the GPU as a table column:
+
+      GPU                     codex/gpt-5.5    opus-4-8
+      RTX PRO 6000 Blackwell      4.34x         14.40x
+      H100                        5.62x         15.50x
+      B200                        9.37x         19.35x   <- highest
+
+Reads: opus dominates codex on every GPU (deeper kernel engineering under
+unlimited time). Both models scale *up* the speedup ratio from Blackwell ->
+H100 -> B200, because the baseline (naive int4 materialize) gets relatively
+worse on the bigger datacenter cards while the fused dequant-GEMV keeps pace --
+so the fusion win compounds with bandwidth. The score is a same-GPU
+speedup-over-baseline ratio, which is exactly why it ports across generations
+with no recalibration. int4/bf16-acc ran on all three with stock cu128 torch and
+zero code changes (Ampere/Hopper/Blackwell all do bf16; no special tensor-core
+format), validated on B200 sm_100 (driver 580).
+
+One-shot reproducibility proven on the B200: `cloud_launch.sh <instance> <gpu>`
+did rsync + bootstrap + cu128-torch-on-sm_100 + the codex+opus sweep in one
+command (`cloud_sweep.sh` tags each run with its GPU so the leaderboard builder
+picks it up). The recurring failure was brev dropping the host entry from
+`~/.brev/ssh_config` (DNS resolve fails) -- now self-healed via `brev refresh`
+retry in `ensure_reachable`, and monitoring switched to direct-IP ssh to dodge
+the alias churn entirely.
+
+Publish path: `scripts/build_mega_leaderboard.py` (requires a per-run `gpu`
+marker, excluding legacy bf16 03-runs) -> `public/data/mega/results.csv` ->
+`app/mega/page.tsx` (GPU column, grouped by GPU then speedup). Both my cloud
+instances (H100, B200) terminated after pull; never touched Elliot's kbh-* eval
+boxes.
+
+---
+
 ## 2026-06-18 — Autonomous H100 cloud run + per-GPU leaderboard
 
 Ran codex/gpt-5.5 (xhigh) autonomously on problem 03 (W4A16 Kimi-Linear decode)
