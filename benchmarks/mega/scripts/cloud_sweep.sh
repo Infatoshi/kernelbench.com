@@ -40,7 +40,8 @@ run_one() {
   local HARNESS="$1" MODEL="$2" EFFORT="$3"
   local log="$HOME/mega_run_${HARNESS}_${MODEL}.log"
   echo "[$GPU_LABEL] launch $HARNESS $MODEL $EFFORT ($(date -Is))"
-  BUDGET_SECONDS="$BUDGET_SECONDS" ./scripts/run_hard.sh "$HARNESS" "$MODEL" "$PROBLEM" "$EFFORT" > "$log" 2>&1 || true
+  # </dev/null: keep the agent CLI from eating the caller loop's here-string stdin
+  BUDGET_SECONDS="$BUDGET_SECONDS" ./scripts/run_hard.sh "$HARNESS" "$MODEL" "$PROBLEM" "$EFFORT" > "$log" 2>&1 </dev/null || true
   local arch
   arch=$(grep -oE "Archive:.*outputs/runs/[^ ]+" "$log" | awk '{print $NF}' | head -1)
   if [ -n "$arch" ] && [ -d "$arch" ]; then
@@ -52,12 +53,12 @@ run_one() {
 }
 
 pids=()
-while IFS='|' read -r HARNESS MODEL EFFORT; do
+while IFS='|' read -r -u3 HARNESS MODEL EFFORT; do
   [ -z "$HARNESS" ] && continue
   run_one "$HARNESS" "$MODEL" "$EFFORT" &
   pids+=($!)
   sleep 20   # stagger launches so torch/triton first-compile doesn't thrash
-done <<< "$ROSTER"
+done 3<<< "$ROSTER"
 
 echo "=== SWEEP $GPU_LABEL launched ${#pids[@]} models concurrently, waiting ==="
 for p in "${pids[@]}"; do wait "$p"; done
