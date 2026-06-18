@@ -139,12 +139,11 @@ export async function loadBaselines(): Promise<ProblemBaselines | null> {
   }
 }
 
-export async function loadLeaderboard(): Promise<Leaderboard> {
-  const path = join(
-    REPO_ROOT,
-    process.env.KERNELBENCH_HARD_LEADERBOARD ??
-      "benchmarks/hard/results/leaderboard.json",
-  )
+export async function loadLeaderboard(
+  file = process.env.KERNELBENCH_HARD_LEADERBOARD ??
+    "benchmarks/hard/results/leaderboard.json",
+): Promise<Leaderboard> {
+  const path = join(REPO_ROOT, file)
   const text = await readFile(path, "utf-8")
   return JSON.parse(text)
 }

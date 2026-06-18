@@ -14,7 +14,10 @@ set -uo pipefail
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$REPO_ROOT"
 
-OUT="results/problem_baselines.json"
+# Per-GPU override: set KBH_BASELINE_OUT + KBH_HARDWARE_LABEL on other boxes
+# (e.g. the H100) so baselines land in a distinct file and tag the right GPU.
+OUT="${KBH_BASELINE_OUT:-results/problem_baselines.json}"
+HW_LABEL="${KBH_HARDWARE_LABEL:-RTX_PRO_6000_BLACKWELL_SM120}"
 mkdir -p results
 TMP_DIR="$(mktemp -d)"
 declare -a touched=()
@@ -44,7 +47,7 @@ out_lines=()
 out_lines+=("{")
 out_lines+=("  \"_schema\": \"per-problem reference and SOTA timings, geomean across shapes\",")
 out_lines+=("  \"_generated\": \"$(date -Iseconds)\",")
-out_lines+=("  \"_hardware\": \"RTX_PRO_6000_BLACKWELL_SM120\",")
+out_lines+=("  \"_hardware\": \"$HW_LABEL\",")
 out_lines+=("  \"problems\": {")
 
 for i in "${!problems[@]}"; do

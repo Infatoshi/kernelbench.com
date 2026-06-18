@@ -5,11 +5,18 @@ v2 environment: KBH_AGENT_CONTAINER=1, parallel sessions, per-command GPU lock,
 cells are kept visible but marked invalid and excluded from ceiling ranking;
 rubric_leak/interesting are valid but flagged.
 """
-import json, glob, os, re
+import json, glob, os, re, sys
 from pathlib import Path
 from collections import defaultdict
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+from src.hardware import get as get_hw  # noqa: E402
+
+# Per-GPU target selects the published hardware block. Default RTX_PRO_6000
+# preserves the original Blackwell leaderboard; set KBH_HARDWARE=H100 on the
+# H100 box so the generated block reports Hopper specs.
+_hw = get_hw(os.environ.get("KBH_HARDWARE", "RTX_PRO_6000"))
 PROBLEMS = ["01_fp8_gemm","02_kda_cutlass","03_paged_attention",
             "05_topk_bitonic","06_sonic_moe_swiglu","07_w4a16_gemm"]
 
@@ -155,7 +162,7 @@ out = {
     "schema_version": 2,
     "environment": "v2_containerized",
     "environment_notes": "KBH_AGENT_CONTAINER=1, parallel sessions, per-command GPU lock, nvcc 13.2, torch 2.11+cu130; 6-problem deck",
-    "hardware": {"name":"RTX PRO 6000 Blackwell Workstation","sm":"sm_120a","vram_gb":96,"peak_bandwidth_gb_s":1800},
+    "hardware": {"name":_hw.name,"sm":_hw.sm,"vram_gb":_hw.vram_gb,"peak_bandwidth_gb_s":_hw.peak_bandwidth_gb_s},
     "problems": PROBLEMS,
     "models": sorted(models, key=lambda m: -m["valid_pass_count"]),
     "per_problem": per_problem,

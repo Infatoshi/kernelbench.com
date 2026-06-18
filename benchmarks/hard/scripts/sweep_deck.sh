@@ -7,6 +7,7 @@ HARNESS="${1:?harness required}"; MODEL="${2:?model required}"; EFFORT="${3:-}"
 HARD_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$HARD_DIR"
 export KBH_AGENT_CONTAINER=1
+PROBLEMS_ROOT="${KBH_PROBLEMS_ROOT:-problems}"   # per-GPU prompt sets, e.g. problems-h100
 PROBLEMS=(01_fp8_gemm 02_kda_cutlass 03_paged_attention 05_topk_bitonic 06_sonic_moe_swiglu 07_w4a16_gemm)
 SLUG="$(echo "${HARNESS}_${MODEL}" | tr '/:. ' '____')"
 LOG="outputs/tmp/sweep_${SLUG}.log"; mkdir -p outputs/tmp; : > "$LOG"
@@ -14,7 +15,7 @@ echo "[$(date -Is)] sweep $HARNESS $MODEL effort='$EFFORT' (6 problems, parallel
 pids=()
 for p in "${PROBLEMS[@]}"; do
   echo "[$(date -Is)] LAUNCH $p" >> "$LOG"
-  uv run kbh run "$HARNESS" "$MODEL" "problems/$p" $EFFORT > "outputs/tmp/sweep_${SLUG}_${p}.log" 2>&1 &
+  uv run kbh run "$HARNESS" "$MODEL" "$PROBLEMS_ROOT/$p" $EFFORT > "outputs/tmp/sweep_${SLUG}_${p}.log" 2>&1 &
   pids+=($!); sleep 25
 done
 fail=0

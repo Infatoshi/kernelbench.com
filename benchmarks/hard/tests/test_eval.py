@@ -74,7 +74,17 @@ def test_hardware_lookup():
     hw = get("RTX_PRO_6000")
     assert hw.sm == "sm_120a"
     assert hw.peak_bandwidth_gb_s == pytest.approx(1800.0)
-    assert hw.peak_tflops_dense["fp8"] == pytest.approx(400.0)
+    assert hw.peak_tflops_dense["fp8"] == pytest.approx(1000.0)
+
+
+def test_hardware_lookup_h100():
+    hw = get("H100")
+    assert hw.sm == "sm_90a"
+    assert hw.vram_gb == 80
+    assert hw.peak_bandwidth_gb_s == pytest.approx(2039.0)
+    # H100 PCIe dense fp8 peak; bf16 is half of fp8.
+    assert hw.peak_tflops_dense["fp8"] == pytest.approx(1513.0)
+    assert hw.peak_tflops_dense["bf16"] == pytest.approx(756.0)
 
 
 def test_benchmark_baselines_env_flags(monkeypatch):

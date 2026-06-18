@@ -61,9 +61,45 @@ function isVisibleModel(m: Model) {
   )
 }
 
-export default async function HardPage() {
+const GPU_TARGETS = [
+  {
+    key: "rtx",
+    label: "RTX PRO 6000",
+    file: "benchmarks/hard/results/leaderboard.json",
+    blurb: (
+      <>
+        Leading models (Opus 4.8, GPT-5.5, GLM-5.2, MiniMax-M3, Gemini 3.5
+        Flash, Kimi K2.7-Code) were reswept June 2026 with{" "}
+        <span className="text-[var(--color-fg)]">unlimited time per problem</span>;
+        earlier rows used the original 45-minute budget. Claude Fable 5 is
+        suspended and shown as a frozen 45-minute reference.
+      </>
+    ),
+  },
+  {
+    key: "h100",
+    label: "H100 PCIe",
+    file: "benchmarks/hard/results/leaderboard.h100.json",
+    blurb: (
+      <>
+        Eight models (Opus 4.8, GPT-5.5, GLM-5.2, MiniMax-M3, Gemini 3.5 Flash,
+        DeepSeek V4 Pro, Kimi K2.7-Code, Composer 2.5 Fast) on a single H100
+        PCIe with the same containerized harness and roofline grading as the
+        Blackwell deck; peak fraction is measured against H100 dense peaks.
+      </>
+    ),
+  },
+] as const
+
+export default async function HardPage({
+  searchParams,
+}: {
+  searchParams: Promise<{ gpu?: string }>
+}) {
+  const { gpu } = await searchParams
+  const target = GPU_TARGETS.find((g) => g.key === gpu) ?? GPU_TARGETS[0]
   const [lb, annotations, audits, hasViewer] = await Promise.all([
-    loadLeaderboard(),
+    loadLeaderboard(target.file),
     loadAnnotations(),
     loadRunAudits(),
     loadAvailableViewers(),
@@ -80,15 +116,26 @@ export default async function HardPage() {
         <h1 className="text-3xl font-semibold tracking-tight text-[var(--color-fg-bright)] mb-3">
           hard
         </h1>
+        <div className="flex gap-2 mb-3" aria-label="hardware selector">
+          {GPU_TARGETS.map((g) => (
+            <Link
+              key={g.key}
+              href={g.key === "rtx" ? "/hard" : `/hard?gpu=${g.key}`}
+              className={
+                g.key === target.key
+                  ? "text-xs px-2 py-1 border border-[var(--color-accent)] text-[var(--color-accent)] rounded"
+                  : "text-xs px-2 py-1 border border-[var(--color-border)] text-[var(--color-fg-muted)] rounded hover:text-[var(--color-fg)]"
+              }
+            >
+              {g.label}
+            </Link>
+          ))}
+        </div>
         <p className="text-sm text-[var(--color-fg)] mb-2">
-          RTX PRO 6000 Blackwell (sm120)
+          {lb.hardware.name} ({lb.hardware.sm})
         </p>
         <p className="text-xs text-[var(--color-fg-muted)] mb-6 max-w-4xl leading-relaxed">
-          Leading models (Opus 4.8, GPT-5.5, GLM-5.2, MiniMax-M3, Gemini 3.5
-          Flash, Kimi K2.7-Code) were reswept June 2026 with{" "}
-          <span className="text-[var(--color-fg)]">unlimited time per problem</span>;
-          earlier rows used the original 45-minute budget. Claude Fable 5 is
-          suspended and shown as a frozen 45-minute reference.
+          {target.blurb}
         </p>
       </section>
 
