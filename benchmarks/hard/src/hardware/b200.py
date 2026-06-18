@@ -1,13 +1,12 @@
 """NVIDIA B200 (Blackwell datacenter, GB100) — SM100, HBM3e.
 
-Peak tensor-core throughputs are dense-matrix advertised peaks (NVIDIA B200
-datasheet; the headline FP4/FP8 figures there include 2x sparsity, so dense =
-half). Real well-tuned kernels see ~60-85% of peak. This box reports ~180GB
-HBM3e (the 180GB B200 SKU) at ~8 TB/s.
-
-Empirical verification pending: confirm cuBLAS achieved TFLOPS land at
-~0.75-0.85 of these (fp8 ~3400-3800, bf16 ~1700-1900) when baselines run on the
-box; bump the table if any real kernel exceeds peak_fraction 1.0.
+Dense tensor-core peaks from the official NVIDIA B200 datasheet. The headline
+figures are with structured sparsity; dense = half: fp4 18->9000, fp8 9->4500,
+bf16/fp16 4.5->2250 PFLOPS->TFLOPS, tf32 2.2->1100. Memory ~8 TB/s HBM3e (NVIDIA
+spec is 192GB; this cloud box reports ~180GB, a binned SKU - bandwidth used for
+the roofline is the 8 TB/s spec). Well-tuned kernels reach ~60-85% of these, so
+they serve as the roofline ceiling: the 2026-06-18 8-model sweep produced no
+peak_fraction > 1.0.
 """
 from src.hardware.rtx_pro_6000 import HardwareTarget
 

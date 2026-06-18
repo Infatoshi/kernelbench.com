@@ -1,14 +1,11 @@
 """NVIDIA H100 PCIe (80GB HBM2e) — Hopper GH100, SM90.
 
-Peak tensor-core throughputs are dense-matrix advertised peaks (NVIDIA H100
-PCIe datasheet; the sparse figures there are 2x these). Real well-tuned kernels
-see ~60-85% of peak, and cuBLAS lands ~75-82% — so dense peaks keep
-peak_fraction < 1.0 for genuine kernels. These are the PCIe SKU numbers (the
-SXM5 part is higher: ~989 bf16 / 1979 fp8 dense, 3.35 TB/s); do not mix them up.
-
-Empirical verification pending: confirm cuBLAS achieved TFLOPS on 4096^3 land
-at ~0.75-0.85 of these (fp8 ~1150-1300, bf16 ~570-640) when baselines run on
-the box; bump the table if any real kernel exceeds peak_fraction 1.0.
+Dense tensor-core peaks from the official NVIDIA H100 datasheet (PCIe column).
+The datasheet quotes structured-sparsity figures; dense = half: fp8 3026->1513,
+bf16/fp16 1513->756, tf32 756->378. Memory 2 TB/s, 80GB. These are the PCIe SKU
+numbers (the SXM5 part is higher: ~989 bf16 / 1979 fp8 dense, 3.35 TB/s); do not
+mix them up. Well-tuned kernels reach ~60-85% of these, so they serve as the
+roofline ceiling: the 2026-06-18 8-model sweep produced no peak_fraction > 1.0.
 """
 from src.hardware.rtx_pro_6000 import HardwareTarget
 
