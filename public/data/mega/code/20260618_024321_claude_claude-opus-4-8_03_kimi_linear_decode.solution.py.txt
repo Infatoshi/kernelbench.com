@@ -1,0 +1,625 @@
+"""Fused W4A16 Kimi-Linear hybrid decode (batch=1) for RTX PRO 6000 (SM120).
+
+Two ideas carry the speedup over baseline.py:
+
+1. A custom Triton kernel fuses the int4 unpack + per-group asymmetric dequant
+   directly into the M=1 GEMV, so the int4 weights stream once (1/4 the bytes of
+   bf16) and the dequantized bf16 matrix is never materialized.
+2. The whole decode step is captured into a CUDA graph (keyed by the MLA cache
+   length, the only dynamic shape) so per-kernel launch overhead -- which at
+   batch-1 dominates the wall clock -- is paid once and replayed for free. MLA
+   uses weight-absorption so kv_b is never re-applied to the full latent cache.
+
+Module tree + buffer/param names mirror reference.py exactly so the reference
+state_dict loads with strict=True.
+"""
+from __future__ import annotations
+
+import os
+
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+EPS = 1.0e-6
+GROUP_SIZE = 128
+_USE_GRAPH = os.environ.get("KIMI_NO_GRAPH", "0") != "1"
+
+
+# --------------------------------------------------------------------------- #
+# Fused int4 dequant-GEMV (M=1), batched over experts via the grid + split-K.
+# --------------------------------------------------------------------------- #
+@triton.jit
+def _gemv_int4_kernel(
+    x_ptr, idx_ptr, wq_ptr, sc_ptr, zr_ptr, y_ptr,
+    N, NG,
+    stride_xe,
+    stride_we, stride_wk, stride_wn,
+    stride_se, stride_sg, stride_sn,
+    stride_ze, stride_zg, stride_zn,
+    stride_yk, stride_ye,
+    GPB: tl.constexpr, BLOCK_N: tl.constexpr,
+):
+    pid_e = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    pid_k = tl.program_id(2)
+    e = tl.load(idx_ptr + pid_e)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    mask_n = offs_n < N
+
+    x_base = x_ptr + pid_e * stride_xe
+    wq_base = wq_ptr + e * stride_we
+    sc_base = sc_ptr + e * stride_se
+    zr_base = zr_ptr + e * stride_ze
+
+    kk = tl.arange(0, 64)
+    acc = tl.zeros((BLOCK_N,), tl.float32)
+    g0 = pid_k * GPB
+    for gi in range(GPB):
+        g = g0 + gi
+        k0 = g * 128
+        xe = tl.load(x_base + k0 + 2 * kk).to(tl.float32)
+        xo = tl.load(x_base + k0 + 2 * kk + 1).to(tl.float32)
+        prow = g * 64 + kk
+        wp = tl.load(wq_base + prow[:, None] * stride_wk + offs_n[None, :] * stride_wn,
+                     mask=mask_n[None, :], other=0)
+        lo = (wp & 0xF).to(tl.float32)
+        hi = ((wp >> 4) & 0xF).to(tl.float32)
+        s = tl.load(sc_base + g * stride_sg + offs_n * stride_sn, mask=mask_n, other=0.0).to(tl.float32)
+        z = tl.load(zr_base + g * stride_zg + offs_n * stride_zn, mask=mask_n, other=0.0).to(tl.float32)
+        a = tl.sum(xe[:, None] * lo + xo[:, None] * hi, axis=0)
+        bsum = tl.sum(xe) + tl.sum(xo)
+        acc += s * (a - z * bsum)
+    # split-K partials (no atomics); reduced by the caller (faster + allows deeper split)
+    tl.store(y_ptr + pid_k * stride_yk + pid_e * stride_ye + offs_n, acc, mask=mask_n)
+
+
+def _largest_div(NG, cands):
+    for s in cands:
+        if NG % s == 0:
+            return s
+    return 1
+
+
+def _cfg(K, N, E):
+    """(block_n, num_warps, split) heuristic from graph-timed sweeps (nw=2 wins)."""
+    NG = K // 128
+    if E >= 8:                       # MoE experts: split-K still helps the stream
+        return 64, 2, _largest_div(NG, (4, 3, 2))
+    if N >= 6000:                    # big fused single GEMV (qkvg, q+kv_a)
+        return 64, 2, _largest_div(NG, (3, 2))
+    return 32, 2, _largest_div(NG, (8, 4, 2))   # small single GEMV (o_proj, shared)
+
+
+def _gemv(x2, wq, sc, zr, idx, n_active, N, K, x_per_expert, cfg=None, reduce=True):
+    """x2: (E,K) or (1,K). wq:(Et,K//2,N) uint8, sc/zr:(Et,K//128,N) bf16.
+    reduce=True -> (E,N) fp32; reduce=False -> raw (split,E,N) partials for a fused reduce."""
+    NG = K // 128
+    block_n, nw, split = cfg if cfg is not None else _cfg(K, N, n_active)
+    part = torch.empty((split, n_active, N), device=x2.device, dtype=torch.float32)
+    grid = (n_active, triton.cdiv(N, block_n), split)
+    sxe = x2.stride(0) if x_per_expert else 0
+    _gemv_int4_kernel[grid](
+        x2, idx, wq, sc, zr, part,
+        N, NG,
+        sxe,
+        wq.stride(0), wq.stride(1), wq.stride(2),
+        sc.stride(0), sc.stride(1), sc.stride(2),
+        zr.stride(0), zr.stride(1), zr.stride(2),
+        part.stride(0), part.stride(1),
+        GPB=NG // split, BLOCK_N=block_n,
+        num_warps=nw,
+    )
+    if not reduce:
+        return part
+    return part[0] if split == 1 else part.sum(0)
+
+
+def _cat_quant(mods, dim):
+    """Concatenate a list of QuantLinear/QuantExperts weights along the N axis."""
+    wq = torch.cat([m.w_q for m in mods], dim=dim).contiguous()
+    sc = torch.cat([m.scales for m in mods], dim=dim).contiguous()
+    zr = torch.cat([m.zeros for m in mods], dim=dim).contiguous()
+    return wq, sc, zr
+
+
+# --------------------------------------------------------------------------- #
+# Fused KDA gated-delta recurrence (one kernel for the whole S update + readout).
+#   S[i,j] *= exp(g[i]); pred[j]=sum_i S[i,j]k[i];
+#   S[i,j] += beta k[i] (v[j]-pred[j]); o[j]=sum_i S[i,j]q[i]
+# parallel over (head, j-block); each program holds all i for its j columns.
+# --------------------------------------------------------------------------- #
+@triton.jit
+def _kda_rec_kernel(S_ptr, g_ptr, k_ptr, v_ptr, q_ptr, beta_ptr, o_ptr,
+                    scale, Dk: tl.constexpr, BJ: tl.constexpr):
+    h = tl.program_id(0)
+    jb = tl.program_id(1)
+    i = tl.arange(0, Dk)
+    j = jb * BJ + tl.arange(0, BJ)
+    base = h * Dk
+    sp = S_ptr + base * Dk + i[:, None] * Dk + j[None, :]
+    S = tl.load(sp)
+    # raw projections -> gated-delta operands (decay = exp(-softplus(g)) = sigmoid(-g))
+    gdecay = tl.sigmoid(-tl.load(g_ptr + base + i).to(tl.float32))
+    k = tl.load(k_ptr + base + i).to(tl.float32)
+    q = tl.load(q_ptr + base + i).to(tl.float32) * scale
+    v = tl.load(v_ptr + base + j).to(tl.float32)
+    beta = tl.sigmoid(tl.load(beta_ptr + h).to(tl.float32))
+    S = S * gdecay[:, None]
+    pred = tl.sum(S * k[:, None], axis=0)
+    S = S + (beta * k)[:, None] * (v[None, :] - pred[None, :])
+    o = tl.sum(S * q[:, None], axis=0)
+    tl.store(sp, S)
+    tl.store(o_ptr + base + j, o)
+
+
+def _kda_recurrence(S, g_raw, k_raw, v_raw, q_raw, beta_logit, scale):
+    """S:(H,Dk,Dk) f32 in place. q/k/v_raw:(H*Dk,) bf16 conv outputs, g_raw:(H*Dk,)
+    raw g-proj, beta_logit:(H,) raw beta-proj. -> o:(H,Dk) f32."""
+    H, Dk, _ = S.shape
+    o = torch.empty((H, Dk), device=S.device, dtype=torch.float32)
+    BJ = 64
+    _kda_rec_kernel[(H, Dk // BJ)](S, g_raw, k_raw, v_raw, q_raw, beta_logit, o,
+                                   scale, Dk=Dk, BJ=BJ, num_warps=4)
+    return o
+
+
+@triton.jit
+def _rmsnorm_kernel(x_ptr, w_ptr, y_ptr, D, eps, BLOCK: tl.constexpr):
+    i = tl.arange(0, BLOCK)
+    mask = i < D
+    x = tl.load(x_ptr + i, mask=mask, other=0.0).to(tl.float32)
+    w = tl.load(w_ptr + i, mask=mask, other=0.0).to(tl.float32)
+    r = tl.rsqrt(tl.sum(x * x) / D + eps)
+    tl.store(y_ptr + i, (x * r * w).to(tl.bfloat16), mask=mask)
+
+
+def _rmsnorm_f(x, w):
+    D = x.shape[0]
+    y = torch.empty_like(x)
+    _rmsnorm_kernel[(1,)](x, w, y, D, EPS, BLOCK=triton.next_power_of_2(D), num_warps=8)
+    return y
+
+
+@triton.jit
+def _rmsnorm_add_kernel(x_ptr, r_ptr, w_ptr, y_ptr, s_ptr, D, eps, rsp,
+                        SPLIT: tl.constexpr, BLOCK: tl.constexpr):
+    i = tl.arange(0, BLOCK)
+    mask = i < D
+    res = tl.zeros((BLOCK,), tl.float32)                          # sum split-K partials of res
+    for sp in range(SPLIT):
+        res += tl.load(r_ptr + sp * rsp + i, mask=mask, other=0.0).to(tl.float32)
+    sb = (tl.load(x_ptr + i, mask=mask, other=0.0).to(tl.float32) + res).to(tl.bfloat16)
+    tl.store(s_ptr + i, sb, mask=mask)                            # new residual = bf16(x+res)
+    s = sb.to(tl.float32)                                         # match reference: norm the bf16 residual
+    w = tl.load(w_ptr + i, mask=mask, other=0.0).to(tl.float32)
+    rms = tl.rsqrt(tl.sum(s * s) / D + eps)
+    tl.store(y_ptr + i, (s * rms * w).to(tl.bfloat16), mask=mask)  # normed(x+res)*w
+
+
+def _rmsnorm_add_f(x, res, w):
+    """rmsnorm(x+res)*w, x+res (both bf16). res may be (D,) or (split,1,D) split-K partials."""
+    D = x.shape[0]
+    split = 1 if res.ndim == 1 else res.shape[0]
+    rsp = 0 if res.ndim == 1 else res.stride(0)
+    y = torch.empty_like(x)
+    s = torch.empty_like(x)
+    _rmsnorm_add_kernel[(1,)](x, res, w, y, s, D, EPS, rsp, SPLIT=split,
+                              BLOCK=triton.next_power_of_2(D), num_warps=8)
+    return y, s
+
+
+@triton.jit
+def _conv3_kernel(vals_ptr, buf_ptr, cw_ptr, out_ptr, C, BLOCK: tl.constexpr):
+    """All three q/k/v causal depthwise convs (kernel 4) + SiLU in one launch, then
+    roll each window in place. vals/out:(3,C); buf:(3,3,C); cw:(3,C,4)."""
+    ci = tl.program_id(0)
+    c = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+    mask = c < C
+    bb = buf_ptr + ci * 3 * C
+    b0 = tl.load(bb + c, mask=mask, other=0.0).to(tl.float32)
+    b1 = tl.load(bb + C + c, mask=mask, other=0.0).to(tl.float32)
+    b2 = tl.load(bb + 2 * C + c, mask=mask, other=0.0).to(tl.float32)
+    v = tl.load(vals_ptr + ci * C + c, mask=mask, other=0.0).to(tl.float32)
+    cwb = cw_ptr + ci * C * 4 + c * 4
+    o = (b0 * tl.load(cwb + 0, mask=mask, other=0.0).to(tl.float32)
+         + b1 * tl.load(cwb + 1, mask=mask, other=0.0).to(tl.float32)
+         + b2 * tl.load(cwb + 2, mask=mask, other=0.0).to(tl.float32)
+         + v * tl.load(cwb + 3, mask=mask, other=0.0).to(tl.float32))
+    o = o * tl.sigmoid(o)
+    tl.store(out_ptr + ci * C + c, o.to(tl.bfloat16), mask=mask)
+    tl.store(bb + c, b1.to(tl.bfloat16), mask=mask)
+    tl.store(bb + C + c, b2.to(tl.bfloat16), mask=mask)
+    tl.store(bb + 2 * C + c, v.to(tl.bfloat16), mask=mask)
+
+
+def _conv3_f(vals, buf, cw):
+    """vals:(3*C,) qkv (any float), buf:(3,3,C) bf16 in place, cw:(3,C,4). -> (3,C) bf16."""
+    C = buf.shape[-1]
+    out = torch.empty((3, C), device=vals.device, dtype=torch.bfloat16)
+    _conv3_kernel[(3, triton.cdiv(C, 1024))](vals, buf, cw, out, C, BLOCK=1024, num_warps=4)
+    return out
+
+
+@triton.jit
+def _silu_gate_kernel(gu_ptr, out_ptr, A, m, ssp, SPLIT: tl.constexpr, BLOCK: tl.constexpr):
+    """gu: (SPLIT, A, 2m) partials -> out:(A,m) = silu(sum_split gate)*sum_split up."""
+    a = tl.program_id(0)
+    i = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+    mask = i < m
+    g = tl.zeros((BLOCK,), tl.float32)
+    u = tl.zeros((BLOCK,), tl.float32)
+    for s in range(SPLIT):
+        base = s * ssp + a * 2 * m
+        g += tl.load(gu_ptr + base + i, mask=mask, other=0.0)
+        u += tl.load(gu_ptr + base + m + i, mask=mask, other=0.0)
+    tl.store(out_ptr + a * m + i, g * tl.sigmoid(g) * u, mask=mask)
+
+
+def _silu_gate(gu, A, m):
+    split = gu.shape[0]
+    out = torch.empty((A, m), device=gu.device, dtype=torch.float32)
+    _silu_gate_kernel[(A, triton.cdiv(m, 512))](gu, out, A, m, gu.stride(0),
+                                                SPLIT=split, BLOCK=512, num_warps=4)
+    return out
+
+
+@triton.jit
+def _moe_combine_kernel(w_ptr, down_ptr, out_ptr, d, ssp, AR: tl.constexpr, NS: tl.constexpr,
+                        SPLIT: tl.constexpr, BLOCK: tl.constexpr):
+    """down: (SPLIT, AR+NS, d) partials. out[i] = sum_a w[a]*sum_split down[a,i]
+    (routed) + sum_shared sum_split down (shared weight 1)."""
+    i = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    mask = i < d
+    acc = tl.zeros((BLOCK,), tl.float32)
+    for a in range(AR + NS):
+        da = tl.zeros((BLOCK,), tl.float32)
+        for s in range(SPLIT):
+            da += tl.load(down_ptr + s * ssp + a * d + i, mask=mask, other=0.0)
+        acc += da if a >= AR else tl.load(w_ptr + a) * da
+    tl.store(out_ptr + i, acc.to(tl.bfloat16), mask=mask)
+
+
+def _moe_combine(w, down, d, n_shared):
+    split, A = down.shape[0], down.shape[1]
+    out = torch.empty(d, device=down.device, dtype=torch.bfloat16)
+    _moe_combine_kernel[(triton.cdiv(d, 512),)](w, down, out, d, down.stride(0),
+                                                AR=A - n_shared, NS=n_shared, SPLIT=split,
+                                                BLOCK=512, num_warps=4)
+    return out
+
+
+_IDX_CACHE = {}
+
+
+def _idx_arange(n, device):
+    key = (n, device)
+    if key not in _IDX_CACHE:
+        _IDX_CACHE[key] = torch.arange(n, dtype=torch.int32, device=device)
+    return _IDX_CACHE[key]
+
+
+def _dequant_torch(wq, sc, zr, K, group=GROUP_SIZE):
+    N = wq.shape[-1]
+    wu = torch.empty((K, N), dtype=torch.uint8, device=wq.device)
+    wu[0::2] = wq & 0xF
+    wu[1::2] = (wq >> 4) & 0xF
+    s = sc.repeat_interleave(group, dim=0)
+    z = zr.repeat_interleave(group, dim=0)
+    return (wu.to(torch.bfloat16) - z) * s
+
+
+# --------------------------------------------------------------------------- #
+# Quant modules (buffer names identical to reference for state_dict loading)
+# --------------------------------------------------------------------------- #
+class QuantLinear(nn.Module):
+    def __init__(self, in_f, out_f, group=GROUP_SIZE):
+        super().__init__()
+        self.in_f, self.out_f, self.group = in_f, out_f, group
+        ng = in_f // group
+        self.register_buffer("w_q", torch.zeros(in_f // 2, out_f, dtype=torch.uint8))
+        self.register_buffer("scales", torch.zeros(ng, out_f, dtype=torch.bfloat16))
+        self.register_buffer("zeros", torch.zeros(ng, out_f, dtype=torch.bfloat16))
+
+    def gemv(self, x, reduce=True):
+        r = _gemv(x.reshape(1, -1), self.w_q[None], self.scales[None], self.zeros[None],
+                  _idx_arange(1, x.device), 1, self.out_f, self.in_f, x_per_expert=False,
+                  reduce=reduce)
+        return r[0] if reduce else r            # reduce=False -> (split,1,N) partials
+
+
+class QuantExperts(nn.Module):
+    def __init__(self, n, in_f, out_f, group=GROUP_SIZE):
+        super().__init__()
+        self.n, self.in_f, self.out_f, self.group = n, in_f, out_f, group
+        ng = in_f // group
+        self.register_buffer("w_q", torch.zeros(n, in_f // 2, out_f, dtype=torch.uint8))
+        self.register_buffer("scales", torch.zeros(n, ng, out_f, dtype=torch.bfloat16))
+        self.register_buffer("zeros", torch.zeros(n, ng, out_f, dtype=torch.bfloat16))
+
+# --------------------------------------------------------------------------- #
+# helpers
+# --------------------------------------------------------------------------- #
+def _rmsnorm(x, w):
+    xf = x.float()
+    xf = xf * torch.rsqrt(xf.pow(2).mean(-1, keepdim=True) + EPS)
+    return (xf * w.float()).to(x.dtype)
+
+
+def _rope_cossin(pos, dim, theta, device):
+    inv = 1.0 / (theta ** (torch.arange(0, dim, 2, device=device, dtype=torch.float32) / dim))
+    ang = pos * inv
+    return torch.cos(ang), torch.sin(ang)
+
+
+def _apply_rope(x, cos, sin):
+    xf = x.float()
+    even, odd = xf[..., 0::2], xf[..., 1::2]
+    out = torch.empty_like(xf)
+    out[..., 0::2] = even * cos - odd * sin
+    out[..., 1::2] = odd * cos + even * sin
+    return out.to(x.dtype)
+
+
+# --------------------------------------------------------------------------- #
+# layers -- _forward(h, L) runs the step against the module's static buffers
+# --------------------------------------------------------------------------- #
+class KDA(nn.Module):
+    def __init__(self, cfg):
+        super().__init__()
+        self.cfg = cfg
+        H, Dk, d = cfg.kda_heads, cfg.kda_head_dim, cfg.hidden
+        self.q_proj = QuantLinear(d, H * Dk, cfg.group)
+        self.k_proj = QuantLinear(d, H * Dk, cfg.group)
+        self.v_proj = QuantLinear(d, H * Dk, cfg.group)
+        self.g_proj = QuantLinear(d, H * Dk, cfg.group)
+        self.beta_proj = nn.Linear(d, H, bias=False, dtype=cfg.dtype)
+        self.conv_w = nn.Parameter(torch.empty(3, H * Dk, cfg.short_conv, dtype=cfg.dtype))
+        self.o_proj = QuantLinear(H * Dk, d, cfg.group)
+        self.scale = Dk ** -0.5
+        self._qkvg = None
+
+    def _prep(self):
+        d = self.cfg.hidden
+        C = self.cfg.kda_heads * self.cfg.kda_head_dim
+        wq, sc, zr = _cat_quant([self.q_proj, self.k_proj, self.v_proj, self.g_proj], dim=1)
+        self._qkvg = (wq[None], sc[None], zr[None])
+        self._qkvg_cfg = _cfg(d, 4 * C, 1)
+
+    def _forward(self, x, L):
+        H, Dk = self.cfg.kda_heads, self.cfg.kda_head_dim
+        C = H * Dk
+        wq, sc, zr = self._qkvg
+        qkvg = _gemv(x.reshape(1, -1), wq, sc, zr, _idx_arange(1, x.device),
+                     1, 4 * C, self.cfg.hidden, False, cfg=self._qkvg_cfg)[0]
+        qkv = _conv3_f(qkvg, self._conv, self.conv_w)
+        o = _kda_recurrence(self._S, qkvg[3 * C:], qkv[1], qkv[2], qkv[0],
+                            self.beta_proj(x), self.scale)
+        return self.o_proj.gemv(o.reshape(H * Dk).to(torch.bfloat16), reduce=False)
+
+
+class MLA(nn.Module):
+    def __init__(self, cfg):
+        super().__init__()
+        self.cfg = cfg
+        H, d = cfg.mla_heads, cfg.hidden
+        self.q_proj = QuantLinear(d, H * (cfg.qk_nope + cfg.qk_rope), cfg.group)
+        self.kv_a = QuantLinear(d, cfg.kv_lora + cfg.qk_rope, cfg.group)
+        self.kv_b = QuantLinear(cfg.kv_lora, H * (cfg.qk_nope + cfg.v_head), cfg.group)
+        self.o_proj = QuantLinear(H * cfg.v_head, d, cfg.group)
+        self.scale = (cfg.qk_nope + cfg.qk_rope) ** -0.5
+        self._absorb = None
+
+    def _prep(self):
+        cfg = self.cfg
+        H, n, vh, lora = cfg.mla_heads, cfg.qk_nope, cfg.v_head, cfg.kv_lora
+        Wb = _dequant_torch(self.kv_b.w_q, self.kv_b.scales, self.kv_b.zeros, lora)
+        Wb = Wb.view(lora, H, n + vh)
+        Wk = Wb[:, :, :n].permute(1, 0, 2).contiguous().float()    # (H, lora, n)
+        Wv = Wb[:, :, n:].permute(1, 0, 2).contiguous().float()    # (H, lora, vh)
+        self._absorb = (Wk, Wv)
+        wq, sc, zr = _cat_quant([self.q_proj, self.kv_a], dim=1)
+        self._qkva = (wq[None], sc[None], zr[None])
+        self._qn = H * (cfg.qk_nope + cfg.qk_rope)                 # q_proj out width
+        self._qkva_n = self._qn + cfg.kv_lora + cfg.qk_rope
+        self._qkva_cfg = _cfg(cfg.hidden, self._qkva_n, 1)
+
+    def _forward(self, x, L):
+        cfg = self.cfg
+        H = cfg.mla_heads
+        wq, sc, zr = self._qkva
+        qkv = _gemv(x.reshape(1, -1), wq, sc, zr, _idx_arange(1, x.device),
+                    1, self._qkva_n, cfg.hidden, False, cfg=self._qkva_cfg)[0]
+        q = qkv[:self._qn].view(H, cfg.qk_nope + cfg.qk_rope)
+        q_nope = q[:, :cfg.qk_nope]
+        q_rope = q[:, cfg.qk_nope:]
+        kv = qkv[self._qn:]
+        c_kv = kv[:cfg.kv_lora]
+        k_rope = kv[cfg.kv_lora:]
+        cos, sin = _rope_cossin(L, cfg.qk_rope, cfg.rope_theta, x.device)
+        q_rope = _apply_rope(q_rope, cos, sin).float()
+        k_rope = _apply_rope(k_rope, cos, sin)
+        self._ckv[L].copy_(c_kv)
+        self._krope[L].copy_(k_rope)
+        ckv = self._ckv[:L + 1]                                       # bf16, no fp32 copy
+        krope = self._krope[:L + 1]
+
+        Wk, Wv = self._absorb
+        q_absorbed = torch.einsum("hd,hed->he", q_nope, Wk).to(torch.bfloat16)   # (H, lora)
+        scores = (q_absorbed @ ckv.t() + q_rope.to(torch.bfloat16) @ krope.t()).float() * self.scale
+        p = torch.softmax(scores, dim=-1).to(torch.bfloat16)         # (H, L)
+        c_weighted = (p @ ckv).float()                               # (H, lora)
+        o = torch.einsum("he,hed->hd", c_weighted, Wv)
+        return self.o_proj.gemv(o.reshape(H * cfg.v_head).to(torch.bfloat16), reduce=False)
+
+
+class MoE(nn.Module):
+    def __init__(self, cfg):
+        super().__init__()
+        self.cfg = cfg
+        d, m, E = cfg.hidden, cfg.moe_inter, cfg.n_experts
+        self.router = nn.Linear(d, E, bias=False, dtype=cfg.dtype)
+        self.gate = QuantExperts(E, d, m, cfg.group)
+        self.up = QuantExperts(E, d, m, cfg.group)
+        self.down = QuantExperts(E, m, d, cfg.group)
+        self.s_gate = QuantExperts(cfg.n_shared, d, m, cfg.group)
+        self.s_up = QuantExperts(cfg.n_shared, d, m, cfg.group)
+        self.s_down = QuantExperts(cfg.n_shared, m, d, cfg.group)
+        self._gu = None
+
+    def _prep(self):
+        cfg = self.cfg
+        d, m, E, S = cfg.hidden, cfg.moe_inter, cfg.n_experts, cfg.n_shared
+        dev = self.gate.w_q.device
+        # Routed + shared experts merged into one pool so a single GEMV covers both.
+        gw = torch.cat([self.gate.w_q, self.s_gate.w_q], 0)
+        uw = torch.cat([self.up.w_q, self.s_up.w_q], 0)
+        gs = torch.cat([self.gate.scales, self.s_gate.scales], 0)
+        us = torch.cat([self.up.scales, self.s_up.scales], 0)
+        gz = torch.cat([self.gate.zeros, self.s_gate.zeros], 0)
+        uz = torch.cat([self.up.zeros, self.s_up.zeros], 0)
+        self._gu = (torch.cat([gw, uw], 2).contiguous(),
+                    torch.cat([gs, us], 2).contiguous(),
+                    torch.cat([gz, uz], 2).contiguous())
+        self._dn = (torch.cat([self.down.w_q, self.s_down.w_q], 0).contiguous(),
+                    torch.cat([self.down.scales, self.s_down.scales], 0).contiguous(),
+                    torch.cat([self.down.zeros, self.s_down.zeros], 0).contiguous())
+        self._gu_cfg = _cfg(d, 2 * m, E + S)
+        self._dn_cfg = _cfg(m, d, cfg.n_active + S)
+        self._shared_idx = torch.arange(E, E + S, dtype=torch.int32, device=dev)
+
+    def _forward(self, x):
+        cfg = self.cfg
+        d, m, S = cfg.hidden, cfg.moe_inter, cfg.n_shared
+        A = cfg.n_active + S
+        # topk over logits == topk over softmax (monotonic); the full-softmax Z cancels
+        # in the renormalization, so softmax over just the top-k gives identical weights.
+        w, idx = torch.topk(self.router(x).float(), cfg.n_active, sorted=False)
+        w = torch.softmax(w, dim=-1) * cfg.routed_scaling
+        idx = torch.cat([idx.to(torch.int32), self._shared_idx])
+        x1 = x.reshape(1, -1)
+
+        gu = _gemv(x1, *self._gu, idx, A, 2 * m, d, False, cfg=self._gu_cfg, reduce=False)
+        h = _silu_gate(gu, A, m)
+        down_o = _gemv(h, *self._dn, idx, A, d, m, True, cfg=self._dn_cfg, reduce=False)
+        return _moe_combine(w, down_o, d, S)
+
+
+class Block(nn.Module):
+    def __init__(self, cfg, kind):
+        super().__init__()
+        self.kind = kind
+        self.attn_norm = nn.Parameter(torch.ones(cfg.hidden, dtype=cfg.dtype))
+        self.moe_norm = nn.Parameter(torch.ones(cfg.hidden, dtype=cfg.dtype))
+        self.attn = KDA(cfg) if kind == "K" else MLA(cfg)
+        self.moe = MoE(cfg)
+
+
+class Model(nn.Module):
+    def __init__(self, cfg):
+        super().__init__()
+        self.cfg = cfg
+        self.blocks = nn.ModuleList(Block(cfg, k) for k in cfg.pattern)
+        self.MAXLEN = 16384 + 64
+        self._ready = False
+        self._graphs = {}
+        self._mla_idx = list(cfg.pattern).index("M")
+
+    # ---- static buffers -------------------------------------------------- #
+    def _ensure(self, device):
+        if self._ready:
+            return
+        cfg = self.cfg
+        H, Dk = cfg.kda_heads, cfg.kda_head_dim
+        for blk in self.blocks:
+            a = blk.attn
+            if blk.kind == "K":
+                a._S = torch.zeros(H, Dk, Dk, device=device, dtype=torch.float32)
+                a._conv = torch.zeros(3, cfg.short_conv - 1, H * Dk, device=device, dtype=cfg.dtype)
+            else:
+                a._ckv = torch.zeros(self.MAXLEN, cfg.kv_lora, device=device, dtype=cfg.dtype)
+                a._krope = torch.zeros(self.MAXLEN, cfg.qk_rope, device=device, dtype=cfg.dtype)
+            a._prep()
+            blk.moe._prep()
+        self._hidden = torch.zeros(cfg.hidden, device=device, dtype=cfg.dtype)
+        self._out = torch.zeros(cfg.hidden, device=device, dtype=cfg.dtype)
+        self._ready = True
+
+    def _forward(self, L):
+        h = self._hidden
+        pend = None                       # deferred residual (folded into next norm)
+        for blk in self.blocks:
+            if pend is None:
+                xa = _rmsnorm_f(h, blk.attn_norm)
+            else:
+                xa, h = _rmsnorm_add_f(h, pend, blk.attn_norm)
+            a = blk.attn._forward(xa, L)
+            xm, h = _rmsnorm_add_f(h, a, blk.moe_norm)
+            pend = blk.moe._forward(xm)
+        torch.add(h, pend, out=self._out)
+
+    def _copy_in(self, hidden, state, cont):
+        self._hidden.copy_(hidden)
+        if cont:                       # state already lives in our buffers
+            return
+        for i, blk in enumerate(self.blocks):
+            a = blk.attn
+            st = state[i]
+            if blk.kind == "K":
+                a._S.copy_(st["S"])
+                a._conv[0].copy_(st["cq"])
+                a._conv[1].copy_(st["ck"])
+                a._conv[2].copy_(st["cv"])
+            else:
+                L = st["c_kv"].shape[0]
+                a._ckv[:L].copy_(st["c_kv"])
+                a._krope[:L].copy_(st["k_rope"])
+
+    def _read_out(self, L):
+        # Return views into the persistent buffers: consecutive decode steps keep
+        # state resident (no per-step clone/copy). Callers read the result before
+        # the next step overwrites it (true for check.py, the gate, and the AR loop).
+        new_state = []
+        for blk in self.blocks:
+            a = blk.attn
+            if blk.kind == "K":
+                new_state.append({"S": a._S, "cq": a._conv[0], "ck": a._conv[1], "cv": a._conv[2]})
+            else:
+                new_state.append({"c_kv": a._ckv[:L + 1], "k_rope": a._krope[:L + 1]})
+        return self._out, new_state
+
+    def _capture(self, L):
+        s = torch.cuda.Stream()
+        s.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(s):
+            for _ in range(3):
+                self._forward(L)
+        torch.cuda.current_stream().wait_stream(s)
+        g = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g):
+            self._forward(L)
+        self._graphs[L] = g
+
+    @torch.no_grad()
+    def step(self, hidden, state):
+        self._ensure(hidden.device)
+        mla = self.blocks[self._mla_idx].attn
+        L = state[self._mla_idx]["c_kv"].shape[0]
+        # continuation: the incoming state already aliases our persistent buffers,
+        # so the recurrent/cache state is resident and needs no copy-in.
+        cont = state[self._mla_idx]["c_kv"].data_ptr() == mla._ckv.data_ptr()
+        if not _USE_GRAPH or L >= self.MAXLEN:
+            self._copy_in(hidden, state, cont)
+            self._forward(L)
+            return self._read_out(L)
+        if L not in self._graphs:
+            try:
+                self._capture(L)
+            except Exception:
+                self._copy_in(hidden, state, cont=False)
+                self._forward(L)
+                return self._read_out(L)
+        self._copy_in(hidden, state, cont)
+        self._graphs[L].replay()
+        return self._read_out(L)

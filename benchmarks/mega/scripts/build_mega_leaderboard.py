@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """Build the per-GPU KernelBench-Mega leaderboard CSV from run archives.
 
-Scans outputs/runs/*/result.json, reads a per-run GPU label (a one-line `gpu`
-file written into each run dir; defaults to the Blackwell workstation for
-untagged anvil runs), and emits public/data/mega/results.csv with a `gpu`
-column -- the same shape the /v3 page already filters on.
+Scans outputs/runs/*/result.json, requires a per-run `gpu` marker file (so
+legacy bf16 runs sharing the 03 problem name are excluded), and emits
+public/data/mega/results.csv with a `gpu` column plus the richer per-run
+metrics the /mega page surfaces: agent wall-clock, output tokens, per-context
+speedups, the approach/framework label, and whether a transcript viewer exists.
 
 Usage:
-  uv run python scripts/build_mega_leaderboard.py [--runs outputs/runs] [--out ../../public/data/mega/results.csv]
+  uv run python scripts/build_mega_leaderboard.py [--runs DIR] [--out CSV] [--runs-html DIR]
 """
 from __future__ import annotations
 
@@ -17,25 +18,48 @@ import json
 import re
 from pathlib import Path
 
-DEFAULT_GPU = "RTX PRO 6000 Blackwell"
 
-
-def _tok_s(bench_log: Path) -> str:
-    """Best tok/s across shapes from benchmark.log, if present."""
+def _bench(bench_log: Path):
+    """Parse benchmark.log -> (best tok/s, {ctx: speedup}). Empty if absent."""
     if not bench_log.exists():
-        return ""
-    best = 0.0
-    for m in re.finditer(r"\((\d+) tok/s\)", bench_log.read_text(errors="ignore")):
-        best = max(best, float(m.group(1)))
-    return str(int(best)) if best else ""
+        return "", {}
+    txt = bench_log.read_text(errors="ignore")
+    best = max((float(m) for m in re.findall(r"\((\d+) tok/s\)", txt)), default=0.0)
+    ctx = {}
+    for m in re.finditer(r"ctx=(\d+):.*?speedup ([0-9.]+)x", txt):
+        ctx[int(m.group(1))] = float(m.group(2))
+    return (str(int(best)) if best else ""), ctx
+
+
+def _framework(run_dir: Path) -> str:
+    f = run_dir / "framework.txt"
+    if f.exists():
+        return f.read_text().strip()
+    sol = run_dir / "solution.py"
+    if sol.exists():
+        code = sol.read_text(errors="ignore")
+        for name, pat in [
+            ("ptx", r"asm\s+volatile|mma\.sync|tcgen05\."),
+            ("cuda", r"load_inline|__global__\s+void"),
+            ("triton", r"@triton\.jit"),
+            ("cudagraph", r"CUDAGraph|make_graphed"),
+            ("compile", r"torch\.compile"),
+        ]:
+            if re.search(pat, code):
+                return name
+    return "eager"
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser()
     here = Path(__file__).resolve().parents[1]
+    ap = argparse.ArgumentParser()
     ap.add_argument("--runs", default=str(here / "outputs" / "runs"))
     ap.add_argument("--out", default=str(here.parents[1] / "public" / "data" / "mega" / "results.csv"))
+    ap.add_argument("--runs-html", default=str(here.parents[1] / "public" / "runs"),
+                    help="dir of generated transcript viewers (run_id.html); gates the viewer flag")
     args = ap.parse_args()
+
+    html_ids = {p.stem for p in Path(args.runs_html).glob("*.html")} if Path(args.runs_html).exists() else set()
 
     rows = []
     for rj in sorted(Path(args.runs).glob("*/result.json")):
@@ -46,11 +70,12 @@ def main() -> None:
         if not d.get("has_solution"):
             continue
         run_dir = rj.parent
-        # Require an explicit `gpu` marker: only the W4A16 sweep runs are tagged,
-        # which cleanly excludes legacy bf16 runs that share the 03 problem name.
         if not (run_dir / "gpu").exists():
             continue
         gpu = (run_dir / "gpu").read_text().strip()
+        tok_s, ctx = _bench(run_dir / "benchmark.log")
+        usage = d.get("usage") or {}
+        rid = d.get("run_id", run_dir.name)
         rows.append({
             "gpu": gpu,
             "harness": d.get("harness", ""),
@@ -58,13 +83,19 @@ def main() -> None:
             "problem": d.get("problem", ""),
             "correct": "true" if d.get("correct") else "false",
             "score": f"{d.get('peak_fraction'):.3f}" if d.get("peak_fraction") is not None else "",
-            "tok_s": _tok_s(run_dir / "benchmark.log"),
+            "tok_s": tok_s,
             "elapsed_s": d.get("elapsed_seconds", ""),
-            "run_id": d.get("run_id", ""),
+            "output_tokens": usage.get("output_tokens", "") if usage.get("output_tokens") is not None else "",
+            "ctx2048": f"{ctx.get(2048):.2f}" if ctx.get(2048) else "",
+            "ctx8192": f"{ctx.get(8192):.2f}" if ctx.get(8192) else "",
+            "ctx16384": f"{ctx.get(16384):.2f}" if ctx.get(16384) else "",
+            "framework": _framework(run_dir),
+            "has_viewer": "true" if rid in html_ids else "false",
+            "run_id": rid,
         })
 
-    # de-dup: keep the best (highest score) per (gpu, model, problem)
-    best: dict[tuple, dict] = {}
+    # keep best (highest score) per (gpu, model, problem)
+    best = {}
     for r in rows:
         key = (r["gpu"], r["model"], r["problem"])
         cur = best.get(key)
@@ -73,15 +104,18 @@ def main() -> None:
 
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
-    fields = ["gpu", "harness", "model", "problem", "correct", "score", "tok_s", "elapsed_s", "run_id"]
+    fields = ["gpu", "harness", "model", "problem", "correct", "score", "tok_s",
+              "elapsed_s", "output_tokens", "ctx2048", "ctx8192", "ctx16384",
+              "framework", "has_viewer", "run_id"]
     with out.open("w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=fields)
         w.writeheader()
-        for r in sorted(best.values(), key=lambda x: (x["gpu"], x["problem"], -float(x["score"] or 0))):
+        for r in sorted(best.values(), key=lambda x: (x["gpu"], -float(x["score"] or 0))):
             w.writerow(r)
     print(f"wrote {len(best)} rows -> {out}")
     for r in sorted(best.values(), key=lambda x: (x["gpu"], -float(x["score"] or 0))):
-        print(f"  {r['gpu']:28s} {r['model']:20s} {r['problem']:22s} score={r['score']} tok/s={r['tok_s']}")
+        print(f"  {r['gpu']:24s} {r['model']:20s} score={r['score']:>7} tok/s={r['tok_s']:>5} "
+              f"fw={r['framework']:8s} viewer={r['has_viewer']}")
 
 
 if __name__ == "__main__":
