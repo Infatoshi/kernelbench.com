@@ -50,6 +50,37 @@ def _framework(run_dir: Path) -> str:
     return "eager"
 
 
+_RUN_TS = re.compile(r"outputs/runs/(\d{8}_\d{6})")
+
+
+def contamination(run_dir: Path) -> int:
+    """Count OTHER run-archive timestamps this run's transcript/logs referenced.
+
+    The harness does not sandbox the agent filesystem, so an agent can read the
+    shared outputs/runs/ archive (every prior winning solution) via absolute
+    paths. A run that references another run's archive saw a prior solution and
+    is contaminated -- excluded from the leaderboard. Returns the count of
+    distinct OTHER run timestamps referenced (0 = clean).
+    """
+    self_ts_m = re.match(r"(\d{8}_\d{6})", run_dir.name)
+    self_ts = self_ts_m.group(1) if self_ts_m else ""
+    seen: set[str] = set()
+    sources = [run_dir / "transcript.jsonl", run_dir / "codex_session.jsonl",
+               run_dir / "stderr.log"]
+    scratch = run_dir / "scratch"
+    if scratch.is_dir():
+        sources += [p for p in scratch.rglob("*") if p.is_file()]
+    for src in sources:
+        try:
+            txt = src.read_text(errors="ignore")
+        except Exception:
+            continue
+        for ts in _RUN_TS.findall(txt):
+            if ts != self_ts:
+                seen.add(ts)
+    return len(seen)
+
+
 def main() -> None:
     here = Path(__file__).resolve().parents[1]
     ap = argparse.ArgumentParser()
@@ -71,6 +102,11 @@ def main() -> None:
             continue
         run_dir = rj.parent
         if not (run_dir / "gpu").exists():
+            continue
+        # Contamination tripwire: drop runs that read other runs' archives.
+        nc = contamination(run_dir)
+        if nc >= 1:
+            print(f"  EXCLUDED (contaminated, read {nc} other archive(s)): {run_dir.name}")
             continue
         gpu = (run_dir / "gpu").read_text().strip()
         tok_s, ctx = _bench(run_dir / "benchmark.log")
