@@ -106,6 +106,23 @@ const GPU_TARGETS = [
       </>
     ),
   },
+  {
+    key: "rtx3090",
+    label: "RTX 3090",
+    file: "benchmarks/hard/results/leaderboard.rtx3090.json",
+    blurb: (
+      <>
+        The first consumer/Ampere part in the set: a single RTX 3090 (SM86,
+        GDDR6X, 936 GB/s). Ampere has no FP8 tensor cores, so the FP8 GEMM
+        problem is dropped entirely &mdash; five problems, not six. The
+        memory-bound cells (paged attention, top-k, W4A16) port cleanly and lead
+        the board, with paged-attention decode reaching ~66% of the 936 GB/s
+        ceiling; the bf16 compute cells (KDA, sonic-MoE) run against Ampere&rsquo;s
+        much lower bf16 peak. MiniMax-M3 and GLM-5.2 are partial &mdash; their
+        sweeps were cut short by provider rate limits.
+      </>
+    ),
+  },
 ] as const
 
 export default async function HardPage({
