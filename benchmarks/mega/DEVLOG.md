@@ -4,6 +4,22 @@ A running record of decisions, dead ends, and lessons. Newest entries on top. Th
 
 ---
 
+## 2026-06-18 — budget is a 3-hour ceiling (documented, not "unlimited")
+
+All mega problem-03 runs this session (codex/opus + the 6-model Hard-roster
+expansion) used `BUDGET_SECONDS=10800` — a 3-hour wall-clock ceiling, NOT
+literally unlimited. Decision (Elliot): keep 3h and document it rather than
+re-run at a larger ceiling. Justification: nothing is hitting the cap — every
+run self-terminated (decided it was done, was not cut off). The new 6 models
+top out ~1.1h (glm 3882s, MiniMax 3815s, deepseek 2556s, gemini 1867s, composer
+867s); the deepest worker, opus, peaked at ~2.5h (B200 9177s), leaving ~30min
+margin. Because every cell shares the same ceiling, the board is internally
+comparable. The /mega page states the 3h ceiling explicitly so it does not claim
+unlimited. If a future/harder problem pushes a strong model past 3h, bump the
+ceiling (a running `timeout` cannot be extended).
+
+---
+
 ## 2026-06-18 — three-GPU leaderboard published (Blackwell / H100 / B200)
 
 Problem 03 (W4A16 Kimi-Linear decode) swept across three GPU generations, codex

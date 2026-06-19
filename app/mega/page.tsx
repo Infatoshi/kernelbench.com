@@ -171,6 +171,11 @@ export default function MegaPage() {
           the model&apos;s full optimization journey from baseline to the final
           megakernel.
         </p>
+        <p className="text-xs text-[var(--color-fg-muted)] mt-3 max-w-3xl">
+          Each run gets a single autonomous session under a 3-hour wall-clock
+          ceiling; models self-terminate well under it (the longest run so far is
+          ~2.5h). All cells use the same ceiling, so the board is comparable.
+        </p>
       </section>
 
       <section>
