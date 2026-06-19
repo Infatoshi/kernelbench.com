@@ -48,6 +48,21 @@ def _rescale_pf(pf, prob, rid):
     return pf
 
 cells = defaultdict(dict)  # (harness,model,effort) -> problem -> list of result dicts
+_TS_RE = re.compile(r"outputs/runs/(\d{8}_\d{6})")
+def _contaminated(run_dir, rid):
+    # The harness does not sandbox the agent filesystem, so an agent can read the
+    # shared outputs/runs/ archive (prior winning solutions). A run whose AGENT
+    # transcript references ANOTHER run's archive is contaminated and excluded.
+    self_ts = rid[:15]
+    for fn in ("transcript.jsonl", "codex_session.jsonl"):
+        p = os.path.join(run_dir, fn)
+        if os.path.exists(p):
+            try: txt = open(p, errors="ignore").read()
+            except Exception: continue
+            if any(ts != self_ts for ts in _TS_RE.findall(txt)):
+                return True
+    return False
+
 for rj in glob.glob(str(ROOT/"outputs/runs/2026*/result.json")):
     rid = os.path.basename(os.path.dirname(rj))
     if rid[:8] < V2_EPOCH: continue
@@ -60,6 +75,9 @@ for rj in glob.glob(str(ROOT/"outputs/runs/2026*/result.json")):
     h, m, e = r.get("harness"), r.get("model"), r.get("reasoning_effort") or ""
     if not h or not m: continue
     run_dir = os.path.dirname(rj)
+    if _contaminated(run_dir, rid):
+        print(f"  EXCLUDED (contaminated, read other archive): {rid}", file=sys.stderr)
+        continue
     has_sol_file = os.path.exists(os.path.join(run_dir, "solution.py"))
     has_check = os.path.exists(os.path.join(run_dir, "check.log"))
     cells[(h,m,e)].setdefault(prob, []).append({
