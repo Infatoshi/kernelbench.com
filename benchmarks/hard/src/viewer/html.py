@@ -71,7 +71,10 @@ header .title .problem { color: var(--fg); }
 .tool .out pre { background: var(--bg-depth); border-left: 2px solid var(--border); border-radius: 0;
   font-size: 12.5px; max-height: none; padding: 8px 12px; color: var(--fg-muted); }
 .tool .more { font-size: 11px; color: var(--fg-dim); margin: 2px 0 0 16px; font-family: var(--mono); }
-.reasoning-line { font-size: 13px; color: var(--fg-dim); font-style: italic; margin: 0 0 8px;
+.reasoning-block { margin: 0 0 10px; border-left: 2px solid #3a3a3a; padding: 4px 0 4px 10px; }
+.reasoning-label { font-size: 10px; letter-spacing: 0.08em; text-transform: uppercase;
+  color: var(--fg-dim); margin: 0 0 4px; }
+.reasoning-line { font-size: 13px; color: var(--fg-muted); font-style: italic; margin: 0;
   white-space: pre-wrap; }
 .event[data-role="system"], .event[data-role="compaction"] { opacity: 0.75; font-size: 13px; }
 /* Sidechain styling outside a subagent dropdown (e.g. true Claude Code
@@ -382,11 +385,12 @@ def _render_event(e: Event, idx: int) -> str:
     role_label = f"{role}{f' — {e.subtype}' if e.subtype else ''}"
     parts.append(f'<div class="role">{_esc(role_label)}</div>')
 
-    # Reasoning: dim italic preview, truncated.
+    # Reasoning: full trace, exposed in its entirety (no truncation).
     if e.reasoning:
-        snip, hidden = _truncate_lines(e.reasoning, 8)
-        more = f"\n… +{hidden} more lines" if hidden else ""
-        parts.append(f'<div class="reasoning-line">{_esc(snip + more)}</div>')
+        parts.append(
+            '<div class="reasoning-block"><div class="reasoning-label">reasoning</div>'
+            f'<div class="reasoning-line">{_esc(e.reasoning)}</div></div>'
+        )
 
     # Assistant/user prose: markdown for assistant, plain for everyone else.
     if e.text:

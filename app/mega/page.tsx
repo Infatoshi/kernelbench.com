@@ -23,11 +23,27 @@ interface Row {
 
 const GPU_ORDER = ["RTX PRO 6000 Blackwell", "H100", "B200"]
 
+const REFERENCE_URL = `/code?f=${encodeURIComponent(
+  "/data/mega/code/03_kimi_linear_decode.reference.py.txt",
+)}`
+const BASELINE_URL = `/code?f=${encodeURIComponent(
+  "/data/mega/code/03_kimi_linear_decode.baseline.py.txt",
+)}`
+
 type SortKey = "speed" | "tok_s" | "runtime" | "tokens" | null
+
+type FilterState = {
+  harness: string
+  outcome: string
+}
 
 export default function MegaPage() {
   const [data, setData] = useState<Row[]>([])
   const [loading, setLoading] = useState(true)
+  const [filters, setFilters] = useState<FilterState>({
+    harness: "all",
+    outcome: "all",
+  })
   const [sort, setSort] = useState<{ key: SortKey; dir: "asc" | "desc" }>({
     key: null,
     dir: "desc",
@@ -75,6 +91,11 @@ export default function MegaPage() {
       })
   }, [])
 
+  const harnesses = useMemo(
+    () => unique(data.map((r) => r.harness)),
+    [data],
+  )
+
   // Max speedup across the whole table, used to normalize the bar widths.
   const maxScore = useMemo(
     () => Math.max(1, ...data.map((r) => r.score ?? 0)),
@@ -94,10 +115,20 @@ export default function MegaPage() {
     return new Set([...best.values()].map((b) => b.runId))
   }, [data])
 
-  // Rows grouped by GPU (fixed order), default sorted by speedup desc within a
-  // group. A clicked column header overrides the within-group sort key while
-  // keeping the GPU grouping stable.
+  // Filter, then group by GPU (fixed order), default sorted by speedup desc
+  // within a group. A clicked column header overrides the within-group sort key
+  // while keeping the GPU grouping stable.
   const sorted = useMemo(() => {
+    const filtered = data.filter((r) => {
+      if (filters.harness !== "all" && r.harness !== filters.harness) {
+        return false
+      }
+      if (filters.outcome !== "all") {
+        const bucket = r.correct ? "pass" : "fail"
+        if (bucket !== filters.outcome) return false
+      }
+      return true
+    })
     const gpuRank = (g: string) => {
       const i = GPU_ORDER.indexOf(g)
       return i === -1 ? GPU_ORDER.length : i
@@ -123,16 +154,15 @@ export default function MegaPage() {
       if (an && bn) return 0
       if (an) return 1
       if (bn) return -1
-      const diff = sort.dir === "asc" ? av - bv : bv - av
-      return diff
+      return sort.dir === "asc" ? av - bv : bv - av
     }
-    return [...data].sort(
+    return [...filtered].sort(
       (a, b) =>
         gpuRank(a.gpu) - gpuRank(b.gpu) ||
         a.gpu.localeCompare(b.gpu) ||
         cmp(a, b),
     )
-  }, [data, sort])
+  }, [data, filters, sort])
 
   const onSort = (key: SortKey) => {
     setSort((cur) =>
@@ -142,159 +172,175 @@ export default function MegaPage() {
     )
   }
 
-  // Track GPU group boundaries so we can render a subtle group label row.
+  const reset = () => {
+    setFilters({ harness: "all", outcome: "all" })
+    setSort({ key: null, dir: "desc" })
+  }
+
+  // Track GPU group boundaries so we can render a subtle group label.
   let lastGpu: string | null = null
 
   return (
     <div className="hard-page space-y-12">
       <section>
-        <h1 className="prompt cursor text-3xl font-bold text-[var(--color-fg-bright)] glow mb-4">
+        <h1 className="text-3xl font-semibold tracking-tight text-[var(--color-fg-bright)] mb-3">
           mega
         </h1>
-        <p className="text-sm text-[var(--color-fg-muted)] mb-6">
-          KernelBench-Mega · whole-block megakernels · RTX PRO 6000 Blackwell +
-          H100 + B200
+        <p className="text-sm text-[var(--color-fg)] mb-2">
+          KernelBench-Mega · whole-block megakernels
+          <span className="ml-2 text-xs font-semibold text-[var(--color-accent)]">
+            ● 3-hour ceiling · RTX PRO 6000 Blackwell + H100 + B200
+          </span>
         </p>
-        <p className="text-[var(--color-fg)] leading-relaxed max-w-3xl">
-          KernelBench-Mega tests <strong>whole-block megakernels</strong>:
-          instead of grading a single isolated op, the agent fuses an entire
-          model block into one kernel. Problem{" "}
-          <code>03_kimi_linear_decode</code> is a Kimi-Linear W4A16 hybrid
-          decode (4-bit weights, bf16 activations). The headline metric{" "}
-          <strong>
-            score is the decode speedup over an optimized-PyTorch baseline
-          </strong>{" "}
+        <p className="text-xs text-[var(--color-fg-muted)] mb-2 max-w-4xl leading-relaxed">
+          KernelBench-Mega tests whole-block megakernels: instead of grading a
+          single isolated op, the agent fuses an entire model block into one
+          kernel. Problem <code>03_kimi_linear_decode</code> is a Kimi-Linear
+          W4A16 hybrid decode (4-bit weights, bf16 activations). The headline
+          metric is the{" "}
+          <span className="text-[var(--color-fg)]">
+            decode speedup over an optimized-PyTorch baseline
+          </span>{" "}
           (e.g. <code>19.35x</code> = 19x faster than the reference), not a 0-1
-          roofline fraction. <code>tok/s</code> is decode tokens per second.
-          Higher is better for both, and results are reported per GPU. The{" "}
-          <strong>transcript link is the headline artifact</strong>: it shows
-          the model&apos;s full optimization journey from baseline to the final
-          megakernel.
+          roofline fraction; <code>tok/s</code> is decode tokens per second.
+          Higher is better for both, and results are reported per GPU. The
+          transcript is the headline artifact: it shows the model&apos;s full
+          optimization journey from baseline to the final megakernel.
         </p>
-        <p className="text-xs text-[var(--color-fg-muted)] mt-3 max-w-3xl">
+        <p className="text-xs text-[var(--color-fg-muted)] mb-6 max-w-4xl leading-relaxed">
           Each run gets a single autonomous session under a 3-hour wall-clock
-          ceiling; models self-terminate well under it (the longest run so far is
-          ~2.5h). All cells use the same ceiling, so the board is comparable.
+          ceiling; models self-terminate well under it (the longest run so far
+          is ~2.5h). All cells use the same ceiling, so the board is comparable.
+          An empty speedup is a 3-hour-timeout DNF.
         </p>
       </section>
 
       <section>
-        <h2 className="text-xl font-bold text-[var(--color-fg-bright)] glow mb-4">
-          # leaderboard
-        </h2>
-        <p className="text-xs text-[var(--color-fg-muted)] mb-4">
-          {loading
-            ? "loading..."
-            : `${sorted.length.toLocaleString()} runs · grouped by GPU, sorted by decode speedup vs optimized-PyTorch baseline`}
-        </p>
-
-        <div className="overflow-x-auto box max-h-[70vh]">
-          <table className="term tabular text-xs sm:text-sm">
-            <thead className="sticky top-0 bg-[var(--color-bg)] z-10">
-              <tr>
-                <th>gpu</th>
-                <th>model</th>
-                <th>harness</th>
-                <SortableTh
-                  label="speedup"
-                  sortKey="speed"
-                  sort={sort}
-                  onSort={onSort}
-                  title="decode speedup vs optimized-PyTorch baseline (per-ctx breakdown shown beneath)"
-                />
-                <SortableTh
-                  label="tok/s"
-                  sortKey="tok_s"
-                  sort={sort}
-                  onSort={onSort}
-                  title="decode tokens per second"
-                />
-                <SortableTh
-                  label="wall-clock"
-                  sortKey="runtime"
-                  sort={sort}
-                  onSort={onSort}
-                  title="agent wall-clock time"
-                />
-                <SortableTh
-                  label="out tok"
-                  sortKey="tokens"
-                  sort={sort}
-                  onSort={onSort}
-                  title="agent output tokens"
-                />
-                <th>framework</th>
-                <th>correct</th>
-                <th>artifacts</th>
-              </tr>
-            </thead>
-            <tbody>
-              {sorted.map((r, i) => {
-                const isWinner = winners.has(r.run_id)
-                const showGpuHeader = r.gpu !== lastGpu
-                lastGpu = r.gpu
-                return (
-                  <tr key={r.run_id || i}>
-                    <td className="text-[var(--color-accent)] whitespace-nowrap align-top">
-                      {showGpuHeader ? (
-                        <span className="font-semibold">{r.gpu}</span>
-                      ) : (
-                        <span className="text-[var(--color-fg-muted)] opacity-50">
-                          {r.gpu}
-                        </span>
-                      )}
-                    </td>
-                    <td className="text-[var(--color-fg-bright)] whitespace-nowrap align-top">
-                      {r.model}
-                    </td>
-                    <td className="text-[var(--color-fg-muted)] align-top">
-                      {r.harness}
-                    </td>
-                    <td className="align-top">
-                      <SpeedupCell
-                        row={r}
-                        maxScore={maxScore}
-                        isWinner={isWinner}
-                      />
-                    </td>
-                    <td className="text-[var(--color-fg-bright)] align-top whitespace-nowrap">
-                      {r.tok_s != null ? r.tok_s.toLocaleString() : "-"}
-                    </td>
-                    <td className="text-[var(--color-fg-muted)] align-top whitespace-nowrap">
-                      {fmtDuration(r.elapsed_s)}
-                    </td>
-                    <td className="text-[var(--color-fg-muted)] align-top whitespace-nowrap">
-                      {fmtCompact(r.output_tokens)}
-                    </td>
-                    <td className="align-top">
-                      {r.framework ? (
-                        <span className="link-chip">{r.framework}</span>
-                      ) : (
-                        "-"
-                      )}
-                    </td>
-                    <td className="align-top">
-                      {r.correct ? (
-                        <span className="status-pill status-pill-good">
-                          PASS
-                        </span>
-                      ) : (
-                        <span className="status-pill status-pill-bad">
-                          FAIL
-                        </span>
-                      )}
-                    </td>
-                    <td className="align-top">
-                      <div className="chip-row">
-                        {r.has_viewer ? (
-                          <>
-                            <a
-                              className="link-chip"
-                              href={`/runs/${r.run_id}.html`}
-                              title="full optimization journey transcript"
-                            >
-                              transcript
-                            </a>
+        <div className="leaderboard-panel">
+          <div
+            className="leaderboard-controls"
+            aria-label="leaderboard filters"
+          >
+            <FilterSelect
+              label="harness"
+              value={filters.harness}
+              onChange={(harness) => setFilters((f) => ({ ...f, harness }))}
+              options={["all", ...harnesses]}
+            />
+            <FilterSelect
+              label="outcome"
+              value={filters.outcome}
+              onChange={(outcome) => setFilters((f) => ({ ...f, outcome }))}
+              options={["all", "pass", "fail"]}
+            />
+            <button type="button" className="filter-reset" onClick={reset}>
+              reset
+            </button>
+          </div>
+          <div className="leaderboard-count">
+            {loading
+              ? "loading…"
+              : `showing ${sorted.length} of ${data.length} rows · grouped by GPU, sorted by decode speedup vs optimized-PyTorch baseline`}
+          </div>
+          <div className="leaderboard-table-wrap">
+            <table className="term leaderboard-runs tabular text-xs">
+              <thead>
+                <tr>
+                  <th>gpu</th>
+                  <th>model</th>
+                  <th>harness</th>
+                  <th>correct</th>
+                  <SortableTh
+                    label="speedup"
+                    sortKey="speed"
+                    sort={sort}
+                    onSort={onSort}
+                  />
+                  <SortableTh
+                    label="tok/s"
+                    sortKey="tok_s"
+                    sort={sort}
+                    onSort={onSort}
+                  />
+                  <SortableTh
+                    label="runtime"
+                    sortKey="runtime"
+                    sort={sort}
+                    onSort={onSort}
+                  />
+                  <th>framework</th>
+                  <th>files</th>
+                  <th>conversation</th>
+                </tr>
+              </thead>
+              <tbody>
+                {sorted.map((r, i) => {
+                  const isWinner = winners.has(r.run_id)
+                  const showGpuHeader = r.gpu !== lastGpu
+                  lastGpu = r.gpu
+                  return (
+                    <tr key={r.run_id || i}>
+                      <td className="leaderboard-model whitespace-nowrap">
+                        {showGpuHeader ? (
+                          <span className="text-[var(--color-accent)] font-semibold">
+                            {r.gpu}
+                          </span>
+                        ) : (
+                          <span className="text-[var(--color-fg-muted)] opacity-50">
+                            {r.gpu}
+                          </span>
+                        )}
+                      </td>
+                      <td className="leaderboard-model">{r.model}</td>
+                      <td className="leaderboard-harness">{r.harness}</td>
+                      <td>
+                        {r.correct ? (
+                          <span className="status-pill status-pill-good">
+                            pass
+                          </span>
+                        ) : (
+                          <span className="status-pill status-pill-bad">
+                            fail
+                          </span>
+                        )}
+                      </td>
+                      <td className={sortCellClass("speed", sort)}>
+                        <SpeedupCell
+                          row={r}
+                          maxScore={maxScore}
+                          isWinner={isWinner}
+                        />
+                      </td>
+                      <td className={sortCellClass("tok_s", sort)}>
+                        {r.tok_s != null ? (
+                          <span className="cell-score">
+                            {r.tok_s.toLocaleString()}
+                          </span>
+                        ) : (
+                          <span className="cell-missing">-</span>
+                        )}
+                      </td>
+                      <td className={sortCellClass("runtime", sort)}>
+                        <RuntimeCell row={r} />
+                      </td>
+                      <td>
+                        {r.framework ? (
+                          <span className="link-chip link-chip-muted">
+                            {r.framework}
+                          </span>
+                        ) : (
+                          <span className="cell-missing">-</span>
+                        )}
+                      </td>
+                      <td>
+                        <div className="chip-row">
+                          <a className="link-chip" href={REFERENCE_URL}>
+                            reference
+                          </a>
+                          <a className="link-chip" href={BASELINE_URL}>
+                            baseline
+                          </a>
+                          {r.has_viewer ? (
                             <a
                               className="link-chip"
                               href={`/runs/${r.run_id}.html#tab-solution`}
@@ -302,44 +348,88 @@ export default function MegaPage() {
                             >
                               solution
                             </a>
-                          </>
-                        ) : (
-                          <>
-                            <span className="link-chip link-chip-muted">
-                              transcript
-                            </span>
+                          ) : (
                             <span className="link-chip link-chip-muted">
                               solution
                             </span>
-                          </>
-                        )}
-                      </div>
-                    </td>
-                  </tr>
-                )
-              })}
-            </tbody>
-          </table>
+                          )}
+                        </div>
+                      </td>
+                      <td>
+                        <div className="conversation-cell">
+                          <div className="chip-row">
+                            {r.has_viewer ? (
+                              <a
+                                className="link-chip"
+                                href={`/runs/${r.run_id}.html`}
+                                title="full optimization journey transcript"
+                              >
+                                transcript
+                              </a>
+                            ) : (
+                              <span className="link-chip link-chip-muted">
+                                transcript
+                              </span>
+                            )}
+                          </div>
+                          <div className="conversation-note">
+                            {r.correct
+                              ? `${fmtCompact(r.output_tokens)} out tok`
+                              : "3h timeout"}
+                          </div>
+                        </div>
+                      </td>
+                    </tr>
+                  )
+                })}
+              </tbody>
+            </table>
+          </div>
         </div>
-        <p className="text-xs text-[var(--color-fg-muted)] mt-2">
+        <p className="text-xs text-[var(--color-fg)] mt-3 max-w-4xl leading-relaxed">
           speedup = decode speedup over an optimized-PyTorch baseline (bar width
-          normalized to the fastest run on the board); per-ctx breakdown shows
-          speedup at 2k / 8k / 16k decode context. Top speedup per GPU is
-          highlighted.
+          normalized to the fastest run on the board); the per-ctx breakdown
+          shows speedup at 2k / 8k / 16k decode context. Top speedup per GPU is
+          highlighted. Browse the{" "}
+          <Link href="/runs" className="underline underline-offset-2">
+            run index
+          </Link>{" "}
+          for transcripts and solutions, or the{" "}
+          <Link
+            href="https://github.com/Infatoshi/kernelbench.com/tree/master/benchmarks/mega"
+            className="underline underline-offset-2"
+          >
+            mega benchmark source
+          </Link>
+          .
         </p>
       </section>
-
-      <section className="text-sm text-[var(--color-fg)] border-t border-[var(--color-border)] pt-6">
-        Source data:{" "}
-        <Link href="https://github.com/Infatoshi/kernelbench.com/tree/master/benchmarks/mega">
-          github.com/Infatoshi/kernelbench.com
-        </Link>
-        {" · "}
-        <Link href="/runs">runs</Link>
-        {" · "}
-        <Link href="/#cite">citation</Link>
-      </section>
     </div>
+  )
+}
+
+function FilterSelect({
+  label,
+  value,
+  options,
+  onChange,
+}: {
+  label: string
+  value: string
+  options: string[]
+  onChange: (value: string) => void
+}) {
+  return (
+    <label className="filter-field">
+      <span>{label}</span>
+      <select value={value} onChange={(event) => onChange(event.target.value)}>
+        {options.map((option) => (
+          <option key={option} value={option}>
+            {option}
+          </option>
+        ))}
+      </select>
+    </label>
   )
 }
 
@@ -348,13 +438,11 @@ function SortableTh({
   sortKey,
   sort,
   onSort,
-  title,
 }: {
   label: string
   sortKey: SortKey
   sort: { key: SortKey; dir: "asc" | "desc" }
   onSort: (key: SortKey) => void
-  title?: string
 }) {
   const isActive = sort.key === sortKey
   return (
@@ -363,7 +451,6 @@ function SortableTh({
       aria-sort={
         isActive ? (sort.dir === "asc" ? "ascending" : "descending") : "none"
       }
-      title={title}
     >
       <button
         type="button"
@@ -378,6 +465,10 @@ function SortableTh({
       </button>
     </th>
   )
+}
+
+function sortCellClass(key: SortKey, sort: { key: SortKey }) {
+  return sort.key === key ? "sort-column-active" : undefined
 }
 
 function SpeedupCell({
@@ -414,12 +505,11 @@ function SpeedupCell({
       </div>
       {ctx.length > 0 && (
         <div
-          className="text-[0.62rem] text-[var(--color-fg-muted)] mt-1 whitespace-nowrap"
+          className="stacked-cell mt-1"
           title="speedup at 2k / 8k / 16k decode context"
         >
-          {ctx.map((c, idx) => (
+          {ctx.map((c) => (
             <span key={c.k}>
-              {idx > 0 && " / "}
               {c.k} {c.v!.toFixed(1)}x
             </span>
           ))}
@@ -427,6 +517,22 @@ function SpeedupCell({
       )}
     </div>
   )
+}
+
+function RuntimeCell({ row }: { row: Row }) {
+  if (row.elapsed_s == null && row.output_tokens == null) {
+    return <span className="cell-missing">-</span>
+  }
+  return (
+    <div className="stacked-cell">
+      <span>wall {fmtDuration(row.elapsed_s)}</span>
+      <span>out {fmtCompact(row.output_tokens)}</span>
+    </div>
+  )
+}
+
+function unique(values: string[]) {
+  return [...new Set(values)].sort((a, b) => a.localeCompare(b))
 }
 
 function parseCsv(line: string): string[] {

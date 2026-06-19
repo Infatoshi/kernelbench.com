@@ -74,10 +74,15 @@ Other commands: `kb run <harness> <model> <problem>` (one problem), `kb dev`
   diffs, reasoning) across every harness format (codex / claude-code / cursor /
   gemini / opencode / …), more complete than the per-bench
   `src/viewer/parsers/*` (which under-extract — an opus transcript with 216
-  thinking blocks can render as 1). The viewer renders reasoning untruncated
-  (`src/viewer/html.py` reasoning-block). Note codex/gpt-5.5 encrypts its CoT, so
-  only sparse reasoning *summaries* exist in any codex transcript; claude-routed
-  harnesses (opus, glm/zai, kimi, deepseek, minimax) carry full thinking blocks.
+  thinking blocks, but 107 are signature-only). The viewer renders reasoning
+  untruncated (`src/viewer/html.py` reasoning-block). **What's actually
+  exposable depends on the provider, not the parser:** native `claude` (opus)
+  and `codex` (gpt-5.5) ENCRYPT their chain-of-thought — the transcript carries
+  empty `thinking` blocks with a `signature` (Anthropic extended thinking) or
+  sparse summaries (codex), so there is nothing to render. The `*-claude` routes
+  to open providers (glm/zai, kimi, deepseek, minimax) return FULL thinking text
+  and now render in full. So a near-empty reasoning trace for opus/codex is the
+  API encrypting it, not a viewer bug.
 - Reward-hack verdicts come from `results/annotations/<run_id>.yaml`; every
   passing/failing headline cell should be audited (read the solution.py) before
   publishing. The template-mutation guard auto-flags grader tampering.
