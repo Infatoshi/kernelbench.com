@@ -50,10 +50,20 @@ def _upload_problem_files(client, sandbox_id: str) -> None:
             client.upload_bytes(sandbox_id, f.read_bytes(), f"{PROB}/{rel}")
 
 
+def _upload_codex_auth(client, sandbox_id: str) -> None:
+    """Own-creds mode: upload codex's ~/.codex/{auth.json,config.toml} so codex talks to real
+    gpt-5.5 directly (the interception only serves chat/anthropic, not codex's Responses API)."""
+    codex_dir = Path.home() / ".codex"
+    for name in ("auth.json", "config.toml"):
+        f = codex_dir / name
+        if f.is_file():
+            client.upload_bytes(sandbox_id, f.read_bytes(), f"/root/.codex/{name}")
+
+
 class KernelDecodeEnv(CliAgentEnv):
     """codex-in-a-sandbox kernel optimizer with a GPU compile/correct/speedup reward."""
 
-    def __init__(self, image: str = DEFAULT_IMAGE, gpu_count: int = 1, **kwargs):
+    def __init__(self, image: str = DEFAULT_IMAGE, gpu_count: int = 1, gpu_type: str = "A10_24GB", **kwargs):
         # One task: the decode kernel. The agent's real prompt is delivered via
         # run_command/KB_PROMPT inside the sandbox; this row just drives iteration.
         dataset = kwargs.pop("dataset", None) or Dataset.from_list([{
@@ -73,10 +83,21 @@ class KernelDecodeEnv(CliAgentEnv):
             keep_sandbox_for_scoring=True,   # rubric needs the sandbox to verify
             **kwargs,
         )
+        self.gpu_type = gpu_type
         self.add_rubric(self._reward_rubric())
 
+    def get_sandbox_resources(self, state):  # noqa: ANN001
+        # CliAgentEnv builds CreateSandboxRequest from this dict; gpu_type defaults to None,
+        # which fails validation when gpu_count>0. Inject the configured GPU type.
+        res = super().get_sandbox_resources(state)
+        res["gpu_type"] = self.gpu_type
+        return res
+
     async def build_env_vars(self, state):  # noqa: ANN001
-        env = await super().build_env_vars(state)
+        # own-creds mode: codex uses its uploaded ~/.codex/auth.json + real OpenAI directly; do
+        # NOT route OPENAI_BASE_URL through the interception tunnel (codex uses the Responses API,
+        # which the interception does not serve). Minimal env: just the prompt.
+        env = dict(self.environment_vars) if self.environment_vars else {}
         env["KB_PROMPT"] = PROMPT
         return env
 
@@ -91,10 +112,11 @@ class KernelDecodeEnv(CliAgentEnv):
             "npm i -g @openai/codex >/dev/null 2>&1; "
             "curl -LsSf https://astral.sh/uv/install.sh | sh >/dev/null 2>&1; "
             "pip install -q pyyaml einops >/dev/null 2>&1 || true; "
-            f"mkdir -p {PROB}"
+            f"mkdir -p {PROB} /root/.codex"
         )
         await c.execute_command(sid, setup, timeout=900)
         _upload_problem_files(c, sid)
+        _upload_codex_auth(c, sid)
         # sanity: torch sees the GPU
         await c.execute_command(
             sid, "python -c 'import torch;print(torch.cuda.get_device_name(0))'", timeout=120
@@ -132,12 +154,13 @@ class KernelDecodeEnv(CliAgentEnv):
 def load_environment(
     image: str = DEFAULT_IMAGE,
     gpu_count: int = 1,
+    gpu_type: str = "A10_24GB",   # cheap smoke GPU; RTX_PRO_6000B_96GB (+cu128 image) for Blackwell
     use_judge: bool = False,
     judge_model: str = "z-ai/glm-5.2",   # GLM-5.2 via OpenRouter
     **kwargs,
 ) -> vf.Environment:
     """Sandboxed KernelBench-decode env. One task: optimize the W4A16 decode kernel."""
-    env = KernelDecodeEnv(image=image, gpu_count=gpu_count, **kwargs)
+    env = KernelDecodeEnv(image=image, gpu_count=gpu_count, gpu_type=gpu_type, **kwargs)
     if use_judge:
         vf.ensure_keys(["OPENROUTER_API_KEY"])
         judge_client = AsyncOpenAI(
