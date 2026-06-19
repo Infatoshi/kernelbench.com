@@ -118,8 +118,10 @@ const GPU_TARGETS = [
         memory-bound cells (paged attention, top-k, W4A16) port cleanly and lead
         the board, with paged-attention decode reaching ~66% of the 936 GB/s
         ceiling; the bf16 compute cells (KDA, sonic-MoE) run against Ampere&rsquo;s
-        much lower bf16 peak. MiniMax-M3 and GLM-5.2 are partial &mdash; their
-        sweeps were cut short by provider rate limits.
+        much lower bf16 peak. GLM-5.2 ties codex and Composer 2.5 at a clean 5/5
+        and its paged-attention kernel holds the board&rsquo;s top bandwidth
+        fraction (~66%). Only MiniMax-M3 is partial (4/5) &mdash; its sweep was
+        cut short by provider rate limits.
       </>
     ),
   },
