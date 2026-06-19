@@ -83,6 +83,21 @@ Other commands: `kb run <harness> <model> <problem>` (one problem), `kb dev`
   to open providers (glm/zai, kimi, deepseek, minimax) return FULL thinking text
   and now render in full. So a near-empty reasoning trace for opus/codex is the
   API encrypting it, not a viewer bug.
+- **CROSS-RUN CONTAMINATION (harness has no filesystem sandbox).** Agents have
+  bash + absolute paths, so they can read the shared `outputs/runs/` archive —
+  every prior winning solution — and reverse-engineer a known answer instead of
+  writing their own kernel. This is NOT what `kb lint` checks (lint only scans a
+  single solution.py). Run `python scripts/audit_contamination.py
+  benchmarks/<bench>/outputs/runs [--published results/leaderboard.json]` before
+  publishing; both leaderboard builders now auto-EXCLUDE any run whose agent
+  transcript references another run's archive. Audit on 2026-06-19 found
+  mega-published 7/24 contaminated (the glm-5.2 17.4x / MiniMax 16.5x "beat opus"
+  cells were fake — glm's genuine clean score is 7.3x; opus 14-19x is real and
+  clean) and hard-published 0/53 (clean — its published set is the curated June
+  generation; 107/403 hard *archive* runs are contaminated but none were
+  published). PROPER FIX is a sandboxed harness — plan is to re-run on Prime
+  Intellect's `verifiers` env (sandboxed harness + a judge/custom-verifier that
+  inspects every passing solution). Until then the tripwire is the guard.
 - Reward-hack verdicts come from `results/annotations/<run_id>.yaml`; every
   passing/failing headline cell should be audited (read the solution.py) before
   publishing. The template-mutation guard auto-flags grader tampering.
