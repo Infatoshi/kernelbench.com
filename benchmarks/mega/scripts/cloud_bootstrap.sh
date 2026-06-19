@@ -19,6 +19,10 @@ grep -q '.local/bin' ~/.bashrc 2>/dev/null || echo 'export PATH="$HOME/.local/bi
 # uv
 command -v uv >/dev/null 2>&1 || { curl -LsSf https://astral.sh/uv/install.sh | sh; }
 
+# bubblewrap: run_hard.sh sandboxes the agent under bwrap (hides outputs/runs so
+# agents cannot read prior solutions). REQUIRED or cloud runs re-contaminate.
+command -v bwrap >/dev/null 2>&1 || sudo apt-get install -y -qq bubblewrap >/dev/null 2>&1
+
 # node + agent CLIs (codex and claude harnesses)
 if ! command -v node >/dev/null 2>&1; then
   curl -fsSL https://deb.nodesource.com/setup_22.x | sudo -E bash - >/dev/null 2>&1

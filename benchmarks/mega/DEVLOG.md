@@ -4,6 +4,33 @@ A running record of decisions, dead ends, and lessons. Newest entries on top. Th
 
 ---
 
+## 2026-06-18 — contamination prevented at the source: bwrap sandbox on run_hard.sh
+
+The near-term, easy fix for cross-run contamination (agents reading prior winning
+solutions from the shared outputs/runs archive via absolute paths). The proper
+sandboxed harness is the Prime verifiers env (`environments/kernelbench_decode/`,
+handed off separately); this is the cheap, in-place prevention that ships now.
+
+Each agent launch in run_hard.sh is now wrapped in:
+  bwrap --dev-bind / / --tmpfs $REPO_ROOT/outputs/runs --bind $RUN_DIR $RUN_DIR --chdir $PROBLEM_DIR
+`--dev-bind / /` keeps EVERYTHING working (toolchain, src symlink, GPU, codex/
+node/claude auth, outputs/gpu.lock — which lives at outputs/gpu.lock, NOT under
+outputs/runs, so it stays visible). The `--tmpfs` over outputs/runs HIDES every
+other run from the agent; `--bind $RUN_DIR` re-exposes just this run's own dir
+(writable, persists). Net: the agent physically cannot read other solutions, and
+nothing else changes. Validated: GPU visible under bwrap, codex runs (auth+node
+intact), other runs invisible (ls -> 0), find solution.py -> 0, own writes
+persist. Only the agent `timeout "$BUDGET_SECONDS"` launches are wrapped (13 of
+them); the harness-owned post-run check.py/benchmark.py scoring runs OUTSIDE the
+sandbox (different timeout var) and writes results normally.
+
+Toggle: `KBH_SANDBOX=0` disables; auto-off if bwrap is absent (e.g. a box without
+bubblewrap). The publish-time tripwire (build_mega_leaderboard.py +
+audit_contamination.py) stays as defense-in-depth. See
+[[cross-run-contamination]].
+
+---
+
 ## 2026-06-18 — budget is a 3-hour ceiling (documented, not "unlimited")
 
 All mega problem-03 runs this session (codex/opus + the 6-model Hard-roster

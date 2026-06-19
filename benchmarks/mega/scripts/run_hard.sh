@@ -130,6 +130,18 @@ WORKSPACE_ROOT="$RUN_DIR/repo"
 PROBLEM_DIR="$WORKSPACE_ROOT/problems/$PROBLEM_NAME"
 mkdir -p "$PROBLEM_DIR"
 
+# Contamination sandbox: run the agent under bwrap with outputs/runs hidden
+# (tmpfs) so it CANNOT read other runs' archives (prior winning solutions), while
+# this run's own dir stays writable and everything else (toolchain, src, GPU,
+# outputs/gpu.lock) passes through via --dev-bind. The cross-run contamination
+# fix at the source. Disable with KBH_SANDBOX=0; auto-off if bwrap is absent.
+RUNS_DIR="$REPO_ROOT/outputs/runs"
+KBH_SBX=()
+if [ "${KBH_SANDBOX:-1}" = "1" ] && command -v bwrap >/dev/null 2>&1; then
+    KBH_SBX=(bwrap --dev-bind / / --tmpfs "$RUNS_DIR" --bind "$RUN_DIR" "$RUN_DIR" --chdir "$PROBLEM_DIR")
+    echo "agent sandbox: bwrap (outputs/runs hidden from the agent)"
+fi
+
 PROMPT="${PROMPT}
 
 Workspace isolation note: you are already running inside the archive-local
@@ -489,7 +501,7 @@ case "$HARNESS" in
         if [ -n "$REASONING_EFFORT" ]; then
             EFFORT_ARG=(--effort "$REASONING_EFFORT")
         fi
-        ( cd "$PROBLEM_DIR" && timeout "$BUDGET_SECONDS" claude \
+        ( cd "$PROBLEM_DIR" && "${KBH_SBX[@]}" timeout "$BUDGET_SECONDS" claude \
             --dangerously-skip-permissions \
             --print --verbose \
             --output-format stream-json \
@@ -505,7 +517,7 @@ case "$HARNESS" in
         # Claude Code routed via ccr-rust to a non-Anthropic provider.
         # Assumes ccr-rust is running locally and ANTHROPIC_BASE_URL points at it.
         # Model name is the upstream lab's model ID (glm-5.1, deepseek-v4-flash, etc.).
-        ( cd "$PROBLEM_DIR" && timeout "$BUDGET_SECONDS" \
+        ( cd "$PROBLEM_DIR" && "${KBH_SBX[@]}" timeout "$BUDGET_SECONDS" \
             env ANTHROPIC_BASE_URL="${CCR_BASE_URL:-http://127.0.0.1:3456}" \
             claude \
                 --dangerously-skip-permissions \
@@ -539,7 +551,7 @@ case "$HARNESS" in
             export ANTHROPIC_DEFAULT_HAIKU_MODEL="$ZAI_CLAUDE_HAIKU_MODEL" && \
             export ANTHROPIC_DEFAULT_SONNET_MODEL="$MODEL" && \
             export ANTHROPIC_DEFAULT_OPUS_MODEL="$MODEL" && \
-            timeout "$BUDGET_SECONDS" claude \
+            "${KBH_SBX[@]}" timeout "$BUDGET_SECONDS" claude \
                 --dangerously-skip-permissions \
                 --print --verbose \
                 --output-format stream-json \
@@ -572,7 +584,7 @@ case "$HARNESS" in
             export ANTHROPIC_DEFAULT_HAIKU_MODEL="$MINIMAX_CLAUDE_HAIKU_MODEL" && \
             export ANTHROPIC_DEFAULT_SONNET_MODEL="$MODEL" && \
             export ANTHROPIC_DEFAULT_OPUS_MODEL="$MODEL" && \
-            timeout "$BUDGET_SECONDS" claude \
+            "${KBH_SBX[@]}" timeout "$BUDGET_SECONDS" claude \
                 --dangerously-skip-permissions \
                 --print --verbose \
                 --output-format stream-json \
@@ -604,7 +616,7 @@ case "$HARNESS" in
             export ANTHROPIC_DEFAULT_HAIKU_MODEL="$KIMI_CLAUDE_HAIKU_MODEL" && \
             export ANTHROPIC_DEFAULT_SONNET_MODEL="$MODEL" && \
             export ANTHROPIC_DEFAULT_OPUS_MODEL="$MODEL" && \
-            timeout "$BUDGET_SECONDS" claude \
+            "${KBH_SBX[@]}" timeout "$BUDGET_SECONDS" claude \
                 --dangerously-skip-permissions \
                 --print --verbose \
                 --output-format stream-json \
@@ -636,7 +648,7 @@ case "$HARNESS" in
             export ANTHROPIC_DEFAULT_HAIKU_MODEL="$DEEPSEEK_CLAUDE_HAIKU_MODEL" && \
             export ANTHROPIC_DEFAULT_SONNET_MODEL="$MODEL" && \
             export ANTHROPIC_DEFAULT_OPUS_MODEL="$MODEL" && \
-            timeout "$BUDGET_SECONDS" claude \
+            "${KBH_SBX[@]}" timeout "$BUDGET_SECONDS" claude \
                 --dangerously-skip-permissions \
                 --print --verbose \
                 --output-format stream-json \
@@ -653,7 +665,7 @@ case "$HARNESS" in
         if [ -n "$REASONING_EFFORT" ]; then
             EFFORT_ARG=(-c "model_reasoning_effort=\"$REASONING_EFFORT\"")
         fi
-        timeout "$BUDGET_SECONDS" codex exec \
+        "${KBH_SBX[@]}" timeout "$BUDGET_SECONDS" codex exec \
             -m "$MODEL" \
             "${EFFORT_ARG[@]}" \
             --dangerously-bypass-approvals-and-sandbox \
@@ -681,7 +693,7 @@ case "$HARNESS" in
         ;;
 
     kimi)
-        echo "$PROMPT" | timeout "$BUDGET_SECONDS" kimi \
+        echo "$PROMPT" | "${KBH_SBX[@]}" timeout "$BUDGET_SECONDS" kimi \
             -w "$PROBLEM_DIR" \
             --print \
             --output-format stream-json \
@@ -693,7 +705,7 @@ case "$HARNESS" in
         if [ -n "$REASONING_EFFORT" ]; then
             EFFORT_ARG=(--reasoning-effort "$REASONING_EFFORT")
         fi
-        timeout "$BUDGET_SECONDS" droid exec \
+        "${KBH_SBX[@]}" timeout "$BUDGET_SECONDS" droid exec \
             --output-format stream-json \
             --skip-permissions-unsafe \
             --cwd "$PROBLEM_DIR" \
@@ -708,7 +720,7 @@ case "$HARNESS" in
         # tools; GEMINI_CLI_TRUST_WORKSPACE=true trusts the dir headlessly. This
         # combo is version-independent: 0.36 lacks --skip-trust, 0.47 needs trust
         # set separately from --yolo. The env var works on both.
-        ( cd "$PROBLEM_DIR" && export GEMINI_CLI_TRUST_WORKSPACE=true && timeout "$BUDGET_SECONDS" gemini \
+        ( cd "$PROBLEM_DIR" && export GEMINI_CLI_TRUST_WORKSPACE=true && "${KBH_SBX[@]}" timeout "$BUDGET_SECONDS" gemini \
             --yolo \
             -m "$MODEL" \
             -o stream-json \
@@ -718,7 +730,7 @@ case "$HARNESS" in
 
     cursor)
         # Cursor Agent CLI is installed as `agent` on Anvil.
-        timeout "$BUDGET_SECONDS" "${AGENT_CUDA_ENV[@]}" agent \
+        "${KBH_SBX[@]}" timeout "$BUDGET_SECONDS" "${AGENT_CUDA_ENV[@]}" agent \
             --trust \
             --yolo \
             --print \
@@ -736,7 +748,7 @@ case "$HARNESS" in
         if [ -n "$REASONING_EFFORT" ]; then
             EFFORT_ARG=(--effort "$REASONING_EFFORT")
         fi
-        timeout "$BUDGET_SECONDS" "${AGENT_CUDA_ENV[@]}" grok \
+        "${KBH_SBX[@]}" timeout "$BUDGET_SECONDS" "${AGENT_CUDA_ENV[@]}" grok \
             --cwd "$PROBLEM_DIR" \
             --always-approve \
             --permission-mode bypassPermissions \
@@ -752,7 +764,7 @@ case "$HARNESS" in
         # OpenCode SST with custom OpenAI-shape providers (deepseek, zai, minimax).
         # Provider/model pair encoded as MODEL="provider/model-id" e.g.
         # "deepseek/deepseek-v4-pro" or "zai/glm-5.1".
-        ( cd "$PROBLEM_DIR" && timeout "$BUDGET_SECONDS" "${AGENT_CUDA_ENV[@]}" opencode run \
+        ( cd "$PROBLEM_DIR" && "${KBH_SBX[@]}" timeout "$BUDGET_SECONDS" "${AGENT_CUDA_ENV[@]}" opencode run \
             --pure --format json -m "$MODEL" "$PROMPT" \
             </dev/null > "$LOG_FILE" 2> "$STDERR_FILE" ) || HARNESS_EXIT=$?
         ;;
