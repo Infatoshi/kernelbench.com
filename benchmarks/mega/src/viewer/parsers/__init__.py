@@ -26,8 +26,16 @@ def sniff(path: Path) -> str:
             try:
                 obj = json.loads(raw)
             except json.JSONDecodeError:
-                # Could be codex stdout text mode
-                return "codex"
+                # Container-mode transcripts are prefixed by the NGC image's
+                # PyTorch/driver banner (plain text). Skip leading non-JSON
+                # banner lines and detect from the first real JSON line; a
+                # file with no JSON at all is codex stdout text (handled below).
+                continue
+
+            # Gemini CLI: bare {type:"init", session_id, model} with no subtype,
+            # followed by message / tool_use / tool_result / result events.
+            if obj.get("type") == "init" and "model" in obj and "session_id" in obj:
+                return "gemini"
 
             # type=system, subtype=init: Claude Code, Cursor, and Droid all emit this.
             # Use field-presence heuristics rather than guessing model strings.
@@ -74,7 +82,8 @@ def sniff(path: Path) -> str:
 
             return "claude"  # fallback
 
-    raise ValueError(f"could not sniff format of {path}")
+    # No JSON line found (banner-only or empty): codex stdout text mode.
+    return "codex"
 
 
 def parse(path: Path) -> Session:
@@ -97,6 +106,9 @@ def parse(path: Path) -> Session:
     if fmt == "opencode":
         from src.viewer.parsers import opencode
         return opencode.parse(path)
+    if fmt == "gemini":
+        from src.viewer.parsers import gemini
+        return gemini.parse(path)
     if fmt == "grok":
         from src.viewer.parsers import grok
         return grok.parse(path)

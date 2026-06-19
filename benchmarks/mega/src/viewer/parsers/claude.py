@@ -120,7 +120,12 @@ def parse(path: Path) -> Session:
 
             if t == "assistant":
                 msg = obj.get("message") or {}
-                model = msg.get("model") or model
+                # Claude Code tags synthetic turns (e.g. the "Prompt is too long"
+                # error) with model="<synthetic>"; don't let that clobber the
+                # real model from genuine assistant turns.
+                _m = msg.get("model")
+                if _m and _m != "<synthetic>":
+                    model = _m
                 content = msg.get("content") or []
                 text_parts: list[str] = []
                 reasoning_parts: list[str] = []

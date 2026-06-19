@@ -7,132 +7,178 @@ from __future__ import annotations
 
 import html as html_mod
 import json
+import re
 from pathlib import Path
 
 from src.viewer.events import Event, Session
 
 CSS = """
+:root {
+  --bg: #111111; --bg-depth: #000000; --surface: #1a1a1a; --surface-muted: #222222;
+  --surface-hover: #242424; --fg: #eeeeee; --fg-bright: #ffffff; --fg-dim: #666666;
+  --fg-muted: #999999; --accent: #76b900; --accent-dim: #004831; --warn: #fbbf24;
+  --bad: #fb7185; --border: #333333;
+  --mono: "Roboto Mono", "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+}
 * { box-sizing: border-box; }
-body { margin: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", sans-serif;
-       background: #0f1115; color: #d8dee9; line-height: 1.5; }
-header { background: #1b1f27; border-bottom: 1px solid #2c313a; padding: 12px 24px;
-         position: sticky; top: 0; z-index: 50; display: flex; gap: 24px; align-items: baseline; flex-wrap: wrap; }
-header .title { font-weight: 600; font-size: 15px; }
-header .meta { font-size: 13px; color: #8c95a8; }
-header .meta b { color: #d8dee9; font-weight: 500; }
-.container { max-width: 1100px; margin: 0 auto; padding: 24px; }
-.event { margin-bottom: 16px; border-left: 3px solid #2c313a; padding: 10px 14px; background: #161922;
-         border-radius: 4px; }
-.event .role { font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em; font-weight: 600;
-               margin-bottom: 6px; color: #6c7689; }
-.event .body { font-size: 14px; white-space: pre-wrap; word-break: break-word; }
-.event .meta { font-size: 11px; color: #6c7689; margin-top: 6px; }
-.event[data-role="user"] { border-left-color: #4dc4ff; }
-.event[data-role="user"] .role { color: #4dc4ff; }
-.event[data-role="assistant"] { border-left-color: #4ade80; }
-.event[data-role="assistant"] .role { color: #4ade80; }
-.event[data-role="tool"] { border-left-color: #fbbf24; }
-.event[data-role="tool"] .role { color: #fbbf24; }
-.event[data-role="system"] { border-left-color: #6c7689; opacity: 0.85; }
-.event[data-role="system"] .role { color: #8c95a8; }
-.event[data-role="error"] { border-left-color: #ef4444; background: #2b1517; }
-.event[data-role="error"] .role { color: #ef4444; }
-.event[data-role="compaction"] { border-left-color: #c084fc; background: #221a2e; }
-.event[data-role="compaction"] .role { color: #c084fc; }
+body { margin: 0; font-family: Arial, Helvetica, ui-sans-serif, system-ui, -apple-system, sans-serif;
+       background: var(--bg); color: var(--fg); line-height: 1.6; font-size: 15px;
+       -webkit-font-smoothing: antialiased; }
+a { color: var(--accent); }
+header { background: var(--bg-depth); border-bottom: 1px solid var(--border); padding: 18px 24px;
+         position: sticky; top: 0; z-index: 50; }
+header .crumb { font-size: 12px; color: var(--fg-muted); margin-bottom: 8px; }
+header .crumb a { color: var(--accent); text-decoration: none; }
+header .crumb a:hover { text-decoration: underline; }
+header .title { font-weight: 600; font-size: 20px; color: var(--fg-bright); display: flex;
+                align-items: center; gap: 12px; flex-wrap: wrap; }
+header .title .sep { color: var(--fg-dim); font-weight: 400; }
+header .title .harness { color: var(--accent); }
+header .title .model { color: var(--fg-bright); font-family: var(--mono); font-size: 17px; }
+header .title .problem { color: var(--fg); }
+.pill { font-size: 12px; font-weight: 600; padding: 3px 10px; border-radius: 999px;
+        letter-spacing: 0.02em; }
+.pill-pass { color: var(--accent); border: 1px solid var(--accent); }
+.pill-fail { color: var(--bad); border: 1px solid var(--bad); }
+.container { max-width: 1080px; margin: 0 auto; padding: 28px 24px 80px; }
+/* Flat transcript (Claude-Code terminal vibe, no boxed role cards) */
+.event { margin: 0 0 18px; padding: 0; background: none; border: none; }
+.event .role { display: none; }
+.event[data-role="user"] > .role, .event[data-role="system"] > .role,
+.event[data-role="error"] > .role, .event[data-role="compaction"] > .role {
+  display: block; font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em;
+  font-weight: 600; margin-bottom: 4px; color: var(--fg-dim); }
+.event[data-role="error"] > .role { color: var(--bad); }
+.event .body { font-size: 15px; word-break: break-word; color: var(--fg); }
+/* Markdown prose inside assistant bodies */
+.event .body.md p { margin: 0 0 10px; }
+.event .body.md pre { margin: 10px 0; }
+.event .body.md code { font-family: var(--mono); font-size: 13px; background: var(--surface-muted);
+  padding: 1px 5px; border-radius: 4px; }
+.event .body.md pre code { background: none; padding: 0; }
+.event .body.md ul, .event .body.md ol { margin: 8px 0; padding-left: 22px; }
+.event .body.md li { margin: 3px 0; }
+.event .body.md h1, .event .body.md h2, .event .body.md h3 { font-size: 15px; font-weight: 600;
+  color: var(--fg-bright); margin: 14px 0 6px; }
+.event .body:not(.md) { white-space: pre-wrap; }
+.event .meta { font-size: 11px; color: var(--fg-dim); margin-top: 8px; }
+/* Tool call line: [Name] summary, then truncated inline output */
+.tool { margin: 6px 0 6px; }
+.tool .label { font-family: var(--mono); font-size: 13px; font-style: italic; color: var(--fg-muted); }
+.tool .label .nm { color: var(--accent); font-style: normal; }
+.tool .label .sm { color: var(--fg); font-style: normal; }
+.tool .out { margin: 4px 0 0 16px; }
+.tool .out pre { background: var(--bg-depth); border-left: 2px solid var(--border); border-radius: 0;
+  font-size: 12.5px; max-height: none; padding: 8px 12px; color: var(--fg-muted); }
+.tool .more { font-size: 11px; color: var(--fg-dim); margin: 2px 0 0 16px; font-family: var(--mono); }
+.reasoning-line { font-size: 13px; color: var(--fg-dim); font-style: italic; margin: 0 0 8px;
+  white-space: pre-wrap; }
+.event[data-role="system"], .event[data-role="compaction"] { opacity: 0.75; font-size: 13px; }
 /* Sidechain styling outside a subagent dropdown (e.g. true Claude Code
    isSidechain events not framed by task_started/task_notification). */
 .event[data-sidechain="1"]:not(.subagent-inner .event) {
-    margin-left: 32px; background: #131722; border-left-style: dashed; position: relative; }
+    margin-left: 32px; background: #151a10; border-left-style: dashed; position: relative; }
 .event[data-sidechain="1"]:not(.subagent-inner .event)::before {
     content: "subagent"; position: absolute; margin-left: -42px;
-    margin-top: 2px; font-size: 10px; color: #6c89bf; letter-spacing: 0.05em; }
+    margin-top: 2px; font-size: 10px; color: #a3c266; letter-spacing: 0.05em; }
 .event[data-role="system"][data-subtype="task_started"],
 .event[data-role="system"][data-subtype="task_notification"] {
-    background: #131c2a; border-left-color: #6c89bf; }
+    background: #151a10; border-left-color: #4d7a00; }
 .event[data-role="system"][data-subtype="task_started"] .role,
-.event[data-role="system"][data-subtype="task_notification"] .role { color: #6c89bf; }
-.subagent-block { margin-bottom: 16px; background: #131c2a; border: 1px solid #2a3548;
-    border-left: 3px solid #6c89bf; border-radius: 6px; padding: 0; overflow: hidden; }
+.event[data-role="system"][data-subtype="task_notification"] .role { color: #a3c266; }
+.subagent-block { margin-bottom: 16px; background: #151a10; border: 1px solid #2c3a18;
+    border-left: 3px solid #4d7a00; border-radius: 6px; padding: 0; overflow: hidden; }
 .subagent-block > summary { padding: 14px 18px; cursor: pointer; font-size: 14px;
-    color: #a3aab8; font-weight: 500; user-select: none; list-style: none;
+    color: #999999; font-weight: 500; user-select: none; list-style: none;
     display: flex; align-items: center; gap: 12px; transition: background 0.15s; }
 .subagent-block > summary::-webkit-details-marker,
 .subagent-block > summary::marker { display: none; }
-.subagent-block > summary:hover { background: #182236; color: #d8dee9; }
+.subagent-block > summary:hover { background: #1c2414; color: #eeeeee; }
 .subagent-block > summary::before {
     content: "";
     display: inline-block;
     width: 0; height: 0;
-    border-left: 9px solid #6c89bf;
+    border-left: 9px solid #76b900;
     border-top: 6px solid transparent;
     border-bottom: 6px solid transparent;
     transition: transform 0.18s ease-out;
     flex-shrink: 0;
 }
 .subagent-block[open] > summary::before { transform: rotate(90deg); }
-.subagent-block[open] > summary { border-bottom: 1px solid #2a3548; color: #d8dee9;
-    background: #182236; }
+.subagent-block[open] > summary { border-bottom: 1px solid #2c3a18; color: #eeeeee;
+    background: #1c2414; }
 .subagent-inner { padding: 14px 16px 6px; }
-.subagent-inner .event { background: #1a2233; border-left-style: dashed; }
-.collapsible { background: #1f242e; border: 1px solid #2c313a; border-radius: 4px;
+.subagent-inner .event { background: #1c2414; border-left-style: dashed; }
+.collapsible { background: #222222; border: 1px solid #333333; border-radius: 4px;
                padding: 6px 10px; margin-top: 8px; cursor: pointer; user-select: none; }
-.collapsible summary { font-size: 12px; color: #a3aab8; outline: none; }
-.collapsible summary::-webkit-details-marker { color: #6c7689; }
-.collapsible[open] summary { color: #d8dee9; margin-bottom: 8px; }
-.collapsible .inner { font-size: 13px; white-space: pre-wrap; color: #b8bdc8; }
-.tool-call { margin-top: 8px; }
-.tool-call .name { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, monospace; font-size: 12px;
-                   color: #fbbf24; font-weight: 600; }
-.tool-call .args { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, monospace; font-size: 12px;
-                   color: #8c95a8; margin-left: 8px; }
-.tool-call .filepath { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, monospace;
-                       font-size: 11px; color: #8c95a8; margin-left: 8px; font-weight: 400; }
-.diff-block { border-color: #2a3548; }
-.diff-block summary { color: #6c89bf; }
-.diff-block .inner pre { background: #0e1218; }
+.collapsible summary { font-size: 12px; color: #999999; outline: none; }
+.collapsible summary::-webkit-details-marker { color: #666666; }
+.collapsible[open] summary { color: #eeeeee; margin-bottom: 8px; }
+.collapsible .inner { font-size: 13px; white-space: pre-wrap; color: #cccccc; }
 .token .deleted, .token.deleted, .language-diff .deleted { color: #fb7185; }
-.token .inserted, .token.inserted, .language-diff .inserted { color: #4ade80; }
-.usage { display: inline-block; font-family: ui-monospace, monospace; font-size: 11px;
-         color: #6c7689; margin-right: 12px; }
-.usage b { color: #a3aab8; font-weight: 500; }
-pre { margin: 0; padding: 8px; background: #1a1d24; border-radius: 4px; overflow-x: auto;
-      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, monospace; font-size: 12.5px;
-      max-height: 480px; }
+.token .inserted, .token.inserted, .language-diff .inserted { color: #76b900; }
+.usage { display: inline-block; font-family: "Roboto Mono", ui-monospace, monospace; font-size: 11px;
+         color: #666666; margin-right: 12px; }
+.usage b { color: #999999; font-weight: 500; }
+pre { margin: 0; padding: 12px; background: #000000; border-radius: 6px; overflow-x: auto;
+      font-family: var(--mono); font-size: 13.5px; line-height: 1.55; max-height: 520px; }
 code { font-family: inherit; }
-.token-bar { height: 4px; background: #2c313a; margin: 2px 0; border-radius: 2px; overflow: hidden; }
-.token-bar .fill { height: 100%; background: linear-gradient(90deg, #4ade80, #fbbf24); }
-.summary-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 12px;
-                margin: 16px 0; }
-.summary-card { background: #161922; border: 1px solid #2c313a; border-radius: 6px; padding: 12px; }
-.summary-card .k { font-size: 11px; text-transform: uppercase; color: #6c7689; letter-spacing: 0.05em; }
-.summary-card .v { font-size: 18px; color: #d8dee9; margin-top: 4px; font-family: ui-monospace, monospace; }
-.tab-bar { display: flex; gap: 4px; border-bottom: 1px solid #2c313a; margin: 16px 0 0 0; }
-.tab { padding: 8px 16px; background: #161922; border: 1px solid #2c313a; border-bottom: none;
-       cursor: pointer; font-size: 13px; color: #8c95a8; border-radius: 4px 4px 0 0; }
-.tab.active { background: #1b1f27; color: #d8dee9; }
-.tab-pane { display: none; padding: 16px; background: #1b1f27; border: 1px solid #2c313a; border-top: none; }
-.tab-pane.active { display: block; }
-.incomplete-banner { background: #2b1517; border: 1px solid #ef4444; border-left: 4px solid #ef4444;
-    border-radius: 6px; padding: 14px 18px; margin-bottom: 16px; font-size: 14px; color: #fca5a5; }
-.incomplete-banner b { color: #fecaca; font-weight: 600; }
+/* Prominent solution link (no inline code window) */
+.solution-link { display: inline-flex; align-items: center; gap: 10px; margin: 0 0 28px 0;
+                 padding: 14px 20px; background: var(--surface); border: 1px solid var(--accent);
+                 border-radius: 10px; color: var(--accent); text-decoration: none; font-size: 15px;
+                 font-weight: 600; transition: background 0.15s; }
+.solution-link:hover { background: var(--surface-hover); }
+.solution-link .arrow { font-size: 18px; }
+.solution-link .lines { color: var(--fg-muted); font-weight: 400; font-family: var(--mono); font-size: 13px; }
+/* Section headings */
+.section-head { font-size: 13px; text-transform: uppercase; letter-spacing: 0.08em; color: var(--fg-muted);
+                font-weight: 600; margin: 36px 0 16px; border-bottom: 1px solid var(--border); padding-bottom: 8px; }
+/* Metadata footer */
+.meta-block { background: var(--surface); border: 1px solid var(--border); border-radius: 8px;
+              margin-bottom: 10px; overflow: hidden; }
+.meta-block > summary { padding: 12px 16px; cursor: pointer; font-size: 14px; color: var(--fg);
+                        list-style: none; user-select: none; display: flex; gap: 10px; align-items: baseline; }
+.meta-block > summary::-webkit-details-marker { display: none; }
+.meta-block > summary:hover { background: var(--surface-hover); }
+.meta-block > summary .desc { color: var(--fg-dim); font-size: 12px; font-family: var(--mono); }
+.meta-block .meta-body { padding: 0 16px 14px; }
+.meta-block .meta-body a { text-decoration: underline; text-underline-offset: 3px; }
+.incomplete-banner { background: #211417; border: 1px solid #fb7185; border-left: 4px solid #fb7185;
+    border-radius: 6px; padding: 14px 18px; margin-bottom: 16px; font-size: 14px; color: #fb7185; }
+.incomplete-banner b { color: #ffd1da; font-weight: 600; }
+/* Prism token theme — matches the kernelbench.com NVIDIA-green palette. */
+code[class*="language-"], pre[class*="language-"] { color: #eeeeee; background: none; text-shadow: none; }
+.token.comment, .token.prolog, .token.doctype, .token.cdata { color: #666666; }
+.token.punctuation { color: #999999; }
+.token.operator, .token.entity, .token.url { color: #999999; }
+.token.boolean, .token.number, .token.constant, .token.symbol { color: #fbbf24; }
+.token.keyword, .token.atrule, .token.important { color: #76b900; }
+.token.selector, .token.attr-name, .token.string, .token.char, .token.attr-value { color: #b8d97a; }
+.token.function, .token.class-name, .token.builtin { color: #ffffff; }
+.token.property, .token.tag, .token.regex, .token.variable { color: #a3c266; }
+.token.deleted { color: #fb7185; }
+.token.inserted { color: #76b900; }
 """
 
 PRISM_HEAD = """
-<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/prismjs@1.29.0/themes/prism-tomorrow.min.css">
 <script src="https://cdn.jsdelivr.net/npm/prismjs@1.29.0/components/prism-core.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/prismjs@1.29.0/plugins/autoloader/prism-autoloader.min.js"></script>
 """
 
 JS = """
-document.querySelectorAll('.tab').forEach(t => {
-    t.addEventListener('click', () => {
-        const pane = t.dataset.pane;
-        document.querySelectorAll('.tab').forEach(x => x.classList.remove('active'));
-        document.querySelectorAll('.tab-pane').forEach(x => x.classList.remove('active'));
-        t.classList.add('active');
-        document.getElementById(pane).classList.add('active');
-    });
-});
+// Open the metadata <details> targeted by a URL hash (e.g. #meta-result) and
+// scroll to it. Legacy #tab-solution links jump to the solution link instead.
+(function () {
+  const h = location.hash.slice(1);
+  if (!h) return;
+  if (h === 'tab-solution') {
+    document.getElementById('solution-link')?.scrollIntoView({ behavior: 'smooth' });
+    return;
+  }
+  const el = document.getElementById(h);
+  if (el) { if (el.tagName === 'DETAILS') el.open = true; el.scrollIntoView({ behavior: 'smooth' }); }
+})();
 """
 
 
@@ -216,41 +262,115 @@ def _guess_lang(key: str, file_path: str | None, value: str) -> str:
     return "text"
 
 
-def _render_args(args: dict, has_diff: bool) -> str:
-    if not isinstance(args, dict) or not args:
-        return ""
+def _truncate_lines(s: str, max_lines: int = 12) -> tuple[str, int]:
+    """Return (first max_lines, hidden_line_count)."""
+    lines = s.rstrip("\n").split("\n")
+    if len(lines) <= max_lines:
+        return "\n".join(lines), 0
+    return "\n".join(lines[:max_lines]), len(lines) - max_lines
 
-    extras: list[tuple[str, str, str]] = []  # (key, value, lang)
-    cleaned: dict = {}
-    file_path = args.get("file_path") or args.get("path") or args.get("filepath")
 
+def _arg_summary(tc) -> str:
+    """One-line, Claude-Code-style summary of a tool call's args."""
+    if tc.file_path:
+        return tc.file_path
+    args = tc.args if isinstance(tc.args, dict) else {}
+    for key in ("command", "cmd", "pattern", "query", "url", "prompt", "description",
+                "path", "filepath", "file"):
+        v = args.get(key)
+        if isinstance(v, str) and v.strip():
+            return v.strip().split("\n")[0]
+    # Fall back to the first short scalar arg.
     for k, v in args.items():
-        if isinstance(v, str) and "\n" in v:
-            if has_diff and k in _HEAVY_ARG_KEYS:
-                cleaned[k] = f"<{len(v)} chars — see diff>"
-            else:
-                extras.append((k, v, _guess_lang(k, file_path, v)))
-                cleaned[k] = f"<{len(v)} chars — see below>"
-        else:
-            cleaned[k] = v
+        if isinstance(v, (str, int, float, bool)) and "\n" not in str(v):
+            return f"{k}={v}"
+    return ""
 
-    out = []
-    args_pretty = json.dumps(cleaned, indent=2, default=str)
-    args_snippet, _ = _truncate(args_pretty, 600)
-    out.append(
-        f'<details class="collapsible"><summary>args</summary>'
-        f'<div class="inner">{_render_code(args_snippet, "json")}</div></details>'
-    )
-    for key, value, lang in extras:
-        snippet, truncated = _truncate(value, 4000)
-        label = f"{key} ({len(value)} chars"
-        label += " — TRUNCATED" if truncated else ""
-        label += ")"
-        out.append(
-            f'<details class="collapsible" open><summary>{_esc(label)}</summary>'
-            f'<div class="inner">{_render_code(snippet, lang)}</div></details>'
-        )
-    return "".join(out)
+
+_MD_INLINE = [
+    (re.compile(r"\*\*(.+?)\*\*"), r"<strong>\1</strong>"),
+    (re.compile(r"(?<!\*)\*(?!\*)(.+?)(?<!\*)\*(?!\*)"), r"<em>\1</em>"),
+    (re.compile(r"`([^`]+?)`"), r"<code>\1</code>"),
+]
+
+
+def _md(text: str) -> str:
+    """Minimal, safe markdown -> HTML for assistant prose. Escapes first, then
+    applies fenced code blocks, headers, lists, inline code/bold/italic."""
+    lines = text.split("\n")
+    out: list[str] = []
+    in_fence = False
+    fence_buf: list[str] = []
+    list_open: str | None = None  # "ul" | "ol"
+    para: list[str] = []
+
+    def close_list() -> None:
+        nonlocal list_open
+        if list_open:
+            out.append(f"</{list_open}>")
+            list_open = None
+
+    def inline(s: str) -> str:
+        s = _esc(s)
+        for rx, rep in _MD_INLINE:
+            s = rx.sub(rep, s)
+        return s
+
+    def flush_para() -> None:
+        if para:
+            out.append(f"<p>{inline(' '.join(para))}</p>")
+            para.clear()
+
+    def open_list(kind: str) -> None:
+        nonlocal list_open
+        if list_open != kind:
+            close_list()
+            out.append(f"<{kind}>")
+            list_open = kind
+
+    for ln in lines:
+        if ln.strip().startswith("```"):
+            if not in_fence:
+                flush_para()
+                close_list()
+                in_fence = True
+                fence_buf = []
+            else:
+                out.append(_render_code("\n".join(fence_buf), "text"))
+                in_fence = False
+            continue
+        if in_fence:
+            fence_buf.append(ln)
+            continue
+        m = re.match(r"^(#{1,3})\s+(.*)", ln)
+        if m:
+            flush_para()
+            close_list()
+            lvl = len(m.group(1))
+            out.append(f"<h{lvl}>{inline(m.group(2))}</h{lvl}>")
+            continue
+        m = re.match(r"^\s*[-*]\s+(.*)", ln)
+        if m:
+            flush_para()
+            open_list("ul")
+            out.append(f"<li>{inline(m.group(1))}</li>")
+            continue
+        m = re.match(r"^\s*\d+\.\s+(.*)", ln)
+        if m:
+            flush_para()
+            open_list("ol")
+            out.append(f"<li>{inline(m.group(1))}</li>")
+            continue
+        if not ln.strip():
+            flush_para()
+            close_list()
+        else:
+            para.append(ln.strip())
+    if in_fence:
+        out.append(_render_code("\n".join(fence_buf), "text"))
+    flush_para()
+    close_list()
+    return "\n".join(out)
 
 
 def _render_event(e: Event, idx: int) -> str:
@@ -259,62 +379,45 @@ def _render_event(e: Event, idx: int) -> str:
     sub_attr = f' data-subtype="{e.subtype}"' if e.subtype else ""
     side_attr = ' data-sidechain="1"' if e.is_sidechain else ""
     parts.append(f'<div class="event" data-role="{role}"{sub_attr}{side_attr} id="e{idx}">')
-    parts.append(f'<div class="role">{role}{f" — {e.subtype}" if e.subtype else ""}</div>')
+    role_label = f"{role}{f' — {e.subtype}' if e.subtype else ''}"
+    parts.append(f'<div class="role">{_esc(role_label)}</div>')
 
-    if e.text:
-        body = _esc(e.text)
-        parts.append(f'<div class="body">{body}</div>')
-
+    # Reasoning: dim italic preview, truncated.
     if e.reasoning:
-        parts.append(
-            f'<details class="collapsible"><summary>reasoning ({len(e.reasoning)} chars)</summary>'
-            f'<div class="inner">{_esc(e.reasoning)}</div></details>'
-        )
+        snip, hidden = _truncate_lines(e.reasoning, 8)
+        more = f"\n… +{hidden} more lines" if hidden else ""
+        parts.append(f'<div class="reasoning-line">{_esc(snip + more)}</div>')
 
+    # Assistant/user prose: markdown for assistant, plain for everyone else.
+    if e.text:
+        if role == "assistant":
+            parts.append(f'<div class="body md">{_md(e.text)}</div>')
+        else:
+            parts.append(f'<div class="body">{_esc(e.text)}</div>')
+
+    # Tool calls: "[Name] summary" then truncated inline output (diff/result).
     for tc in e.tool_calls:
-        parts.append('<div class="tool-call">')
-        name_label = _esc(tc.name)
-        if tc.file_path:
-            name_label += f' <span class="filepath">{_esc(tc.file_path)}</span>'
-        parts.append(f'<span class="name">{name_label}</span>')
+        summ = _arg_summary(tc)
+        summ_html = f' <span class="sm">{_esc(summ)}</span>' if summ else ""
+        parts.append(
+            f'<div class="tool"><div class="label">[<span class="nm">{_esc(tc.name)}</span>]{summ_html}</div>'
+        )
         if tc.diff:
-            diff_snippet, diff_truncated = _truncate(tc.diff, 6000)
-            label = f"diff ({tc.diff.count(chr(10))} lines"
-            label += " — TRUNCATED" if diff_truncated else ""
-            label += ")"
-            parts.append(
-                f'<details class="collapsible diff-block" open>'
-                f'<summary>{_esc(label)}</summary>'
-                f'<div class="inner">{_render_code(diff_snippet, "diff")}</div></details>'
-            )
-        parts.append(_render_args(tc.args, has_diff=bool(tc.diff)))
+            snip, hidden = _truncate_lines(tc.diff, 16)
+            parts.append(f'<div class="out">{_render_code(snip, "diff")}</div>')
+            if hidden:
+                parts.append(f'<div class="more">… +{hidden} more lines</div>')
         parts.append('</div>')
 
+    # Tool result: truncated inline preview (first ~12 lines), de-emphasized.
     if e.tool_result:
-        content = e.tool_result.content or ""
-        # If the tool output is itself a JSON object (common in Codex
-        # apply_patch / function_call_output), pretty-print it so embedded
-        # newlines aren't shown as literal \n.
-        content = _maybe_pretty_json(content)
-        snippet, truncated = _truncate(content, 1500)
-        kind = "stderr" if e.tool_result.is_error else "stdout"
-        parts.append(
-            f'<details class="collapsible"{" open" if len(content) < 600 else ""}>'
-            f'<summary>{kind} ({len(content)} chars)'
-            f'{" — TRUNCATED" if truncated else ""}</summary>'
-            f'<div class="inner">{_render_code(snippet, "text")}</div></details>'
-        )
-
-    if e.usage:
-        u = e.usage
-        parts.append(
-            f'<div class="meta">'
-            f'<span class="usage">in <b>{u.input_tokens}</b></span>'
-            f'<span class="usage">out <b>{u.output_tokens}</b></span>'
-            f'<span class="usage">cache_r <b>{u.cache_read_tokens}</b></span>'
-            f'<span class="usage">cache_w <b>{u.cache_write_tokens}</b></span>'
-            f'</div>'
-        )
+        content = _maybe_pretty_json(e.tool_result.content or "")
+        if content.strip():
+            snip, hidden = _truncate_lines(content, 12)
+            parts.append(f'<div class="tool"><div class="out">{_render_code(snip, "text")}</div>')
+            if hidden:
+                parts.append(f'<div class="more">… +{hidden} more lines</div>')
+            parts.append('</div>')
 
     parts.append('</div>')
     return "\n".join(parts)
@@ -378,6 +481,56 @@ def _render_timeline(events: list[Event]) -> str:
     return "\n".join(out)
 
 
+_HARNESS_LABELS = {
+    "claude": "Claude Code",
+    "zai-claude": "Claude Code",
+    "minimax-claude": "Claude Code",
+    "kimi-claude": "Claude Code",
+    "deepseek-claude": "Claude Code",
+    "qwen-claude": "Claude Code",
+    "codex": "Codex",
+    "cursor": "Cursor",
+    "gemini": "Gemini CLI",
+    "grok": "Grok",
+    "opencode": "OpenCode",
+    "droid": "Droid",
+}
+
+_PROBLEM_LABELS = {
+    "01_fp8_gemm": "FP8 GEMM",
+    "02_kda_cutlass": "KimiDeltaAttention CUTLASS",
+    "03_paged_attention": "Paged Attention",
+    "05_topk_bitonic": "TopK Bitonic",
+    "06_sonic_moe_swiglu": "Sonic MoE SwiGLU",
+    "07_w4a16_gemm": "W4A16 GEMM",
+}
+
+
+def _harness_label(h: str | None) -> str:
+    return _HARNESS_LABELS.get(h or "", h or "?")
+
+
+def _problem_label(p: str | None) -> str:
+    return _PROBLEM_LABELS.get(p or "", (p or "").replace("_", " ") or "?")
+
+
+def _fmt_dur(seconds) -> str:
+    try:
+        s = int(seconds)
+    except (TypeError, ValueError):
+        return "-"
+    if s < 60:
+        return f"{s}s"
+    return f"{s // 60}m {s % 60}s"
+
+
+def _fmt_int(n) -> str:
+    try:
+        return f"{int(n):,}"
+    except (TypeError, ValueError):
+        return "-"
+
+
 def _read_artifact(run_dir: Path, name: str) -> str | None:
     p = run_dir / name
     if p.exists() and p.is_file():
@@ -400,97 +553,143 @@ def render(run_dir: Path, session: Session, out_path: Path | None = None) -> Pat
     result_json = _read_artifact(run_dir, "result.json")
     final_text = session.final_text
 
-    u = session.total_usage or None
-
-    summary = [
-        ("harness", session.harness),
-        ("model", session.model or "?"),
-        ("turns", str(session.turn_count)),
-        ("tools called", str(session.tool_call_count)),
-        ("events", str(len(session.events))),
-    ]
-    if u:
-        summary.append(("input toks", f"{u.input_tokens:,}"))
-        summary.append(("output toks", f"{u.output_tokens:,}"))
-        summary.append(("cache hit", f"{u.cache_read_tokens:,}"))
-    if session.duration_ms:
-        summary.append(("duration", f"{session.duration_ms/1000:.1f}s"))
-
-    summary_html = '<div class="summary-grid">' + "".join(
-        f'<div class="summary-card"><div class="k">{_esc(k)}</div><div class="v">{_esc(v)}</div></div>'
-        for k, v in summary
-    ) + '</div>'
-
-    # Render an INCOMPLETE banner if result.json says session_complete=false
-    incomplete_banner = ""
+    r: dict = {}
     if result_json:
         try:
             r = json.loads(result_json)
-            if r.get("session_complete") is False:
-                exit_code = r.get("harness_exit_code", "?")
-                reason = ("hit wall-clock budget (SIGTERM)" if exit_code == 124
-                          else f"harness exited with code {exit_code}")
-                incomplete_banner = (
-                    '<div class="incomplete-banner">'
-                    '<b>INCOMPLETE SESSION.</b> '
-                    f'{_esc(reason)}. The transcript below is usable but may be '
-                    'missing the agent\'s final tool calls or summary. '
-                    'Don\'t score this run as a clean failure or success.'
-                    '</div>'
-                )
         except json.JSONDecodeError:
-            pass
+            r = {}
+
+    harness = _harness_label(r.get("harness") or session.harness)
+    model = r.get("model") or session.model or "?"
+    problem = _problem_label(r.get("problem"))
+    correct = bool(r.get("correct"))
+    pf = r.get("peak_fraction")
+    effort = r.get("reasoning_effort") or ""
+
+    # ---- Header status pill ----
+    if correct:
+        status_pill = '<span class="pill pill-pass">PASS</span>'
+    else:
+        status_pill = '<span class="pill pill-fail">FAIL</span>'
+
+    # Token/timing stats are intentionally omitted from the page body; the full
+    # numbers live in the collapsed result.json metadata block at the bottom.
+    u = session.total_usage
+    out_tok = (u.output_tokens if u else None)
+    if r.get("usage"):
+        out_tok = r["usage"].get("output_tokens", out_tok)
+
+    # ---- Incomplete banner ----
+    incomplete_banner = ""
+    if r.get("session_complete") is False:
+        exit_code = r.get("harness_exit_code", "?")
+        reason = ("hit the wall-clock budget (still iterating when time ran out)" if exit_code == 124
+                  else f"harness exited with code {exit_code}")
+        incomplete_banner = (
+            '<div class="incomplete-banner">'
+            '<b>Session ran out the clock.</b> '
+            f'The agent {_esc(reason)}; the timeline below is complete up to that point. '
+            'The submitted kernel was still graded normally.'
+            '</div>'
+        )
+
+    # ---- Prominent solution link (raw file, no inline window) ----
+    solution_html = ""
+    if solution:
+        raw_name = f"{out.stem}_solution.py.txt"
+        (out.parent / raw_name).write_text(solution)
+        n_lines = solution.count("\n") + 1
+        solution_html = (
+            f'<a class="solution-link" id="solution-link" '
+            f'href="{html_mod.escape(raw_name, quote=True)}" target="_blank" rel="noopener">'
+            f'<span>View submitted kernel</span>'
+            f'<span class="lines">solution.py · {n_lines} lines</span>'
+            f'<span class="arrow">&rarr;</span></a>'
+        )
 
     events_html = _render_timeline(session.events)
 
-    tabs: list[tuple[str, str, str]] = []  # (id, label, html)
-    if solution:
-        tabs.append(("tab-solution", "solution.py", _render_code(solution, "python")))
-    if final_text:
-        tabs.append(("tab-final", "final answer", f'<div style="white-space:pre-wrap">{_esc(final_text)}</div>'))
-    if bench_log:
-        tabs.append(("tab-bench", "benchmark.log", _render_code(bench_log, "text")))
-    if check_log:
-        tabs.append(("tab-check", "check.log", _render_code(check_log, "text")))
+    # ---- Metadata footer (collapsed) ----
+    meta_blocks: list[str] = []
     if result_json:
-        tabs.append(("tab-result", "result.json", _render_code(result_json, "json")))
-
-    if tabs:
-        tab_bar = '<div class="tab-bar">' + "".join(
-            f'<div class="tab{" active" if i == 0 else ""}" data-pane="{tid}">{_esc(label)}</div>'
-            for i, (tid, label, _) in enumerate(tabs)
-        ) + '</div>'
-        tab_panes = "\n".join(
-            f'<div class="tab-pane{" active" if i == 0 else ""}" id="{tid}">{body}</div>'
-            for i, (tid, _, body) in enumerate(tabs)
+        desc_bits = []
+        if r.get("failure_reason"):
+            desc_bits.append(str(r["failure_reason"]))
+        if pf is not None:
+            desc_bits.append(f"peak {pf:.4f}")
+        desc_bits.append(f"agent {_fmt_dur(r.get('elapsed_seconds'))}")
+        if out_tok is not None:
+            desc_bits.append(f"{_fmt_int(out_tok)} out tok")
+        desc = " · ".join(desc_bits)
+        meta_blocks.append(
+            f'<details class="meta-block" id="meta-result"><summary>result.json '
+            f'<span class="desc">[{_esc(desc)}]</span></summary>'
+            f'<div class="meta-body">{_render_code(result_json, "json")}</div></details>'
         )
-    else:
-        tab_bar = ""
-        tab_panes = ""
+    if check_log:
+        verdict = "passed" if r.get("check_exit_code") == 0 else f"exit {r.get('check_exit_code', '?')}"
+        meta_blocks.append(
+            f'<details class="meta-block" id="meta-check"><summary>check.log '
+            f'<span class="desc">[correctness {_esc(str(verdict))}]</span></summary>'
+            f'<div class="meta-body">{_render_code(check_log, "text")}</div></details>'
+        )
+    if bench_log:
+        meta_blocks.append(
+            f'<details class="meta-block" id="meta-bench"><summary>benchmark.log '
+            f'<span class="desc">[roofline timing]</span></summary>'
+            f'<div class="meta-body">{_render_code(bench_log, "text")}</div></details>'
+        )
+    if final_text:
+        meta_blocks.append(
+            f'<details class="meta-block" id="meta-final"><summary>agent final answer</summary>'
+            f'<div class="meta-body" style="white-space:pre-wrap;font-size:14px">{_esc(final_text)}</div></details>'
+        )
+    meta_blocks.append(
+        f'<details class="meta-block" id="meta-session"><summary>session info '
+        f'<span class="desc">[{_esc(session.session_id or "?")}]</span></summary>'
+        f'<div class="meta-body" style="font-size:13px;color:var(--fg-muted)">'
+        f'run_id: {_esc(r.get("run_id") or out.stem)}<br>'
+        f'harness: {_esc(r.get("harness") or session.harness)}<br>'
+        f'model: {_esc(model)}<br>'
+        f'reasoning effort: {_esc(effort or "default")}<br>'
+        f'cwd: {_esc(session.cwd or "?")}<br>'
+        f'events: {len(session.events)}</div></details>'
+    )
+    meta_html = (
+        '<div class="section-head">run metadata &amp; logs</div>' + "".join(meta_blocks)
+    )
 
-    title = f"{session.harness} / {session.model or '?'}"
+    eff_str = f" [{effort}]" if effort else ""
+    title = f"{harness} / {model} — {problem}"
 
     html_doc = f"""<!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>{_esc(title)} — KernelBench-Hard</title>
   {PRISM_HEAD}
   <style>{CSS}</style>
 </head>
 <body>
   <header>
-    <span class="title">{_esc(title)}</span>
-    <span class="meta">session: <b>{_esc(session.session_id or '?')}</b></span>
-    <span class="meta">cwd: <b>{_esc(session.cwd or '?')}</b></span>
+    <div class="crumb"><a href="/hard">&larr; KernelBench-Hard</a></div>
+    <div class="title">
+      <span class="harness">{_esc(harness)}</span>
+      <span class="sep">/</span>
+      <span class="model">{_esc(model)}{_esc(eff_str)}</span>
+      <span class="sep">·</span>
+      <span class="problem">{_esc(problem)}</span>
+      {status_pill}
+    </div>
   </header>
   <div class="container">
     {incomplete_banner}
-    {summary_html}
-    {tab_bar}
-    {tab_panes}
-    <h2 style="margin-top:32px;font-size:16px;color:#a3aab8">timeline ({len(session.events)} events)</h2>
+    {solution_html}
+    <div class="section-head">agent timeline &middot; {len(session.events)} events</div>
     {events_html}
+    {meta_html}
   </div>
   <script>{JS}</script>
 </body>
