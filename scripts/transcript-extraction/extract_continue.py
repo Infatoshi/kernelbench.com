@@ -1,0 +1,139 @@
+#!/usr/bin/env python3
+"""
+Extract ALL Continue AI assistant data
+Includes: messages, tool calls, reasoning, context
+"""
+
+import json
+from pathlib import Path
+from datetime import datetime
+
+def extract_continue_sessions():
+    """Extract all Continue sessions"""
+    continue_dir = Path.home() / ".continue/sessions"
+
+    if not continue_dir.exists():
+        return []
+
+    conversations = []
+
+    for session_file in continue_dir.glob("*.json"):
+        if session_file.name == "sessions.json":
+            continue
+
+        try:
+            with open(session_file) as f:
+                data = json.loads(f.read())
+
+            if 'history' not in data:
+                continue
+
+            messages = []
+            for item in data['history']:
+                if 'message' not in item:
+                    continue
+
+                msg = item['message']
+                role = msg.get('role')
+
+                # Extract content
+                content_parts = msg.get('content', [])
+                if isinstance(content_parts, str):
+                    content = content_parts
+                elif isinstance(content_parts, list):
+                    content = '\n'.join([
+                        c.get('text', '') for c in content_parts
+                        if isinstance(c, dict) and c.get('type') == 'text'
+                    ])
+                else:
+                    content = ''
+
+                message = {
+                    'role': role,
+                    'content': content
+                }
+
+                # Add tool calls for assistant messages
+                if 'toolCalls' in msg:
+                    message['tool_calls'] = msg['toolCalls']
+
+                # Add reasoning
+                if 'reasoning' in item and item['reasoning']:
+                    message['reasoning'] = item['reasoning'].get('text', '')
+
+                # Add context items
+                if 'contextItems' in item and item['contextItems']:
+                    message['context_items'] = item['contextItems']
+
+                # Add tool results
+                if 'toolCallStates' in item:
+                    tool_results = []
+                    for state in item['toolCallStates']:
+                        if state.get('status') == 'done' and 'output' in state:
+                            tool_results.append({
+                                'tool': state.get('tool', {}).get('function', {}).get('name'),
+                                'output': state['output']
+                            })
+                    if tool_results:
+                        message['tool_results'] = tool_results
+
+                messages.append(message)
+
+            if messages:
+                conversations.append({
+                    'messages': messages,
+                    'source': 'continue',
+                    'session_id': data.get('sessionId'),
+                    'title': data.get('title'),
+                    'workspace': data.get('workspaceDirectory')
+                })
+
+        except Exception as e:
+            print(f"Error processing {session_file}: {e}")
+            continue
+
+    return conversations
+
+def main():
+    print("="*80)
+    print("CONTINUE AI ASSISTANT EXTRACTION")
+    print("="*80)
+    print()
+
+    conversations = extract_continue_sessions()
+
+    if not conversations:
+        print("❌ No Continue sessions found!")
+        return
+
+    print(f"✅ Found {len(conversations)} conversations")
+
+    total_messages = sum(len(c['messages']) for c in conversations)
+    with_tools = sum(1 for c in conversations
+                     if any('tool_calls' in m or 'tool_results' in m
+                           for m in c['messages']))
+    with_reasoning = sum(1 for c in conversations
+                        if any('reasoning' in m for m in c['messages']))
+
+    print(f"Total messages: {total_messages}")
+    print(f"With tool use: {with_tools}")
+    print(f"With reasoning: {with_reasoning}")
+    print()
+
+    # Save
+    output_dir = Path('extracted_data')
+    output_dir.mkdir(exist_ok=True)
+
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    output_file = output_dir / f'continue_conversations_{timestamp}.jsonl'
+
+    with open(output_file, 'w') as f:
+        for conv in conversations:
+            f.write(json.dumps(conv, ensure_ascii=False) + '\n')
+
+    file_size = output_file.stat().st_size / 1024
+    print(f"✅ Saved to: {output_file}")
+    print(f"   Size: {file_size:.2f} KB")
+
+if __name__ == '__main__':
+    main()

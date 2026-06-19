@@ -67,16 +67,17 @@ Other commands: `kb run <harness> <model> <problem>` (one problem), `kb dev`
 - The publish pipeline regenerates `benchmarks/hard/results/leaderboard.json`
   (site data) and `public/runs/*.html` (transcript viewers) from the archives.
   `just publish` does it; don't hand-edit the leaderboard.
-- **Transcript / reasoning extraction: use `ai-data-extraction`** (anvil
-  `~/tools/cli/ai-data-extraction`, GitHub `0xSero/ai-data-extraction`) as the
-  canonical complete extractor when working on the agent-timeline viewers. It
-  pulls full conversations (messages, tool use, diffs, reasoning) across every
-  harness format (codex / claude-code / cursor / gemini / opencode / …) and is
-  the reference for "fully exposed reasoning" — more complete than the per-bench
-  `src/viewer/parsers/*`. Note codex/gpt-5.5 encrypts its CoT, so only sparse
-  reasoning *summaries* exist in any codex transcript; claude-routed harnesses
-  (opus, glm/zai, kimi, deepseek, minimax) carry full thinking blocks. The
-  viewer renders reasoning untruncated (`src/viewer/html.py` reasoning-block).
+- **Transcript / reasoning extraction lives in-repo at
+  `scripts/transcript-extraction/`** (vendored complete extractor; see its
+  `VENDORED.md`). Use it as the canonical reference when working on the
+  agent-timeline viewers — it pulls full conversations (messages, tool use,
+  diffs, reasoning) across every harness format (codex / claude-code / cursor /
+  gemini / opencode / …), more complete than the per-bench
+  `src/viewer/parsers/*` (which under-extract — an opus transcript with 216
+  thinking blocks can render as 1). The viewer renders reasoning untruncated
+  (`src/viewer/html.py` reasoning-block). Note codex/gpt-5.5 encrypts its CoT, so
+  only sparse reasoning *summaries* exist in any codex transcript; claude-routed
+  harnesses (opus, glm/zai, kimi, deepseek, minimax) carry full thinking blocks.
 - Reward-hack verdicts come from `results/annotations/<run_id>.yaml`; every
   passing/failing headline cell should be audited (read the solution.py) before
   publishing. The template-mutation guard auto-flags grader tampering.
