@@ -39,4 +39,25 @@ for rid in $RIDS; do
     uv run python -m src.viewer "outputs/runs/$rid" --out "$REPO_ROOT/public/runs/$rid.html" >/dev/null 2>&1 && n=$((n+1)) || echo "  WARN viewer failed: $rid"
 done
 echo "  generated $n viewers"
+
+echo "[3b/3] redacting secrets from viewers (agents can echo env keys)"
+# Build sed rules from every ~/.env_vars value + token prefixes. Never printed.
+SEDF=$(mktemp)
+if [ -f "$HOME/.env_vars" ]; then
+  while IFS= read -r line; do
+    val="${line#*=}"; val="${val%\"}"; val="${val#\"}"
+    [ ${#val} -ge 16 ] && printf 's|%s|REDACTED|g\n' "$(printf '%s' "$val" | sed 's/[&/\\|]/\\&/g')" >> "$SEDF"
+  done < <(grep -E "^(export )?[A-Z_]+=." "$HOME/.env_vars" | sed 's/^export //')
+fi
+cat >> "$SEDF" <<'PAT'
+s|sk-[A-Za-z0-9_-]\{20,\}|sk-REDACTED|g
+s|ghp_[A-Za-z0-9]\{30,\}|ghp_REDACTED|g
+s|github_pat_[A-Za-z0-9_]\{30,\}|github_pat_REDACTED|g
+s|hf_[A-Za-z0-9]\{30,\}|hf_REDACTED|g
+PAT
+for rid in $RIDS; do
+  [ -f "$REPO_ROOT/public/runs/$rid.html" ] && sed -i -f "$SEDF" "$REPO_ROOT/public/runs/$rid.html"
+done
+rm -f "$SEDF"
+echo "  redacted secrets from viewers"
 echo "done. review, then: git push (or: kb deploy \"msg\")"
