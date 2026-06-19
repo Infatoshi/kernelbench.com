@@ -21,9 +21,8 @@ and someone can RL-train a model against them on a GPU cluster, unchanged.
 | dir | task | turns | status |
 |---|---|---|---|
 | `kernel_v3/` | 42 curated/hardened single-op problems (levels 1-4), `class Model` contract, v3's `run_benchmark` (multi-seed correctness + determinism + guardrails + % of peak) | single-turn | **validated** on RTX PRO 6000 (matmul 48% of peak; wrong→0; judge-veto works) |
-| `kernelbench_decode/` | W4A16 Kimi-Linear decode megakernel, codex-in-a-Prime-GPU-sandbox, sandbox isolation closes the contamination hole | agentic | code-complete; **blocked on Prime VM-sandbox beta access** — see `kernelbench_decode/TODO.md` |
 | `kernel_hard/` | ~10 operation-level hard CUDA kernels, native agentic harness (write/check/benchmark flywheel) + roofline | multi-turn | **built** — validated on RTX PRO 6000 (`03_paged_attention` known-good → correct, peak_fraction 0.67) |
-| `kernel_mega/` | full megakernel deck (Qwen3 decode block, Kimi-Linear decode, …), same native harness as Hard | multi-turn | **built** — validated on RTX PRO 6000 (`02_rl_grid_ppo` known-good → correct, peak_fraction 0.32) |
+| `kernel_mega/` | full megakernel deck (Qwen3 decode block, Kimi-Linear decode, …), same native harness as Hard; owns the decode + RL-sim + megakernel deck. Prime-sandbox (contamination-fix) execution = PRIME_SANDBOX_TODO.md | multi-turn | **built** — validated on RTX PRO 6000 (`02_rl_grid_ppo` known-good → correct, peak_fraction 0.32) |
 
 ## Run an env (eval or as an RL environment)
 Each env is a standard verifiers environment package (`load_environment(**kwargs)` + `pyproject.toml`).
