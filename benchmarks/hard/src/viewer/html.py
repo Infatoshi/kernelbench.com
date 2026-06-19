@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import html as html_mod
 import json
+import re
 from pathlib import Path
 
 from src.viewer.events import Event, Session
@@ -40,24 +41,39 @@ header .title .problem { color: var(--fg); }
 .pill-pass { color: var(--accent); border: 1px solid var(--accent); }
 .pill-fail { color: var(--bad); border: 1px solid var(--bad); }
 .container { max-width: 1080px; margin: 0 auto; padding: 28px 24px 80px; }
-.event { margin-bottom: 14px; border-left: 3px solid var(--border); padding: 12px 16px; background: var(--surface);
-         border-radius: 6px; }
-.event .role { font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em; font-weight: 600;
-               margin-bottom: 6px; color: var(--fg-dim); }
-.event .body { font-size: 15px; white-space: pre-wrap; word-break: break-word; color: var(--fg); }
+/* Flat transcript (Claude-Code terminal vibe, no boxed role cards) */
+.event { margin: 0 0 18px; padding: 0; background: none; border: none; }
+.event .role { display: none; }
+.event[data-role="user"] > .role, .event[data-role="system"] > .role,
+.event[data-role="error"] > .role, .event[data-role="compaction"] > .role {
+  display: block; font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em;
+  font-weight: 600; margin-bottom: 4px; color: var(--fg-dim); }
+.event[data-role="error"] > .role { color: var(--bad); }
+.event .body { font-size: 15px; word-break: break-word; color: var(--fg); }
+/* Markdown prose inside assistant bodies */
+.event .body.md p { margin: 0 0 10px; }
+.event .body.md pre { margin: 10px 0; }
+.event .body.md code { font-family: var(--mono); font-size: 13px; background: var(--surface-muted);
+  padding: 1px 5px; border-radius: 4px; }
+.event .body.md pre code { background: none; padding: 0; }
+.event .body.md ul, .event .body.md ol { margin: 8px 0; padding-left: 22px; }
+.event .body.md li { margin: 3px 0; }
+.event .body.md h1, .event .body.md h2, .event .body.md h3 { font-size: 15px; font-weight: 600;
+  color: var(--fg-bright); margin: 14px 0 6px; }
+.event .body:not(.md) { white-space: pre-wrap; }
 .event .meta { font-size: 11px; color: var(--fg-dim); margin-top: 8px; }
-.event[data-role="user"] { border-left-color: #eeeeee; }
-.event[data-role="user"] .role { color: #eeeeee; }
-.event[data-role="assistant"] { border-left-color: #76b900; }
-.event[data-role="assistant"] .role { color: #76b900; }
-.event[data-role="tool"] { border-left-color: #fbbf24; }
-.event[data-role="tool"] .role { color: #fbbf24; }
-.event[data-role="system"] { border-left-color: #666666; opacity: 0.85; }
-.event[data-role="system"] .role { color: #999999; }
-.event[data-role="error"] { border-left-color: #fb7185; background: #211417; }
-.event[data-role="error"] .role { color: #fb7185; }
-.event[data-role="compaction"] { border-left-color: #999999; background: #1d1d1d; }
-.event[data-role="compaction"] .role { color: #999999; }
+/* Tool call line: [Name] summary, then truncated inline output */
+.tool { margin: 6px 0 6px; }
+.tool .label { font-family: var(--mono); font-size: 13px; font-style: italic; color: var(--fg-muted); }
+.tool .label .nm { color: var(--accent); font-style: normal; }
+.tool .label .sm { color: var(--fg); font-style: normal; }
+.tool .out { margin: 4px 0 0 16px; }
+.tool .out pre { background: var(--bg-depth); border-left: 2px solid var(--border); border-radius: 0;
+  font-size: 12.5px; max-height: none; padding: 8px 12px; color: var(--fg-muted); }
+.tool .more { font-size: 11px; color: var(--fg-dim); margin: 2px 0 0 16px; font-family: var(--mono); }
+.reasoning-line { font-size: 13px; color: var(--fg-dim); font-style: italic; margin: 0 0 8px;
+  white-space: pre-wrap; }
+.event[data-role="system"], .event[data-role="compaction"] { opacity: 0.75; font-size: 13px; }
 /* Sidechain styling outside a subagent dropdown (e.g. true Claude Code
    isSidechain events not framed by task_started/task_notification). */
 .event[data-sidechain="1"]:not(.subagent-inner .event) {
@@ -99,16 +115,6 @@ header .title .problem { color: var(--fg); }
 .collapsible summary::-webkit-details-marker { color: #666666; }
 .collapsible[open] summary { color: #eeeeee; margin-bottom: 8px; }
 .collapsible .inner { font-size: 13px; white-space: pre-wrap; color: #cccccc; }
-.tool-call { margin-top: 8px; }
-.tool-call .name { font-family: "Roboto Mono", "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px;
-                   color: #fbbf24; font-weight: 600; }
-.tool-call .args { font-family: "Roboto Mono", "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px;
-                   color: #999999; margin-left: 8px; }
-.tool-call .filepath { font-family: "Roboto Mono", "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
-                       font-size: 11px; color: #999999; margin-left: 8px; font-weight: 400; }
-.diff-block { border-color: #2c3a18; }
-.diff-block summary { color: #a3c266; }
-.diff-block .inner pre { background: #000000; }
 .token .deleted, .token.deleted, .language-diff .deleted { color: #fb7185; }
 .token .inserted, .token.inserted, .language-diff .inserted { color: #76b900; }
 .usage { display: inline-block; font-family: "Roboto Mono", ui-monospace, monospace; font-size: 11px;
@@ -256,41 +262,115 @@ def _guess_lang(key: str, file_path: str | None, value: str) -> str:
     return "text"
 
 
-def _render_args(args: dict, has_diff: bool) -> str:
-    if not isinstance(args, dict) or not args:
-        return ""
+def _truncate_lines(s: str, max_lines: int = 12) -> tuple[str, int]:
+    """Return (first max_lines, hidden_line_count)."""
+    lines = s.rstrip("\n").split("\n")
+    if len(lines) <= max_lines:
+        return "\n".join(lines), 0
+    return "\n".join(lines[:max_lines]), len(lines) - max_lines
 
-    extras: list[tuple[str, str, str]] = []  # (key, value, lang)
-    cleaned: dict = {}
-    file_path = args.get("file_path") or args.get("path") or args.get("filepath")
 
+def _arg_summary(tc) -> str:
+    """One-line, Claude-Code-style summary of a tool call's args."""
+    if tc.file_path:
+        return tc.file_path
+    args = tc.args if isinstance(tc.args, dict) else {}
+    for key in ("command", "cmd", "pattern", "query", "url", "prompt", "description",
+                "path", "filepath", "file"):
+        v = args.get(key)
+        if isinstance(v, str) and v.strip():
+            return v.strip().split("\n")[0]
+    # Fall back to the first short scalar arg.
     for k, v in args.items():
-        if isinstance(v, str) and "\n" in v:
-            if has_diff and k in _HEAVY_ARG_KEYS:
-                cleaned[k] = f"<{len(v)} chars — see diff>"
-            else:
-                extras.append((k, v, _guess_lang(k, file_path, v)))
-                cleaned[k] = f"<{len(v)} chars — see below>"
-        else:
-            cleaned[k] = v
+        if isinstance(v, (str, int, float, bool)) and "\n" not in str(v):
+            return f"{k}={v}"
+    return ""
 
-    out = []
-    args_pretty = json.dumps(cleaned, indent=2, default=str)
-    args_snippet, _ = _truncate(args_pretty, 600)
-    out.append(
-        f'<details class="collapsible"><summary>args</summary>'
-        f'<div class="inner">{_render_code(args_snippet, "json")}</div></details>'
-    )
-    for key, value, lang in extras:
-        snippet, truncated = _truncate(value, 4000)
-        label = f"{key} ({len(value)} chars"
-        label += " — TRUNCATED" if truncated else ""
-        label += ")"
-        out.append(
-            f'<details class="collapsible" open><summary>{_esc(label)}</summary>'
-            f'<div class="inner">{_render_code(snippet, lang)}</div></details>'
-        )
-    return "".join(out)
+
+_MD_INLINE = [
+    (re.compile(r"\*\*(.+?)\*\*"), r"<strong>\1</strong>"),
+    (re.compile(r"(?<!\*)\*(?!\*)(.+?)(?<!\*)\*(?!\*)"), r"<em>\1</em>"),
+    (re.compile(r"`([^`]+?)`"), r"<code>\1</code>"),
+]
+
+
+def _md(text: str) -> str:
+    """Minimal, safe markdown -> HTML for assistant prose. Escapes first, then
+    applies fenced code blocks, headers, lists, inline code/bold/italic."""
+    lines = text.split("\n")
+    out: list[str] = []
+    in_fence = False
+    fence_buf: list[str] = []
+    list_open: str | None = None  # "ul" | "ol"
+    para: list[str] = []
+
+    def close_list() -> None:
+        nonlocal list_open
+        if list_open:
+            out.append(f"</{list_open}>")
+            list_open = None
+
+    def inline(s: str) -> str:
+        s = _esc(s)
+        for rx, rep in _MD_INLINE:
+            s = rx.sub(rep, s)
+        return s
+
+    def flush_para() -> None:
+        if para:
+            out.append(f"<p>{inline(' '.join(para))}</p>")
+            para.clear()
+
+    def open_list(kind: str) -> None:
+        nonlocal list_open
+        if list_open != kind:
+            close_list()
+            out.append(f"<{kind}>")
+            list_open = kind
+
+    for ln in lines:
+        if ln.strip().startswith("```"):
+            if not in_fence:
+                flush_para()
+                close_list()
+                in_fence = True
+                fence_buf = []
+            else:
+                out.append(_render_code("\n".join(fence_buf), "text"))
+                in_fence = False
+            continue
+        if in_fence:
+            fence_buf.append(ln)
+            continue
+        m = re.match(r"^(#{1,3})\s+(.*)", ln)
+        if m:
+            flush_para()
+            close_list()
+            lvl = len(m.group(1))
+            out.append(f"<h{lvl}>{inline(m.group(2))}</h{lvl}>")
+            continue
+        m = re.match(r"^\s*[-*]\s+(.*)", ln)
+        if m:
+            flush_para()
+            open_list("ul")
+            out.append(f"<li>{inline(m.group(1))}</li>")
+            continue
+        m = re.match(r"^\s*\d+\.\s+(.*)", ln)
+        if m:
+            flush_para()
+            open_list("ol")
+            out.append(f"<li>{inline(m.group(1))}</li>")
+            continue
+        if not ln.strip():
+            flush_para()
+            close_list()
+        else:
+            para.append(ln.strip())
+    if in_fence:
+        out.append(_render_code("\n".join(fence_buf), "text"))
+    flush_para()
+    close_list()
+    return "\n".join(out)
 
 
 def _render_event(e: Event, idx: int) -> str:
@@ -299,62 +379,45 @@ def _render_event(e: Event, idx: int) -> str:
     sub_attr = f' data-subtype="{e.subtype}"' if e.subtype else ""
     side_attr = ' data-sidechain="1"' if e.is_sidechain else ""
     parts.append(f'<div class="event" data-role="{role}"{sub_attr}{side_attr} id="e{idx}">')
-    parts.append(f'<div class="role">{role}{f" — {e.subtype}" if e.subtype else ""}</div>')
+    role_label = f"{role}{f' — {e.subtype}' if e.subtype else ''}"
+    parts.append(f'<div class="role">{_esc(role_label)}</div>')
 
-    if e.text:
-        body = _esc(e.text)
-        parts.append(f'<div class="body">{body}</div>')
-
+    # Reasoning: dim italic preview, truncated.
     if e.reasoning:
-        parts.append(
-            f'<details class="collapsible"><summary>reasoning ({len(e.reasoning)} chars)</summary>'
-            f'<div class="inner">{_esc(e.reasoning)}</div></details>'
-        )
+        snip, hidden = _truncate_lines(e.reasoning, 8)
+        more = f"\n… +{hidden} more lines" if hidden else ""
+        parts.append(f'<div class="reasoning-line">{_esc(snip + more)}</div>')
 
+    # Assistant/user prose: markdown for assistant, plain for everyone else.
+    if e.text:
+        if role == "assistant":
+            parts.append(f'<div class="body md">{_md(e.text)}</div>')
+        else:
+            parts.append(f'<div class="body">{_esc(e.text)}</div>')
+
+    # Tool calls: "[Name] summary" then truncated inline output (diff/result).
     for tc in e.tool_calls:
-        parts.append('<div class="tool-call">')
-        name_label = _esc(tc.name)
-        if tc.file_path:
-            name_label += f' <span class="filepath">{_esc(tc.file_path)}</span>'
-        parts.append(f'<span class="name">{name_label}</span>')
+        summ = _arg_summary(tc)
+        summ_html = f' <span class="sm">{_esc(summ)}</span>' if summ else ""
+        parts.append(
+            f'<div class="tool"><div class="label">[<span class="nm">{_esc(tc.name)}</span>]{summ_html}</div>'
+        )
         if tc.diff:
-            diff_snippet, diff_truncated = _truncate(tc.diff, 6000)
-            label = f"diff ({tc.diff.count(chr(10))} lines"
-            label += " — TRUNCATED" if diff_truncated else ""
-            label += ")"
-            parts.append(
-                f'<details class="collapsible diff-block" open>'
-                f'<summary>{_esc(label)}</summary>'
-                f'<div class="inner">{_render_code(diff_snippet, "diff")}</div></details>'
-            )
-        parts.append(_render_args(tc.args, has_diff=bool(tc.diff)))
+            snip, hidden = _truncate_lines(tc.diff, 16)
+            parts.append(f'<div class="out">{_render_code(snip, "diff")}</div>')
+            if hidden:
+                parts.append(f'<div class="more">… +{hidden} more lines</div>')
         parts.append('</div>')
 
+    # Tool result: truncated inline preview (first ~12 lines), de-emphasized.
     if e.tool_result:
-        content = e.tool_result.content or ""
-        # If the tool output is itself a JSON object (common in Codex
-        # apply_patch / function_call_output), pretty-print it so embedded
-        # newlines aren't shown as literal \n.
-        content = _maybe_pretty_json(content)
-        snippet, truncated = _truncate(content, 1500)
-        kind = "stderr" if e.tool_result.is_error else "stdout"
-        parts.append(
-            f'<details class="collapsible"{" open" if len(content) < 600 else ""}>'
-            f'<summary>{kind} ({len(content)} chars)'
-            f'{" — TRUNCATED" if truncated else ""}</summary>'
-            f'<div class="inner">{_render_code(snippet, "text")}</div></details>'
-        )
-
-    if e.usage:
-        u = e.usage
-        parts.append(
-            f'<div class="meta">'
-            f'<span class="usage">in <b>{u.input_tokens}</b></span>'
-            f'<span class="usage">out <b>{u.output_tokens}</b></span>'
-            f'<span class="usage">cache_r <b>{u.cache_read_tokens}</b></span>'
-            f'<span class="usage">cache_w <b>{u.cache_write_tokens}</b></span>'
-            f'</div>'
-        )
+        content = _maybe_pretty_json(e.tool_result.content or "")
+        if content.strip():
+            snip, hidden = _truncate_lines(content, 12)
+            parts.append(f'<div class="tool"><div class="out">{_render_code(snip, "text")}</div>')
+            if hidden:
+                parts.append(f'<div class="more">… +{hidden} more lines</div>')
+            parts.append('</div>')
 
     parts.append('</div>')
     return "\n".join(parts)
