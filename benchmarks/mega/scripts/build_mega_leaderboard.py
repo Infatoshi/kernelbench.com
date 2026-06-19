@@ -51,20 +51,27 @@ def _framework(run_dir: Path) -> str:
 
 
 _RUN_TS = re.compile(r"outputs/runs/(\d{8}_\d{6})")
+# Recipe/solution sources an agent must never touch. Reading any of these leaks a
+# prior winning solution or the optimization recipe. outputs/runs/<ts> (another
+# run's archive) is the obvious one, but the DEVLOG *is* the recipe (the journey
+# log), the ~/.claude memory records the winning recipe, and the sibling `hard`
+# benchmark shares these kernels. The original tripwire only caught the first and
+# MISSED the DEVLOG leak; this catches all of them.
+_FORBIDDEN = re.compile(r"/DEVLOG\.md|/memory/|benchmarks/hard/|kimi-linear-decode-solution")
 
 
 def contamination(run_dir: Path) -> int:
-    """Count OTHER run-archive timestamps this run's transcript/logs referenced.
+    """Count references to forbidden recipe/solution sources in this run's transcript.
 
-    The harness does not sandbox the agent filesystem, so an agent can read the
-    shared outputs/runs/ archive (every prior winning solution) via absolute
-    paths. A run that references another run's archive saw a prior solution and
-    is contaminated -- excluded from the leaderboard. Returns the count of
-    distinct OTHER run timestamps referenced (0 = clean).
+    The agent must write its own kernel; reading a prior solution or the recipe
+    is contamination. Counts distinct OTHER-run-archive timestamps PLUS any hit
+    on a forbidden source (DEVLOG, ~/.claude memory, sibling hard benchmark).
+    Returns 0 only if the run touched none of them.
     """
     self_ts_m = re.match(r"(\d{8}_\d{6})", run_dir.name)
     self_ts = self_ts_m.group(1) if self_ts_m else ""
     seen: set[str] = set()
+    forbidden_hits = 0
     sources = [run_dir / "transcript.jsonl", run_dir / "codex_session.jsonl",
                run_dir / "stderr.log"]
     scratch = run_dir / "scratch"
@@ -78,7 +85,8 @@ def contamination(run_dir: Path) -> int:
         for ts in _RUN_TS.findall(txt):
             if ts != self_ts:
                 seen.add(ts)
-    return len(seen)
+        forbidden_hits += len(_FORBIDDEN.findall(txt))
+    return len(seen) + forbidden_hits
 
 
 def main() -> None:

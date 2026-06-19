@@ -130,16 +130,28 @@ WORKSPACE_ROOT="$RUN_DIR/repo"
 PROBLEM_DIR="$WORKSPACE_ROOT/problems/$PROBLEM_NAME"
 mkdir -p "$PROBLEM_DIR"
 
-# Contamination sandbox: run the agent under bwrap with outputs/runs hidden
-# (tmpfs) so it CANNOT read other runs' archives (prior winning solutions), while
-# this run's own dir stays writable and everything else (toolchain, src, GPU,
-# outputs/gpu.lock) passes through via --dev-bind. The cross-run contamination
-# fix at the source. Disable with KBH_SANDBOX=0; auto-off if bwrap is absent.
+# Contamination sandbox: run the agent under bwrap with EVERY source of a prior
+# solution or the optimization recipe hidden, while the toolchain (src, .venv,
+# GPU, outputs/gpu.lock) passes through via --dev-bind. The leak sources are NOT
+# just this benchmark's run archive -- they include the sibling `hard` benchmark's
+# runs (same kernels), the DEVLOG (the optimization journey == the recipe), and
+# the ~/.claude memory (which records the winning recipe). Each is tmpfs'd /
+# blanked only if present, so this works identically on anvil (full repo) and a
+# cloud box (only mega rsync'd). Own run dir stays writable. KBH_SANDBOX=0 to
+# disable; auto-off if bwrap is absent (e.g. verda B200, where userns is denied --
+# there, blank DEVLOG on the box and run on a single-model box instead).
 RUNS_DIR="$REPO_ROOT/outputs/runs"
+SIB_PARENT="$(dirname "$REPO_ROOT")"   # benchmarks/ on anvil, $HOME on a cloud box
+KBH_EMPTY="$RUN_DIR/.kbh_empty"; : > "$KBH_EMPTY"
 KBH_SBX=()
 if [ "${KBH_SANDBOX:-1}" = "1" ] && command -v bwrap >/dev/null 2>&1; then
-    KBH_SBX=(bwrap --dev-bind / / --tmpfs "$RUNS_DIR" --bind "$RUN_DIR" "$RUN_DIR" --chdir "$PROBLEM_DIR")
-    echo "agent sandbox: bwrap (outputs/runs hidden from the agent)"
+    KBH_SBX=(bwrap --dev-bind / / --tmpfs "$RUNS_DIR")
+    [ -e "$REPO_ROOT/DEVLOG.md" ] && KBH_SBX+=(--ro-bind "$KBH_EMPTY" "$REPO_ROOT/DEVLOG.md")
+    [ -d "$SIB_PARENT/hard" ]     && KBH_SBX+=(--tmpfs "$SIB_PARENT/hard")
+    [ -d "$SIB_PARENT/v3" ]       && KBH_SBX+=(--tmpfs "$SIB_PARENT/v3")
+    [ -d "$HOME/.claude/projects" ] && KBH_SBX+=(--tmpfs "$HOME/.claude/projects")
+    KBH_SBX+=(--bind "$RUN_DIR" "$RUN_DIR" --chdir "$PROBLEM_DIR")
+    echo "agent sandbox: bwrap (hidden: mega+hard runs, DEVLOG recipe, ~/.claude memory)"
 fi
 
 PROMPT="${PROMPT}
