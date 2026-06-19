@@ -705,8 +705,10 @@ case "$HARNESS" in
 
     gemini)
         # Gemini CLI. No --cwd flag, so cd into PROBLEM_DIR. --yolo auto-approves
-        # tools + trusts the dir (the old --skip-trust flag is gone in gemini 0.36).
-        ( cd "$PROBLEM_DIR" && timeout "$BUDGET_SECONDS" gemini \
+        # tools; GEMINI_CLI_TRUST_WORKSPACE=true trusts the dir headlessly. This
+        # combo is version-independent: 0.36 lacks --skip-trust, 0.47 needs trust
+        # set separately from --yolo. The env var works on both.
+        ( cd "$PROBLEM_DIR" && export GEMINI_CLI_TRUST_WORKSPACE=true && timeout "$BUDGET_SECONDS" gemini \
             --yolo \
             -m "$MODEL" \
             -o stream-json \
