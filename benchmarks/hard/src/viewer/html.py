@@ -117,18 +117,13 @@ header .title .problem { color: var(--fg); }
 pre { margin: 0; padding: 12px; background: #000000; border-radius: 6px; overflow-x: auto;
       font-family: var(--mono); font-size: 13.5px; line-height: 1.55; max-height: 520px; }
 code { font-family: inherit; }
-/* AA-style stat tiles */
-.stat-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 14px;
-             margin: 0 0 28px 0; }
-.stat-card { background: var(--surface); border: 1px solid var(--border); border-radius: 10px;
-             padding: 16px 18px; }
-.stat-card .k { font-size: 11px; text-transform: uppercase; color: var(--fg-muted); letter-spacing: 0.06em;
-                font-weight: 600; }
-.stat-card .v { font-size: 26px; color: var(--fg-bright); margin-top: 6px; font-family: var(--mono);
-                font-weight: 500; line-height: 1.1; }
-.stat-card .v.accent { color: var(--accent); }
-.stat-card .v.bad { color: var(--bad); }
-.stat-card .sub { font-size: 11px; color: var(--fg-dim); margin-top: 4px; }
+/* Slim one-line stat strip */
+.stat-strip { display: flex; flex-wrap: wrap; align-items: baseline; gap: 8px 22px;
+              margin: 0 0 24px 0; font-size: 13px; color: var(--fg-muted); }
+.stat-strip .stat { white-space: nowrap; }
+.stat-strip .stat b { color: var(--fg); font-weight: 500; font-family: var(--mono); }
+.stat-strip .stat.hero b { color: var(--accent); font-size: 16px; }
+.stat-strip .stat.hero.bad b { color: var(--bad); }
 /* Prominent solution link (no inline code window) */
 .solution-link { display: inline-flex; align-items: center; gap: 10px; margin: 0 0 28px 0;
                  padding: 14px 20px; background: var(--surface); border: 1px solid var(--accent);
@@ -522,34 +517,26 @@ def render(run_dir: Path, session: Session, out_path: Path | None = None) -> Pat
     else:
         status_pill = '<span class="pill pill-fail">FAIL</span>'
 
-    # ---- AA-style stat tiles ----
+    # ---- Slim stat strip (peak fraction is the hero; rest muted inline) ----
     u = session.total_usage
-    tiles: list[tuple[str, str, str, str]] = []  # (key, value, css_class, sub)
-    if pf is not None:
-        tiles.append(("peak fraction", f"{pf*100:.1f}%", "accent" if correct else "", "of hardware roofline"))
-    tiles.append(("correct", "yes" if correct else "no", "accent" if correct else "bad",
-                  _esc(str(r.get("failure_reason") or ""))))
-    tiles.append(("turns", str(session.turn_count), "", f"{session.tool_call_count} tool calls"))
     out_tok = (u.output_tokens if u else None)
     if r.get("usage"):
         out_tok = r["usage"].get("output_tokens", out_tok)
-    tiles.append(("output tokens", _fmt_int(out_tok), "", "agent generation"))
-    if u and u.cache_read_tokens:
-        tiles.append(("cache hits", _fmt_int(u.cache_read_tokens), "", "input tokens"))
+
+    stats: list[str] = []
+    if pf is not None:
+        hero_cls = "hero" if correct else "hero bad"
+        stats.append(f'<span class="stat {hero_cls}">peak <b>{pf*100:.1f}%</b></span>')
+    stats.append(f'<span class="stat">turns <b>{session.turn_count}</b></span>')
+    stats.append(f'<span class="stat">tools <b>{session.tool_call_count}</b></span>')
+    if out_tok is not None:
+        stats.append(f'<span class="stat">out tok <b>{_fmt_int(out_tok)}</b></span>')
     if r.get("elapsed_seconds") is not None:
-        tiles.append(("agent time", _fmt_dur(r.get("elapsed_seconds")), "",
-                      f"check {_fmt_dur(r.get('check_elapsed_seconds'))} · bench {_fmt_dur(r.get('benchmark_elapsed_seconds'))}"))
+        stats.append(f'<span class="stat">agent <b>{_fmt_dur(r.get("elapsed_seconds"))}</b></span>')
     elif session.duration_ms:
-        tiles.append(("duration", f"{session.duration_ms/1000:.0f}s", "", ""))
+        stats.append(f'<span class="stat">duration <b>{session.duration_ms/1000:.0f}s</b></span>')
 
-    def _tile(k: str, v: str, cls: str, sub: str) -> str:
-        sub_html = f'<div class="sub">{sub}</div>' if sub else ""
-        return (f'<div class="stat-card"><div class="k">{_esc(k)}</div>'
-                f'<div class="v {cls}">{_esc(v)}</div>{sub_html}</div>')
-
-    tiles_html = '<div class="stat-grid">' + "".join(
-        _tile(k, v, cls, sub) for k, v, cls, sub in tiles
-    ) + '</div>'
+    tiles_html = '<div class="stat-strip">' + "".join(stats) + '</div>'
 
     # ---- Incomplete banner ----
     incomplete_banner = ""
