@@ -117,13 +117,6 @@ header .title .problem { color: var(--fg); }
 pre { margin: 0; padding: 12px; background: #000000; border-radius: 6px; overflow-x: auto;
       font-family: var(--mono); font-size: 13.5px; line-height: 1.55; max-height: 520px; }
 code { font-family: inherit; }
-/* Slim one-line stat strip */
-.stat-strip { display: flex; flex-wrap: wrap; align-items: baseline; gap: 8px 22px;
-              margin: 0 0 24px 0; font-size: 13px; color: var(--fg-muted); }
-.stat-strip .stat { white-space: nowrap; }
-.stat-strip .stat b { color: var(--fg); font-weight: 500; font-family: var(--mono); }
-.stat-strip .stat.hero b { color: var(--accent); font-size: 16px; }
-.stat-strip .stat.hero.bad b { color: var(--bad); }
 /* Prominent solution link (no inline code window) */
 .solution-link { display: inline-flex; align-items: center; gap: 10px; margin: 0 0 28px 0;
                  padding: 14px 20px; background: var(--surface); border: 1px solid var(--accent);
@@ -517,26 +510,12 @@ def render(run_dir: Path, session: Session, out_path: Path | None = None) -> Pat
     else:
         status_pill = '<span class="pill pill-fail">FAIL</span>'
 
-    # ---- Slim stat strip (peak fraction is the hero; rest muted inline) ----
+    # Token/timing stats are intentionally omitted from the page body; the full
+    # numbers live in the collapsed result.json metadata block at the bottom.
     u = session.total_usage
     out_tok = (u.output_tokens if u else None)
     if r.get("usage"):
         out_tok = r["usage"].get("output_tokens", out_tok)
-
-    stats: list[str] = []
-    if pf is not None:
-        hero_cls = "hero" if correct else "hero bad"
-        stats.append(f'<span class="stat {hero_cls}">peak <b>{pf*100:.1f}%</b></span>')
-    stats.append(f'<span class="stat">turns <b>{session.turn_count}</b></span>')
-    stats.append(f'<span class="stat">tools <b>{session.tool_call_count}</b></span>')
-    if out_tok is not None:
-        stats.append(f'<span class="stat">out tok <b>{_fmt_int(out_tok)}</b></span>')
-    if r.get("elapsed_seconds") is not None:
-        stats.append(f'<span class="stat">agent <b>{_fmt_dur(r.get("elapsed_seconds"))}</b></span>')
-    elif session.duration_ms:
-        stats.append(f'<span class="stat">duration <b>{session.duration_ms/1000:.0f}s</b></span>')
-
-    tiles_html = '<div class="stat-strip">' + "".join(stats) + '</div>'
 
     # ---- Incomplete banner ----
     incomplete_banner = ""
@@ -644,7 +623,6 @@ def render(run_dir: Path, session: Session, out_path: Path | None = None) -> Pat
   </header>
   <div class="container">
     {incomplete_banner}
-    {tiles_html}
     {solution_html}
     <div class="section-head">agent timeline &middot; {len(session.events)} events</div>
     {events_html}
