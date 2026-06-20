@@ -78,14 +78,16 @@ export function EfficiencyChart({ mega, hard }: { mega: EffData; hard: EffData }
           className="eff-frontier"
         />
 
-        {data.points.map((p) => {
-          const right = px(p.x) > W * 0.72
+        {placeLabels(data.points, px, py).map(({ p, cx, cy, level, right }) => {
+          const lx = cx + (right ? -10 : 10)
+          const ly = cy - 9 - level * 15
           return (
             <g key={p.label}>
-              <circle cx={px(p.x)} cy={py(p.y)} r={6} className={p.frontier ? "eff-dot on" : "eff-dot"} />
+              <line x1={cx} y1={cy} x2={lx} y2={ly - 3} className="eff-leader" />
+              <circle cx={cx} cy={cy} r={6} className={p.frontier ? "eff-dot on" : "eff-dot"} />
               <text
-                x={px(p.x) + (right ? -10 : 10)}
-                y={py(p.y) - 9}
+                x={lx}
+                y={ly}
                 textAnchor={right ? "end" : "start"}
                 className={p.frontier ? "eff-label on" : "eff-label"}
               >
@@ -102,6 +104,38 @@ export function EfficiencyChart({ mega, hard }: { mega: EffData; hard: EffData }
       </p>
     </div>
   )
+}
+
+// Place labels above each point; if a point sits close to the previously
+// placed one (x-sorted), drop its label below to avoid overlap.
+function placeLabels(
+  points: EffPoint[],
+  px: (x: number) => number,
+  py: (y: number) => number,
+) {
+  const sorted = [...points].sort((a, b) => a.x - b.x)
+  const boxes: { x0: number; x1: number; y0: number; y1: number }[] = []
+  return sorted.map((p) => {
+    const cx = px(p.x)
+    const cy = py(p.y)
+    const right = cx > W * 0.72
+    const w = p.label.length * 6.6 + 6
+    // Lift the label one row at a time until its box clears every placed label.
+    let level = 0
+    let box = { x0: 0, x1: 0, y0: 0, y1: 0 }
+    while (level < 8) {
+      const ly = cy - 9 - level * 15
+      const x0 = right ? cx - 10 - w : cx + 10
+      box = { x0, x1: x0 + w, y0: ly - 12, y1: ly + 3 }
+      const hit = boxes.some(
+        (b) => box.x0 < b.x1 && box.x1 > b.x0 && box.y0 < b.y1 && box.y1 > b.y0,
+      )
+      if (!hit) break
+      level++
+    }
+    boxes.push(box)
+    return { p, cx, cy, level, right }
+  })
 }
 
 function niceTicks(max: number, count: number): number[] {

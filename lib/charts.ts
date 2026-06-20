@@ -107,6 +107,19 @@ function markFrontier(points: EffPoint[]): EffPoint[] {
   return points
 }
 
+// Short labels for the dense scatter (full names crowd the clustered points).
+const SHORT_NAMES: Record<string, string> = {
+  "claude-opus-4-8": "Opus 4.8",
+  "glm-5.2": "GLM-5.2",
+  "gpt-5.5": "GPT-5.5",
+  "MiniMax-M3": "MiniMax",
+  "kimi-k2.7-code": "Kimi",
+  "composer-2.5-fast": "Composer",
+  "gemini-3.5-flash": "Gemini",
+  "deepseek-v4-pro": "DeepSeek",
+  "claude-fable-5": "Fable 5",
+}
+
 // Performance vs compute (output tokens), RTX PRO 6000, clean-telemetry subset.
 export async function loadEfficiency(): Promise<{ mega: EffData; hard: EffData }> {
   // Mega: speedup vs output tokens.
@@ -124,7 +137,7 @@ export async function loadEfficiency(): Promise<{ mega: EffData; hard: EffData }
     if (f[ix("gpu")] !== "RTX PRO 6000 Blackwell") continue
     const tok = parseInt(f[ix("output_tokens")], 10)
     if (!tok || tok < 1000) continue
-    const name = MODEL_NAMES[f[ix("model")]]
+    const name = SHORT_NAMES[f[ix("model")]]
     if (!name) continue
     megaPts.push({ label: name, x: tok, y: parseFloat(f[ix("score")]), frontier: false })
   }
@@ -133,7 +146,7 @@ export async function loadEfficiency(): Promise<{ mega: EffData; hard: EffData }
   const lb = await loadLeaderboard("benchmarks/hard/results/leaderboard.json")
   const hardPts: EffPoint[] = []
   for (const m of lb.models) {
-    const name = MODEL_NAMES[m.model]
+    const name = SHORT_NAMES[m.model]
     if (!name) continue
     const pfs: number[] = []
     let tok = 0
