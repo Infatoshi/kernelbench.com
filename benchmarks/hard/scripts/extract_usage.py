@@ -213,7 +213,11 @@ def extract(run_dir: Path, harness: str) -> dict:
             events = _read_jsonl(run_dir / "transcript.jsonl")
         return _codex(events)
     transcript = _read_jsonl(run_dir / "transcript.jsonl")
-    if harness in ("claude", "zai-claude", "minimax-claude", "kimi-claude", "ccr-claude", "kimi"):
+    # Every Claude-Code-routed provider (zai/minimax/kimi/deepseek/qwen-claude,
+    # ccr-claude, native claude) and bare kimi emit the Anthropic-shape terminal
+    # {"type":"result"} with cumulative usage. Match the -claude suffix so a newly
+    # added provider route is never silently dropped to null tokens.
+    if harness == "claude" or harness == "kimi" or harness.endswith("-claude"):
         return _claude_or_kimi(transcript)
     if harness == "droid":
         return _droid(transcript)
