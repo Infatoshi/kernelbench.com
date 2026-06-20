@@ -83,6 +83,101 @@ export async function loadHardChart(): Promise<ChartData> {
   return assemble(cell, "%", 0)
 }
 
+export type EffPoint = {
+  label: string
+  x: number // output tokens
+  y: number // performance
+  frontier: boolean
+}
+export type EffData = {
+  points: EffPoint[]
+  ySuffix: string
+  yDecimals: number
+  yLabel: string
+}
+
+function markFrontier(points: EffPoint[]): EffPoint[] {
+  let best = -1
+  for (const p of [...points].sort((a, b) => a.x - b.x)) {
+    if (p.y > best) {
+      p.frontier = true
+      best = p.y
+    }
+  }
+  return points
+}
+
+// Performance vs compute (output tokens), RTX PRO 6000, clean-telemetry subset.
+export async function loadEfficiency(): Promise<{ mega: EffData; hard: EffData }> {
+  // Mega: speedup vs output tokens.
+  const csv = await readFile(
+    join(REPO_ROOT, "public/data/mega/results.csv"),
+    "utf-8",
+  )
+  const lines = csv.trim().split("\n")
+  const h = lines[0].split(",")
+  const ix = (k: string) => h.indexOf(k)
+  const megaPts: EffPoint[] = []
+  for (const line of lines.slice(1)) {
+    const f = line.split(",")
+    if (f[ix("correct")] !== "true") continue
+    if (f[ix("gpu")] !== "RTX PRO 6000 Blackwell") continue
+    const tok = parseInt(f[ix("output_tokens")], 10)
+    if (!tok || tok < 1000) continue
+    const name = MODEL_NAMES[f[ix("model")]]
+    if (!name) continue
+    megaPts.push({ label: name, x: tok, y: parseFloat(f[ix("score")]), frontier: false })
+  }
+
+  // Hard: avg roofline % vs total output tokens.
+  const lb = await loadLeaderboard("benchmarks/hard/results/leaderboard.json")
+  const hardPts: EffPoint[] = []
+  for (const m of lb.models) {
+    const name = MODEL_NAMES[m.model]
+    if (!name) continue
+    const pfs: number[] = []
+    let tok = 0
+    for (const c of Object.values(m.results)) {
+      if (!c.correct || c.peak_fraction == null) continue
+      pfs.push(c.peak_fraction)
+      try {
+        const r = JSON.parse(
+          await readFile(
+            join(REPO_ROOT, "benchmarks/hard/outputs/runs", c.run_id, "result.json"),
+            "utf-8",
+          ),
+        )
+        tok += r?.usage?.output_tokens ?? 0
+      } catch {
+        // missing run dir / usage — skip token contribution
+      }
+    }
+    if (pfs.length && tok > 1000) {
+      hardPts.push({
+        label: name,
+        x: tok,
+        y: (pfs.reduce((a, b) => a + b, 0) / pfs.length) * 100,
+        frontier: false,
+      })
+    }
+  }
+
+  return {
+    mega: {
+      points: markFrontier(megaPts),
+      ySuffix: "x",
+      yDecimals: 1,
+      yLabel: "speedup over reference",
+    },
+    hard: {
+      points: markFrontier(hardPts),
+      ySuffix: "%",
+      yDecimals: 0,
+      yLabel: "percent of hardware roofline",
+    },
+  }
+}
+
 function assemble(
   cell: Record<string, Record<string, number>>,
   suffix: string,

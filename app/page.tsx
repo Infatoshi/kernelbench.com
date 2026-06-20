@@ -1,6 +1,7 @@
 import Link from "next/link"
 import { GroupedBars } from "./home-charts"
-import { loadMegaChart, loadHardChart } from "@/lib/charts"
+import { EfficiencyChart } from "./efficiency-chart"
+import { loadMegaChart, loadHardChart, loadEfficiency } from "@/lib/charts"
 
 const HUGGING_FACE_LOGO =
   "https://huggingface.co/front/assets/huggingface_logo-noborder.svg"
@@ -87,9 +88,10 @@ const benchmarks = [
 ]
 
 export default async function HomePage() {
-  const [megaChart, hardChart] = await Promise.all([
+  const [megaChart, hardChart, efficiency] = await Promise.all([
     loadMegaChart(),
     loadHardChart(),
+    loadEfficiency(),
   ])
   const charts: Record<string, React.ReactNode> = {
     "/mega": (
@@ -172,6 +174,10 @@ export default async function HomePage() {
             </div>
           </article>
         ))}
+      </section>
+
+      <section aria-label="Performance vs compute" className="box p-6">
+        <EfficiencyChart mega={efficiency.mega} hard={efficiency.hard} />
       </section>
 
       <section className="space-y-5">
