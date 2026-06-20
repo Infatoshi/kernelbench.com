@@ -29,16 +29,36 @@ json.dump(out, open("results/leaderboard.json","w"), indent=2)
 print(f"  wrote results/leaderboard.json ({len(models)} models)")
 PY
 
-echo "[3/3] regenerating transcript viewers into public/runs..."
+echo "[3/3] emitting redacted solution files into public/runs (transcripts live on HuggingFace)..."
 mkdir -p "$REPO_ROOT/public/runs"
-RIDS=$(uv run python -c "import json;d=json.load(open('results/leaderboard.json'));print(' '.join(sorted({c['run_id'] for m in d['models'] for c in m['results'].values()})))")
-n=0
-for rid in $RIDS; do
-  [ -d "outputs/runs/$rid" ] || continue
-  KB_VIEWER_THEME=phosphor KB_ANNOTATIONS_DIR="$HARD_DIR/results/annotations" \
-    uv run python -m src.viewer "outputs/runs/$rid" --out "$REPO_ROOT/public/runs/$rid.html" >/dev/null 2>&1 && n=$((n+1)) || echo "  WARN viewer failed: $rid"
-done
-echo "  generated $n viewers"
+PUB="$REPO_ROOT/public/runs" uv run python - <<'PY'
+import json, os, re
+pub = os.environ["PUB"]
+rids = sorted({c["run_id"] for m in json.load(open("results/leaderboard.json"))["models"]
+               for c in m["results"].values() if c.get("run_id")})
+vals = []
+envf = os.path.expanduser("~/.env_vars")
+if os.path.exists(envf):
+    for ln in open(envf):
+        if "=" in ln and "export" in ln:
+            v = ln.split("=", 1)[1].strip().strip('"').strip("'")
+            if len(v) >= 12:
+                vals.append(v)
+vals = sorted(set(vals), key=len, reverse=True)
+pats = [re.compile(p) for p in [r"sk-ant-oat01-[A-Za-z0-9_\-]+", r"sk-proj-[A-Za-z0-9_\-]+",
+        r"AIzaSy[A-Za-z0-9_\-]{20,}", r"sk-[a-z]{2,}-[A-Za-z0-9_\-]{16,}", r"hf_[A-Za-z0-9]{20,}"]]
+def red(s):
+    for v in vals: s = s.replace(v, "REDACTED")
+    for p in pats: s = p.sub("REDACTED", s)
+    return s
+n = 0
+for rid in rids:
+    sp = f"outputs/runs/{rid}/solution.py"
+    if os.path.isfile(sp):
+        open(f"{pub}/{rid}_solution.py.txt", "w").write(red(open(sp).read()))
+        n += 1
+print(f"  wrote {n} solution files")
+PY
 
 echo "[3b/3] redacting secrets from viewers (agents can echo env keys)"
 # Build sed rules from every ~/.env_vars value + token prefixes. Never printed.

@@ -214,11 +214,17 @@ export function LeaderboardTable({ rows }: { rows: HardRunRecord[] }) {
                   <div className="conversation-cell">
                     <div className="chip-row">
                       {row.transcriptUrl ? (
-                        <a className="link-chip" href={row.transcriptUrl} title={row.title}>
-                          transcript
+                        <a
+                          className="link-chip"
+                          href={row.transcriptUrl}
+                          target="_blank"
+                          rel="noopener"
+                          title="full agent trace on HuggingFace"
+                        >
+                          trace ↗
                         </a>
                       ) : (
-                        <span className="link-chip link-chip-muted">transcript</span>
+                        <span className="link-chip link-chip-muted">trace</span>
                       )}
                       <span className="link-chip link-chip-muted">{row.scored}</span>
                     </div>

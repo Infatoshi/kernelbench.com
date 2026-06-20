@@ -11,13 +11,21 @@ import {
 } from "@/lib/data"
 import { LeaderboardTable, type HardRunRecord } from "./leaderboard-table"
 
-async function loadAvailableViewers(): Promise<Set<string>> {
+// Full agent transcripts now live on HuggingFace (per-run trace files); the
+// site keeps only the raw submitted-kernel files (<run_id>_solution.py.txt).
+const HARD_TRACES_HF = "https://huggingface.co/datasets/Infatoshi/kernelbench-hard-traces"
+
+function hardTraceUrl(runId: string): string {
+  return `${HARD_TRACES_HF}/blob/main/${runId}.jsonl`
+}
+
+async function loadAvailableSolutions(): Promise<Set<string>> {
   try {
     const entries = await readdir(join(process.cwd(), "public/runs"))
     return new Set(
       entries
-        .filter((n) => n.endsWith(".html"))
-        .map((n) => n.slice(0, -5)),
+        .filter((n) => n.endsWith("_solution.py.txt"))
+        .map((n) => n.slice(0, -"_solution.py.txt".length)),
     )
   } catch {
     return new Set()
@@ -138,7 +146,7 @@ export default async function HardPage({
     loadLeaderboard(target.file),
     loadAnnotations(),
     loadRunAudits(),
-    loadAvailableViewers(),
+    loadAvailableSolutions(),
   ])
   const models = [...lb.models].sort(compareModelRows)
   // The v2 containerized sweep is already a curated single-environment run, so
@@ -308,8 +316,8 @@ function buildRunRows(
         gpuWaitSeconds: cell.gpu_lock_wait_seconds_total ?? null,
         gpuActiveSeconds: cell.gpu_lock_active_seconds_total ?? null,
         referenceUrl: referenceUrlFor(p.key),
-        solutionUrl: hasRunViewer ? `/runs/${cell.run_id}.html#tab-solution` : null,
-        transcriptUrl: hasRunViewer ? `/runs/${cell.run_id}.html` : null,
+        solutionUrl: hasRunViewer ? `/runs/${cell.run_id}_solution.py.txt` : null,
+        transcriptUrl: hardTraceUrl(cell.run_id),
         scored: `${m.pass_count}/${m.total_runs}`,
         note,
         title,

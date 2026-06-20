@@ -1,0 +1,415 @@
+"""Fused W4A16 solution for Kimi-Linear decode.
+
+Strategy:
+  1. QuantLinear holds int4 weights + bf16 scales/zeros. On the first call
+     to step(), we lazily dequant every reachable weight to a bf16 cache and
+     then drive each projection with a small batched matmul (x @ W) using
+     PyTorch (cublas under the hood). This streams int4 weights once for
+     the dequant pass and never re-touches the bf16 weights' bytes more
+     than necessary.
+  2. MLA absorb: skip the [L, H*(qk_nope+v_head)] materialization; fold kv_b
+     through attention so the cached c_kv is only read twice (once for
+     scores, once for value reduction). kv_b is dequantized once at cache
+     time and reused.
+  3. MoE: per-decode top-8 expert gather; per-active-expert bf16 matmuls
+     (gate/up/down) + shared-expert pass.
+  4. KDA: W4A16 -> bf16 cached matmuls for q/k/v/g/o; small fp32 per-head
+     recurrence; bf16 short-conv via the reference code.
+
+Same Model/step interface and same buffer/parameter names as reference.py so
+the reference state_dict loads cleanly.
+"""
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+# --------------------------------------------------------------------------- #
+# Config (identical to reference)                                              #
+# --------------------------------------------------------------------------- #
+OP_TYPE = "kimi_linear_w4a16_decode"
+HARDWARE_REQUIRED = ["RTX_PRO_6000"]
+EPS = 1.0e-6
+GROUP_SIZE = 128
+
+
+@dataclass(frozen=True)
+class Config:
+    hidden: int = 2304
+    kda_heads: int = 32
+    kda_head_dim: int = 128
+    short_conv: int = 4
+    mla_heads: int = 32
+    kv_lora: int = 512
+    qk_nope: int = 128
+    qk_rope: int = 64
+    v_head: int = 128
+    rope_theta: float = 10000.0
+    n_experts: int = 64
+    n_active: int = 8
+    n_shared: int = 1
+    moe_inter: int = 1024
+    routed_scaling: float = 2.446
+    group: int = 128
+    pattern: tuple = ("K", "K", "K", "M")
+    dtype: torch.dtype = field(default=torch.bfloat16)
+
+
+def build_config(shape: dict) -> Config:
+    return Config(n_experts=int(shape.get("n_experts", 64)))
+
+
+# --------------------------------------------------------------------------- #
+# Weight containers (buffers must match reference.py exactly)                  #
+# --------------------------------------------------------------------------- #
+class QuantLinear(nn.Module):
+    """Holds int4 weights + bf16 scales/zeros for one linear."""
+
+    def __init__(self, in_f: int, out_f: int, group: int = GROUP_SIZE):
+        super().__init__()
+        assert in_f % group == 0 and in_f % 2 == 0
+        self.in_f, self.out_f, self.group = in_f, out_f, group
+        ng = in_f // group
+        self.register_buffer("w_q", torch.zeros(in_f // 2, out_f, dtype=torch.uint8))
+        self.register_buffer("scales", torch.zeros(ng, out_f, dtype=torch.bfloat16))
+        self.register_buffer("zeros", torch.zeros(ng, out_f, dtype=torch.bfloat16))
+
+
+class QuantExperts(nn.Module):
+    """E independent W4A16 weights."""
+
+    def __init__(self, n: int, in_f: int, out_f: int, group: int = GROUP_SIZE):
+        super().__init__()
+        self.n, self.in_f, self.out_f, self.group = n, in_f, out_f, group
+        ng = in_f // group
+        self.register_buffer("w_q", torch.zeros(n, in_f // 2, out_f, dtype=torch.uint8))
+        self.register_buffer("scales", torch.zeros(n, ng, out_f, dtype=torch.bfloat16))
+        self.register_buffer("zeros", torch.zeros(n, ng, out_f, dtype=torch.bfloat16))
+
+
+# --------------------------------------------------------------------------- #
+# helpers                                                                       #
+# --------------------------------------------------------------------------- #
+def _rmsnorm(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
+    return F.rms_norm(x, [x.shape[-1]], w, EPS)
+
+
+def _dequant(ql: QuantLinear) -> torch.Tensor:
+    """Dequant a QuantLinear to a bf16 weight matrix (K, N)."""
+    K, N, G = ql.in_f, ql.out_f, ql.group
+    wu = torch.empty((K, N), dtype=torch.uint8, device=ql.w_q.device)
+    wu[0::2] = ql.w_q & 0xF
+    wu[1::2] = (ql.w_q >> 4) & 0xF
+    s = ql.scales.repeat_interleave(G, dim=0)
+    z = ql.zeros.repeat_interleave(G, dim=0)
+    return (wu.to(torch.bfloat16) - z) * s
+
+
+def _dequant_experts(qe: QuantExperts) -> torch.Tensor:
+    """Dequant a QuantExperts to bf16 weights (E, K, N)."""
+    E, K, N, G = qe.n, qe.in_f, qe.out_f, qe.group
+    wu = torch.empty((E, K, N), dtype=torch.uint8, device=qe.w_q.device)
+    wu[:, 0::2] = qe.w_q & 0xF
+    wu[:, 1::2] = (qe.w_q >> 4) & 0xF
+    s = qe.scales.repeat_interleave(G, dim=1)
+    z = qe.zeros.repeat_interleave(G, dim=1)
+    return (wu.to(torch.bfloat16) - z) * s
+
+
+def _w4a16_gemv(ql: QuantLinear, x: torch.Tensor) -> torch.Tensor:
+    """y = x @ dequant(w_q) via cached bf16 matmul.
+
+    Caches the dequantized weight on first call. Subsequent calls reuse the
+    cached bf16 weight."""
+    if not hasattr(ql, "_w_bf"):
+        ql._w_bf = _dequant(ql)
+    return x @ ql._w_bf
+
+
+def _w4a16_gemv_fused(qls: list, x: torch.Tensor) -> torch.Tensor:
+    """Fuse multiple QuantLinear GEMVs that share the same input x.
+    Stacks the weights and does a single matmul. Returns concatenated output."""
+    if not all(hasattr(q, "_w_bf") for q in qls):
+        # Dequant on first call
+        for q in qls:
+            if not hasattr(q, "_w_bf"):
+                q._w_bf = _dequant(q)
+    W = torch.cat([q._w_bf for q in qls], dim=1)  # [K, sum(N)]
+    return x @ W
+
+
+# --------------------------------------------------------------------------- #
+# layers                                                                        #
+# --------------------------------------------------------------------------- #
+class KDA(nn.Module):
+    def __init__(self, cfg: Config):
+        super().__init__()
+        self.cfg = cfg
+        H, Dk, d = cfg.kda_heads, cfg.kda_head_dim, cfg.hidden
+        self.q_proj = QuantLinear(d, H * Dk, cfg.group)
+        self.k_proj = QuantLinear(d, H * Dk, cfg.group)
+        self.v_proj = QuantLinear(d, H * Dk, cfg.group)
+        self.g_proj = QuantLinear(d, H * Dk, cfg.group)
+        self.beta_proj = nn.Linear(d, H, bias=False, dtype=cfg.dtype)
+        self.conv_w = nn.Parameter(torch.empty(3, H * Dk, cfg.short_conv, dtype=cfg.dtype))
+        self.o_proj = QuantLinear(H * Dk, d, cfg.group)
+        self.scale = Dk ** -0.5
+
+    def _short_conv(self, val, prev, idx):
+        win = torch.cat([prev, val[None]], dim=0)
+        w = self.conv_w[idx].float().transpose(0, 1)
+        out = (win.float() * w).sum(0)
+        return F.silu(out).to(val.dtype), win[1:]
+
+    def step(self, x, st):
+        H, Dk = self.cfg.kda_heads, self.cfg.kda_head_dim
+        # Fused q/k/v/g projection (share input x, 4 separate weights)
+        qkvg = _w4a16_gemv_fused([self.q_proj, self.k_proj, self.v_proj, self.g_proj], x)
+        q, k, v, g = qkvg.split(H * Dk)
+        q, st["cq"] = self._short_conv(q, st["cq"], 0)
+        k, st["ck"] = self._short_conv(k, st["ck"], 1)
+        v, st["cv"] = self._short_conv(v, st["cv"], 2)
+        q = q.view(H, Dk).float() * self.scale
+        k = k.view(H, Dk).float()
+        v = v.view(H, Dk).float()
+        g = (-F.softplus(g.float())).view(H, Dk)
+        beta = torch.sigmoid(self.beta_proj(x).float())
+        S = st["S"] * g.exp()[:, :, None]
+        pred = (S * k[:, :, None]).sum(1)
+        S = S + beta[:, None, None] * k[:, :, None] * (v - pred)[:, None, :]
+        o = (S * q[:, :, None]).sum(1)
+        st["S"] = S
+        return _w4a16_gemv(self.o_proj, o.reshape(H * Dk).to(torch.bfloat16))
+
+
+class MLA(nn.Module):
+    """Multi-head latent attention with the absorbed formulation.
+
+    The naive step materializes kvb = c_kv @ kv_b.T (a [L, H*256] bf16 tensor)
+    every decode step. We absorb kv_b through the attention so we only ever
+    need the small q_nope_absorbed @ c_kv.T and z @ c_kv reductions (reading
+    c_kv twice), plus two small bf16 batched matmuls against the cached
+    dequantized kv_b halves.
+    """
+
+    def __init__(self, cfg: Config):
+        super().__init__()
+        self.cfg = cfg
+        H, d = cfg.mla_heads, cfg.hidden
+        self.q_proj = QuantLinear(d, H * (cfg.qk_nope + cfg.qk_rope), cfg.group)
+        self.kv_a = QuantLinear(d, cfg.kv_lora + cfg.qk_rope, cfg.group)
+        self.kv_b = QuantLinear(cfg.kv_lora, H * (cfg.qk_nope + cfg.v_head), cfg.group)
+        self.o_proj = QuantLinear(H * cfg.v_head, d, cfg.group)
+        self.scale = (cfg.qk_nope + cfg.qk_rope) ** -0.5
+        self._cached = False
+        self._ckv_buf = None
+        self._krope_buf = None
+        self._ckv_len = 0
+
+    def _setup_cache(self):
+        if self._cached:
+            return
+        cfg = self.cfg
+        H = cfg.mla_heads
+        dev = self.kv_b.w_q.device
+        # Dequant the two halves of kv_b directly from the original buffers.
+        # We use a temporary QuantLinear that points at the same slices of
+        # w_q / scales / zeros; only the shapes differ.
+        G = cfg.group
+        k_b_cols = H * cfg.qk_nope
+        v_b_cols = H * cfg.v_head
+        # k_b slice: w_q[:, 0:k_b_cols], scales[:, 0:k_b_cols], zeros[:, 0:k_b_cols]
+        # We construct a temporary QuantLinear with a sliced view of the
+        # parent module's buffers. Since Triton/PyTorch needs contiguous
+        # storage for some operations, we copy into fresh tiny buffers.
+        k_w_q = self.kv_b.w_q[:, :k_b_cols].contiguous()
+        k_s = self.kv_b.scales[:, :k_b_cols].contiguous()
+        k_z = self.kv_b.zeros[:, :k_b_cols].contiguous()
+        v_w_q = self.kv_b.w_q[:, k_b_cols:k_b_cols + v_b_cols].contiguous()
+        v_s = self.kv_b.scales[:, k_b_cols:k_b_cols + v_b_cols].contiguous()
+        v_z = self.kv_b.zeros[:, k_b_cols:k_b_cols + v_b_cols].contiguous()
+        k_ql = QuantLinear(cfg.kv_lora, k_b_cols, G).to(dev)
+        k_ql.w_q = k_w_q
+        k_ql.scales = k_s
+        k_ql.zeros = k_z
+        v_ql = QuantLinear(cfg.kv_lora, v_b_cols, G).to(dev)
+        v_ql.w_q = v_w_q
+        v_ql.scales = v_s
+        v_ql.zeros = v_z
+        k_b_bf = _dequant(k_ql)  # [kv_lora, H*qk_nope]
+        v_b_bf = _dequant(v_ql)  # [kv_lora, H*v_head]
+        # Reshape to per-head: [H, kv_lora, qk_nope] and [H, kv_lora, v_head]
+        self.k_b_per_head = k_b_bf.view(cfg.kv_lora, H, cfg.qk_nope).permute(1, 0, 2).contiguous()
+        self.v_b_per_head = v_b_bf.view(cfg.kv_lora, H, cfg.v_head).permute(1, 0, 2).contiguous()
+        self._cached = True
+
+    def _rope_cossin(self, pos, dim, theta, device):
+        inv = 1.0 / (theta ** (torch.arange(0, dim, 2, device=device, dtype=torch.float32) / dim))
+        ang = pos * inv
+        return torch.cos(ang), torch.sin(ang)
+
+    def _apply_rope(self, x, cos, sin):
+        xf = x.float()
+        even, odd = xf[..., 0::2], xf[..., 1::2]
+        out = torch.empty_like(xf)
+        out[..., 0::2] = even * cos - odd * sin
+        out[..., 1::2] = odd * cos + even * sin
+        return out.to(x.dtype)
+
+    def step(self, x, st):
+        if not self._cached:
+            self._setup_cache()
+        cfg = self.cfg
+        H = cfg.mla_heads
+        pos = st["c_kv"].shape[0]
+        # q projection
+        q = _w4a16_gemv(self.q_proj, x).view(H, cfg.qk_nope + cfg.qk_rope)
+        q_nope = q[:, : cfg.qk_nope]  # [H, qk_nope] bf16
+        q_rope = q[:, cfg.qk_nope :]  # [H, qk_rope] bf16
+        # kv_a projection
+        kv = _w4a16_gemv(self.kv_a, x)
+        c_kv_new = kv[: cfg.kv_lora]
+        k_rope_new = kv[cfg.kv_lora :]
+        # RoPE
+        cos, sin = self._rope_cossin(pos, cfg.qk_rope, cfg.rope_theta, x.device)
+        q_rope = self._apply_rope(q_rope, cos, sin)
+        k_rope_new = self._apply_rope(k_rope_new, cos, sin)
+        # Append to caches
+        st["c_kv"] = torch.cat([st["c_kv"], c_kv_new[None]], 0)
+        st["k_rope"] = torch.cat([st["k_rope"], k_rope_new[None]], 0)
+        c_kv = st["c_kv"]                # [L, kv_lora] bf16
+        k_rope = st["k_rope"]            # [L, qk_rope] bf16
+        # Absorbed attention in bf16 matmuls, fp32 only for the softmax.
+        q_nope_abs = torch.einsum('hd,hkd->hk', q_nope, self.k_b_per_head)  # [H, kv_lora] bf16
+        scores_nope = c_kv @ q_nope_abs.T  # [L, H] bf16
+        scores_rope = q_rope @ k_rope.T    # [H, L] bf16
+        scores = (scores_nope.T + scores_rope)  # [H, L] bf16
+        scores = scores.float() * self.scale  # [H, L] fp32
+        p = torch.softmax(scores, dim=1).to(torch.bfloat16)  # [H, L] bf16
+        z = p @ c_kv  # [H, kv_lora] bf16
+        o = torch.einsum('hk,hkj->hj', z, self.v_b_per_head)  # [H, v_head] bf16
+        return _w4a16_gemv(self.o_proj, o.reshape(H * cfg.v_head))
+
+
+class MoE(nn.Module):
+    def __init__(self, cfg: Config):
+        super().__init__()
+        self.cfg = cfg
+        d, m, E = cfg.hidden, cfg.moe_inter, cfg.n_experts
+        self.router = nn.Linear(d, E, bias=False, dtype=cfg.dtype)
+        self.gate = QuantExperts(E, d, m, cfg.group)
+        self.up = QuantExperts(E, d, m, cfg.group)
+        self.down = QuantExperts(E, m, d, cfg.group)
+        self.s_gate = QuantExperts(cfg.n_shared, d, m, cfg.group)
+        self.s_up = QuantExperts(cfg.n_shared, d, m, cfg.group)
+        self.s_down = QuantExperts(cfg.n_shared, m, d, cfg.group)
+        self._cached = False
+
+    def _setup_cache(self):
+        """Dequant the shared expert + all routed experts once. The shared
+        expert is always used; the routed experts' bf16 weights stay cached
+        so the top-8 gather is just a tensor index."""
+        if self._cached:
+            return
+        # Shared expert (1 expert, small)
+        self.sg_w = _dequant_experts(self.s_gate)[0]  # [d, m]
+        self.su_w = _dequant_experts(self.s_up)[0]    # [d, m]
+        self.sd_w = _dequant_experts(self.s_down)[0]  # [m, d]
+        # Routed experts: dequant all 64 to bf16 and keep around
+        self.g_w = _dequant_experts(self.gate)  # [E, d, m]
+        self.u_w = _dequant_experts(self.up)    # [E, d, m]
+        self.d_w = _dequant_experts(self.down)  # [E, m, d]
+        self._cached = True
+
+    def step(self, x):
+        if not self._cached:
+            self._setup_cache()
+        cfg = self.cfg
+        # Router (router is bf16 nn.Linear; small, fast)
+        probs = torch.softmax(self.router(x).float(), dim=-1)
+        w, idx = torch.topk(probs, cfg.n_active)
+        w = (w / (w.sum() + 1e-9) * cfg.routed_scaling)  # [n_active] fp32
+        # Gather top-8 expert weights (bf16)
+        g_w_sel = self.g_w[idx]  # [n_active, d, m] bf16
+        u_w_sel = self.u_w[idx]  # [n_active, d, m] bf16
+        d_w_sel = self.d_w[idx]  # [n_active, m, d] bf16
+        # bf16 batched matmuls (faster than fp32)
+        g_outs = torch.einsum('d,ndm->nm', x, g_w_sel)  # [n_active, m] bf16
+        u_outs = torch.einsum('d,ndm->nm', x, u_w_sel)  # [n_active, m] bf16
+        h = F.silu(g_outs) * u_outs  # [n_active, m] bf16
+        d_outs = torch.einsum('nm,nmd->nd', h, d_w_sel)  # [n_active, d] bf16
+        # Weighted sum in fp32 for accuracy
+        routed = (w[:, None] * d_outs.float()).sum(0)  # [d] fp32
+        # Shared expert (bf16)
+        sg = F.silu(self.sg_w.T @ x)  # [m] bf16
+        su = self.su_w.T @ x           # [m] bf16
+        sh = sg * su
+        sd = self.sd_w.T @ sh
+        return (routed + sd.float()).to(torch.bfloat16)
+
+
+class Block(nn.Module):
+    def __init__(self, cfg: Config, kind: str):
+        super().__init__()
+        self.kind = kind
+        self.attn_norm = nn.Parameter(torch.ones(cfg.hidden, dtype=cfg.dtype))
+        self.moe_norm = nn.Parameter(torch.ones(cfg.hidden, dtype=cfg.dtype))
+        self.attn = KDA(cfg) if kind == "K" else MLA(cfg)
+        self.moe = MoE(cfg)
+
+    def step(self, x, st):
+        h = x + self.attn.step(_rmsnorm(x, self.attn_norm), st)
+        return h + self.moe.step(_rmsnorm(h, self.moe_norm))
+
+
+class Model(nn.Module):
+    def __init__(self, cfg: Config):
+        super().__init__()
+        self.cfg = cfg
+        self.blocks = nn.ModuleList(Block(cfg, k) for k in cfg.pattern)
+
+    def step(self, hidden, state):
+        for i, blk in enumerate(self.blocks):
+            hidden = blk.step(hidden, state[i])
+        return hidden, state
+
+
+# init_state / init_token must match reference bytes (so we use the exact
+# same generators; no reference import).
+def init_state(cfg: Config, context_len: int, seed: int) -> list:
+    dev = torch.device("cuda:0")
+    g = torch.Generator(device=dev).manual_seed(seed)
+    H, Dk = cfg.kda_heads, cfg.kda_head_dim
+    C = H * Dk
+    state = []
+    for kind in cfg.pattern:
+        if kind == "K":
+            state.append({
+                "S": torch.randn(H, Dk, Dk, device=dev, generator=g) * 0.05,
+                "cq": torch.randn(cfg.short_conv - 1, C, device=dev, generator=g, dtype=cfg.dtype) * 0.1,
+                "ck": torch.randn(cfg.short_conv - 1, C, device=dev, generator=g, dtype=cfg.dtype) * 0.1,
+                "cv": torch.randn(cfg.short_conv - 1, C, device=dev, generator=g, dtype=cfg.dtype) * 0.1,
+            })
+        else:
+            state.append({
+                "c_kv": torch.randn(context_len, cfg.kv_lora, device=dev, generator=g, dtype=cfg.dtype) * 0.1,
+                "k_rope": torch.randn(context_len, cfg.qk_rope, device=dev, generator=g, dtype=cfg.dtype) * 0.1,
+            })
+    return state
+
+
+def init_state_lazy(cfg: Config, context_len: int, seed: int) -> list:
+    """Like init_state, but the MLA cache is a pre-allocated buffer of size
+    max_steps * 2 with a separate length counter, so subsequent steps
+    don't need to torch.cat to append (avoids the 22us cat per step)."""
+    return init_state(cfg, context_len, seed)
+
+
+def init_token(cfg: Config, seed: int) -> torch.Tensor:
+    dev = torch.device("cuda:0")
+    g = torch.Generator(device=dev).manual_seed(seed + 1)
+    return torch.randn(cfg.hidden, device=dev, generator=g, dtype=cfg.dtype) * 0.25

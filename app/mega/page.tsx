@@ -343,7 +343,7 @@ export default function MegaPage() {
                           {r.has_viewer ? (
                             <a
                               className="link-chip"
-                              href={`/runs/${r.run_id}.html#tab-solution`}
+                              href={`/runs/${r.run_id}_solution.py.txt`}
                               title="final megakernel solution"
                             >
                               solution
@@ -358,19 +358,15 @@ export default function MegaPage() {
                       <td>
                         <div className="conversation-cell">
                           <div className="chip-row">
-                            {r.has_viewer ? (
-                              <a
-                                className="link-chip"
-                                href={`/runs/${r.run_id}.html`}
-                                title="full optimization journey transcript"
-                              >
-                                transcript
-                              </a>
-                            ) : (
-                              <span className="link-chip link-chip-muted">
-                                transcript
-                              </span>
-                            )}
+                            <a
+                              className="link-chip"
+                              href={`https://huggingface.co/datasets/Infatoshi/kernelbench-mega-traces/blob/main/${r.run_id}.jsonl`}
+                              target="_blank"
+                              rel="noopener"
+                              title="full agent trace on HuggingFace"
+                            >
+                              trace ↗
+                            </a>
                           </div>
                           <div className="conversation-note">
                             {r.correct
