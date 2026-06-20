@@ -1,4 +1,6 @@
 import Link from "next/link"
+import { GroupedBars } from "./home-charts"
+import { loadMegaChart, loadHardChart } from "@/lib/charts"
 
 const HUGGING_FACE_LOGO =
   "https://huggingface.co/front/assets/huggingface_logo-noborder.svg"
@@ -84,7 +86,27 @@ const benchmarks = [
   },
 ]
 
-export default function HomePage() {
+export default async function HomePage() {
+  const [megaChart, hardChart] = await Promise.all([
+    loadMegaChart(),
+    loadHardChart(),
+  ])
+  const charts: Record<string, React.ReactNode> = {
+    "/mega": (
+      <GroupedBars
+        title="Speedup over reference megakernel"
+        subtitle="Kimi linear-decode megakernel, per model across three NVIDIA GPUs"
+        data={megaChart}
+      />
+    ),
+    "/hard": (
+      <GroupedBars
+        title="Percent of hardware roofline"
+        subtitle="Average across solved problems, relative to each GPU's own roofline"
+        data={hardChart}
+      />
+    ),
+  }
   return (
     <div className="space-y-12">
       <script
@@ -129,6 +151,7 @@ export default function HomePage() {
                 ))}
               </div>
             </Link>
+            {charts[benchmark.href]}
             <div className="benchmark-footer">
               <a
                 href={benchmark.hfHref}
