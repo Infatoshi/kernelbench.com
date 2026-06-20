@@ -51,7 +51,7 @@ echo "[2/3] bootstrap"
 
 echo "[3/3] launch detached sweep (gpu=$GPU_LABEL budget=${BUDGET}s/model)"
 ensure_reachable
-"${S[@]}" "$NAME" "nohup env GPU_LABEL=$GPU_LABEL BUDGET_SECONDS=$BUDGET PROBLEM=$PROBLEM bash ~/mega/scripts/cloud_sweep.sh > ~/mega_sweep.log 2>&1 & echo launched sweep PID \$!"
+"${S[@]}" "$NAME" "nohup env GPU_LABEL=$GPU_LABEL BUDGET_SECONDS=$BUDGET PROBLEM=$PROBLEM ROSTER_OVERRIDE='${ROSTER_OVERRIDE:-}' bash ~/mega/scripts/cloud_sweep.sh > ~/mega_sweep.log 2>&1 & echo launched sweep PID \$!"
 echo "Poll:   ${S[*]} $NAME 'tail -20 ~/mega_sweep.log'"
 echo "Pull:   rsync runs back, then 'uv run python scripts/build_mega_leaderboard.py'"
 echo "Tagged: each run dir gets a 'gpu' marker = $GPU_LABEL"

@@ -1,0 +1,780 @@
+"""Fused W4A16 dequant-GEMV solution for the Kimi-Linear hybrid decode unit.
+
+Beats baseline.py three ways:
+
+1. **Fused int4 dequant-GEMV** (Triton, split-K + fp32 atomic reduction). The int4
+   weights are streamed once; the per-group asymmetric dequant is fused into the
+   dot so the bf16 weight is never materialized. Two kernels: ``w4_gemv`` for the
+   M=1 attention projections and ``w4_gemv_batched`` for the MoE experts (indexes
+   the full expert table directly, no weight gather).
+
+2. **MLA weight absorption.** q is projected into the 512-d latent and attention
+   runs against the compressed ``c_kv`` cache directly, so the [ctx, 8192] KV
+   tensor is never materialized -- the dominant win at long context.
+
+3. **CUDA Graph capture/replay.** Batch-1 decode is dispatch-bound (~90 tiny
+   kernels/step, ~4 us launch each). The whole step is captured into a graph and
+   replayed as one launch. To make the step shape-stable (graphs need fixed
+   shapes/addresses) the MLA KV cache is a *padded* buffer with a length mask and
+   in-place append instead of a growing ``cat``, and all recurrent state is
+   updated in-place on static buffers.
+
+Module / buffer names are identical to reference.py so the reference state_dict
+loads with strict=True.
+"""
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import triton
+import triton.language as tl
+
+EPS = 1.0e-6
+GROUP_SIZE = 128
+OP_TYPE = "kimi_linear_w4a16_decode"
+
+
+@dataclass(frozen=True)
+class Config:
+    hidden: int = 2304
+    kda_heads: int = 32
+    kda_head_dim: int = 128
+    short_conv: int = 4
+    mla_heads: int = 32
+    kv_lora: int = 512
+    qk_nope: int = 128
+    qk_rope: int = 64
+    v_head: int = 128
+    rope_theta: float = 10000.0
+    n_experts: int = 64
+    n_active: int = 8
+    n_shared: int = 1
+    moe_inter: int = 1024
+    routed_scaling: float = 2.446
+    group: int = 128
+    pattern: tuple = ("K", "K", "K", "M")
+    dtype: torch.dtype = field(default=torch.bfloat16)
+
+
+def build_config(shape: dict) -> Config:
+    return Config(n_experts=int(shape.get("n_experts", 64)))
+
+
+# --------------------------------------------------------------------------- #
+# Triton kernels -- fused int4 dequant-GEMV (tl.dot / tensor-core, split-K).
+# Each program owns BLOCK_N output features and strides through K in GROUP-sized
+# chunks; the int4 nibbles are unpacked, per-group dequantized, and dotted with
+# the activation in-register -- the bf16 weight is never materialized. Split-K
+# (round-robin over KS) multiplies block count for batch-1 parallelism; partials
+# reduce via fp32 atomics. tl.dot keeps the issue slots free for memory traffic.
+# --------------------------------------------------------------------------- #
+@triton.jit
+def _w4_gemv_kernel(x_ptr, wq_ptr, s_ptr, z_ptr, y_ptr, K, N,
+                    GROUP: tl.constexpr, PAIRS: tl.constexpr,
+                    BLOCK_N: tl.constexpr, KS: tl.constexpr, TM: tl.constexpr):
+    pid_n = tl.program_id(0)
+    pid_k = tl.program_id(1)
+    cols = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    ngroups = K // GROUP
+    acc = tl.zeros([TM, BLOCK_N], dtype=tl.float32)
+    rm = tl.arange(0, TM)
+    pair_ar = tl.arange(0, PAIRS)
+    for g in range(pid_k, ngroups, KS):
+        k_base = g * GROUP
+        x_even = tl.load(x_ptr + k_base + pair_ar * 2)
+        x_odd = tl.load(x_ptr + k_base + pair_ar * 2 + 1)
+        x_even = tl.where(rm[:, None] < 1, x_even[None, :], 0.0).to(tl.bfloat16)
+        x_odd = tl.where(rm[:, None] < 1, x_odd[None, :], 0.0).to(tl.bfloat16)
+        row_off = (k_base // 2 + pair_ar)[:, None]
+        wq = tl.load(wq_ptr + row_off * N + cols[None, :])      # [PAIRS, BLOCK_N] uint8
+        lo = (wq & 0xF).to(tl.float32)
+        hi = ((wq >> 4) & 0xF).to(tl.float32)
+        s = tl.load(s_ptr + g * N + cols).to(tl.float32)
+        z = tl.load(z_ptr + g * N + cols).to(tl.float32)
+        lo = (lo - z[None, :]) * s[None, :]
+        hi = (hi - z[None, :]) * s[None, :]
+        acc += tl.dot(x_even, lo.to(tl.bfloat16))
+        acc += tl.dot(x_odd, hi.to(tl.bfloat16))
+    tl.atomic_add(y_ptr + cols, tl.sum(acc, axis=0))
+
+
+def _pick_ks(K: int, group: int = GROUP_SIZE) -> int:
+    ng = K // group
+    return max(1, min(8, ng))
+
+
+def w4_gemv(x: torch.Tensor, w_q: torch.Tensor, scales: torch.Tensor,
+            zeros: torch.Tensor, K: int, N: int, group: int = GROUP_SIZE,
+            block_n: int = 64) -> torch.Tensor:
+    """y = x @ dequant(w_q); x is [K] bf16, returns [N] bf16."""
+    ks = _pick_ks(K, group)
+    y = torch.zeros(N, dtype=torch.float32, device=x.device)
+    grid = (triton.cdiv(N, block_n), ks)
+    _w4_gemv_kernel[grid](x, w_q, scales, zeros, y, K, N,
+                          GROUP=group, PAIRS=group // 2, BLOCK_N=block_n, KS=ks, TM=16,
+                          num_warps=4, num_stages=3)
+    return y.to(torch.bfloat16)
+
+
+@triton.jit
+def _w4_gemv_batch_kernel(x_ptr, wq_ptr, s_ptr, z_ptr, idx_ptr, y_ptr,
+                          K, N, stride_xe, stride_ye,
+                          GROUP: tl.constexpr, PAIRS: tl.constexpr,
+                          BLOCK_N: tl.constexpr, KS: tl.constexpr, TM: tl.constexpr):
+    pid_n = tl.program_id(0)
+    pid_k = tl.program_id(1)
+    pid_e = tl.program_id(2)
+    e = tl.load(idx_ptr + pid_e).to(tl.int64)
+    cols = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    ngroups = K // GROUP
+    acc = tl.zeros([TM, BLOCK_N], dtype=tl.float32)
+    rm = tl.arange(0, TM)
+    pair_ar = tl.arange(0, PAIRS)
+    xbase = x_ptr + pid_e * stride_xe
+    wq_base = wq_ptr + e * (K // 2) * N
+    s_base = s_ptr + e * ngroups * N
+    z_base = z_ptr + e * ngroups * N
+    for g in range(pid_k, ngroups, KS):
+        k_base = g * GROUP
+        x_even = tl.load(xbase + k_base + pair_ar * 2)
+        x_odd = tl.load(xbase + k_base + pair_ar * 2 + 1)
+        x_even = tl.where(rm[:, None] < 1, x_even[None, :], 0.0).to(tl.bfloat16)
+        x_odd = tl.where(rm[:, None] < 1, x_odd[None, :], 0.0).to(tl.bfloat16)
+        row_off = (k_base // 2 + pair_ar)[:, None]
+        wq = tl.load(wq_base + row_off * N + cols[None, :])
+        lo = (wq & 0xF).to(tl.float32)
+        hi = ((wq >> 4) & 0xF).to(tl.float32)
+        s = tl.load(s_base + g * N + cols).to(tl.float32)
+        z = tl.load(z_base + g * N + cols).to(tl.float32)
+        lo = (lo - z[None, :]) * s[None, :]
+        hi = (hi - z[None, :]) * s[None, :]
+        acc += tl.dot(x_even, lo.to(tl.bfloat16))
+        acc += tl.dot(x_odd, hi.to(tl.bfloat16))
+    tl.atomic_add((y_ptr + pid_e * stride_ye + cols), tl.sum(acc, axis=0))
+
+
+def w4_gemv_batched(x: torch.Tensor, w_q: torch.Tensor, scales: torch.Tensor,
+                    zeros: torch.Tensor, idx: torch.Tensor, K: int, N: int,
+                    group: int = GROUP_SIZE, block_n: int = 64) -> torch.Tensor:
+    """Batched expert GEMV. x is [K] (shared across selected experts) or
+    [n_sel, K] (per-expert). idx selects experts from the full table (no copy).
+    Returns [n_sel, N] bf16."""
+    n_sel = idx.numel()
+    ks = max(1, min(8, (K // group)))
+    y = torch.zeros((n_sel, N), dtype=torch.float32, device=x.device)
+    stride_xe = 0 if x.dim() == 1 else x.stride(0)
+    grid = (triton.cdiv(N, block_n), ks, n_sel)
+    _w4_gemv_batch_kernel[grid](x, w_q, scales, zeros, idx, y, K, N,
+                                stride_xe, N,
+                                GROUP=group, PAIRS=group // 2, BLOCK_N=block_n, KS=ks, TM=16,
+                                num_warps=4, num_stages=3)
+    return y.to(torch.bfloat16)
+
+
+# --------------------------------------------------------------------------- #
+# quantized layers (same buffer names as reference.py)
+# --------------------------------------------------------------------------- #
+class QuantLinear(nn.Module):
+    def __init__(self, in_f: int, out_f: int, group: int = GROUP_SIZE):
+        super().__init__()
+        self.in_f, self.out_f, self.group = in_f, out_f, group
+        ng = in_f // group
+        self.register_buffer("w_q", torch.zeros(in_f // 2, out_f, dtype=torch.uint8))
+        self.register_buffer("scales", torch.zeros(ng, out_f, dtype=torch.bfloat16))
+        self.register_buffer("zeros", torch.zeros(ng, out_f, dtype=torch.bfloat16))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return w4_gemv(x, self.w_q, self.scales, self.zeros, self.in_f, self.out_f, self.group)
+
+
+class QuantExperts(nn.Module):
+    def __init__(self, n: int, in_f: int, out_f: int, group: int = GROUP_SIZE):
+        super().__init__()
+        self.n, self.in_f, self.out_f, self.group = n, in_f, out_f, group
+        ng = in_f // group
+        self.register_buffer("w_q", torch.zeros(n, in_f // 2, out_f, dtype=torch.uint8))
+        self.register_buffer("scales", torch.zeros(n, ng, out_f, dtype=torch.bfloat16))
+        self.register_buffer("zeros", torch.zeros(n, ng, out_f, dtype=torch.bfloat16))
+
+    def forward_idx(self, x: torch.Tensor, idx: torch.Tensor) -> torch.Tensor:
+        return w4_gemv_batched(x, self.w_q, self.scales, self.zeros, idx,
+                               self.in_f, self.out_f, self.group)
+
+
+# --------------------------------------------------------------------------- #
+# helpers
+# --------------------------------------------------------------------------- #
+@triton.jit
+def _rmsnorm_kernel(x_ptr, w_ptr, o_ptr, N, EPS: tl.constexpr, BLOCK: tl.constexpr):
+    offs = tl.arange(0, BLOCK)
+    mask = offs < N
+    x = tl.load(x_ptr + offs, mask=mask, other=0.0).to(tl.float32)
+    var = tl.sum(x * x, axis=0) / N
+    inv = tl.rsqrt(var + EPS)
+    w = tl.load(w_ptr + offs, mask=mask, other=0.0).to(tl.float32)
+    out = (x * inv * w).to(tl.bfloat16)
+    tl.store(o_ptr + offs, out, mask=mask)
+
+
+def _rmsnorm(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
+    n = x.numel()
+    o = torch.empty(n, dtype=torch.bfloat16, device=x.device)
+    _rmsnorm_kernel[(1,)](x, w, o, n, EPS=EPS, BLOCK=triton.next_power_of_2(n), num_warps=8)
+    return o
+
+
+@triton.jit
+def _kda_recur_kernel(S_ptr, q_ptr, k_ptr, v_ptr, g_ptr, beta_ptr, o_ptr,
+                      H: tl.constexpr, DK: tl.constexpr, BJ: tl.constexpr):
+    pid_h = tl.program_id(0)
+    pid_j = tl.program_id(1)
+    iar = tl.arange(0, DK)
+    js = pid_j * BJ + tl.arange(0, BJ)
+    base = pid_h * DK
+    krow = tl.load(k_ptr + base + iar)              # [DK] f32
+    qrow = tl.load(q_ptr + base + iar)
+    gval = tl.load(g_ptr + base + iar).to(tl.float32)
+    ge = tl.sigmoid(-gval)                            # = exp(-softplus(g))
+    beta = tl.load(beta_ptr + pid_h)
+    soff = pid_h * DK * DK + iar[:, None] * DK + js[None, :]   # [DK, BJ]
+    st = tl.load(S_ptr + soff)                        # [DK, BJ] f32
+    st = st * ge[:, None]
+    pred = tl.sum(st * krow[:, None], axis=0)         # [BJ]
+    vrow = tl.load(v_ptr + base + js)
+    st = st + beta * krow[:, None] * (vrow - pred)[None, :]
+    oj = tl.sum(st * qrow[:, None], axis=0)           # [BJ]
+    tl.store(S_ptr + soff, st)
+    tl.store(o_ptr + base + js, oj)
+
+
+def _kda_recur(S, q, k, v, g, beta, H, Dk):
+    """Fused gated-delta recurrence: update S in-place, return o [H*Dk] f32.
+    q,k,v,g are [H*Dk] (g raw pre-softplus); beta is [H]."""
+    o = torch.empty(H * Dk, dtype=torch.float32, device=S.device)
+    BJ = 32
+    _kda_recur_kernel[(H, Dk // BJ)](S, q, k, v, g, beta, o, H=H, DK=Dk, BJ=BJ, num_warps=4)
+    return o
+
+
+@triton.jit
+def _short_conv_kernel(val_ptr, prev_ptr, cw_ptr, out_ptr, prev_out_ptr, C: tl.constexpr,
+                       K: tl.constexpr, BLOCK_C: tl.constexpr):
+    pid = tl.program_id(0)
+    cs = pid * BLOCK_C + tl.arange(0, BLOCK_C)
+    # window rows 0..K-1: rows 0..K-2 from prev, row K-1 = val
+    acc = tl.zeros([BLOCK_C], dtype=tl.float32)
+    for t in range(K):
+        if t < K - 1:
+            w = tl.load(prev_ptr + t * C + cs)
+        else:
+            w = tl.load(val_ptr + cs)
+        cw = tl.load(cw_ptr + cs * K + t).to(tl.float32)
+        acc += w.to(tl.float32) * cw
+    out = tl.sigmoid(acc) * acc                       # silu
+    tl.store(out_ptr + cs, out.to(tl.bfloat16))
+    # roll prev: new_prev[t] = old prev[t+1] for t in 0..K-3, new_prev[K-2] = val
+    for t in range(K - 1):
+        if t < K - 2:
+            v = tl.load(prev_ptr + (t + 1) * C + cs)
+        else:
+            v = tl.load(val_ptr + cs)
+        tl.store(prev_out_ptr + t * C + cs, v)
+
+
+def _short_conv_fused(val, prev_buf, conv_w_idx, C, K=4):
+    """val [C] bf16, prev_buf [K-1, C] bf16 (updated in place via prev_out),
+    conv_w_idx [C, K] fp32. Returns silu(conv) [C] bf16."""
+    out = torch.empty(C, dtype=torch.bfloat16, device=val.device)
+    BLOCK_C = 256
+    _short_conv_kernel[(triton.cdiv(C, BLOCK_C),)](
+        val, prev_buf, conv_w_idx, out, prev_buf, C=C, K=K, BLOCK_C=BLOCK_C, num_warps=4)
+    return out
+
+
+@triton.jit
+def _silu_mul_kernel(g_ptr, u_ptr, o_ptr, D, BD: tl.constexpr):
+    pid_m = tl.program_id(0)
+    pid_d = tl.program_id(1)
+    offs = pid_d * BD + tl.arange(0, BD)
+    base = pid_m * D + offs
+    g = tl.load(g_ptr + base).to(tl.float32)
+    u = tl.load(u_ptr + base).to(tl.float32)
+    r = (g * tl.sigmoid(g)) * u
+    tl.store(o_ptr + base, r.to(tl.bfloat16))
+
+
+def silu_mul(g: torch.Tensor, u: torch.Tensor) -> torch.Tensor:
+    """out[k,m] = silu(g)*u, bf16. Inputs bf16 [k,m]."""
+    k, m = g.shape
+    o = torch.empty_like(g)
+    BD = 256
+    _silu_mul_kernel[(k, triton.cdiv(m, BD))](g, u, o, m, BD=BD, num_warps=4)
+    return o
+
+
+@triton.jit
+def _wsum_kernel(d_ptr, w_ptr, o_ptr, D, K: tl.constexpr, BD: tl.constexpr):
+    pid = tl.program_id(0)
+    offs = pid * BD + tl.arange(0, BD)
+    acc = tl.zeros([BD], dtype=tl.float32)
+    for k in range(K):
+        dk = tl.load(d_ptr + k * D + offs).to(tl.float32)
+        wk = tl.load(w_ptr + k)
+        acc += wk * dk
+    tl.store(o_ptr + offs, acc.to(tl.bfloat16))
+
+
+def weighted_sum(d_r: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
+    """out[d] = sum_k w[k]*d_r[k,d]. d_r bf16 [k,d], w fp32 [k]."""
+    k, d = d_r.shape
+    o = torch.empty(d, dtype=torch.bfloat16, device=d_r.device)
+    BD = 256
+    _wsum_kernel[(triton.cdiv(d, BD),)](d_r, w, o, d, K=k, BD=BD, num_warps=4)
+    return o
+
+
+@triton.jit
+def _rope_kernel(x_ptr, cos_ptr, sin_ptr, o_ptr, NPAIRS,
+                 HALF: tl.constexpr, BP: tl.constexpr):
+    pid = tl.program_id(0)
+    pids = pid * BP + tl.arange(0, BP)
+    mask = pids < NPAIRS
+    row = pids // HALF
+    loc = pids % HALF
+    e0 = row * (2 * HALF) + 2 * loc
+    e1 = e0 + 1
+    x0 = tl.load(x_ptr + e0, mask=mask, other=0.0).to(tl.float32)
+    x1 = tl.load(x_ptr + e1, mask=mask, other=0.0).to(tl.float32)
+    c = tl.load(cos_ptr + loc, mask=mask, other=0.0)
+    s = tl.load(sin_ptr + loc, mask=mask, other=0.0)
+    tl.store(o_ptr + e0, (x0 * c - x1 * s).to(tl.bfloat16), mask=mask)
+    tl.store(o_ptr + e1, (x1 * c + x0 * s).to(tl.bfloat16), mask=mask)
+
+
+def apply_rope_fused(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+    """Fused RoPE on x [..., D] (D = qk_rope). Returns bf16."""
+    D = x.shape[-1]
+    half = D // 2
+    npairs = x.numel() // 2
+    o = torch.empty_like(x)
+    BP = 128
+    _rope_kernel[(triton.cdiv(npairs, BP),)](x, cos, sin, o, npairs, HALF=half, BP=BP, num_warps=2)
+    return o
+
+
+def _rmsnorm_eager(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
+    xf = x.float()
+    xf = xf * torch.rsqrt(xf.pow(2).mean(-1, keepdim=True) + EPS)
+    return (xf * w.float()).to(x.dtype)
+
+
+def _rope_cossin(pos, dim: int, theta: float, device):
+    inv = 1.0 / (theta ** (torch.arange(0, dim, 2, device=device, dtype=torch.float32) / dim))
+    ang = pos * inv
+    return torch.cos(ang), torch.sin(ang)
+
+
+def _apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+    xf = x.float()
+    even, odd = xf[..., 0::2], xf[..., 1::2]
+    out = torch.empty_like(xf)
+    out[..., 0::2] = even * cos - odd * sin
+    out[..., 1::2] = odd * cos + even * sin
+    return out.to(x.dtype)
+
+
+def _dequant_full(ql: QuantLinear) -> torch.Tensor:
+    """Materialize full bf16 weight (only used for the small kv_b)."""
+    K = ql.in_f
+    wu = torch.empty((K, ql.out_f), dtype=torch.uint8, device=ql.w_q.device)
+    wu[0::2] = ql.w_q & 0xF
+    wu[1::2] = (ql.w_q >> 4) & 0xF
+    s = ql.scales.repeat_interleave(ql.group, dim=0)
+    z = ql.zeros.repeat_interleave(ql.group, dim=0)
+    return (wu.to(torch.bfloat16) - z) * s
+
+
+# --------------------------------------------------------------------------- #
+# layers
+# --------------------------------------------------------------------------- #
+class KDA(nn.Module):
+    def __init__(self, cfg: Config):
+        super().__init__()
+        self.cfg = cfg
+        H, Dk, d = cfg.kda_heads, cfg.kda_head_dim, cfg.hidden
+        self.q_proj = QuantLinear(d, H * Dk, cfg.group)
+        self.k_proj = QuantLinear(d, H * Dk, cfg.group)
+        self.v_proj = QuantLinear(d, H * Dk, cfg.group)
+        self.g_proj = QuantLinear(d, H * Dk, cfg.group)
+        self.beta_proj = nn.Linear(d, H, bias=False, dtype=cfg.dtype)
+        self.conv_w = nn.Parameter(torch.empty(3, H * Dk, cfg.short_conv, dtype=cfg.dtype))
+        self.o_proj = QuantLinear(H * Dk, d, cfg.group)
+        self.scale = Dk ** -0.5
+        self._qkvg = None       # fused q/k/v/g weight table (lazy, post-load)
+        self._qkvg_idx = None
+
+    def _fuse_qkvg(self):
+        if self._qkvg is None or self._qkvg[0].device != self.q_proj.w_q.device:
+            wq = torch.stack([self.q_proj.w_q, self.k_proj.w_q,
+                              self.v_proj.w_q, self.g_proj.w_q], dim=0).contiguous()
+            s = torch.stack([self.q_proj.scales, self.k_proj.scales,
+                             self.v_proj.scales, self.g_proj.scales], dim=0).contiguous()
+            z = torch.stack([self.q_proj.zeros, self.k_proj.zeros,
+                             self.v_proj.zeros, self.g_proj.zeros], dim=0).contiguous()
+            self._qkvg = (wq, s, z)
+            self._qkvg_idx = torch.arange(4, device=wq.device)
+        return self._qkvg
+
+    def _short_conv_ip(self, val, prev_buf, idx):
+        # in-place rolling conv window (graph-safe: prev_buf updated via copy_)
+        win = torch.cat([prev_buf, val[None]], dim=0)
+        w = self.conv_w[idx].float().transpose(0, 1)
+        out = F.silu((win.float() * w).sum(0)).to(val.dtype)
+        prev_buf.copy_(win[1:])
+        return out
+
+    def step_static(self, x, b):
+        H, Dk = self.cfg.kda_heads, self.cfg.kda_head_dim
+        d = self.cfg.hidden
+        C = H * Dk
+        wq, s, z = self._fuse_qkvg()
+        qkvg = w4_gemv_batched(x, wq, s, z, self._qkvg_idx, d, C)        # [4, C] bf16
+        q = _short_conv_fused(qkvg[0], b["cq"], self.conv_w[0], C)
+        k = _short_conv_fused(qkvg[1], b["ck"], self.conv_w[1], C)
+        v = _short_conv_fused(qkvg[2], b["cv"], self.conv_w[2], C)
+        qf = (q.view(H, Dk).float() * self.scale).reshape(-1)
+        kf = k.view(H, Dk).float().reshape(-1)
+        vf = v.view(H, Dk).float().reshape(-1)
+        beta = torch.sigmoid(self.beta_proj(x).float())                  # [H]
+        o = _kda_recur(b["S"], qf, kf, vf, qkvg[3].reshape(-1), beta, H, Dk)
+        return self.o_proj(o.reshape(H * Dk).to(torch.bfloat16))
+
+    # eager path (kept for safety / non-graph use)
+    def step(self, x, st):
+        H, Dk = self.cfg.kda_heads, self.cfg.kda_head_dim
+        q = self.q_proj(x)
+        k = self.k_proj(x)
+        v = self.v_proj(x)
+        q, st["cq"] = self._short_conv_ip(q, st["cq"].clone(), 0)
+        k, st["ck"] = self._short_conv_ip(k, st["ck"].clone(), 1)
+        v, st["cv"] = self._short_conv_ip(v, st["cv"].clone(), 2)
+        q = q.view(H, Dk).float() * self.scale
+        k = k.view(H, Dk).float()
+        v = v.view(H, Dk).float()
+        g = (-F.softplus(self.g_proj(x).float())).view(H, Dk)
+        beta = torch.sigmoid(self.beta_proj(x).float())
+        S = st["S"].clone() * g.exp()[:, :, None]
+        pred = (S * k[:, :, None]).sum(1)
+        S = S + beta[:, None, None] * k[:, :, None] * (v - pred)[:, None, :]
+        o = (S * q[:, :, None]).sum(1)
+        st["S"] = S
+        return self.o_proj(o.reshape(H * Dk).to(torch.bfloat16))
+
+
+class MLA(nn.Module):
+    def __init__(self, cfg: Config):
+        super().__init__()
+        self.cfg = cfg
+        H, d = cfg.mla_heads, cfg.hidden
+        self.q_proj = QuantLinear(d, H * (cfg.qk_nope + cfg.qk_rope), cfg.group)
+        self.kv_a = QuantLinear(d, cfg.kv_lora + cfg.qk_rope, cfg.group)
+        self.kv_b = QuantLinear(cfg.kv_lora, H * (cfg.qk_nope + cfg.v_head), cfg.group)
+        self.o_proj = QuantLinear(H * cfg.v_head, d, cfg.group)
+        self.scale = (cfg.qk_nope + cfg.qk_rope) ** -0.5
+        self._kv_b_bf = None
+        self._W_nope = None
+        self._W_v = None
+        self._arange = None
+
+    def _kv_b_split(self):
+        if self._W_nope is None or self._W_nope.device != self.kv_b.w_q.device:
+            Wkv = _dequant_full(self.kv_b).float().view(self.cfg.kv_lora, self.cfg.mla_heads,
+                                                        self.cfg.qk_nope + self.cfg.v_head)
+            self._W_nope = Wkv[:, :, :self.cfg.qk_nope].contiguous()
+            self._W_v = Wkv[:, :, self.cfg.qk_nope:].contiguous()
+        return self._W_nope, self._W_v
+
+    def step_static(self, x, b):
+        cfg = self.cfg
+        H = cfg.mla_heads
+        pad = b["c_kv"]          # [CAP, 512] bf16, padded
+        krop = b["k_rope"]       # [CAP, 64]
+        seq = b["seq"]           # [1] int64, current length = new token position
+        pos = seq[0]
+        q = self.q_proj(x).view(H, cfg.qk_nope + cfg.qk_rope)
+        q_nope = q[:, :cfg.qk_nope].float()
+        q_rope = q[:, cfg.qk_nope:]
+        kv = self.kv_a(x)
+        c_new = kv[:cfg.kv_lora]
+        kr_new = kv[cfg.kv_lora:]
+        cos, sin = _rope_cossin(pos, cfg.qk_rope, cfg.rope_theta, x.device)
+        q_rope = apply_rope_fused(q_rope, cos, sin).float()
+        kr_new = apply_rope_fused(kr_new, cos, sin)
+        # in-place append into padded cache
+        pad.index_copy_(0, seq, c_new[None])
+        krop.index_copy_(0, seq, kr_new[None])
+        seq.add_(1)
+
+        W_nope, W_v = self._kv_b_split()
+        ckv = pad.float()                                   # [CAP, 512]
+        qabs = torch.einsum("hd,ihd->hi", q_nope, W_nope)   # [H, 512]
+        # scores laid out [H, CAP] so softmax reduces along the contiguous dim
+        score_nope = torch.einsum("hi,ci->hc", qabs, ckv)   # [H, CAP]
+        score_rope = torch.einsum("hd,cd->hc", q_rope, krop.float())
+        scores = (score_nope + score_rope) * self.scale
+        if self._arange is None or self._arange.shape[0] != pad.shape[0]:
+            self._arange = torch.arange(pad.shape[0], device=x.device)
+        valid = (self._arange < seq)                        # [CAP]
+        scores = scores.masked_fill(~valid[None, :], float("-inf"))
+        p = torch.softmax(scores, dim=1)                    # [H, CAP]
+        u = torch.einsum("hc,ci->hi", p, ckv)              # [H, 512]
+        o = torch.einsum("hi,ihd->hd", u, W_v)             # [H, 128]
+        return self.o_proj(o.reshape(H * cfg.v_head).to(torch.bfloat16))
+
+    def step(self, x, st):
+        # eager fallback (non-padded), kept for safety
+        cfg = self.cfg
+        H = cfg.mla_heads
+        pos = st["c_kv"].shape[0]
+        q = self.q_proj(x).view(H, cfg.qk_nope + cfg.qk_rope)
+        q_nope = q[:, :cfg.qk_nope].float()
+        q_rope = q[:, cfg.qk_nope:]
+        kv = self.kv_a(x)
+        c_kv = kv[:cfg.kv_lora]
+        k_rope = kv[cfg.kv_lora:]
+        cos, sin = _rope_cossin(pos, cfg.qk_rope, cfg.rope_theta, x.device)
+        q_rope = _apply_rope(q_rope, cos, sin).float()
+        k_rope = _apply_rope(k_rope, cos, sin)
+        st["c_kv"] = torch.cat([st["c_kv"], c_kv[None]], 0)
+        st["k_rope"] = torch.cat([st["k_rope"], k_rope[None]], 0)
+        W_nope, W_v = self._kv_b_split()
+        ckv = st["c_kv"].float()
+        qabs = torch.einsum("hd,ihd->hi", q_nope, W_nope)
+        score_nope = torch.einsum("lc,hc->lh", ckv, qabs)
+        score_rope = torch.einsum("hd,ld->lh", q_rope, st["k_rope"].float())
+        scores = (score_nope + score_rope) * self.scale
+        p = torch.softmax(scores, dim=0)
+        u = torch.einsum("lh,li->hi", p, ckv)
+        o = torch.einsum("hi,ihd->hd", u, W_v)
+        return self.o_proj(o.reshape(H * cfg.v_head).to(torch.bfloat16))
+
+
+class MoE(nn.Module):
+    def __init__(self, cfg: Config):
+        super().__init__()
+        self.cfg = cfg
+        d, m, E = cfg.hidden, cfg.moe_inter, cfg.n_experts
+        self.router = nn.Linear(d, E, bias=False, dtype=cfg.dtype)
+        self.gate = QuantExperts(E, d, m, cfg.group)
+        self.up = QuantExperts(E, d, m, cfg.group)
+        self.down = QuantExperts(E, m, d, cfg.group)
+        self.s_gate = QuantExperts(cfg.n_shared, d, m, cfg.group)
+        self.s_up = QuantExperts(cfg.n_shared, d, m, cfg.group)
+        self.s_down = QuantExperts(cfg.n_shared, m, d, cfg.group)
+        self._sidx = None
+        self._gu = None           # fused routed gate+up table [2E, ...]
+        self._sgu = None          # fused shared gate+up table [2*n_shared, ...]
+
+    def _fuse(self):
+        if self._gu is None or self._gu[0].device != self.gate.w_q.device:
+            self._gu = (torch.cat([self.gate.w_q, self.up.w_q], 0).contiguous(),
+                        torch.cat([self.gate.scales, self.up.scales], 0).contiguous(),
+                        torch.cat([self.gate.zeros, self.up.zeros], 0).contiguous())
+            self._sgu = (torch.cat([self.s_gate.w_q, self.s_up.w_q], 0).contiguous(),
+                         torch.cat([self.s_gate.scales, self.s_up.scales], 0).contiguous(),
+                         torch.cat([self.s_gate.zeros, self.s_up.zeros], 0).contiguous())
+            self._sidx = torch.arange(self.cfg.n_shared, device=self.gate.w_q.device)
+        return self._gu
+
+    def step(self, x):
+        cfg = self.cfg
+        d, m, E = cfg.hidden, cfg.moe_inter, cfg.n_experts
+        gu_wq, gu_s, gu_z = self._fuse()
+        probs = torch.softmax(self.router(x).float(), dim=-1)
+        w, idx = torch.topk(probs, cfg.n_active)
+        w = w / (w.sum() + 1e-9) * cfg.routed_scaling
+        k = cfg.n_active
+        # routed: fused gate+up (shared activation x)
+        idx_gu = torch.cat([idx, idx + E], 0)
+        gu = w4_gemv_batched(x, gu_wq, gu_s, gu_z, idx_gu, d, m)   # [2k, m] bf16
+        hh = silu_mul(gu[:k], gu[k:])                              # [k, m] bf16
+        d_r = self.down.forward_idx(hh, idx)                       # [k, d] bf16
+        out = weighted_sum(d_r, w)                                 # [d] bf16
+        # shared expert (fused gate+up)
+        sgu_wq, sgu_s, sgu_z = self._sgu
+        sidx_gu = torch.cat([self._sidx, self._sidx + cfg.n_shared], 0)
+        sgu = w4_gemv_batched(x, sgu_wq, sgu_s, sgu_z, sidx_gu, d, m)  # [2*ns, m]
+        sh = silu_mul(sgu[:cfg.n_shared], sgu[cfg.n_shared:])
+        sd = self.s_down.forward_idx(sh, self._sidx)               # [ns, d]
+        out = out + sd.sum(0)
+        return out
+
+
+class Block(nn.Module):
+    def __init__(self, cfg: Config, kind: str):
+        super().__init__()
+        self.kind = kind
+        self.attn_norm = nn.Parameter(torch.ones(cfg.hidden, dtype=cfg.dtype))
+        self.moe_norm = nn.Parameter(torch.ones(cfg.hidden, dtype=cfg.dtype))
+        self.attn = KDA(cfg) if kind == "K" else MLA(cfg)
+        self.moe = MoE(cfg)
+
+    def step_static(self, x, b):
+        h = x + self.attn.step_static(_rmsnorm(x, self.attn_norm), b)
+        return h + self.moe.step(_rmsnorm(h, self.moe_norm))
+
+    def step(self, x, st):
+        h = x + self.attn.step(_rmsnorm(x, self.attn_norm), st)
+        return h + self.moe.step(_rmsnorm(h, self.moe_norm))
+
+
+class Model(nn.Module):
+    def __init__(self, cfg: Config):
+        super().__init__()
+        self.cfg = cfg
+        self.blocks = nn.ModuleList(Block(cfg, k) for k in cfg.pattern)
+        self._mla_idx = cfg.pattern.index("M")
+        self._MARGIN = 128
+        # graph / static-buffer state (lazy)
+        self._h = None
+        self._bufs = None
+        self._cap = None
+        self._graph = None
+        self._py_seq = 0
+
+    # -- static buffer management ------------------------------------------- #
+    def _dev(self):
+        return self.blocks[0].attn_norm.device
+
+    def _alloc_kda(self):
+        dev = self._dev()
+        cfg = self.cfg
+        H, Dk, C = cfg.kda_heads, cfg.kda_head_dim, cfg.kda_heads * cfg.kda_head_dim
+        bufs = []
+        for kind in cfg.pattern:
+            if kind == "K":
+                bufs.append({
+                    "S": torch.zeros(H, Dk, Dk, device=dev, dtype=torch.float32),
+                    "cq": torch.zeros(cfg.short_conv - 1, C, device=dev, dtype=cfg.dtype),
+                    "ck": torch.zeros(cfg.short_conv - 1, C, device=dev, dtype=cfg.dtype),
+                    "cv": torch.zeros(cfg.short_conv - 1, C, device=dev, dtype=cfg.dtype),
+                })
+            else:
+                bufs.append(None)   # MLA allocated when ctx is known
+        return bufs
+
+    def _prime(self, hidden, state):
+        dev = self._dev()
+        cfg = self.cfg
+        mla = self._mla_idx
+        ctx = state[mla]["c_kv"].shape[0]
+        need_cap = ctx + self._MARGIN
+        if self._h is None or self._h.device != dev:
+            self._h = torch.zeros(cfg.hidden, device=dev, dtype=cfg.dtype)
+        if self._bufs is None:
+            self._bufs = self._alloc_kda()
+        if self._cap is None or need_cap > self._cap:
+            self._cap = need_cap
+            cap = self._cap
+            self._bufs[mla] = {
+                "c_kv": torch.zeros(cap, cfg.kv_lora, device=dev, dtype=cfg.dtype),
+                "k_rope": torch.zeros(cap, cfg.qk_rope, device=dev, dtype=cfg.dtype),
+                "seq": torch.zeros(1, device=dev, dtype=torch.int64),
+            }
+            self._graph = None   # shape changed -> recapture
+        # copy hidden + KDA state
+        self._h.copy_(hidden)
+        for i, kind in enumerate(cfg.pattern):
+            if kind == "K":
+                self._bufs[i]["S"].copy_(state[i]["S"].to(torch.float32))
+                self._bufs[i]["cq"].copy_(state[i]["cq"])
+                self._bufs[i]["ck"].copy_(state[i]["ck"])
+                self._bufs[i]["cv"].copy_(state[i]["cv"])
+        # copy MLA cache into padded buffer
+        mbuf = self._bufs[mla]
+        cap = self._cap
+        mbuf["c_kv"][:ctx].copy_(state[mla]["c_kv"])
+        mbuf["c_kv"][ctx:cap].zero_()
+        mbuf["k_rope"][:ctx].copy_(state[mla]["k_rope"])
+        mbuf["k_rope"][ctx:cap].zero_()
+        mbuf["seq"].fill_(ctx)
+        self._py_seq = ctx
+
+    def _step_static(self):
+        h = self._h
+        for i, blk in enumerate(self.blocks):
+            h = blk.step_static(h, self._bufs[i])
+        self._h.copy_(h)
+
+    def _capture(self):
+        s = torch.cuda.Stream()
+        s.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(s):
+            for _ in range(3):
+                self._step_static()
+        torch.cuda.current_stream().wait_stream(s)
+        g = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g):
+            self._step_static()
+        self._graph = g
+
+    def _is_mine(self, state):
+        try:
+            return state[self._mla_idx]["c_kv"].data_ptr() == self._bufs[self._mla_idx]["c_kv"].data_ptr()
+        except Exception:
+            return False
+
+    def step(self, hidden, state):
+        mine = self._bufs is not None and self._is_mine(state) and hidden.data_ptr() == self._h.data_ptr()
+        if not mine:
+            self._prime(hidden, state)
+            if self._graph is None:
+                self._prime(hidden, state)   # reset after warmup mutation
+                self._capture()
+                self._prime(hidden, state)   # restore initial state for first real replay
+        self._graph.replay()
+        self._py_seq += 1
+        return self._h, self._make_state()
+
+    def _make_state(self):
+        out = []
+        for i, kind in enumerate(self.cfg.pattern):
+            if kind == "K":
+                b = self._bufs[i]
+                out.append({"S": b["S"], "cq": b["cq"], "ck": b["ck"], "cv": b["cv"]})
+            else:
+                b = self._bufs[i]
+                n = self._py_seq
+                out.append({"c_kv": b["c_kv"][:n], "k_rope": b["k_rope"][:n]})
+        return out
+
+
+def init_state(cfg: Config, context_len: int, seed: int) -> list:
+    dev = torch.device("cuda:0")
+    g = torch.Generator(device=dev).manual_seed(seed)
+    H, Dk = cfg.kda_heads, cfg.kda_head_dim
+    C = H * Dk
+    state = []
+    for kind in cfg.pattern:
+        if kind == "K":
+            state.append({
+                "S": torch.randn(H, Dk, Dk, device=dev, generator=g) * 0.05,
+                "cq": torch.randn(cfg.short_conv - 1, C, device=dev, generator=g, dtype=cfg.dtype) * 0.1,
+                "ck": torch.randn(cfg.short_conv - 1, C, device=dev, generator=g, dtype=cfg.dtype) * 0.1,
+                "cv": torch.randn(cfg.short_conv - 1, C, device=dev, generator=g, dtype=cfg.dtype) * 0.1,
+            })
+        else:
+            state.append({
+                "c_kv": torch.randn(context_len, cfg.kv_lora, device=dev, generator=g, dtype=cfg.dtype) * 0.1,
+                "k_rope": torch.randn(context_len, cfg.qk_rope, device=dev, generator=g, dtype=cfg.dtype) * 0.1,
+            })
+    return state
+
+
+def init_token(cfg: Config, seed: int) -> torch.Tensor:
+    dev = torch.device("cuda:0")
+    g = torch.Generator(device=dev).manual_seed(seed + 1)
+    return torch.randn(cfg.hidden, device=dev, generator=g, dtype=cfg.dtype) * 0.25
