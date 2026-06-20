@@ -137,20 +137,16 @@ const SHORT_NAMES: Record<string, string> = {
   "claude-fable-5": "Fable 5",
 }
 
-async function readOutTokens(runsRel: string, runId: string): Promise<number> {
-  try {
-    const r = JSON.parse(
-      await readFile(join(REPO_ROOT, runsRel, runId, "result.json"), "utf-8"),
-    )
-    return r?.usage?.output_tokens ?? 0
-  } catch {
-    return 0
-  }
-}
+// Hard GPUs shown on the efficiency chart. RTX + B200 have clean per-model token
+// telemetry (fresh runs / re-extracted). H100 is omitted: its resweep hit a
+// disk-full failure so its opus tokens are truncated, which would misrender as
+// fake hyper-efficiency. RTX 3090 is unpublished. Re-add H100 after a clean re-run.
+const HARD_EFF_GPUS = ["RTX PRO 6000", "B200"]
 
-// Performance vs compute (output tokens), per GPU. A GPU appears for a benchmark
-// only if >=2 of its models have clean token telemetry (>1000 output tokens),
-// so partial/truncated-telemetry GPUs are dropped rather than shown misleadingly.
+// Performance vs compute (output tokens), per GPU. Hard tokens are read from the
+// committed leaderboard cells (output_tokens baked in by inject_tokens.py) so the
+// chart works on Vercel, where outputs/runs is gitignored. A GPU appears only if
+// >=2 of its models have clean token telemetry (>1000 output tokens).
 export async function loadEfficiency(): Promise<{ mega: EffByGpu; hard: EffByGpu }> {
   // Mega: speedup vs output tokens, grouped by GPU.
   const csv = await readFile(join(REPO_ROOT, "public/data/mega/results.csv"), "utf-8")
@@ -170,9 +166,10 @@ export async function loadEfficiency(): Promise<{ mega: EffByGpu; hard: EffByGpu
     ;(megaPts[gpu] ??= []).push({ label: name, x: tok, y: parseFloat(f[ix("score")]), frontier: false })
   }
 
-  // Hard: avg roofline % vs total output tokens, per GPU.
+  // Hard: avg roofline % vs total output tokens, per GPU. Tokens come from the
+  // committed leaderboard cell (output_tokens), not the gitignored runs archive.
   const hardPts: Record<string, EffPoint[]> = {}
-  for (const gpu of EFF_GPU_ORDER) {
+  for (const gpu of HARD_EFF_GPUS) {
     const src = HARD_SRC[gpu]
     let lb
     try {
@@ -189,7 +186,7 @@ export async function loadEfficiency(): Promise<{ mega: EffByGpu; hard: EffByGpu
       for (const c of Object.values(m.results)) {
         if (!c.correct || c.peak_fraction == null) continue
         pfs.push(c.peak_fraction)
-        tok += await readOutTokens(src.runs, c.run_id)
+        tok += c.output_tokens ?? 0
       }
       if (pfs.length && tok > 1000) {
         pts.push({ label: name, x: tok, y: (pfs.reduce((a, b) => a + b, 0) / pfs.length) * 100, frontier: false })
@@ -198,9 +195,15 @@ export async function loadEfficiency(): Promise<{ mega: EffByGpu; hard: EffByGpu
     hardPts[gpu] = pts
   }
 
-  const pack = (byGpu: Record<string, EffPoint[]>, ySuffix: string, yDecimals: number, yLabel: string): EffByGpu => {
+  const pack = (
+    byGpu: Record<string, EffPoint[]>,
+    order: string[],
+    ySuffix: string,
+    yDecimals: number,
+    yLabel: string,
+  ): EffByGpu => {
     const out: EffByGpu = {}
-    for (const gpu of EFF_GPU_ORDER) {
+    for (const gpu of order) {
       const pts = byGpu[gpu]
       if (pts && pts.length >= 2) out[gpu] = { points: markFrontier(pts), ySuffix, yDecimals, yLabel }
     }
@@ -208,8 +211,8 @@ export async function loadEfficiency(): Promise<{ mega: EffByGpu; hard: EffByGpu
   }
 
   return {
-    mega: pack(megaPts, "x", 1, "speedup over reference"),
-    hard: pack(hardPts, "%", 0, "percent of hardware roofline"),
+    mega: pack(megaPts, EFF_GPU_ORDER, "x", 1, "speedup over reference"),
+    hard: pack(hardPts, HARD_EFF_GPUS, "%", 0, "percent of hardware roofline"),
   }
 }
 

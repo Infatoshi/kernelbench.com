@@ -15,6 +15,7 @@ export type Cell = {
   retryable_infra_failure?: boolean | null
   minimum_useful_output_tokens?: number | null
   peak_fraction: number | null
+  output_tokens?: number | null
   elapsed_seconds?: number | null
   total_elapsed_seconds?: number | null
   check_elapsed_seconds?: number | null
