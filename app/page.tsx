@@ -95,14 +95,14 @@ export default async function HomePage() {
     "/mega": (
       <GroupedBars
         title="Speedup over reference megakernel"
-        subtitle="Kimi linear-decode megakernel, per model across three NVIDIA GPUs"
+        subtitle="Kimi linear-decode megakernel, per model. Pick a GPU."
         data={megaChart}
       />
     ),
     "/hard": (
       <GroupedBars
         title="Percent of hardware roofline"
-        subtitle="Average across solved problems, relative to each GPU's own roofline"
+        subtitle="Average across solved problems, relative to the GPU's own roofline. Pick a GPU."
         data={hardChart}
       />
     ),

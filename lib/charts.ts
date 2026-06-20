@@ -32,7 +32,8 @@ export type ChartData = {
   series: { key: string; color: string }[]
   groups: ChartGroup[]
   max: number
-  format: (v: number) => string
+  suffix: string
+  decimals: number
 }
 
 const MEGA_GPU_LABEL: Record<string, string> = {
@@ -58,7 +59,7 @@ export async function loadMegaChart(): Promise<ChartData> {
     if (!gpu) continue
     ;(cell[model] ??= {})[gpu] = parseFloat(f[idx("score")])
   }
-  return assemble(cell, (v) => `${v.toFixed(1)}x`)
+  return assemble(cell, "x", 1)
 }
 
 export async function loadHardChart(): Promise<ChartData> {
@@ -79,12 +80,13 @@ export async function loadHardChart(): Promise<ChartData> {
       }
     }
   }
-  return assemble(cell, (v) => `${v.toFixed(0)}%`)
+  return assemble(cell, "%", 0)
 }
 
 function assemble(
   cell: Record<string, Record<string, number>>,
-  fmt: (v: number) => string,
+  suffix: string,
+  decimals: number,
 ): ChartData {
   const series = GPU_SERIES
   const models = Object.keys(MODEL_NAMES).filter((m) => cell[m])
@@ -103,5 +105,5 @@ function assemble(
     })
     return { label: MODEL_NAMES[m], values }
   })
-  return { series, groups, max, format: fmt }
+  return { series, groups, max, suffix, decimals }
 }
