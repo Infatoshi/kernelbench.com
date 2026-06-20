@@ -20,25 +20,32 @@ const citationGraph = {
         "Open agentic GPU kernel benchmark results, run transcripts, source repositories, and datasets.",
       citation: [
         "https://github.com/Infatoshi/kernelbench.com",
-        "https://github.com/Infatoshi/kernelbench.com/tree/master/benchmarks/v3",
+        "https://github.com/Infatoshi/kernelbench.com/tree/master/benchmarks/mega",
         "https://github.com/Infatoshi/kernelbench.com/tree/master/benchmarks/hard",
-        "https://huggingface.co/datasets/Infatoshi/kernelbench-v3-runs",
-        "https://huggingface.co/datasets/Infatoshi/kernelbench-hard-runs",
+        "https://huggingface.co/datasets/Infatoshi/kernelbench-mega-traces",
+        "https://huggingface.co/datasets/Infatoshi/kernelbench-hard-traces",
       ],
     },
     {
       "@type": "Dataset",
-      "@id": "https://huggingface.co/datasets/Infatoshi/kernelbench-hard-runs",
-      name: "KernelBench-Hard run artifacts",
-      url: "https://huggingface.co/datasets/Infatoshi/kernelbench-hard-runs",
+      "@id": "https://huggingface.co/datasets/Infatoshi/kernelbench-mega-traces",
+      name: "KernelBench-Mega agent traces",
+      url: "https://huggingface.co/datasets/Infatoshi/kernelbench-mega-traces",
       creator: { "@type": "Person", name: "Elliot Arledge" },
     },
     {
       "@type": "Dataset",
-      "@id": "https://huggingface.co/datasets/Infatoshi/kernelbench-v3-runs",
-      name: "KernelBench-v3 run artifacts",
-      url: "https://huggingface.co/datasets/Infatoshi/kernelbench-v3-runs",
+      "@id": "https://huggingface.co/datasets/Infatoshi/kernelbench-hard-traces",
+      name: "KernelBench-Hard agent traces",
+      url: "https://huggingface.co/datasets/Infatoshi/kernelbench-hard-traces",
       creator: { "@type": "Person", name: "Elliot Arledge" },
+    },
+    {
+      "@type": "SoftwareSourceCode",
+      "@id": "https://github.com/Infatoshi/kernelbench.com/tree/master/benchmarks/mega",
+      name: "Mega result suite repository",
+      codeRepository: "https://github.com/Infatoshi/kernelbench.com/tree/master/benchmarks/mega",
+      author: { "@type": "Person", name: "Elliot Arledge" },
     },
     {
       "@type": "SoftwareSourceCode",
@@ -47,41 +54,33 @@ const citationGraph = {
       codeRepository: "https://github.com/Infatoshi/kernelbench.com/tree/master/benchmarks/hard",
       author: { "@type": "Person", name: "Elliot Arledge" },
     },
-    {
-      "@type": "SoftwareSourceCode",
-      "@id": "https://github.com/Infatoshi/kernelbench.com/tree/master/benchmarks/v3",
-      name: "v3 result suite repository",
-      codeRepository: "https://github.com/Infatoshi/kernelbench.com/tree/master/benchmarks/v3",
-      author: { "@type": "Person", name: "Elliot Arledge" },
-    },
   ],
 }
 
 const benchmarks = [
   {
+    href: "/mega",
+    title: "Mega",
+    description:
+      "Full GPU megakernel build (W4A16 linear decode), 8 frontier models across Blackwell / H100 / B200, scored as speedup over the reference. Contamination-audited in a sandboxed harness.",
+    stats: [
+      ["problem", "megakernel"],
+      ["models", "8"],
+      ["GPUs", "3"],
+    ],
+    hfHref: "https://huggingface.co/datasets/Infatoshi/kernelbench-mega-traces",
+  },
+  {
     href: "/hard",
     title: "Hard",
     description:
-      "Small hard CUDA deck, curated frontier-model comparison, single Blackwell SM120, clickable transcript viewers for scored runs.",
+      "Curated hard CUDA/Triton deck, frontier-model comparison across RTX PRO 6000 Blackwell, H100 PCIe, and B200, roofline-graded with per-run agent traces.",
     stats: [
       ["problems", "6"],
-      ["models", "13"],
-      ["GPU", "SM120"],
-    ],
-    hfHref: "https://huggingface.co/datasets/Infatoshi/kernelbench-hard-runs",
-  },
-  {
-    href: "/v3",
-    title: "v3",
-    description:
-      "43-58 problems per GPU, 10 models, RTX 3090, H100, B200, four difficulty levels, and a custom v3 agent loop.",
-    stats: [
-      ["problems", "43-58"],
+      ["models", "8"],
       ["GPUs", "3"],
-      ["models", "10"],
-      ["evaluations", "1500+"],
     ],
-    hfHref: "https://huggingface.co/datasets/Infatoshi/kernelbench-v3-runs",
+    hfHref: "https://huggingface.co/datasets/Infatoshi/kernelbench-hard-traces",
   },
 ]
 
@@ -178,14 +177,14 @@ export default function HomePage() {
             <Link href="/runs" className="underlined-link">
               the run index
             </Link>{" "}
-            or open{" "}
+            or open the{" "}
             <Link
-              href="/runs/20260601_124343_minimax-claude_MiniMax-M3_07_w4a16_gemm.html"
+              href="https://huggingface.co/datasets/Infatoshi/kernelbench-hard-traces"
               className="underlined-link"
             >
-              a scored Hard run
+              Hard agent traces on Hugging Face
             </Link>{" "}
-            to inspect tool calls, solution files, checks, timing, and costs.
+            to inspect tool calls, reasoning, solution files, and timing.
           </Bullet>
           <Bullet>
             <strong className="text-[var(--color-fg-bright)]">
@@ -221,20 +220,20 @@ export default function HomePage() {
             label="Website repository"
           />
           <ArtifactLink
+            href="https://github.com/Infatoshi/kernelbench.com/tree/master/benchmarks/mega"
+            label="Mega repository"
+          />
+          <ArtifactLink
             href="https://github.com/Infatoshi/kernelbench.com/tree/master/benchmarks/hard"
             label="Hard repository"
           />
           <ArtifactLink
-            href="https://github.com/Infatoshi/kernelbench.com/tree/master/benchmarks/v3"
-            label="v3 repository"
+            href="https://huggingface.co/datasets/Infatoshi/kernelbench-mega-traces"
+            label="Mega HF traces"
           />
           <ArtifactLink
-            href="https://huggingface.co/datasets/Infatoshi/kernelbench-hard-runs"
-            label="Hard HF dataset"
-          />
-          <ArtifactLink
-            href="https://huggingface.co/datasets/Infatoshi/kernelbench-v3-runs"
-            label="v3 HF dataset"
+            href="https://huggingface.co/datasets/Infatoshi/kernelbench-hard-traces"
+            label="Hard HF traces"
           />
         </div>
 
@@ -255,30 +254,30 @@ export default function HomePage() {
   note         = {CUDA benchmark suite, harness, results, and annotations}
 }
 
-@misc{arledge2026v3,
-  title        = {v3: Multi-GPU Agentic Kernel Result Suite},
+@misc{arledge2026mega,
+  title        = {Mega: Agentic GPU Megakernel Result Suite},
   author       = {Arledge, Elliot},
   year         = {2026},
-  howpublished = {\\url{https://github.com/Infatoshi/kernelbench.com/tree/master/benchmarks/v3}},
-  note         = {Multi-GPU benchmark suite, harness, and result artifacts}
+  howpublished = {\\url{https://github.com/Infatoshi/kernelbench.com/tree/master/benchmarks/mega}},
+  note         = {Megakernel benchmark suite, sandboxed harness, and result artifacts}
 }
 
-@misc{arledge2026hardruns,
-  title        = {KernelBench-Hard Run Artifacts},
+@misc{arledge2026hardtraces,
+  title        = {KernelBench-Hard Agent Traces},
   author       = {Arledge, Elliot},
   year         = {2026},
   publisher    = {Hugging Face},
-  howpublished = {\\url{https://huggingface.co/datasets/Infatoshi/kernelbench-hard-runs}},
-  note         = {Run transcripts, solutions, checks, timing, and cost metadata}
+  howpublished = {\\url{https://huggingface.co/datasets/Infatoshi/kernelbench-hard-traces}},
+  note         = {Per-run agent transcripts: messages, tool calls, reasoning}
 }
 
-@misc{arledge2026v3runs,
-  title        = {KernelBench-v3 Run Artifacts},
+@misc{arledge2026megatraces,
+  title        = {KernelBench-Mega Agent Traces},
   author       = {Arledge, Elliot},
   year         = {2026},
   publisher    = {Hugging Face},
-  howpublished = {\\url{https://huggingface.co/datasets/Infatoshi/kernelbench-v3-runs}},
-  note         = {Run artifacts and benchmark result data}
+  howpublished = {\\url{https://huggingface.co/datasets/Infatoshi/kernelbench-mega-traces}},
+  note         = {Per-run agent transcripts for the megakernel suite}
 }`}
         </pre>
       </section>
