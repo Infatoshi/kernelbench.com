@@ -11,6 +11,8 @@ from collections import defaultdict
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
+# Per-GPU builds point this at outputs/runs-<gpu> so we never move dirs around.
+RUNS_DIR = Path(os.environ.get("KBH_RUNS_DIR") or (ROOT / "outputs/runs"))
 from src.hardware import get as get_hw  # noqa: E402
 
 # Per-GPU target selects the published hardware block. Default RTX_PRO_6000
@@ -63,7 +65,7 @@ def _contaminated(run_dir, rid):
                 return True
     return False
 
-for rj in glob.glob(str(ROOT/"outputs/runs/2026*/result.json")):
+for rj in glob.glob(str(RUNS_DIR/"2026*/result.json")):
     rid = os.path.basename(os.path.dirname(rj))
     if rid[:8] < V2_EPOCH: continue
     try: r = json.load(open(rj))
