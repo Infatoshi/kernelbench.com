@@ -137,11 +137,11 @@ const SHORT_NAMES: Record<string, string> = {
   "claude-fable-5": "Fable 5",
 }
 
-// Hard GPUs shown on the efficiency chart. RTX + B200 have clean per-model token
-// telemetry (fresh runs / re-extracted). H100 is omitted: its resweep hit a
-// disk-full failure so its opus tokens are truncated, which would misrender as
-// fake hyper-efficiency. RTX 3090 is unpublished. Re-add H100 after a clean re-run.
-const HARD_EFF_GPUS = ["RTX PRO 6000", "B200"]
+// Hard GPUs shown on the efficiency chart, all with clean per-model token
+// telemetry: RTX (re-extracted), B200 + H100 (fresh resweeps with caches on
+// /ephemeral and parallel=3/budget=12000 so sessions complete). RTX 3090 is
+// unpublished. The 50k token floor below drops any stale/truncated artifacts.
+const HARD_EFF_GPUS = ["RTX PRO 6000", "H100", "B200"]
 
 // Performance vs compute (output tokens), per GPU. Hard tokens are read from the
 // committed leaderboard cells (output_tokens baked in by inject_tokens.py) so the
@@ -188,7 +188,11 @@ export async function loadEfficiency(): Promise<{ mega: EffByGpu; hard: EffByGpu
         pfs.push(c.peak_fraction)
         tok += c.output_tokens ?? 0
       }
-      if (pfs.length && tok > 1000) {
+      // 50k floor: a model that genuinely solved hard kernels spent >>50k tokens
+      // across the deck. Anything less is a stale/truncated-telemetry artifact
+      // (e.g. pre-fix runs that never emitted a result event) — exclude it so the
+      // frontier isn't distorted by fake hyper-efficiency points.
+      if (pfs.length && tok > 50000) {
         pts.push({ label: name, x: tok, y: (pfs.reduce((a, b) => a + b, 0) / pfs.length) * 100, frontier: false })
       }
     }
