@@ -213,7 +213,10 @@ def extract(run_dir: Path, harness: str) -> dict:
             events = _read_jsonl(run_dir / "transcript.jsonl")
         return _codex(events)
     transcript = _read_jsonl(run_dir / "transcript.jsonl")
-    if harness in ("claude", "zai-claude", "minimax-claude", "ccr-claude", "kimi"):
+    # Match the -claude suffix so every Claude-Code-routed provider
+    # (zai/minimax/kimi/deepseek/qwen-claude, ccr-claude) is covered, not just a
+    # hardcoded list that silently drops new routes (e.g. deepseek-claude) to null.
+    if harness == "claude" or harness == "kimi" or harness.endswith("-claude"):
         return _claude_or_kimi(transcript)
     if harness == "droid":
         return _droid(transcript)
