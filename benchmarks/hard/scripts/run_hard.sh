@@ -927,6 +927,7 @@ run_opencode_container() {
         -e DEEPSEEK_API_KEY
         -e MINIMAX_API_KEY
         -e GEMINI_API_KEY
+        -e SAKANA_API_KEY
         -e CUDA_HOME=/usr/local/cuda-host
         -e UV_CACHE_DIR=/uv-cache
         -e UV_PYTHON_INSTALL_DIR=/uv-cache/python
