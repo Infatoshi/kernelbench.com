@@ -45,14 +45,37 @@ ax.axhline(1.0, color=C["fg_dim"], lw=1, ls="--")
 ax.text(len(traj), 1.005, "hardware roofline (1.0)", color=C["fg_muted"],
         fontsize=10, ha="right", va="bottom")
 
-ax.plot(x, traj, color=C["accent"], lw=2.4, marker="o", markersize=7,
+ax.plot(x, traj, color=C["accent"], lw=2.4, marker="o", markersize=6,
         markerfacecolor=C["accent"], markeredgecolor=C["bg"], zorder=3)
 
-# annotate first + final
-ax.annotate(f"{traj[0]:.2f}", (x[0], traj[0]), textcoords="offset points",
-            xytext=(8, -14), color=C["fg_muted"], fontsize=10)
-ax.annotate(f"{final:.3f}", (x[-1], final), textcoords="offset points",
-            xytext=(8, 6), color=C["accent"], fontsize=13, fontweight="bold")
+# Major optimization milestones, keyed by the peak_fraction value the agent
+# measured right after each change (from the run transcript). (value, label, label_y)
+MILESTONES = [
+    (0.2550, "Baseline Triton fp8 tl.dot kernel", 0.50),
+    (0.3409, "128-aligned K padding\n(was padding K to 8192)", 0.66),
+    (0.3737, "Per-shape autotuned\ntile / warp configs", 0.80),
+    (0.3869, "Cached weight packing\n+ output-buffer reuse", 0.92),
+    (0.3941, "CUDA graph on skinny shape\n(kills launch overhead)", 0.60),
+]
+for val, label, ly in MILESTONES:
+    # first step that reached this value
+    idx = next((i for i, v in enumerate(traj) if abs(v - val) < 1e-4), None)
+    if idx is None:
+        continue
+    px, py = x[idx], traj[idx]
+    lx = px + (1.2 if px < len(traj) * 0.7 else -1.2)
+    ha = "left" if px < len(traj) * 0.7 else "right"
+    ax.annotate(
+        label, xy=(px, py), xytext=(lx, ly), ha=ha, va="center",
+        color=C["fg_bright"], fontsize=10.5,
+        arrowprops=dict(arrowstyle="-", color=C["fg_dim"], lw=0.9,
+                        connectionstyle="arc3,rad=0.0"),
+    )
+    ax.scatter([px], [py], s=95, facecolor="none", edgecolor=C["accent"],
+               linewidths=1.6, zorder=4)
+    ax.annotate(f"{val:.3f}", (px, py), textcoords="offset points",
+                xytext=(0, -15), ha="center", color=C["accent"], fontsize=9.5,
+                fontweight="bold")
 
 ax.set_xlim(0.5, len(traj) + 1.5)
 ax.set_ylim(0, 1.06)
