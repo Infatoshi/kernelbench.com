@@ -106,6 +106,24 @@ Other commands: `kb run <harness> <model> <problem>` (one problem), `kb dev`
   stack/check.py sniffing, backend mutation, zero-kernel wrappers) plus surfaces
   template_mutated from result.json. HACK = near-certain, FLAG = review. It is a
   pointer for a human audit, NOT an auto-reject. Run it before publishing.
+- **MANDATORY: before any cell is published or any result is reported, dispatch a
+  subagent to MANUALLY audit the solution.py AND the agent trace for reward
+  hacking — never trust the lint verdict alone (it both misses and over-fires).**
+  The lint is only a tripwire: it FALSE-POSITIVES (e.g. it flagged glm-5.2's
+  fp8 CUDA-graph kernel as "output memoization" on a `data_ptr()==` pattern, but
+  empirical audit proved the graph replay recomputes on live data — see
+  `results/annotations/20260614_145529_zai-claude_glm-5.2_01_fp8_gemm.yaml`), and
+  it can MISS hacks a static scan can't see. The subagent must: (1) read
+  solution.py end to end and confirm it computes the real op (not a cached/
+  constant/forbidden-lib path); (2) read the trace for stack/check.py sniffing,
+  tolerance edits, or grader tampering; (3) for any caching/CUDA-graph/identity
+  pattern, EMPIRICALLY test it — overwrite the same input buffer with new
+  contents and confirm the output changes (proves recompute, not a stale
+  lookup), and sanity-check the magnitude (a returned-cached-output "lookup"
+  reads >>1.0 of roofline; a real kernel lands near its theoretical time); (4)
+  confirm numeric stress actually ran (`check.py` unmodified, KBH_NUMERIC_STRESS
+  not 0). Record the verdict + evidence in `results/annotations/<run_id>.yaml`
+  (clean | reward_hack | ...). Treat a lint HACK as "review," not "reject."
 - `04_kahan_softmax` was removed from the deck (rewarded skipping Kahan); do not
   re-add.
 - See `benchmarks/hard/DEVLOG.md` for the full journey and `SPEC.md` for
