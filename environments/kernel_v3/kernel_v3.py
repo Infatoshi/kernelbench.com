@@ -14,9 +14,12 @@ Design (settled with user):
 
 CPU-import-safe: torch / v3 eval are imported lazily inside the reward, never at module top.
 
-TODO(vendoring): For Hub publishing, v3's eval (src/eval), sandbox (src/agent/local_sandbox.py,
-modal_sandbox.py), config (src/config) and the problems/ tree must be VENDORED into this env dir
-(and listed in [tool.hatch.build].include). Today we import v3 by adding V3_ROOT to sys.path.
+SELF-CONTAINED (option 1): v3's eval (src/eval), sandbox (src/agent), config (src/config) and
+the problems/ tree are VENDORED into this env dir at `_v3/` (listed in [tool.hatch.build].include).
+We add the vendored `_v3/` dir to sys.path so the original `from src.config...` / `from src.eval...`
+imports resolve against the vendored copy. The reward runs via the ENV's own python+torch: the
+vendored LocalSandbox.run_command rewrites bare `python` to sys.executable so GPU subprocesses use
+this venv's torch (no benchmark uv env, no checkout). torch + benchmark deps are in pyproject.
 TODO(modal): sandbox="modal" path is stubbed -- wire src/agent/modal_sandbox.py (Modal B200) for
 the Hub/remote-GPU path; today only sandbox="local" is implemented.
 """
@@ -32,12 +35,13 @@ import verifiers as vf
 from datasets import Dataset
 
 # ---------------------------------------------------------------------------
-# v3 location. Override with KERNEL_V3_ROOT. Default = anvil checkout path.
-# (Hub-publishing must vendor v3 into this dir; see module docstring TODO.)
+# v3 location: the VENDORED copy bundled in this env dir (`_v3/`). Self-contained;
+# NO checkout dependency. (`KERNEL_V3_ROOT` can still override for local dev, but
+# the default is the vendored dir and nothing falls back to a repo checkout.)
 # ---------------------------------------------------------------------------
 V3_ROOT = os.environ.get(
     "KERNEL_V3_ROOT",
-    os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "benchmarks", "v3")),
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "_v3"),
 )
 
 # v3's gpu_sku for the local Blackwell box is "RTX_PRO_6000", but

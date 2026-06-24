@@ -27,9 +27,9 @@ log(){ echo "[$(date -Is)] $*" | tee -a "$DLOG"; }
 
 # Deck: "harness model effort parallel"  (safe providers first, throttled last)
 declare -a DECK=(
-  "claude claude-opus-4-8 _ 6"
+  "claude claude-opus-4-8 _ 3"
   "codex gpt-5.5 xhigh 6"
-  "gemini gemini-3.5-flash _ 6"
+  "gemini gemini-3.5-flash _ 3"
   "zai-claude glm-5.2 _ 3"
   "kimi-claude kimi-k2.7-code _ 3"
   "minimax-claude MiniMax-M3 _ 3"

@@ -45,6 +45,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 from pathlib import Path
 from typing import Any
@@ -116,7 +117,14 @@ def problem_dir(ws: str, problem: str) -> Path:
 
 
 def run_native(ws: str, problem: str, script: str, timeout_s: int) -> tuple[int, str]:
-    """Run the problem's own check.py / benchmark.py in the benchmark uv env."""
+    """Run the problem's own check.py / benchmark.py with THIS env's interpreter.
+
+    Self-contained (option 1): we use `sys.executable` (the env venv python, which
+    has torch + the benchmark deps from this env's pyproject) instead of the
+    benchmark's `uv run python`. check.py/benchmark.py self-insert the workspace's
+    `src/` (their `parents[2]`) onto sys.path, so the vendored harness resolves
+    with no benchmark uv env and no checkout dependency.
+    """
     pdir = problem_dir(ws, problem)
     env = dict(os.environ)
     env.setdefault("CUDA_HOME", "/usr/local/cuda-13")
@@ -125,7 +133,7 @@ def run_native(ws: str, problem: str, script: str, timeout_s: int) -> tuple[int,
         env["PATH"] = cuda_bin + ":" + env.get("PATH", "")
     try:
         proc = subprocess.run(
-            ["uv", "run", "python", script],
+            [sys.executable, script],
             cwd=str(pdir),
             env=env,
             capture_output=True,

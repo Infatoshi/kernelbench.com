@@ -12,12 +12,13 @@ problem deck differs. Both wrap `kernel_native_harness.build_environment`; this
 module just binds `bench_root` to the hard checkout.
 
 CPU-import-safe: torch/CUDA only run inside the native check.py/benchmark.py
-SUBPROCESS (the benchmark's own uv env), never in this module's interpreter.
+SUBPROCESS, never in this module's interpreter.
 
-TODO(vendoring): for Hub publishing, vendor benchmarks/hard's `src/` and
-`problems/` (+ pyproject/uv.lock) into this env dir and list them in
-[tool.hatch.build].include; today we point at the anvil checkout via
-KERNEL_HARD_ROOT.
+SELF-CONTAINED (option 1): benchmarks/hard's `src/` and `problems/` are VENDORED
+into this env dir at `_bench/` (listed in [tool.hatch.build]). The native scoring
+subprocess runs check.py/benchmark.py with the ENV's own interpreter (sys.executable
+in kernel_native_harness.run_native; torch + benchmark deps declared in this env's
+pyproject), NOT the benchmark's `uv run python`. No checkout dependency.
 """
 
 from __future__ import annotations
@@ -30,7 +31,7 @@ import kernel_native_harness as knh
 
 HARD_ROOT = os.environ.get(
     "KERNEL_HARD_ROOT",
-    os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "benchmarks", "hard")),
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "_bench"),
 )
 
 

@@ -16,11 +16,13 @@ report raw peak_fraction > 1 (dense-FLOPS/bytes formula overcounts skipped
 work); the reward CLAMPS to [0,1] (raw value kept as `raw_peak_fraction`).
 
 CPU-import-safe: torch/CUDA only run inside the native check.py/benchmark.py
-SUBPROCESS (the benchmark's own uv env).
+SUBPROCESS, never in this module's interpreter.
 
-TODO(vendoring): for Hub publishing, vendor benchmarks/mega's `src/` and
-`problems/` (+ pyproject/uv.lock) into this env dir; today we point at the anvil
-checkout via KERNEL_MEGA_ROOT.
+SELF-CONTAINED (option 1): benchmarks/mega's `src/` and `problems/` are VENDORED
+into this env dir at `_bench/` (listed in [tool.hatch.build]). The native scoring
+subprocess runs check.py/benchmark.py with the ENV's own interpreter (sys.executable
+in kernel_native_harness.run_native; torch + benchmark deps declared in this env's
+pyproject), NOT the benchmark's `uv run python`. No checkout dependency.
 """
 
 from __future__ import annotations
@@ -33,7 +35,7 @@ import kernel_native_harness as knh
 
 MEGA_ROOT = os.environ.get(
     "KERNEL_MEGA_ROOT",
-    os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "benchmarks", "mega")),
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "_bench"),
 )
 
 
