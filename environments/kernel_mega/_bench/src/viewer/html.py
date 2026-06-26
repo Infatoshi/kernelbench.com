@@ -501,12 +501,8 @@ _HARNESS_LABELS = {
 }
 
 _PROBLEM_LABELS = {
-    "01_fp8_gemm": "FP8 GEMM",
-    "02_kda_cutlass": "KimiDeltaAttention CUTLASS",
-    "03_paged_attention": "Paged Attention",
-    "05_topk_bitonic": "TopK Bitonic",
-    "06_sonic_moe_swiglu": "Sonic MoE SwiGLU",
-    "07_w4a16_gemm": "W4A16 GEMM",
+    "01_rl_grid_ppo": "Grid-Foraging PPO Megakernel",
+    "02_kimi_linear_decode": "Kimi-Linear W4A16 Decode",
 }
 
 
@@ -672,13 +668,13 @@ def render(run_dir: Path, session: Session, out_path: Path | None = None) -> Pat
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>{_esc(title)} — KernelBench-Hard</title>
+  <title>{_esc(title)} — KernelBench-Mega</title>
   {PRISM_HEAD}
   <style>{CSS}</style>
 </head>
 <body>
   <header>
-    <div class="crumb"><a href="/hard">&larr; KernelBench-Hard</a></div>
+    <div class="crumb"><a href="/mega">&larr; KernelBench-Mega</a></div>
     <div class="title">
       <span class="harness">{_esc(harness)}</span>
       <span class="sep">/</span>

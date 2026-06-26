@@ -1,12 +1,12 @@
 """kernel_mega: verifiers/Prime-RL environment wrapping the NATIVE KernelBench-Mega
 agentic harness (`anvil:~/kernelbench.com/benchmarks/mega`).
 
-Full MEGAKERNEL deck (Qwen3-0.6B decode-block megakernel, Kimi-Linear decode,
-RL-grid PPO, ... plus operation-level problems shared with Hard). Per the Mega
-README it uses the SAME native-harness, transcript, and roofline machinery as
-KernelBench-Hard; only the `problems/` deck differs. So this module is the
-SIBLING of kernel_hard: both wrap `kernel_native_harness.build_environment`;
-this one binds `bench_root` to the mega checkout.
+Two-problem MEGAKERNEL deck: `01_rl_grid_ppo` (PufferLib-style grid-foraging PPO
+training megakernel) and `02_kimi_linear_decode` (Kimi-Linear W4A16 decode
+megakernel). KernelBench-Mega is its own benchmark, separate from
+KernelBench-Hard. It reuses this repo's native-harness, transcript, and roofline
+machinery (the shared `kernel_native_harness.build_environment` core), binding
+`bench_root` to the mega checkout.
 
 The model iterates in a persistent workspace with the native tools
 (write_solution -> run_check -> run_benchmark); reward = the native benchmark's
@@ -61,7 +61,7 @@ def load_environment(
         bench_root: KernelBench-Mega checkout (default $KERNEL_MEGA_ROOT or repo-relative).
         hardware: gpu_sku for the roofline (default RTX_PRO_6000 / sm_120).
         deck: optional explicit list of problem dir names; default = all problems.
-            e.g. deck=["01_qwen3_decode_block"] for just the active megakernel.
+            e.g. deck=["02_kimi_linear_decode"] for just the published megakernel.
         eval_frac: deterministic hash-based held-out eval split (disjoint from train).
         max_turns: max agentic turns (write/check/benchmark iterations).
         check_timeout_s / bench_timeout_s: per-script subprocess timeouts (megakernels are slow).

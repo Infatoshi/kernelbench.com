@@ -3,7 +3,7 @@
 `kernel_mega` today runs the native harness locally as a multi-turn ToolEnv (the policy iterates with
 write_solution/run_check/run_benchmark over a shared workspace). This TODO is the alternative
 EXECUTION mode that closes the cross-run contamination hole, folded in from the former standalone
-`kernelbench_decode` env (which was just mega problem `03_kimi_linear_decode` wrapped separately).
+`kernelbench_decode` env (which was just mega problem `02_kimi_linear_decode` wrapped separately).
 
 ## Why (the contamination finding)
 KernelBench's old harness has no filesystem sandbox: an eval agent gets bash + absolute paths and can

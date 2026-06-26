@@ -1,10 +1,10 @@
 # kernel_mega
 
 Verifiers / Prime-RL environment that **wraps the native KernelBench-Mega agentic harness**
-(`anvil:~/kernelbench.com/benchmarks/mega`). Per the Mega README it uses the **same
-native-harness, transcript, and roofline machinery as KernelBench-Hard**; only the `problems/`
-deck differs. So this env is the **sibling of kernel_hard** and shares `kernel_native_harness.py`
-verbatim — it just binds `bench_root` to the mega checkout.
+(`anvil:~/kernelbench.com/benchmarks/mega`). KernelBench-Mega is its **own benchmark**, separate
+from KernelBench-Hard. It reuses the shared native-harness, transcript, and roofline machinery
+(`kernel_native_harness.py`) — binding `bench_root` to the mega checkout — but ships its own
+two-problem megakernel deck.
 
 It does **not** reimplement eval: the reward replicates the native `scripts/run_hard.sh` scoring
 contract — workspace (`src/` at `parents[2]` + template files + `solution.py`), native `check.py`
@@ -12,10 +12,10 @@ contract — workspace (`src/` at `parents[2]` + template files + `solution.py`)
 
 ## Task / deck
 
-Full **megakernel** deck: `01_qwen3_decode_block` (Qwen3-0.6B B=1 decode-block megakernel — whole-block
-fusion: GQA attention + RoPE + RMSNorm + SwiGLU MLP), `02_rl_grid_ppo`, `03_kimi_linear_decode`,
-plus operation-level problems shared with Hard. Pass `deck=["01_qwen3_decode_block"]` for just the
-active megakernel.
+Two **megakernel** problems: `01_rl_grid_ppo` (PufferLib-style grid-foraging PPO training
+megakernel — fused env step + rollout + PPO update) and `02_kimi_linear_decode` (Kimi-Linear
+W4A16 decode megakernel — whole-block fused decode, W4A16 dequant, linear-attention state update).
+Pass `deck=["02_kimi_linear_decode"]` for just the published megakernel.
 
 Megakernel problems are `regime: memory` (peak_fraction off the HBM-bandwidth roofline) and can
 report **raw peak_fraction > 1** (the dense-FLOPS/bytes formula overcounts work the kernel
@@ -52,7 +52,7 @@ computed at the end from the workspace's final `solution.py` via the same native
 |---|---|---|
 | `bench_root` | `$KERNEL_MEGA_ROOT` or repo-relative `benchmarks/mega` | KernelBench-Mega checkout |
 | `hardware` | `"RTX_PRO_6000"` | gpu_sku for the roofline (sm_120) |
-| `deck` | `None` (all) | explicit list of problem dir names (e.g. `["01_qwen3_decode_block"]`) |
+| `deck` | `None` (all) | explicit list of problem dir names (e.g. `["02_kimi_linear_decode"]`) |
 | `eval_frac` | `0.2` | deterministic hash-based held-out eval split |
 | `max_turns` | `12` | max agentic turns |
 | `check_timeout_s` / `bench_timeout_s` | `900` / `1200` | per-script subprocess timeouts (megakernels are slow) |
@@ -69,13 +69,14 @@ not used for training, cap `max_concurrent`.
 ## Validation (anvil, RTX PRO 6000 / sm_120)
 
 - GATE 1: `load_environment()` builds; dataset = the mega deck (problem count printed at validation).
-- GATE 2: a known-good `02_rl_grid_ppo` solution from `benchmarks/mega/outputs` → **correct=True,
-  peak_fraction≈0.32** via the env's reward path. (Megakernel `03_kimi_linear_decode` solutions score
+- GATE 2: a known-good `01_rl_grid_ppo` solution from `benchmarks/mega/outputs` → **correct=True,
+  peak_fraction≈0.32** via the env's reward path. (Megakernel `02_kimi_linear_decode` solutions score
   correct=True but raw_peak_fraction > 1 → reward clamps to 1.0.)
 - GATE 3: multi-turn loop wired — `StatefulToolEnv` exposes `write_solution`/`run_check`/`run_benchmark`
   over one persistent workspace.
 
-## TODO
+## Vendoring
 
-- **Vendoring** for standalone Hub publishing: vendor `benchmarks/mega`'s `src/` + `problems/`
-  into this dir. Today points at the anvil checkout via `KERNEL_MEGA_ROOT`.
+Self-contained for Hub publishing: `benchmarks/mega`'s `src/` + `problems/` are vendored into
+`_bench/` (the default `KERNEL_MEGA_ROOT`). Override `KERNEL_MEGA_ROOT` to point at a live
+`benchmarks/mega` checkout instead.
