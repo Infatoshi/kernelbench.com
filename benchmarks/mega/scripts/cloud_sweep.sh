@@ -10,7 +10,7 @@
 # benchmark timings stay clean (one benchmark.py on the GPU at a time). Each run
 # is tagged with GPU_LABEL via its own archive path (no newest-dir race).
 #
-# Roster = the KernelBench-Hard field (minus Fable 5, retired). Override with
+# Roster = the KernelBench-Mega field (minus Fable 5, retired). Override with
 # ROSTER_OVERRIDE="harness|model|effort;harness|model|effort".
 set -uo pipefail
 export PATH="$HOME/.local/bin:$PATH"
@@ -18,7 +18,7 @@ cd "$(dirname "$0")/.." || exit 1
 
 GPU_LABEL="${GPU_LABEL:-unknown-gpu}"
 BUDGET_SECONDS="${BUDGET_SECONDS:-10800}"
-PROBLEM="${PROBLEM:-problems/03_kimi_linear_decode}"
+PROBLEM="${PROBLEM:-problems/02_kimi_linear_decode}"
 # shellcheck disable=SC1090
 source ~/.env_vars 2>/dev/null || true
 

@@ -1,8 +1,8 @@
 # KernelBench-Mega
 
-Megakernel-focused GPU benchmark scaffold. KernelBench-Mega uses the same native-harness, transcript, and roofline machinery as KernelBench-Hard, but starts with one full megakernel problem instead of the old operation-level Hard deck.
+Megakernel-focused GPU benchmark scaffold. KernelBench-Mega uses the same native-harness, transcript, and roofline machinery as KernelBench-Hard, but its deck is full fused megakernels instead of the old operation-level Hard deck.
 
-The first problem is a MegaQwen-style Qwen3-0.6B batch=1 decode-block megakernel on the RTX PRO 6000 Blackwell workstation.
+The deck is two megakernel problems: a PufferLib-style grid-foraging PPO training megakernel and a Kimi-Linear W4A16 decode megakernel. The live, GPU-scored board (`/mega`) is the Kimi-Linear decode problem.
 
 ## PR policy
 
@@ -12,9 +12,10 @@ This repository is published for transparency: it documents the exact prompts, h
 
 | # | Problem | Hardware | What it tests |
 |---|---------|----------|---------------|
-| 01 | Qwen3-0.6B decode block megakernel | RTX PRO 6000 (SM120) | Whole-block fusion, B=1 decode, seq-len-scaled GQA attention, RoPE, RMSNorm, SwiGLU MLP, cooperative scheduling |
+| 01 | Grid-foraging PPO training megakernel | RTX PRO 6000 (SM120) | PufferLib-style vectorized GPU RL: fused env step + rollout + PPO update in one kernel |
+| 03 | Kimi-Linear W4A16 decode megakernel | RTX PRO 6000 (SM120) | Whole-block fused decode, W4A16 dequant, linear-attention state update, seq-len sweep |
 
-Historical KernelBench-Hard-derived problem directories may still exist in this repo while the scaffold is being converted. They are not part of the active KernelBench-Mega deck unless listed above or included by the sweep scripts.
+The Kimi-Linear decode problem (`03`) is the published, GPU-scored board (3 GPUs x ~9 models, see `/mega`). Problem `01` (PPO) has reference/check/prompt in place but no published board yet.
 
 ## Hardware
 
@@ -31,7 +32,7 @@ One harness per model, each pinned to the highest-fidelity native endpoint. See 
 ```bash
 uv sync
 ./scripts/patch_torch.sh
-./scripts/run_hard.sh codex gpt-5.5 problems/01_qwen3_decode_block xhigh
+./scripts/run_hard.sh codex gpt-5.5 problems/02_kimi_linear_decode xhigh
 ./scripts/sweep.sh
 uv run python scripts/roofline_plot.py outputs/runs/<run_dir>
 ```

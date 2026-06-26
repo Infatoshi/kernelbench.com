@@ -5,14 +5,14 @@
 #   ./scripts/run_hard.sh <harness> <model> <problem_dir> [reasoning_effort]
 #
 # Examples:
-#   ./scripts/run_hard.sh claude claude-opus-4-7 problems/01_qwen3_decode_block
-#   ./scripts/run_hard.sh codex gpt-5.5 problems/01_qwen3_decode_block xhigh
-#   ./scripts/run_hard.sh kimi kimi-k2.6 problems/01_qwen3_decode_block
-#   ./scripts/run_hard.sh droid glm-5.1 problems/01_qwen3_decode_block
-#   ./scripts/run_hard.sh grok grok-build problems/01_qwen3_decode_block max
-#   ./scripts/run_hard.sh zai-claude glm-5.1 problems/01_qwen3_decode_block
-#   ./scripts/run_hard.sh minimax-claude MiniMax-M3 problems/01_qwen3_decode_block
-#   ./scripts/run_hard.sh ccr-claude glm-5.1 problems/01_qwen3_decode_block
+#   ./scripts/run_hard.sh claude claude-opus-4-7 problems/02_kimi_linear_decode
+#   ./scripts/run_hard.sh codex gpt-5.5 problems/02_kimi_linear_decode xhigh
+#   ./scripts/run_hard.sh kimi kimi-k2.6 problems/02_kimi_linear_decode
+#   ./scripts/run_hard.sh droid glm-5.1 problems/02_kimi_linear_decode
+#   ./scripts/run_hard.sh grok grok-build problems/02_kimi_linear_decode max
+#   ./scripts/run_hard.sh zai-claude glm-5.1 problems/02_kimi_linear_decode
+#   ./scripts/run_hard.sh minimax-claude MiniMax-M3 problems/02_kimi_linear_decode
+#   ./scripts/run_hard.sh ccr-claude glm-5.1 problems/02_kimi_linear_decode
 #
 # Archives everything to outputs/runs/<ts>_<harness>_<model>_<problem>/.
 

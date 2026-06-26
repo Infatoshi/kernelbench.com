@@ -24,10 +24,10 @@ interface Row {
 const GPU_ORDER = ["RTX PRO 6000 Blackwell", "H100", "B200"]
 
 const REFERENCE_URL = `/code?f=${encodeURIComponent(
-  "/data/mega/code/03_kimi_linear_decode.reference.py.txt",
+  "/data/mega/code/02_kimi_linear_decode.reference.py.txt",
 )}`
 const BASELINE_URL = `/code?f=${encodeURIComponent(
-  "/data/mega/code/03_kimi_linear_decode.baseline.py.txt",
+  "/data/mega/code/02_kimi_linear_decode.baseline.py.txt",
 )}`
 
 type SortKey = "speed" | "tok_s" | "runtime" | "tokens" | null
@@ -195,7 +195,7 @@ export default function MegaPage() {
         <p className="text-xs text-[var(--color-fg-muted)] mb-2 max-w-4xl leading-relaxed">
           KernelBench-Mega tests whole-block megakernels: instead of grading a
           single isolated op, the agent fuses an entire model block into one
-          kernel. Problem <code>03_kimi_linear_decode</code> is a Kimi-Linear
+          kernel. Problem <code>02_kimi_linear_decode</code> is a Kimi-Linear
           W4A16 hybrid decode (4-bit weights, bf16 activations). The headline
           metric is the{" "}
           <span className="text-[var(--color-fg)]">

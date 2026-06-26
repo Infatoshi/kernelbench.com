@@ -19,7 +19,7 @@
 # CSV (build_mega_leaderboard.py), redeploy, then terminate the instance.
 set -euo pipefail
 NAME="${1:?instance name required}"; GPU_LABEL="${2:?gpu label required, e.g. B200}"
-PROBLEM="${3:-problems/03_kimi_linear_decode}"; BUDGET="${4:-10800}"
+PROBLEM="${3:-problems/02_kimi_linear_decode}"; BUDGET="${4:-10800}"
 S=(ssh -F "$HOME/.brev/ssh_config" -o StrictHostKeyChecking=no)
 HERE="$(cd "$(dirname "$0")/.." && pwd)"
 

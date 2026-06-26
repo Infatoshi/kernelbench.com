@@ -4,21 +4,16 @@ Last updated: 2026-06-05.
 
 ## Purpose
 
-KernelBench-Mega is a small, hand-curated GPU megakernel benchmark where frontier coding agents attempt to build large fused kernels on specific hardware. It inherits the KernelBench-Hard harness style, archive format, and roofline reporting, but its deck starts with one full megakernel problem instead of many operation-level kernels.
+KernelBench-Mega is a small, hand-curated GPU megakernel benchmark where frontier coding agents attempt to build large fused kernels on specific hardware. It inherits the KernelBench-Hard harness style, archive format, and roofline reporting, but its deck is full fused megakernels instead of many operation-level kernels.
 
-## Active Problem
+## Active Problems
 
-`problems/01_qwen3_decode_block` is the initial KernelBench-Mega problem. It asks agents to implement one Qwen3-0.6B transformer block decode step for batch=1 and one new token, matching the dimensions and spirit of `Infatoshi/megaqwen`:
+The deck is two megakernel problems:
 
-- hidden size: 1024
-- intermediate size: 3072
-- Q heads: 16
-- KV heads: 8
-- head dim: 128
-- static BF16 projection weights
-- sequence-length sweep: 32, 128, 512
+- `problems/01_rl_grid_ppo` — a PufferLib-style grid-foraging PPO training megakernel: fused environment step, rollout collection, and PPO update in one vectorized GPU kernel. Reference/check/prompt are in place; no published board yet.
+- `problems/02_kimi_linear_decode` — a Kimi-Linear W4A16 decode megakernel: whole-block fused decode with W4A16 weight dequant and linear-attention state update across a sequence-length sweep. This is the published, GPU-scored board (3 GPUs x ~9 models).
 
-The operation includes input RMSNorm, Q/K/V projection, Q/K RMSNorm, RoPE, cache append, GQA attention decode, O projection, residual, post-attention RMSNorm, SwiGLU MLP, down projection, and final residual.
+See each problem's `problem.yaml` and `PROMPT.txt` for exact shapes, dtypes, tolerances, and forbidden shortcuts.
 
 ## Metric
 

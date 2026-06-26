@@ -4,7 +4,7 @@ Reads problem.yaml, looks at the `sota.deps` field, and installs via uv pip.
 Run once per problem before sweeping. Safe to re-run.
 
 Usage:
-    uv run python scripts/setup_problem.py problems/01_fp8_gemm
+    uv run python scripts/setup_problem.py problems/02_kimi_linear_decode
     uv run python scripts/setup_problem.py --all
 """
 import argparse

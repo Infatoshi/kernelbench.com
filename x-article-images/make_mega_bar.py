@@ -2,7 +2,7 @@
 
 Title = problem name, bars = per-model speedup over the reference megakernel.
 One GPU (RTX PRO 6000 Blackwell). Mega currently = the Kimi linear-decode
-megakernel only (03_kimi_linear_decode).
+megakernel only (02_kimi_linear_decode).
 """
 import sys; sys.path.insert(0, "..")
 import csv
