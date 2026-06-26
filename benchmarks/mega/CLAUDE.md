@@ -4,8 +4,11 @@ Last updated: 2026-06-04.
 
 This file is for **coding agents editing the repo** (you, via Claude Code). Do not confuse with `problems/<X>/PROMPT.txt` — those are the human-voice queries fed to agents _under test_.
 
-KernelBench-Mega is currently a KernelBench-Hard scaffold copy. The active Hard
-problem deck is temporary and will be replaced with megakernel problems.
+KernelBench-Mega reuses the KernelBench-Hard harness/archive/roofline machinery,
+but its deck is two full fused megakernel problems: `problems/01_rl_grid_ppo`
+(PufferLib-style grid-foraging PPO training megakernel) and
+`problems/02_kimi_linear_decode` (Kimi-Linear W4A16 decode megakernel, the
+published GPU-scored board). The old operation-level Hard deck was removed.
 
 For the journey behind the current design, read [DEVLOG.md](./DEVLOG.md).
 
@@ -64,7 +67,7 @@ KernelBench-Mega/
 3. Required files (order matters — write them in this order so you can sanity-check each):
    - `reference.py` — shortest naive PyTorch that produces the right answer. No optimization tricks. This is the correctness oracle.
    - `shapes.py` — 3 to 5 canonical shapes as a list of dicts. Include at least one "off-alignment" shape (e.g., K not multiple of 128 for GEMM).
-   - `problem.yaml` — metadata. See `problems/01_qwen3_decode_block/problem.yaml` as the canonical example.
+   - `problem.yaml` — metadata. See `problems/02_kimi_linear_decode/problem.yaml` as the canonical example.
    - `sota.py` — wrap the library function that defines the ceiling. If no library supports SM120 yet, leave a stub and document the H100 paper number in a comment.
    - `check.py` — copy from the closest existing problem and adapt the formulas/imports.
    - `benchmark.py` — copy from the closest existing problem and adapt the throughput formula to match `problem.yaml.flops_formula` / `bytes_formula`.
@@ -76,12 +79,12 @@ KernelBench-Mega/
 
 ```bash
 # Single (harness, model, problem)
-./scripts/run_hard.sh claude claude-opus-4-7 problems/01_qwen3_decode_block
+./scripts/run_hard.sh claude claude-opus-4-7 problems/02_kimi_linear_decode
 
 # Full active matrix on one problem
 for model_harness in "claude claude-opus-4-7" "codex gpt-5.5 xhigh" "kimi kimi-k2.6"; do
     read -r HARNESS MODEL <<< "$model_harness"
-    ./scripts/run_hard.sh "$HARNESS" "$MODEL" problems/01_qwen3_decode_block
+    ./scripts/run_hard.sh "$HARNESS" "$MODEL" problems/02_kimi_linear_decode
 done
 
 # Everything (this is what sweep.sh does)
@@ -192,11 +195,11 @@ cannot serialize unrelated CUDA compiles or benchmark jobs elsewhere on Anvil.
 Smoke-tested candidates and useful commands:
 
 ```bash
-./scripts/run_hard.sh opencode openrouter-alibaba/qwen/qwen3.7-max problems/01_qwen3_decode_block
-./scripts/run_hard.sh opencode openrouter-google-ai-studio/google/gemini-3.5-flash problems/01_qwen3_decode_block
-./scripts/run_hard.sh cursor composer-2.5 problems/01_qwen3_decode_block
-./scripts/run_hard.sh cursor composer-2.5-fast problems/01_qwen3_decode_block
-./scripts/run_hard.sh grok grok-build problems/01_qwen3_decode_block max
+./scripts/run_hard.sh opencode openrouter-alibaba/qwen/qwen3.7-max problems/02_kimi_linear_decode
+./scripts/run_hard.sh opencode openrouter-google-ai-studio/google/gemini-3.5-flash problems/02_kimi_linear_decode
+./scripts/run_hard.sh cursor composer-2.5 problems/02_kimi_linear_decode
+./scripts/run_hard.sh cursor composer-2.5-fast problems/02_kimi_linear_decode
+./scripts/run_hard.sh grok grok-build problems/02_kimi_linear_decode max
 ```
 
 Other serious rows to keep in the matrix if their auth/config is healthy:

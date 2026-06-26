@@ -41,7 +41,7 @@ declare -a QUEUE=(
 )
 
 declare -a PROBLEMS=(
-    "problems/01_qwen3_decode_block"
+    "problems/02_kimi_linear_decode"
 )
 
 TS="$(date +%Y%m%d_%H%M%S)"

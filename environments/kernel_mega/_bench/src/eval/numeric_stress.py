@@ -32,69 +32,10 @@ _LARGE_BF16 = {"bfloat16": {"atol": 2e-1, "rtol": 5e-2}}
 _TINY_FP32 = {"float32": {"atol": 1e-7, "rtol": 1e-4}}
 _LARGE_FP32 = {"float32": {"atol": 1e-1, "rtol": 1e-4}}
 
-_CASES: dict[str, tuple[NumericStressCase, ...]] = {
-    "01_fp8_gemm": (
-        NumericStressCase("small_input", input_scales={0: 1e-3}, tolerance=_SMALL_BF16),
-        NumericStressCase("large_input", input_scales={0: 64.0}, tolerance=_LARGE_BF16),
-        NumericStressCase(
-            "small_weight",
-            state_scales={"weight": 1e-2},
-            tolerance=_SMALL_BF16,
-        ),
-    ),
-    "02_kda_cutlass": (
-        NumericStressCase(
-            "small_qkv",
-            input_scales={0: 1e-2, 1: 1e-2, 2: 1e-2},
-            tolerance=_MED_BF16,
-        ),
-        NumericStressCase(
-            "large_qkv",
-            input_scales={0: 2.0, 1: 2.0, 2: 2.0},
-            tolerance={"bfloat16": {"atol": 5e-2, "rtol": 5e-2}},
-        ),
-    ),
-    "03_paged_attention": (
-        NumericStressCase(
-            "small_q_kv",
-            input_scales={0: 1e-2, 1: 1e-2},
-            tolerance=_MED_BF16,
-        ),
-        NumericStressCase(
-            "large_q_kv",
-            input_scales={0: 8.0, 1: 8.0},
-            tolerance={"bfloat16": {"atol": 5e-2, "rtol": 5e-2}},
-        ),
-    ),
-    "05_topk_bitonic": (
-        NumericStressCase("tiny_values", input_scales={0: 1e-4}, tolerance=_TINY_FP32),
-        NumericStressCase("large_values", input_scales={0: 1e3}, tolerance=_LARGE_FP32),
-    ),
-    "06_sonic_moe_swiglu": (
-        NumericStressCase("small_hidden", input_scales={0: 1e-2}, tolerance=_MED_BF16),
-        NumericStressCase(
-            "large_hidden",
-            input_scales={0: 8.0},
-            tolerance={"bfloat16": {"atol": 1e-1, "rtol": 5e-2}},
-        ),
-    ),
-    "07_w4a16_gemm": (
-        NumericStressCase("small_activation", input_scales={0: 1e-3}, tolerance=_SMALL_BF16),
-        NumericStressCase(
-            "large_activation",
-            input_scales={0: 64.0},
-            tolerance={"bfloat16": {"atol": 1.0, "rtol": 5e-2}},
-        ),
-    ),
-    "09_fmha_preattn_mrope": (
-        NumericStressCase("small_qk", input_scales={0: 1e-2, 1: 1e-2}, tolerance=_SMALL_BF16),
-        NumericStressCase("large_qk", input_scales={0: 16.0, 1: 16.0}, tolerance=_LARGE_BF16),
-    ),
-    "10_patch_embed_conv3d_gemm": (
-        NumericStressCase("small_input", input_scales={0: 1e-2}, tolerance=_SMALL_BF16),
-        NumericStressCase("large_input", input_scales={0: 16.0}, tolerance=_LARGE_BF16),
-    ),
-}
+# Per-problem targeted stress cases. The KernelBench-Mega deck (rl_grid_ppo,
+# kimi_linear_decode) currently declares none, so every problem runs the nominal
+# case only; add an entry here keyed by problem dir name to add targeted scales.
+_CASES: dict[str, tuple[NumericStressCase, ...]] = {}
 
 
 def numeric_stress_cases(problem_name: str) -> tuple[NumericStressCase, ...]:

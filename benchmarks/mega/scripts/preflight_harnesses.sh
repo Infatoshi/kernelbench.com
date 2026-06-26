@@ -1,5 +1,5 @@
 #!/bin/bash
-# Cheap provider/harness preflight before an expensive KernelBench-Hard sweep.
+# Cheap provider/harness preflight before an expensive KernelBench-Mega sweep.
 #
 # This intentionally uses tiny text prompts instead of a benchmark problem. It
 # verifies auth, model routing, streaming JSON shape, and obvious quota/rate

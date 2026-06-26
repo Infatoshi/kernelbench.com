@@ -1,4 +1,4 @@
-"""Browser-based transcript viewer for KernelBench-Hard agent runs.
+"""Browser-based transcript viewer for KernelBench-Mega agent runs.
 
 Generates self-contained static HTML from a run directory's transcript and
 artifacts. Supports claude, codex, kimi, cursor, droid harness formats.

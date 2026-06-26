@@ -20,7 +20,7 @@ Summary of the non-negotiables:
 ```bash
 uv sync
 ./scripts/patch_torch.sh
-./scripts/run_hard.sh claude claude-opus-4-7 problems/01_qwen3_decode_block
+./scripts/run_hard.sh claude claude-opus-4-7 problems/02_kimi_linear_decode
 ```
 
 ## Repo layout and adding a new problem
@@ -131,12 +131,12 @@ uv run python scripts/summarize_runs.py --run-group <name>
 High-priority rows:
 
 ```bash
-./scripts/run_hard.sh minimax-claude MiniMax-M3 problems/01_qwen3_decode_block
-./scripts/run_hard.sh opencode openrouter-alibaba/qwen/qwen3.7-max problems/01_qwen3_decode_block
-./scripts/run_hard.sh opencode openrouter-google-ai-studio/google/gemini-3.5-flash problems/01_qwen3_decode_block
-./scripts/run_hard.sh cursor composer-2.5 problems/01_qwen3_decode_block
-./scripts/run_hard.sh cursor composer-2.5-fast problems/01_qwen3_decode_block
-./scripts/run_hard.sh grok grok-build problems/01_qwen3_decode_block max
+./scripts/run_hard.sh minimax-claude MiniMax-M3 problems/02_kimi_linear_decode
+./scripts/run_hard.sh opencode openrouter-alibaba/qwen/qwen3.7-max problems/02_kimi_linear_decode
+./scripts/run_hard.sh opencode openrouter-google-ai-studio/google/gemini-3.5-flash problems/02_kimi_linear_decode
+./scripts/run_hard.sh cursor composer-2.5 problems/02_kimi_linear_decode
+./scripts/run_hard.sh cursor composer-2.5-fast problems/02_kimi_linear_decode
+./scripts/run_hard.sh grok grok-build problems/02_kimi_linear_decode max
 ```
 
 Claude Code runs explicitly pass `--settings

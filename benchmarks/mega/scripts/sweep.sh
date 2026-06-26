@@ -54,7 +54,7 @@ declare -a ACTIVE_MATRIX=(
 # for the first sweep). Order is outer=problem, inner=model so an early abort
 # leaves complete per-problem rows rather than complete per-model columns.
 declare -a CUDA_PROBLEMS=(
-    "problems/01_qwen3_decode_block"
+    "problems/02_kimi_linear_decode"
 )
 
 SWEEP_TIMESTAMP="$(date +%Y%m%d_%H%M%S)"

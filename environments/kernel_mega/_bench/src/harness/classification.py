@@ -1,4 +1,4 @@
-"""Classify KernelBench-Hard run outcomes.
+"""Classify KernelBench-Mega run outcomes.
 
 Provider failure detection must not scan arbitrary transcript text. Agents often
 read AGENTS.md, run_hard.sh, old result JSON, or problem docs that contain words

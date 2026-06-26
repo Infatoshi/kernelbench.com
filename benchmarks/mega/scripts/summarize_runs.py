@@ -1,4 +1,4 @@
-"""Summarize KernelBench-Hard archived run results.
+"""Summarize KernelBench-Mega archived run results.
 
 Usage:
     uv run python scripts/summarize_runs.py [--run-group NAME] [--output-dir DIR]

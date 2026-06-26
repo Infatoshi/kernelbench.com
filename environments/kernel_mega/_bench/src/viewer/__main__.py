@@ -35,7 +35,7 @@ def _find_transcript(run_dir: Path, prefer: str | None = None) -> Path:
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="KernelBench-Hard transcript viewer")
+    parser = argparse.ArgumentParser(description="KernelBench-Mega transcript viewer")
     parser.add_argument("run_dir", type=Path, help="run directory with transcript + artifacts")
     parser.add_argument("--transcript", help="transcript filename to use (auto-detected by default)")
     parser.add_argument("--out", type=Path, help="output HTML path (default: <run_dir>/index.html)")

@@ -52,6 +52,8 @@ def test_state_scale_applies_to_both_models_and_restores() -> None:
     assert torch.equal(sol.weight, original)
 
 
-def test_problem_cases_include_nominal_and_targeted_fp8_cases() -> None:
-    names = [case.name for case in numeric_stress_cases("01_fp8_gemm")]
-    assert names == ["nominal", "small_input", "large_input", "small_weight"]
+def test_unkeyed_problem_defaults_to_nominal_only() -> None:
+    # The KernelBench-Mega deck declares no targeted stress cases, so an unkeyed
+    # problem name returns just the nominal case.
+    names = [case.name for case in numeric_stress_cases("02_kimi_linear_decode")]
+    assert names == ["nominal"]

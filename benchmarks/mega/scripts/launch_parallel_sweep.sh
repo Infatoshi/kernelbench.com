@@ -1,5 +1,5 @@
 #!/bin/bash
-# Launch a queue-safe parallel KernelBench-Hard sweep.
+# Launch a queue-safe parallel KernelBench-Mega sweep.
 #
 # Defaults favor broad model comparison while keeping CUDA validation serialized:
 # agents run with CUDA hidden, then run_hard.sh owns check.py/benchmark.py under
@@ -14,7 +14,7 @@ cd "$REPO_ROOT"
 RUN_GROUP="${KBH_RUN_GROUP:-sweep_$(date +%Y%m%d_%H%M%S)}"
 BUDGET_SECONDS="${KBH_BUDGET_SECONDS:-2700}"
 HARNESS_CONCURRENCY="${KBH_HARNESS_CONCURRENCY:-2}"
-PROBLEMS="${KBH_PROBLEMS:-problems/01_qwen3_decode_block}"
+PROBLEMS="${KBH_PROBLEMS:-problems/02_kimi_linear_decode}"
 SWEEP_DIR="$REPO_ROOT/outputs/sweeps/$RUN_GROUP"
 mkdir -p "$SWEEP_DIR"
 

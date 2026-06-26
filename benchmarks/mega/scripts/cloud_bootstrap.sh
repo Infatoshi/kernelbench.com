@@ -11,7 +11,7 @@
 #   brev create claude-mega-h100 --gpu H100      # hyperstack ~$2.28/hr
 #   rsync benchmarks/mega + ~/.codex/auth.json + ~/.claude/.credentials.json + ~/.env_vars
 #   ssh <box> bash ~/mega/scripts/cloud_bootstrap.sh
-#   ssh <box> "cd ~/mega && BUDGET_SECONDS=10800 ./scripts/run_hard.sh codex gpt-5.5 problems/03_kimi_linear_decode"
+#   ssh <box> "cd ~/mega && BUDGET_SECONDS=10800 ./scripts/run_hard.sh codex gpt-5.5 problems/02_kimi_linear_decode"
 set -euo pipefail
 export PATH="$HOME/.local/bin:$PATH"
 grep -q '.local/bin' ~/.bashrc 2>/dev/null || echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc

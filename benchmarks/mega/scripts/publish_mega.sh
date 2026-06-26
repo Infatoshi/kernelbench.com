@@ -17,7 +17,7 @@ mkdir -p "$PUB_RUNS" "$PUB_CODE"
 
 echo "[1/3] generate transcript viewers for gpu-tagged runs"
 n=0
-for d in "$RUNS"/*_03_kimi_linear_decode; do
+for d in "$RUNS"/*_02_kimi_linear_decode; do
   [ -f "$d/gpu" ] || continue
   [ -f "$d/result.json" ] || continue
   rid=$(basename "$d")
@@ -47,14 +47,14 @@ s|ghp_[A-Za-z0-9]\{30,\}|ghp_REDACTED|g
 s|github_pat_[A-Za-z0-9_]\{30,\}|github_pat_REDACTED|g
 s|hf_[A-Za-z0-9]\{30,\}|hf_REDACTED|g
 PAT
-for f in "$PUB_RUNS"/*_03_kimi_linear_decode.html "$PUB_CODE"/*; do
+for f in "$PUB_RUNS"/*_02_kimi_linear_decode.html "$PUB_CODE"/*; do
   [ -f "$f" ] && sed -i -f "$SEDF" "$f"
 done
 rm -f "$SEDF"
 
 echo "[2/3] copy problem reference"
-cp problems/03_kimi_linear_decode/reference.py "$PUB_CODE/03_kimi_linear_decode.reference.py.txt"
-cp problems/03_kimi_linear_decode/baseline.py "$PUB_CODE/03_kimi_linear_decode.baseline.py.txt"
+cp problems/02_kimi_linear_decode/reference.py "$PUB_CODE/02_kimi_linear_decode.reference.py.txt"
+cp problems/02_kimi_linear_decode/baseline.py "$PUB_CODE/02_kimi_linear_decode.baseline.py.txt"
 # reference/baseline are repo source (no secrets) but redact defensively too
 [ -f /tmp/_noop ] || true
 

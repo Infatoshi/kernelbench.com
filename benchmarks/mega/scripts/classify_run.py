@@ -1,4 +1,4 @@
-"""Classify a KernelBench-Hard run from run_hard.sh environment variables."""
+"""Classify a KernelBench-Mega run from run_hard.sh environment variables."""
 from __future__ import annotations
 
 import json
