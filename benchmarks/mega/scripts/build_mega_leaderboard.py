@@ -31,6 +31,36 @@ def _bench(bench_log: Path):
     return (str(int(best)) if best else ""), ctx
 
 
+def _sidecar_code(run_dir: Path, sol_code: str) -> str:
+    """Code of local modules that solution.py imports.
+
+    Some harnesses (notably cursor) keep the actual kernel in a sidecar module
+    that solution.py imports (e.g. `from w4_triton import ...` with the
+    @triton.jit kernels living in scratch/w4_triton.py) instead of inlining it.
+    Without resolving these imports, _framework only sees the thin solution.py
+    wrapper and mislabels a real Triton/CUDA kernel as "eager". Resolve the
+    imported module names to files under run_dir (top level + scratch/, never
+    .venv/site-packages) and return their concatenated source.
+    """
+    mods = set(re.findall(r"^\s*(?:from|import)\s+([a-zA-Z_]\w*)", sol_code, re.M))
+    if not mods:
+        return ""
+    cands = list(run_dir.glob("*.py"))
+    sc = run_dir / "scratch"
+    if sc.is_dir():
+        cands += list(sc.rglob("*.py"))
+    out = []
+    for p in cands:
+        if p.name == "solution.py" or "site-packages" in p.parts or ".venv" in p.parts:
+            continue
+        if p.stem in mods:
+            try:
+                out.append(p.read_text(errors="ignore"))
+            except Exception:
+                pass
+    return "\n".join(out)
+
+
 def _framework(run_dir: Path) -> str:
     f = run_dir / "framework.txt"
     if f.exists():
@@ -38,6 +68,7 @@ def _framework(run_dir: Path) -> str:
     sol = run_dir / "solution.py"
     if sol.exists():
         code = sol.read_text(errors="ignore")
+        code += "\n" + _sidecar_code(run_dir, code)
         for name, pat in [
             ("ptx", r"asm\s+volatile|mma\.sync|tcgen05\."),
             ("cuda", r"load_inline|__global__\s+void"),
