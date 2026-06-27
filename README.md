@@ -12,24 +12,29 @@ This is the canonical monorepo: it ships both the public website and the benchma
 ├── lib/data.ts             Reads benchmark data from benchmarks/ at build time
 ├── public/                 Website static assets
 ├── benchmarks/
-│   ├── hard/             Latest (2026-04). Single Blackwell, 9 problems, 14 model-harness sweeps.
+│   ├── hard/             Latest (2026-04). Single Blackwell, 6 problems, 10 models. Live on /hard.
+│   │   ├── AGENTS.md       Agent operating rules for this bench (CLAUDE.md → symlink).
+│   │   ├── SPEC.md         Design + methodology.
 │   │   ├── DEVLOG.md       Decisions, dead ends, lessons.
 │   │   ├── LEADERBOARD.md  Human-readable cross-model grid + rubric-leak footnotes.
 │   │   ├── results/
-│   │   │   ├── leaderboard.json    Schema-versioned, machine-readable.
+│   │   │   ├── leaderboard.json    Schema-versioned, machine-readable (drives the site).
 │   │   │   └── annotations/        Per-cell YAML commentary (clean / rubric_leak / etc.).
 │   │   ├── problems/       Problem definitions (reference.py, check.py, benchmark.py, …).
 │   │   ├── src/            Eval infrastructure (timing, correctness, hardware ceilings).
 │   │   ├── scripts/        Sweep orchestration.
 │   │   └── tests/
+│   ├── mega/              Megakernel bench (2 problems). Same shape as hard/; not yet published to the site.
 │   └── v3/                 Archive (2026-02). RTX 3090 + H100 + B200, 43-58 problems/GPU, 10 models.
-│       ├── DEVLOG.md
-│       ├── README.md
+│       ├── AGENTS.md, README.md, SPEC.md
+│       ├── docs/           Overflow reference (problem inventory, reward-hack cases, v4 briefs).
 │       ├── problems/, src/, scripts/, tests/, …
+├── environments/           Prime Intellect `verifiers` mirrors of the benches (kernel_hard / kernel_mega / kernel_v3).
+├── AGENTS.md               Repo-wide operator guide (CLAUDE.md → symlink). Per-bench detail lives in each bench's AGENTS.md.
 └── README.md               (this file)
 ```
 
-Each benchmark in `benchmarks/` keeps its own DEVLOG.md as the running record of decisions and dead ends. The website surfaces the visualization-ready slice (leaderboard, per-problem ceilings, annotations); the benchmark subdirs hold the full machinery so the work can be reproduced or extended.
+Doc convention: every level carries `README.md` (humans), `AGENTS.md` (agents; `CLAUDE.md` is a symlink to it), and each bench adds `SPEC.md` (design), `DEVLOG.md` (running record of decisions and dead ends), and `LEADERBOARD.md` (human-readable grid). The website surfaces the visualization-ready slice (leaderboard, per-problem ceilings, annotations); the benchmark subdirs hold the full machinery so the work can be reproduced or extended.
 
 ## How the site reads data
 
@@ -39,7 +44,7 @@ Each benchmark in `benchmarks/` keeps its own DEVLOG.md as the running record of
 
 | version | date | hardware | problems | models | live page |
 | --- | --- | --- | --- | --- | --- |
-| **hard** | 2026-04 | RTX PRO 6000 Blackwell (sm_120) | 7 | 12 | [/hard](https://kernelbench.com/hard) |
+| **hard** | 2026-04 | RTX PRO 6000 Blackwell (sm_120) | 6 | 10 | [/hard](https://kernelbench.com/hard) |
 | v3 | 2026-02 | RTX 3090 + H100 + B200 | 43-58 per GPU | 10 | [/v3](https://kernelbench.com/v3) |
 
 ## Running the website locally
