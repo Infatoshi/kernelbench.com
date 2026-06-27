@@ -12,7 +12,7 @@ REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$REPO_ROOT"
 
 RUN_GROUP="${KBH_RUN_GROUP:-sweep_$(date +%Y%m%d_%H%M%S)}"
-BUDGET_SECONDS="${KBH_BUDGET_SECONDS:-2700}"
+BUDGET_SECONDS="${KBH_BUDGET_SECONDS:-0}"   # 0 = unlimited (run_hard.sh enforces no cap)
 HARNESS_CONCURRENCY="${KBH_HARNESS_CONCURRENCY:-2}"
 PROBLEMS="${KBH_PROBLEMS:-problems/01_fp8_gemm problems/02_kda_cutlass problems/03_paged_attention problems/05_topk_bitonic problems/06_sonic_moe_swiglu problems/07_w4a16_gemm}"
 SWEEP_DIR="$REPO_ROOT/outputs/sweeps/$RUN_GROUP"

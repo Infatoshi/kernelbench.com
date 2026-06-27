@@ -44,8 +44,6 @@ Annotations (`★`) attached to specific cells live in `results/annotations/<run
 | 05_topk_bitonic | 0.046 | claude-opus-4-8 [2026-05-28 opus48-grok max] | 11/23 |
 | 06_sonic_moe_swiglu | 0.254 | MiniMax M3 [2026-06-01] | 18/23 |
 | 07_w4a16_gemm | 0.220 | kimi-k2.6 | 17/23 |
-| 09_fmha_preattn_mrope | 0.722 | claude-opus-4-7 [max] | 10/14 |
-| 10_patch_embed_conv3d_gemm | 0.248 | gpt-5.5 [xhigh] | 9/14 |
 
 ## Benchmark design flaws — read these before citing numbers
 

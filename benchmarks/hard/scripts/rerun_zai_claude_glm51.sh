@@ -13,8 +13,6 @@ PROBLEMS=(
     "problems/05_topk_bitonic"
     "problems/06_sonic_moe_swiglu"
     "problems/07_w4a16_gemm"
-    "problems/09_fmha_preattn_mrope"
-    "problems/10_patch_embed_conv3d_gemm"
 )
 
 echo "========================================"
