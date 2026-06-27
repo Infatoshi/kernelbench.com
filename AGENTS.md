@@ -431,8 +431,11 @@ Most likely causes:
   build verification. The repo sets it locally; new clones must `git config
   user.email elliot@arledge.net`.
 - The publish pipeline regenerates `benchmarks/hard/results/leaderboard.json`
-  (site data) and `public/runs/*.html` (transcript viewers) from the archives.
-  `just publish` does it; don't hand-edit the leaderboard.
+  (site data) and the redacted `public/runs/*_solution.py.txt` kernels from the
+  archives. `kb publish` does it; don't hand-edit the leaderboard. Full agent
+  transcripts live on HuggingFace (`kernelbench-<bench>-traces`); push them with
+  `kb push-runs <hard|mega>` (or `kb publish --push`). The site links each run
+  to its HF trace — it no longer self-hosts `*.html` viewers.
 - **Transcript / reasoning extraction lives in-repo at
   `scripts/transcript-extraction/`** (vendored complete extractor; see its
   `VENDORED.md`). Use it as the canonical reference when working on the
