@@ -56,7 +56,7 @@ from datasets import Dataset
 # Per-problem files the native harness copies into a workspace. The native
 # run_hard.sh TEMPLATE_FILES list is (reference/sota/shapes/problem.yaml/
 # check/benchmark/PROMPT[/baseline]) but some problems ship EXTRA aux modules
-# that check.py/benchmark.py import (e.g. mega's 03_kimi_linear_decode imports
+# that check.py/benchmark.py import (e.g. mega's 02_kimi_linear_decode imports
 # `baseline`). To be faithful across both decks we copy EVERY file in the
 # problem dir except generated/agent artifacts (below).
 _PROBLEM_ARTIFACTS = {"solution.py", "framework.txt", "__pycache__", ".pytest_cache"}
@@ -127,7 +127,7 @@ def run_native(ws: str, problem: str, script: str, timeout_s: int) -> tuple[int,
     """
     pdir = problem_dir(ws, problem)
     env = dict(os.environ)
-    env.setdefault("CUDA_HOME", "/usr/local/cuda-13")
+    env.setdefault("CUDA_HOME", env.get("KBH_CUDA_HOME", "/usr/local/cuda-13"))
     cuda_bin = f"{env['CUDA_HOME']}/bin"
     if cuda_bin not in env.get("PATH", ""):
         env["PATH"] = cuda_bin + ":" + env.get("PATH", "")

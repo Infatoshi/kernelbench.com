@@ -127,7 +127,7 @@ def run_native(ws: str, problem: str, script: str, timeout_s: int) -> tuple[int,
     """
     pdir = problem_dir(ws, problem)
     env = dict(os.environ)
-    env.setdefault("CUDA_HOME", "/usr/local/cuda-13")
+    env.setdefault("CUDA_HOME", env.get("KBH_CUDA_HOME", "/usr/local/cuda-13"))
     cuda_bin = f"{env['CUDA_HOME']}/bin"
     if cuda_bin not in env.get("PATH", ""):
         env["PATH"] = cuda_bin + ":" + env.get("PATH", "")

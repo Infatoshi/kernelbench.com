@@ -13,9 +13,11 @@ set -euo pipefail
 # Pin CUDA 13 for agent subprocesses. The /usr/local/cuda symlink may still
 # point to 12.8 on some machines; /usr/local/cuda-13 always resolves to the
 # 13.x toolkit we need for SM120 / SM100 targets (flashinfer, CUTLASS 4.x,
-# Blackwell compile flags).
-if [ -d /usr/local/cuda-13 ]; then
-    export CUDA_HOME=/usr/local/cuda-13
+# Blackwell compile flags). Override the pinned toolkit dir on other machines
+# with KBH_CUDA_HOME (default /usr/local/cuda-13).
+KBH_CUDA_HOME="${KBH_CUDA_HOME:-/usr/local/cuda-13}"
+if [ -d "$KBH_CUDA_HOME" ]; then
+    export CUDA_HOME="$KBH_CUDA_HOME"
     export PATH="$CUDA_HOME/bin:$PATH"
 fi
 
