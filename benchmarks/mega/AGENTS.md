@@ -1,42 +1,139 @@
-# KernelBench-Mega — Developer Instructions (codex / droid)
+# KernelBench-Mega — Developer Instructions
 
-This is the codex / droid / cursor-agent equivalent of `CLAUDE.md`. Content is identical; format is plain markdown for any CLI.
+Last updated: 2026-06-04.
 
-See [`CLAUDE.md`](./CLAUDE.md) for the canonical version. All rules there apply.
+This file is for **coding agents editing the repo** (you — via Claude Code, Codex, Cursor, or any other CLI; `CLAUDE.md` is a symlink to this file, so both tools read the same content). Do not confuse with `problems/<X>/PROMPT.txt` — those are the human-voice queries fed to agents _under test_.
 
-Summary of the non-negotiables:
+KernelBench-Mega reuses the KernelBench-Hard harness/archive/roofline machinery,
+but its deck is two full fused megakernel problems: `problems/01_rl_grid_ppo`
+(PufferLib-style grid-foraging PPO training megakernel) and
+`problems/02_kimi_linear_decode` (Kimi-Linear W4A16 decode megakernel, the
+published GPU-scored board). The old operation-level Hard deck was removed.
 
-- **uv only.** `uv run ...`, `uv add ...`, `uv pip install ...`. Never `pip` or bare `python`.
+For the journey behind the current design, read [DEVLOG.md](./DEVLOG.md).
+
+## What this repo is
+
+Small kernel benchmark. Frontier coding agents are given URLs to SOTA implementations (sonic-moe, flashinfer, marlin) and asked to write a competitive kernel on RTX PRO 6000 Blackwell (SM120) with unlimited time (one autonomous session, runs until the model decides it is done, under a large wall-clock ceiling). Roofline-graded. Published artifact is the best kernel per (problem × model × harness), plus the agent trace.
+
+See [SPEC.md](./SPEC.md) for methodology. See [README.md](./README.md) for the model matrix and quick start.
+
+## Non-negotiable rules
+
+- **uv only.** No bare `python`, no `pip`. Use `uv run ...`, `uv add ...`, `uv pip install ...`.
 - **Before committing:** `uv run ruff check . --fix && uv run pytest`.
-- **Do not edit `problems/*/solution.py`** — those are agent output.
-- **Do not modify `reference.py`, `check.py`, `benchmark.py`, `problem.yaml`, `shapes.py`, or `PROMPT.txt`** of an already-published problem unless intentionally versioning the benchmark/validation surface; `scripts/run_hard.sh` invalidates and restores runs where agents under test change them.
-- **Apply the torch 2.11 inductor CSE hotfix** via `./scripts/patch_torch.sh` after any `uv sync`.
-- **Z.ai GLM-5.1 Claude Code reruns:** use `zai-claude`; `scripts/run_hard.sh` sets `CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS=1`, `CLAUDE_CODE_MAX_RETRIES=1000000`, `CLAUDE_CODE_MAX_OUTPUT_TOKENS=128000`, and routes all Claude Code aliases, including Haiku / Explore / subagents, to `glm-5.1`.
+- **Never edit `problems/*/solution.py`**. Those files are agent output; they're gitignored for a reason. If you need to inspect one, read it from `outputs/runs/<run>/<problem>/solution.py`.
+- **Never modify `problems/*/reference.py`, `check.py`, `benchmark.py`, `problem.yaml`, `shapes.py`, or `PROMPT.txt`** once a sweep has been published unless you are intentionally versioning the benchmark/validation surface. Those files define the benchmark. `scripts/run_hard.sh` snapshots them and marks the run invalid if an agent under test changes them.
+- **torch.compile fix.** torch 2.11.0+cu130 has a broken inductor CSE typing annotation that breaks the compile baseline. Run `./scripts/patch_torch.sh` after every `uv sync`.
 - **GPU work must go through `scripts/run_hard.sh`.** It creates archive-local workspaces, isolated CUDA/Triton/Torch caches, and a shared GPU lock so concurrent agent sweeps can edit in parallel while compile/check/benchmark work queues cleanly.
-- **Correctness includes numeric stress.** `check.py` reruns canonical shapes/seeds under problem-specific small/large activation or weight scales via `src/eval/numeric_stress.py`; `benchmark.py` still measures only the canonical performance deck.
+- **Correctness now includes numeric stress.** `check.py` reruns canonical shapes/seeds under problem-specific small/large activation or weight scales via `src/eval/numeric_stress.py`. This hardens correctness against zero-output, cached-nominal, and loose-tolerance cheats. `benchmark.py` still measures only the canonical performance deck.
 
-## Quick actions
+## Repo layout
 
-```bash
-uv sync
-./scripts/patch_torch.sh
-./scripts/run_hard.sh claude claude-opus-4-7 problems/02_kimi_linear_decode
+```
+KernelBench-Mega/
+├── README.md, SPEC.md         project docs
+├── CLAUDE.md, AGENTS.md, .cursorrules   dev-facing (this file)
+├── pyproject.toml             uv project
+├── problems/                  the deck (append-only after release)
+│   └── NN_name/
+│       ├── reference.py       naive PyTorch, for correctness
+│       ├── sota.py            library call for the ceiling number
+│       ├── shapes.py          canonical shape list (read by check.py / benchmark.py)
+│       ├── problem.yaml       metadata (flops, bytes, tolerance, forbidden ops)
+│       ├── check.py           correctness runner (per-dtype atol)
+│       ├── benchmark.py       roofline measurement: solution; optional eager/compiled/sota
+│       ├── PROMPT.txt         human-voice query sent to the agent under test
+│       └── solution.py        agent output (gitignored)
+├── src/
+│   ├── harness/               claude.py, codex.py, kimi.py, ccr_router.py
+│   ├── eval/                  correctness.py, numeric_stress.py, roofline.py, shapes.py, report.py
+│   ├── hardware/              rtx_pro_6000.py, m4_max.py — peak lookup
+│   └── sandbox/               local.py, metal.py
+├── scripts/
+│   ├── run_hard.sh            fire one (harness, model, problem)
+│   ├── sweep.sh               full active matrix
+│   ├── setup_problem.py       install SOTA deps for a problem
+│   ├── roofline_plot.py       post-hoc plot from run artifacts
+│   └── patch_torch.sh         torch 2.11 inductor CSE typing hotfix
+├── outputs/runs/              per-run archival (gitignored)
+└── docs/                      design notes, reward-hack case studies
 ```
 
-## Repo layout and adding a new problem
+## Adding a new problem
 
-See `CLAUDE.md` — everything there is authoritative.
+1. Pick the next NN (zero-padded). Don't reuse numbers.
+2. Create `problems/NN_name/`.
+3. Required files (order matters — write them in this order so you can sanity-check each):
+   - `reference.py` — shortest naive PyTorch that produces the right answer. No optimization tricks. This is the correctness oracle.
+   - `shapes.py` — 3 to 5 canonical shapes as a list of dicts. Include at least one "off-alignment" shape (e.g., K not multiple of 128 for GEMM).
+   - `problem.yaml` — metadata. See `problems/02_kimi_linear_decode/problem.yaml` as the canonical example.
+   - `sota.py` — wrap the library function that defines the ceiling. If no library supports SM120 yet, leave a stub and document the H100 paper number in a comment.
+   - `check.py` — copy from the closest existing problem and adapt the formulas/imports.
+   - `benchmark.py` — copy from the closest existing problem and adapt the throughput formula to match `problem.yaml.flops_formula` / `bytes_formula`.
+   - `PROMPT.txt` — single cohesive human-voice query. Match the structure of the existing seven: hardware in parenthetical on first line, file roles + "make a mess" allowance, op semantics + tolerance + every shape inlined as prose, custom-kernel mandate + forbidden ops list spelled out + suggested implementation paths + "look it up yourself" directive, flywheel sentence ending with "Take as long as you need to actually push the number up." Do not include peak throughput numbers, optimization recipes, or "you are being evaluated" framing.
+4. Smoke-test: `./scripts/run_hard.sh claude claude-opus-4-7 problems/NN_name` on a cheap model first. Verify `check.py` runs, `benchmark.py` runs, result.json is sane.
+5. Once you're happy, run the full model matrix sweep.
 
-## Current sweep context
+## Running a sweep
 
-Use `scripts/run_hard.sh` for all model evals. It stages each problem under
-`outputs/runs/<run_id>/repo/problems/<problem_name>/`, copies immutable problem
-files, symlinks `src/`, copies project metadata, and sets per-run
-`TORCH_EXTENSIONS_DIR`, `TRITON_CACHE_DIR`, `CUDA_CACHE_PATH`, and temp dirs.
-It also wraps `uv`, `python`, `python3`, `nvidia-smi`, `ncu`, `nsys`, and
-`nvcc` behind `outputs/gpu.lock`. The wrapper is reentrant through
-`KBH_GPU_LOCK_HELD=1`; preserve that guard or `uv run python benchmark.py` can
-deadlock when child `nvcc` tries to acquire the same lock.
+```bash
+# Single (harness, model, problem)
+./scripts/run_hard.sh claude claude-opus-4-7 problems/02_kimi_linear_decode
+
+# Full active matrix on one problem
+for model_harness in "claude claude-opus-4-7" "codex gpt-5.5 xhigh" "kimi kimi-k2.6"; do
+    read -r HARNESS MODEL <<< "$model_harness"
+    ./scripts/run_hard.sh "$HARNESS" "$MODEL" problems/02_kimi_linear_decode
+done
+
+# Everything (this is what sweep.sh does)
+./scripts/sweep.sh
+```
+
+### Correctness validation
+
+The correctness gate is stricter than the performance gate. `check.py` first
+validates nominal canonical shapes/seeds, then reruns the same shapes/seeds
+under problem-specific numeric stress cases from `src/eval/numeric_stress.py`.
+Stress cases only rescale existing floating inputs or model state; they do not
+add hidden shapes. Integer/discrete outputs are exact, while floating outputs
+use explicit per-dtype tolerances and report max absolute/relative error, bad
+element count, worst index, and tolerance on failure.
+
+`KBH_NUMERIC_STRESS=0` disables stress cases for local debugging only. Do not
+use it for official checks, sweeps, or published result backfills.
+
+The performance score remains comparable across the canonical deck:
+`benchmark.py` does not import numeric stress and still times the submitted
+solution on the normal benchmark inputs.
+
+### Concurrent sweeps and GPU isolation
+
+`scripts/run_hard.sh` gives every run a repo-shaped workspace under
+`outputs/runs/<run_id>/repo/problems/<problem_name>/`. Agents write there, not
+directly in `problems/<problem>/`. The workspace has immutable problem files
+copied from the source tree, `src/` symlinked from the repo, and local copies of
+`pyproject.toml`, `uv.lock`, and `.python-version` so an agent can mutate
+dependencies inside the run archive without touching repo metadata.
+
+Each run gets isolated build/cache state:
+
+```bash
+TORCH_EXTENSIONS_DIR="$RUN_DIR/cache/torch_extensions"
+TRITON_CACHE_DIR="$RUN_DIR/cache/triton"
+CUDA_CACHE_PATH="$RUN_DIR/cache/cuda"
+TMPDIR="$RUN_DIR/tmp"
+TEMP="$RUN_DIR/tmp"
+TMP="$RUN_DIR/tmp"
+```
+
+The harness prepends `$RUN_DIR/bin` to `PATH` and wraps `uv`, `python`,
+`python3`, `nvidia-smi`, `ncu`, `nsys`, and `nvcc`. These wrappers acquire the
+shared `outputs/gpu.lock`, log timing to `$RUN_DIR/gpu_lock.log`, and then run
+the real binary. The lock wrapper is intentionally reentrant:
+`KBH_GPU_LOCK_HELD=1` lets child tools such as `nvcc` run under the parent
+`uv run python benchmark.py` lock instead of deadlocking.
 Run metadata includes agent wall time, total/check/benchmark wall time,
 check/benchmark exit codes, parsed token/cache/reasoning usage, and GPU lock
 wait/active totals via `scripts/summarize_runs.py`.
@@ -49,45 +146,19 @@ Provider-credit detection must stay credit-specific; do not match plain
 Provider credit/rate classifications should only apply to rows without a
 solution; successful sessions may quote old run logs or result JSON in the
 transcript, and those quotes are not provider failures.
-Provider credit/rate detection must read explicit CLI/API error events and
-stderr only, not arbitrary assistant text or tool outputs; models can read
-AGENTS.md, `run_hard.sh`, and old artifacts containing those trigger words.
 When `KBH_DISABLE_AGENT_CUDA=1`, agent-phase `uv`/`python`/`python3`,
 `nvidia-smi`, and `nvcc` probes bypass the lock because CUDA is hidden and
 guarded or the probe is harmless; `ncu` and `nsys` fail fast. Harness-owned
 `check.py`/`benchmark.py` still lock normally.
-The `check.py`/`benchmark.py` execution timeout must start after the GPU lock is
-acquired. Use `run_gpu_locked_timeout`; do not wrap `timeout` outside `uv run`
-or queued rows can fail while merely waiting for `outputs/gpu.lock`.
+Transcript usage extraction also bypasses the lock; it is CPU-only post-processing.
 `benchmark.py` must score `variant=solution` first. Eager / compiled / SOTA
 reference diagnostics are opt-in via `KBH_BENCHMARK_BASELINES=1` (or a
 per-problem alias) and emit `benchmark_event` start/end/error lines for audits.
-Transcript usage extraction also bypasses the lock; it is CPU-only post-processing.
-`check.py` numeric stress is part of official correctness and should stay on.
-`KBH_NUMERIC_STRESS=0` is for local debugging only, not sweeps or published
-backfills. These stress cases do not add hidden shapes; they rescale existing
-floating inputs/state to catch zero-output, cached-nominal, and loose-tolerance
-cheats.
 
-Before expensive sweeps, check:
-
-```bash
-overnight-compute status
-nvidia-smi
-```
-
-The lock only protects KernelBench children launched through this harness. It
-does not stop unrelated CUDA compiles or benchmark jobs elsewhere on Anvil.
-
-For parallel sweeps, prefer:
-
-```bash
-KBH_DISABLE_AGENT_CUDA=1 ./scripts/launch_parallel_sweep.sh
-```
-
-`scripts/launch_parallel_sweep.sh` defaults to `KBH_HARNESS_CONCURRENCY=2`,
-so each harness/provider path gets at most two active agent sessions at once.
-Raise it only after a preflight proves quota and rate limits are healthy.
+For broad sweeps, `scripts/launch_parallel_sweep.sh` defaults to
+`KBH_HARNESS_CONCURRENCY=2`, meaning each harness/provider path can have at
+most two active agent sessions at once. Raise it only after a preflight proves
+quota and rate limits are healthy.
 The launcher must use per-harness workers. A problem-major loop causes
 head-of-line blocking: if Codex or Claude holds its two slots, freed Cursor,
 Gemini, or OpenCode slots do not backfill.
@@ -109,29 +180,21 @@ KernelBench-Hard. Do not kill unrelated higher-priority jobs such as IVA just
 to make the GPU table empty; note them in the report and keep KernelBench at
 lower priority.
 
-`KBH_DISABLE_AGENT_CUDA=1` hides CUDA from OpenCode/Cursor agent phases and
-lets only the harness-owned `check.py` / `benchmark.py` path touch the GPU
-under `outputs/gpu.lock`. PATH wrappers alone are not sufficient because
-agents can call absolute interpreters such as `.venv/bin/python3`; the current
-harness also injects an agent-phase `sitecustomize.py` guard and wrapper
-recursion fallback. If you see `REAL_UV=$(which uv)` inside a model command, it
-must not resolve back to the per-run wrapper or the lock owner can hang. Run
-archives now include `run_group`, total/check/benchmark wall time, queue mode,
-and token metadata where the harness exposes it. Summaries:
-
-Claude-family harnesses must launch from the archive-local `$PROBLEM_DIR`, not
-from repo root with only `--add-dir`; otherwise models can write
-`problems/<name>/solution.py` in the source tree and the archived run records
-`no_solution`.
+Before expensive work, still check external machine state:
 
 ```bash
-uv run python scripts/summarize_runs.py --run-group <name>
+overnight-compute status
+nvidia-smi
 ```
 
-High-priority rows:
+The lock only governs KernelBench children launched through `run_hard.sh`; it
+cannot serialize unrelated CUDA compiles or benchmark jobs elsewhere on Anvil.
+
+### Current model/harness candidates
+
+Smoke-tested candidates and useful commands:
 
 ```bash
-./scripts/run_hard.sh minimax-claude MiniMax-M3 problems/02_kimi_linear_decode
 ./scripts/run_hard.sh opencode openrouter-alibaba/qwen/qwen3.7-max problems/02_kimi_linear_decode
 ./scripts/run_hard.sh opencode openrouter-google-ai-studio/google/gemini-3.5-flash problems/02_kimi_linear_decode
 ./scripts/run_hard.sh cursor composer-2.5 problems/02_kimi_linear_decode
@@ -139,26 +202,117 @@ High-priority rows:
 ./scripts/run_hard.sh grok grok-build problems/02_kimi_linear_decode max
 ```
 
-Claude Code runs explicitly pass `--settings
-'{"fastMode":false,"alwaysThinkingEnabled":true}'`. Opus comparability also
-requires `--effort max`.
-MiniMax M3 through Claude Code uses harness `minimax-claude`, model
-`MiniMax-M3`, and MiniMax's Anthropic-compatible endpoint
-`https://api.minimax.io/anthropic`. Put `export MINIMAX_API_KEY=...` in
-Anvil's `~/.env_vars`; do not put it in repo files. Enable it in broad
-preflight/sweeps with `KBH_USE_MINIMAX_M3_CLAUDE=1`.
-Do not pass provider API keys with `timeout env KEY=... claude`; that puts the
-key in process argv. Export secrets inside the subshell before invoking
-`timeout claude` instead.
+Other serious rows to keep in the matrix if their auth/config is healthy:
+`codex gpt-5.5 xhigh`, `claude claude-opus-4-7 max`, `claude
+claude-opus-4-8 max`, `zai-claude glm-5.1`, Factory/Droid GLM-5.1 if the auth
+bundle is present, and Kimi only after auth is fixed.
 
-As of 2026-05-22, Qwen 3.7 Max passed a 300 second `01_qwen3_decode_block` smoke via
-OpenCode/Alibaba (`correct=true`, `peak_fraction=0.4257`). Gemini 3.5 Flash and
-Composer 2.5 wrote solutions in 300 second smokes but did not pass correctness;
-Composer's sidecar-CUDA behavior makes that smoke harness-sensitive, so rerun it
-with the current isolation before judging the model. Cursor CLI on Anvil is
-`agent`, not `cursor`; available Cursor model slugs include `composer-2.5` and
-`composer-2.5-fast`.
-Grok CLI is installed on Anvil as `/home/infatoshi/.local/bin/grok`, not on the
-Mac control plane. Use harness `grok` with model `grok-build`; the working
-headless route is top-level `grok --cwd <workspace> --output-format
-streaming-json -p <prompt>`, not `grok agent`.
+For Claude Code runs, `scripts/run_hard.sh` passes `--settings
+'{"fastMode":false,"alwaysThinkingEnabled":true}'` by default. The Opus matrix
+also passes `--effort max`; do not count a Claude rerun as comparable if either
+fast mode or a lower effort tier slipped in.
+
+Current smoke notes:
+
+- Qwen 3.7 Max via OpenCode/Alibaba passed a 300 second `01_qwen3_decode_block` smoke:
+  `correct=true`, `peak_fraction=0.4257`, `template_mutated=false`.
+- Gemini 3.5 Flash via OpenCode/Google AI Studio wrote a solution in a 300
+  second smoke but did not pass correctness.
+- Composer 2.5 via Cursor Agent wrote a solution in a 300 second smoke but did
+  not pass correctness. That run was harness-sensitive because it generated a
+  sidecar CUDA file, so rerun it with the current workspace/cache/lock isolation
+  before judging capability.
+- Cursor CLI on Anvil is `/home/infatoshi/.local/bin/agent`, not `cursor`.
+  Available Cursor model slugs include `composer-2.5` and `composer-2.5-fast`.
+- Grok CLI is installed on Anvil as `/home/infatoshi/.local/bin/grok`, not on
+  the Mac control plane. `grok models` currently exposes `grok-build` as the
+  default model. The working headless route is top-level `grok --cwd
+  <workspace> --output-format streaming-json -p <prompt>`; `grok agent` does
+  not accept the same cwd/output flags.
+
+### Z.ai GLM-5.1 via Claude Code
+
+For a canonical GLM-5.1 rerun through Claude Code, use the `zai-claude`
+harness, not OpenCode. Z.ai's Anthropic-compatible Claude Code endpoint is
+`https://api.z.ai/api/anthropic`; the OpenAI-compatible coding endpoint is for
+Droid/Factory.
+
+`scripts/run_hard.sh` sets the Z.ai-recommended Claude Code defaults in the
+`zai-claude` branch:
+
+```bash
+CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS=1
+CLAUDE_CODE_MAX_RETRIES=1000000
+CLAUDE_CODE_MAX_OUTPUT_TOKENS=128000
+ZAI_CLAUDE_HAIKU_MODEL=glm-5.1
+```
+
+All Claude Code aliases should map to `glm-5.1`, including Haiku / Explore /
+subagent calls. The harness also passes `--disallowedTools ExitPlanMode
+EnterPlanMode AskUserQuestion` for this route.
+
+### Harness operational notes
+
+These apply to every harness route, not just Claude Code:
+
+- **Timeout starts after the GPU lock.** Use `run_gpu_locked_timeout` for
+  `check.py`/`benchmark.py`; do not wrap `timeout` outside `uv run`, or queued
+  rows can fail while merely waiting for `outputs/gpu.lock`.
+- **CUDA hiding needs more than PATH wrappers.** `KBH_DISABLE_AGENT_CUDA=1`
+  hides CUDA from OpenCode/Cursor agent phases, but agents can call absolute
+  interpreters such as `.venv/bin/python3`, so the harness also injects an
+  agent-phase `sitecustomize.py` guard and a wrapper-recursion fallback. If you
+  see `REAL_UV=$(which uv)` inside a model command, it must not resolve back to
+  the per-run wrapper or the lock owner can hang.
+- **Claude-family harnesses must launch from the archive-local `$PROBLEM_DIR`,**
+  not from repo root with only `--add-dir`; otherwise models can write
+  `problems/<name>/solution.py` in the source tree and the archived run records
+  `no_solution`.
+- **Provider credit/rate detection must read explicit CLI/API error events and
+  stderr only,** never arbitrary assistant text or tool output — models can read
+  AGENTS.md, `run_hard.sh`, and old artifacts that contain those trigger words.
+  It should only apply to rows without a solution.
+- **Never pass provider API keys via `timeout env KEY=... claude`** — that puts
+  the key in process argv. Export secrets inside the subshell before invoking
+  `timeout claude`.
+
+#### MiniMax M3 via Claude Code
+
+MiniMax M3 routes through the `minimax-claude` harness (model `MiniMax-M3`) and
+MiniMax's Anthropic-compatible endpoint `https://api.minimax.io/anthropic`. Put
+`export MINIMAX_API_KEY=...` in Anvil's `~/.env_vars` (never in repo files), and
+enable it in broad preflight/sweeps with `KBH_USE_MINIMAX_M3_CLAUDE=1`.
+
+## Interpreting results
+
+- `outputs/runs/<ts>_<harness>_<model>_<problem>/result.json` — scalar metrics (correct, achieved_tflops, peak_fraction, shape-by-shape times)
+- `outputs/runs/<ts>_..../transcript.jsonl` — full agent trace
+- `outputs/runs/<ts>_..../solution.py` — final agent-written kernel
+- `outputs/runs/<ts>_..../roofline.png` — visual: peak line, eager/compile/SOTA/solution points per shape
+
+Run `uv run python scripts/roofline_plot.py outputs/runs/<ts>_...` to (re)generate the plot.
+
+## Testing
+
+Keep `tests/` minimal. We test:
+- `src/hardware/` peak-value lookup
+- `src/eval/roofline.py` throughput math
+- `src/eval/correctness.py` per-dtype tolerance enforcement
+- `src/eval/numeric_stress.py` against classic zero-output, cached-nominal, and
+  parameter-scale restoration cases
+
+We do **not** test full problem files directly — those are validated by running
+a real agent or a disposable smoke workspace against them.
+
+```bash
+uv run pytest
+```
+
+## When a sweep fails
+
+Most likely causes:
+1. **torch.compile CSE crash** — run `./scripts/patch_torch.sh`.
+2. **CUDA_HOME pointing at 12.8** — harness script already sets `CUDA_HOME=/usr/local/cuda-13`; make sure you sourced it.
+3. **`sota.py` import fails** — the SOTA dep isn't installed. Check `problem.yaml` for the pinned version; install with `uv pip install <spec>`.
+4. **Agent CLI not authenticated** — `claude`, `codex`, `kimi` each need their own auth. Check `~/.env_vars` and each CLI's `info` / `whoami` command.
+5. **Agent ran out of budget before writing anything** — raise `BUDGET_SECONDS` (the wall-clock ceiling; unlimited-time generations use a large value) or accept this as a failure mode worth recording.
