@@ -13,7 +13,6 @@ This is the canonical monorepo: it ships both the public website and the benchma
 ├── public/                 Website static assets
 ├── benchmarks/
 │   ├── hard/             Latest (2026-04). Single Blackwell, 6 problems, 10 models. Live on /hard.
-│   │   ├── AGENTS.md       Agent operating rules for this bench (CLAUDE.md → symlink).
 │   │   ├── SPEC.md         Design + methodology.
 │   │   ├── DEVLOG.md       Decisions, dead ends, lessons.
 │   │   ├── LEADERBOARD.md  Human-readable cross-model grid + rubric-leak footnotes.
@@ -26,15 +25,15 @@ This is the canonical monorepo: it ships both the public website and the benchma
 │   │   └── tests/
 │   ├── mega/              Megakernel bench (2 problems). Same shape as hard/; not yet published to the site.
 │   └── v3/                 Archive (2026-02). RTX 3090 + H100 + B200, 43-58 problems/GPU, 10 models.
-│       ├── AGENTS.md, README.md, SPEC.md
+│       ├── AGENTS.md, README.md, SPEC.md   (archive keeps its own agent doc)
 │       ├── docs/           Overflow reference (problem inventory, reward-hack cases, v4 briefs).
 │       ├── problems/, src/, scripts/, tests/, …
 ├── environments/           Prime Intellect `verifiers` mirrors of the benches (kernel_hard / kernel_mega / kernel_v3).
-├── AGENTS.md               Repo-wide operator guide (CLAUDE.md → symlink). Per-bench detail lives in each bench's AGENTS.md.
+├── AGENTS.md               Single operator guide for the whole repo + both active benches (CLAUDE.md → symlink).
 └── README.md               (this file)
 ```
 
-Doc convention: every level carries `README.md` (humans), `AGENTS.md` (agents; `CLAUDE.md` is a symlink to it), and each bench adds `SPEC.md` (design), `DEVLOG.md` (running record of decisions and dead ends), and `LEADERBOARD.md` (human-readable grid). The website surfaces the visualization-ready slice (leaderboard, per-problem ceilings, annotations); the benchmark subdirs hold the full machinery so the work can be reproduced or extended.
+Doc convention: agent instructions for the website and both active benches (hard + mega) are consolidated into one top-level `AGENTS.md` (`CLAUDE.md` is a symlink to it), so Claude Code and Codex read the same file and there's no confusion about which bench you're editing. Per-bench `README.md` (humans), `SPEC.md` (design), `DEVLOG.md` (running record), and `LEADERBOARD.md` (grid) stay in each bench dir; only the `benchmarks/v3/` archive keeps its own `AGENTS.md`. The website surfaces the visualization-ready slice (leaderboard, per-problem ceilings, annotations); the benchmark subdirs hold the full machinery so the work can be reproduced or extended.
 
 ## How the site reads data
 
