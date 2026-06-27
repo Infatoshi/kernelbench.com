@@ -12,10 +12,9 @@ Sibling of **kernel_mega**: identical native-harness machinery (`src/eval`, `che
 
 ## Task / deck
 
-~10 operation-level hard CUDA kernels: `01_fp8_gemm`, `02_kda_cutlass`, `03_paged_attention`,
-`05_topk_bitonic`, `06_sonic_moe_swiglu`, `07_w4a16_gemm`, `09_fmha_preattn_mrope`,
-`10_patch_embed_conv3d_gemm`, … (link-don't-spoil briefs; forbidden-op lists enforced by the
-native `check.py`).
+6 operation-level hard CUDA kernels: `01_fp8_gemm`, `02_kda_cutlass`, `03_paged_attention`,
+`05_topk_bitonic`, `06_sonic_moe_swiglu`, `07_w4a16_gemm` (link-don't-spoil briefs;
+forbidden-op lists enforced by the native `check.py`).
 
 ## Multi-turn (agentic) structure
 

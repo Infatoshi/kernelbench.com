@@ -280,4 +280,4 @@ Most likely causes:
 2. **CUDA_HOME pointing at 12.8** — harness script already sets `CUDA_HOME=/usr/local/cuda-13`; make sure you sourced it.
 3. **`sota.py` import fails** — the SOTA dep isn't installed. Check `problem.yaml` for the pinned version; install with `uv pip install <spec>`.
 4. **Agent CLI not authenticated** — `claude`, `codex`, `kimi` each need their own auth. Check `~/.env_vars` and each CLI's `info` / `whoami` command.
-5. **Agent ran out of budget before writing anything** — raise `BUDGET_SECONDS` (the wall-clock ceiling; unlimited-time generations use a large value) or accept this as a failure mode worth recording.
+5. **Agent stopped before writing anything** — runs are unlimited-time (no wall-clock cap; `BUDGET_SECONDS=0` in `run_hard.sh`), so a no-solution row is a real failure mode (early stop / provider error), not a budget cutoff. Record it.

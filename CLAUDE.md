@@ -22,7 +22,7 @@ justfile                   `just` recipes (see below)
 ## Run a sweep (the common task) — use the `kb` CLI (on PATH, runs from any cwd)
 
 ```
-kb sweep kimi-claude kimi-k2.7-code       # all 6 problems, parallel containers, 2700s
+kb sweep kimi-claude kimi-k2.7-code       # all 6 problems, parallel containers, unlimited time
 kb publish                                # rebuild leaderboard + viewers from archives
 kb deploy "bench kimi k2.7"               # publish + commit + push (Vercel auto-builds)
 ```

@@ -95,11 +95,10 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# Wall-clock ceiling per run. Methodology is unlimited-time: the model runs until
-# it decides it is done, so real generations override this to a large value
-# (e.g. BUDGET_SECONDS=21600). 2700 is a fallback default; smoke-test with a small
-# override (e.g. BUDGET_SECONDS=300).
-BUDGET_SECONDS="${BUDGET_SECONDS:-2700}"
+# No wall-clock ceiling per run. Methodology is unlimited-time: the model runs
+# until it decides it is done. 0 = no cap (GNU `timeout 0` disables the timeout),
+# applied uniformly to every harness invocation below.
+BUDGET_SECONDS=0
 CHECK_TIMEOUT_SECONDS="${KBH_CHECK_TIMEOUT_SECONDS:-180}"
 if [ "$PROBLEM_NAME" = "02_kda_cutlass" ]; then
     BENCHMARK_TIMEOUT_SECONDS="${KBH_BENCHMARK_TIMEOUT_02_KDA_CUTLASS_SECONDS:-${KBH_BENCHMARK_TIMEOUT_SECONDS:-7200}}"
@@ -958,10 +957,15 @@ run_opencode_container() {
     local start_ts elapsed remaining status wd_before wd_after
     start_ts="$(date +%s)"
     while :; do
-        elapsed=$(( $(date +%s) - start_ts ))
-        remaining=$(( BUDGET_SECONDS - elapsed ))
-        if [ "$remaining" -le 60 ]; then
-            return 124
+        # Unlimited wall clock: pass 0 to timeout (no cap). The stall watchdog
+        # below still supervises the session for silent hangs and retries.
+        remaining=0
+        if [ "$BUDGET_SECONDS" -ne 0 ]; then
+            elapsed=$(( $(date +%s) - start_ts ))
+            remaining=$(( BUDGET_SECONDS - elapsed ))
+            if [ "$remaining" -le 60 ]; then
+                return 124
+            fi
         fi
         wd_before=0
         [ -f "$RUN_DIR/stall_watchdog.log" ] && wd_before="$(wc -l < "$RUN_DIR/stall_watchdog.log")"
@@ -1283,7 +1287,7 @@ echo "Problem:    $PROBLEM_NAME"
 echo "Source:     $SOURCE_PROBLEM_DIR"
 echo "Workspace:  $PROBLEM_DIR"
 echo "Archive:    $RUN_DIR"
-echo "Budget:     ${BUDGET_SECONDS}s"
+echo "Budget:     unlimited (no wall-clock cap)"
 echo "========================================"
 
 START_TIME=$(date +%s)

@@ -91,14 +91,6 @@ _CASES: dict[str, tuple[NumericStressCase, ...]] = {
             tolerance={"bfloat16": {"atol": 1.0, "rtol": 5e-2}},
         ),
     ),
-    "09_fmha_preattn_mrope": (
-        NumericStressCase("small_qk", input_scales={0: 1e-2, 1: 1e-2}, tolerance=_SMALL_BF16),
-        NumericStressCase("large_qk", input_scales={0: 16.0, 1: 16.0}, tolerance=_LARGE_BF16),
-    ),
-    "10_patch_embed_conv3d_gemm": (
-        NumericStressCase("small_input", input_scales={0: 1e-2}, tolerance=_SMALL_BF16),
-        NumericStressCase("large_input", input_scales={0: 16.0}, tolerance=_LARGE_BF16),
-    ),
 }
 
 
