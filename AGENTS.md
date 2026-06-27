@@ -65,9 +65,14 @@ kb deploy "bench kimi k2.7"               # publish + commit + push (Vercel auto
 ```
 Other commands: `kb run <harness> <model> <problem>` (one problem), `kb dev`
 (preview, view from Mac via Tailscale anvil:3000), `kb build`, `kb audit <run_id>`,
-`kb help`. The CLI lives at `bin/kb` (symlinked to ~/.local/bin/kb). The `kb`
-CLI targets the **hard** bench; for **mega** drive `./scripts/run_hard.sh` /
-`./scripts/sweep.sh` from inside `benchmarks/mega/`.
+`kb contamination <hard|mega|v3>`, `kb traces-to-hf`, `kb help`. The CLI is the
+`kbtool/` uv package (`kbtool/kb/cli.py`); `bin/kb` is a thin shim that runs it
+via `uv run` (symlinked to ~/.local/bin/kb). Install standalone with
+`uv tool install ./kbtool`. The GPU-coupled sweep orchestration stays as
+bench-local shell (`benchmarks/<bench>/scripts/*.sh`); the CLI shells out to it.
+The `kb` CLI targets the **hard** bench; for **mega** drive
+`./scripts/run_hard.sh` / `./scripts/sweep.sh` from inside `benchmarks/mega/`
+(or `kb publish mega`).
 
 - API keys live in `~/.env_vars` (KIMI_API_KEY, ZAI_API_KEY, MINIMAX_API_KEY,
   OPENROUTER_API_KEY, OPENAI_API_KEY, GEMINI_API_KEY, CLAUDE_CODE_OAUTH_TOKEN).
@@ -448,8 +453,8 @@ Most likely causes:
   bash + absolute paths, so they can read the shared `outputs/runs/` archive —
   every prior winning solution — and reverse-engineer a known answer instead of
   writing their own kernel. This is NOT what `kb lint` checks (lint only scans a
-  single solution.py). Run `python scripts/audit_contamination.py
-  benchmarks/<bench>/outputs/runs [--published results/leaderboard.json]` before
+  single solution.py). Run `kb contamination <hard|mega|v3>
+  [--published benchmarks/<bench>/results/leaderboard.json]` before
   publishing; both leaderboard builders now auto-EXCLUDE any run whose agent
   transcript references another run's archive. Audit on 2026-06-19 found
   mega-published 7/24 contaminated (the glm-5.2 17.4x / MiniMax 16.5x "beat opus"

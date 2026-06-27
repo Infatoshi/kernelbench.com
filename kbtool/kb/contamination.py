@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Cross-run contamination audit for KernelBench runs (hard or mega).
 
 The harness does NOT sandbox the agent filesystem: an agent has bash + absolute
@@ -7,13 +6,9 @@ solution -- and reverse-engineer a known answer instead of writing its own
 kernel. A run is CONTAMINATED if its agent transcript references another run's
 archive (`outputs/runs/<other_ts>`).
 
-This is the audit `kb lint` did NOT do (lint only scans a single solution.py for
-in-solution reward-hacks). Run it before publishing; the leaderboard builders
-also exclude contaminated runs automatically.
-
-Usage:
-  python scripts/audit_contamination.py benchmarks/mega/outputs/runs
-  python scripts/audit_contamination.py benchmarks/hard/outputs/runs --published benchmarks/hard/results/leaderboard.json
+This is the audit `kb lint` does NOT do (lint only scans a single solution.py
+for in-solution reward-hacks). Run it before publishing; the leaderboard
+builders also exclude contaminated runs automatically.
 """
 from __future__ import annotations
 
@@ -43,14 +38,24 @@ def other_archives(run_dir: Path) -> set[str]:
     return seen
 
 
-def main() -> None:
-    ap = argparse.ArgumentParser()
-    ap.add_argument("runs", help="path to an outputs/runs directory")
+def run(argv: list[str] | None = None, repo_root: Path | None = None) -> int:
+    ap = argparse.ArgumentParser(prog="kb contamination")
+    ap.add_argument(
+        "runs",
+        help="path to an outputs/runs directory, or a bench name (hard|mega|v3)",
+    )
     ap.add_argument("--published", help="leaderboard.json to flag contaminated PUBLISHED cells")
-    args = ap.parse_args()
+    args = ap.parse_args(argv)
 
     runs = Path(args.runs)
-    dirty = {}
+    # Convenience: accept a bench name and resolve against the repo.
+    if repo_root is not None and not runs.exists() and args.runs in ("hard", "mega", "v3"):
+        runs = repo_root / "benchmarks" / args.runs / "outputs" / "runs"
+    if not runs.is_dir():
+        print(f"no such runs dir: {runs}")
+        return 1
+
+    dirty: dict[str, int] = {}
     total = 0
     for d in sorted(runs.iterdir()):
         if not d.is_dir():
@@ -78,7 +83,4 @@ def main() -> None:
                     pub_dirty += 1
                     print(f"  PUBLISHED-CONTAMINATED  {m.get('label')} {prob}  ({dirty[rid]} archives)")
         print(f"=== PUBLISHED cells contaminated: {pub_dirty} / {pub_total} ===")
-
-
-if __name__ == "__main__":
-    main()
+    return 0
