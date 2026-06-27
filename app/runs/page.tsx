@@ -1,6 +1,6 @@
 import { readdir } from "node:fs/promises"
 import { join } from "node:path"
-import { loadLeaderboard } from "@/lib/data"
+import { loadLeaderboard } from "@/app/_lib/data"
 
 type RunRow = {
   run_id: string

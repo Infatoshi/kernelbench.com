@@ -8,9 +8,9 @@ This is the canonical monorepo: it ships both the public website and the benchma
 
 ```
 .
-├── app/                    Next.js website
-├── lib/data.ts             Reads benchmark data from benchmarks/ at build time
+├── app/                    Next.js website (app/_lib/data.ts reads benchmark data at build time)
 ├── public/                 Website static assets
+├── media/                  Tracked chart generators (kbh_theme.py + make_*.py + generate_dark_plots.py)
 ├── benchmarks/
 │   ├── hard/             Latest (2026-04). Single Blackwell, 6 problems, 10 models. Live on /hard.
 │   │   ├── SPEC.md         Design + methodology.
@@ -37,7 +37,7 @@ Doc convention: agent instructions for the website and both active benches (hard
 
 ## How the site reads data
 
-`lib/data.ts` reads `benchmarks/hard/results/leaderboard.json` and the YAML annotations directly from the filesystem at build time. No network fetch, no HTTP cache — Next.js bakes the data into the page during `next build`. To update what the site shows: change the file under `benchmarks/`, push, Vercel rebuilds.
+`app/_lib/data.ts` reads `benchmarks/hard/results/leaderboard.json` and the YAML annotations directly from the filesystem at build time. No network fetch, no HTTP cache — Next.js bakes the data into the page during `next build`. To update what the site shows: change the file under `benchmarks/`, push, Vercel rebuilds.
 
 ## Versions
 

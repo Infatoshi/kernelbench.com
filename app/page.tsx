@@ -1,7 +1,7 @@
 import Link from "next/link"
 import { GroupedBars } from "./home-charts"
 import { EfficiencyChart } from "./efficiency-chart"
-import { loadMegaChart, loadHardChart, loadEfficiency } from "@/lib/charts"
+import { loadMegaChart, loadHardChart, loadEfficiency } from "@/app/_lib/charts"
 
 const HUGGING_FACE_LOGO =
   "https://huggingface.co/front/assets/huggingface_logo-noborder.svg"

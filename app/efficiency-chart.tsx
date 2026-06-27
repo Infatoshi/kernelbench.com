@@ -1,7 +1,7 @@
 "use client"
 
 import { useState } from "react"
-import type { EffByGpu, EffPoint } from "@/lib/charts"
+import type { EffByGpu, EffPoint } from "@/app/_lib/charts"
 
 // Performance vs compute (output tokens) scatter with the efficiency frontier
 // highlighted. Benchmark toggle (Mega/Hard) + GPU toggle (only GPUs with clean

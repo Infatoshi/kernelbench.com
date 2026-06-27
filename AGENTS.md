@@ -41,7 +41,8 @@ unless you're specifically working the archive.
 ## Layout
 
 ```
-app/ lib/ public/          the website (Next.js 16, Tailwind v4)
+app/ public/              the website (Next.js 16, Tailwind v4)
+  app/_lib/data.ts             reads benchmark data at build time
   public/data/v3/results.csv   /v3 reads this
 benchmarks/hard/           KernelBench-Hard eval — the per-op deck
   results/leaderboard.json     /hard reads this (v2 site-shaped data)
@@ -51,8 +52,8 @@ benchmarks/hard/           KernelBench-Hard eval — the per-op deck
 benchmarks/mega/           KernelBench-Mega eval — megakernel deck (reuses hard's machinery)
 benchmarks/v3/             KernelBench-v3 eval — archived (keeps its own AGENTS.md)
 environments/              Prime Intellect `verifiers` mirrors (kernel_hard / kernel_mega / kernel_v3)
-x-article-images/          tracked chart generators (kbh_theme.py + make_*.py)
-justfile                   `just` recipes (see below)
+media/                     tracked chart generators (kbh_theme.py + make_*.py + generate_dark_plots.py)
+runs/                      gitignored HF staging (kb publish fills it, pushes to HF)
 ```
 
 ## Run a sweep (the common task) — use the `kb` CLI (on PATH, runs from any cwd)
@@ -496,13 +497,13 @@ optional. They are what makes a post read as signal, not slop.
 
 - **Charts MUST use the website NVIDIA palette.** Import the shared theme,
   never hardcode colors: `from kbh_theme import C, SERIES, apply` (module at
-  `x-article-images/kbh_theme.py`, mirrored on Mac at
-  `~/dev/sites/kernelbench.com/x-article-images/`). It copies the `:root`
+  `media/kbh_theme.py`, mirrored on Mac at
+  `~/dev/sites/kernelbench.com/media/`). It copies the `:root`
   tokens from `app/globals.css`: bg `#111111`, accent (NVIDIA green) `#76b900`,
   fg `#eeeeee`/`#999999`, warn `#fbbf24`, bad `#fb7185`, grid `#242424`. Lead
   bars with the green accent (the ceiling/subject); rose `#fb7185` = reward
   hack (hatched), amber = warn, grey = fail, faded+dotted = real kernel that
-  bugged/timed out. `x-article-images/make_glm52_4way.py` is the canonical
+  bugged/timed out. `media/make_glm52_4way.py` is the canonical
   example. If `globals.css` changes, update `kbh_theme.py` to match. Charts are
   generated on Mac (matplotlib) and dragged into posts; PNGs are gitignored,
   the `.py` scripts are tracked.
@@ -517,7 +518,7 @@ optional. They are what makes a post read as signal, not slop.
   cannot show is the whole point.
 - **Post artifacts are EPHEMERAL — clean up after posting.** The only durable
   things are (1) these doc rules and (2) the tracked chart generators in
-  `x-article-images/*.py` (`kbh_theme.py` = palette, `make_*.py` = each chart).
+  `media/*.py` (`kbh_theme.py` = palette, `make_*.py` = each chart).
   Raw post drafts (`X-*.md`/`.txt`) and rendered `*.png` are throwaway: drafts
   never get committed, PNGs are gitignored and regenerate from the `.py` on
   demand. After you help draft a post, **ask the human when it goes live, then

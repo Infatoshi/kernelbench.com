@@ -1,7 +1,7 @@
 "use client"
 
 import { useState } from "react"
-import type { ChartData } from "@/lib/charts"
+import type { ChartData } from "@/app/_lib/charts"
 
 // GPU-toggled chart: pick a GPU and the benchmark renders as a single sorted
 // bar per model. The full cross-GPU numbers live in an expandable table.

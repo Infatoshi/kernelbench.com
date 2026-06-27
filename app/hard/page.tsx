@@ -8,7 +8,7 @@ import {
   type Cell,
   type Model,
   type RunAudit,
-} from "@/lib/data"
+} from "@/app/_lib/data"
 import { LeaderboardTable, type HardRunRecord } from "./leaderboard-table"
 
 // Full agent transcripts now live on HuggingFace (per-run trace files); the

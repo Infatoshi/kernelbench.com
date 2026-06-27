@@ -1,5 +1,5 @@
 import Link from "next/link"
-import { loadBaselines, loadLeaderboard } from "@/lib/data"
+import { loadBaselines, loadLeaderboard } from "@/app/_lib/data"
 
 const PROBLEMS = [
   { key: "01_fp8_gemm", label: "FP8 GEMM" },
