@@ -19,9 +19,11 @@
 
 set -euo pipefail
 
-# Pin CUDA 13 — /usr/local/cuda may still point at 12.8.
-if [ -d /usr/local/cuda-13 ]; then
-    export CUDA_HOME=/usr/local/cuda-13
+# Pin CUDA 13 — /usr/local/cuda may still point at 12.8. Override the pinned
+# toolkit dir on other machines with KBH_CUDA_HOME (default /usr/local/cuda-13).
+KBH_CUDA_HOME="${KBH_CUDA_HOME:-/usr/local/cuda-13}"
+if [ -d "$KBH_CUDA_HOME" ]; then
+    export CUDA_HOME="$KBH_CUDA_HOME"
     export PATH="$CUDA_HOME/bin:$PATH"
 fi
 

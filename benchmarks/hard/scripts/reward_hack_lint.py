@@ -7,7 +7,7 @@ legitimate CUDA-graph replay). "Greps are tripwires, not audits."
 
 Usage:
   python scripts/reward_hack_lint.py <run_id>     # one run
-  python scripts/reward_hack_lint.py --all        # every run referenced by leaderboard_v2.json
+  python scripts/reward_hack_lint.py --all        # every run referenced by the live leaderboard.json
 """
 from __future__ import annotations
 import json, re, sys, glob
@@ -86,8 +86,19 @@ def main(argv):
     if not argv:
         print(__doc__); return 2
     if argv[0] == "--all":
-        lb = json.load(open(ROOT / "results/leaderboard_v2.json"))
-        rids = sorted({c["run_id"] for m in lb["models"] for c in m["results"].values()})
+        # Lint the LIVE published board (what the site serves), not a stale copy.
+        lb_path = ROOT / "results/leaderboard.json"
+        if not lb_path.exists():
+            lb_path = ROOT / "results/leaderboard_v2.json"
+        lb = json.load(open(lb_path))
+        rids = sorted(
+            {
+                c["run_id"]
+                for m in lb["models"]
+                for c in m["results"].values()
+                if c.get("run_id")
+            }
+        )
         n = sum(report(r) for r in rids)
         print(f"\n{n}/{len(rids)} runs flagged for audit.")
     else:

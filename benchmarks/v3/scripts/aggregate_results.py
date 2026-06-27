@@ -2,10 +2,18 @@
 
 import csv
 import json
+import os
 import shutil
+import sys
 from pathlib import Path
 
-BASE = Path("/home/infatoshi/cuda/KernelBench-v3")
+# Root of the KernelBench-v3 checkout whose outputs we aggregate. Override with
+# the KB_V3_BASE env var or a single CLI arg; defaults to the canonical Anvil
+# checkout for backwards compatibility.
+BASE = Path(
+    os.environ.get("KB_V3_BASE")
+    or (sys.argv[1] if len(sys.argv) > 1 else "/home/infatoshi/cuda/KernelBench-v3")
+).expanduser()
 BATCH_DIR = BASE / "outputs" / "batch_eval"
 OUT_DIR = BASE / "outputs" / "aggregated"
 CSV_PATH = OUT_DIR / "results_v3.csv"

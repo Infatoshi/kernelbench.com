@@ -137,10 +137,14 @@ class LocalSandbox:
         """Execute command in local sandbox."""
         if not self._started:
             raise RuntimeError("Sandbox not started")
-        # VENDORED PATCH (kernel_v3 self-containment): rewrite a leading bare
-        # `python` token to this interpreter so the GPU subprocess uses the ENV
-        # venv torch, not whatever `python` happens to be on PATH.
-        command = re.sub(r"(?<![\w/.-])python(?=\s)", sys.executable, command)
+        # VENDORED PATCH (kernel_v3 self-containment): rewrite a bare `python`,
+        # `python3`, or `python3.x` token to this interpreter so the GPU
+        # subprocess uses the ENV venv torch, not whatever `python` happens to be
+        # on PATH. The lookbehind avoids matching inside paths/identifiers
+        # (e.g. `ipython`, `/usr/bin/python`).
+        command = re.sub(
+            r"(?<![\w/.-])python(?:3(?:\.\d+)?)?(?=\s)", sys.executable, command
+        )
         return self._exec(command, timeout)
 
     def write_file(self, path: str, content: str) -> bool:
