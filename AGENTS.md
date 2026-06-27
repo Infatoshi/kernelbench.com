@@ -1,11 +1,12 @@
 # kernelbench.com — operator guide
 
-`AGENTS.md` is the **single source of truth** for working in this repo, and
-`CLAUDE.md` is a symlink to it — so Claude Code (`CLAUDE.md`), Codex, Cursor,
-and any other CLI (`AGENTS.md`) all read this exact file. Everything you need to
-work on the website **and** both active benches lives here; there are no
-per-bench `AGENTS.md` / `CLAUDE.md` files anymore (the lone exception is the
-`benchmarks/v3/` archive, which keeps its own).
+`AGENTS.md` is the **single source of truth** for working in this repo;
+`CLAUDE.md` and `.cursorrules` are symlinks to it — so Claude Code
+(`CLAUDE.md`), Cursor (`.cursorrules` / `AGENTS.md`), Codex, and any other CLI
+(`AGENTS.md`) all read this exact file. Everything you need to work on the
+website **and** both active benches lives here; there are no per-bench
+`AGENTS.md` / `CLAUDE.md` / `.cursorrules` files anymore (the lone exception is
+the `benchmarks/v3/` archive, which keeps its own).
 
 This is the **canonical monorepo** for the KernelBench website AND the eval
 benchmarks. It lives on Anvil at `~/kernelbench.com` (the GPU box, where evals
