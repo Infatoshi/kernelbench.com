@@ -2,6 +2,15 @@ import { readdir } from "node:fs/promises"
 import { join } from "node:path"
 import { loadLeaderboard } from "@/app/_lib/data"
 
+// Full agent transcripts live on HuggingFace (per-run trace JSONL); the site
+// keeps only the raw submitted-kernel files locally. Each row links to its HF
+// trace, matching how /hard and /mega surface transcripts.
+const HARD_TRACES_HF = "https://huggingface.co/datasets/Infatoshi/kernelbench-hard-traces"
+
+function traceUrl(runId: string): string {
+  return `${HARD_TRACES_HF}/blob/main/${runId}.jsonl`
+}
+
 type RunRow = {
   run_id: string
   problem: string
@@ -23,20 +32,21 @@ type RunsIndexProps = {
 
 async function loadAllRuns(): Promise<RunRow[]> {
   const lb = await loadLeaderboard()
-  const viewerEntries = new Set<string>()
+  const solutionEntries = new Set<string>()
   try {
     const entries = await readdir(join(process.cwd(), "public/runs"))
     for (const n of entries) {
-      if (n.endsWith(".html")) viewerEntries.add(n.slice(0, -5))
+      if (n.endsWith("_solution.py.txt"))
+        solutionEntries.add(n.slice(0, -"_solution.py.txt".length))
     }
   } catch {
-    // no public/runs dir, no viewers — page still works, just empty
+    // no public/runs dir — page still works, just empty
   }
 
   const out: RunRow[] = []
   for (const m of lb.models) {
     for (const [problem, cell] of Object.entries(m.results)) {
-      if (!viewerEntries.has(cell.run_id)) continue
+      if (!solutionEntries.has(cell.run_id)) continue
       out.push({
         run_id: cell.run_id,
         problem,
@@ -144,7 +154,7 @@ export default async function RunsIndex({ searchParams }: RunsIndexProps) {
           </p>
         ) : null}
         <p className="text-[var(--color-fg)] leading-relaxed max-w-3xl text-sm">
-          One row per (model, problem) cell. Click any row to open the full transcript viewer — every tool call, every reasoning step, the model&apos;s solution.py, the check.log, the result.json. The viewer is the same one we use locally to audit runs, just themed for the site.
+          One row per (model, problem) cell. Click any row to open the full agent transcript on HuggingFace — every tool call, every reasoning step, the model&apos;s solution.py, and the result. Transcripts are published as per-run JSONL in the <a href={HARD_TRACES_HF} target="_blank" rel="noreferrer">kernelbench-hard-traces</a> dataset.
         </p>
       </section>
 
@@ -166,7 +176,9 @@ export default async function RunsIndex({ searchParams }: RunsIndexProps) {
                 <td className="text-right pr-4">{statusCell(r)}</td>
                 <td className="text-[var(--color-fg)] whitespace-nowrap">
                   <a
-                    href={`/runs/${r.run_id}.html`}
+                    href={traceUrl(r.run_id)}
+                    target="_blank"
+                    rel="noreferrer"
                     className="no-underline hover:text-[var(--color-accent)]"
                   >
                     {r.problem}
@@ -174,7 +186,9 @@ export default async function RunsIndex({ searchParams }: RunsIndexProps) {
                 </td>
                 <td className="text-[var(--color-fg-bright)] whitespace-nowrap">
                   <a
-                    href={`/runs/${r.run_id}.html`}
+                    href={traceUrl(r.run_id)}
+                    target="_blank"
+                    rel="noreferrer"
                     className="no-underline hover:text-[var(--color-accent)]"
                   >
                     {shortModel(r.harness, r.model, r.effort)}
@@ -190,7 +204,9 @@ export default async function RunsIndex({ searchParams }: RunsIndexProps) {
                 </td>
                 <td className="text-[var(--color-fg-muted)] text-[10px]">
                   <a
-                    href={`/runs/${r.run_id}.html`}
+                    href={traceUrl(r.run_id)}
+                    target="_blank"
+                    rel="noreferrer"
                     className="no-underline hover:text-[var(--color-accent)]"
                   >
                     {r.run_id}

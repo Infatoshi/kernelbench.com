@@ -30,6 +30,7 @@ kb — KernelBench operator CLI   (repo: {root})
   kb lint <run_id|--all>                        static reward-hack tripwire (scans solution.py)
   kb contamination <hard|mega|v3|path> [--published <lb.json>]   cross-run contamination audit
   kb traces-to-hf <out_dir> [run_dirs...]       convert run transcripts to HF agent-trace JSONL
+  kb push-runs <hard|mega> [--dataset R] [--dry-run]   convert published runs' traces and push to HF
   kb help
 
 Keys live in ~/.env_vars. Bench a new model: add its key, then  kb sweep <harness> <model>.
@@ -136,11 +137,81 @@ def cmd_run(root: Path, args: list[str]) -> int:
 
 
 def cmd_publish(root: Path, args: list[str]) -> int:
+    push = "--push" in args
+    args = [a for a in args if a != "--push"]
     bench = args[0] if args else "hard"
     script = {"hard": "publish_v2.sh", "mega": "publish_mega.sh"}.get(bench)
     if not script:
         sys.exit(f"kb publish: no publish script for bench '{bench}' (hard|mega)")
-    return _exec([str(_bench_dir(root, bench) / "scripts" / script)])
+    pub = _bench_dir(root, bench) / "scripts" / script
+    if not push:
+        return _exec([str(pub)])
+    # --push: publish, then upload the published runs' traces to HF.
+    subprocess.run([str(pub)], check=True)
+    return cmd_push_runs(root, [bench])
+
+
+def _leaderboard_run_ids(bench_dir: Path) -> list[str]:
+    lb = bench_dir / "results" / "leaderboard.json"
+    if not lb.exists():
+        return []
+    data = json.loads(lb.read_text())
+    rids: set[str] = set()
+    for m in data.get("models", []):
+        for cell in m.get("results", {}).values():
+            rid = cell.get("run_id")
+            if rid:
+                rids.add(rid)
+    return sorted(rids)
+
+
+def cmd_push_runs(root: Path, args: list[str]) -> int:
+    dry = "--dry-run" in args
+    args = [a for a in args if a != "--dry-run"]
+    dataset = None
+    if "--dataset" in args:
+        i = args.index("--dataset")
+        dataset = args[i + 1]
+        del args[i:i + 2]
+    bench = args[0] if args else "hard"
+    if bench not in ("hard", "mega"):
+        sys.exit("kb push-runs: only hard|mega have trace datasets (v3 is archived)")
+    bench_dir = _bench_dir(root, bench)
+    dataset = dataset or f"Infatoshi/kernelbench-{bench}-traces"
+
+    rids = _leaderboard_run_ids(bench_dir)
+    if not rids:
+        sys.exit(f"kb push-runs: no run_ids in {bench}/results/leaderboard.json")
+
+    staging = root / "runs" / bench / "traces"
+    staging.mkdir(parents=True, exist_ok=True)
+    listfile = root / "runs" / bench / "_rids.txt"
+    listfile.write_text("\n".join(rids) + "\n")
+
+    # Reuse the bench-local converter (knows that bench's transcript parsers).
+    conv = bench_dir / "scripts" / "traces_to_hf.py"
+    print(f"converting {len(rids)} published run traces -> {staging} ...")
+    bench_env = {k: v for k, v in os.environ.items() if k != "VIRTUAL_ENV"}
+    subprocess.run(
+        ["uv", "run", "python", str(conv), str(staging),
+         "--from-list", str(listfile), "--search", "outputs/runs"],
+        cwd=bench_dir, check=True, env=bench_env,
+    )
+    produced = sorted(staging.glob("*.jsonl"))
+    print(f"  produced {len(produced)} jsonl traces")
+
+    if dry:
+        print(f"[dry-run] would upload {staging} -> {dataset} (dataset)")
+        return 0
+
+    from huggingface_hub import HfApi
+    api = HfApi()
+    api.create_repo(dataset, repo_type="dataset", exist_ok=True)
+    print(f"uploading {len(produced)} traces -> {dataset} ...")
+    api.upload_folder(folder_path=str(staging), repo_id=dataset, repo_type="dataset",
+                      commit_message=f"publish {bench} run traces ({len(produced)} runs)")
+    print(f"done: https://huggingface.co/datasets/{dataset}")
+    return 0
 
 
 def cmd_deploy(root: Path, args: list[str]) -> int:
@@ -212,6 +283,7 @@ _COMMANDS = {
     "lint": cmd_lint,
     "contamination": cmd_contamination,
     "traces-to-hf": cmd_traces_to_hf,
+    "push-runs": cmd_push_runs,
 }
 
 
