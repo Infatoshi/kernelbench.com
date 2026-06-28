@@ -321,8 +321,8 @@ export default async function HomePage() {
         </p>
         <p className="text-sm text-[var(--color-fg)] leading-relaxed mt-2">
           Reach out:{" "}
-          <a href="mailto:infatoshi@gmail.com" className="font-bold">
-            infatoshi@gmail.com
+          <a href="mailto:elliot@arledge.net" className="font-bold">
+            elliot@arledge.net
           </a>
         </p>
       </section>

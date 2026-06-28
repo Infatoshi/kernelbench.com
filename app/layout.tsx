@@ -102,19 +102,28 @@ function Header() {
 function Footer() {
   return (
     <footer className="border-t border-[var(--color-border)] mt-16">
-      <div className="container mx-auto max-w-7xl px-4 sm:px-6 py-6 text-xs text-[var(--color-fg-muted)] flex flex-col sm:flex-row gap-2 sm:items-center sm:justify-between">
-        <span>
-          built by{" "}
-          <a href="https://elliotarledge.com">elliot arledge</a>
-          {" · "}
-          <a href="mailto:infatoshi@gmail.com">infatoshi@gmail.com</a>
-        </span>
-        <span>
-          source:{" "}
-          <a href="https://github.com/Infatoshi/kernelbench.com">
-            github.com/Infatoshi/kernelbench.com
-          </a>
-        </span>
+      <div className="container mx-auto max-w-7xl px-4 sm:px-6 py-6 text-xs text-[var(--color-fg-muted)] flex flex-col gap-4">
+        <div className="flex flex-col sm:flex-row gap-2 sm:items-center sm:justify-between">
+          <span>
+            built by{" "}
+            <a href="https://elliotarledge.com">elliot arledge</a>
+            {" · "}
+            <a href="mailto:elliot@arledge.net">elliot@arledge.net</a>
+          </span>
+          <span>
+            source:{" "}
+            <a href="https://github.com/Infatoshi/kernelbench.com">
+              github.com/Infatoshi/kernelbench.com
+            </a>
+          </span>
+        </div>
+        <p className="text-[var(--color-fg-muted)] leading-relaxed">
+          Disclaimer: This site is not affiliated with or endorsed by the
+          authors of Stanford KernelBench. It is an independent website and hub
+          for benchmark runs made by Elliot Arledge (
+          <a href="https://x.com/elliotarledge">x.com/elliotarledge</a>
+          ).
+        </p>
       </div>
     </footer>
   )
