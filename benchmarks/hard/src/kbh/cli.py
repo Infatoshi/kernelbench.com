@@ -36,7 +36,7 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument(
         "problem_dir",
         type=Path,
-        help="problem directory, for example problems/01_fp8_gemm",
+        help="problem directory, for example problems-rtxpro6000/01_fp8_gemm",
     )
     run.add_argument("reasoning_effort", nargs="?", help="optional reasoning/effort argument")
     run.add_argument(

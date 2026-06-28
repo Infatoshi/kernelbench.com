@@ -5,15 +5,15 @@
 #   ./scripts/run_hard.sh <harness> <model> <problem_dir> [reasoning_effort]
 #
 # Examples:
-#   ./scripts/run_hard.sh claude claude-opus-4-7 problems/01_fp8_gemm
-#   ./scripts/run_hard.sh codex gpt-5.5 problems/01_fp8_gemm xhigh
-#   ./scripts/run_hard.sh kimi kimi-k2.6 problems/01_fp8_gemm
-#   ./scripts/run_hard.sh droid glm-5.1 problems/01_fp8_gemm
-#   ./scripts/run_hard.sh grok grok-build problems/01_fp8_gemm max
-#   ./scripts/run_hard.sh zai-claude glm-5.1 problems/01_fp8_gemm
-#   ./scripts/run_hard.sh minimax-claude MiniMax-M3 problems/01_fp8_gemm
-#   ./scripts/run_hard.sh ccr-claude glm-5.1 problems/01_fp8_gemm
-#   ./scripts/run_hard.sh opencode-nemotron nvidia/nemotron-3-ultra-550b-a55b problems/01_fp8_gemm
+#   ./scripts/run_hard.sh claude claude-opus-4-7 problems-rtxpro6000/01_fp8_gemm
+#   ./scripts/run_hard.sh codex gpt-5.5 problems-rtxpro6000/01_fp8_gemm xhigh
+#   ./scripts/run_hard.sh kimi kimi-k2.6 problems-rtxpro6000/01_fp8_gemm
+#   ./scripts/run_hard.sh droid glm-5.1 problems-rtxpro6000/01_fp8_gemm
+#   ./scripts/run_hard.sh grok grok-build problems-rtxpro6000/01_fp8_gemm max
+#   ./scripts/run_hard.sh zai-claude glm-5.1 problems-rtxpro6000/01_fp8_gemm
+#   ./scripts/run_hard.sh minimax-claude MiniMax-M3 problems-rtxpro6000/01_fp8_gemm
+#   ./scripts/run_hard.sh ccr-claude glm-5.1 problems-rtxpro6000/01_fp8_gemm
+#   ./scripts/run_hard.sh opencode-nemotron nvidia/nemotron-3-ultra-550b-a55b problems-rtxpro6000/01_fp8_gemm
 #
 # Archives everything to outputs/runs/<ts>_<harness>_<model>_<problem>/.
 

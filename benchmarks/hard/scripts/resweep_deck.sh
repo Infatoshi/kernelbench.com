@@ -8,7 +8,7 @@
 #
 # Env:
 #   KBH_HARDWARE        roofline target (RTX_PRO_6000 | RTX_3090 | H100 | B200)
-#   KBH_PROBLEMS_ROOT   prompt set dir (problems | problems-h100 | problems-b200 ...)
+#   KBH_PROBLEMS_ROOT   prompt set dir (problems-rtxpro6000 | problems-h100 | problems-b200 | problems-3090)
 #   BUDGET_SECONDS      per-run wall budget (default 6000 = 100min)
 #   RESWEEP_MODELS      optional space-list to override the deck (e.g. "opus glm")
 #   RESWEEP_ONLY_MISSING=1  skip (harness,model,problem) cells already correct in $LEADERBOARD
@@ -17,7 +17,7 @@ set -u
 HARD_DIR="$(cd "$(dirname "$0")/.." && pwd)"; cd "$HARD_DIR"
 export KBH_AGENT_CONTAINER=1
 export BUDGET_SECONDS="${BUDGET_SECONDS:-6000}"
-PROOT="${KBH_PROBLEMS_ROOT:-problems}"
+PROOT="${KBH_PROBLEMS_ROOT:-problems-rtxpro6000}"
 HW="${KBH_HARDWARE:-RTX_PRO_6000}"
 LEADERBOARD="${LEADERBOARD:-results/leaderboard.json}"
 PROBLEMS=(01_fp8_gemm 02_kda_cutlass 03_paged_attention 05_topk_bitonic 06_sonic_moe_swiglu 07_w4a16_gemm)

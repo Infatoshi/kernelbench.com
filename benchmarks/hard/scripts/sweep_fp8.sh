@@ -26,7 +26,7 @@ run_one() {
   local h="$1" m="$2" e="${3:-}"
   local slug; slug="$(echo "${h}_${m}_01_fp8_gemm" | tr '/:. ' '____')"
   echo "[$(date -Is)] START $h $m 01_fp8_gemm ${e:-<default>}" >> "$CLOG"
-  uv run kbh run "$h" "$m" "problems/01_fp8_gemm" $e > "outputs/tmp/fp8resweep_${slug}.log" 2>&1
+  uv run kbh run "$h" "$m" "problems-rtxpro6000/01_fp8_gemm" $e > "outputs/tmp/fp8resweep_${slug}.log" 2>&1
   echo "[$(date -Is)] DONE  $h $m 01_fp8_gemm (exit $?)" >> "$CLOG"
 }
 

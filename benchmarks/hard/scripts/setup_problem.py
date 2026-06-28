@@ -4,7 +4,7 @@ Reads problem.yaml, looks at the `sota.deps` field, and installs via uv pip.
 Run once per problem before sweeping. Safe to re-run.
 
 Usage:
-    uv run python scripts/setup_problem.py problems/01_fp8_gemm
+    uv run python scripts/setup_problem.py problems-rtxpro6000/01_fp8_gemm
     uv run python scripts/setup_problem.py --all
 """
 import argparse
@@ -46,7 +46,7 @@ def main():
 
     if args.all:
         root = Path(__file__).resolve().parent.parent
-        for p in sorted((root / "problems").iterdir()):
+        for p in sorted((root / "problems-rtxpro6000").iterdir()):
             if p.is_dir():
                 print(f"--- {p.name} ---")
                 install_deps(p)

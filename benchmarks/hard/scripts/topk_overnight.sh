@@ -28,7 +28,7 @@ declare -a MATRIX=(
     "opencode openrouter-pinned/minimax/minimax-m2.7 "
 )
 
-PROBLEM="problems/05_topk_bitonic"
+PROBLEM="problems-rtxpro6000/05_topk_bitonic"
 TS="$(date +%Y%m%d_%H%M%S)"
 LOG="outputs/runs/topk_overnight_${TS}.log"
 mkdir -p "$(dirname "$LOG")"

@@ -6,8 +6,8 @@ LAUNCH_PARALLEL = ROOT / "scripts" / "launch_parallel_sweep.sh"
 SWEEP = ROOT / "scripts" / "sweep.sh"
 RUN_BASELINES = ROOT / "scripts" / "run_baselines.sh"
 CLASSIFICATION = ROOT / "src" / "harness" / "classification.py"
-BENCHMARKS = sorted((ROOT / "problems").glob("*/benchmark.py"))
-KDA_BENCHMARK = ROOT / "problems" / "02_kda_cutlass" / "benchmark.py"
+BENCHMARKS = sorted((ROOT / "problems-rtxpro6000").glob("*/benchmark.py"))
+KDA_BENCHMARK = ROOT / "problems-rtxpro6000" / "02_kda_cutlass" / "benchmark.py"
 
 
 def test_post_run_timeout_starts_inside_gpu_lock() -> None:

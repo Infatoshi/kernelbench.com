@@ -129,7 +129,7 @@ def cmd_run(root: Path, args: list[str]) -> int:
     effort = args[3:] if len(args) > 3 else []
     preflight_key(h, m)
     hard = _bench_dir(root, "hard")
-    problems_root = os.environ.get("KBH_PROBLEMS_ROOT", "problems")
+    problems_root = os.environ.get("KBH_PROBLEMS_ROOT", "problems-rtxpro6000")
     env = {**os.environ, "KBH_AGENT_CONTAINER": "1"}
     os.chdir(hard)
     os.environ.update(env)

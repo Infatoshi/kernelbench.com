@@ -66,10 +66,10 @@ uv sync
 ./scripts/patch_torch.sh
 
 # Run a single problem through a single harness
-uv run kbh run claude claude-opus-4-7 problems/01_fp8_gemm
+uv run kbh run claude claude-opus-4-7 problems-rtxpro6000/01_fp8_gemm
 
 # Preferred Nemotron route, with OPENROUTER_API_KEY in the environment
-uv run kbh run opencode-nemotron nvidia/nemotron-3-ultra-550b-a55b problems/01_fp8_gemm
+uv run kbh run opencode-nemotron nvidia/nemotron-3-ultra-550b-a55b problems-rtxpro6000/01_fp8_gemm
 
 # Targeted Nemotron route preflight, without running the rest of the matrix
 KBH_USE_OPENROUTER_NEMOTRON=1 KBH_PREFLIGHT_ONLY=opencode_nemotron_ultra ./scripts/preflight_harnesses.sh
@@ -78,7 +78,7 @@ KBH_USE_OPENROUTER_NEMOTRON=1 KBH_PREFLIGHT_ONLY=opencode_nemotron_ultra ./scrip
 KBH_USE_OPENROUTER_NEMOTRON=1 ./scripts/sweep.sh
 
 # Diagnostic Nemotron/NVCF route, with NGC_API_KEY in the environment
-uv run kbh run nvcf-nemotron nemotron-3-ultra problems/01_fp8_gemm
+uv run kbh run nvcf-nemotron nemotron-3-ultra problems-rtxpro6000/01_fp8_gemm
 
 # Full sweep (active matrix × all 6 active CUDA problems)
 ./scripts/sweep.sh

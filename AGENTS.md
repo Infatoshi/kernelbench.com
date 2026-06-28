@@ -48,8 +48,9 @@ benchmarks/hard/           KernelBench-Hard eval — the per-op deck
   results/leaderboard.json     /hard reads this (v2 site-shaped data)
   results/annotations/*.yaml   per-cell reward-hack / clean verdicts
   outputs/runs/                run archives (gitignored; ~186G)
-  scripts/ src/ problems/      eval code
-benchmarks/mega/           KernelBench-Mega eval — megakernel deck (reuses hard's machinery)
+  scripts/ src/                eval code
+  problems-rtxpro6000/         the deck — per-GPU sets: -rtxpro6000 (default, RTX PRO 6000), -h100, -b200, -3090
+benchmarks/mega/           KernelBench-Mega eval — megakernel deck (single problems/; reuses hard's machinery)
 benchmarks/v3/             KernelBench-v3 eval — archived (keeps its own AGENTS.md)
 environments/              Prime Intellect `verifiers` mirrors (kernel_hard / kernel_mega / kernel_v3)
 media/                     tracked chart generators (kbh_theme.py + make_*.py + generate_dark_plots.py)
@@ -163,28 +164,29 @@ benchmarks/<bench>/
 ### Adding a new problem
 
 1. Pick the next NN (zero-padded). Don't reuse numbers.
-2. Create `problems/NN_name/`.
+2. Create the deck dir: `problems-rtxpro6000/NN_name/` (hard) or `problems/NN_name/` (mega).
 3. Required files (order matters — write them in this order so you can sanity-check each):
    - `reference.py` — shortest naive PyTorch that produces the right answer. No optimization tricks. This is the correctness oracle.
    - `shapes.py` — 3 to 5 canonical shapes as a list of dicts. Include at least one "off-alignment" shape (e.g., K not multiple of 128 for GEMM).
-   - `problem.yaml` — metadata. See `problems/01_fp8_gemm/problem.yaml` (hard) or `problems/02_kimi_linear_decode/problem.yaml` (mega) as the canonical example.
+   - `problem.yaml` — metadata. See `problems-rtxpro6000/01_fp8_gemm/problem.yaml` (hard) or `problems/02_kimi_linear_decode/problem.yaml` (mega) as the canonical example.
    - `sota.py` — wrap the library function that defines the ceiling. If no library supports SM120 yet, leave a stub and document the H100 paper number in a comment.
    - `check.py` — copy from the closest existing problem and adapt the imports/formulas.
    - `benchmark.py` — copy from the closest existing problem and adapt the throughput formula to match `problem.yaml.flops_formula` / `bytes_formula`.
    - `PROMPT.txt` — single cohesive human-voice query. Match the structure of the existing problems: hardware in parenthetical on first line, file roles + "make a mess" allowance, op semantics + tolerance + every shape inlined as prose, custom-kernel mandate + forbidden ops list spelled out + suggested implementation paths + "look it up yourself" directive, flywheel sentence ending with "Take as long as you need to actually push the number up." Do not include peak throughput numbers, optimization recipes, or "you are being evaluated" framing.
-4. Smoke-test on a cheap model first (`uv run kbh run claude claude-opus-4-7 problems/NN_name` for hard, `./scripts/run_hard.sh claude claude-opus-4-7 problems/NN_name` for mega). Verify `check.py` runs, `benchmark.py` runs, result.json is sane.
+4. Smoke-test on a cheap model first (`uv run kbh run claude claude-opus-4-7 problems-rtxpro6000/NN_name` for hard, `./scripts/run_hard.sh claude claude-opus-4-7 problems/NN_name` for mega). Verify `check.py` runs, `benchmark.py` runs, result.json is sane.
 5. Once you're happy, run the full model matrix sweep.
 
 ### Running a sweep
 
 ```bash
-# Hard — single (harness, model, problem)
-uv run kbh run claude claude-opus-4-7 problems/01_fp8_gemm
+# Hard — single (harness, model, problem). Deck is per-GPU: problems-rtxpro6000
+# (default, RTX PRO 6000), problems-h100, problems-b200, problems-3090.
+uv run kbh run claude claude-opus-4-7 problems-rtxpro6000/01_fp8_gemm
 
 # Full active matrix on one problem
 for model_harness in "claude claude-opus-4-7" "codex gpt-5.5 xhigh" "kimi kimi-k2.6"; do
     read -r HARNESS MODEL <<< "$model_harness"
-    uv run kbh run "$HARNESS" "$MODEL" problems/01_fp8_gemm
+    uv run kbh run "$HARNESS" "$MODEL" problems-rtxpro6000/01_fp8_gemm
 done
 
 # Everything (this is what sweep.sh does)
@@ -300,12 +302,12 @@ Smoke-tested candidates and useful commands (hard examples; for mega swap to
 `./scripts/run_hard.sh` and a mega problem):
 
 ```bash
-uv run kbh run opencode openrouter-alibaba/qwen/qwen3.7-max problems/01_fp8_gemm
-uv run kbh run opencode openrouter-google-ai-studio/google/gemini-3.5-flash problems/01_fp8_gemm
-uv run kbh run opencode-nemotron nvidia/nemotron-3-ultra-550b-a55b problems/01_fp8_gemm
-uv run kbh run cursor composer-2.5 problems/01_fp8_gemm
-uv run kbh run cursor composer-2.5-fast problems/01_fp8_gemm
-uv run kbh run grok grok-build problems/01_fp8_gemm max
+uv run kbh run opencode openrouter-alibaba/qwen/qwen3.7-max problems-rtxpro6000/01_fp8_gemm
+uv run kbh run opencode openrouter-google-ai-studio/google/gemini-3.5-flash problems-rtxpro6000/01_fp8_gemm
+uv run kbh run opencode-nemotron nvidia/nemotron-3-ultra-550b-a55b problems-rtxpro6000/01_fp8_gemm
+uv run kbh run cursor composer-2.5 problems-rtxpro6000/01_fp8_gemm
+uv run kbh run cursor composer-2.5-fast problems-rtxpro6000/01_fp8_gemm
+uv run kbh run grok grok-build problems-rtxpro6000/01_fp8_gemm max
 ```
 
 Other serious rows to keep in the matrix if their auth/config is healthy:

@@ -41,12 +41,12 @@ declare -a QUEUE=(
 )
 
 declare -a PROBLEMS=(
-    "problems/01_fp8_gemm"
-    "problems/02_kda_cutlass"
-    "problems/03_paged_attention"
-    "problems/05_topk_bitonic"
-    "problems/06_sonic_moe_swiglu"
-    "problems/07_w4a16_gemm"
+    "problems-rtxpro6000/01_fp8_gemm"
+    "problems-rtxpro6000/02_kda_cutlass"
+    "problems-rtxpro6000/03_paged_attention"
+    "problems-rtxpro6000/05_topk_bitonic"
+    "problems-rtxpro6000/06_sonic_moe_swiglu"
+    "problems-rtxpro6000/07_w4a16_gemm"
 )
 
 TS="$(date +%Y%m%d_%H%M%S)"

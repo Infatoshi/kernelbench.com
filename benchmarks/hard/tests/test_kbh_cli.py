@@ -11,7 +11,7 @@ def test_kbh_run_dry_run_targets_existing_runner(capsys) -> None:
         "run",
         "codex",
         "gpt-5.5",
-        "problems/01_fp8_gemm",
+        "problems-rtxpro6000/01_fp8_gemm",
         "xhigh",
         "--dry-run",
     ])
@@ -20,7 +20,7 @@ def test_kbh_run_dry_run_targets_existing_runner(capsys) -> None:
     out = capsys.readouterr().out.strip()
     assert out.startswith(str(ROOT / "scripts" / "run_hard.sh"))
     assert "codex gpt-5.5" in out
-    assert str(ROOT / "problems" / "01_fp8_gemm") in out
+    assert str(ROOT / "problems-rtxpro6000" / "01_fp8_gemm") in out
     assert out.endswith("xhigh")
 
 
@@ -33,7 +33,7 @@ def test_kbh_run_invokes_backend_runner(monkeypatch) -> None:
 
     monkeypatch.setattr(cli.subprocess, "run", fake_run)
 
-    status = cli.main(["run", "opencode", "model/id", "problems/07_topk_softmax"])
+    status = cli.main(["run", "opencode", "model/id", "problems-rtxpro6000/07_topk_softmax"])
 
     assert status == 17
     assert len(calls) == 1
@@ -42,7 +42,7 @@ def test_kbh_run_invokes_backend_runner(monkeypatch) -> None:
         str(ROOT / "scripts" / "run_hard.sh"),
         "opencode",
         "model/id",
-        str(ROOT / "problems" / "07_topk_softmax"),
+        str(ROOT / "problems-rtxpro6000" / "07_topk_softmax"),
     ]
     assert cwd == ROOT
     assert check is False
@@ -57,7 +57,7 @@ def test_kbh_run_accepts_claude_code_alias(monkeypatch) -> None:
 
     monkeypatch.setattr(cli.subprocess, "run", fake_run)
 
-    status = cli.main(["run", "claude-code", "claude-opus-4-7", "problems/01_fp8_gemm"])
+    status = cli.main(["run", "claude-code", "claude-opus-4-7", "problems-rtxpro6000/01_fp8_gemm"])
 
     assert status == 0
     command, _, _ = calls[0]
@@ -77,7 +77,7 @@ def test_kbh_run_preserves_droid_and_opencode_harnesses(capsys) -> None:
             "run",
             harness,
             model,
-            "problems/01_fp8_gemm",
+            "problems-rtxpro6000/01_fp8_gemm",
             "--dry-run",
         ])
 
@@ -94,7 +94,7 @@ def test_kbh_run_reports_missing_backend(capsys, tmp_path) -> None:
         "run",
         "claude",
         "model",
-        "problems/01_fp8_gemm",
+        "problems-rtxpro6000/01_fp8_gemm",
         "--runner",
         str(missing),
     ])
