@@ -41,7 +41,12 @@ for row in "${ROWS[@]}"; do
     echo "[$key] no runs in $runs, skipping"; continue
   fi
   echo "[$key] build hw=$hw runs=$runs -> $out"
-  KBH_HARDWARE="$hw" KBH_RUNS_DIR="$runs" uv run python scripts/build_v2_leaderboard.py | tail -1
+  # The published-run curation manifest is RTX_PRO_6000-specific; the other GPU
+  # boards keep date-gated collection from their own runs dir. The rtx row uses
+  # the default manifest (results/published_runs.json); others disable it.
+  manifest_env=""
+  [ "$key" = "rtx" ] || manifest_env="KBH_PUBLISHED_MANIFEST="
+  env $manifest_env KBH_HARDWARE="$hw" KBH_RUNS_DIR="$runs" uv run python scripts/build_v2_leaderboard.py | tail -1
   reshape "$out"
 done
 echo "ALL_GPU_BUILDS_DONE"

@@ -36,6 +36,18 @@ for f in glob.glob(str(ROOT/"results/annotations/*.yaml")):
 # Date-gated instead of an enumerated list so new sweep dates are picked up
 # automatically (was hardcoded to 10/11/12 and silently dropped later sweeps).
 V2_EPOCH = "20260610"
+
+# Curation allowlist. The date gate alone over-includes experimental/superseded
+# sweeps, so the *published* board is an explicit set of run_ids. When the
+# manifest exists (and KBH_PUBLISHED_MANIFEST is not set to empty), only those
+# run_ids are considered -- this makes leaderboard.json reproducible from the
+# archives. Per-GPU builds (build_all_gpus.sh) set KBH_PUBLISHED_MANIFEST="" to
+# disable it and keep their date-gated behavior. Empty manifest => no filter.
+_MANIFEST_PATH = os.environ.get("KBH_PUBLISHED_MANIFEST", str(ROOT / "results/published_runs.json"))
+PUBLISHED: set[str] = set()
+if _MANIFEST_PATH and os.path.exists(_MANIFEST_PATH):
+    PUBLISHED = set(json.load(open(_MANIFEST_PATH)).get("run_ids", []))
+    print(f"  curation manifest: {len(PUBLISHED)} run_ids ({_MANIFEST_PATH})", file=sys.stderr)
 # Roofline was corrected 2026-06-14 (peak_tflops 2.5x too low). Compute-regime
 # problems (graded on TFLOPS) scored before the fix need peak_fraction x0.4;
 # memory-regime problems (graded on bandwidth, unchanged) and post-fix runs do not.
@@ -68,6 +80,7 @@ def _contaminated(run_dir, rid):
 for rj in glob.glob(str(RUNS_DIR/"2026*/result.json")):
     rid = os.path.basename(os.path.dirname(rj))
     if rid[:8] < V2_EPOCH: continue
+    if PUBLISHED and rid not in PUBLISHED: continue
     try: r = json.load(open(rj))
     except: continue
     prob = None

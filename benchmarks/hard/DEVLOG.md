@@ -4,6 +4,48 @@ A running record of decisions, dead ends, and lessons. Newest entries on top. Th
 
 ---
 
+## 2026-06-27 - glm-5.2 fp8 verdict overturned to clean; publish made reproducible
+
+Two corrections, one of which redraws a published cell. Per the integrity note
+below: the evidence overturned a prior verdict, so the record is corrected here.
+
+**glm-5.2 01_fp8_gemm is CLEAN, not a reward_hack** (overturns the 2026-06-15
+entry below, which marked it invalid for an "output-memoization / data_ptr cache"
+hack). An empirical re-audit (annotation `20260614_145529_zai-claude_glm-5.2_01_fp8_gemm.yaml`,
+also cited in CLAUDE.md as THE canonical `kb lint` false-positive) proved the
+`data_ptr()` pattern is a CUDA-graph replay, not a lookup: overwriting the same
+input buffer with new contents changes the output (recompute, not stale), the
+~0.18 ms reused-input time matches the theoretical 4096-cube fp8 GEMM (not a µs
+lookup), and 0.406 sits in the frontier pack (opus 0.386, fugu 0.394). The graph
+just elides Triton launch overhead — a legitimate optimization. The lint fired on
+`data_ptr()==`; the static scan can't tell replay from memoization, so the human
+audit governs.
+
+**Why the live board was stale.** The annotation was flipped to clean shortly
+after 06-15, but `leaderboard.json` was never rebuilt to honor it — because a
+rebuild would have *ballooned* the curated board (the date-gate footgun, fixed
+below). So the published board kept opus as the 01_fp8_gemm ceiling while the
+annotation said glm-5.2 was clean and higher. Rebuilding now corrects it:
+**glm-5.2 holds the 01_fp8_gemm ceiling (0.4059 > opus 0.3855), pass_count 5->6.**
+`leaderboard_v2.json` (a stale H100/8-model snapshot) was also regenerated to
+match the RTX/10-model site file.
+
+**Publish is now reproducible (the footgun fix).** `build_v2_leaderboard.py` was
+date-gated only (every run >= 20260610), so any rebuild silently grew the curated
+board 10->13 models / 55->63 cells by pulling in experimental/superseded sweeps.
+Added an explicit allowlist `results/published_runs.json` honored via
+`KBH_PUBLISHED_MANIFEST` (default-on for the RTX board; `build_all_gpus.sh`
+disables it for the per-GPU boards). `rebuild == committed` now holds.
+
+**Mega framework labels fixed.** `build_mega_leaderboard.py:_framework()` only
+scanned `solution.py`, so cursor cells that import the kernel from a sidecar
+(`from w4_triton import ...`, `@triton.jit` in `scratch/w4_triton.py`) were
+mislabeled "eager". It now resolves local imports into sidecar modules. Relabels
+the 3 cursor composer `02_kimi_linear_decode` cells eager -> triton (no score
+change).
+
+---
+
 ## 2026-06-15 - the unlimited-time generation: shipped, audited, published
 
 Closed out the "everyone gets unlimited time" resweep into a clean, honest 8-model
