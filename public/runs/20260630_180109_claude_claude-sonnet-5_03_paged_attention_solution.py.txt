@@ -1,0 +1,495 @@
+"""Triton paged-attention decode kernel for RTX PRO 6000 (SM120 Blackwell).
+
+Flash-decoding style: KV sequence is split across `NUM_SPLITS` programs per
+(batch, kv_head) so that even small batch*num_kv_heads shapes fill all SMs.
+Each split does an online-softmax scan over its page range (paged KV cache
+gather via block_table), producing a partial normalized output + a
+log-sum-exp. A second (cheap) reduce kernel combines splits with the
+log-sum-exp trick. When batch*num_kv_heads already saturates the GPU,
+NUM_SPLITS=1 and the split kernel writes the final output directly, skipping
+the reduce kernel launch entirely.
+
+All query heads sharing a kv head (the GQA group) are handled by one program,
+so the KV cache page is read once from HBM and reused for the whole group.
+
+Decode kernels this small are launch-overhead bound as much as bandwidth
+bound, so the Model wraps the two kernel launches in a CUDA graph and replays
+it on every call whose (query, kv_cache, block_table, seq_lens) tensors still
+live at the addresses the graph was captured against; it transparently
+recaptures if those addresses change. NUM_SPLITS/num_warps/num_stages/
+PAGES_PER_ITER are picked by a small internal autotuner (see `Model._plan`)
+that captures+replays each candidate for real and keeps the fastest -- tuning
+against eager-launch latency would pick the wrong config, since replay has
+none of the per-kernel-launch overhead eager execution does.
+"""
+import math
+import os
+
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+OP_TYPE = "attention"
+SUPPORTED_PRECISIONS = ["bf16"]
+HARDWARE_REQUIRED = ["RTX_PRO_6000", "H100", "B200"]
+
+
+BATCH = 8
+NUM_HEADS = 32
+NUM_KV_HEADS = 8
+HEAD_DIM = 128
+SEQ_LEN = 1024
+PAGE_SIZE = 16
+
+LOG2E = tl.constexpr(1.4426950408889634)
+
+
+@triton.jit
+def _decode_split_kernel(
+    q_ptr, kv_ptr, bt_ptr, seqlens_ptr,
+    out_ptr, po_ptr, plse_ptr,
+    scale,
+    stride_qb, stride_qh, stride_qd,
+    stride_kvblk, stride_kvtok, stride_kvh, stride_kvd,
+    stride_btb, stride_btp,
+    stride_slb,
+    stride_ob, stride_oh, stride_od,
+    stride_pob, stride_poh, stride_pos, stride_pod,
+    stride_plb, stride_plh, stride_pls,
+    GROUP: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    PAGE_SIZE: tl.constexpr,
+    PAGES_PER_SPLIT: tl.constexpr,
+    NUM_SPLITS: tl.constexpr,
+    PAGES_PER_ITER: tl.constexpr,
+):
+    pid_kvh = tl.program_id(0)
+    pid_split = tl.program_id(1)
+    pid_b = tl.program_id(2)
+
+    seq_len = tl.load(seqlens_ptr + pid_b * stride_slb).to(tl.int32)
+    num_pages_total = (seq_len + PAGE_SIZE - 1) // PAGE_SIZE
+
+    page_start = pid_split * PAGES_PER_SPLIT
+    page_end = tl.minimum(page_start + PAGES_PER_SPLIT, num_pages_total)
+
+    offs_g = tl.arange(0, GROUP)
+    offs_d = tl.arange(0, HEAD_DIM)
+    offs_pg = tl.arange(0, PAGES_PER_ITER)
+    offs_tok = tl.arange(0, PAGE_SIZE)
+    BLOCK_N: tl.constexpr = PAGES_PER_ITER * PAGE_SIZE
+
+    h_idx = pid_kvh * GROUP + offs_g
+
+    q_ptrs = q_ptr + pid_b.to(tl.int64) * stride_qb + h_idx[:, None].to(tl.int64) * stride_qh + offs_d[None, :] * stride_qd
+    q = tl.load(q_ptrs)
+
+    m_i = tl.full((GROUP,), float("-inf"), dtype=tl.float32)
+    l_i = tl.zeros((GROUP,), dtype=tl.float32)
+    acc = tl.zeros((GROUP, HEAD_DIM), dtype=tl.float32)
+
+    kv_base = kv_ptr + pid_kvh.to(tl.int64) * stride_kvh
+
+    for grp_start in range(page_start, page_end, PAGES_PER_ITER):
+        page_idx_pg = grp_start + offs_pg                              # (PAGES_PER_ITER,)
+        page_valid = page_idx_pg < page_end
+        page_idx_pg_c = tl.where(page_valid, page_idx_pg, 0)
+        page_ids = tl.load(bt_ptr + pid_b * stride_btb + page_idx_pg_c * stride_btp,
+                            mask=page_valid, other=0).to(tl.int64)     # (PAGES_PER_ITER,)
+
+        tok_global = page_idx_pg[:, None] * PAGE_SIZE + offs_tok[None, :]      # (PAGES_PER_ITER, PAGE_SIZE)
+        tok_mask = (tok_global < seq_len) & page_valid[:, None]
+
+        page_base = kv_base + page_ids[:, None, None] * stride_kvblk
+        k_ptrs = page_base + offs_tok[None, :, None] * stride_kvtok + offs_d[None, None, :] * stride_kvd
+        v_ptrs = page_base + offs_tok[None, :, None] * stride_kvtok + (HEAD_DIM + offs_d[None, None, :]) * stride_kvd
+
+        k = tl.load(k_ptrs, mask=tok_mask[:, :, None], other=0.0)     # (PAGES_PER_ITER, PAGE_SIZE, HEAD_DIM)
+        v = tl.load(v_ptrs, mask=tok_mask[:, :, None], other=0.0)
+        k = tl.reshape(k, (BLOCK_N, HEAD_DIM))
+        v = tl.reshape(v, (BLOCK_N, HEAD_DIM))
+        tok_mask = tl.reshape(tok_mask, (BLOCK_N,))
+
+        qk = tl.dot(q, tl.trans(k)) * (scale * LOG2E)
+        qk = tl.where(tok_mask[None, :], qk, float("-inf"))
+
+        m_new = tl.maximum(m_i, tl.max(qk, axis=1))
+        p = tl.math.exp2(qk - m_new[:, None])
+        alpha = tl.math.exp2(m_i - m_new)
+        l_i = l_i * alpha + tl.sum(p, axis=1)
+        acc = acc * alpha[:, None] + tl.dot(p.to(v.dtype), v)
+        m_i = m_new
+
+    l_safe = tl.where(l_i > 0, l_i, 1.0)
+    o_norm = acc / l_safe[:, None]
+
+    if NUM_SPLITS == 1:
+        out_ptrs = out_ptr + pid_b * stride_ob + h_idx[:, None] * stride_oh + offs_d[None, :] * stride_od
+        tl.store(out_ptrs, o_norm.to(out_ptr.dtype.element_ty))
+    else:
+        lse = tl.where(l_i > 0, m_i + tl.math.log2(l_i), float("-inf"))
+
+        po_ptrs = po_ptr + pid_b * stride_pob + h_idx[:, None] * stride_poh + pid_split * stride_pos + offs_d[None, :] * stride_pod
+        tl.store(po_ptrs, o_norm)
+
+        pl_ptrs = plse_ptr + pid_b * stride_plb + h_idx * stride_plh + pid_split * stride_pls
+        tl.store(pl_ptrs, lse)
+
+
+@triton.jit
+def _decode_reduce_kernel(
+    po_ptr, plse_ptr, out_ptr,
+    stride_pob, stride_poh, stride_pos, stride_pod,
+    stride_plb, stride_plh, stride_pls,
+    stride_ob, stride_oh, stride_od,
+    NUM_SPLITS: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+):
+    pid_b = tl.program_id(0)
+    pid_h = tl.program_id(1)
+
+    offs_s = tl.arange(0, NUM_SPLITS)
+    offs_d = tl.arange(0, HEAD_DIM)
+
+    lse = tl.load(plse_ptr + pid_b * stride_plb + pid_h * stride_plh + offs_s * stride_pls)
+    m = tl.max(lse, axis=0)
+    w = tl.math.exp2(lse - m)
+    denom = tl.sum(w, axis=0)
+    denom = tl.where(denom > 0, denom, 1.0)
+
+    po = tl.load(po_ptr + pid_b * stride_pob + pid_h * stride_poh + offs_s[:, None] * stride_pos + offs_d[None, :] * stride_pod)
+    out = tl.sum(w[:, None] * po, axis=0) / denom
+
+    tl.store(out_ptr + pid_b * stride_ob + pid_h * stride_oh + offs_d * stride_od, out.to(out_ptr.dtype.element_ty))
+
+
+_SPLIT_CANDIDATES = (1, 2, 4, 8, 16, 32)
+_WARP_CANDIDATES = (2, 4, 8)
+_STAGE_CANDIDATES = (2, 3, 4)
+_PPI_CANDIDATES = (1, 2, 4)
+_L2_FLUSH_BYTES = 128 * 1024 * 1024
+
+
+class Model(nn.Module):
+    """Single-query paged attention decode (Triton flash-decoding kernel).
+
+    NUM_SPLITS (how many programs cooperatively scan one sequence's KV pages),
+    num_warps, num_stages, and PAGES_PER_ITER (pages gathered per loop step)
+    are chosen by a tiny internal autotuner on the first forward call: shapes
+    are static (fixed at __init__), but the best split factor trades off SM
+    occupancy against extra reduce-kernel launch overhead in a way that isn't
+    well captured by a closed-form heuristic (verified empirically), so we
+    just measure a handful of candidates -- via real CUDA graph capture +
+    replay, since that's the code path actually used at serve time -- and
+    cache the winner.
+    """
+
+    def __init__(
+        self,
+        batch: int,
+        num_heads: int,
+        num_kv_heads: int,
+        head_dim: int,
+        seq_len: int,
+        page_size: int,
+    ):
+        super().__init__()
+        assert num_heads % num_kv_heads == 0, "num_heads must be a multiple of num_kv_heads (GQA)"
+        self.batch = batch
+        self.num_heads = num_heads
+        self.num_kv_heads = num_kv_heads
+        self.head_dim = head_dim
+        self.seq_len = seq_len
+        self.page_size = page_size
+        self.group_size = num_heads // num_kv_heads
+        self.scale = 1.0 / math.sqrt(head_dim)
+
+        self.register_buffer("_dummy", torch.zeros(1, dtype=torch.bfloat16), persistent=False)
+
+        self._num_splits = None
+        self._pages_per_split = None
+        self._num_warps = 4
+        self._num_stages = 3
+        self._pages_per_iter = 2
+        self._out = None
+        self._po = None
+        self._plse = None
+        self._plan_device = None
+        self._l2_scratch = None
+        self._graph = None
+        self._graph_key = None
+        self._graph_disabled = False
+
+    def _alloc(self, device: torch.device, num_splits: int):
+        out = torch.empty(self.batch, self.num_heads, self.head_dim, dtype=torch.bfloat16, device=device)
+        if num_splits > 1:
+            po = torch.empty(self.batch, self.num_heads, num_splits, self.head_dim, dtype=torch.float32, device=device)
+            plse = torch.empty(self.batch, self.num_heads, num_splits, dtype=torch.float32, device=device)
+        else:
+            po = torch.empty(1, dtype=torch.float32, device=device)
+            plse = torch.empty(1, dtype=torch.float32, device=device)
+        return out, po, plse
+
+    def _run(self, query, kv_cache, block_table, seq_lens, out, po, plse, num_splits, pages_per_split, num_warps, num_stages, pages_per_iter):
+        B, H, D = query.shape
+        Hkv = self.num_kv_heads
+        G = self.group_size
+        P = self.page_size
+
+        grid = (Hkv, num_splits, B)
+
+        if num_splits == 1:
+            po_strides = (0, 0, 0, 0)
+            plse_strides = (0, 0, 0)
+        else:
+            po_strides = po.stride()
+            plse_strides = plse.stride()
+
+        _decode_split_kernel[grid](
+            query, kv_cache, block_table, seq_lens,
+            out, po, plse,
+            self.scale,
+            query.stride(0), query.stride(1), query.stride(2),
+            kv_cache.stride(0), kv_cache.stride(1), kv_cache.stride(2), kv_cache.stride(3),
+            block_table.stride(0), block_table.stride(1),
+            seq_lens.stride(0),
+            out.stride(0), out.stride(1), out.stride(2),
+            po_strides[0], po_strides[1], po_strides[2], po_strides[3],
+            plse_strides[0], plse_strides[1], plse_strides[2],
+            GROUP=G,
+            HEAD_DIM=D,
+            PAGE_SIZE=P,
+            PAGES_PER_SPLIT=pages_per_split,
+            NUM_SPLITS=num_splits,
+            PAGES_PER_ITER=pages_per_iter,
+            num_warps=num_warps,
+            num_stages=num_stages,
+        )
+
+        if num_splits > 1:
+            _decode_reduce_kernel[(B, H)](
+                po, plse, out,
+                po.stride(0), po.stride(1), po.stride(2), po.stride(3),
+                plse.stride(0), plse.stride(1), plse.stride(2),
+                out.stride(0), out.stride(1), out.stride(2),
+                NUM_SPLITS=num_splits,
+                HEAD_DIM=D,
+                num_warps=4,
+            )
+
+        return out
+
+    def _l2_flush(self, device: torch.device) -> None:
+        if self._l2_scratch is None:
+            self._l2_scratch = torch.empty(_L2_FLUSH_BYTES // 4, dtype=torch.float32, device=device)
+        self._l2_scratch.zero_()
+
+    @staticmethod
+    def _tensor_key(query, kv_cache, block_table, seq_lens):
+        return (
+            query.data_ptr(), kv_cache.data_ptr(), block_table.data_ptr(), seq_lens.data_ptr(),
+            query.shape, kv_cache.shape, block_table.shape, seq_lens.shape,
+        )
+
+    def _capture(self, query, kv_cache, block_table, seq_lens, out, po, plse, num_splits, pages_per_split, num_warps, num_stages, pages_per_iter):
+        """Warm up on a side stream, then capture a CUDA graph bound to the given buffers."""
+        device = query.device
+        side_stream = torch.cuda.Stream(device=device)
+        side_stream.wait_stream(torch.cuda.current_stream(device))
+        with torch.cuda.stream(side_stream):
+            for _ in range(3):
+                self._run(query, kv_cache, block_table, seq_lens, out, po, plse, num_splits, pages_per_split, num_warps, num_stages, pages_per_iter)
+        torch.cuda.current_stream(device).wait_stream(side_stream)
+        torch.cuda.synchronize(device)
+
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            self._run(query, kv_cache, block_table, seq_lens, out, po, plse, num_splits, pages_per_split, num_warps, num_stages, pages_per_iter)
+        return graph
+
+    def _time_graph(self, graph, device, iters=5):
+        for _ in range(2):
+            graph.replay()
+        torch.cuda.synchronize(device)
+
+        times = []
+        for _ in range(iters):
+            self._l2_flush(device)
+            torch.cuda.synchronize(device)
+            start = torch.cuda.Event(enable_timing=True)
+            end = torch.cuda.Event(enable_timing=True)
+            start.record()
+            graph.replay()
+            end.record()
+            torch.cuda.synchronize(device)
+            times.append(start.elapsed_time(end))
+        times.sort()
+        return times[len(times) // 2]
+
+    def _try_config(self, query, kv_cache, block_table, seq_lens, num_splits, pages_per_split, num_warps, num_stages, pages_per_iter):
+        """Capture + time one candidate config.
+
+        Returns (ms, graph, out, po, plse); ms=inf and the rest None on failure.
+        Crucially, each candidate gets its OWN freshly allocated (out, po, plse)
+        buffers that stay alive as long as its graph might still win the search
+        -- reusing self._out etc. across candidates would let a later
+        reallocation free memory a still-live earlier graph secretly points at.
+        """
+        device = query.device
+        try:
+            out, po, plse = self._alloc(device, num_splits)
+            graph = self._capture(query, kv_cache, block_table, seq_lens, out, po, plse, num_splits, pages_per_split, num_warps, num_stages, pages_per_iter)
+            ms = self._time_graph(graph, device)
+            return ms, graph, out, po, plse
+        except Exception:
+            return float("inf"), None, None, None, None
+
+    def _plan(self, query, kv_cache, block_table, seq_lens) -> None:
+        device = query.device
+        num_pages_max = (self.seq_len + self.page_size - 1) // self.page_size
+
+        force_splits = os.environ.get("KBH_FORCE_SPLITS")
+        force_warps = os.environ.get("KBH_FORCE_WARPS")
+        force_stages = os.environ.get("KBH_FORCE_STAGES")
+        force_ppi = os.environ.get("KBH_FORCE_PPI")
+        if force_splits is not None:
+            num_splits = max(1, min(int(force_splits), num_pages_max))
+            num_warps = int(force_warps) if force_warps is not None else 4
+            num_stages = int(force_stages) if force_stages is not None else 3
+            pages_per_iter = int(force_ppi) if force_ppi is not None else 2
+            pages_per_split = (num_pages_max + num_splits - 1) // num_splits
+            self._num_splits = num_splits
+            self._pages_per_split = pages_per_split
+            self._num_warps = num_warps
+            self._num_stages = num_stages
+            self._pages_per_iter = pages_per_iter
+            self._out, self._po, self._plse = self._alloc(device, num_splits)
+            self._plan_device = device
+            self._graph = None
+            self._graph_key = None
+            self._graph_disabled = False
+            return
+
+        split_candidates = [s for s in _SPLIT_CANDIDATES if s <= num_pages_max] or [1]
+
+        # (ms, splits, warps, stages, ppi, graph, out, po, plse)
+        best = (float("inf"), 1, 4, 3, 2, None, None, None, None)
+        for cand_splits in split_candidates:
+            pages_per_split = (num_pages_max + cand_splits - 1) // cand_splits
+            ms, graph, out, po, plse = self._try_config(query, kv_cache, block_table, seq_lens, cand_splits, pages_per_split, 4, 3, 2)
+            if ms < best[0]:
+                best = (ms, cand_splits, 4, 3, 2, graph, out, po, plse)
+
+        num_splits = best[1]
+        pages_per_split = (num_pages_max + num_splits - 1) // num_splits
+        for nw in _WARP_CANDIDATES:
+            if nw == best[2]:
+                continue
+            ms, graph, out, po, plse = self._try_config(query, kv_cache, block_table, seq_lens, num_splits, pages_per_split, nw, 3, 2)
+            if ms < best[0]:
+                best = (ms, num_splits, nw, 3, 2, graph, out, po, plse)
+
+        num_warps = best[2]
+        for ns in _STAGE_CANDIDATES:
+            if ns == best[3]:
+                continue
+            ms, graph, out, po, plse = self._try_config(query, kv_cache, block_table, seq_lens, num_splits, pages_per_split, num_warps, ns, 2)
+            if ms < best[0]:
+                best = (ms, num_splits, num_warps, ns, 2, graph, out, po, plse)
+
+        num_stages = best[3]
+        for ppi in _PPI_CANDIDATES:
+            if ppi == best[4]:
+                continue
+            ms, graph, out, po, plse = self._try_config(query, kv_cache, block_table, seq_lens, num_splits, pages_per_split, num_warps, num_stages, ppi)
+            if ms < best[0]:
+                best = (ms, num_splits, num_warps, num_stages, ppi, graph, out, po, plse)
+
+        best_ms, num_splits, num_warps, num_stages, pages_per_iter, best_graph, out, po, plse = best
+        self._num_splits = num_splits
+        self._pages_per_split = pages_per_split
+        self._num_warps = num_warps
+        self._num_stages = num_stages
+        self._pages_per_iter = pages_per_iter
+        self._plan_device = device
+
+        if best_graph is not None:
+            self._out, self._po, self._plse = out, po, plse
+            self._graph = best_graph
+            self._graph_key = self._tensor_key(query, kv_cache, block_table, seq_lens)
+            self._graph_disabled = False
+        else:
+            # Every graph capture attempt failed; fall back to eager execution.
+            self._out, self._po, self._plse = self._alloc(device, num_splits)
+            self._graph = None
+            self._graph_key = None
+            self._graph_disabled = True
+
+    def forward(
+        self,
+        query: torch.Tensor,
+        kv_cache: torch.Tensor,
+        block_table: torch.Tensor,
+        seq_lens: torch.Tensor,
+    ) -> torch.Tensor:
+        if self._plan_device != query.device:
+            self._plan(query, kv_cache, block_table, seq_lens)
+
+        if self._graph_disabled:
+            return self._run(
+                query, kv_cache, block_table, seq_lens,
+                self._out, self._po, self._plse,
+                self._num_splits, self._pages_per_split, self._num_warps, self._num_stages, self._pages_per_iter,
+            )
+
+        key = self._tensor_key(query, kv_cache, block_table, seq_lens)
+        if self._graph is not None and key == self._graph_key:
+            self._graph.replay()
+            return self._out
+
+        try:
+            new_graph = self._capture(
+                query, kv_cache, block_table, seq_lens,
+                self._out, self._po, self._plse,
+                self._num_splits, self._pages_per_split, self._num_warps, self._num_stages, self._pages_per_iter,
+            )
+        except Exception:
+            self._graph = None
+            self._graph_key = None
+            self._graph_disabled = True
+            return self._run(
+                query, kv_cache, block_table, seq_lens,
+                self._out, self._po, self._plse,
+                self._num_splits, self._pages_per_split, self._num_warps, self._num_stages, self._pages_per_iter,
+            )
+
+        self._graph = new_graph
+        self._graph_key = key
+        self._graph.replay()
+        return self._out
+
+
+def get_inputs():
+    B = BATCH
+    H = NUM_HEADS
+    Hkv = NUM_KV_HEADS
+    D = HEAD_DIM
+    L = SEQ_LEN
+    P = PAGE_SIZE
+
+    pages_per_seq = (L + P - 1) // P
+    total_pages = max(B * pages_per_seq + 8, 64)
+
+    query = torch.randn(B, H, D, dtype=torch.bfloat16) * 0.1
+    kv_cache = torch.randn(total_pages, P, Hkv, 2 * D, dtype=torch.bfloat16) * 0.1
+
+    perm = torch.randperm(total_pages)[: B * pages_per_seq].reshape(B, pages_per_seq).int()
+    block_table = perm.contiguous()
+    seq_lens = torch.full((B,), L, dtype=torch.int32)
+
+    return [query, kv_cache, block_table, seq_lens]
+
+
+def get_init_inputs():
+    return [BATCH, NUM_HEADS, NUM_KV_HEADS, HEAD_DIM, SEQ_LEN, PAGE_SIZE]

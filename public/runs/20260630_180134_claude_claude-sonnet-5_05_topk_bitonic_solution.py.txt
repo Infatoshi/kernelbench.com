@@ -1,0 +1,421 @@
+"""Top-k over the last dim via a Triton bitonic top-k reduction.
+
+Algorithm
+---------
+Each row is split into S segments. Stage 1 loads each segment, packs
+(value, index) into a single monotonic uint64 sort key (so ordering by the
+key is equivalent to ordering by value, with index as a tie-break), and
+calls Triton's bitonic `tl.topk` (see triton.language.standard) to reduce
+the segment to its local top-Kpad candidates in registers/shared memory
+(Kpad = next power of two >= k; all our k's are already powers of two).
+If there's only one segment per row, stage 1 unpacks and writes the final
+(values, int64 indices) directly ("topk" mode, S == 1). Otherwise a merge
+kernel reduces the S*Kpad candidates per row (again via tl.topk on the
+packed keys) down to the final top-k ("topk" mode, S > 1).
+
+The merge fans in to a single block per row, which is fine as long as that
+block's row count (batch) gives enough parallelism to keep the GPU busy.
+When batch is small (the pathological case: batch == 1, a single decoder
+row) and S is large, that single merge block ends up doing a lot of
+serialized work with only ~1 block active on the whole chip -- confirmed
+via ncu (0.04 waves, <10% achieved occupancy) to be the dominant cost, not
+the memory read. "topk3" mode adds one more level: stage 1 emits many small
+segments, an intermediate merge (many blocks, grouped ~sqrt(S1) segments
+each) shrinks the candidate count in parallel, and only the small final
+merge is serialized to one block per row. ~2.3x faster than 2-stage for the
+batch=1/n=131072/k=64 shape in practice.
+
+k == 1 is special-cased as a plain argmax reduction (tl.topk's internal
+hypercube reduction hits a real Triton bug when it fully collapses to a
+0-d tensor, i.e. Kpad == 1).
+
+Kernel-launch overhead, not bandwidth, dominates at these sizes (0.5-2MB
+inputs -> sub-microsecond at 1.8TB/s), so forward() also captures the whole
+kernel sequence into a CUDA graph on first call (see Model docstring).
+"""
+import math
+
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+OP_TYPE = "topk"
+SUPPORTED_PRECISIONS = ["fp32"]
+HARDWARE_REQUIRED = ["RTX_PRO_6000", "H100", "B200"]
+
+
+# --------------------------------------------------------------------------
+# Triton kernels
+# --------------------------------------------------------------------------
+
+
+@triton.jit
+def _pack_key(x, idx):
+    """Monotonic uint64 sort key: bits[63:32] = order-preserving value bits,
+    bits[31:0] = original column index."""
+    u32 = x.to(tl.uint32, bitcast=True)
+    signbit = (u32 >> 31) != 0
+    mask = tl.where(signbit, 0xFFFFFFFF, 0x80000000).to(tl.uint32)
+    key32 = u32 ^ mask
+    return (key32.to(tl.uint64) << 32) | idx.to(tl.uint32).to(tl.uint64)
+
+
+@triton.jit
+def _unpack_val(key):
+    key32 = (key >> 32).to(tl.uint32)
+    signbit2 = (key32 >> 31) == 0
+    inv_mask = tl.where(signbit2, 0xFFFFFFFF, 0x80000000).to(tl.uint32)
+    orig_u32 = key32 ^ inv_mask
+    return orig_u32.to(tl.float32, bitcast=True)
+
+
+@triton.jit
+def _unpack_idx(key):
+    return (key & 0xFFFFFFFF).to(tl.int32)
+
+
+@triton.jit
+def topk_stage1(
+    x_ptr, out_val_ptr, out_idx_ptr, out_key_ptr,
+    n, row_stride, seg_len,
+    S, KOUT,
+    KPAD: tl.constexpr, BLOCK: tl.constexpr, FINAL: tl.constexpr,
+):
+    row = tl.program_id(0)
+    seg = tl.program_id(1)
+    start = seg * seg_len
+    offs = start + tl.arange(0, BLOCK)
+    m = offs < n
+    x = tl.load(x_ptr + row * row_stride + offs, mask=m, other=float("-inf"))
+    idx = offs.to(tl.int32)
+    key = _pack_key(x, idx)
+    top = tl.topk(key, KPAD, dim=0)
+
+    if FINAL:
+        val = _unpack_val(top)
+        oidx = _unpack_idx(top)
+        k_offs = tl.arange(0, KPAD)
+        km = k_offs < KOUT
+        tl.store(out_val_ptr + row * KOUT + k_offs, val, mask=km)
+        tl.store(out_idx_ptr + row * KOUT + k_offs, oidx.to(tl.int64), mask=km)
+    else:
+        k_offs = tl.arange(0, KPAD)
+        tl.store(out_key_ptr + (row * S + seg) * KPAD + k_offs, top)
+
+
+@triton.jit
+def topk_merge(
+    in_key_ptr, out_val_ptr, out_idx_ptr, out_key_ptr,
+    S_in, G, KOUT,
+    KPAD: tl.constexpr, BLOCK: tl.constexpr, FINAL: tl.constexpr,
+):
+    """Merge packed uint64 keys (already-computed local top-Kpad groups of
+    S_in total) down to top-Kpad. Grid is (batch, num_groups): each block
+    handles G of the S_in input segments (num_groups*G >= S_in). FINAL
+    blocks write the unpacked (values, int64 indices); non-FINAL blocks
+    write the still-packed top-Kpad keys for a further merge stage."""
+    row = tl.program_id(0)
+    grp = tl.program_id(1)
+    n_groups = tl.num_programs(1)
+    offs = tl.arange(0, BLOCK)
+    seg_local = offs // KPAD
+    kk = offs % KPAD
+    seg = grp * G + seg_local
+    # seg_local < G bounds this block's own slice; seg < S_in guards the
+    # last group, which can spill past S_in when G doesn't divide S_in
+    # evenly -- without it that tail read aliases into the next row.
+    m = (seg_local < G) & (seg < S_in)
+    key = tl.load(in_key_ptr + row * S_in * KPAD + seg * KPAD + kk, mask=m, other=0)
+    top = tl.topk(key, KPAD, dim=0)
+
+    if FINAL:
+        val = _unpack_val(top)
+        oidx = _unpack_idx(top)
+        k_offs = tl.arange(0, KPAD)
+        km = k_offs < KOUT
+        tl.store(out_val_ptr + row * KOUT + k_offs, val, mask=km)
+        tl.store(out_idx_ptr + row * KOUT + k_offs, oidx.to(tl.int64), mask=km)
+    else:
+        k_offs = tl.arange(0, KPAD)
+        tl.store(out_key_ptr + (row * n_groups + grp) * KPAD + k_offs, top)
+
+
+@triton.jit
+def argmax_kernel(
+    x_ptr, out_val_ptr, out_idx_ptr,
+    n, row_stride,
+    N: tl.constexpr,
+):
+    row = tl.program_id(0)
+    offs = tl.arange(0, N)
+    m = offs < n
+    x = tl.load(x_ptr + row * row_stride + offs, mask=m, other=float("-inf"))
+    val, idx = tl.max(x, axis=0, return_indices=True)
+    tl.store(out_val_ptr + row, val)
+    tl.store(out_idx_ptr + row, idx.to(tl.int64))
+
+
+# --------------------------------------------------------------------------
+# Host-side planning
+# --------------------------------------------------------------------------
+
+
+def _next_pow2(x: int) -> int:
+    if x <= 1:
+        return 1
+    return 1 << (x - 1).bit_length()
+
+
+def _prev_pow2(x: int) -> int:
+    if x < 1:
+        return 1
+    return 1 << (x.bit_length() - 1)
+
+
+# A merge block is next_pow2(group_size) * kpad uint64 keys (8B each),
+# resident in shared memory for a single `tl.topk` call. Keep it under the
+# default static shared-memory limit (48KB) so we never need a dynamic-smem
+# opt-in.
+_MAX_MERGE_SMEM_BYTES = 49152
+
+# Empirically (RTX PRO 6000, sm120), Triton's bitonic tl.topk over a BLOCK-sized
+# uint64-key hypercube peaks at ~BLOCK*4 bytes of shared memory during the
+# initial "build sorted runs of size kpad" phase (independent of kpad, since
+# that phase always processes the full BLOCK). This is the hard cap before
+# `OutOfResources`; stay comfortably under it.
+_MAX_STAGE1_SMEM_BYTES = 98304
+
+# Segment length as a multiple of kpad, for stage 1. Small enough to keep
+# occupancy/launch count reasonable, large enough that each segment's local
+# top-kpad reduction actually filters data (rather than being mostly -inf
+# padding). Two variants: when the merge fans in to a single block per row
+# (2-stage), a bigger segment (fewer, cheaper merge inputs) wins; when an
+# intermediate merge absorbs the fan-in (3-stage), a smaller segment (more
+# raw stage-1 parallelism) wins instead because the merge is no longer
+# serialized to ~1 block/row. Tuned via scratch/sweep2.py + scratch/test_3stage*.py.
+_RATIO_2STAGE = 32
+_RATIO_3STAGE = 16
+
+# Above this many elements (next_pow2(S) * kpad), a single-block-per-row merge
+# is slow enough (confirmed via ncu: <0.05 waves, <10% occupancy when S is
+# large and batch is small) that inserting an intermediate merge stage -- more
+# blocks, run in parallel -- wins despite the extra kernel launch.
+_MAX_2STAGE_MERGE_ELEMS = 1024
+
+
+def _plan(n: int, k: int):
+    kpad = _next_pow2(k)
+    if kpad == 1:
+        return {"mode": "argmax", "N": _next_pow2(n)}
+
+    stage1_max_block = _prev_pow2(_MAX_STAGE1_SMEM_BYTES // 4)
+    max_merge_pow2 = _prev_pow2(max(1, _MAX_MERGE_SMEM_BYTES // (kpad * 8)))
+
+    def make_block(ratio):
+        b = _next_pow2(ratio * kpad)
+        return max(256, min(b, stage1_max_block, _next_pow2(n)))
+
+    # --- 2-stage: stage1 segments merge directly to a single block/row ---
+    block = make_block(_RATIO_2STAGE)
+    s = math.ceil(n / block)
+    # Cap S so the merge block (next_pow2(S) * kpad keys) fits in the
+    # shared-memory budget; grow segment length (fewer, larger segments)
+    # instead of overflowing, up to stage-1's own shared-memory ceiling.
+    while s > 1 and _next_pow2(s) > max_merge_pow2 and block < stage1_max_block:
+        block *= 2
+        s = math.ceil(n / block)
+
+    if s <= 1 or _next_pow2(s) * kpad <= _MAX_2STAGE_MERGE_ELEMS:
+        return {"mode": "topk", "kpad": kpad, "block": block, "s": s}
+
+    # --- 3-stage: stage1 -> parallel intermediate merge -> final merge ---
+    block1 = make_block(_RATIO_3STAGE)
+    s1 = math.ceil(n / block1)
+
+    groups = max(1, round(math.sqrt(s1)))
+    lo, hi = _prev_pow2(groups), _next_pow2(groups)
+    groups = lo if (groups / lo) <= (hi / max(groups, 1)) else hi
+    groups = max(1, min(groups, s1, max_merge_pow2))
+
+    g_per_group = math.ceil(s1 / groups)
+    block_mid = _next_pow2(g_per_group) * kpad
+    # Keep the intermediate merge's own tl.topk call within stage-1's
+    # shared-memory ceiling too; shrink its per-block fan-in (more groups)
+    # if needed.
+    while block_mid > stage1_max_block and groups < s1:
+        groups = min(groups * 2, s1)
+        g_per_group = math.ceil(s1 / groups)
+        block_mid = _next_pow2(g_per_group) * kpad
+
+    block_final = _next_pow2(groups) * kpad
+
+    return {
+        "mode": "topk3",
+        "kpad": kpad,
+        "block1": block1, "s1": s1,
+        "groups": groups, "g_per_group": g_per_group,
+        "block_mid": block_mid, "block_final": block_final,
+    }
+
+
+# --------------------------------------------------------------------------
+# Model
+# --------------------------------------------------------------------------
+
+
+class Model(nn.Module):
+    """Top-k over the last dim of a 2D tensor.
+
+    Input:
+        x: (batch, n) fp32
+    Output:
+        values:  (batch, k) fp32, sorted descending
+        indices: (batch, k) int64, into the last dim of x
+
+    At these shapes the whole problem is 0.5-2MB of input, i.e. sub-microsecond
+    at DRAM bandwidth -- completely dominated by CPU-side kernel-launch/dispatch
+    overhead (measured ~4-8us per Triton launch here) rather than GPU execution
+    time. So on top of picking a bandwidth-friendly reduction, forward() captures
+    the whole kernel sequence into a CUDA graph on first call and replays it on
+    every subsequent call, which cuts out Triton's per-launch Python overhead
+    almost entirely (only a cheap `copy_` into a static input buffer remains
+    eager, since the real input tensor's address isn't guaranteed stable across
+    calls). Falls back to eager kernel launches if graph capture isn't usable.
+    """
+
+    def __init__(self, batch: int, n: int, k: int):
+        super().__init__()
+        self.batch, self.n, self.k = batch, n, k
+        self.register_buffer("_dummy", torch.zeros(1))
+        self._cfg = _plan(n, k)
+        self._buffers_ready = False
+        self._graph = None
+
+    def _run_kernels(self, x: torch.Tensor):
+        batch, n, k = self.batch, self.n, self.k
+        cfg = self._cfg
+        out_val, out_idx = self._out_val, self._out_idx
+        dummy_key = self._dummy_key
+
+        if cfg["mode"] == "argmax":
+            argmax_kernel[(batch,)](
+                x, out_val, out_idx,
+                n, n,
+                N=cfg["N"],
+            )
+            return
+
+        kpad = cfg["kpad"]
+
+        if cfg["mode"] == "topk":
+            block, s = cfg["block"], cfg["s"]
+            if s == 1:
+                topk_stage1[(batch, 1)](
+                    x, out_val, out_idx, dummy_key,
+                    n, n, block,
+                    s, k,
+                    KPAD=kpad, BLOCK=block, FINAL=True,
+                )
+            else:
+                topk_stage1[(batch, s)](
+                    x, out_val, out_idx, self._inter,
+                    n, n, block,
+                    s, k,
+                    KPAD=kpad, BLOCK=block, FINAL=False,
+                )
+                topk_merge[(batch, 1)](
+                    self._inter, out_val, out_idx, dummy_key,
+                    s, s, k,
+                    KPAD=kpad, BLOCK=self._block2, FINAL=True,
+                )
+            return
+
+        # topk3: stage1 -> parallel intermediate merge -> final merge
+        block1, s1 = cfg["block1"], cfg["s1"]
+        groups, g_per_group = cfg["groups"], cfg["g_per_group"]
+        block_mid, block_final = cfg["block_mid"], cfg["block_final"]
+
+        topk_stage1[(batch, s1)](
+            x, out_val, out_idx, self._inter1,
+            n, n, block1,
+            s1, k,
+            KPAD=kpad, BLOCK=block1, FINAL=False,
+        )
+        topk_merge[(batch, groups)](
+            self._inter1, out_val, out_idx, self._inter2,
+            s1, g_per_group, k,
+            KPAD=kpad, BLOCK=block_mid, FINAL=False,
+        )
+        topk_merge[(batch, 1)](
+            self._inter2, out_val, out_idx, dummy_key,
+            groups, groups, k,
+            KPAD=kpad, BLOCK=block_final, FINAL=True,
+        )
+
+    def _lazy_init(self, x: torch.Tensor):
+        device = x.device
+        cfg = self._cfg
+        batch, k = self.batch, self.k
+        self._out_val = torch.empty((batch, k), dtype=torch.float32, device=device)
+        self._out_idx = torch.empty((batch, k), dtype=torch.int64, device=device)
+        self._dummy_key = torch.empty((1,), dtype=torch.uint64, device=device)
+
+        if cfg["mode"] == "topk" and cfg["s"] > 1:
+            kpad, s = cfg["kpad"], cfg["s"]
+            self._inter = torch.empty((batch * s * kpad,), dtype=torch.uint64, device=device)
+            self._block2 = _next_pow2(s) * kpad
+        elif cfg["mode"] == "topk3":
+            kpad, s1, groups = cfg["kpad"], cfg["s1"], cfg["groups"]
+            self._inter1 = torch.empty((batch * s1 * kpad,), dtype=torch.uint64, device=device)
+            self._inter2 = torch.empty((batch * groups * kpad,), dtype=torch.uint64, device=device)
+
+        self._buffers_ready = True
+
+        self._static_x = torch.empty_like(x)
+        self._static_x.copy_(x)
+
+        try:
+            side = torch.cuda.Stream()
+            side.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(side):
+                for _ in range(3):
+                    self._run_kernels(self._static_x)
+            torch.cuda.current_stream().wait_stream(side)
+            torch.cuda.synchronize()
+
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                self._run_kernels(self._static_x)
+            self._graph = graph
+        except Exception:
+            # Graph capture is a pure perf optimization; if it's unavailable
+            # or a kernel isn't capturable, fall back to eager launches.
+            self._graph = None
+
+    def forward(self, x: torch.Tensor):
+        if not self._buffers_ready:
+            self._lazy_init(x)
+
+        if self._graph is not None:
+            self._static_x.copy_(x)
+            self._graph.replay()
+        else:
+            self._run_kernels(x)
+
+        return self._out_val, self._out_idx
+
+
+# Module-level shims rebuilt by check.py / benchmark.py per shape.
+batch = 64
+n = 8192
+k = 8
+
+
+def get_inputs():
+    x = torch.randn(batch, n, dtype=torch.float32)
+    return [x]
+
+
+def get_init_inputs():
+    return [batch, n, k]

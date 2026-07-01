@@ -75,7 +75,9 @@ s|ghp_[A-Za-z0-9]\{30,\}|ghp_REDACTED|g
 s|github_pat_[A-Za-z0-9_]\{30,\}|github_pat_REDACTED|g
 s|hf_[A-Za-z0-9]\{30,\}|hf_REDACTED|g
 PAT
-for rid in $RIDS; do
+# Legacy HTML viewers moved to HuggingFace; redact any that still exist locally.
+# RIDS may be unset (no local *.html viewers), so default to empty to stay set -u safe.
+for rid in ${RIDS:-}; do
   [ -f "$REPO_ROOT/public/runs/$rid.html" ] && sed -i -f "$SEDF" "$REPO_ROOT/public/runs/$rid.html"
 done
 rm -f "$SEDF"
