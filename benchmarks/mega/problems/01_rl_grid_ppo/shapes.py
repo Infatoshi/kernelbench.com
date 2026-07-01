@@ -13,5 +13,7 @@ TOTAL_ENV_STEPS = 32 * 4096 * 40
 # Correctness is checked on these seeds (reference vs solution return level).
 GRADING_SEEDS = (0, 1, 2)
 
-# Throughput is measured on this seed.
+# Legacy fixed bench seed. benchmark.py now draws a fresh random seed per timed
+# trial (anti-memoization guard, 2026-07-01); kept for compatibility with older
+# harness tooling that imports it.
 BENCH_SEED = 7

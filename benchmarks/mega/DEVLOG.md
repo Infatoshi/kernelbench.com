@@ -4,6 +4,45 @@ A running record of decisions, dead ends, and lessons. Newest entries on top. Th
 
 ---
 
+## 2026-07-01 — RL sim fidelity smoke + fabrication red-team on the 3090 (benchmark v2 guards)
+
+Pre-sweep smoke of `01_rl_grid_ppo` on the idle RTX 3090 (disposable /tmp
+workspace, `CUDA_VISIBLE_DEVICES=1`), before handing the deck to an external
+machine. Fidelity is good: reference trains 0.16 → 3.97 return over 40 iters,
+bit-deterministic per seed, seed-to-seed final spread <1%, ~2.1M SPS on the
+3090. check.py's band logic and the honest reference-as-solution control both
+behave.
+
+Red-teaming found a **critical hole: the return curve is unfalsifiable.**
+`train()` just returns floats — nothing proves an env step ever happened. Two
+cheats sailed through the old gates with absurd scores:
+- **Fabricated curve** (analytic exponential ramp, no GPU work at all): check.py
+  PASS (lands in the return band, "improves" from its own early window),
+  benchmark **22,006x** peak_fraction.
+- **Memoized replay** (`{(steps, seed): curve}` dict; benchmark reran the same
+  BENCH_SEED every trial): **26,849x**.
+
+Fixes shipped (validated same-session on the 3090):
+- **benchmark.py draws a fresh random seed per timed trial** (SystemRandom).
+  SPS doesn't depend on the seed, but a memoized lookup misses every trial —
+  the cached cheat now pays full training cost (honest ~6.2M SPS on the 3090).
+- **Return floor enforced per trial**, not just on the last curve.
+- **SPS credibility cap**: `max_credible_sps_multiple: 20` in problem.yaml —
+  anything over 20x peak_sps scores 0.0 outright (fabricator lands ~4 orders of
+  magnitude over; a real megakernel can't). Near-cap results are an audit flag.
+- **`import reference` / `from reference` / baseline added to `forbidden`** for
+  the RL problem (decode already had them; RL didn't — a solution could
+  literally re-export `reference.train`).
+
+Residual, documented and judge-gated: a fabricator that also *sleeps* to fake a
+plausible elapsed time defeats any mechanical timing check. That's exactly what
+the mandatory authenticity audit catches — a "trainer" with no environment and
+no policy update fails on sight. check.py still can't verify env steps happened
+(fabricated curves pass correctness); the benchmark guards + judge are the
+enforcement pair.
+
+---
+
 ## 2026-07-01 — megakernel authenticity: judge gate + advisory tripwires (not a substring ban)
 
 Audit finding that started this: **zero of the archived mega submissions are
