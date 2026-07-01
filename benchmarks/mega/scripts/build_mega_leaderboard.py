@@ -16,7 +16,12 @@ import argparse
 import csv
 import json
 import re
+import sys
 from pathlib import Path
+
+_HERE = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(_HERE))
+from src.eval.megakernel import extract_evidence  # noqa: E402
 
 
 def _bench(bench_log: Path):
@@ -84,6 +89,73 @@ def _framework(run_dir: Path) -> str:
 _RUN_TS = re.compile(r"outputs/runs/(\d{8}_\d{6})")
 
 
+def megakernel_authentic(run_id: str, annotations_dir: Path) -> bool | None:
+    """Read the authenticity verdict recorded by the post-run judge audit.
+
+    Returns False only when an annotation explicitly says the submission is not a
+    genuine megakernel (CUDA-graph / torch.compile / per-op-loop escape hatch, or
+    plain eager dressed up as fusion). None = not yet judged (do NOT exclude).
+    See docs/megakernel_authenticity_judge.md.
+    """
+    f = annotations_dir / f"{run_id}.yaml"
+    if not f.exists():
+        return None
+    try:
+        import yaml
+        d = yaml.safe_load(f.read_text()) or {}
+    except Exception:
+        return None
+    return d.get("megakernel_authentic")
+
+
+def _constraints(problem: str) -> dict:
+    y = _HERE / "problems" / problem / "problem.yaml"
+    if not y.exists():
+        return {}
+    try:
+        import yaml
+        return yaml.safe_load(y.read_text()).get("constraints", {}) or {}
+    except Exception:
+        return {}
+
+
+def megakernel_row(run_dir: Path, run_id: str, annotations_dir: Path, problem: str):
+    """Per-row megakernel signal: (kernels, status, judged).
+
+    `kernels` is the count of custom kernels (@triton.jit / load_inline /
+    __global__) in the timed path -- a proxy for launches-per-step (decode) or
+    launches-per-iteration (RL, where coarse fusion of many steps into one launch
+    is expected and fine). `status` is pass/fail/unknown; `judged` says whether
+    the pass/fail came from the authoritative judge annotation (True) or is a
+    provisional evidence-based read (False). Green = pass, red = fail.
+
+    Threshold: the problem's constraint (`launches_per_step` for decode = 1,
+    `max_launches_per_iteration` for RL = 8). A judge verdict always wins; absent
+    one, any graph/compile/codegen/obfuscation tripwire is a fail, else the kernel
+    count must be in [1, threshold] (0 = plain eager, over = unfused).
+    """
+    verdict = megakernel_authentic(run_id, annotations_dir)
+    try:
+        ev = extract_evidence(run_dir)
+    except Exception:
+        return "", "unknown", verdict is not None
+    kernels = ev["kernel_count"]["total"]
+    tw = ev["tripwires"]
+    cons = _constraints(problem)
+    threshold = cons.get("launches_per_step") or cons.get("max_launches_per_iteration") or 1
+    if verdict is True:
+        status = "pass"
+    elif verdict is False:
+        status = "fail"
+    elif tw["graph"] or tw["compile"] or tw["codegen"] or tw["obfuscation"]:
+        status = "fail"
+    elif 1 <= kernels <= threshold:
+        status = "pass"
+    else:
+        status = "fail"
+    return kernels, status, verdict is not None
+
+
 def contamination(run_dir: Path) -> int:
     """Count distinct OTHER run-archive timestamps referenced in the AGENT transcript.
 
@@ -124,6 +196,7 @@ def main() -> None:
     args = ap.parse_args()
 
     html_ids = {p.stem for p in Path(args.runs_html).glob("*.html")} if Path(args.runs_html).exists() else set()
+    annotations_dir = here / "results" / "annotations"
 
     rows = []
     for rj in sorted(Path(args.runs).glob("*/result.json")):
@@ -141,10 +214,18 @@ def main() -> None:
         if nc >= 1:
             print(f"  EXCLUDED (contaminated, read {nc} other archive(s)): {run_dir.name}")
             continue
+        rid = d.get("run_id", run_dir.name)
+        # Megakernel authenticity gate: drop runs the judge audit marked as not a
+        # genuine fused megakernel (graph/compile/per-op-loop). None = unjudged, kept.
+        if megakernel_authentic(rid, annotations_dir) is False:
+            print(f"  EXCLUDED (not a megakernel, judge verdict): {run_dir.name}")
+            continue
         gpu = (run_dir / "gpu").read_text().strip()
         tok_s, ctx = _bench(run_dir / "benchmark.log")
         usage = d.get("usage") or {}
-        rid = d.get("run_id", run_dir.name)
+        mk_kernels, mk_status, mk_judged = megakernel_row(
+            run_dir, rid, annotations_dir, d.get("problem", "")
+        )
         rows.append({
             "gpu": gpu,
             "harness": d.get("harness", ""),
@@ -159,6 +240,9 @@ def main() -> None:
             "ctx8192": f"{ctx.get(8192):.2f}" if ctx.get(8192) else "",
             "ctx16384": f"{ctx.get(16384):.2f}" if ctx.get(16384) else "",
             "framework": _framework(run_dir),
+            "kernels": mk_kernels,
+            "megakernel": mk_status,
+            "megakernel_judged": "true" if mk_judged else "false",
             "has_viewer": "true" if rid in html_ids else "false",
             "run_id": rid,
         })
@@ -175,7 +259,8 @@ def main() -> None:
     out.parent.mkdir(parents=True, exist_ok=True)
     fields = ["gpu", "harness", "model", "problem", "correct", "score", "tok_s",
               "elapsed_s", "output_tokens", "ctx2048", "ctx8192", "ctx16384",
-              "framework", "has_viewer", "run_id"]
+              "framework", "kernels", "megakernel", "megakernel_judged",
+              "has_viewer", "run_id"]
     with out.open("w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=fields)
         w.writeheader()
@@ -183,8 +268,9 @@ def main() -> None:
             w.writerow(r)
     print(f"wrote {len(best)} rows -> {out}")
     for r in sorted(best.values(), key=lambda x: (x["gpu"], -float(x["score"] or 0))):
+        _mk = f"{r['megakernel']}({r['kernels']}k{'*' if r['megakernel_judged']=='true' else '?'})"
         print(f"  {r['gpu']:24s} {r['model']:20s} score={r['score']:>7} tok/s={r['tok_s']:>5} "
-              f"fw={r['framework']:8s} viewer={r['has_viewer']}")
+              f"fw={r['framework']:8s} mk={_mk:12s} viewer={r['has_viewer']}")
 
 
 if __name__ == "__main__":
