@@ -33,7 +33,46 @@ def main() -> None:
         sys.exit(1)
 
     meta = yaml.safe_load(Path("problem.yaml").read_text())
+    # Scan solution.py AND every local module it imports (recursively), so
+    # forbidden ops / the megakernel escape hatches (CUDA graphs, torch.compile)
+    # can't hide in a sidecar kernels.py. Harness files are excluded.
+    import ast as _ast
+    _HARNESS = {"reference", "baseline", "shapes", "check", "benchmark", "problem"}
+
+    def _local_imports(_src):
+        _mods = set()
+        try:
+            _tree = _ast.parse(_src)
+        except Exception:
+            return _mods
+        for _node in _ast.walk(_tree):
+            if isinstance(_node, _ast.Import):
+                for _n in _node.names:
+                    _mods.add(_n.name.split(".")[0])
+            elif isinstance(_node, _ast.ImportFrom):
+                if _node.module and _node.level == 0:
+                    _mods.add(_node.module.split(".")[0])
+        return _mods
+
     sol_src = Path("solution.py").read_text() if Path("solution.py").exists() else ""
+    _seen = {"solution"}
+    _queue = [
+        _m for _m in _local_imports(sol_src)
+        if _m not in _HARNESS and Path(_m + ".py").exists()
+    ]
+    while _queue:
+        _m = _queue.pop()
+        if _m in _seen:
+            continue
+        _seen.add(_m)
+        try:
+            _s = Path(_m + ".py").read_text()
+        except Exception:
+            continue
+        sol_src += "\n" + _s
+        for _mm in _local_imports(_s):
+            if _mm not in _seen and _mm not in _HARNESS and Path(_mm + ".py").exists():
+                _queue.append(_mm)
     for forbidden in meta.get("forbidden", []):
         if re.search(re.escape(forbidden), sol_src):
             print(f"FAIL: forbidden op used: {forbidden}")
