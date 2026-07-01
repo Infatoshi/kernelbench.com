@@ -497,6 +497,29 @@ Most likely causes:
   (clean | reward_hack | ...). Treat a lint HACK as "review," not "reject."
 - `04_kahan_softmax` was removed from the hard deck (rewarded skipping Kahan); do not
   re-add. (This is also why the hard deck skips 04.)
+- **KernelBench-Multi (`benchmarks/multi/`, the WIP 8×H100 NVLink bench) runs on
+  rented Brev GPUs — two gotchas that each cost real money if you miss them:**
+  - **`brev delete <name>` has a hidden interactive "are you sure?" confirmation
+    that SILENTLY HANGS with no TTY** (it prints nothing and never deletes; `brev
+    stop` and `yes | brev delete` also no-op). The ONLY reliable teardown is to
+    give it a pseudo-TTY and feed it `y`:
+    `script -qec "brev delete <name>" /dev/null <<< "y"`. Any auto-teardown
+    watchdog MUST use this form — a plain `yes | brev delete` backstop does
+    nothing, so a forgotten node bills at ~$23/hr (8×H100 SXM5) until caught.
+    Always confirm teardown with `brev ls` showing "No instances".
+  - **torch wheel must be CUDA-driver-matched.** Hyperstack/shadeform 8×H100
+    nodes ship driver CUDA 12.8; the default `uv pip install torch` pulls a cu130
+    wheel that can't see the GPUs (`torch.cuda.is_available()==False`, "driver too
+    old"). Install the matched build:
+    `uv pip install --index-url https://download.pytorch.org/whl/cu128 torch==2.8.0`.
+    Bake this (plus uv + the repo) into a prebaked image so you don't pay node
+    time for the reinstall.
+  - Pick the **NVSwitch** SKU (`hyperstack_H100_sxm5x8`, every pair `NV18` in
+    `nvidia-smi topo -m`), not the PCIe `hyperstack_H100x8` — this bench grades
+    NVLink busbw, so a PCIe node produces meaningless numbers. Validate
+    correctness for free on a single GPU first via gloo+cpu
+    (`KBM_BACKEND=gloo KBM_DEVICE=cpu KBM_WORLD_SIZE=4 python check.py`); the
+    rented node should never see a correctness bug for the first time.
 - See each bench's `DEVLOG.md` for the full journey and `SPEC.md` for
   methodology.
 
