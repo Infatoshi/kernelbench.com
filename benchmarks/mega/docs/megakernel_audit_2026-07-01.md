@@ -54,38 +54,60 @@ rationally reached for the cheapest launch-overhead fix instead of fusion. The
 mandatory reward-hack/contamination audit never checked "did the solution do the
 kind of thing the bench claims to test."
 
-## Actions taken (benchmark surface v2)
-Both mega problems were versioned to enforce the premise:
+## Actions taken (benchmark surface v2 → v2.1)
+Both mega problems were versioned to enforce the premise. The first pass (v2)
+tried to string-forbid `torch.compile`/`CUDAGraph` in `check.py`; a red-team
+battery (below) showed that gate is both leaky and brittle, so v2.1 moved
+authenticity to a **judge gate fed by advisory tripwires**. Final state:
 
 1. **`PROMPT.txt` (both):** explicit hard mandate.
    - Decode: the timed `step()` must be a **single GPU kernel launch**; the whole
      per-token forward fused into one custom kernel. CUDA graphs / `torch.compile`
-     / per-op kernel loops are banned as substitutes.
+     / per-op kernel loops do not count — a **post-run authenticity judge** reads
+     the final source (recursively) and rejects them; obfuscation is itself a flag.
    - RL: launches must **not scale with env-steps/horizon/minibatches**; the whole
-     rollout (all HORIZON steps × all envs + policy + sampling + advantage) runs
-     in one persistent kernel launch, PPO update fused in or a small fixed number
-     of extra launches per iteration. Coarse fusion (many rollouts per launch) is
-     the goal — only per-step/per-minibatch loops are ruled out.
-2. **`problem.yaml` (both):** added `torch.compile`, `CUDAGraph`, `cuda.graph`,
-   `make_graphed_callables` to `forbidden`, plus a documented `constraints:` block.
-3. **`check.py` (both):** the forbidden scan now covers `solution.py` **and every
-   local module it imports** (recursively), so the escape hatches can't hide in a
-   sidecar `kernels.py`.
+     rollout in one persistent kernel launch, PPO update fused in or a small fixed
+     number of extra launches per iteration. Coarse fusion is the goal — only
+     per-step/per-minibatch loops are ruled out. Same judge gate.
+2. **`problem.yaml` (both):** graph/compile are **not** in `forbidden` (they
+   false-positive on honest disclaimers and miss obfuscation). `forbidden` is now
+   libraries only; a `constraints:` block documents `authenticity_gate: judge` and
+   the advisory tripwires.
+3. **`check.py` (both):** the one bright-line hard fail is **importing a banned
+   library**, matched by **AST import statements** (not substring) over
+   `solution.py` + every local module it imports (recursively, incl. `scratch/`).
+4. **`src/eval/megakernel.py` + `scripts/megakernel_evidence.py`:** deterministic
+   advisory evidence — recursive source, kernel count, and graph/compile/codegen/
+   obfuscation tripwires (graph/compile checked on comment+string-stripped code so
+   a disclaimer doesn't trip; obfuscation caught at the AST level).
+5. **The judge gate:** the mandatory pre-publish audit renders the judge prompt
+   from the evidence and records `megakernel_authentic: true|false` in
+   `results/annotations/<run_id>.yaml`. `build_mega_leaderboard.py` excludes any
+   run marked `false` (like the contamination exclusion). See
+   `docs/megakernel_authenticity_judge.md`.
 
-These give immediate teeth against the two launch-overhead workarounds (graph +
-compile), enforced by `check.py`.
+## Red-team result (why v2.1, not v2)
+`tests/test_megakernel_evidence.py` runs 7 adversarial cases. A raw substring gate
+on graph/compile **false-fails** an honest solution that merely disclaims the
+techniques in a comment (A7), and **misses** `getattr(torch.cuda,"CUDAGra"+"ph")`
+(A5) and `importlib`-based runtime codegen (A6). The deterministic tripwires now
+catch A5 (obfuscation) and A6 (codegen) and stay quiet on A7; the LLM judge
+resolved every case correctly (PASS A1, FAIL A2–A6, FAIL A7-as-eager). Verified
+on real archives: the Opus 19.35x cell trips the graph tripwire (9 kernels +
+CUDA graph), Sonnet's cell is graph-clean (9 Triton kernels, no graph) — both
+correctly flagged as *not a single fused megakernel* for the judge to rule on.
 
 ## Remaining gap (follow-up)
-String-forbidding graph/compile does **not** by itself guarantee "exactly one
-launch" — a `MULTI_EAGER` many-small-kernels solution would still pass `check.py`
-while not being a megakernel. The airtight fix is a **profiler-based launch-count
-gate** in `check.py`: warm up a step, profile one step, assert exactly 1 kernel
-launch (decode) / launches that don't scale with steps (RL). This needs on-GPU
-validation of the counting method (CUDA-graph replay and memcpy/memset must be
-handled) before wiring in.
+The tripwires + judge do not *measure* launch count. The airtight complement is a
+**profiler-based launch-count gate**: warm up a step, profile one step, assert 1
+launch (decode) / launches that don't scale with steps (RL), handling CUDA-graph
+replay and memcpy/memset. Needs on-GPU validation before wiring in; the judge gate
+is the enforcement mechanism until then.
 
 ## Implication for any prior "mega" numbers
 The existing mega board reflects CUDA-graph launch-overhead elimination, not
-megakernel fusion. Under v2 rules the high-scoring graph/compile cells would fail
-`check.py`. A re-sweep under v2 is required before reporting a real megakernel
-leaderboard.
+megakernel fusion. Under v2.1 the high-scoring graph/compile cells (incl. the Opus
+19.35x decode cell) must be annotated `megakernel_authentic: false` and are
+excluded by the builder, or re-done as a true single fused kernel. A re-sweep is
+required before reporting a real megakernel leaderboard. Mega is not on the public
+site yet, so nothing user-facing is currently wrong.

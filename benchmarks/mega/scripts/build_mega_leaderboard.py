@@ -84,6 +84,25 @@ def _framework(run_dir: Path) -> str:
 _RUN_TS = re.compile(r"outputs/runs/(\d{8}_\d{6})")
 
 
+def megakernel_authentic(run_id: str, annotations_dir: Path) -> bool | None:
+    """Read the authenticity verdict recorded by the post-run judge audit.
+
+    Returns False only when an annotation explicitly says the submission is not a
+    genuine megakernel (CUDA-graph / torch.compile / per-op-loop escape hatch, or
+    plain eager dressed up as fusion). None = not yet judged (do NOT exclude).
+    See docs/megakernel_authenticity_judge.md.
+    """
+    f = annotations_dir / f"{run_id}.yaml"
+    if not f.exists():
+        return None
+    try:
+        import yaml
+        d = yaml.safe_load(f.read_text()) or {}
+    except Exception:
+        return None
+    return d.get("megakernel_authentic")
+
+
 def contamination(run_dir: Path) -> int:
     """Count distinct OTHER run-archive timestamps referenced in the AGENT transcript.
 
@@ -124,6 +143,7 @@ def main() -> None:
     args = ap.parse_args()
 
     html_ids = {p.stem for p in Path(args.runs_html).glob("*.html")} if Path(args.runs_html).exists() else set()
+    annotations_dir = here / "results" / "annotations"
 
     rows = []
     for rj in sorted(Path(args.runs).glob("*/result.json")):
@@ -141,10 +161,15 @@ def main() -> None:
         if nc >= 1:
             print(f"  EXCLUDED (contaminated, read {nc} other archive(s)): {run_dir.name}")
             continue
+        rid = d.get("run_id", run_dir.name)
+        # Megakernel authenticity gate: drop runs the judge audit marked as not a
+        # genuine fused megakernel (graph/compile/per-op-loop). None = unjudged, kept.
+        if megakernel_authentic(rid, annotations_dir) is False:
+            print(f"  EXCLUDED (not a megakernel, judge verdict): {run_dir.name}")
+            continue
         gpu = (run_dir / "gpu").read_text().strip()
         tok_s, ctx = _bench(run_dir / "benchmark.log")
         usage = d.get("usage") or {}
-        rid = d.get("run_id", run_dir.name)
         rows.append({
             "gpu": gpu,
             "harness": d.get("harness", ""),
