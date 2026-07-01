@@ -17,6 +17,9 @@ interface Row {
   ctx8192: number | null
   ctx16384: number | null
   framework: string
+  kernels: number | null
+  megakernel: string
+  megakernel_judged: boolean
   has_viewer: boolean
   run_id: string
 }
@@ -63,6 +66,7 @@ export default function MegaPage() {
           "ctx2048",
           "ctx8192",
           "ctx16384",
+          "kernels",
         ])
         const rows: Row[] = []
         for (let i = 1; i < lines.length; i++) {
@@ -73,7 +77,7 @@ export default function MegaPage() {
             const val = (v[idx] ?? "").trim()
             if (h === "correct") {
               r[h] = val.toLowerCase() === "true"
-            } else if (h === "has_viewer") {
+            } else if (h === "has_viewer" || h === "megakernel_judged") {
               r[h] = val.toLowerCase() === "true"
             } else if (numericFields.has(h)) {
               r[h] =
@@ -269,6 +273,9 @@ export default function MegaPage() {
                     onSort={onSort}
                   />
                   <th>framework</th>
+                  <th title="custom kernels in the timed path (proxy for launches/step). Green = genuine fused megakernel within the launch budget; red = hides launches (CUDA graph / torch.compile) or is unfused / eager. Hollow dot = provisional (not yet judge-verified).">
+                    megakernel
+                  </th>
                   <th>files</th>
                   <th>conversation</th>
                 </tr>
@@ -333,6 +340,9 @@ export default function MegaPage() {
                         )}
                       </td>
                       <td>
+                        <MegakernelCell row={r} />
+                      </td>
+                      <td>
                         <div className="chip-row">
                           <a className="link-chip" href={REFERENCE_URL}>
                             reference
@@ -386,7 +396,15 @@ export default function MegaPage() {
           speedup = decode speedup over an optimized-PyTorch baseline (bar width
           normalized to the fastest run on the board); the per-ctx breakdown
           shows speedup at 2k / 8k / 16k decode context. Top speedup per GPU is
-          highlighted. Browse the{" "}
+          highlighted. The <span className="text-[var(--color-fg)]">megakernel</span>{" "}
+          column is the count of custom kernels in the timed path (the
+          launches-per-step proxy) with a{" "}
+          <span className="text-[var(--color-accent)]">green</span> /{" "}
+          <span className="text-[var(--color-bad)]">red</span> marker for whether
+          it is a genuine single fused megakernel or hides launches (CUDA graph /
+          torch.compile) / stays unfused; a hollow dot with a trailing{" "}
+          <code>?</code> means the verdict is provisional (not yet judge-verified).
+          Browse the{" "}
           <Link href="/runs" className="underline underline-offset-2">
             run index
           </Link>{" "}
@@ -512,6 +530,41 @@ function SpeedupCell({
         </div>
       )}
     </div>
+  )
+}
+
+function MegakernelCell({ row }: { row: Row }) {
+  if (!row.megakernel || row.megakernel === "unknown") {
+    return <span className="cell-missing">-</span>
+  }
+  const pass = row.megakernel === "pass"
+  const judged = row.megakernel_judged
+  const color = pass ? "var(--color-accent)" : "var(--color-bad)"
+  const num = row.kernels != null ? row.kernels : "?"
+  const title =
+    `${pass ? "genuine fused megakernel" : "not a single fused megakernel"} · ` +
+    `${num} custom kernel(s) in timed path · ` +
+    `${judged ? "judge-verified" : "provisional (not yet judge-verified)"}`
+  return (
+    <span
+      title={title}
+      style={{ display: "inline-flex", alignItems: "center", gap: "0.4rem" }}
+    >
+      <span
+        aria-hidden="true"
+        style={{
+          width: 8,
+          height: 8,
+          borderRadius: "50%",
+          background: judged ? color : "transparent",
+          border: `1.5px solid ${color}`,
+        }}
+      />
+      <span style={{ color: pass ? "var(--color-fg)" : "var(--color-fg-muted)" }}>
+        {num}
+        {judged ? "" : "?"}
+      </span>
+    </span>
   )
 }
 
