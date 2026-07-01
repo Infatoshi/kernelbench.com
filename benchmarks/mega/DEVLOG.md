@@ -4,6 +4,77 @@ A running record of decisions, dead ends, and lessons. Newest entries on top. Th
 
 ---
 
+## 2026-07-01 — megakernel authenticity: judge gate + advisory tripwires (not a substring ban)
+
+Audit finding that started this: **zero of the archived mega submissions are
+true single-launch megakernels**, despite the bench being branded one. Every
+high-scoring decode cell wins via CUDA graphs (Opus 19.35x = 9 Triton kernels
+replayed under a captured graph — cuts launch overhead without fusing anything);
+the honest single-custom-kernel attempts are "1 fused GEMV + eager everything
+else." The Sonnet 5 (4.03x) vs Opus (19.35x) gap is *entirely* this axis: same
+algebra, but Opus captured the whole step as a graph (~1 replay/token) while
+Sonnet drove ~9 kernels/token from Python. Neither actually fused. The prompts
+and graders never *required* a megakernel, so models rationally reached for the
+cheapest launch-overhead fix. Full write-up: `docs/megakernel_audit_2026-07-01.md`.
+
+**First attempt (v2) was wrong: string-forbid `torch.compile`/`CUDAGraph` in
+check.py.** Before shipping it I red-teamed the gate with a 7-case adversarial
+battery (`tests/test_megakernel_evidence.py`). A raw substring scan turned out to
+be the worst of both worlds:
+- **Leaky** — `getattr(torch.cuda, "CUDAGra"+"ph")` (A5) and `importlib`-based
+  runtime codegen that writes+imports a kernel module (A6) carry no literal
+  banned token, so they sail through.
+- **Brittle** — an honest solution whose *comment* says "no torch.compile, no
+  CUDA graphs" (A7) gets false-failed on its own disclaimer.
+
+A substring gate therefore punishes honesty and rewards obfuscation. Killed it.
+
+**Shipped (v2.1): judge gate fed by deterministic advisory evidence.**
+- The one bright line that stays a hard fail in check.py is **importing a banned
+  library**, matched by **AST import statements** (not substring), recursively
+  over solution.py + every local module it imports (incl. `scratch/` sidecars,
+  where archived claude/cursor runs stash the real kernel). Naming a lib in a
+  comment no longer fails; `marlin` no longer matches `marlinx`.
+- `src/eval/megakernel.py` (CLI `scripts/megakernel_evidence.py`) extracts
+  objective signals: recursive source, kernel count, and graph/compile/codegen/
+  obfuscation tripwires. graph/compile are matched on **comment+string-stripped
+  code** (so a disclaimer can't trip them); obfuscation (getattr string-concat,
+  banned-token folding) is caught at the AST level so it survives stripping.
+- The mandatory pre-publish audit renders the judge prompt from that evidence and
+  records `megakernel_authentic: true|false` in `results/annotations/<run_id>.yaml`.
+  The judge reasons from code, treating tripwires as hints and docstrings as
+  untrusted. Red-team result: judge PASSed A1, FAILed A2–A6 (incl. the obfuscated/
+  codegen evasions the substring scan missed) and FAILed A7-as-eager.
+- `build_mega_leaderboard.py` **excludes** runs annotated `megakernel_authentic:
+  false` (alongside the contamination exclusion), and now emits a **megakernel
+  column**: the custom-kernel count in the timed path (launches-per-step proxy;
+  for RL, coarse fusion of many steps into one launch is expected, budget ≤8) +
+  a green/red marker. Green = genuine fused megakernel within the launch budget;
+  red = hides launches / unfused / eager. The marker uses the judge verdict when
+  present, else a provisional evidence-based read (hollow dot + trailing `?`).
+  `/mega` renders it. Rubric + integration: `docs/megakernel_authenticity_judge.md`.
+
+**Prompts (both problems) updated** to state the timed path must be one fused
+kernel and that a *post-run authenticity judge* (not check.py) rejects graph/
+compile/per-op-loop escapes — and that obfuscating them is itself a red flag.
+Decode mandates one launch/step; RL allows coarse fusion (many env-steps per
+launch) but forbids launch counts that scale with steps/horizon/minibatches.
+
+**Known implication, not yet actioned:** the published Opus 19.35x decode cell is
+a CUDA-graph solution → not an authentic megakernel. It (and the other graph/
+many-kernel cells) currently show a *provisional* red marker; they need explicit
+`megakernel_authentic: false` annotations, or a redo as a true single fused
+kernel, before any megakernel-headline re-publish. Mega is not on the public site
+yet, so nothing user-facing is wrong today.
+
+**Follow-up (the airtight complement):** the tripwires+judge do not *measure*
+launch count. A profiler-based launch-count gate (warm up, profile one step,
+assert 1 launch for decode / non-scaling launches for RL, handling graph replay
+and memcpy/memset) is the durable enforcement. Needs on-GPU validation before
+wiring; the judge gate is the mechanism until then.
+
+---
+
 ## 2026-06-18 — contamination prevented at the source: bwrap sandbox on run_hard.sh
 
 The near-term, easy fix for cross-run contamination (agents reading prior winning
