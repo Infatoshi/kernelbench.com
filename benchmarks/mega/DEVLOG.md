@@ -4,6 +4,29 @@ A running record of decisions, dead ends, and lessons. Newest entries on top. Th
 
 ---
 
+## 2026-07-01 — fable-5 lands 14.3x on 01_rl_grid_ppo; SPS credibility cap recalibrated 20x → 100x
+
+First fable-5 (Claude Code, effort max) run on the RL deck: 14.2961x
+(357M SPS), 54 min agent time. Manual audit verdict: **clean, megakernel
+authentic** — the entire training run (40 iters of rollout + GAE + 4×4 PPO/Adam
+update) executes inside a single `cudaLaunchCooperativeKernel` launch with
+`grid.sync()` barriers; one warp per env episode, MLP split 2 units/lane with
+butterfly reductions. Empirically verified from the run workspace: fresh random
+seeds start at random-policy return (~0.13) and learn to ~3.97, seed-dependent
+curves, from-scratch on every call, 356M SPS reproduced independently. See
+`results/annotations/20260701_172617_claude_claude-fable-5_01_rl_grid_ppo.yaml`.
+
+Consequence: yesterday's fabrication guard set `max_credible_sps_multiple: 20`
+(500M SPS) when the best known honest kernel was the ~2.1M SPS reference on the
+3090. A clean 357M SPS solution leaves only ~1.4x honest headroom before the
+cap zeroes a legitimate kernel. Recalibrated to 100x (2.5B SPS): still orders
+of magnitude below the ~20,000x a no-work fabricator posts, so the guard keeps
+its teeth. The 25M `peak_sps` scoring ceiling is also clearly miscalibrated
+(scores now read as >14x "of peak") but rescaling it changes every published
+multiple, so that decision is deferred — flagged, not changed.
+
+---
+
 ## 2026-07-01 — RL sim fidelity smoke + fabrication red-team on the 3090 (benchmark v2 guards)
 
 Pre-sweep smoke of `01_rl_grid_ppo` on the idle RTX 3090 (disposable /tmp

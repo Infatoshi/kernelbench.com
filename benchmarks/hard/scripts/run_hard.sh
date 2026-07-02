@@ -35,6 +35,14 @@ if [ -f "$HOME/.env_vars" ]; then
     set +a
 fi
 
+# Per-run Claude account selection. ~/.env_vars exports CLAUDE_CODE_OAUTH_TOKEN,
+# which takes precedence over the interactive login in ~/.claude/.credentials.json.
+# KBH_CLAUDE_AUTH=keychain drops the env token for this run so it bills the
+# keychain account instead — lets concurrent runs spread across two accounts.
+if [ "${KBH_CLAUDE_AUTH:-}" = "keychain" ]; then
+    unset CLAUDE_CODE_OAUTH_TOKEN
+fi
+
 HARNESS="${1:?Usage: $0 <harness> <model> <problem_dir> [reasoning_effort]}"
 MODEL="${2:?model required}"
 SOURCE_PROBLEM_DIR="${3:?problem_dir required}"

@@ -1,0 +1,306 @@
+"""Fused W4A16 decode solution for the Kimi-Linear hybrid block.
+
+Design (see kernels.py for the actual Triton kernels):
+
+1. Every big projection (KDA q/k/v/g/o, MLA q/kv_a/kv_b/o, MoE gate/up/down) is
+   evaluated with a fused int4 dequant-GEMV that streams the packed weight
+   exactly once -- the int4 bytes are read, dequantized in registers against
+   the per-group scale/zero, and reduced against the activation vector in one
+   pass. The dequantized bf16 matrix is never materialized anywhere.
+
+2. MLA decode never recomputes k_nope/v for the whole growing cache every
+   step (that is what reference.py/baseline.py do, and it is O(context_len)
+   compute per step). Instead it uses matrix absorption: q_nope is projected
+   once through kv_b's nope-half ("qabs"), attention scores + softmax +
+   latent aggregation are fused into one kernel that only reads the compressed
+   cache, and the aggregated latent is projected once through kv_b's v-half
+   ("oabs"). kv_b's weight is streamed O(1) times per step, not O(context_len).
+
+3. The KDA gated-delta-rule state update (decay, delta rule, readout) is one
+   Triton kernel per head instead of ~6 separate elementwise PyTorch ops, so
+   the recurrent state is read and written once instead of several times.
+
+4. Weight buffers that share an input activation (KDA's q/k/v/g, MLA's
+   q_proj/kv_a, MoE's routed+shared experts) are lazily concatenated once
+   (on first `step()`, i.e. during warmup) into single fused buffers so decode
+   issues far fewer kernel launches per token.
+
+5. The MLA latent cache (c_kv, k_rope) is grown with an amortized-doubling
+   buffer instead of reallocating + copying the whole cache every step, so a
+   step's cost stays close to O(1) append instead of O(context_len) copy.
+
+Buffer/parameter names mirror reference.py exactly so `load_state_dict` from
+the reference model's state dict works unmodified.
+"""
+from __future__ import annotations
+
+import kernels
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import triton  # noqa: F401  -- solution.py's actual compute is the @triton.jit kernels in kernels.py
+
+EPS = 1.0e-6
+GROUP_SIZE = 128
+
+
+# --------------------------------------------------------------------------- #
+# quantized weight containers (buffer names/shapes match reference.py exactly
+# so `sol_model.load_state_dict(ref_model.state_dict(), strict=True)` works)
+# --------------------------------------------------------------------------- #
+class QuantLinear(nn.Module):
+    def __init__(self, in_f: int, out_f: int, group: int = GROUP_SIZE):
+        super().__init__()
+        assert in_f % group == 0 and in_f % 2 == 0
+        self.in_f, self.out_f, self.group = in_f, out_f, group
+        ng = in_f // group
+        self.register_buffer("w_q", torch.zeros(in_f // 2, out_f, dtype=torch.uint8))
+        self.register_buffer("scales", torch.zeros(ng, out_f, dtype=torch.bfloat16))
+        self.register_buffer("zeros", torch.zeros(ng, out_f, dtype=torch.bfloat16))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        y = kernels.qgemv_single(x, self.w_q, self.scales, self.zeros, self.in_f, self.out_f, self.group)
+        return y.to(torch.bfloat16)
+
+
+class QuantExperts(nn.Module):
+    def __init__(self, n: int, in_f: int, out_f: int, group: int = GROUP_SIZE):
+        super().__init__()
+        self.n, self.in_f, self.out_f, self.group = n, in_f, out_f, group
+        ng = in_f // group
+        self.register_buffer("w_q", torch.zeros(n, in_f // 2, out_f, dtype=torch.uint8))
+        self.register_buffer("scales", torch.zeros(n, ng, out_f, dtype=torch.bfloat16))
+        self.register_buffer("zeros", torch.zeros(n, ng, out_f, dtype=torch.bfloat16))
+
+
+# --------------------------------------------------------------------------- #
+# helpers
+# --------------------------------------------------------------------------- #
+def _rmsnorm(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
+    return kernels.rmsnorm(x, w, EPS)
+
+
+# --------------------------------------------------------------------------- #
+# KDA: gated-delta linear attention with fixed-size recurrent state
+# --------------------------------------------------------------------------- #
+class KDA(nn.Module):
+    def __init__(self, cfg):
+        super().__init__()
+        self.cfg = cfg
+        H, Dk, d = cfg.kda_heads, cfg.kda_head_dim, cfg.hidden
+        self.q_proj = QuantLinear(d, H * Dk, cfg.group)
+        self.k_proj = QuantLinear(d, H * Dk, cfg.group)
+        self.v_proj = QuantLinear(d, H * Dk, cfg.group)
+        self.g_proj = QuantLinear(d, H * Dk, cfg.group)
+        self.beta_proj = nn.Linear(d, H, bias=False, dtype=cfg.dtype)
+        self.conv_w = nn.Parameter(torch.empty(3, H * Dk, cfg.short_conv, dtype=cfg.dtype))
+        self.o_proj = QuantLinear(H * Dk, d, cfg.group)
+        self.scale = Dk ** -0.5
+        self._fused = False
+
+    def _fuse(self):
+        self.qkvg_wq = torch.cat(
+            [self.q_proj.w_q, self.k_proj.w_q, self.v_proj.w_q, self.g_proj.w_q], dim=1
+        ).contiguous()
+        self.qkvg_s = torch.cat(
+            [self.q_proj.scales, self.k_proj.scales, self.v_proj.scales, self.g_proj.scales], dim=1
+        ).contiguous()
+        self.qkvg_z = torch.cat(
+            [self.q_proj.zeros, self.k_proj.zeros, self.v_proj.zeros, self.g_proj.zeros], dim=1
+        ).contiguous()
+        self._fused = True
+
+    def step(self, x, st):
+        if not self._fused:
+            self._fuse()
+        cfg = self.cfg
+        H, Dk = cfg.kda_heads, cfg.kda_head_dim
+        Dout = H * Dk
+
+        qkvg = kernels.qgemv_single(x, self.qkvg_wq, self.qkvg_s, self.qkvg_z, cfg.hidden, 4 * Dout, cfg.group)
+        qkv_raw = qkvg[:3 * Dout].to(torch.bfloat16).view(3, Dout)
+        g_raw = qkvg[3 * Dout:4 * Dout]
+
+        q, st["cq"] = kernels.short_conv(qkv_raw[0], st["cq"], self.conv_w[0])
+        k, st["ck"] = kernels.short_conv(qkv_raw[1], st["ck"], self.conv_w[1])
+        v, st["cv"] = kernels.short_conv(qkv_raw[2], st["cv"], self.conv_w[2])
+        q = (q.view(H, Dk).float() * self.scale).contiguous()
+        k = k.view(H, Dk).float().contiguous()
+        v = v.view(H, Dk).float().contiguous()
+        g = (-F.softplus(g_raw)).view(H, Dk).contiguous()
+        beta = torch.sigmoid(self.beta_proj(x).float()).contiguous()
+
+        o, S_new = kernels.kda_recurrence(st["S"], k, v, q, g, beta, Dk)
+        st["S"] = S_new
+
+        o_bf = o.reshape(Dout).to(torch.bfloat16)
+        return self.o_proj(o_bf)
+
+
+# --------------------------------------------------------------------------- #
+# MLA: multi-head latent attention with absorbed decode
+# --------------------------------------------------------------------------- #
+class MLA(nn.Module):
+    def __init__(self, cfg):
+        super().__init__()
+        self.cfg = cfg
+        H, d = cfg.mla_heads, cfg.hidden
+        self.q_proj = QuantLinear(d, H * (cfg.qk_nope + cfg.qk_rope), cfg.group)
+        self.kv_a = QuantLinear(d, cfg.kv_lora + cfg.qk_rope, cfg.group)
+        self.kv_b = QuantLinear(cfg.kv_lora, H * (cfg.qk_nope + cfg.v_head), cfg.group)
+        self.o_proj = QuantLinear(H * cfg.v_head, d, cfg.group)
+        self.scale = (cfg.qk_nope + cfg.qk_rope) ** -0.5
+        self._fused = False
+
+    def _fuse(self):
+        self.qkva_wq = torch.cat([self.q_proj.w_q, self.kv_a.w_q], dim=1).contiguous()
+        self.qkva_s = torch.cat([self.q_proj.scales, self.kv_a.scales], dim=1).contiguous()
+        self.qkva_z = torch.cat([self.q_proj.zeros, self.kv_a.zeros], dim=1).contiguous()
+        self._fused = True
+
+    def step(self, x, st):
+        if not self._fused:
+            self._fuse()
+        cfg = self.cfg
+        H = cfg.mla_heads
+        pos = st["_len"]
+        Nq = H * (cfg.qk_nope + cfg.qk_rope)
+        Nkva = cfg.kv_lora + cfg.qk_rope
+
+        out = kernels.qgemv_single(x, self.qkva_wq, self.qkva_s, self.qkva_z, cfg.hidden, Nq + Nkva, cfg.group)
+        q = out[:Nq].view(H, cfg.qk_nope + cfg.qk_rope)
+        # non-contiguous views are fine here: mla_qabs takes explicit strides,
+        # and apply_rope's internal .float() cast already materializes a copy.
+        q_nope = q[:, :cfg.qk_nope]
+        q_rope_raw = q[:, cfg.qk_nope:]
+        c_kv_new = out[Nq:Nq + cfg.kv_lora].to(torch.bfloat16)
+        k_rope_new = out[Nq + cfg.kv_lora:].to(torch.bfloat16)
+
+        cos, sin = kernels.rope_cossin(pos, cfg.qk_rope, cfg.rope_theta, x.device)
+        q_rope = kernels.apply_rope(q_rope_raw, cos, sin)
+        k_rope_new = kernels.apply_rope(k_rope_new, cos, sin).to(torch.bfloat16)
+
+        _cache_append(st, "c_kv", c_kv_new, cfg.kv_lora)
+        _cache_append(st, "k_rope", k_rope_new, cfg.qk_rope)
+        st["_len"] += 1
+
+        c_kv_view = st["c_kv"][: st["_len"]]
+        k_rope_view = st["k_rope"][: st["_len"]]
+
+        qabs = kernels.mla_qabs(q_nope, self.kv_b.w_q, self.kv_b.scales, self.kv_b.zeros,
+                                 H, cfg.qk_nope, cfg.v_head, cfg.kv_lora, cfg.group)
+        ctx_agg = kernels.mla_attend(qabs, q_rope, c_kv_view, k_rope_view, self.scale, cfg.kv_lora, cfg.qk_rope)
+        o = kernels.mla_oabs(ctx_agg, self.kv_b.w_q, self.kv_b.scales, self.kv_b.zeros,
+                              H, cfg.qk_nope, cfg.v_head, cfg.kv_lora, cfg.group)
+
+        o_bf = o.reshape(H * cfg.v_head).to(torch.bfloat16)
+        return self.o_proj(o_bf)
+
+
+def _cache_append(st, key, row, width):
+    """Amortized-growth append: state[key] always exposes an exact-length view
+    (st["_len"] + 1 rows) but the backing buffer over-allocates so most steps
+    are an O(1) write instead of an O(context_len) torch.cat copy."""
+    buf_key = "_buf_" + key
+    cap_key = "_cap_" + key
+    cur_len = st["_len"]
+    buf = st.get(buf_key)
+    if buf is None:
+        existing = st[key]
+        cap = max(existing.shape[0] * 2, existing.shape[0] + 64)
+        buf = torch.empty((cap, width), dtype=row.dtype, device=row.device)
+        buf[:cur_len] = existing
+        st[buf_key] = buf
+        st[cap_key] = cap
+    elif cur_len >= st[cap_key]:
+        new_cap = st[cap_key] * 2
+        new_buf = torch.empty((new_cap, width), dtype=buf.dtype, device=buf.device)
+        new_buf[:cur_len] = buf[:cur_len]
+        buf = new_buf
+        st[buf_key] = buf
+        st[cap_key] = new_cap
+
+    buf[cur_len] = row
+    st[key] = buf[: cur_len + 1]
+
+
+# --------------------------------------------------------------------------- #
+# MoE: 64-expert top-8 routed + 1 shared, fused batched dequant-GEMV
+# --------------------------------------------------------------------------- #
+class MoE(nn.Module):
+    def __init__(self, cfg):
+        super().__init__()
+        self.cfg = cfg
+        d, m, E = cfg.hidden, cfg.moe_inter, cfg.n_experts
+        self.router = nn.Linear(d, E, bias=False, dtype=cfg.dtype)
+        self.gate = QuantExperts(E, d, m, cfg.group)
+        self.up = QuantExperts(E, d, m, cfg.group)
+        self.down = QuantExperts(E, m, d, cfg.group)
+        self.s_gate = QuantExperts(cfg.n_shared, d, m, cfg.group)
+        self.s_up = QuantExperts(cfg.n_shared, d, m, cfg.group)
+        self.s_down = QuantExperts(cfg.n_shared, m, d, cfg.group)
+        self._fused = False
+
+    def _fuse(self):
+        self.gate_wq = torch.cat([self.gate.w_q, self.s_gate.w_q], dim=0).contiguous()
+        self.gate_s = torch.cat([self.gate.scales, self.s_gate.scales], dim=0).contiguous()
+        self.gate_z = torch.cat([self.gate.zeros, self.s_gate.zeros], dim=0).contiguous()
+        self.up_wq = torch.cat([self.up.w_q, self.s_up.w_q], dim=0).contiguous()
+        self.up_s = torch.cat([self.up.scales, self.s_up.scales], dim=0).contiguous()
+        self.up_z = torch.cat([self.up.zeros, self.s_up.zeros], dim=0).contiguous()
+        self.down_wq = torch.cat([self.down.w_q, self.s_down.w_q], dim=0).contiguous()
+        self.down_s = torch.cat([self.down.scales, self.s_down.scales], dim=0).contiguous()
+        self.down_z = torch.cat([self.down.zeros, self.s_down.zeros], dim=0).contiguous()
+        self._fused = True
+
+    def step(self, x):
+        if not self._fused:
+            self._fuse()
+        cfg = self.cfg
+        probs = torch.softmax(self.router(x).float(), dim=-1)
+        w, idx = torch.topk(probs, cfg.n_active)
+        w = w / (w.sum() + 1e-9) * cfg.routed_scaling
+
+        shared_idx = torch.arange(cfg.n_experts, cfg.n_experts + cfg.n_shared, device=x.device, dtype=idx.dtype)
+        idx_all = torch.cat([idx, shared_idx])
+        weights_all = torch.cat([w, torch.ones(cfg.n_shared, device=x.device, dtype=w.dtype)])
+
+        g = kernels.qgemv(x, self.gate_wq, self.gate_s, self.gate_z, idx_all, cfg.hidden, cfg.moe_inter, cfg.group)
+        u = kernels.qgemv(x, self.up_wq, self.up_s, self.up_z, idx_all, cfg.hidden, cfg.moe_inter, cfg.group)
+        h = F.silu(g) * u
+
+        d = kernels.qgemv(h, self.down_wq, self.down_s, self.down_z, idx_all, cfg.moe_inter, cfg.hidden, cfg.group,
+                           x_per_batch=True)
+        out = (weights_all[:, None] * d).sum(0)
+        return out.to(torch.bfloat16)
+
+
+# --------------------------------------------------------------------------- #
+# Block / Model
+# --------------------------------------------------------------------------- #
+class Block(nn.Module):
+    def __init__(self, cfg, kind: str):
+        super().__init__()
+        self.kind = kind
+        self.attn_norm = nn.Parameter(torch.ones(cfg.hidden, dtype=cfg.dtype))
+        self.moe_norm = nn.Parameter(torch.ones(cfg.hidden, dtype=cfg.dtype))
+        self.attn = KDA(cfg) if kind == "K" else MLA(cfg)
+        self.moe = MoE(cfg)
+
+    def step(self, x, st):
+        h = x + self.attn.step(_rmsnorm(x, self.attn_norm), st)
+        return h + self.moe.step(_rmsnorm(h, self.moe_norm))
+
+
+class Model(nn.Module):
+    def __init__(self, cfg):
+        super().__init__()
+        self.cfg = cfg
+        self.blocks = nn.ModuleList(Block(cfg, k) for k in cfg.pattern)
+
+    def step(self, hidden, state):
+        for i, blk in enumerate(self.blocks):
+            if blk.kind == "M" and "_len" not in state[i]:
+                state[i]["_len"] = state[i]["c_kv"].shape[0]
+            hidden = blk.step(hidden, state[i])
+        return hidden, state
