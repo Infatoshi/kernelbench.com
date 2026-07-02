@@ -68,14 +68,15 @@ whos   = [h[3] for h in hard][::-1]
 cols   = [C["accent"] if r >= 1 else C["fg_dim"] for r in ratios]
 bars2 = ax2.barh(probs, ratios, color=cols, height=0.55)
 ax2.axvline(1.0, color=C["warn"], linewidth=1.1, linestyle="--")
-ax2.text(0.985, -0.42, "field best ", color=C["warn"], fontsize=8.5,
+ax2.text(0.985, -0.42, "best rival model ", color=C["warn"], fontsize=8.5,
          va="top", ha="right")
 for b, r, w, h_ in zip(bars2, ratios, whos, hard[::-1]):
-    ax2.text(r + 0.015, b.get_y() + b.get_height() / 2,
-             f"{r:.2f}x vs {w}", va="center", color=C["fg_muted"], fontsize=8.5)
-ax2.set_xlim(0, 1.45)
-ax2.set_xlabel("Fable 5 peak fraction ÷ best non-Fable model")
-ax2.set_title("Hard: per-op kernel deck vs the field\nRTX PRO 6000 Blackwell",
+    ax2.text(r + 0.02, b.get_y() + b.get_height() / 2,
+             f"{h_[1]:.3f} vs {h_[2]:.3f}\n{w}",
+             va="center", color=C["fg_muted"], fontsize=8, linespacing=1.3)
+ax2.set_xlim(0, 1.6)
+ax2.set_xlabel("relative to best rival (labels: absolute roofline fractions)")
+ax2.set_title("Hard: Fable 5 vs best rival, per problem\nRTX PRO 6000 — 1.0 line = tied with field best",
               color=C["fg"], fontsize=11, loc="left")
 ax2.grid(axis="x", color=C["grid"], linewidth=0.7)
 ax2.set_axisbelow(True)
