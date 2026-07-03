@@ -77,11 +77,11 @@ const benchmarks = [
     href: "/hard",
     title: "Hard",
     description:
-      "Curated hard CUDA/Triton deck, frontier-model comparison across RTX PRO 6000 Blackwell, H100 PCIe, and B200, roofline-graded with per-run agent traces.",
+      "Curated hard CUDA/Triton deck, frontier-model comparison across RTX PRO 6000 Blackwell and B200, roofline-graded with per-run agent traces.",
     stats: [
       ["problems", "6"],
       ["models", "8"],
-      ["GPUs", "3"],
+      ["GPUs", "2"],
     ],
     hfHref: "https://huggingface.co/datasets/Infatoshi/kernelbench-hard-traces",
   },

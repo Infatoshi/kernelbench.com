@@ -86,20 +86,6 @@ const GPU_TARGETS = [
     ),
   },
   {
-    key: "h100",
-    label: "H100 PCIe",
-    runtime: "limited",
-    file: "benchmarks/hard/results/leaderboard.h100.json",
-    blurb: (
-      <>
-        Eight models (Opus 4.8, GPT-5.5, GLM-5.2, MiniMax-M3, Gemini 3.5 Flash,
-        DeepSeek V4 Pro, Kimi K2.7-Code, Composer 2.5 Fast) on a single H100
-        PCIe with the same containerized harness and roofline grading as the
-        Blackwell deck; peak fraction is measured against H100 dense peaks.
-      </>
-    ),
-  },
-  {
     key: "b200",
     label: "B200",
     runtime: "limited",
