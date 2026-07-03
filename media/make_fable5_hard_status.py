@@ -24,9 +24,14 @@ PROBS = ["01_fp8_gemm", "02_kda_cutlass", "03_paged_attention",
          "05_topk_bitonic", "06_sonic_moe_swiglu", "07_w4a16_gemm"]
 GPUS = ["RTX PRO 6000", "H100", "B200"]
 
-# cell -> (category, text). categories: pass / fail / infra / rate / none
+# cell -> (category, text). four categories:
+#   pass  = green, labelled with fraction of roofline
+#   rate  = red, provider rate-limit / quota wall (no real attempt)
+#   infra = amber (hatched), missing-ninja box gap (rerun pending)
+#   fail  = grey, genuine correctness / compilation / runtime failure
+# per-cell reasons verified against each run's result.json + check.log.
 CELLS = {
-    ("RTX PRO 6000", "01_fp8_gemm"):        ("none", "not run\n(quota)"),
+    ("RTX PRO 6000", "01_fp8_gemm"):        ("rate", "rate\nlimit"),
     ("RTX PRO 6000", "02_kda_cutlass"):     ("pass", "0.036"),
     ("RTX PRO 6000", "03_paged_attention"): ("pass", "0.630"),
     ("RTX PRO 6000", "05_topk_bitonic"):    ("pass", "0.049"),
@@ -37,7 +42,7 @@ CELLS = {
     ("H100", "02_kda_cutlass"):     ("fail",  "smem\noverflow"),
     ("H100", "03_paged_attention"): ("infra", "ninja"),
     ("H100", "05_topk_bitonic"):    ("infra", "ninja"),
-    ("H100", "06_sonic_moe_swiglu"):("fail",  "timeout"),
+    ("H100", "06_sonic_moe_swiglu"):("fail",  "check\ntimeout"),
     ("H100", "07_w4a16_gemm"):      ("infra", "ninja"),
 
     ("B200", "01_fp8_gemm"):        ("pass", "0.254"),
@@ -53,10 +58,9 @@ FILL = {
     "fail":  C["fg_dim"],
     "infra": C["warn"],
     "rate":  C["bad"],
-    "none":  C["surface"],
 }
 TXTCOL = {"pass": "#0a0a0a", "fail": C["fg"], "infra": "#0a0a0a",
-          "rate": "#0a0a0a", "none": C["fg_dim"]}
+          "rate": "#0a0a0a"}
 
 fig, ax = plt.subplots(figsize=(9.2, 7.3))
 fig.subplots_adjust(left=0.19, right=0.98, top=0.82, bottom=0.22)
@@ -71,7 +75,7 @@ for j, gpu in enumerate(GPUS):
                                    edgecolor=C["bg"], linewidth=2, hatch=hatch))
         ax.text(j + 0.47, y + 0.47, txt, ha="center", va="center",
                 color=TXTCOL[cat], fontsize=9.5, linespacing=1.1,
-                fontweight="bold" if cat == "pass" else "normal")
+                fontweight="bold" if cat in ("pass", "infra") else "normal")
 
 ax.set_xlim(0, ncols)
 ax.set_ylim(0, nrows)
@@ -85,17 +89,18 @@ for s in ax.spines.values():
 ax.tick_params(length=0)
 
 # column tallies
-tally = {"RTX PRO 6000": "5 / 5 attempted", "H100": "1 / 6 (infra-invalid)", "B200": "4 / 6"}
+tally = {"RTX PRO 6000": "5 pass · 1 rate-limited",
+         "H100": "1 pass · 3 infra · 2 fail",
+         "B200": "4 pass · 1 fail · 1 rate"}
 for j, gpu in enumerate(GPUS):
     ax.text(j + 0.47, -0.22, tally[gpu], ha="center", va="top",
-            color=C["fg_muted"], fontsize=9)
+            color=C["fg_muted"], fontsize=8.5)
 
 legend = [
-    Patch(facecolor=C["accent"], label="pass (fraction of roofline)"),
+    Patch(facecolor=C["accent"], label="pass — fraction of roofline"),
+    Patch(facecolor=C["bad"], label="provider rate limit / quota (no real attempt)"),
     Patch(facecolor=C["warn"], hatch="///", label="infra gap — ninja missing on box (rerun pending)"),
-    Patch(facecolor=C["fg_dim"], label="correctness / portability miss"),
-    Patch(facecolor=C["bad"], label="provider rate limit (no real attempt)"),
-    Patch(facecolor=C["surface"], label="not attempted (quota)"),
+    Patch(facecolor=C["fg_dim"], label="correctness / compile / runtime failure"),
 ]
 ax.legend(handles=legend, loc="upper left", bbox_to_anchor=(0.0, -0.14),
           frameon=False, fontsize=8.5, ncol=1, handlelength=1.4,
@@ -104,8 +109,8 @@ ax.legend(handles=legend, loc="upper left", bbox_to_anchor=(0.0, -0.14),
 fig.suptitle("KernelBench-Hard — Claude Fable 5, what actually came back",
              color=C["fg_bright"], fontsize=13, x=0.19, ha="left", y=0.965)
 fig.text(0.19, 0.895,
-         "RTX PRO 6000 is the clean capability result. H100 was mis-provisioned "
-         "(no ninja -> hand-written\nCUDA kernels couldn't compile at grading); only its pure-Triton fp8 cell survived.",
+         "RTX PRO 6000 + B200 are the real numbers. H100 is held out (resweep pending): its box\n"
+         "shipped without ninja, so hand-written CUDA cells couldn't compile at grading — infra, not capability.",
          color=C["fg_muted"], fontsize=8.5, linespacing=1.4)
 
 out = pathlib.Path(__file__).parent / "fable5_hard_status.png"
