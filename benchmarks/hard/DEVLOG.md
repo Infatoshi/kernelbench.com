@@ -4,6 +4,49 @@ A running record of decisions, dead ends, and lessons. Newest entries on top. Th
 
 ---
 
+## 2026-07-02 - Fable 5 hard sweep (RTX + B200); H100 held out; TWO RESWEEPS PENDING
+
+Swept Claude Fable 5 [max] across the hard deck on RTX PRO 6000 + a rented B200,
+and published both boards. Then hit Anthropic's ~50%-of-weekly cap on both
+accounts (elliot@ keychain + infatoshi@ env-token), so the sweep is incomplete.
+
+**>>> PENDING WORK — do these when Fable is back and rate limits reset: <<<**
+1. **RTX PRO 6000 `01_fp8_gemm` for Fable 5** — never ran (rate-limited before it
+   started). It is the ONE blank cell on the RTX board. Command:
+   `uv run kbh run claude claude-fable-5 problems-rtxpro6000/01_fp8_gemm max`
+2. **Full H100 resweep for Fable 5** — the H100 board was REMOVED from the site
+   (app/hard/page.tsx GPU_TARGETS, app/_lib/charts.ts, app/page.tsx) and
+   `leaderboard.h100.json` deleted, because the H100 box shipped **without ninja**,
+   so every `load_inline` hand-CUDA cell died at grading with "Ninja is required"
+   (03/05/07 were pure-infra fails; only the pure-Triton fp8 cell survived at
+   0.303). This is an infra gap, not a capability miss. **Fix is already in**:
+   `ninja>=1.11` is now pinned in `benchmarks/hard/pyproject.toml` (commit
+   9814b3f). On resweep, re-add the H100 target to the three files above and
+   rebuild via `scripts/build_all_gpus.sh`.
+
+After either resweep: audit new passing cells (annotations), `kb contamination
+hard`, `kb publish`, push traces to HF, and regenerate the charts from
+`media/make_fable5_hard_bars.py` / `make_fable5_b200_fp8.py` /
+`make_fable5_hard_status.py`.
+
+**What DID ship (audited clean unless noted):**
+- **RTX PRO 6000** (5/6, fp8 blank): W4A16 GEMM 0.348 (board-best), MoE SwiGLU
+  0.108 (board-best), paged-attn 0.630, top-k 0.049, kda 0.036. Beats/ties
+  GLM-5.2 / Opus 4.8 / GPT-5.5 on the two compute cells.
+- **B200** (4/6): **fp8 GEMM 0.254 — board leader** (GLM 0.200, Opus 0.196, GPT
+  0.146), a HAND-WRITTEN SM100 tcgen05 kernel (2-CTA cluster `tcgen05.mma`, TMEM
+  accumulators, TMA + mbarrier pipeline, swizzled fused-scale epilogue). Real PTX,
+  no CUTLASS/cuBLASLt. The shipped kernel dispatches the hand path on all 4 graded
+  shapes (Triton is only the compile-failure fallback); note it came out ~even
+  with its own tuned Triton (~0.283 vs ~0.281 self-measured, ~90k extra tokens for
+  <1%) — impressive as capability, ROI-negative as an optimization. Viewer:
+  `/code?f=/runs/20260702_090059_claude_claude-fable-5_01_fp8_gemm_solution.py.txt`
+  (force-added to `public/runs/`; the RTX publish script does not cover the B200
+  board). B200 kda failed correctness; top-k was rate-limited out.
+- Posted to X (mega post earlier got a Karpathy like; hard post 2026-07-02).
+
+---
+
 ## 2026-06-27 - glm-5.2 fp8 verdict overturned to clean; publish made reproducible
 
 Two corrections, one of which redraws a published cell. Per the integrity note
