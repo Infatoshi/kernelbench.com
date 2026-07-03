@@ -72,6 +72,9 @@ const benchmarks = [
       ["GPUs", "3"],
     ],
     hfHref: "https://huggingface.co/datasets/Infatoshi/kernelbench-mega-traces",
+    ghHref:
+      "https://github.com/Infatoshi/kernelbench.com/tree/master/benchmarks/mega",
+    comingSoon: false,
   },
   {
     href: "/hard",
@@ -84,6 +87,24 @@ const benchmarks = [
       ["GPUs", "2"],
     ],
     hfHref: "https://huggingface.co/datasets/Infatoshi/kernelbench-hard-traces",
+    ghHref:
+      "https://github.com/Infatoshi/kernelbench.com/tree/master/benchmarks/hard",
+    comingSoon: false,
+  },
+  {
+    href: "/multi",
+    title: "Multi",
+    description:
+      "The multi-GPU (NVLink) sibling of Hard: agents rewrite PyTorch + NCCL collectives as fine-grained NVLink kernels on an 8×H100 SXM (NVSwitch) node, graded on busbw — bus-bandwidth efficiency, not TFLOPS. Six communication-dominated problems.",
+    stats: [
+      ["problems", "6"],
+      ["GPUs", "8×H100"],
+      ["metric", "busbw"],
+    ],
+    hfHref: null,
+    ghHref:
+      "https://github.com/Infatoshi/kernelbench.com/tree/master/benchmarks/multi",
+    comingSoon: true,
   },
 ]
 
@@ -116,6 +137,13 @@ export default async function HomePage() {
         dangerouslySetInnerHTML={{ __html: JSON.stringify(citationGraph) }}
       />
       <h1 className="sr-only">Agentic GPU kernel benchmark results</h1>
+      <p className="text-sm text-[var(--color-fg-muted)]">
+        For business inquiries reach out to{" "}
+        <a href="mailto:elliot@arledge.net" className="font-bold text-[var(--color-fg-bright)]">
+          elliot@arledge.net
+        </a>
+        .
+      </p>
       <section aria-label="Benchmarks" className="space-y-4">
         {benchmarks.map((benchmark) => (
           <article key={benchmark.href} className="benchmark-card">
@@ -126,8 +154,13 @@ export default async function HomePage() {
             >
               <div className="flex flex-col gap-5 sm:flex-row sm:items-start sm:justify-between">
                 <div className="max-w-2xl">
-                  <h2 className="text-2xl sm:text-3xl font-semibold tracking-tight text-[var(--color-fg-bright)]">
+                  <h2 className="text-2xl sm:text-3xl font-semibold tracking-tight text-[var(--color-fg-bright)] flex items-center gap-3">
                     {benchmark.title}
+                    {benchmark.comingSoon && (
+                      <span className="text-xs font-semibold uppercase tracking-wide px-2 py-1 rounded border border-[var(--color-accent)] text-[var(--color-accent)]">
+                        coming soon
+                      </span>
+                    )}
                   </h2>
                   <p className="mt-3 text-sm sm:text-base text-[var(--color-fg)] leading-relaxed">
                     {benchmark.description}
@@ -154,23 +187,43 @@ export default async function HomePage() {
               </div>
             </Link>
             {charts[benchmark.href]}
-            <div className="benchmark-footer">
+            <div className="benchmark-footer flex flex-wrap items-center gap-4">
               <a
-                href={benchmark.hfHref}
+                href={benchmark.ghHref}
                 target="_blank"
                 rel="noreferrer"
                 className="hf-link no-underline"
-                aria-label={`Open ${benchmark.title} benchmark runs on Hugging Face`}
+                aria-label={`Open ${benchmark.title} benchmark source on GitHub`}
               >
-                <img
-                  src={HUGGING_FACE_LOGO}
-                  alt=""
-                  width="22"
-                  height="22"
-                  loading="lazy"
-                />
-                <span>Hugging Face runs</span>
+                <svg
+                  viewBox="0 0 24 24"
+                  aria-hidden="true"
+                  width="20"
+                  height="20"
+                  fill="currentColor"
+                >
+                  <path d="M12 2C6.48 2 2 6.58 2 12.26c0 4.53 2.87 8.37 6.84 9.73.5.1.68-.22.68-.49 0-.24-.01-1.04-.01-1.89-2.78.62-3.37-1.22-3.37-1.22-.45-1.19-1.11-1.5-1.11-1.5-.91-.64.07-.63.07-.63 1 .07 1.53 1.06 1.53 1.06.9 1.57 2.35 1.12 2.92.86.09-.67.35-1.12.63-1.38-2.22-.26-4.55-1.14-4.55-5.07 0-1.12.39-2.03 1.03-2.75-.1-.26-.45-1.3.1-2.71 0 0 .84-.28 2.75 1.05A9.29 9.29 0 0 1 12 6.98c.85 0 1.71.12 2.51.34 1.91-1.33 2.75-1.05 2.75-1.05.55 1.41.2 2.45.1 2.71.64.72 1.03 1.63 1.03 2.75 0 3.94-2.34 4.81-4.57 5.06.36.32.68.94.68 1.9 0 1.38-.01 2.49-.01 2.83 0 .27.18.59.69.49A10.05 10.05 0 0 0 22 12.26C22 6.58 17.52 2 12 2Z" />
+                </svg>
+                <span>GitHub source</span>
               </a>
+              {benchmark.hfHref && (
+                <a
+                  href={benchmark.hfHref}
+                  target="_blank"
+                  rel="noreferrer"
+                  className="hf-link no-underline"
+                  aria-label={`Open ${benchmark.title} benchmark runs on Hugging Face`}
+                >
+                  <img
+                    src={HUGGING_FACE_LOGO}
+                    alt=""
+                    width="22"
+                    height="22"
+                    loading="lazy"
+                  />
+                  <span>Hugging Face runs</span>
+                </a>
+              )}
             </div>
           </article>
         ))}
@@ -311,21 +364,6 @@ export default async function HomePage() {
         </pre>
       </section>
 
-      <section className="box p-6">
-        <h2 className="text-lg font-semibold text-[var(--color-fg-bright)] mb-2">
-          Contact
-        </h2>
-        <p className="text-sm text-[var(--color-fg)] leading-relaxed">
-          Open to inquiries: collaborations, model evals, custom benchmark
-          builds, kernel-engineering consulting, anything kernel-adjacent.
-        </p>
-        <p className="text-sm text-[var(--color-fg)] leading-relaxed mt-2">
-          Reach out:{" "}
-          <a href="mailto:elliot@arledge.net" className="font-bold">
-            elliot@arledge.net
-          </a>
-        </p>
-      </section>
     </div>
   )
 }
