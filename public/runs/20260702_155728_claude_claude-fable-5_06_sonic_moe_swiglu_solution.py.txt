@@ -1,0 +1,208 @@
+"""MoE up-projection: variable-length grouped GEMM + fused SwiGLU on B200 (SM100).
+
+Kernel (CUDA C++/CUTLASS 3.x, built from ./csrc + ./cutlass headers):
+  - stock Blackwell ptr-array warp-specialized mainloop from
+    cutlass/gemm/collective builders: tcgen05 2-SM MMA, 256x256x64 MMA tile,
+    cluster (2,1,1), TMA A/B with per-group device tensormap updates
+    (cutlass::arch::Sm100, KernelPtrArrayTmaWarpSpecialized2SmSm100);
+  - custom fused epilogue (csrc/moe_swiglu_epilogue.hpp, generated from the
+    stock array TMA epilogue by gen_epilogue.py): weights are pre-interleaved
+    so each 256-wide MMA tile is [128 gate cols | 128 up cols] of the same
+    output columns; the epilogue loads both TMEM subtiles, computes
+    silu(g) * u in fp32 registers, and TMA-stores the half-width bf16 tile.
+    The producer C-load pipeline is disabled (no C operand) — its full-width
+    subtile cadence would deadlock against the half-width store loop;
+  - per-group problem shapes / A,B,D pointers / strides are built on device
+    from expert_offsets by a tiny prep kernel (no host sync); zero-token
+    experts and non-tile-multiple sizes handled by the group scheduler + TMA
+    bounds.
+
+Weights are re-packed once (cached, keyed on parameter data_ptr/version) into
+the 128-column-block interleaved layout
+  W[e, h, 256*b + j] = W_gate[e, h, 128*b + j]        (0 <= j < 128)
+  W[e, h, 256*b + 128 + j] = W_up[e, h, 128*b + j].
+
+Falls back to a Triton persistent grouped-GEMM kernel (solution_il.py) if the
+extension cannot be built or fails at runtime.
+
+Measured (B200, median of 20 L2-flushed iters, cold clocks):
+  shape0 (T=32768,H=4096,I=1536,E=128,K=8): ~4.0 ms  (~1650 real TFLOPS, 73% peak)
+  shape1 (T=4096, H=2048,I=1024,E=64, K=4): ~0.134 ms
+  shape2 (T=16384,H=2048,I=4096,E=64, K=8): ~2.73 ms (~1610 real TFLOPS, 72% peak)
+"""
+from __future__ import annotations
+
+import os
+import sys
+from pathlib import Path
+
+import torch
+import torch.nn as nn
+
+_HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(_HERE))
+
+_ext = None
+_ext_err = None
+
+# (H, I, E) -> (raster, swizzle, config_id); config_id: 0=cluster(2,1), 1=(4,1), 2=(2,2)
+CONFIGS = {
+    (4096, 1536, 128): (0, 1, 0),
+    (2048, 1024, 64): (0, 1, 0),
+    (2048, 4096, 64): (0, 1, 0),
+}
+DEFAULT_CONFIG = (0, 1, 0)
+
+
+def _get_ext():
+    global _ext, _ext_err
+    if _ext is not None or _ext_err is not None:
+        return _ext
+    try:
+        os.environ["TORCH_EXTENSIONS_DIR"] = str(_HERE / "torch_ext_cache")
+        from torch.utils.cpp_extension import load
+        _ext = load(
+            name="moe_gg_fused",
+            sources=[str(_HERE / "csrc" / "moe_gg_binding.cpp"),
+                     str(_HERE / "csrc" / "moe_gg.cu")],
+            extra_include_paths=[str(_HERE / "cutlass" / "include"),
+                                 str(_HERE / "cutlass" / "tools" / "util" / "include")],
+            extra_cuda_cflags=[
+                "-O3", "-std=c++17", "-DNDEBUG", "-DMOE_FUSED=1",
+                "--expt-relaxed-constexpr",
+                "-gencode=arch=compute_100a,code=sm_100a",
+                "--threads=8",
+            ],
+            extra_cflags=["-O2", "-std=c++17"],
+            verbose=os.environ.get("MOE_GG_VERBOSE", "0") == "1",
+        )
+    except Exception as e:  # noqa: BLE001
+        _ext_err = e
+        _ext = None
+    return _ext
+
+
+class Model(nn.Module):
+    """Same interface as reference.Model."""
+
+    def __init__(self, T_total: int, H: int, I: int, E: int, K: int):  # noqa: E741
+        super().__init__()
+        self.T_total = T_total
+        self.H = H
+        self.I = I
+        self.E = E
+        self.K = K
+        self.W_gate = nn.Parameter(torch.empty(E, H, I, dtype=torch.bfloat16))
+        self.W_up = nn.Parameter(torch.empty(E, H, I, dtype=torch.bfloat16))
+        nn.init.normal_(self.W_gate, std=0.02)
+        nn.init.normal_(self.W_up, std=0.02)
+        self._w_cache = None
+        self._buf_cache = None
+        self._sm_count = None
+        self._fallback = None
+        self._use_ext = None
+        self._ext_verified = False
+        self.cfg = list(CONFIGS.get((H, I, E), DEFAULT_CONFIG))
+
+    def _resolve_backend(self):
+        if self._use_ext is None:
+            ok = self.I % 128 == 0 and self.H % 64 == 0 and _get_ext() is not None
+            self._use_ext = bool(ok)
+            if not self._use_ext:
+                self._use_fallback()
+        return self._use_ext
+
+    def _w_cat(self):
+        wg, wu = self.W_gate, self.W_up
+        key = (wg.data_ptr(), wg._version, wu.data_ptr(), wu._version)
+        if self._w_cache is not None and self._w_cache[0] == key:
+            return self._w_cache[1]
+        HB = 128
+        E, H, I = self.E, self.H, self.I  # noqa: E741
+        Wg = wg.detach().reshape(E, H, I // HB, HB)
+        Wu = wu.detach().reshape(E, H, I // HB, HB)
+        W = torch.stack([Wg, Wu], dim=3).reshape(E, H, 2 * I).contiguous()
+        self._w_cache = (key, W)
+        return W
+
+    def _ext_buffers(self, ext, device):
+        if self._buf_cache is None:
+            if self._sm_count is None:
+                self._sm_count = torch.cuda.get_device_properties(device).multi_processor_count
+            ga = torch.empty(ext.group_args_bytes(self.E), dtype=torch.uint8, device=device)
+            ws_bytes = ext.workspace_bytes(self.E, self._sm_count)
+            ws = torch.empty(max(int(ws_bytes), 16), dtype=torch.uint8, device=device)
+            self._buf_cache = (ga, ws)
+        return self._buf_cache
+
+    def _use_fallback(self):
+        import solution_il
+        fb = solution_il.Model(self.T_total, self.H, self.I, self.E, self.K)
+        fb.W_gate = self.W_gate
+        fb.W_up = self.W_up
+        self._fallback = fb.to(self.W_gate.device)
+        self._use_ext = False
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,   # (T_perm, H) bf16
+        expert_offsets: torch.Tensor,  # (E+1,) int32
+    ) -> torch.Tensor:
+        if not self._resolve_backend():
+            return self._fallback(hidden_states, expert_offsets)
+        if not self._ext_verified:
+            try:
+                out = self._forward_ext(hidden_states, expert_offsets)
+                torch.cuda.synchronize()
+                self._ext_verified = True
+                return out
+            except Exception:
+                self._use_fallback()
+                return self._fallback(hidden_states, expert_offsets)
+        return self._forward_ext(hidden_states, expert_offsets)
+
+    def _forward_ext(self, hidden_states, expert_offsets):
+        ext = _get_ext()
+        T_perm, H = hidden_states.shape
+        if expert_offsets.dtype != torch.int32:
+            expert_offsets = expert_offsets.to(torch.int32)
+        if not expert_offsets.is_contiguous():
+            expert_offsets = expert_offsets.contiguous()
+        if not hidden_states.is_contiguous():
+            hidden_states = hidden_states.contiguous()
+        W = self._w_cat()
+        out = torch.empty(T_perm, self.I, dtype=torch.bfloat16, device=hidden_states.device)
+        ga, ws = self._ext_buffers(ext, hidden_states.device)
+        ext.run(hidden_states, W, out, expert_offsets, ga, ws,
+                self.E, H, 2 * self.I, self.I, self._sm_count, *self.cfg)
+        return out
+
+
+# Module-level shape shims rewritten by check.py / benchmark.py per shape.
+T_total = 32768
+H = 4096
+I = 1536  # noqa: E741
+E = 128
+K = 8
+
+
+def _build_routing(T_total: int, E: int, K: int, device: str = "cpu") -> torch.Tensor:
+    T_perm = T_total * K
+    base = T_perm // E
+    rem = T_perm - base * E
+    counts = torch.full((E,), base, dtype=torch.int32, device=device)
+    counts[:rem] += 1
+    offsets = torch.zeros(E + 1, dtype=torch.int32, device=device)
+    offsets[1:] = torch.cumsum(counts, dim=0)
+    return offsets
+
+
+def get_inputs():
+    T_perm = T_total * K
+    hidden_states = torch.randn(T_perm, H, dtype=torch.bfloat16) * 0.1
+    expert_offsets = _build_routing(T_total, E, K)
+    return [hidden_states, expert_offsets]
+
+
+def get_init_inputs():
+    return [T_total, H, I, E, K]

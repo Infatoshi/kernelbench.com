@@ -1,0 +1,789 @@
+"""FP8 e4m3 GEMM for H100 PCIe (SM90): y = (x @ w.T) * weight_scale -> bf16.
+
+Primary path: CUTLASS 3.x SM90 kernels (TMA + WGMMA fp8 e4m3 x e4m3, fp32
+accumulate, FastAccum warp-specialized schedules) with an EVT epilogue fusing
+the per-output-channel scale and bf16 store. Compiled once via
+torch.utils.cpp_extension from sources embedded below; a prebuilt .so in
+./_sol_ext is imported directly when present.
+
+K not divisible by 16 (e.g. 4127) makes byte strides TMA-illegal; those shapes
+run through a fast row-pad kernel into a stride-aligned buffer (weight pad is
+cached keyed on (data_ptr, _version) so in-place weight mutation invalidates
+it; x is padded every call).
+
+Fallback: Triton fp8 tl.dot kernel (wgmma on SM90) so the module always works.
+"""
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+import torch
+import torch.nn as nn
+
+E4M3_MAX = 448.0
+
+_HERE = Path(__file__).resolve().parent
+
+_EXT_SOURCES = {
+    'fp8_params.h': r'''// Plain-C++ shared declarations (no CUDA/CUTLASS includes).
+#pragma once
+#include <cstddef>
+#include <cstdint>
+#include <cuda_runtime_api.h>
+
+namespace fp8gemm {
+
+struct LaunchParams {
+  const void* x;
+  const void* w;
+  const void* s;
+  void* y;
+  void* workspace;
+  int M, N, K;
+  int64_t lda, ldb;
+  int sm_count;
+  int max_swizzle;
+  int raster;   // 0 heuristic, 1 along M, 2 along N
+  int splits;   // stream-k splits (<=1: auto)
+  int pdl;      // launch gemm with programmatic dependent launch
+  cudaStream_t stream;
+};
+
+#define FP8GEMM_DECLARE_CFG(i) \
+  void run_cfg##i(const LaunchParams& p); \
+  size_t ws_cfg##i(const LaunchParams& p);
+
+FP8GEMM_DECLARE_CFG(0)
+FP8GEMM_DECLARE_CFG(1)
+FP8GEMM_DECLARE_CFG(2)
+FP8GEMM_DECLARE_CFG(3)
+FP8GEMM_DECLARE_CFG(4)
+FP8GEMM_DECLARE_CFG(5)
+FP8GEMM_DECLARE_CFG(6)
+
+// Pad (M,K) contiguous fp8 rows into (M,Kp) with zero fill (fp8_pad.cu).
+void pad_rows(const void* src, void* dst, int M, int K, int Kp, cudaStream_t stream);
+
+}  // namespace fp8gemm
+''',
+    'fp8_common.cuh': r'''// Common CUTLASS SM90 fp8 GEMM config: y = (x @ w^T) * s[n], bf16 out.
+#pragma once
+
+#include <cutlass/cutlass.h>
+#include <cutlass/numeric_types.h>
+#include <cute/tensor.hpp>
+#include <cutlass/gemm/dispatch_policy.hpp>
+#include <cutlass/gemm/collective/collective_builder.hpp>
+#include <cutlass/gemm/device/gemm_universal_adapter.h>
+#include <cutlass/gemm/kernel/gemm_universal.hpp>
+#include <cutlass/epilogue/dispatch_policy.hpp>
+#include <cutlass/epilogue/collective/collective_builder.hpp>
+#include <cutlass/epilogue/fusion/sm90_callbacks_tma_warpspecialized.hpp>
+#include <cutlass/kernel_hardware_info.h>
+
+#include <cstdint>
+#include <stdexcept>
+#include <string>
+
+#include "fp8_params.h"
+
+namespace fp8gemm {
+
+using namespace cute;
+
+// Scheduler-arg setter: persistent scheduler has {max_swizzle_size, raster_order};
+// stream-k adds splits.
+template <class SchedArgs>
+void set_scheduler_args(SchedArgs& sched, const LaunchParams& p) {
+  if constexpr (requires { sched.max_swizzle_size; }) {
+    sched.max_swizzle_size = p.max_swizzle;
+  }
+  if constexpr (requires { sched.raster_order; }) {
+    using RO = decltype(sched.raster_order);
+    sched.raster_order = (p.raster == 1) ? RO::AlongM : (p.raster == 2) ? RO::AlongN : RO::Heuristic;
+  }
+  if constexpr (requires { sched.splits; }) {
+    if (p.splits > 1) sched.splits = p.splits;
+  }
+}
+
+template <class TileShape, class ClusterShape, class KernelSchedule,
+          class EpilogueSchedule, class TileScheduler>
+struct GemmConfig {
+  using SchedulerTag = TileScheduler;
+  using ElementA = cutlass::float_e4m3_t;
+  using ElementB = cutlass::float_e4m3_t;
+  using ElementD = cutlass::bfloat16_t;
+  using LayoutA = cutlass::layout::RowMajor;
+  using LayoutB = cutlass::layout::ColumnMajor;
+  using LayoutD = cutlass::layout::RowMajor;
+
+  // D(i,j) = acc(i,j) * s(j): row-vector broadcast of s over the N mode.
+  using Scale = cutlass::epilogue::fusion::Sm90RowBroadcast<
+      0, TileShape, float, float, Stride<_0, _1, _0>>;
+  using Mul = cutlass::epilogue::fusion::Sm90Compute<
+      cutlass::multiplies, ElementD, float, cutlass::FloatRoundStyle::round_to_nearest>;
+  using EVT = cutlass::epilogue::fusion::Sm90EVT<Mul, Scale, cutlass::epilogue::fusion::Sm90AccFetch>;
+
+  using CollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
+      cutlass::arch::Sm90, cutlass::arch::OpClassTensorOp,
+      TileShape, ClusterShape,
+      cutlass::epilogue::collective::EpilogueTileAuto,
+      float, float,
+      void, LayoutD, 8,
+      ElementD, LayoutD, 8,
+      EpilogueSchedule,
+      EVT>::CollectiveOp;
+
+  using CollectiveMainloop = typename cutlass::gemm::collective::CollectiveBuilder<
+      cutlass::arch::Sm90, cutlass::arch::OpClassTensorOp,
+      ElementA, LayoutA, 16,
+      ElementB, LayoutB, 16,
+      float,
+      TileShape, ClusterShape,
+      cutlass::gemm::collective::StageCountAutoCarveout<
+          static_cast<int>(sizeof(typename CollectiveEpilogue::SharedStorage))>,
+      KernelSchedule>::CollectiveOp;
+
+  using GemmKernel = cutlass::gemm::kernel::GemmUniversal<
+      Shape<int, int, int, int>, CollectiveMainloop, CollectiveEpilogue, TileScheduler>;
+  using Gemm = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;
+};
+
+template <class Config>
+size_t gemm_workspace_size(const LaunchParams& p) {
+  using Gemm = typename Config::Gemm;
+  typename Gemm::Arguments args;
+  args.mode = cutlass::gemm::GemmUniversalMode::kGemm;
+  args.problem_shape = {p.M, p.N, p.K, 1};
+  args.hw_info.device_id = 0;
+  args.hw_info.sm_count = p.sm_count;
+  return Gemm::get_workspace_size(args);
+}
+
+template <class Config>
+typename Config::Gemm::Arguments make_args(const LaunchParams& p) {
+  using Gemm = typename Config::Gemm;
+  using StrideA = typename Gemm::GemmKernel::StrideA;
+  using StrideB = typename Gemm::GemmKernel::StrideB;
+  using StrideD = typename Gemm::GemmKernel::StrideD;
+
+  StrideA stride_a{p.lda, _1{}, int64_t(0)};
+  StrideB stride_b{p.ldb, _1{}, int64_t(0)};
+  StrideD stride_d{int64_t(p.N), _1{}, int64_t(0)};
+
+  typename Gemm::Arguments args{
+      cutlass::gemm::GemmUniversalMode::kGemm,
+      {p.M, p.N, p.K, 1},
+      {reinterpret_cast<cutlass::float_e4m3_t const*>(p.x), stride_a,
+       reinterpret_cast<cutlass::float_e4m3_t const*>(p.w), stride_b},
+      {{},  // epilogue.thread (EVT args), filled below
+       nullptr, stride_d,
+       reinterpret_cast<cutlass::bfloat16_t*>(p.y), stride_d}};
+
+  // EVT arguments: {scale_bcast_args, accfetch_args, multiplies_args}
+  args.epilogue.thread = {
+      {reinterpret_cast<const float*>(p.s), float(0), Stride<_0, _1, _0>{}},
+      {},
+      {}};
+
+  args.hw_info.device_id = 0;
+  args.hw_info.sm_count = p.sm_count;
+
+  using SchedArgs = typename Gemm::GemmKernel::TileSchedulerArguments;
+  set_scheduler_args<SchedArgs>(args.scheduler, p);
+  return args;
+}
+
+// Persistent-scheduler configs cache the initialized Gemm object keyed on all
+// launch-relevant fields; re-initialize only on change (~8us saved per call).
+// Stream-K configs always re-initialize (their workspace needs per-run setup).
+template <class Config>
+void run_gemm(const LaunchParams& p) {
+  using Gemm = typename Config::Gemm;
+  constexpr bool kCacheable =
+      !std::is_same_v<typename Config::SchedulerTag, cutlass::gemm::StreamKScheduler>;
+
+  static thread_local Gemm gemm;
+  static thread_local LaunchParams last{};
+  static thread_local bool valid = false;
+
+  bool hit = kCacheable && valid &&
+             last.x == p.x && last.w == p.w && last.s == p.s && last.y == p.y &&
+             last.workspace == p.workspace && last.M == p.M && last.N == p.N &&
+             last.K == p.K && last.lda == p.lda && last.ldb == p.ldb &&
+             last.max_swizzle == p.max_swizzle && last.raster == p.raster &&
+             last.splits == p.splits;
+  if (!hit) {
+    auto args = make_args<Config>(p);
+    cutlass::Status st = gemm.can_implement(args);
+    if (st != cutlass::Status::kSuccess) {
+      throw std::runtime_error(std::string("cutlass can_implement failed: ") +
+                               cutlassGetStatusString(st));
+    }
+    st = gemm.initialize(args, p.workspace, p.stream);
+    if (st != cutlass::Status::kSuccess) {
+      throw std::runtime_error(std::string("cutlass initialize failed: ") +
+                               cutlassGetStatusString(st));
+    }
+    last = p;
+    valid = true;
+  }
+  cutlass::Status st = gemm.run(p.stream, /*cuda_adapter=*/nullptr, /*launch_with_pdl=*/p.pdl != 0);
+  if (st != cutlass::Status::kSuccess) {
+    throw std::runtime_error(std::string("cutlass run failed: ") +
+                             cutlassGetStatusString(st));
+  }
+}
+
+}  // namespace fp8gemm
+''',
+    'fp8_pad.cu': r'''// Row-pad kernel: (M, K) contiguous fp8 -> (M, Kp) buffer, zero-filled tail.
+// Handles arbitrary (odd) K with aligned 4B loads + funnel-shift realignment.
+#include "fp8_params.h"
+#include <cuda_runtime.h>
+#include <cstdint>
+
+namespace fp8gemm {
+
+// One warp per row. dst rows are 4B-aligned (Kp % 4 == 0); src rows start at
+// arbitrary byte offsets. Read aligned uint32 words, funnel-shift to realign.
+__global__ void pad_rows_kernel(const uint8_t* __restrict__ src, uint8_t* __restrict__ dst,
+                                int M, int K, int Kp) {
+  int warp = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
+  int lane = threadIdx.x & 31;
+  if (warp >= M) return;
+
+  const uint8_t* srow = src + (int64_t)warp * K;
+  uint8_t* drow = dst + (int64_t)warp * Kp;
+
+  uintptr_t saddr = (uintptr_t)srow;
+  const uint32_t* sw = (const uint32_t*)(saddr & ~uintptr_t(3));
+  int shb = int(saddr & 3);      // src misalignment in bytes
+  int sh = shb * 8;              // ... in bits
+
+  uint32_t* dw = (uint32_t*)drow;
+  int nw = Kp >> 2;              // dst words per row
+  int full = K >> 2;             // dst words fully covered by src bytes
+  // number of src words this row's K bytes touch (for OOB-safe hi loads)
+  int span = (shb + K + 3) >> 2;
+
+  // Bulk: 16B stores; each lane covers 4 consecutive dst words per step.
+  int full4 = full >> 2;         // uint4-sized dst chunks fully covered
+  uint4* dv = (uint4*)drow;
+  for (int j = lane; j < full4; j += 32) {
+    int i = j << 2;
+    uint32_t w0 = sw[i], w1 = sw[i + 1], w2 = sw[i + 2], w3 = sw[i + 3];
+    uint4 out;
+    if (sh == 0) {
+      out = make_uint4(w0, w1, w2, w3);
+    } else {
+      uint32_t w4 = sw[i + 4];   // i+4 <= full <= span-? safe: 4*(full4)<=full => i+4 <= full < span when sh>0
+      out.x = __funnelshift_r(w0, w1, sh);
+      out.y = __funnelshift_r(w1, w2, sh);
+      out.z = __funnelshift_r(w2, w3, sh);
+      out.w = __funnelshift_r(w3, w4, sh);
+    }
+    dv[j] = out;
+  }
+  // Remaining fully-covered words (full4*4 .. full)
+  for (int i = (full4 << 2) + lane; i < full; i += 32) {
+    uint32_t lo = sw[i];
+    uint32_t hi = (i + 1 < span) ? sw[i + 1] : 0u;
+    dw[i] = sh ? __funnelshift_r(lo, hi, sh) : lo;
+  }
+  // tail: word `full` holds the last K%4 bytes; words beyond are zero.
+  for (int i = full + lane; i < nw; i += 32) {
+    uint32_t v = 0;
+    if (i == full) {
+      int rem = K & 3;
+      for (int b = 0; b < rem; ++b) {
+        v |= uint32_t(srow[4 * full + b]) << (8 * b);
+      }
+    }
+    dw[i] = v;
+  }
+#if __CUDA_ARCH__ >= 900
+  cudaTriggerProgrammaticLaunchCompletion();
+#endif
+}
+
+void pad_rows(const void* src, void* dst, int M, int K, int Kp, cudaStream_t stream) {
+  int warps_per_block = 8;
+  int blocks = (M + warps_per_block - 1) / warps_per_block;
+  pad_rows_kernel<<<blocks, warps_per_block * 32, 0, stream>>>(
+      (const uint8_t*)src, (uint8_t*)dst, M, K, Kp);
+}
+
+}  // namespace fp8gemm
+''',
+    'fp8_dispatch.cpp': r'''// Python-facing dispatcher (compiled with gcc; no CUTLASS includes).
+#include <torch/extension.h>
+#include <ATen/cuda/CUDAContext.h>
+#include <c10/cuda/CUDAGuard.h>
+
+#include "fp8_params.h"
+
+namespace fp8gemm {
+
+static LaunchParams make_params(const torch::Tensor& x, const torch::Tensor& w,
+                                const torch::Tensor& s, torch::Tensor& y,
+                                int64_t lda, int64_t ldb, int64_t max_swizzle,
+                                int64_t raster, int64_t splits, void* workspace) {
+  static int sm_count = [] {
+    int dev = 0, n = 0;
+    cudaGetDevice(&dev);
+    cudaDeviceGetAttribute(&n, cudaDevAttrMultiProcessorCount, dev);
+    return n;
+  }();
+  LaunchParams p;
+  p.x = x.data_ptr();
+  p.w = w.data_ptr();
+  p.s = s.data_ptr();
+  p.y = y.data_ptr();
+  p.workspace = workspace;
+  p.M = static_cast<int>(x.size(0));
+  p.K = static_cast<int>(x.size(1));
+  p.N = static_cast<int>(w.size(0));
+  p.lda = lda;
+  p.ldb = ldb;
+  p.sm_count = sm_count;
+  p.max_swizzle = static_cast<int>(max_swizzle);
+  p.raster = static_cast<int>(raster);
+  p.splits = static_cast<int>(splits);
+  p.pdl = 0;
+  p.stream = at::cuda::getCurrentCUDAStream();
+  return p;
+}
+
+using RunFn = void (*)(const LaunchParams&);
+using WsFn = size_t (*)(const LaunchParams&);
+
+static RunFn kRun[] = {run_cfg0, run_cfg1, run_cfg2, run_cfg3, run_cfg4, run_cfg5, run_cfg6};
+static WsFn kWs[] = {ws_cfg0, ws_cfg1, ws_cfg2, ws_cfg3, ws_cfg4, ws_cfg5, ws_cfg6};
+static constexpr int kNumCfgs = sizeof(kRun) / sizeof(kRun[0]);
+
+int64_t num_configs() { return kNumCfgs; }
+
+int64_t workspace_size(int64_t cfg, const torch::Tensor& x, const torch::Tensor& w,
+                       const torch::Tensor& s, torch::Tensor y,
+                       int64_t lda, int64_t ldb, int64_t max_swizzle, int64_t raster,
+                       int64_t splits) {
+  TORCH_CHECK(cfg >= 0 && cfg < kNumCfgs, "bad cfg");
+  LaunchParams p = make_params(x, w, s, y, lda, ldb, max_swizzle, raster, splits, nullptr);
+  return static_cast<int64_t>(kWs[cfg](p));
+}
+
+void gemm(int64_t cfg, const torch::Tensor& x, const torch::Tensor& w,
+          const torch::Tensor& s, torch::Tensor y,
+          int64_t lda, int64_t ldb, int64_t max_swizzle, int64_t raster,
+          int64_t splits, c10::optional<torch::Tensor> workspace) {
+  TORCH_CHECK(cfg >= 0 && cfg < kNumCfgs, "bad cfg");
+  void* ws = workspace.has_value() ? workspace->data_ptr() : nullptr;
+  LaunchParams p = make_params(x, w, s, y, lda, ldb, max_swizzle, raster, splits, ws);
+  kRun[cfg](p);
+}
+
+// x is (M, K) contiguous with K odd/unaligned: pad into xpad (M, Kp) then gemm
+// with lda = Kp. One python->C++ transition for the whole forward.
+void gemm_pad_a(int64_t cfg, const torch::Tensor& x, torch::Tensor xpad,
+                const torch::Tensor& w, const torch::Tensor& s, torch::Tensor y,
+                int64_t ldb, int64_t max_swizzle, int64_t raster,
+                int64_t splits, c10::optional<torch::Tensor> workspace) {
+  TORCH_CHECK(cfg >= 0 && cfg < kNumCfgs, "bad cfg");
+  int M = static_cast<int>(x.size(0));
+  int K = static_cast<int>(x.size(1));
+  int Kp = static_cast<int>(xpad.size(1));
+  cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  pad_rows(x.data_ptr(), xpad.data_ptr(), M, K, Kp, stream);
+  void* ws = workspace.has_value() ? workspace->data_ptr() : nullptr;
+  // Run with K = Kp: both operands are zero-padded in [K, Kp), which adds
+  // exact zeros to the accumulation. (TMA requires 16-aligned K extent.)
+  LaunchParams p = make_params(xpad, w, s, y, Kp, ldb, max_swizzle, raster, splits, ws);
+  p.pdl = 1;  // overlap gemm prologue with the pad kernel tail
+  kRun[cfg](p);
+  (void)K;
+}
+
+void pad(const torch::Tensor& src, torch::Tensor dst) {
+  int M = static_cast<int>(src.size(0));
+  int K = static_cast<int>(src.size(1));
+  int Kp = static_cast<int>(dst.size(1));
+  cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  pad_rows(src.data_ptr(), dst.data_ptr(), M, K, Kp, stream);
+}
+
+}  // namespace fp8gemm
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+  m.def("gemm", &fp8gemm::gemm, "fp8 gemm");
+  m.def("gemm_pad_a", &fp8gemm::gemm_pad_a, "fp8 gemm with A row padding");
+  m.def("pad", &fp8gemm::pad, "row pad");
+  m.def("workspace_size", &fp8gemm::workspace_size, "workspace size");
+  m.def("num_configs", &fp8gemm::num_configs, "number of configs");
+}
+''',
+    'cfg0.cu': r'''#include "fp8_common.cuh"
+namespace fp8gemm {
+using Cfg0 = GemmConfig<Shape<_128,_128,_128>, Shape<_2,_1,_1>,
+    cutlass::gemm::KernelTmaWarpSpecializedPingpongFP8FastAccum,
+    cutlass::epilogue::TmaWarpSpecialized,
+    cutlass::gemm::PersistentScheduler>;
+void run_cfg0(const LaunchParams& p) { run_gemm<Cfg0>(p); }
+size_t ws_cfg0(const LaunchParams& p) { return gemm_workspace_size<Cfg0>(p); }
+}
+''',
+    'cfg1.cu': r'''#include "fp8_common.cuh"
+namespace fp8gemm {
+using Cfg1 = GemmConfig<Shape<_128,_128,_128>, Shape<_1,_2,_1>,
+    cutlass::gemm::KernelTmaWarpSpecializedPingpongFP8FastAccum,
+    cutlass::epilogue::TmaWarpSpecialized,
+    cutlass::gemm::PersistentScheduler>;
+void run_cfg1(const LaunchParams& p) { run_gemm<Cfg1>(p); }
+size_t ws_cfg1(const LaunchParams& p) { return gemm_workspace_size<Cfg1>(p); }
+}
+''',
+    'cfg3.cu': r'''#include "fp8_common.cuh"
+namespace fp8gemm {
+using Cfg3 = GemmConfig<Shape<_128,_256,_128>, Shape<_1,_2,_1>,
+    cutlass::gemm::KernelTmaWarpSpecializedCooperativeFP8FastAccum,
+    cutlass::epilogue::TmaWarpSpecializedCooperative,
+    cutlass::gemm::PersistentScheduler>;
+void run_cfg3(const LaunchParams& p) { run_gemm<Cfg3>(p); }
+size_t ws_cfg3(const LaunchParams& p) { return gemm_workspace_size<Cfg3>(p); }
+}
+''',
+    'cfg4.cu': r'''#include "fp8_common.cuh"
+namespace fp8gemm {
+using Cfg4 = GemmConfig<Shape<_64,_128,_128>, Shape<_1,_1,_1>,
+    cutlass::gemm::KernelTmaWarpSpecializedPingpongFP8FastAccum,
+    cutlass::epilogue::TmaWarpSpecialized,
+    cutlass::gemm::PersistentScheduler>;
+void run_cfg4(const LaunchParams& p) { run_gemm<Cfg4>(p); }
+size_t ws_cfg4(const LaunchParams& p) { return gemm_workspace_size<Cfg4>(p); }
+}
+''',
+    'cfg5.cu': r'''#include "fp8_common.cuh"
+namespace fp8gemm {
+using Cfg5 = GemmConfig<Shape<_128,_128,_128>, Shape<_1,_1,_1>,
+    cutlass::gemm::KernelTmaWarpSpecializedCooperativeFP8FastAccum,
+    cutlass::epilogue::TmaWarpSpecializedCooperative,
+    cutlass::gemm::StreamKScheduler>;
+void run_cfg5(const LaunchParams& p) { run_gemm<Cfg5>(p); }
+size_t ws_cfg5(const LaunchParams& p) { return gemm_workspace_size<Cfg5>(p); }
+}
+''',
+    'cfg6.cu': r'''#include "fp8_common.cuh"
+namespace fp8gemm {
+using Cfg6 = GemmConfig<Shape<_128,_128,_128>, Shape<_1,_1,_1>,
+    cutlass::gemm::KernelTmaWarpSpecializedPingpongFP8FastAccum,
+    cutlass::epilogue::TmaWarpSpecialized,
+    cutlass::gemm::PersistentScheduler>;
+void run_cfg6(const LaunchParams& p) { run_gemm<Cfg6>(p); }
+size_t ws_cfg6(const LaunchParams& p) { return gemm_workspace_size<Cfg6>(p); }
+}
+''',
+    'cfg2.cu': r'''#include "fp8_params.h"
+#include <stdexcept>
+namespace fp8gemm {
+void run_cfg2(const LaunchParams&) { throw std::runtime_error("cfg2 not built"); }
+size_t ws_cfg2(const LaunchParams&) { return 0; }
+}
+''',
+}
+
+
+def _find_cutlass() -> Path | None:
+    for cand in [_HERE / "cutlass", _HERE / "third_party" / "cutlass"]:
+        if (cand / "include" / "cutlass" / "cutlass.h").exists():
+            return cand
+    # last resort: shallow clone (only if network available)
+    dest = _HERE / "cutlass"
+    try:
+        subprocess.run(
+            ["git", "clone", "--depth", "1", "https://github.com/NVIDIA/cutlass.git", str(dest)],
+            check=True, capture_output=True, timeout=600,
+        )
+        if (dest / "include" / "cutlass" / "cutlass.h").exists():
+            return dest
+    except Exception:
+        pass
+    return None
+
+
+def _import_so(so_path: Path):
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("fp8gemm_sol", str(so_path))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def _load_ext():
+    if os.environ.get("FP8GEMM_DISABLE_EXT") == "1":
+        return None
+    build_dir = _HERE / "_sol_ext"
+    so_path = build_dir / "fp8gemm_sol.so"
+    # 1) prebuilt .so — trust it only if it was built from these exact sources
+    sources_current = all(
+        (build_dir / name).exists() and (build_dir / name).read_text() == text
+        for name, text in _EXT_SOURCES.items()
+    )
+    if so_path.exists() and sources_current:
+        try:
+            return _import_so(so_path)
+        except Exception:
+            pass
+    # 2) build from embedded sources
+    try:
+        cutlass = _find_cutlass()
+        if cutlass is None:
+            return None
+        build_dir.mkdir(exist_ok=True)
+        srcs = []
+        for name, text in _EXT_SOURCES.items():
+            p = build_dir / name
+            if not p.exists() or p.read_text() != text:
+                p.write_text(text)
+            if name.endswith((".cu", ".cpp")):
+                srcs.append(str(p))
+        os.environ["TORCH_CUDA_ARCH_LIST"] = "9.0a"
+        os.environ.setdefault("MAX_JOBS", str(min(16, os.cpu_count() or 8)))
+        from torch.utils.cpp_extension import load
+
+        return load(
+            name="fp8gemm_sol",
+            sources=sorted(srcs),
+            extra_include_paths=[str(build_dir), str(cutlass / "include"),
+                                 str(cutlass / "tools/util/include")],
+            extra_cflags=["-O3", "-std=c++20"],
+            extra_cuda_cflags=["-O3", "-std=c++20", "--expt-relaxed-constexpr",
+                               "-DNDEBUG", "-DCUTLASS_ENABLE_GDC_FOR_SM90=1"],
+            build_directory=str(build_dir),
+            verbose=False,
+        )
+    except Exception as e:
+        print(f"[solution.py] extension build failed ({type(e).__name__}: {e}); "
+              f"falling back to Triton", file=sys.stderr)
+        return None
+
+
+_EXT = None
+_EXT_TRIED = False
+
+
+def _get_ext():
+    global _EXT, _EXT_TRIED
+    if not _EXT_TRIED:
+        _EXT_TRIED = True
+        _EXT = _load_ext()
+    return _EXT
+
+
+# ----------------------------------------------------------------------------
+# Triton fallback (also handles shapes the CUTLASS build can't)
+# ----------------------------------------------------------------------------
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def _tt_fp8_gemm(
+    x_ptr, w_ptr, s_ptr, y_ptr,
+    M, N, K,
+    sxm, swn, sym,
+    BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr,
+    GROUP_M: tl.constexpr, MASK_M: tl.constexpr, MASK_N: tl.constexpr,
+    HAS_TAIL: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    grid_m = tl.cdiv(M, BM)
+    grid_n = tl.cdiv(N, BN)
+    width = GROUP_M * grid_n
+    group_id = pid // width
+    group_size = tl.minimum(grid_m - group_id * GROUP_M, GROUP_M)
+    pid_m = group_id * GROUP_M + (pid % group_size)
+    pid_n = (pid % width) // group_size
+
+    rm = pid_m * BM + tl.arange(0, BM)
+    rn = pid_n * BN + tl.arange(0, BN)
+    rk = tl.arange(0, BK)
+    x_ptrs = x_ptr + rm[:, None] * sxm + rk[None, :]
+    w_ptrs = w_ptr + rn[None, :] * swn + rk[:, None]
+    acc = tl.zeros((BM, BN), dtype=tl.float32)
+    m_mask = rm[:, None] < M
+    n_mask = rn[None, :] < N
+
+    for _k in range(0, K // BK):
+        if MASK_M:
+            a = tl.load(x_ptrs, mask=m_mask, other=0.0)
+        else:
+            a = tl.load(x_ptrs)
+        if MASK_N:
+            b = tl.load(w_ptrs, mask=n_mask, other=0.0)
+        else:
+            b = tl.load(w_ptrs)
+        acc = tl.dot(a, b, acc)
+        x_ptrs += BK
+        w_ptrs += BK
+    if HAS_TAIL:
+        k0 = (K // BK) * BK
+        k_mask = (k0 + rk) < K
+        am = k_mask[None, :] & m_mask if MASK_M else k_mask[None, :]
+        bm = k_mask[:, None] & n_mask if MASK_N else k_mask[:, None]
+        a = tl.load(x_ptrs, mask=am, other=0.0)
+        b = tl.load(w_ptrs, mask=bm, other=0.0)
+        acc = tl.dot(a, b, acc)
+
+    s = tl.load(s_ptr + rn, mask=rn < N, other=0.0)
+    acc = acc * s[None, :]
+    y_ptrs = y_ptr + rm[:, None] * sym + rn[None, :]
+    tl.store(y_ptrs, acc.to(tl.bfloat16), mask=m_mask & (rn[None, :] < N))
+
+
+def _triton_forward(x, w, s, M, N, K):
+    y = torch.empty(M, N, dtype=torch.bfloat16, device=x.device)
+    if M <= 64:
+        BM, BN, BK, GM, nw, ns = 64, 128, 128, 1, 4, 6
+    else:
+        BM, BN, BK, GM, nw, ns = 128, 128, 128, 8, 8, 4
+    grid = (triton.cdiv(M, BM) * triton.cdiv(N, BN),)
+    _tt_fp8_gemm[grid](
+        x, w, s, y, M, N, K,
+        x.stride(0), w.stride(0), y.stride(0),
+        BM=BM, BN=BN, BK=BK, GROUP_M=GM,
+        MASK_M=(M % BM != 0), MASK_N=(N % BN != 0), HAS_TAIL=(K % BK != 0),
+        num_warps=nw, num_stages=ns,
+    )
+    return y
+
+
+# ----------------------------------------------------------------------------
+# Model
+# ----------------------------------------------------------------------------
+class Model(nn.Module):
+    """y = ((x @ w.T) * weight_scale).to(bf16); x,w fp8_e4m3, scale fp32."""
+
+    def __init__(self, M: int, N: int, K: int):
+        super().__init__()
+        self.M, self.N, self.K = M, N, K
+        w = torch.empty(N, K, dtype=torch.bfloat16)
+        nn.init.normal_(w, std=0.02)
+        s = (w.float().abs().amax(dim=1, keepdim=True) / E4M3_MAX).clamp(min=1e-12)
+        w_fp8 = (w.float() / s).to(torch.float8_e4m3fn)
+        self.register_buffer("weight", w_fp8)
+        self.register_buffer("weight_scale", s.squeeze(1).to(torch.float32))
+
+        # K padded up to a multiple of 16 elements so TMA strides are legal.
+        self.Kp = K if K % 16 == 0 else (K + 15) & ~15
+        self._wpad_key = None
+        self._wpad = None
+        self._xpad = None
+        # CUDA-graph cache: key -> (graph, y). Graphs replay the recorded
+        # kernel launches on the recorded pointers; they read the tensors'
+        # CURRENT contents, so in-place data changes are safe. Anything that
+        # changes a pointer/shape (or the derived padded weight) is in the key.
+        self._graphs = {}
+        self._graphs_ok = True
+
+    def _padded_weight(self, ext):
+        w = self.weight
+        key = (w.data_ptr(), w._version)
+        if key != self._wpad_key:
+            wp = torch.empty(self.N, self.Kp, dtype=w.dtype, device=w.device)
+            ext.pad(w, wp)
+            self._wpad = wp
+            self._wpad_key = key
+        return self._wpad
+
+    def _launch(self, x, y, cfg, swz, raster):
+        """Enqueue the kernels for y = (x @ w.T) * s (no allocations)."""
+        ext = _EXT
+        w = self.weight
+        s = self.weight_scale
+        K, Kp = self.K, self.Kp
+        if K % 16 == 0:
+            ext.gemm(cfg, x, w, s, y, K, K, swz, raster, 1, None)
+        else:
+            ext.gemm_pad_a(cfg, x, self._xpad, self._wpad, s, y, Kp, swz, raster, 1, None)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        M, N, K, Kp = self.M, self.N, self.K, self.Kp
+        w = self.weight
+        s = self.weight_scale
+        ext = _get_ext()
+
+        usable = (
+            ext is not None
+            and x.is_cuda and x.dtype == torch.float8_e4m3fn and x.is_contiguous()
+            and w.is_contiguous() and s.is_contiguous()
+            and x.data_ptr() % 16 == 0 and w.data_ptr() % 16 == 0
+            and N % 8 == 0 and K >= 32
+        )
+        if not usable:
+            return _triton_forward(x, w, s, M, N, K)
+
+        # config choice per shape (empirically tuned on H100 PCIe)
+        if M <= 64:
+            cfg, swz, raster = 4, 1, 0
+        elif N <= 8192:
+            cfg, swz, raster = 0, 2, 0
+        else:
+            cfg, swz, raster = 0, 1, 0
+
+        try:
+            if K % 16 != 0:
+                self._padded_weight(ext)  # refresh version-keyed cache
+                if self._xpad is None or self._xpad.shape[0] != M:
+                    self._xpad = torch.empty(M, Kp, dtype=x.dtype, device=x.device)
+
+            use_graph = self._graphs_ok and not torch.cuda.is_current_stream_capturing()
+            if not use_graph:
+                y = torch.empty(M, N, dtype=torch.bfloat16, device=x.device)
+                self._launch(x, y, cfg, swz, raster)
+                return y
+
+            key = (x.data_ptr(), x.shape[0], x.shape[1], w.data_ptr(), w._version,
+                   s.data_ptr(), cfg, swz, raster)
+            ent = self._graphs.get(key)
+            if ent is not None:
+                ent[0].replay()
+                return ent[1]
+
+            # First call for this key: run eagerly (warms host-side param
+            # cache and produces the result), then capture for future calls.
+            y = torch.empty(M, N, dtype=torch.bfloat16, device=x.device)
+            self._launch(x, y, cfg, swz, raster)
+            try:
+                if len(self._graphs) >= 16:
+                    self._graphs.clear()
+                g = torch.cuda.CUDAGraph()
+                with torch.no_grad(), torch.cuda.graph(g):
+                    self._launch(x, y, cfg, swz, raster)
+                # keep refs to every buffer the recorded launches touch
+                self._graphs[key] = (g, y, self._xpad, self._wpad)
+            except Exception:
+                self._graphs_ok = False
+            return y
+        except Exception as e:
+            if not getattr(Model, "_warned", False):
+                Model._warned = True
+                print(f"[solution.py] cutlass path failed ({type(e).__name__}: {e}); "
+                      f"using Triton fallback", file=sys.stderr)
+            return _triton_forward(x, w, s, M, N, K)
+
+
+M = 4096
+N = 4096
+K = 4096
+
+
+def get_inputs():
+    x = (torch.rand(M, K) * 8 - 4).to(torch.float8_e4m3fn)
+    return [x]
+
+
+def get_init_inputs():
+    return [M, N, K]

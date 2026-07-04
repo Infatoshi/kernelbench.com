@@ -1,0 +1,252 @@
+"""Fused variable-length grouped GEMM + SwiGLU for the MoE up-projection.
+
+Design (H100 / SM90, Triton):
+
+* One kernel instance per (expert, m-tile, n-tile). The tile -> (expert, m, n)
+  mapping is derived in-kernel from expert_offsets with a vectorized scan over
+  E lanes: no host sync, no helper kernels, a single launch whose grid is a
+  host-computable upper bound.
+* Operands stream through TMA (host-built tensor descriptors).
+* Two kernel flavors, chosen per shape:
+    - "packed": W_gate/W_up are repacked once into a column-interleaved
+      (E, H, 2I) tensor ([g0,u0,g1,u1,...]); the mainloop then needs a single
+      TMA load + a single wgmma-backed tl.dot per K-step into one (BM, 2*BNO)
+      accumulator. In the WGMMA fragment layout adjacent column pairs live in
+      the same thread, so the epilogue's even/odd split (gate vs up) is free.
+    - "dual": two B loads + two dots with separate accumulators (no repack).
+* SwiGLU epilogue in fp32: out = silu(gate) * up, stored bf16 with row masks
+  at segment boundaries (loads may overrun into the next expert's rows; those
+  lanes are never stored).
+* Plain direct launches; CUDA-graph replay was measured to be slower under
+  the harness's flush-then-time protocol on this box, so it is not used.
+"""
+from __future__ import annotations
+
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+from triton.tools.tensor_descriptor import TensorDescriptor
+
+
+@triton.jit
+def _map_tile(OFFS, pid, num_n,
+              E: tl.constexpr, EP2: tl.constexpr,
+              BM: tl.constexpr, GROUP_M: tl.constexpr):
+    """pid -> (row0, seg_hi, expert, ncol_tile); row0 = -1 when pid is padding."""
+    eidx = tl.arange(0, EP2)
+    lo = tl.load(OFFS + eidx, mask=eidx < E, other=0)
+    hi = tl.load(OFFS + eidx + 1, mask=eidx < E, other=0)
+    mt = tl.cdiv(hi - lo, BM)          # m-tiles per expert (0 if empty)
+    tiles = mt * num_n
+    cum = tl.cumsum(tiles, 0)          # inclusive prefix sum
+    total = tl.sum(tiles, 0)
+    hit = cum <= pid
+    e = tl.sum(hit.to(tl.int32), 0)
+    sel = eidx == e
+    seg_lo = tl.sum(tl.where(sel, lo, 0), 0)
+    seg_hi = tl.sum(tl.where(sel, hi, 0), 0)
+    mt_e = tl.sum(tl.where(sel, mt, 0), 0)
+    excl = tl.sum(tl.where(sel, cum - tiles, 0), 0)
+    tile_in_e = pid - excl
+
+    # grouped (L2-friendly) ordering within the expert
+    num_in_group = GROUP_M * num_n
+    group_id = tile_in_e // num_in_group
+    first_m = group_id * GROUP_M
+    gsz = max(min(mt_e - first_m, GROUP_M), 1)
+    pid_m = first_m + ((tile_in_e % num_in_group) % gsz)
+    pid_n = (tile_in_e % num_in_group) // gsz
+
+    row0 = seg_lo + pid_m * BM
+    row0 = tl.where(pid < total, row0, -1)
+    return row0, seg_hi, e, pid_n
+
+
+@triton.jit
+def _moe_swiglu_packed(
+    x_desc, wp_desc, OUT, OFFS,
+    Tperm,
+    H: tl.constexpr, I: tl.constexpr, E: tl.constexpr, EP2: tl.constexpr,
+    BM: tl.constexpr, BNO: tl.constexpr, BK: tl.constexpr,
+    GROUP_M: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    num_n: tl.constexpr = I // BNO
+    BNP: tl.constexpr = 2 * BNO
+
+    row0, seg_hi, e, pid_n = _map_tile(OFFS, pid, num_n, E=E, EP2=EP2,
+                                       BM=BM, GROUP_M=GROUP_M)
+    if row0 < 0:
+        return
+    ncol = pid_n * BNO
+    wrow = e * H
+
+    # Boundary tiles read a few rows past the segment (into the next expert's
+    # rows, or zero-filled past Tperm via TMA bounds); those lanes are never
+    # stored, so correctness only depends on the store mask below.
+    acc = tl.zeros((BM, BNP), dtype=tl.float32)
+    for k in range(0, H, BK):
+        a = x_desc.load([row0, k])
+        b = wp_desc.load([wrow + k, 2 * ncol])
+        acc = tl.dot(a, b, acc)
+
+    g, u = tl.split(tl.reshape(acc, (BM, BNO, 2)))
+    o = (g * tl.sigmoid(g) * u).to(tl.bfloat16)
+    rm = row0 + tl.arange(0, BM)
+    rn = ncol + tl.arange(0, BNO)
+    tl.store(OUT + rm[:, None] * I + rn[None, :], o, mask=(rm < seg_hi)[:, None])
+
+
+@triton.jit
+def _moe_swiglu_dual(
+    x_desc, wg_desc, wu_desc, OUT, OFFS,
+    Tperm,
+    H: tl.constexpr, I: tl.constexpr, E: tl.constexpr, EP2: tl.constexpr,
+    BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr,
+    GROUP_M: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    num_n: tl.constexpr = I // BN
+
+    row0, seg_hi, e, pid_n = _map_tile(OFFS, pid, num_n, E=E, EP2=EP2,
+                                       BM=BM, GROUP_M=GROUP_M)
+    if row0 < 0:
+        return
+    ncol = pid_n * BN
+    wrow = e * H
+
+    acc_g = tl.zeros((BM, BN), dtype=tl.float32)
+    acc_u = tl.zeros((BM, BN), dtype=tl.float32)
+    for k in range(0, H, BK):
+        a = x_desc.load([row0, k])
+        bg = wg_desc.load([wrow + k, ncol])
+        bu = wu_desc.load([wrow + k, ncol])
+        acc_g = tl.dot(a, bg, acc_g)
+        acc_u = tl.dot(a, bu, acc_u)
+
+    o = (acc_g * tl.sigmoid(acc_g) * acc_u).to(tl.bfloat16)
+    rm = row0 + tl.arange(0, BM)
+    rn = ncol + tl.arange(0, BN)
+    tl.store(OUT + rm[:, None] * I + rn[None, :], o, mask=(rm < seg_hi)[:, None])
+
+
+def _pick_plan(T_perm: int, H: int, I: int, E: int):
+    """Per-shape tuned plan: (kernel, BM, BN(out), BK, GROUP_M, warps, stages)."""
+    key = (T_perm, H, I, E)
+    table = {
+        # headline: 32K tokens * top8, 128 experts
+        (262144, 4096, 1536, 128): ("packed", 128, 128, 64, 16, 8, 3),
+        # small / fast-iteration shape
+        (16384, 2048, 1024, 64): ("packed", 128, 128, 64, 16, 8, 4),
+        # intermediate-heavy shape
+        (131072, 2048, 4096, 64): ("dual", 128, 128, 64, 16, 8, 3),
+    }
+    if key in table:
+        return table[key]
+    # Generic fallback: shrink BN/BK to divisors of I/H if needed.
+    BN = 128 if I % 128 == 0 else 64
+    BK = 64 if H % 64 == 0 else 32
+    return ("dual", 128, BN, BK, 16, 8, 3)
+
+
+class Model(nn.Module):
+    """Up-projection of a top-K MoE FFN with fused SwiGLU (custom Triton kernels)."""
+
+    def __init__(self, T_total: int, H: int, I: int, E: int, K: int):  # noqa: E741
+        super().__init__()
+        self.T_total = T_total
+        self.H = H
+        self.I = I
+        self.E = E
+        self.K = K
+        self.W_gate = nn.Parameter(torch.empty(E, H, I, dtype=torch.bfloat16))
+        self.W_up = nn.Parameter(torch.empty(E, H, I, dtype=torch.bfloat16))
+        nn.init.normal_(self.W_gate, std=0.02)
+        nn.init.normal_(self.W_up, std=0.02)
+        self._wp = None            # packed (E, H, 2I) weights
+        self._wp_key = None
+
+    # -- packed weights: [g0, u0, g1, u1, ...] along the last dim -------------
+    def _packed(self):
+        key = (self.W_gate.data_ptr(), self.W_up.data_ptr())
+        if self._wp is None or self._wp_key != key:
+            E, H, I = self.W_gate.shape  # noqa: E741
+            wp = torch.empty(E, H, 2 * I, dtype=torch.bfloat16,
+                             device=self.W_gate.device)
+            wpv = wp.view(E, H, I, 2)
+            wpv[..., 0] = self.W_gate.detach()
+            wpv[..., 1] = self.W_up.detach()
+            self._wp = wp
+            self._wp_key = key
+        return self._wp
+
+    def _launch(self, x, offs, out, T_perm):
+        H, I, E = self.H, self.I, self.E  # noqa: E741
+        kernel, BM, BN, BK, GROUP_M, warps, stages = _pick_plan(T_perm, H, I, E)
+        assert I % BN == 0 and H % BK == 0
+        x_desc = TensorDescriptor(x, [T_perm, H], [H, 1], [BM, BK])
+        grid = ((triton.cdiv(T_perm, BM) + E) * (I // BN),)
+        if kernel == "packed":
+            wp = self._packed().view(E * H, 2 * I)
+            wp_desc = TensorDescriptor(wp, [E * H, 2 * I], [2 * I, 1], [BK, 2 * BN])
+            _moe_swiglu_packed[grid](
+                x_desc, wp_desc, out, offs, T_perm,
+                H=H, I=I, E=E, EP2=triton.next_power_of_2(E),
+                BM=BM, BNO=BN, BK=BK, GROUP_M=GROUP_M,
+                num_warps=warps, num_stages=stages,
+            )
+        else:
+            wg = self.W_gate.view(E * H, I)
+            wu = self.W_up.view(E * H, I)
+            wg_desc = TensorDescriptor(wg, [E * H, I], [I, 1], [BK, BN])
+            wu_desc = TensorDescriptor(wu, [E * H, I], [I, 1], [BK, BN])
+            _moe_swiglu_dual[grid](
+                x_desc, wg_desc, wu_desc, out, offs, T_perm,
+                H=H, I=I, E=E, EP2=triton.next_power_of_2(E),
+                BM=BM, BN=BN, BK=BK, GROUP_M=GROUP_M,
+                num_warps=warps, num_stages=stages,
+            )
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,   # (T_perm, H) bf16
+        expert_offsets: torch.Tensor,  # (E+1,) int32
+    ) -> torch.Tensor:
+        T_perm, H = hidden_states.shape
+        I, E = self.I, self.E  # noqa: E741
+        x = hidden_states.contiguous()
+        offs = expert_offsets.to(device=x.device, dtype=torch.int32)
+        out = torch.empty(T_perm, I, dtype=torch.bfloat16, device=x.device)
+        self._launch(x, offs, out, T_perm)
+        return out
+
+
+# Module-level shape shims (mirrors reference.py; rewritten by harness per shape).
+T_total = 32768
+H = 4096
+I = 1536  # noqa: E741
+E = 128
+K = 8
+
+
+def _build_routing(T_total: int, E: int, K: int, device: str = "cpu") -> torch.Tensor:
+    T_perm = T_total * K
+    base = T_perm // E
+    rem = T_perm - base * E
+    counts = torch.full((E,), base, dtype=torch.int32, device=device)
+    counts[:rem] += 1
+    offsets = torch.zeros(E + 1, dtype=torch.int32, device=device)
+    offsets[1:] = torch.cumsum(counts, dim=0)
+    return offsets
+
+
+def get_inputs():
+    T_perm = T_total * K
+    hidden_states = torch.randn(T_perm, H, dtype=torch.bfloat16) * 0.1
+    expert_offsets = _build_routing(T_total, E, K)
+    return [hidden_states, expert_offsets]
+
+
+def get_init_inputs():
+    return [T_total, H, I, E, K]

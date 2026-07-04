@@ -80,8 +80,22 @@ const GPU_TARGETS = [
         Leading models (Opus 4.8, GPT-5.5, GLM-5.2, MiniMax-M3, Gemini 3.5
         Flash, Kimi K2.7-Code) were reswept June 2026 with{" "}
         <span className="text-[var(--color-fg)]">unlimited time per problem</span>;
-        earlier rows used the original 45-minute budget. Claude Fable 5 is
-        suspended and shown as a frozen 45-minute reference.
+        earlier rows used the original 45-minute budget. Claude Fable 5 on this
+        GPU is the original 45-minute reference; its unlimited resweep is pending.
+      </>
+    ),
+  },
+  {
+    key: "h100",
+    label: "H100 PCIe",
+    runtime: "limited",
+    file: "benchmarks/hard/results/leaderboard.h100.json",
+    blurb: (
+      <>
+        Eight models (Opus 4.8, GPT-5.5, GLM-5.2, MiniMax-M3, Gemini 3.5 Flash,
+        DeepSeek V4 Pro, Kimi K2.7-Code, Composer 2.5 Fast) on a single H100
+        PCIe with the same containerized harness and roofline grading as the
+        Blackwell deck; peak fraction is measured against H100 dense peaks.
       </>
     ),
   },

@@ -1,0 +1,203 @@
+"""Grouped GEMM + fused SwiGLU up-projection (MoE FFN) for B200 (SM100).
+
+Per expert e:  h_e = silu(x_e @ W_gate[e]) * (x_e @ W_up[e])
+
+x_e is the slice of permuted hidden_states routed to expert e
+(rows [offsets[e]:offsets[e+1]]).
+
+Implementation: a variable-length grouped GEMM in Triton with SwiGLU fused into
+the epilogue. The two weight matrices are interleaved along the output dimension
+(g,u,g,u,...) so a single MMA per K-step produces both the gate and up
+projections; tl.split separates them for the SwiGLU activation. This turns the
+fused dual-GEMM into one structurally-standard GEMM with N=2*BLOCK_N, which the
+Blackwell tcgen05 path pipelines well. An L2 swizzle (GROUP_M) and a fused
+schedule-builder kernel keep launch/scheduling overhead minimal.
+"""
+from __future__ import annotations
+
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+# --------------------------------------------------------------------------
+# Schedule builder: map each global tile -> (expert, row_start, row_end).
+# One fused launch, no host sync.
+# --------------------------------------------------------------------------
+@triton.jit
+def _build_sched_kernel(off_ptr, te_ptr, trs_ptr, tre_ptr,
+                        E: tl.constexpr, BLOCK_M: tl.constexpr):
+    g = tl.program_id(0)
+    cum = 0
+    found_e = -1
+    rs = 0
+    re = 0
+    for e in range(0, E):
+        s = tl.load(off_ptr + e)
+        en = tl.load(off_ptr + e + 1)
+        nt = (en - s + BLOCK_M - 1) // BLOCK_M
+        local = g - cum
+        cond = (found_e < 0) and (g >= cum) and (g < cum + nt)
+        found_e = tl.where(cond, e, found_e)
+        rs = tl.where(cond, s + local * BLOCK_M, rs)
+        re = tl.where(cond, tl.minimum(s + local * BLOCK_M + BLOCK_M, en), re)
+        cum += nt
+    tl.store(te_ptr + g, found_e)
+    tl.store(trs_ptr + g, rs)
+    tl.store(tre_ptr + g, re)
+
+
+def _build_schedule(expert_offsets, BLOCK_M, max_tiles, E):
+    dev = expert_offsets.device
+    te = torch.empty(max_tiles, dtype=torch.int32, device=dev)
+    trs = torch.empty(max_tiles, dtype=torch.int32, device=dev)
+    tre = torch.empty(max_tiles, dtype=torch.int32, device=dev)
+    off = expert_offsets.to(torch.int32)
+    _build_sched_kernel[(max_tiles,)](off, te, trs, tre, E=E, BLOCK_M=BLOCK_M, num_warps=1)
+    return te, trs, tre
+
+
+# --------------------------------------------------------------------------
+# Grouped GEMM + fused SwiGLU. Weights interleaved (g,u,g,u,...) along N.
+# --------------------------------------------------------------------------
+@triton.jit
+def _grouped_swiglu_kernel(
+    X_ptr, W_ptr, Out_ptr,
+    tile_expert_ptr, tile_row_start_ptr, tile_row_end_ptr,
+    H,
+    stride_xm, stride_xk,
+    stride_we, stride_wk, stride_wn,
+    stride_om, stride_on,
+    NUM_M_TILES: tl.constexpr, NUM_N_TILES: tl.constexpr,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+    GROUP_M: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    num_pid_in_group = GROUP_M * NUM_N_TILES
+    group_id = pid // num_pid_in_group
+    first_pid_m = group_id * GROUP_M
+    group_size = min(NUM_M_TILES - first_pid_m, GROUP_M)
+    pid_m = first_pid_m + (pid % group_size)
+    pid_n = (pid % num_pid_in_group) // group_size
+
+    expert = tl.load(tile_expert_ptr + pid_m)
+    if expert < 0:
+        return
+
+    row_start = tl.load(tile_row_start_ptr + pid_m)
+    row_end = tl.load(tile_row_end_ptr + pid_m)
+
+    offs_m = row_start + tl.arange(0, BLOCK_M)
+    offs_k = tl.arange(0, BLOCK_K)
+    offs_wn = pid_n * (2 * BLOCK_N) + tl.arange(0, 2 * BLOCK_N)
+    mask_m = offs_m < row_end
+
+    x_ptrs = X_ptr + (offs_m[:, None] * stride_xm + offs_k[None, :] * stride_xk)
+    w_ptrs = W_ptr + expert * stride_we + (offs_k[:, None] * stride_wk + offs_wn[None, :] * stride_wn)
+
+    acc = tl.zeros((BLOCK_M, 2 * BLOCK_N), dtype=tl.float32)
+    for k in range(0, H, BLOCK_K):
+        x = tl.load(x_ptrs, mask=mask_m[:, None], other=0.0)
+        w = tl.load(w_ptrs)
+        acc = tl.dot(x, w, acc)
+        x_ptrs += BLOCK_K * stride_xk
+        w_ptrs += BLOCK_K * stride_wk
+
+    g, u = tl.split(tl.reshape(acc, (BLOCK_M, BLOCK_N, 2)))
+    out = (g * tl.sigmoid(g) * u).to(Out_ptr.dtype.element_ty)
+
+    offs_on = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    out_ptrs = Out_ptr + (offs_m[:, None] * stride_om + offs_on[None, :] * stride_on)
+    tl.store(out_ptrs, out, mask=mask_m[:, None])
+
+
+# (BLOCK_M, BLOCK_N, BLOCK_K, num_warps, num_stages, GROUP_M)
+def _pick_config(H, I, E, T_perm):
+    if I >= 4096:                        # intermediate-heavy
+        return (256, 128, 64, 8, 3, 8)
+    return (256, 128, 64, 8, 3, 4)       # headline / small
+
+
+class Model(nn.Module):
+    def __init__(self, T_total: int, H: int, I: int, E: int, K: int):  # noqa: E741
+        super().__init__()
+        self.T_total = T_total
+        self.H = H
+        self.I = I
+        self.E = E
+        self.K = K
+        self.W_gate = nn.Parameter(torch.empty(E, H, I, dtype=torch.bfloat16))
+        self.W_up = nn.Parameter(torch.empty(E, H, I, dtype=torch.bfloat16))
+        nn.init.normal_(self.W_gate, std=0.02)
+        nn.init.normal_(self.W_up, std=0.02)
+        self._w_il = None
+        self._w_il_ver = None
+
+    def _interleaved_weight(self):
+        ver = (self.W_gate._version, self.W_up._version,
+               self.W_gate.data_ptr(), self.W_up.data_ptr())
+        if self._w_il is None or self._w_il_ver != ver:
+            E, H, I = self.E, self.H, self.I
+            # (E, H, I, 2) -> (E, H, 2I): columns are g0,u0,g1,u1,...
+            self._w_il = torch.stack([self.W_gate, self.W_up], dim=-1).reshape(E, H, 2 * I).contiguous()
+            self._w_il_ver = ver
+        return self._w_il
+
+    def forward(self, hidden_states: torch.Tensor, expert_offsets: torch.Tensor) -> torch.Tensor:
+        T_perm, H = hidden_states.shape
+        I, E = self.I, self.E
+        out = torch.empty(T_perm, I, dtype=torch.bfloat16, device=hidden_states.device)
+
+        BLOCK_M, BLOCK_N, BLOCK_K, warps, stages, GROUP_M = _pick_config(H, I, E, T_perm)
+
+        W = self._interleaved_weight()
+        max_tiles = (T_perm + BLOCK_M - 1) // BLOCK_M + E
+        te, trs, tre = _build_schedule(expert_offsets, BLOCK_M, max_tiles, E)
+
+        num_n_tiles = (I + BLOCK_N - 1) // BLOCK_N
+        grid = (max_tiles * num_n_tiles,)
+
+        _grouped_swiglu_kernel[grid](
+            hidden_states, W, out,
+            te, trs, tre,
+            H,
+            hidden_states.stride(0), hidden_states.stride(1),
+            W.stride(0), W.stride(1), W.stride(2),
+            out.stride(0), out.stride(1),
+            NUM_M_TILES=max_tiles, NUM_N_TILES=num_n_tiles,
+            BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
+            GROUP_M=GROUP_M,
+            num_warps=warps, num_stages=stages,
+        )
+        return out
+
+
+# Module-level shape shims (rewritten by check.py / benchmark.py per shape).
+T_total = 32768
+H = 4096
+I = 1536  # noqa: E741
+E = 128
+K = 8
+
+
+def _build_routing(T_total: int, E: int, K: int, device: str = "cpu") -> torch.Tensor:
+    T_perm = T_total * K
+    base = T_perm // E
+    rem = T_perm - base * E
+    counts = torch.full((E,), base, dtype=torch.int32, device=device)
+    counts[:rem] += 1
+    offsets = torch.zeros(E + 1, dtype=torch.int32, device=device)
+    offsets[1:] = torch.cumsum(counts, dim=0)
+    return offsets
+
+
+def get_inputs():
+    T_perm = T_total * K
+    hidden_states = torch.randn(T_perm, H, dtype=torch.bfloat16) * 0.1
+    expert_offsets = _build_routing(T_total, E, K)
+    return [hidden_states, expert_offsets]
+
+
+def get_init_inputs():
+    return [T_total, H, I, E, K]

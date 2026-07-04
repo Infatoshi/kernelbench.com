@@ -4,6 +4,142 @@ A running record of decisions, dead ends, and lessons. Newest entries on top. Th
 
 ---
 
+## 2026-07-04 - Fable-5 hard resweep finished: H100 5/6 published, RTX fp8 held back on purpose
+
+Closed out the Fable-5 [max] hard sweep across all three GPUs.
+
+**H100 (published, 5/6).** Reswept the cells the July-2 run lost to the missing-ninja
+grading bug + rate limits. Final board-best-per-cell for Fable: fp8 0.3033, kda
+0.0152, paged 0.4605, topk 0.047, w4a16 **0.3681 (board ceiling)**. `06_sonic_moe_swiglu`
+is the one gap — its solution.py built fine but `check.py` `check_timeout`'d on the
+cold CUTLASS compile, so it's ungraded, not a correctness fail. We SKIPPED it: the
+H100 box (`wgmma-hopper`) was reclaimed by the provider mid-retry, and moe_swiglu is
+low-impact (RTX 0.076 / B200 0.076). Re-added the H100 target to the site (it had
+been pulled July 2 while the ninja bug was live) and rebuilt `leaderboard.h100.json`
+from `outputs/runs-h100/` (9 models, contamination guard excluded 1 tainted composer
+run). All 5 passing Fable cells reward-hack audited CLEAN.
+
+**B200 (published, 4/6).** Unchanged from the earlier publish. `02_kda_cutlass` and
+`05_topk_bitonic` were SKIPPED — their July-2 `check_failed` was the SAME missing-ninja
+infra bug (solution.py existed, grader couldn't load the C++ ext), not correctness.
+Not worth renting a B200 to re-grade two cells.
+
+**RTX fp8: fresh 0.4098 run EXISTS but is deliberately NOT published. Important gotcha.**
+The blank RTX fp8 cell finally got a real unlimited run (`20260703_001306`, pf 0.4098,
+audited clean). But adding it to `results/published_runs.json` and rebuilding DROPPED
+Fable's other 5 RTX cells, taking the row from 5/6 → 1/6. Cause: `build_v2_leaderboard.py`
+has a **best-of-both / CAMPAIGN_EPOCH (20260613) rule** — once a model has ANY
+post-campaign "unlimited" run, it filters OUT all that model's pre-campaign 45-minute
+cells (so a model is shown as EITHER the 45-min generation OR the unlimited generation,
+never a mix). Fable's other 5 RTX cells are all June 45-min runs with no unlimited
+equivalent, so the single fresh fp8 run demoted the whole row. Reverted the manifest;
+RTX Fable stays the 5-cell June reference (fp8 blank), and the /hard RTX blurb now says
+Fable's unlimited resweep is pending. TO PUBLISH RTX fp8 PROPERLY: do a full unlimited
+RTX resweep of ALL 6 Fable cells (or at minimum enough to beat/replace the June set),
+then add that generation to the manifest as a unit. Do not add a lone unlimited cell.
+
+---
+
+## 2026-07-03 - Deck-redesign brainstorm: DO NOT touch Hard; ideas parked for a new bench (DEFERRED on cost)
+
+Long design conversation about reshaping the Hard deck. **Outcome: change NOTHING
+in Hard. Park all of this and revisit in ~2 weeks.** Deferred purely on cost —
+Fable-5 [max] runs ~thousands of dollars to sweep once across all GPU
+architectures × problems × benches, so a new bench isn't getting swept right now.
+This entry exists so a future agent can resume the thinking without re-deriving it.
+
+**>>> THE HARD RULE THAT CAME OUT OF THIS: Hard is now (near-)FROZEN. <<<**
+Chinese frontier labs have reached out and are considering citing KernelBench-Hard
+in their model-release reports. Once a bench is externally cited it becomes shared
+infrastructure — mutating it retroactively invalidates labs' published numbers
+(the MLPerf / SWE-bench / GPQA lesson: version, never edit a released bench).
+So:
+- **Non-breaking = still OK for Hard:** *appending* a new problem (e.g. `08_*`).
+  Benchmarks grow; that never invalidates an existing cell.
+- **Breaking = must be a NEW bench, never an edit to Hard:** switching the metric,
+  and REMOVING/reshaping existing problems (kda / topk / paged). Treat any of
+  these as a "rug pull" on Hard and don't do them.
+
+### The ideas we explored (all parked, none implemented)
+
+1. **DeepSeek Sparse Attention (DSA) as a problem.** More relevant than KDA
+   (DeepSeek-V3.2 / GLM-5.2 are open-weight frontier; Kimi Linear is narrower),
+   and harder to reward-hack (no SM120 drop-in lib to forbid-then-copy). DSA =
+   lightning indexer (small score GEMM) + top-k token selection + sparse MLA
+   attention, so it naturally *subsumes* the standalone top-k problem and could
+   stand in for kda + topk + paged in one op. Two hard design gates we identified:
+   - **Metric fit is bad for Hard.** Hard scores fraction-of-dense-peak with the
+     algorithmic-FLOPS "dense-equivalent, no credit for skipping" rule. DSA's whole
+     point is structural sparsity (fixed `k`), so scoring vs dense peak either reads
+     absurdly low OR rewards NOT being sparse. You'd have to score at the *sparse*
+     work (indexer + k-token attn) — a special-case decision. This is the main
+     reason DSA doesn't belong in Hard as-is.
+   - **Selection determinism.** Top-k over indexer scores is discrete; fp rounding
+     in a candidate indexer flips the selected set → flaky correctness. Fix pattern
+     (same as `05_topk`): grade the FINAL attention output with tolerance, make the
+     reference selection deterministic (fp32 indexer, stable tie-break, scores
+     well-separated near the k boundary). Do NOT grade the index set directly.
+   - Home: full fused DSA *decode* = Mega (speedup-over-reference, sparsity pays
+     off there); DSA *attention-op* could be Hard-scale but the metric fights it.
+
+2. **Metric switch: fraction-of-peak → wall-clock (ms).** Motivation: FFT, 3DGS,
+   hash-join, and mixed ALU→tensor-core kernels have NO clean single roofline, so
+   "fraction of peak" is ill-defined for them (this is a real blocker, not a
+   preference — those problems literally can't be scored on a roofline). Resolution
+   we landed on: **measure ms, but report GEOMEAN SPEEDUP OVER `reference.py`**
+   (dimensionless, comparable/averageable across problems; raw ms alone can't rank
+   because a 40µs FFT and a 4ms MoE don't average). This ALSO unifies the metric
+   with Mega ("×over reference") — one mental model across the whole site. Secondary
+   read where a real ceiling exists (fp8→cuBLASLt, FFT→cuFFT): `solution_ms /
+   sota_ms` = "% of best hand-tuned kernel" (roofline's honest, measured cousin).
+   Presentation: reuse `media/make_fable5_hard_bars.py` grouped bars, y-axis =
+   ×speedup (higher = better, kills the "why not 1.0?" question), one headline
+   geomean bar per model, raw ms on a LOG axis / detail table only.
+   NOTE: a metric switch is itself breaking → new bench only.
+
+3. **Two candidate NEW benches (collection additions, NOT Hard edits):**
+   - **KernelBench-Classic** — non-DL / "old-school but still modern" kernels:
+     graphics (**3DGS rasterization**), physics (n-body / stencil / PDE), crypto
+     (hashing), **FFT** (ideally *fused*, e.g. FFT-conv or STFT→mel), hash-join /
+     dedup, radix sort. Thesis: *can agents write fast kernels beyond the
+     transformer?* Biggest whitespace in the field; nobody benchmarks agent
+     kernel-writing on graphics/data/science. ms-speedup metric is native (no
+     rooflines). This is the one most worth building out.
+   - **KernelBench-Frontier** — signature kernels of the newest lab architectures:
+     DSA, MLA (multi-head latent attention), whatever ships next; a rolling
+     "~last 6 months" window. Most attractive to the labs who reached out (a bench
+     featuring *their* architecture). Open problem the user flagged: it gets awkward
+     once entries hit ~1yr old (architectures age out) — needs an explicit rolling /
+     versioning policy before it's real.
+
+### Per-idea verdicts worth keeping
+- **Keep W4A16** (if ever reconsidered): it is NOT redundant with fp8 GEMM. fp8 is
+  compute-bound tensor-core (MMA/tcgen05 throughput); W4A16 is memory-bound with a
+  register-level dequant pipeline and NO tensor-memory path — different regime,
+  different tricks.
+- **FFT is only a MEDIUM differentiator.** Shared-mem / bank-conflict / fusion
+  skills overlap fp8 & W4A16. It's distinct only on the butterfly *communication*
+  pattern + warp shuffles + zero tensor-core path. Include as a "signal" slot; do
+  not anchor a bench on it.
+- **3DGS is gradable and the showpiece.** Non-hackable recipe: pin a `.ply` scene +
+  camera by URL AND hash; naive PyTorch tile-rasterizer reference (bin → stable
+  depth-sort → alpha-composite); correctness = rendered image within pixel
+  tolerance / PSNR floor; ceiling = time `gsplat` / `diff-gaussian-rasterization`
+  in `sota.py` and FORBID those same libs in `solution.py`. Zero tensor cores, no
+  allowed drop-in → maximally hack-resistant. Only care-item is depth-sort
+  determinism (stable tie-break).
+
+### When we resume (checklist for future agent)
+1. Pick a bench identity (Classic vs Frontier; Classic is the recommended flagship).
+2. Draft its `SPEC.md` (purpose, ms→geomean-speedup metric, problem set, reward-hack
+   rules, relationship to Hard/Mega). No changes to any live deck.
+3. Budget the sweep BEFORE building (Fable full sweep ≈ thousands of $; that's why
+   this is deferred).
+4. DSA: decide Mega (fused decode) vs Frontier bench. It does NOT go into Hard under
+   the current fraction-of-peak metric.
+
+---
+
 ## 2026-07-02 - Fable 5 hard sweep (RTX + B200); H100 held out; TWO RESWEEPS PENDING
 
 Swept Claude Fable 5 [max] across the hard deck on RTX PRO 6000 + a rented B200,

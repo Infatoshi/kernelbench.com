@@ -65,6 +65,7 @@ export async function loadMegaChart(): Promise<ChartData> {
 export async function loadHardChart(): Promise<ChartData> {
   const files = {
     "RTX PRO 6000": "benchmarks/hard/results/leaderboard.json",
+    H100: "benchmarks/hard/results/leaderboard.h100.json",
     B200: "benchmarks/hard/results/leaderboard.b200.json",
   }
   const cell: Record<string, Record<string, number>> = {}
@@ -107,6 +108,7 @@ const MEGA_GPU_MAP: Record<string, string> = {
 }
 const HARD_SRC: Record<string, { lb: string; runs: string }> = {
   "RTX PRO 6000": { lb: "benchmarks/hard/results/leaderboard.json", runs: "benchmarks/hard/outputs/runs" },
+  H100: { lb: "benchmarks/hard/results/leaderboard.h100.json", runs: "benchmarks/hard/outputs/runs-h100" },
   B200: { lb: "benchmarks/hard/results/leaderboard.b200.json", runs: "benchmarks/hard/outputs/runs-b200" },
   "RTX 3090": { lb: "benchmarks/hard/results/leaderboard.rtx3090.json", runs: "benchmarks/hard/outputs/runs-rtx3090" },
 }
@@ -139,7 +141,7 @@ const SHORT_NAMES: Record<string, string> = {
 // telemetry: RTX (re-extracted), B200 + H100 (fresh resweeps with caches on
 // /ephemeral and parallel=3/budget=12000 so sessions complete). RTX 3090 is
 // unpublished. The 50k token floor below drops any stale/truncated artifacts.
-const HARD_EFF_GPUS = ["RTX PRO 6000", "B200"]
+const HARD_EFF_GPUS = ["RTX PRO 6000", "H100", "B200"]
 
 // Performance vs compute (output tokens), per GPU. Hard tokens are read from the
 // committed leaderboard cells (output_tokens baked in by inject_tokens.py) so the
