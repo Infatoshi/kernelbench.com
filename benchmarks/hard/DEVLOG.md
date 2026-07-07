@@ -40,6 +40,16 @@ Lessons that cost real time:
   wall (any non-cuBLAS reduction order compounds through the sequential recurrence), and on
   paged it deliberately abandoned a hung cp.async CUDA kernel for its working Triton
   split-K version when it couldn't profile blind (ncu blocked in container). Good triage.
+- **GPU-lock starvation cascade (worse than the check_timeouts).** While one run's
+  harness-owned check.py holds `outputs/gpu.lock` for 30-60+ min (crawling under the vLLM
+  co-tenant), every OTHER session's wrapped agent commands (nvidia-smi/uv probes) block on
+  the lock until Claude Code's 2-min Bash timeout SIGTERMs them (exit 143, zombie chains of
+  bash->gpu-lock-exec->flock under the container's PID 1). LongCat's RTX kda session was
+  starved for essentially its whole 2h15m window — 43/43 bash launches dead — and still
+  shipped a first-try-PASS fallback by static reasoning alone ("correctness is provable by
+  construction"). That cell under-measures the model; rerun it on a quiet GPU. Lesson:
+  under co-tenant contention the lock doesn't just slow checks, it silently lobotomizes
+  every concurrent agent session. Don't run KernelBench sweeps against a busy co-tenant.
 
 ---
 
