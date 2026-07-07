@@ -59,6 +59,27 @@ runs/                      gitignored HF staging (kb publish fills it, pushes to
 
 ## Run a sweep (the common task) — use the `kb` CLI (on PATH, runs from any cwd)
 
+**"Do a sweep of <model>" is an end-to-end order, not a question.** When the
+human says "run/do a sweep" for a model (however loosely worded), assume the
+full default scope, state the assumption in one line ("Assuming: all problems,
+hard + mega, audited, published"), and go — do not ask for confirmation. The
+default scope is:
+
+1. **All problems** in the deck for the current GPU (hard) **and** the mega
+   deck (`02_kimi_linear_decode` at minimum), unlimited time for hard, the
+   standard cap for mega. Existing valid cells for the same
+   (model, harness, problem, GPU) don't need reruns.
+2. **Reward-hack audit every cell** (subagent reads solution.py + trace,
+   annotation YAML written) — this is already mandatory before reporting, so a
+   "sweep" is not done until the audits are.
+3. **Publish end-to-end**: contamination check, redaction, `kb publish`,
+   commit + push (deploy). Report back with the numbers and anything
+   interesting found in the traces.
+
+The human coming back to finished, audited, published results is the success
+condition. Only interrupt for a missing API key (`STOP: needs $X_API_KEY`), an
+occupied shared GPU that never frees, or a genuinely ambiguous model identity.
+
 ```
 kb sweep kimi-claude kimi-k2.7-code       # all hard problems, parallel containers, unlimited time
 kb publish                                # rebuild leaderboard + viewers from archives
@@ -438,6 +459,14 @@ Most likely causes:
   transcripts live on HuggingFace (`kernelbench-<bench>-traces`); push them with
   `kb push-runs <hard|mega>` (or `kb publish --push`). The site links each run
   to its HF trace — it no longer self-hosts `*.html` viewers.
+- **Redact on every publish/push pass.** Before uploading HF traces, committing
+  `public/runs`, or deploying site artifacts, run
+  `uv run python scripts/redaction.py runs public/runs` from the repo root. This
+  is mandatory even if the converter/publish scripts already redacted once:
+  agents can echo env dumps, old machine keys, or local `AGENTS.md` /
+  `CLAUDE.md` content into transcripts. Block publish if a scan still finds
+  local-instruction markers or unredacted sensitive assignments:
+  `rg -n "# AGENTS\\.md instructions|<proactive-behavior>|~/.codex/AGENTS\\.md|~/.claude/CLAUDE\\.md|GOG_KEYRING_PASSWORD=|[A-Z0-9_]*(API_KEY|TOKEN|SECRET|PASSWORD)=" runs public/runs`.
 - **Transcript / reasoning extraction lives in-repo at
   `scripts/transcript-extraction/`** (vendored complete extractor; see its
   `VENDORED.md`). Use it as the canonical reference when working on the

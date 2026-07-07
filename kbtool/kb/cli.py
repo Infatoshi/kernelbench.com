@@ -99,7 +99,7 @@ def preflight_key(harness: str, model: str = "") -> None:
         sys.exit(3)
 
 
-def _exec(cmd: list[str], cwd: Path | None = None, env: dict | None = None) -> "int":
+def _exec(cmd: list[str], cwd: Path | None = None, env: dict | None = None) -> int:
     """Replace this process with cmd (preserves TTY/signals)."""
     if cwd is not None:
         os.chdir(cwd)
@@ -188,8 +188,10 @@ def cmd_push_runs(root: Path, args: list[str]) -> int:
     listfile = root / "runs" / bench / "_rids.txt"
     listfile.write_text("\n".join(rids) + "\n")
 
-    # Reuse the bench-local converter (knows that bench's transcript parsers).
+    # Mega reuses hard's transcript parser/converter machinery.
     conv = bench_dir / "scripts" / "traces_to_hf.py"
+    if not conv.exists() and bench == "mega":
+        conv = _bench_dir(root, "hard") / "scripts" / "traces_to_hf.py"
     print(f"converting {len(rids)} published run traces -> {staging} ...")
     bench_env = {k: v for k, v in os.environ.items() if k != "VIRTUAL_ENV"}
     subprocess.run(

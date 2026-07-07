@@ -2029,7 +2029,12 @@ if [ "$TEMPLATE_MUTATED" = "false" ] && [ "$HAS_SOLUTION" = "true" ]; then
         SCORE="null"
         echo "FAIL: immutable problem files changed during check.py."
         restore_template_files
-    elif grep -q "^PASS" "$CHECK_LOG"; then
+    elif [ "$CHECK_EXIT_CODE" -eq 0 ] && grep -aq "PASS" "$CHECK_LOG"; then
+        # Not anchored (^PASS): solution stdout without a trailing newline can
+        # glue onto check.py's PASS marker (seen 2026-07-07: "kv_cache=0x7PASS"
+        # from an agent's debug printf), and that false-negative silently
+        # skipped benchmark.py. Requiring check.py exit 0 alongside the marker
+        # is strictly stronger than the old anchored grep alone.
         CORRECT=true
         echo "Running benchmark.py..."
         # Some problems (KDA chunked recurrence, sonic-MoE)

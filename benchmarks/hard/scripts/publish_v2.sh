@@ -82,4 +82,5 @@ for rid in ${RIDS:-}; do
 done
 rm -f "$SEDF"
 echo "  redacted secrets from viewers"
+uv run python "$REPO_ROOT/scripts/redaction.py" "$REPO_ROOT/public/runs"
 echo "done. review, then: git push (or: kb deploy \"msg\")"

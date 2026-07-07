@@ -51,6 +51,7 @@ for f in "$PUB_RUNS"/*_02_kimi_linear_decode.html "$PUB_CODE"/*; do
   [ -f "$f" ] && sed -i -f "$SEDF" "$f"
 done
 rm -f "$SEDF"
+uv run python "$REPO/scripts/redaction.py" "$PUB_RUNS" "$PUB_CODE"
 
 echo "[2/3] copy problem reference"
 cp problems/02_kimi_linear_decode/reference.py "$PUB_CODE/02_kimi_linear_decode.reference.py.txt"

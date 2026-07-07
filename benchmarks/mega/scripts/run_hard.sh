@@ -650,6 +650,71 @@ case "$HARNESS" in
             > "$LOG_FILE" 2> "$STDERR_FILE" || HARNESS_EXIT=$?
         ;;
 
+    longcat-claude)
+        # Claude Code routed to Meituan LongCat's Anthropic-compatible endpoint.
+        # Requires LONGCAT_API_KEY. Pass MODEL=LongCat-2.0.
+        if [ -z "${LONGCAT_API_KEY:-}" ]; then
+            echo "LONGCAT_API_KEY is required for longcat-claude" >&2
+            exit 1
+        fi
+        LONGCAT_CLAUDE_ALIAS="${LONGCAT_CLAUDE_ALIAS:-opus}"
+        LONGCAT_CLAUDE_HAIKU_MODEL="${LONGCAT_CLAUDE_HAIKU_MODEL:-$MODEL}"
+        ( cd "$PROBLEM_DIR" && \
+            export ANTHROPIC_AUTH_TOKEN="$LONGCAT_API_KEY" && \
+            export ANTHROPIC_BASE_URL="${LONGCAT_ANTHROPIC_BASE_URL:-https://api.longcat.chat/anthropic}" && \
+            export API_TIMEOUT_MS="${API_TIMEOUT_MS:-3000000}" && \
+            export CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC="${CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC:-1}" && \
+            export CLAUDE_CODE_MAX_RETRIES="${CLAUDE_CODE_MAX_RETRIES:-1000000}" && \
+            export CLAUDE_CODE_MAX_OUTPUT_TOKENS="${CLAUDE_CODE_MAX_OUTPUT_TOKENS:-131072}" && \
+            export ANTHROPIC_MODEL="$MODEL" && \
+            export ANTHROPIC_DEFAULT_HAIKU_MODEL="$LONGCAT_CLAUDE_HAIKU_MODEL" && \
+            export ANTHROPIC_DEFAULT_SONNET_MODEL="$MODEL" && \
+            export ANTHROPIC_DEFAULT_OPUS_MODEL="$MODEL" && \
+            "${KBH_SBX[@]}" timeout "$BUDGET_SECONDS" claude \
+                --dangerously-skip-permissions \
+                --print --verbose \
+                --output-format stream-json \
+                --settings "$CLAUDE_KBH_SETTINGS" \
+                --model "$LONGCAT_CLAUDE_ALIAS" \
+                --disallowedTools ExitPlanMode EnterPlanMode AskUserQuestion \
+                --add-dir "$PROBLEM_DIR" \
+                -p "$PROMPT" ) \
+            > "$LOG_FILE" 2> "$STDERR_FILE" || HARNESS_EXIT=$?
+        ;;
+
+    hy3-claude)
+        # Claude Code routed to OpenRouter's Anthropic "skin" for Tencent Hy3
+        # (Tencent TokenHub is OpenAI-compatible only). Requires
+        # OPENROUTER_API_KEY. Pass MODEL=tencent/hy3-preview.
+        if [ -z "${OPENROUTER_API_KEY:-}" ]; then
+            echo "OPENROUTER_API_KEY is required for hy3-claude" >&2
+            exit 1
+        fi
+        HY3_CLAUDE_ALIAS="${HY3_CLAUDE_ALIAS:-opus}"
+        HY3_CLAUDE_HAIKU_MODEL="${HY3_CLAUDE_HAIKU_MODEL:-$MODEL}"
+        ( cd "$PROBLEM_DIR" && \
+            export ANTHROPIC_AUTH_TOKEN="$OPENROUTER_API_KEY" && \
+            export ANTHROPIC_BASE_URL="${HY3_ANTHROPIC_BASE_URL:-https://openrouter.ai/api}" && \
+            export API_TIMEOUT_MS="${API_TIMEOUT_MS:-3000000}" && \
+            export CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC="${CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC:-1}" && \
+            export CLAUDE_CODE_MAX_RETRIES="${CLAUDE_CODE_MAX_RETRIES:-1000000}" && \
+            export CLAUDE_CODE_MAX_OUTPUT_TOKENS="${CLAUDE_CODE_MAX_OUTPUT_TOKENS:-128000}" && \
+            export ANTHROPIC_MODEL="$MODEL" && \
+            export ANTHROPIC_DEFAULT_HAIKU_MODEL="$HY3_CLAUDE_HAIKU_MODEL" && \
+            export ANTHROPIC_DEFAULT_SONNET_MODEL="$MODEL" && \
+            export ANTHROPIC_DEFAULT_OPUS_MODEL="$MODEL" && \
+            "${KBH_SBX[@]}" timeout "$BUDGET_SECONDS" claude \
+                --dangerously-skip-permissions \
+                --print --verbose \
+                --output-format stream-json \
+                --settings "$CLAUDE_KBH_SETTINGS" \
+                --model "$HY3_CLAUDE_ALIAS" \
+                --disallowedTools ExitPlanMode EnterPlanMode AskUserQuestion \
+                --add-dir "$PROBLEM_DIR" \
+                -p "$PROMPT" ) \
+            > "$LOG_FILE" 2> "$STDERR_FILE" || HARNESS_EXIT=$?
+        ;;
+
     deepseek-claude)
         # Claude Code routed to DeepSeek's Anthropic-compatible endpoint.
         # Requires DEEPSEEK_API_KEY. Pass MODEL=deepseek-v4-pro.
@@ -793,7 +858,7 @@ case "$HARNESS" in
 
     *)
         echo "Unknown harness: $HARNESS" >&2
-        echo "Supported: claude, zai-claude, minimax-claude, kimi-claude, deepseek-claude, ccr-claude, codex, kimi, droid, gemini, cursor, grok, opencode" >&2
+        echo "Supported: claude, zai-claude, minimax-claude, kimi-claude, longcat-claude, hy3-claude, deepseek-claude, ccr-claude, codex, kimi, droid, gemini, cursor, grok, opencode" >&2
         exit 1
         ;;
 esac
@@ -824,7 +889,7 @@ fi
 
 SESSION_COMPLETE=true
 case "$HARNESS" in
-    claude|zai-claude|minimax-claude|kimi-claude|deepseek-claude|ccr-claude|cursor|gemini)
+    claude|zai-claude|minimax-claude|kimi-claude|longcat-claude|hy3-claude|deepseek-claude|ccr-claude|cursor|gemini)
         if ! grep -q '"type":"result"' "$CHECK_FILE" 2>/dev/null; then
             SESSION_COMPLETE=false
         fi
@@ -889,7 +954,10 @@ if [ "$TEMPLATE_MUTATED" = "false" ] && [ "$HAS_SOLUTION" = "true" ]; then
         SCORE="null"
         echo "FAIL: immutable problem files changed during check.py."
         restore_template_files
-    elif grep -q "^PASS" "$CHECK_LOG"; then
+    elif [ "$CHECK_EXIT_CODE" -eq 0 ] && grep -aq "PASS" "$CHECK_LOG"; then
+        # Not anchored (^PASS): solution stdout without a trailing newline can
+        # glue onto check.py's PASS marker; require check.py exit 0 alongside
+        # the marker instead (same fix as benchmarks/hard, 2026-07-07).
         CORRECT=true
         echo "Running benchmark.py..."
         # Some problems (KDA chunked recurrence, sonic-MoE)

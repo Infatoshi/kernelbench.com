@@ -14,45 +14,23 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import re
 import sys
 import uuid as uuidlib
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+MONOREPO_ROOT = REPO_ROOT.parents[1]
 sys.path.insert(0, str(REPO_ROOT))
+sys.path.insert(0, str(MONOREPO_ROOT))
+
+from scripts.redaction import redact_text  # noqa: E402
 
 from src.viewer.parsers import parse  # noqa: E402
 
-# ---- redaction ---------------------------------------------------------------
-_ENV_VALS: list[str] = []
-_envf = Path(os.path.expanduser("~/.env_vars"))
-if _envf.exists():
-    for _ln in _envf.read_text().splitlines():
-        if "=" in _ln and "export" in _ln:
-            _v = _ln.split("=", 1)[1].strip().strip('"').strip("'")
-            if len(_v) >= 12:
-                _ENV_VALS.append(_v)
-_ENV_VALS = sorted(set(_ENV_VALS), key=len, reverse=True)
-_PATS = [re.compile(p) for p in [
-    r"sk-ant-oat01-[A-Za-z0-9_\-]+", r"sk-ant-api[A-Za-z0-9_\-]+",
-    r"sk-proj-[A-Za-z0-9_\-]+", r"AIzaSy[A-Za-z0-9_\-]{20,}",
-    r"sk-[a-z]{2,}-[A-Za-z0-9_\-]{16,}", r"sk-[A-Za-z0-9]{24,}",
-    r"ghp_[A-Za-z0-9]{20,}", r"gho_[A-Za-z0-9]{20,}", r"hf_[A-Za-z0-9]{20,}",
-    r"Bearer\s+[A-Za-z0-9._\-]{20,}",
-]]
-
 
 def _redact(s):
-    if not isinstance(s, str):
-        return s
-    for v in _ENV_VALS:
-        if v:
-            s = s.replace(v, "REDACTED")
-    for p in _PATS:
-        s = p.sub("REDACTED", s)
-    return s
+    return redact_text(s) if isinstance(s, str) else s
 
 
 def _new_uuid() -> str:

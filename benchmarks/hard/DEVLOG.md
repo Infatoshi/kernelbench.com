@@ -4,6 +4,45 @@ A running record of decisions, dead ends, and lessons. Newest entries on top. Th
 
 ---
 
+## 2026-07-07 - Hy3 + LongCat-2.0 debut: cloud-H100 overnight sweep, shared-GPU contention, PASS-gate bug
+
+Debuted two new harness routes: `hy3-claude` (Tencent Hy3 preview via OpenRouter's
+Anthropic skin, `tencent/hy3-preview`) and `longcat-claude` (Meituan LongCat-2.0 via
+`api.longcat.chat/anthropic`). Both are copies of the `kimi-claude` branch; both ported to
+mega's `run_hard.sh` too. Published H100 (Hy3 4/6, LongCat 3/3 attempted) + first RTX
+cells, 12 audit annotations, all clean, zero contamination.
+
+Lessons that cost real time:
+
+- **PASS-gate false negative (fixed in both benches).** An agent debug printf without a
+  trailing newline glued onto check.py's marker (`kv_cache=0x7PASS`), so the anchored
+  `grep -q "^PASS"` missed it and silently skipped benchmark.py, misclassifying a passing
+  run as harness_error. Gate is now `check exit 0 && grep -aq "PASS"` — strictly stronger.
+- **H100 rented via brev (`kbh-h100`, ~$2.28/hr).** TRT-LLM `:latest` rotated off nvcr.io —
+  pull by digest with an anonymous token, retag. Never `docker save | ssh` from Anvil
+  (~5MB/s uplink); pull from registries on the node. End-of-sweep watchdog pattern worked:
+  poll `pgrep run_hard|run_queue`, 8h hard deadline, rsync archives to `runs-h100/`,
+  ABORT teardown if rsync fails, then `script -qec "brev delete ..." <<< "y"` + `brev ls`
+  verify. Deadline fired with LongCat 05/06/07 still queued — those cells are simply
+  missing, not failed. A per-run venv is ~4.7G: run a janitor that purges `repo/.venv` +
+  caches from any run dir that already has result.json, or a 100G root disk fills mid-sweep.
+- **Hy3's signature failure mode is infrastructure, not cheating.** OpenRouter caps it at
+  262144 context with 128000 reserved for output; three cells died mid-fix on that 400
+  (topk was one edit from correct — the agent had already diagnosed the bug). Its H100 kda
+  cell is a leaderboard first: honest eager-PyTorch verification scaffold, correct, pf
+  0.0000 ("Triton optimizations will be added after verification" — then the provider 400'd).
+- **Shared-GPU check_timeouts are salvageable.** kernel-rl's vLLM (up to 91GB / 100% util
+  on GPU0) made six RTX check.py runs time out under contention. Solutions are real;
+  a rescore loop waits for GPU0 quiet (<8GB, 3x60s probes) and re-runs check+benchmark in
+  the archived workspace, patching result.json with a `rescore_note`. Don't publish a
+  benchmark timed inside a vLLM burst without noting it (hy3 w4a16 measured ~3-6% low).
+- LongCat runs LONG sessions (3.5-6h): 26MB transcript on kda grinding the bf16-tolerance
+  wall (any non-cuBLAS reduction order compounds through the sequential recurrence), and on
+  paged it deliberately abandoned a hung cp.async CUDA kernel for its working Triton
+  split-K version when it couldn't profile blind (ncu blocked in container). Good triage.
+
+---
+
 ## 2026-07-04 - Fable-5 hard resweep finished: H100 5/6 published, RTX fp8 held back on purpose
 
 Closed out the Fable-5 [max] hard sweep across all three GPUs.
@@ -37,6 +76,32 @@ RTX Fable stays the 5-cell June reference (fp8 blank), and the /hard RTX blurb n
 Fable's unlimited resweep is pending. TO PUBLISH RTX fp8 PROPERLY: do a full unlimited
 RTX resweep of ALL 6 Fable cells (or at minimum enough to beat/replace the June set),
 then add that generation to the manifest as a unit. Do not add a lone unlimited cell.
+
+**Published as commit a9b6875.** Re-added the H100 target to `/hard` + the home/efficiency
+charts, rebuilt `leaderboard.h100.json`, emitted redacted solution viewers for the new
+H100/B200 cells (force-add — `public/runs/` is gitignored via the `runs/` rule, so viewers
+need `git add -f`), 5 clean audit annotations.
+
+**HuggingFace trace coverage — non-obvious gotcha.** `kb push-runs` only uploads the
+run_ids in `results/leaderboard.json` (i.e. the RTX board) and only searches `outputs/runs`,
+so by itself it misses the H100 and B200 boards AND every failed run. For full transparency
+(all GPUs, winners + failures) push manually: `scripts/traces_to_hf.py <stage> --from-list
+<ids.txt> --search outputs/runs --search outputs/runs-h100 --search outputs/runs-b200`,
+then `HfApi().upload_folder(<stage> -> Infatoshi/kernelbench-hard-traces)`. **Mega has NO
+bench-local `traces_to_hf.py`** (it reuses hard's machinery) — run hard's converter with
+`--search <mega>/outputs/runs`; the claude transcript format is identical. End state for
+Fable: 77/77 hard + 18/18 mega traces on HF (was 16 winners + 1). Caveat already known but
+worth restating: native `claude` encrypts chain-of-thought, so these traces carry the full
+message/tool/diff timeline but empty thinking blocks — not a capture bug.
+
+**Fable weekly sub-cap (pace future sweeps against this).** The 20x max plan gates Fable 5
+at ~50% of the *weekly* usage, then forces a fallback to Opus 4.8 for the back half. The
+tell is Fable-SPECIFIC, not an account lockout: `"You're out of usage credits. Run
+/usage-credits to keep using Fable 5 or /model to switch models"` while Opus still runs =
+you've crossed the halfway line. We hit it and paused Fable until reset. So the real budget
+for a Fable sweep is ~half the weekly credits before it silently downshifts; plan the matrix
+(and the spend) around that ceiling, and remember token rotation means one machine per
+account at a time or the creds get wiped mid-sweep.
 
 ---
 
