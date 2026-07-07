@@ -490,6 +490,8 @@ _HARNESS_LABELS = {
     "zai-claude": "Claude Code",
     "minimax-claude": "Claude Code",
     "kimi-claude": "Claude Code",
+    "longcat-claude": "Claude Code",
+    "hy3-claude": "Claude Code",
     "deepseek-claude": "Claude Code",
     "qwen-claude": "Claude Code",
     "codex": "Codex",

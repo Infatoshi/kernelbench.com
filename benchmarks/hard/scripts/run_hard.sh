@@ -108,7 +108,9 @@ trap cleanup EXIT
 # No wall-clock ceiling per run. Methodology is unlimited-time: the model runs
 # until it decides it is done. 0 = no cap (GNU `timeout 0` disables the timeout),
 # applied uniformly to every harness invocation below.
-BUDGET_SECONDS=0
+# Default 0 (no cap). KBH_BUDGET_SECONDS_OVERRIDE only exists for time-boxed
+# smoke tests of a new harness route; never set it for an official run.
+BUDGET_SECONDS="${KBH_BUDGET_SECONDS_OVERRIDE:-0}"
 CHECK_TIMEOUT_SECONDS="${KBH_CHECK_TIMEOUT_SECONDS:-180}"
 if [ "$PROBLEM_NAME" = "02_kda_cutlass" ]; then
     BENCHMARK_TIMEOUT_SECONDS="${KBH_BENCHMARK_TIMEOUT_02_KDA_CUTLASS_SECONDS:-${KBH_BENCHMARK_TIMEOUT_SECONDS:-7200}}"
@@ -1520,6 +1522,130 @@ case "$HARNESS" in
         fi
         ;;
 
+    longcat-claude)
+        # Claude Code routed to Meituan's Anthropic-compatible endpoint for
+        # LongCat-2.0. Requires LONGCAT_API_KEY in the environment or
+        # ~/.env_vars. Vendor-recommended defaults per
+        # https://longcat.chat/platform/docs/ClaudeCode.html (all aliases map
+        # to the single LongCat-2.0 model).
+        if [ -z "${LONGCAT_API_KEY:-}" ]; then
+            echo "LONGCAT_API_KEY is required for longcat-claude" >&2
+            exit 1
+        fi
+        LONGCAT_CLAUDE_ALIAS="${LONGCAT_CLAUDE_ALIAS:-opus}"
+        LONGCAT_CLAUDE_HAIKU_MODEL="${LONGCAT_CLAUDE_HAIKU_MODEL:-$MODEL}"
+        if [ "$KBH_AGENT_CONTAINER" = "1" ]; then
+            CLAUDE_CONTAINER_ENV_NAMES=(
+                ANTHROPIC_BASE_URL API_TIMEOUT_MS
+                CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC
+                CLAUDE_CODE_MAX_RETRIES CLAUDE_CODE_MAX_OUTPUT_TOKENS
+                ANTHROPIC_MODEL
+                ANTHROPIC_DEFAULT_HAIKU_MODEL ANTHROPIC_DEFAULT_SONNET_MODEL
+                ANTHROPIC_DEFAULT_OPUS_MODEL
+            )
+            CLAUDE_CONTAINER_EXTRA_CLAUDE_ARGS=(--disallowedTools ExitPlanMode EnterPlanMode AskUserQuestion)
+            ( export ANTHROPIC_AUTH_TOKEN="$LONGCAT_API_KEY" && \
+                export ANTHROPIC_BASE_URL="${LONGCAT_ANTHROPIC_BASE_URL:-https://api.longcat.chat/anthropic}" && \
+                export API_TIMEOUT_MS="${API_TIMEOUT_MS:-3000000}" && \
+                export CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC="${CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC:-1}" && \
+                export CLAUDE_CODE_MAX_RETRIES="${CLAUDE_CODE_MAX_RETRIES:-1000000}" && \
+                export CLAUDE_CODE_MAX_OUTPUT_TOKENS="${CLAUDE_CODE_MAX_OUTPUT_TOKENS:-131072}" && \
+                export ANTHROPIC_MODEL="$MODEL" && \
+                export ANTHROPIC_DEFAULT_HAIKU_MODEL="$LONGCAT_CLAUDE_HAIKU_MODEL" && \
+                export ANTHROPIC_DEFAULT_SONNET_MODEL="$MODEL" && \
+                export ANTHROPIC_DEFAULT_OPUS_MODEL="$MODEL" && \
+                run_claude_container "" "$LONGCAT_CLAUDE_ALIAS" 0 ) \
+                > "$LOG_FILE" 2> "$STDERR_FILE" || HARNESS_EXIT=$?
+            CLAUDE_CONTAINER_ENV_NAMES=()
+            CLAUDE_CONTAINER_EXTRA_CLAUDE_ARGS=()
+        else
+        ( cd "$PROBLEM_DIR" && \
+            export ANTHROPIC_AUTH_TOKEN="$LONGCAT_API_KEY" && \
+            export ANTHROPIC_BASE_URL="${LONGCAT_ANTHROPIC_BASE_URL:-https://api.longcat.chat/anthropic}" && \
+            export API_TIMEOUT_MS="${API_TIMEOUT_MS:-3000000}" && \
+            export CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC="${CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC:-1}" && \
+            export CLAUDE_CODE_MAX_RETRIES="${CLAUDE_CODE_MAX_RETRIES:-1000000}" && \
+            export CLAUDE_CODE_MAX_OUTPUT_TOKENS="${CLAUDE_CODE_MAX_OUTPUT_TOKENS:-131072}" && \
+            export ANTHROPIC_MODEL="$MODEL" && \
+            export ANTHROPIC_DEFAULT_HAIKU_MODEL="$LONGCAT_CLAUDE_HAIKU_MODEL" && \
+            export ANTHROPIC_DEFAULT_SONNET_MODEL="$MODEL" && \
+            export ANTHROPIC_DEFAULT_OPUS_MODEL="$MODEL" && \
+            timeout "$BUDGET_SECONDS" claude \
+                --dangerously-skip-permissions \
+                --print --verbose \
+                --output-format stream-json \
+                --settings "$CLAUDE_KBH_SETTINGS" \
+                --model "$LONGCAT_CLAUDE_ALIAS" \
+                --disallowedTools ExitPlanMode EnterPlanMode AskUserQuestion \
+                --add-dir "$PROBLEM_DIR" \
+                -p "$PROMPT" ) \
+            > "$LOG_FILE" 2> "$STDERR_FILE" || HARNESS_EXIT=$?
+        fi
+        ;;
+
+    hy3-claude)
+        # Claude Code routed to OpenRouter's Anthropic "skin" for Tencent Hy3.
+        # Tencent's own TokenHub is OpenAI-compatible only, so OpenRouter's
+        # Anthropic endpoint (https://openrouter.ai/api -> CC appends
+        # /v1/messages) is what keeps Hy3 on the reliable Claude Code route
+        # instead of the opencode OpenAI-compatible adapter. Requires
+        # OPENROUTER_API_KEY. MODEL should be an OpenRouter slug, e.g.
+        # tencent/hy3-preview.
+        if [ -z "${OPENROUTER_API_KEY:-}" ]; then
+            echo "OPENROUTER_API_KEY is required for hy3-claude" >&2
+            exit 1
+        fi
+        HY3_CLAUDE_ALIAS="${HY3_CLAUDE_ALIAS:-opus}"
+        HY3_CLAUDE_HAIKU_MODEL="${HY3_CLAUDE_HAIKU_MODEL:-$MODEL}"
+        if [ "$KBH_AGENT_CONTAINER" = "1" ]; then
+            CLAUDE_CONTAINER_ENV_NAMES=(
+                ANTHROPIC_BASE_URL API_TIMEOUT_MS
+                CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC
+                CLAUDE_CODE_MAX_RETRIES CLAUDE_CODE_MAX_OUTPUT_TOKENS
+                ANTHROPIC_MODEL
+                ANTHROPIC_DEFAULT_HAIKU_MODEL ANTHROPIC_DEFAULT_SONNET_MODEL
+                ANTHROPIC_DEFAULT_OPUS_MODEL
+            )
+            CLAUDE_CONTAINER_EXTRA_CLAUDE_ARGS=(--disallowedTools ExitPlanMode EnterPlanMode AskUserQuestion)
+            ( export ANTHROPIC_AUTH_TOKEN="$OPENROUTER_API_KEY" && \
+                export ANTHROPIC_BASE_URL="${HY3_ANTHROPIC_BASE_URL:-https://openrouter.ai/api}" && \
+                export API_TIMEOUT_MS="${API_TIMEOUT_MS:-3000000}" && \
+                export CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC="${CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC:-1}" && \
+                export CLAUDE_CODE_MAX_RETRIES="${CLAUDE_CODE_MAX_RETRIES:-1000000}" && \
+                export CLAUDE_CODE_MAX_OUTPUT_TOKENS="${CLAUDE_CODE_MAX_OUTPUT_TOKENS:-128000}" && \
+                export ANTHROPIC_MODEL="$MODEL" && \
+                export ANTHROPIC_DEFAULT_HAIKU_MODEL="$HY3_CLAUDE_HAIKU_MODEL" && \
+                export ANTHROPIC_DEFAULT_SONNET_MODEL="$MODEL" && \
+                export ANTHROPIC_DEFAULT_OPUS_MODEL="$MODEL" && \
+                run_claude_container "" "$HY3_CLAUDE_ALIAS" 0 ) \
+                > "$LOG_FILE" 2> "$STDERR_FILE" || HARNESS_EXIT=$?
+            CLAUDE_CONTAINER_ENV_NAMES=()
+            CLAUDE_CONTAINER_EXTRA_CLAUDE_ARGS=()
+        else
+        ( cd "$PROBLEM_DIR" && \
+            export ANTHROPIC_AUTH_TOKEN="$OPENROUTER_API_KEY" && \
+            export ANTHROPIC_BASE_URL="${HY3_ANTHROPIC_BASE_URL:-https://openrouter.ai/api}" && \
+            export API_TIMEOUT_MS="${API_TIMEOUT_MS:-3000000}" && \
+            export CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC="${CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC:-1}" && \
+            export CLAUDE_CODE_MAX_RETRIES="${CLAUDE_CODE_MAX_RETRIES:-1000000}" && \
+            export CLAUDE_CODE_MAX_OUTPUT_TOKENS="${CLAUDE_CODE_MAX_OUTPUT_TOKENS:-128000}" && \
+            export ANTHROPIC_MODEL="$MODEL" && \
+            export ANTHROPIC_DEFAULT_HAIKU_MODEL="$HY3_CLAUDE_HAIKU_MODEL" && \
+            export ANTHROPIC_DEFAULT_SONNET_MODEL="$MODEL" && \
+            export ANTHROPIC_DEFAULT_OPUS_MODEL="$MODEL" && \
+            timeout "$BUDGET_SECONDS" claude \
+                --dangerously-skip-permissions \
+                --print --verbose \
+                --output-format stream-json \
+                --settings "$CLAUDE_KBH_SETTINGS" \
+                --model "$HY3_CLAUDE_ALIAS" \
+                --disallowedTools ExitPlanMode EnterPlanMode AskUserQuestion \
+                --add-dir "$PROBLEM_DIR" \
+                -p "$PROMPT" ) \
+            > "$LOG_FILE" 2> "$STDERR_FILE" || HARNESS_EXIT=$?
+        fi
+        ;;
+
     deepseek-claude)
         # Claude Code routed to DeepSeek Anthropic-compatible endpoint.
         # Requires DEEPSEEK_API_KEY. Pass MODEL=deepseek-v4-pro (claude-opus
@@ -1807,7 +1933,7 @@ case "$HARNESS" in
 
     *)
         echo "Unknown harness: $HARNESS" >&2
-        echo "Supported: claude, zai-claude, minimax-claude, kimi-claude, deepseek-claude, qwen-claude, ccr-claude, codex, kimi, droid, gemini, cursor, grok, opencode, opencode-nemotron, nvcf-nemotron" >&2
+        echo "Supported: claude, zai-claude, minimax-claude, kimi-claude, longcat-claude, hy3-claude, deepseek-claude, qwen-claude, ccr-claude, codex, kimi, droid, gemini, cursor, grok, opencode, opencode-nemotron, nvcf-nemotron" >&2
         exit 1
         ;;
 esac
@@ -1838,7 +1964,7 @@ fi
 
 SESSION_COMPLETE=true
 case "$HARNESS" in
-    claude|zai-claude|minimax-claude|kimi-claude|deepseek-claude|qwen-claude|ccr-claude|cursor|gemini)
+    claude|zai-claude|minimax-claude|kimi-claude|longcat-claude|hy3-claude|deepseek-claude|qwen-claude|ccr-claude|cursor|gemini)
         if ! grep -q '"type":"result"' "$CHECK_FILE" 2>/dev/null; then
             SESSION_COMPLETE=false
         fi
