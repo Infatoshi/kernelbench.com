@@ -125,7 +125,7 @@ def best_cell(runs):
     # no pass: surface the MOST INFORMATIVE failed attempt — one that actually
     # wrote a solution and ran check (a real attempt that failed correctness)
     # beats an empty context-overflow run. Rank: has_solution, has_check, peak.
-    fails = [dict(c, verdict=None) for c in runs]
+    fails = [dict(c, verdict=ann.get(c["run_id"], (None, None))[0]) for c in runs]
     if not fails:
         return None
     return max(fails, key=lambda c: (
