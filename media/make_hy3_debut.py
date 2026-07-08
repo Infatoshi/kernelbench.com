@@ -27,14 +27,10 @@ ROWS = [
     ("Tencent Hy3",    "hy3-claude",     "tencent/hy3-preview"),
     ("Claude Fable 5", "claude",         "claude-fable-5"),
     ("Opus 4.8",       "claude",         "claude-opus-4-8"),
-    ("GPT-5.5",        "codex",          "gpt-5.5"),
     ("GLM-5.2",        "zai-claude",     "glm-5.2"),
-    ("Kimi K2.7",      "kimi-claude",    "kimi-k2.7-code"),
-    ("DeepSeek V4 Pro", "deepseek-claude", "deepseek-v4-pro"),
 ]
 MCOL = {"Tencent Hy3": C["accent"],
-        "Claude Fable 5": "#cfcfcf", "Opus 4.8": "#4d9fff", "GPT-5.5": "#7aa8d8",
-        "GLM-5.2": "#b07cff", "Kimi K2.7": "#e8a1c4", "DeepSeek V4 Pro": "#8ad0d8"}
+        "Claude Fable 5": "#cfcfcf", "Opus 4.8": "#4d9fff", "GLM-5.2": "#b07cff"}
 GREY = C["fg_muted"]; AMBER = C["warn"]; RED = C["bad"]; SLATE = "#3a3a3a"
 
 
@@ -67,7 +63,7 @@ panels = [("RTX PRO 6000 Blackwell (SM120)", "leaderboard.json"),
 fig, axes = plt.subplots(2, 1, figsize=(14.5, 12.6))
 fig.subplots_adjust(top=0.86, left=0.065, right=0.975, bottom=0.06, hspace=0.42)
 
-fig.text(0.065, 0.965, "New on KernelBench-Hard:  Tencent Hy3 (preview)  vs the US + China frontier tier",
+fig.text(0.065, 0.965, "New on KernelBench-Hard:  Tencent Hy3 (preview)  vs the frontier tier",
          color=C["accent"], fontsize=15.5, fontweight="bold", ha="left")
 fig.text(0.065, 0.935, "One unlimited-time autonomous session per problem (Claude Code harness -> each vendor's Anthropic-compatible endpoint). bar = peak_fraction of that GPU's roofline.",
          color=GREY, fontsize=10, ha="left")
