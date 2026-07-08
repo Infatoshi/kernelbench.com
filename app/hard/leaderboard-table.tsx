@@ -14,6 +14,7 @@ export type HardRunRecord = {
   runId: string | null
   model: string
   harness: string
+  gpu: string
   problem: string
   problemKey: string
   date: string | null
@@ -25,30 +26,17 @@ export type HardRunRecord = {
   peakFraction: number | null
   speedPct: number | null
   isWinner: boolean
-  outputTokens: number | null
-  reasoningTokens: number | null
-  cacheTokens: number | null
-  inputTokens: number | null
-  costUsd: number | null
-  outputTokensPerSecond: number | null
-  elapsedSeconds: number | null
-  checkSeconds: number | null
-  benchmarkSeconds: number | null
-  totalSeconds: number | null
-  gpuWaitSeconds: number | null
-  gpuActiveSeconds: number | null
   referenceUrl: string
   solutionUrl: string | null
   transcriptUrl: string | null
   scored: string
   note: string
   title: string
-  tokenTitle: string
-  runtimeTitle: string
   searchText: string
 }
 
 type FilterState = {
+  gpu: string
   problem: string
   harness: string
   outcome: string
@@ -57,6 +45,7 @@ type FilterState = {
 type SortKey =
   | "model"
   | "harness"
+  | "gpu"
   | "problem"
   | "date"
   | "compiled"
@@ -64,8 +53,6 @@ type SortKey =
   | "audit"
   | "explanation"
   | "speed"
-  | "tokens"
-  | "runtime"
 
 type SortState = {
   key: SortKey
@@ -74,16 +61,19 @@ type SortState = {
 
 export function LeaderboardTable({ rows }: { rows: HardRunRecord[] }) {
   const [filters, setFilters] = useState<FilterState>({
+    gpu: "all",
     problem: "all",
     harness: "all",
     outcome: "all",
   })
   const [sort, setSort] = useState<SortState>({ key: "problem", dir: "asc" })
 
+  const gpus = useMemo(() => unique(rows.map((r) => r.gpu)), [rows])
   const problems = useMemo(() => unique(rows.map((r) => r.problem)), [rows])
   const harnesses = useMemo(() => unique(rows.map((r) => r.harness)), [rows])
   const filteredRows = useMemo(() => {
     return rows.filter((row) => {
+      if (filters.gpu !== "all" && row.gpu !== filters.gpu) return false
       if (filters.problem !== "all" && row.problem !== filters.problem) return false
       if (filters.harness !== "all" && row.harness !== filters.harness) return false
       if (filters.outcome !== "all" && outcomeBucket(row) !== filters.outcome) {
@@ -94,7 +84,7 @@ export function LeaderboardTable({ rows }: { rows: HardRunRecord[] }) {
   }, [filters, rows, sort])
 
   const reset = () => {
-    setFilters({ problem: "all", harness: "all", outcome: "all" })
+    setFilters({ gpu: "all", problem: "all", harness: "all", outcome: "all" })
     setSort({ key: "problem", dir: "asc" })
   }
 
@@ -109,6 +99,12 @@ export function LeaderboardTable({ rows }: { rows: HardRunRecord[] }) {
   return (
     <div className="leaderboard-panel">
       <div className="leaderboard-controls" aria-label="leaderboard filters">
+        <FilterSelect
+          label="GPU"
+          value={filters.gpu}
+          onChange={(gpu) => setFilters((f) => ({ ...f, gpu }))}
+          options={["all", ...gpus]}
+        />
         <FilterSelect
           label="problem"
           value={filters.problem}
@@ -140,6 +136,7 @@ export function LeaderboardTable({ rows }: { rows: HardRunRecord[] }) {
             <tr>
               <SortableTh label="model" sortKey="model" active={sort} onSort={setSortKey} />
               <SortableTh label="harness" sortKey="harness" active={sort} onSort={setSortKey} />
+              <SortableTh label="GPU" sortKey="gpu" active={sort} onSort={setSortKey} />
               <SortableTh label="problem" sortKey="problem" active={sort} onSort={setSortKey} />
               <SortableTh label="date" sortKey="date" active={sort} onSort={setSortKey} />
               <SortableTh label="compiled" sortKey="compiled" active={sort} onSort={setSortKey} />
@@ -147,8 +144,6 @@ export function LeaderboardTable({ rows }: { rows: HardRunRecord[] }) {
               <SortableTh label="audit" sortKey="audit" active={sort} onSort={setSortKey} />
               <SortableTh label="explanation" sortKey="explanation" active={sort} onSort={setSortKey} />
               <SortableTh label="SOL" sortKey="speed" active={sort} onSort={setSortKey} />
-              <SortableTh label="tokens" sortKey="tokens" active={sort} onSort={setSortKey} />
-              <SortableTh label="runtime" sortKey="runtime" active={sort} onSort={setSortKey} />
               <th>files</th>
               <th>conversation</th>
             </tr>
@@ -158,6 +153,7 @@ export function LeaderboardTable({ rows }: { rows: HardRunRecord[] }) {
               <tr key={row.key}>
                 <td className={sortCellClass("model", sort, "leaderboard-model")}>{row.model}</td>
                 <td className={sortCellClass("harness", sort, "leaderboard-harness")}>{row.harness}</td>
+                <td className={sortCellClass("gpu", sort)}>{row.gpu}</td>
                 <td className={sortCellClass("problem", sort, "leaderboard-problem")}>{row.problem}</td>
                 <td className={sortCellClass("date", sort)}>
                   {row.date ? (
@@ -189,12 +185,6 @@ export function LeaderboardTable({ rows }: { rows: HardRunRecord[] }) {
                 </td>
                 <td className={sortCellClass("speed", sort)}>
                   <SpeedCell row={row} />
-                </td>
-                <td className={sortCellClass("tokens", sort)}>
-                  <TokenCell row={row} />
-                </td>
-                <td className={sortCellClass("runtime", sort)}>
-                  <RuntimeCell row={row} />
                 </td>
                 <td>
                   <div className="chip-row">
@@ -326,40 +316,6 @@ function SpeedCell({ row }: { row: HardRunRecord }) {
   )
 }
 
-function TokenCell({ row }: { row: HardRunRecord }) {
-  if (
-    row.outputTokens == null &&
-    row.reasoningTokens == null &&
-    row.cacheTokens == null
-  ) {
-    return <span className="cell-missing">-</span>
-  }
-  return (
-    <div className="stacked-cell" title={row.tokenTitle}>
-      <span>out {fmtCompact(row.outputTokens)}</span>
-      <span>think {fmtCompact(row.reasoningTokens)}</span>
-      <span>cache {fmtCompact(row.cacheTokens)}</span>
-    </div>
-  )
-}
-
-function RuntimeCell({ row }: { row: HardRunRecord }) {
-  if (
-    row.elapsedSeconds == null &&
-    row.checkSeconds == null &&
-    row.benchmarkSeconds == null
-  ) {
-    return <span className="cell-missing">-</span>
-  }
-  return (
-    <div className="stacked-cell" title={row.runtimeTitle}>
-      <span>agent {fmtDurationMaybe(row.elapsedSeconds)}</span>
-      <span>check {fmtDurationMaybe(row.checkSeconds)}</span>
-      <span>bench {fmtDurationMaybe(row.benchmarkSeconds)}</span>
-    </div>
-  )
-}
-
 function AuditCell({ row }: { row: HardRunRecord }) {
   if (row.auditFlags.length === 0) {
     return <span className="audit-chip audit-chip-clean">clean</span>
@@ -417,6 +373,8 @@ function sortValue(row: HardRunRecord, key: SortKey) {
       return row.model
     case "harness":
       return row.harness
+    case "gpu":
+      return row.gpu
     case "problem":
       return row.problemKey
     case "date":
@@ -431,10 +389,6 @@ function sortValue(row: HardRunRecord, key: SortKey) {
       return row.explanation
     case "speed":
       return row.speedPct
-    case "tokens":
-      return (row.outputTokens ?? 0) + (row.reasoningTokens ?? 0)
-    case "runtime":
-      return row.elapsedSeconds
   }
 }
 
@@ -450,17 +404,3 @@ function unique(values: string[]) {
   return [...new Set(values)].sort((a, b) => a.localeCompare(b))
 }
 
-function fmtCompact(value: number | null | undefined) {
-  if (value == null) return "-"
-  if (Math.abs(value) >= 1_000_000) return `${(value / 1_000_000).toFixed(1)}m`
-  if (Math.abs(value) >= 1_000) return `${(value / 1_000).toFixed(1)}k`
-  return new Intl.NumberFormat("en-US").format(value)
-}
-
-function fmtDurationMaybe(value: number | null | undefined) {
-  if (value == null) return "-"
-  if (value < 60) return `${value}s`
-  const min = Math.floor(value / 60)
-  const sec = value % 60
-  return `${min}m ${sec}s`
-}

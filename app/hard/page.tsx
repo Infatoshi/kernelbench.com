@@ -135,24 +135,34 @@ const GPU_TARGETS = [
   },
 ] as const
 
-export default async function HardPage({
-  searchParams,
-}: {
-  searchParams: Promise<{ gpu?: string }>
-}) {
-  const { gpu } = await searchParams
-  const target = GPU_TARGETS.find((g) => g.key === gpu) ?? GPU_TARGETS[0]
-  const [lb, annotations, audits, hasViewer] = await Promise.all([
-    loadLeaderboard(target.file),
+export default async function HardPage() {
+  const [annotations, audits, hasViewer] = await Promise.all([
     loadAnnotations(),
     loadRunAudits(),
     loadAvailableSolutions(),
   ])
-  const models = [...lb.models].sort(compareModelRows)
-  // The v2 containerized sweep is already a curated single-environment run, so
-  // it bypasses the v1 hand-picked visibility allowlist and shows every row.
-  const isV2 = (lb as { environment?: string }).environment === "v2_containerized"
-  const visibleModels = isV2 ? models : models.filter(isVisibleModel)
+  const boards = await Promise.all(
+    GPU_TARGETS.map(async (target) => ({
+      target,
+      lb: await loadLeaderboard(target.file),
+    })),
+  )
+  const rows = boards.flatMap(({ target, lb }) => {
+    const models = [...lb.models].sort(compareModelRows)
+    // The v2 containerized sweep is already a curated single-environment run,
+    // so it bypasses the v1 hand-picked visibility allowlist and shows every row.
+    const isV2 = (lb as { environment?: string }).environment === "v2_containerized"
+    const visibleModels = isV2 ? models : models.filter(isVisibleModel)
+    const winners = findVisibleWinners(visibleModels, annotations, audits)
+    return buildRunRows(
+      visibleModels,
+      annotations,
+      audits,
+      hasViewer,
+      winners,
+      target.label,
+    )
+  })
 
   return (
     <div className="hard-page space-y-12">
@@ -160,47 +170,21 @@ export default async function HardPage({
         <h1 className="text-3xl font-semibold tracking-tight text-[var(--color-fg-bright)] mb-3">
           hard
         </h1>
-        <div className="flex gap-2 mb-3" aria-label="hardware selector">
-          {GPU_TARGETS.map((g) => (
-            <Link
-              key={g.key}
-              href={g.key === "rtx" ? "/hard" : `/hard?gpu=${g.key}`}
-              className={
-                g.key === target.key
-                  ? "text-xs px-2 py-1 border border-[var(--color-accent)] text-[var(--color-accent)] rounded"
-                  : "text-xs px-2 py-1 border border-[var(--color-border)] text-[var(--color-fg-muted)] rounded hover:text-[var(--color-fg)]"
-              }
-            >
-              {g.label}
-            </Link>
-          ))}
-        </div>
         <p className="text-sm text-[var(--color-fg)] mb-2">
-          {lb.hardware.name} ({lb.hardware.sm})
-          <span
-            className={
-              target.runtime === "unlimited"
-                ? "ml-2 text-xs font-semibold text-[var(--color-accent)]"
-                : "ml-2 text-xs font-semibold text-[var(--color-bad)]"
-            }
-          >
-            {target.runtime === "unlimited"
-              ? "● unlimited runtime"
-              : "● limited runtime (45-min budget)"}
-          </span>
+          All GPUs in one table &mdash; use the GPU column filter to focus on one
+          board. Peak fraction (SOL) is measured against each GPU&rsquo;s own
+          roofline, so cells are comparable within a GPU, not across GPUs.
         </p>
         <p className="text-xs text-[var(--color-fg-muted)] mb-6 max-w-4xl leading-relaxed">
-          {target.blurb}
+          RTX PRO 6000 rows run with{" "}
+          <span className="text-[var(--color-fg)]">unlimited time per problem</span>;
+          H100 / B200 / RTX 3090 boards mix unlimited-time resweeps with earlier
+          45-minute-budget rows. Hardware notes for each GPU are below the table.
         </p>
       </section>
 
       <section>
-        <LeaderboardMetricsTable
-          models={visibleModels}
-          annotations={annotations}
-          audits={audits}
-          hasViewer={hasViewer}
-        />
+        <LeaderboardTable rows={rows} />
         <p className="text-xs text-[var(--color-fg)] mt-3 max-w-4xl leading-relaxed">
           Browse the{" "}
           <Link href="/runs" className="underline underline-offset-2">
@@ -218,25 +202,25 @@ export default async function HardPage({
         </p>
       </section>
 
+      <section>
+        <h2 className="text-sm font-semibold text-[var(--color-fg-bright)] mb-3">
+          hardware notes
+        </h2>
+        <div className="space-y-3">
+          {GPU_TARGETS.map((g) => (
+            <p
+              key={g.key}
+              className="text-xs text-[var(--color-fg-muted)] max-w-4xl leading-relaxed"
+            >
+              <span className="text-[var(--color-fg)] font-semibold">{g.label}.</span>{" "}
+              {g.blurb}
+            </p>
+          ))}
+        </div>
+      </section>
+
     </div>
   )
-}
-
-function LeaderboardMetricsTable({
-  models,
-  annotations,
-  audits,
-  hasViewer,
-}: {
-  models: Model[]
-  annotations: Map<string, { verdict: string; summary?: string }>
-  audits: Map<string, RunAudit>
-  hasViewer: Set<string>
-}) {
-  const winners = findVisibleWinners(models, annotations, audits)
-  const rows = buildRunRows(models, annotations, audits, hasViewer, winners)
-
-  return <LeaderboardTable rows={rows} />
 }
 
 type RunStatusTone = "good" | "bad" | "warn" | "muted"
@@ -260,6 +244,7 @@ function buildRunRows(
   audits: Map<string, RunAudit>,
   hasViewer: Set<string>,
   winners: Map<string, string>,
+  gpu: string,
 ): RunRow[] {
   const rows: RunRow[] = []
   for (const m of models) {
@@ -268,7 +253,7 @@ function buildRunRows(
       const model = shortLabel(m.label)
       const harness = harnessLabel(m.harness)
       if (!cell) {
-        rows.push(missingRunRow(model, harness, p))
+        rows.push(missingRunRow(model, harness, gpu, p))
         continue
       }
 
@@ -276,7 +261,6 @@ function buildRunRows(
       const audit = audits.get(cell.run_id)
       const isWinner = winners.get(p.key) === cell.run_id
       const title = cellTitle(cell, hasViewer.has(cell.run_id), annot, isWinner, audit)
-      const usage = cell.usage ?? {}
       const runAt = runDateParts(cell.run_id)
       const hasRunViewer = hasViewer.has(cell.run_id)
       const compiled = compiledStatus(cell)
@@ -285,13 +269,12 @@ function buildRunRows(
       const auditFlags = auditFlagsFor(annot, audit)
       const explanation =
         audit?.summary || annot?.summary || cell.invalid_reason || cell.failure_reason || null
-      const cacheTokens =
-        (usage.cache_read_tokens ?? 0) + (usage.cache_creation_tokens ?? 0)
       rows.push({
-        key: cell.run_id,
+        key: `${gpu}:${cell.run_id}`,
         runId: cell.run_id,
         model,
         harness,
+        gpu,
         problem: p.label,
         problemKey: p.key,
         date: runAt.date,
@@ -303,29 +286,16 @@ function buildRunRows(
         peakFraction: cell.peak_fraction,
         speedPct: cell.peak_fraction == null ? null : cell.peak_fraction * 100,
         isWinner,
-        outputTokens: usage.output_tokens ?? null,
-        reasoningTokens: usage.reasoning_tokens ?? null,
-        cacheTokens,
-        inputTokens: usage.input_tokens ?? null,
-        costUsd: usage.total_cost_usd ?? null,
-        outputTokensPerSecond: cell.output_tokens_per_second ?? null,
-        elapsedSeconds: cell.elapsed_seconds ?? null,
-        checkSeconds: cell.check_elapsed_seconds ?? null,
-        benchmarkSeconds: cell.benchmark_elapsed_seconds ?? null,
-        totalSeconds: cell.total_elapsed_seconds ?? null,
-        gpuWaitSeconds: cell.gpu_lock_wait_seconds_total ?? null,
-        gpuActiveSeconds: cell.gpu_lock_active_seconds_total ?? null,
         referenceUrl: referenceUrlFor(p.key),
         solutionUrl: hasRunViewer ? `/runs/${cell.run_id}_solution.py.txt` : null,
         transcriptUrl: hardTraceUrl(cell.run_id),
         scored: `${m.pass_count}/${m.total_runs}`,
         note,
         title,
-        tokenTitle: tokenTitle(cell),
-        runtimeTitle: runtimeTitle(cell),
         searchText: [
           model,
           harness,
+          gpu,
           p.label,
           p.key,
           cell.run_id,
@@ -349,13 +319,15 @@ function buildRunRows(
 function missingRunRow(
   model: string,
   harness: string,
+  gpu: string,
   problem: { key: string; label: string },
 ): RunRow {
   return {
-    key: `${model}:${harness}:${problem.key}:missing`,
+    key: `${gpu}:${model}:${harness}:${problem.key}:missing`,
     runId: null,
     model,
     harness,
+    gpu,
     problem: problem.label,
     problemKey: problem.key,
     date: null,
@@ -367,27 +339,13 @@ function missingRunRow(
     peakFraction: null,
     speedPct: null,
     isWinner: false,
-    outputTokens: null,
-    reasoningTokens: null,
-    cacheTokens: null,
-    inputTokens: null,
-    costUsd: null,
-    outputTokensPerSecond: null,
-    elapsedSeconds: null,
-    checkSeconds: null,
-    benchmarkSeconds: null,
-    totalSeconds: null,
-    gpuWaitSeconds: null,
-    gpuActiveSeconds: null,
     referenceUrl: referenceUrlFor(problem.key),
     solutionUrl: null,
     transcriptUrl: null,
     scored: "0/0",
     note: "no run",
     title: "no run",
-    tokenTitle: "",
-    runtimeTitle: "",
-    searchText: `${model} ${harness} ${problem.label} ${problem.key} no run`,
+    searchText: `${model} ${harness} ${gpu} ${problem.label} ${problem.key} no run`,
   }
 }
 
@@ -712,6 +670,8 @@ function shortLabel(label: string) {
     .replace("gemini/gemini-3.1-pro-preview", "Gemini 3.1 Pro")
     .replace("deepseek-claude/deepseek-v4-pro", "DeepSeek V4 Pro")
     .replace("kimi-claude/kimi-k2.7-code", "Kimi K2.7-Code")
+    .replace("hy3-claude/tencent/hy3-preview", "Tencent Hy3 (Preview)")
+    .replace("longcat-claude/LongCat-2.0", "Meituan LongCat 2.0")
     .replace("zai-claude/glm-5.2", "GLM-5.2")
     .replace("opencode/openrouter-pinned/", "or/")
     .replace("opencode/", "")
