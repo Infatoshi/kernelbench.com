@@ -109,11 +109,10 @@ for ax, (title, board) in zip(axes, panels):
 
 leg = [Patch(facecolor=MCOL[lbl], label=lbl) for lbl, _, _ in ROWS]
 leg += [Patch(facecolor=RED, hatch="////", label="reward hack (invalid)"),
+        Patch(facecolor="#888888", hatch="..", alpha=0.4, label="failed correctness"),
         Patch(facecolor=SLATE, label="not run")]
-axes[0].legend(handles=leg, loc="upper center", ncol=7, facecolor=C["surface"],
+axes[0].legend(handles=leg, loc="upper center", ncol=4, facecolor=C["surface"],
                edgecolor=C["border"], labelcolor=C["fg"], fontsize=8.4, framealpha=0.97)
-axes[0].text(0.985, 0.97, "faded/dotted = wrote a kernel that failed correctness",
-             transform=axes[0].transAxes, ha="right", va="top", color=GREY, fontsize=8.5)
 
 out = Path(__file__).with_name("hy3_longcat_debut.png")
 fig.savefig(out, dpi=140)
