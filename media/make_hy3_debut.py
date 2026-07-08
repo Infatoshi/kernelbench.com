@@ -1,4 +1,4 @@
-"""Hy3 + LongCat-2.0 debut on KernelBench-Hard, vs the same-tier incumbents
+"""Tencent Hy3 (preview) debut on KernelBench-Hard, vs the same-tier incumbents
 (Fable 5, Opus 4.8, GLM-5.2), on BOTH published GPUs (RTX PRO 6000 + H100).
 
 Reads results/leaderboard.json and results/leaderboard.h100.json fresh, so
@@ -25,12 +25,11 @@ PROB_LBL = ["01 fp8_gemm", "02 kda_cutlass", "03 paged_attn",
 # (display label, harness, model) — debut models lead, then the tier peers.
 ROWS = [
     ("Tencent Hy3",    "hy3-claude",     "tencent/hy3-preview"),
-    ("LongCat-2.0",    "longcat-claude", "LongCat-2.0"),
     ("Claude Fable 5", "claude",         "claude-fable-5"),
     ("Opus 4.8",       "claude",         "claude-opus-4-8"),
     ("GLM-5.2",        "zai-claude",     "glm-5.2"),
 ]
-MCOL = {"Tencent Hy3": C["accent"], "LongCat-2.0": "#2dd4bf",
+MCOL = {"Tencent Hy3": C["accent"],
         "Claude Fable 5": "#cfcfcf", "Opus 4.8": "#4d9fff", "GLM-5.2": "#b07cff"}
 GREY = C["fg_muted"]; AMBER = C["warn"]; RED = C["bad"]; SLATE = "#3a3a3a"
 
@@ -64,7 +63,7 @@ panels = [("RTX PRO 6000 Blackwell (SM120)", "leaderboard.json"),
 fig, axes = plt.subplots(2, 1, figsize=(14.5, 12.6))
 fig.subplots_adjust(top=0.86, left=0.065, right=0.975, bottom=0.06, hspace=0.42)
 
-fig.text(0.065, 0.965, "New on KernelBench-Hard:  Tencent Hy3  and  Meituan LongCat-2.0  vs the frontier tier",
+fig.text(0.065, 0.965, "New on KernelBench-Hard:  Tencent Hy3 (preview)  vs the frontier tier",
          color=C["accent"], fontsize=15.5, fontweight="bold", ha="left")
 fig.text(0.065, 0.935, "One unlimited-time autonomous session per problem (Claude Code harness -> each vendor's Anthropic-compatible endpoint). bar = peak_fraction of that GPU's roofline.",
          color=GREY, fontsize=10, ha="left")
@@ -114,6 +113,6 @@ leg += [Patch(facecolor=RED, hatch="////", label="reward hack (invalid)"),
 axes[0].legend(handles=leg, loc="upper center", ncol=4, facecolor=C["surface"],
                edgecolor=C["border"], labelcolor=C["fg"], fontsize=8.4, framealpha=0.97)
 
-out = Path(__file__).with_name("hy3_longcat_debut.png")
+out = Path(__file__).with_name("hy3_debut.png")
 fig.savefig(out, dpi=140)
 print(f"wrote {out}")
