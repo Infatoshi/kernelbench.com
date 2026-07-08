@@ -25,12 +25,11 @@ PROB_LBL = ["01 fp8_gemm", "02 kda_cutlass", "03 paged_attn",
 # (display label, harness, model) — Hy3 leads, then US frontier, then China tier.
 ROWS = [
     ("Tencent Hy3",    "hy3-claude",     "tencent/hy3-preview"),
-    ("Claude Fable 5", "claude",         "claude-fable-5"),
     ("Opus 4.8",       "claude",         "claude-opus-4-8"),
     ("GLM-5.2",        "zai-claude",     "glm-5.2"),
 ]
 MCOL = {"Tencent Hy3": C["accent"],
-        "Claude Fable 5": "#cfcfcf", "Opus 4.8": "#4d9fff", "GLM-5.2": "#b07cff"}
+        "Opus 4.8": "#4d9fff", "GLM-5.2": "#b07cff"}
 GREY = C["fg_muted"]; AMBER = C["warn"]; RED = C["bad"]; SLATE = "#3a3a3a"
 
 
