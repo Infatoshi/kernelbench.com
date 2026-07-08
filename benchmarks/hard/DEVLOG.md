@@ -4,6 +4,29 @@ A running record of decisions, dead ends, and lessons. Newest entries on top. Th
 
 ---
 
+## 2026-07-08 - LongCat H100 gap-fill: two watchdog bugs that each cost real money
+
+Second scaleway H100 node filled LongCat's 05/06/07 gaps (6/6 on H100 now; all
+three cells audited clean). Two automation bugs from the same night, both in
+"unattended teardown" code paths, both silent:
+
+- **`pgrep -c` prints 0 but exits nonzero on no-match.** The teardown watchdog
+  did `BUSY=$(ssh node 'pgrep -c -f ...' || echo probe_fail)`, so on completion
+  BUSY became `"0\nprobe_fail"` — matching neither the done branch nor the retry
+  branch. Infinite silent loop at $3.96/hr (~2h burned before a manual check-in
+  caught it). Rule: never bolt `|| fallback` onto a command substitution whose
+  success-case exit code is nonzero; test `$?` separately or use
+  `pgrep ... | wc -l`.
+- **Node-side disk janitors must not touch dirs the harness still owns.** A
+  cleanup loop purging `repo/.venv` from "finished" runs (result.json exists)
+  raced the harness's own check phase and deleted the venv mid-check; uv rebuilt
+  the whole environment inside the check timeout window and the run recorded
+  `check_timeout` (exit 124) for a kernel that passes in 3 minutes. Rescoring the
+  archived solution on the same node recovered the cell (0.0390, matching the
+  model's own in-transcript geomean prediction). Rule: janitors key off the
+  harness's terminal marker only after QUEUE_END for that problem, not
+  result.json existence — and never purge the venv of the newest run.
+
 ## 2026-07-07 - Hy3 + LongCat-2.0 debut: cloud-H100 overnight sweep, shared-GPU contention, PASS-gate bug
 
 Debuted two new harness routes: `hy3-claude` (Tencent Hy3 preview via OpenRouter's
