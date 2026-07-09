@@ -4,6 +4,35 @@ A running record of decisions, dead ends, and lessons. Newest entries on top. Th
 
 ---
 
+## 2026-07-09 - Hy3: retire OpenRouter preview, official TokenHub route
+
+**Published purge:** all `hy3-claude/tencent/hy3-preview` cells removed from
+leaderboard.json (+ h100), published_runs.json, public/runs solutions,
+annotations, and HuggingFace `Infatoshi/kernelbench-hard-traces` (12 jsonl).
+Raw archives under `outputs/runs*` kept on disk only. Re-enter the board via
+TokenHub `hy3` resweep when ready.
+
+Tencent eval guide (`Evaluation_Guide_Using_Hy3_API_Keys.docx`) specifies direct
+TokenHub OpenAI-compat only:
+
+- `POST https://tokenhub.tencentmaas.com/v1/chat/completions`
+- model id **`hy3`** (not `hy3-preview` / not OpenRouter `tencent/hy3-preview`)
+- `Authorization: Bearer $TENCENT_API_KEY`
+- `reasoning_effort`: `high` (slow) or `no_think` (fast)
+- `max_tokens` up to 262144
+
+Harness change: `hy3-claude` OpenRouter+Claude-Code path is **gone**. New harness
+**`hy3`** = OpenCode → TokenHub (`tokenhub/hy3`), archive-local opencode.json,
+`extraBody.reasoning_effort` pinned. Alias `hy3-claude` still maps to `hy3` so
+old commands don't silently hit Claude. Site display drops "(Preview)".
+
+Published board still has historical `hy3-claude/tencent/hy3-preview` cells from
+the OpenRouter era (run ids unchanged). Re-sweep with `uv run kbh run hy3 hy3
+problems-rtxpro6000/<problem>` for official TokenHub numbers.
+
+Smoke: raw TokenHub chat/completions 200; OpenCode `tokenhub/hy3` returned
+`pong` with reasoning_effort high. Full problem smoke next.
+
 ## 2026-07-08 - LongCat H100 gap-fill: two watchdog bugs that each cost real money
 
 Second scaleway H100 node filled LongCat's 05/06/07 gaps (6/6 on H100 now; all

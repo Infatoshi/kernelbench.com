@@ -15,6 +15,9 @@ from pathlib import Path
 HARNESS_ALIASES = {
     "claude-code": "claude",
     "claude_code": "claude",
+    # hy3-claude was the old OpenRouter+Claude-Code preview route; TokenHub
+    # Hy3 is OpenCode. Alias keeps old muscle memory working.
+    "hy3-claude": "hy3",
 }
 
 

@@ -673,6 +673,51 @@ JSON
     printf '%s\n' "$config_home"
 }
 
+# Tencent Hy3 via TokenHub (official eval route). OpenAI-compatible only —
+# model id `hy3`, NOT hy3-preview / OpenRouter. TENCENT_API_KEY required.
+# Eval guide: reasoning_effort high|no_think, max_tokens up to 262144.
+write_tokenhub_hy3_opencode_config() {
+    if [ -z "${TENCENT_API_KEY:-}" ]; then
+        echo "TENCENT_API_KEY is required for hy3 (Tencent TokenHub)" >&2
+        return 1
+    fi
+    local reasoning_effort="${1:-high}"
+    local config_home="$RUN_DIR/opencode_tokenhub_hy3_config"
+    mkdir -p "$config_home/opencode"
+    cat > "$config_home/opencode/opencode.json" <<JSON
+{
+  "\$schema": "https://opencode.ai/config.json",
+  "permission": {
+    "external_directory": "deny"
+  },
+  "provider": {
+    "tokenhub": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "Tencent TokenHub",
+      "options": {
+        "baseURL": "${HY3_TOKENHUB_BASE_URL:-https://tokenhub.tencentmaas.com/v1}",
+        "apiKey": "${TENCENT_API_KEY}",
+        "extraBody": {
+          "reasoning_effort": "${reasoning_effort}"
+        }
+      },
+      "models": {
+        "hy3": {
+          "name": "Hy3",
+          "limit": {
+            "context": 262144,
+            "output": 131072
+          },
+          "tools": true
+        }
+      }
+    }
+  }
+}
+JSON
+    printf '%s\n' "$config_home"
+}
+
 prepare_claude_container_home() {
     # $1: copy Anthropic credentials (1, default) or not (0). Claude-compat
     # reroutes (Z.ai / MiniMax) authenticate via ANTHROPIC_AUTH_TOKEN and must
@@ -1583,66 +1628,48 @@ case "$HARNESS" in
         fi
         ;;
 
-    hy3-claude)
-        # Claude Code routed to OpenRouter's Anthropic "skin" for Tencent Hy3.
-        # Tencent's own TokenHub is OpenAI-compatible only, so OpenRouter's
-        # Anthropic endpoint (https://openrouter.ai/api -> CC appends
-        # /v1/messages) is what keeps Hy3 on the reliable Claude Code route
-        # instead of the opencode OpenAI-compatible adapter. Requires
-        # OPENROUTER_API_KEY. MODEL should be an OpenRouter slug, e.g.
-        # tencent/hy3-preview.
-        if [ -z "${OPENROUTER_API_KEY:-}" ]; then
-            echo "OPENROUTER_API_KEY is required for hy3-claude" >&2
+    hy3|hy3-claude)
+        # Tencent Hy3 official eval route: OpenCode -> TokenHub OpenAI-compat.
+        # Docs: Evaluation_Guide_Using_Hy3_API_Keys (TokenHub chat/completions).
+        #   base:  https://tokenhub.tencentmaas.com/v1
+        #   model: hy3   (hy3-preview / OpenRouter tencent/hy3-preview RETIRED)
+        #   key:   TENCENT_API_KEY
+        #   body:  reasoning_effort high (default) or no_think
+        # Old name hy3-claude still accepted as an alias; it is NOT Claude Code.
+        if [ -z "${TENCENT_API_KEY:-}" ]; then
+            echo "STOP: hy3 needs \$TENCENT_API_KEY (Tencent TokenHub)" >&2
             exit 1
         fi
-        HY3_CLAUDE_ALIAS="${HY3_CLAUDE_ALIAS:-opus}"
-        HY3_CLAUDE_HAIKU_MODEL="${HY3_CLAUDE_HAIKU_MODEL:-$MODEL}"
+        case "$MODEL" in
+            ""|hy3|tokenhub/hy3) MODEL=hy3 ;;
+            *preview*|tencent/hy3-preview|tencent/hy3)
+                echo "STOP: hy3-preview / OpenRouter slugs are retired. Use: uv run kbh run hy3 hy3 <problem>" >&2
+                exit 1
+                ;;
+            *)
+                echo "STOP: hy3 harness only accepts model 'hy3' (got '$MODEL')" >&2
+                exit 1
+                ;;
+        esac
+        # Map optional 4th-arg effort -> TokenHub reasoning_effort.
+        HY3_RE="${HY3_REASONING_EFFORT:-}"
+        if [ -z "$HY3_RE" ]; then
+            case "${REASONING_EFFORT:-high}" in
+                no_think|none|low|minimal|fast) HY3_RE=no_think ;;
+                *) HY3_RE=high ;;
+            esac
+        fi
+        HY3_OC_HOME="$(write_tokenhub_hy3_opencode_config "$HY3_RE")"
+        HY3_OC_MODEL="tokenhub/hy3"
         if [ "$KBH_AGENT_CONTAINER" = "1" ]; then
-            CLAUDE_CONTAINER_ENV_NAMES=(
-                ANTHROPIC_BASE_URL API_TIMEOUT_MS
-                CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC
-                CLAUDE_CODE_MAX_RETRIES CLAUDE_CODE_MAX_OUTPUT_TOKENS
-                ANTHROPIC_MODEL
-                ANTHROPIC_DEFAULT_HAIKU_MODEL ANTHROPIC_DEFAULT_SONNET_MODEL
-                ANTHROPIC_DEFAULT_OPUS_MODEL
-            )
-            CLAUDE_CONTAINER_EXTRA_CLAUDE_ARGS=(--disallowedTools ExitPlanMode EnterPlanMode AskUserQuestion)
-            ( export ANTHROPIC_AUTH_TOKEN="$OPENROUTER_API_KEY" && \
-                export ANTHROPIC_BASE_URL="${HY3_ANTHROPIC_BASE_URL:-https://openrouter.ai/api}" && \
-                export API_TIMEOUT_MS="${API_TIMEOUT_MS:-3000000}" && \
-                export CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC="${CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC:-1}" && \
-                export CLAUDE_CODE_MAX_RETRIES="${CLAUDE_CODE_MAX_RETRIES:-1000000}" && \
-                export CLAUDE_CODE_MAX_OUTPUT_TOKENS="${CLAUDE_CODE_MAX_OUTPUT_TOKENS:-128000}" && \
-                export ANTHROPIC_MODEL="$MODEL" && \
-                export ANTHROPIC_DEFAULT_HAIKU_MODEL="$HY3_CLAUDE_HAIKU_MODEL" && \
-                export ANTHROPIC_DEFAULT_SONNET_MODEL="$MODEL" && \
-                export ANTHROPIC_DEFAULT_OPUS_MODEL="$MODEL" && \
-                run_claude_container "" "$HY3_CLAUDE_ALIAS" 0 ) \
+            KBH_OPENCODE_CONFIG_FILE="$HY3_OC_HOME/opencode/opencode.json" \
+                run_opencode_container "$HY3_OC_MODEL" \
                 > "$LOG_FILE" 2> "$STDERR_FILE" || HARNESS_EXIT=$?
-            CLAUDE_CONTAINER_ENV_NAMES=()
-            CLAUDE_CONTAINER_EXTRA_CLAUDE_ARGS=()
         else
-        ( cd "$PROBLEM_DIR" && \
-            export ANTHROPIC_AUTH_TOKEN="$OPENROUTER_API_KEY" && \
-            export ANTHROPIC_BASE_URL="${HY3_ANTHROPIC_BASE_URL:-https://openrouter.ai/api}" && \
-            export API_TIMEOUT_MS="${API_TIMEOUT_MS:-3000000}" && \
-            export CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC="${CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC:-1}" && \
-            export CLAUDE_CODE_MAX_RETRIES="${CLAUDE_CODE_MAX_RETRIES:-1000000}" && \
-            export CLAUDE_CODE_MAX_OUTPUT_TOKENS="${CLAUDE_CODE_MAX_OUTPUT_TOKENS:-128000}" && \
-            export ANTHROPIC_MODEL="$MODEL" && \
-            export ANTHROPIC_DEFAULT_HAIKU_MODEL="$HY3_CLAUDE_HAIKU_MODEL" && \
-            export ANTHROPIC_DEFAULT_SONNET_MODEL="$MODEL" && \
-            export ANTHROPIC_DEFAULT_OPUS_MODEL="$MODEL" && \
-            timeout "$BUDGET_SECONDS" claude \
-                --dangerously-skip-permissions \
-                --print --verbose \
-                --output-format stream-json \
-                --settings "$CLAUDE_KBH_SETTINGS" \
-                --model "$HY3_CLAUDE_ALIAS" \
-                --disallowedTools ExitPlanMode EnterPlanMode AskUserQuestion \
-                --add-dir "$PROBLEM_DIR" \
-                -p "$PROMPT" ) \
-            > "$LOG_FILE" 2> "$STDERR_FILE" || HARNESS_EXIT=$?
+            ( cd "$PROBLEM_DIR" && timeout "$BUDGET_SECONDS" "${AGENT_CUDA_ENV[@]}" \
+                env XDG_CONFIG_HOME="$HY3_OC_HOME" \
+                opencode run --pure --format json -m "$HY3_OC_MODEL" "$PROMPT" \
+                </dev/null > "$LOG_FILE" 2> "$STDERR_FILE" ) || HARNESS_EXIT=$?
         fi
         ;;
 
@@ -1933,7 +1960,7 @@ case "$HARNESS" in
 
     *)
         echo "Unknown harness: $HARNESS" >&2
-        echo "Supported: claude, zai-claude, minimax-claude, kimi-claude, longcat-claude, hy3-claude, deepseek-claude, qwen-claude, ccr-claude, codex, kimi, droid, gemini, cursor, grok, opencode, opencode-nemotron, nvcf-nemotron" >&2
+        echo "Supported: claude, zai-claude, minimax-claude, kimi-claude, longcat-claude, hy3, deepseek-claude, qwen-claude, ccr-claude, codex, kimi, droid, gemini, cursor, grok, opencode, opencode-nemotron, nvcf-nemotron" >&2
         exit 1
         ;;
 esac
@@ -1964,7 +1991,7 @@ fi
 
 SESSION_COMPLETE=true
 case "$HARNESS" in
-    claude|zai-claude|minimax-claude|kimi-claude|longcat-claude|hy3-claude|deepseek-claude|qwen-claude|ccr-claude|cursor|gemini)
+    claude|zai-claude|minimax-claude|kimi-claude|longcat-claude|deepseek-claude|qwen-claude|ccr-claude|cursor|gemini)
         if ! grep -q '"type":"result"' "$CHECK_FILE" 2>/dev/null; then
             SESSION_COMPLETE=false
         fi
@@ -1979,7 +2006,7 @@ case "$HARNESS" in
             SESSION_COMPLETE=false
         fi
         ;;
-    droid|kimi|opencode|opencode-nemotron|nvcf-nemotron)
+    droid|kimi|opencode|opencode-nemotron|nvcf-nemotron|hy3|hy3-claude)
         # No reliable terminal marker; trust the exit code.
         if [ "$HARNESS_EXIT" -ne 0 ]; then
             SESSION_COMPLETE=false

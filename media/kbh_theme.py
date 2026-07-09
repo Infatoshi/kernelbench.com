@@ -4,13 +4,17 @@ Palette is copied verbatim from app/globals.css :root tokens. Every X-post /
 article chart imports this so diagrams look native to kernelbench.com.
 
 Usage:
-    import sys; sys.path.insert(0, "..")   # if in a subfolder
-    from kbh_theme import C, apply
-    apply()                                # sets matplotlib rcParams
+    from kbh_theme import C, SERIES, apply, tight_square
+    apply()
+    fig, axes = tight_square(nrows=3)   # engagement multi-panel, 1:1, no header band
     ax.bar(..., color=C["accent"])
-    # model bars: use SERIES in order, or pick by role (ceiling/subject/other).
+
+Engagement rules (also in AGENTS.md):
+  - Bars + axes + compact legend only. No multi-line title / gray essay chrome.
+  - Prefer square (1:1) multi-GPU panels. Context goes in the post copy.
 """
 import matplotlib
+import matplotlib.pyplot as plt
 
 # website :root tokens (app/globals.css)
 C = {
@@ -51,3 +55,36 @@ def apply():
         "font.family":       "monospace",
         "font.size":         11,
     })
+
+
+def tight_square(nrows: int = 1, ncols: int = 1, size: float = 10.0, **subplot_kw):
+    """1:1 figure with almost no outer padding — for feed / engagement charts.
+
+    No reserved header band. Callers put GPU tags inside axes if needed.
+    """
+    fig, axes = plt.subplots(
+        nrows,
+        ncols,
+        figsize=(size, size),
+        squeeze=False,
+        **subplot_kw,
+    )
+    fig.subplots_adjust(
+        left=0.09,
+        right=0.985,
+        top=0.985,
+        bottom=0.07,
+        hspace=0.18 if nrows > 1 else 0.0,
+        wspace=0.12 if ncols > 1 else 0.0,
+    )
+    for ax in axes.flat:
+        ax.set_facecolor(C["bg"])
+        for spine in ax.spines.values():
+            spine.set_color(C["border"])
+    if nrows == 1 and ncols == 1:
+        return fig, axes[0, 0]
+    if ncols == 1:
+        return fig, [axes[i, 0] for i in range(nrows)]
+    if nrows == 1:
+        return fig, [axes[0, j] for j in range(ncols)]
+    return fig, axes

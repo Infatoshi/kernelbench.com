@@ -24,7 +24,10 @@ PROB_LBL = ["01 fp8_gemm", "02 kda_cutlass", "03 paged_attn",
 
 # (display label, harness, model) — Hy3 leads, then US frontier, then China tier.
 ROWS = [
+    # Historical published cells used harness hy3-claude + model tencent/hy3-preview
+    # (OpenRouter). Official TokenHub route is harness hy3 + model hy3.
     ("Tencent Hy3",    "hy3-claude",     "tencent/hy3-preview"),
+    # ("Tencent Hy3",  "hy3",            "hy3"),  # enable after TokenHub resweep
     ("Opus 4.8",       "claude",         "claude-opus-4-8"),
     ("GLM-5.2",        "zai-claude",     "glm-5.2"),
 ]

@@ -27,7 +27,8 @@ NAME = {
     "glm-5.2": "GLM-5.2", "MiniMax-M3": "MiniMax M3",
     "gemini-3.5-flash": "Gemini 3.5 Flash", "deepseek-v4-pro": "DeepSeek V4 Pro",
     "composer-2.5-fast": "Composer 2.5 Fast", "kimi-k2.7-code": "Kimi K2.7",
-    "tencent/hy3-preview": "Tencent Hy3 (new)", "LongCat-2.0": "LongCat 2.0 (new)",
+    "tencent/hy3-preview": "Tencent Hy3", "hy3": "Tencent Hy3",
+    "LongCat-2.0": "LongCat 2.0 (new)",
 }
 
 rows = {g: [] for g in GPUS}

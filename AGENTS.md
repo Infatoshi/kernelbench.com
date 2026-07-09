@@ -97,12 +97,13 @@ The `kb` CLI targets the **hard** bench; for **mega** drive
 (or `kb publish mega`).
 
 - API keys live in `~/.env_vars` (KIMI_API_KEY, ZAI_API_KEY, MINIMAX_API_KEY,
-  OPENROUTER_API_KEY, OPENAI_API_KEY, GEMINI_API_KEY, CLAUDE_CODE_OAUTH_TOKEN).
+  OPENROUTER_API_KEY, OPENAI_API_KEY, GEMINI_API_KEY, CLAUDE_CODE_OAUTH_TOKEN,
+  TENCENT_API_KEY for TokenHub Hy3, LONGCAT_API_KEY, DEEPSEEK_API_KEY).
   To bench a new model: drop its key in `~/.env_vars`, then `kb sweep`.
-- **If `kb sweep` prints `STOP: ... needs $X_API_KEY`**, the key is missing —
-  ask the human for it, append `export X_API_KEY=...` to `~/.env_vars`, rerun.
-  `kb` preflights the key before launching so you get one clear message, not
-  six failed runs.
+- **If `kb sweep` / `kbh run` prints `STOP: ... needs $X_API_KEY`**, the key is
+  missing — ask the human for it, append `export X_API_KEY=...` to
+  `~/.env_vars`, rerun. `kb` preflights the key before launching so you get one
+  clear message, not six failed runs.
 - Benching a **brand-new provider** (no harness yet) needs a harness branch:
   copy the `kimi-claude` block in `scripts/run_hard.sh` (Claude-Code → the
   provider's Anthropic-compatible endpoint) and add the row. Not a one-liner.
@@ -111,17 +112,31 @@ The `kb` CLI targets the **hard** bench; for **mega** drive
 ## Harnesses (run via `uv run kbh run <harness> <model> <problem> [effort]`)
 
 - Native CLIs: `claude`, `codex`, `cursor`, `gemini`, `grok`, `opencode`.
-- Claude-Code-routed providers (most reliable): `zai-claude` (GLM via
-  api.z.ai/api/anthropic), `minimax-claude`, `kimi-claude` (Kimi via
-  api.moonshot.ai/anthropic, model `kimi-k2.7-code`), `deepseek-claude`
-  (DeepSeek via api.deepseek.com/anthropic, model `deepseek-v4-pro` or
-  `deepseek-v4-flash`), `qwen-claude` (Qwen via DashScope Model Studio
-  Intl, dashscope-intl.aliyuncs.com/apps/anthropic, model `qwen3-max` —
-  needs DASHSCOPE_API_KEY, which we do not have yet). These mirror each other;
-  to add one, copy the `kimi-claude` branch in `scripts/run_hard.sh`.
-  Rationale: opencode is a strong harness but its `@ai-sdk/openai-compatible`
-  transport stalls intermittently (~1/3-1/2 of sessions); routing these models
-  through Claude Code to the provider Anthropic endpoint bypasses that adapter.
+- Claude-Code-routed providers (most reliable when the vendor has an Anthropic
+  skin): `zai-claude` (GLM via api.z.ai/api/anthropic), `minimax-claude`,
+  `kimi-claude` (Kimi via api.moonshot.ai/anthropic, model `kimi-k2.7-code`),
+  `deepseek-claude` (DeepSeek via api.deepseek.com/anthropic, model
+  `deepseek-v4-pro` or `deepseek-v4-flash`), `qwen-claude` (Qwen via DashScope
+  Model Studio Intl, dashscope-intl.aliyuncs.com/apps/anthropic, model
+  `qwen3-max` — needs DASHSCOPE_API_KEY, which we do not have yet),
+  `longcat-claude` (Meituan LongCat-2.0 via api.longcat.chat/anthropic).
+  These mirror each other; to add one, copy the `kimi-claude` branch in
+  `scripts/run_hard.sh`. Rationale: opencode is a strong harness but its
+  `@ai-sdk/openai-compatible` transport stalls intermittently (~1/3-1/2 of
+  sessions); routing these models through Claude Code to the provider Anthropic
+  endpoint bypasses that adapter.
+- **Tencent Hy3 (`hy3` harness)** — official TokenHub route, **not** Claude Code
+  and **not** OpenRouter. TokenHub is OpenAI-compatible only:
+  - key: `TENCENT_API_KEY` in `~/.env_vars`
+  - base: `https://tokenhub.tencentmaas.com/v1` (override `HY3_TOKENHUB_BASE_URL`)
+  - model: **`hy3` only** (`hy3-preview` / `tencent/hy3-preview` are **retired**)
+  - agent: OpenCode with archive-local config (`tokenhub/hy3`)
+  - eval defaults: `reasoning_effort=high` (pass effort `no_think` / `low` for
+    fast mode); `max_tokens` ceiling via model output limit (up to 262k per
+    Tencent eval guide)
+  - run: `uv run kbh run hy3 hy3 problems-rtxpro6000/01_fp8_gemm`
+  - alias: `hy3-claude` still accepted but maps to this TokenHub path (legacy
+    name only — it is **not** Claude Code)
 - Always container mode (`KBH_AGENT_CONTAINER=1`): isolated per-run workspace,
   native GPU, sessions overlap while GPU commands serialize through the lock.
 
@@ -554,7 +569,7 @@ Most likely causes:
 
 ## Publishing results: charts + write-ups (REQUIRED format)
 
-When you post benchmark results (X posts, blog, threads), two rules are not
+When you post benchmark results (X posts, blog, threads), these rules are not
 optional. They are what makes a post read as signal, not slop.
 
 - **Charts MUST use the website NVIDIA palette.** Import the shared theme,
@@ -565,10 +580,21 @@ optional. They are what makes a post read as signal, not slop.
   fg `#eeeeee`/`#999999`, warn `#fbbf24`, bad `#fb7185`, grid `#242424`. Lead
   bars with the green accent (the ceiling/subject); rose `#fb7185` = reward
   hack (hatched), amber = warn, grey = fail, faded+dotted = real kernel that
-  bugged/timed out. `media/make_glm52_4way.py` is the canonical
-  example. If `globals.css` changes, update `kbh_theme.py` to match. Charts are
-  generated on Mac (matplotlib) and dragged into posts; PNGs are gitignored,
-  the `.py` scripts are tracked.
+  bugged/timed out. If `globals.css` changes, update `kbh_theme.py` to match.
+  Charts are generated on Mac or Anvil (matplotlib) and dragged into posts;
+  PNGs are gitignored, the `.py` scripts are tracked.
+- **Visual-first: bars + axes only. No essay chrome.** Engagement charts are
+  judged in a feed scroll — the graph is the product. Do **not** put multi-line
+  titles, gray subtitle stacks, methodology paragraphs, or caption essays on
+  the figure itself. Allowed on-image text: short axis labels, tick labels,
+  a compact legend, and at most a tiny in-axes GPU/tag label if multi-panel.
+  Put context in the post copy, not the PNG. Prefer **square (1:1)** for
+  multi-GPU comparison posts (one panel per GPU, tight margins, minimal
+  `subplots_adjust` padding). Squish the plot area; never pad a 16:9 frame
+  with empty header bands. Canonical engagement layout:
+  `media/make_grok45_frontier.py` (3 GPUs × hard deck, subject models only).
+  Older scripts (`make_glm52_4way.py`, etc.) may still have header essays —
+  do not copy that pattern for new post charts.
 - **Write-ups lead with the unique/interesting/inconsistent, not adjectives.**
   "4/6 clean, strong showing, solid 2nd place" is filler. Before writing,
   actually read 2-3 transcripts/solutions for the headline cells and surface

@@ -672,7 +672,10 @@ function shortLabel(label: string) {
     .replace("gemini/gemini-3.1-pro-preview", "Gemini 3.1 Pro")
     .replace("deepseek-claude/deepseek-v4-pro", "DeepSeek V4 Pro")
     .replace("kimi-claude/kimi-k2.7-code", "Kimi K2.7-Code")
-    .replace("hy3-claude/tencent/hy3-preview", "Tencent Hy3 (Preview)")
+    .replace("hy3-claude/tencent/hy3-preview", "Tencent Hy3")
+    .replace("hy3-claude/hy3", "Tencent Hy3")
+    .replace("hy3/hy3", "Tencent Hy3")
+    .replace("hy3/tokenhub/hy3", "Tencent Hy3")
     .replace("longcat-claude/LongCat-2.0", "Meituan LongCat 2.0")
     .replace("zai-claude/glm-5.2", "GLM-5.2")
     .replace("opencode/openrouter-pinned/", "or/")
@@ -696,9 +699,13 @@ function harnessLabel(harness: string) {
     "minimax-claude": "Claude Code",
     "deepseek-claude": "Claude Code",
     "kimi-claude": "Claude Code",
+    hy3: "OpenCode",
+    "hy3-claude": "OpenCode",
   }
   // Provider models routed through Claude Code (the "<provider>-claude" harnesses)
   // are all just Claude Code; only the underlying model differs.
+  // Exception: hy3-claude is a legacy alias for TokenHub Hy3 via OpenCode.
+  if (harness === "hy3" || harness === "hy3-claude") return "OpenCode"
   if (harness.endsWith("-claude")) return "Claude Code"
   return labels[harness] ?? harness
 }

@@ -491,7 +491,8 @@ _HARNESS_LABELS = {
     "minimax-claude": "Claude Code",
     "kimi-claude": "Claude Code",
     "longcat-claude": "Claude Code",
-    "hy3-claude": "Claude Code",
+    "hy3": "OpenCode",
+    "hy3-claude": "OpenCode",  # legacy alias; TokenHub Hy3, not Claude Code
     "deepseek-claude": "Claude Code",
     "qwen-claude": "Claude Code",
     "codex": "Codex",
