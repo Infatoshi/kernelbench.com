@@ -648,6 +648,8 @@ function shortLabel(label: string) {
     .replace("cursor/composer-2.5-fast [2026-05-28 finish]", "Composer 2.5 Fast")
     .replace("gemini/gemini-3.5-flash [2026-05-28 finish]", "Gemini 3.5 Flash")
     .replace("grok/grok-build [2026-05-28 opus48-grok max]", "Grok Build")
+    .replace("grok/grok-4.5 [max]", "Grok 4.5")
+    .replace("grok/grok-4.5", "Grok 4.5")
     .replace("kimi/kimi-k2.6", "Kimi K2.6")
     .replace("opencode/openrouter-pinned/xiaomi/mimo-v2.5-pro", "MiMo v2.5 Pro")
     .replace("opencode/deepseek/deepseek-v4-flash", "DeepSeek V4 Flash")
@@ -689,7 +691,7 @@ function harnessLabel(harness: string) {
     kimi: "kimi",
     cursor: "Cursor",
     gemini: "Gemini CLI",
-    grok: "Grok Build",
+    grok: "Grok CLI",
     "zai-claude": "Claude Code",
     "minimax-claude": "Claude Code",
     "deepseek-claude": "Claude Code",
