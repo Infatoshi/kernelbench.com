@@ -1,0 +1,595 @@
+"""CUDA paged-attention decode specialized for the benchmark's GQA shapes.
+
+The first kernel assigns one CUDA block to a (batch, KV-head, sequence-split)
+triple.  Its four or eight warps are the query heads which share that KV head,
+so each packed K/V page is fetched from DRAM only once.  Every warp maintains
+an online-softmax numerator for its query head.  A small second kernel merges
+the sequence splits and writes bf16 output.
+"""
+
+from __future__ import annotations
+
+import math
+import os
+
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+
+os.environ.setdefault("MAX_JOBS", "4")
+
+
+_CPP = r"""
+#include <torch/extension.h>
+
+void paged_attention_cuda(
+    torch::Tensor query,
+    torch::Tensor kv_cache,
+    torch::Tensor block_table,
+    torch::Tensor seq_lens,
+    torch::Tensor partial,
+    torch::Tensor stats,
+    torch::Tensor counters,
+    torch::Tensor output,
+    int64_t num_kv_heads,
+    int64_t max_seq_len,
+    int64_t page_size,
+    int64_t num_splits);
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+  m.def("run", &paged_attention_cuda, "shared-KV paged attention (CUDA)");
+}
+"""
+
+
+_CUDA = r"""
+#include <torch/extension.h>
+#include <ATen/cuda/CUDAContext.h>
+#include <c10/cuda/CUDAGuard.h>
+#include <c10/cuda/CUDAException.h>
+#include <cuda.h>
+#include <cuda_bf16.h>
+#include <cuda_runtime.h>
+#include <math.h>
+#include <stdint.h>
+
+__device__ __forceinline__ void copy16_async(void* shared_dst, const void* global_src) {
+  const uint32_t shared_addr = static_cast<uint32_t>(__cvta_generic_to_shared(shared_dst));
+  asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::
+               "r"(shared_addr), "l"(global_src));
+}
+
+__device__ __forceinline__ void async_commit() {
+  asm volatile("cp.async.commit_group;\n" ::);
+}
+
+__device__ __forceinline__ void async_wait_all() {
+  asm volatile("cp.async.wait_group 0;\n" ::);
+}
+
+template<int HEAD_DIM, int GROUP_SIZE, int PAGE_SIZE>
+__global__ void paged_split_kernel(
+    const __nv_bfloat16* __restrict__ query,
+    const __nv_bfloat16* __restrict__ kv_cache,
+    const int* __restrict__ block_table,
+    const int* __restrict__ seq_lens,
+    float* __restrict__ partial,
+    float* __restrict__ stats,
+    int* __restrict__ counters,
+    __nv_bfloat16* __restrict__ output,
+    int batch,
+    int num_heads,
+    int num_kv_heads,
+    int max_pages,
+    int num_splits,
+    float scale) {
+
+  // One warp owns one Q head. All GROUP_SIZE warps reuse this shared KV tile.
+  extern __shared__ __align__(16) unsigned char shared_raw[];
+  __nv_bfloat16* tile = reinterpret_cast<__nv_bfloat16*>(shared_raw);
+
+  const int tid = threadIdx.x;
+  const int warp = tid >> 5;
+  const int lane = tid & 31;
+
+  int z = blockIdx.x;
+  const int split = z % num_splits;
+  z /= num_splits;
+  const int kv_head = z % num_kv_heads;
+  const int b = z / num_kv_heads;
+  const int q_head = kv_head * GROUP_SIZE + warp;
+
+  constexpr int PAIRS_PER_LANE = HEAD_DIM / 64;
+  float q0[PAIRS_PER_LANE];
+  float q1[PAIRS_PER_LANE];
+  float acc0[PAIRS_PER_LANE];
+  float acc1[PAIRS_PER_LANE];
+
+  const __nv_bfloat162* q2 = reinterpret_cast<const __nv_bfloat162*>(
+      query + (static_cast<int64_t>(b) * num_heads + q_head) * HEAD_DIM);
+#pragma unroll
+  for (int j = 0; j < PAIRS_PER_LANE; ++j) {
+    const int pair_idx = lane + 32 * j;
+    const float2 qf = __bfloat1622float2(q2[pair_idx]);
+    q0[j] = qf.x;
+    q1[j] = qf.y;
+    acc0[j] = 0.0f;
+    acc1[j] = 0.0f;
+  }
+
+  float running_max = -INFINITY;
+  float running_sum = 0.0f;
+  const int pages_per_split = (max_pages + num_splits - 1) / num_splits;
+  const int first_page = split * pages_per_split;
+  const int last_page = min(max_pages, first_page + pages_per_split);
+  const int seq_len = seq_lens[b];
+  const int table_stride = max_pages;
+
+  // Double-buffer half-pages. The asynchronous load of the next eight tokens
+  // overlaps all QK, softmax, and PV work on the current eight, while the two
+  // buffers together use no more shared memory than the old full-page tile.
+  constexpr int TILE_TOKENS = PAGE_SIZE / 2;
+  constexpr int VECS_PER_TOKEN = (2 * HEAD_DIM) / 8;
+  constexpr int VECS_PER_TILE = TILE_TOKENS * VECS_PER_TOKEN;
+  constexpr int SCALARS_PER_TILE = TILE_TOKENS * 2 * HEAD_DIM;
+  uint4* shared_vec = reinterpret_cast<uint4*>(tile);
+
+  const int num_tiles = (last_page - first_page) * 2;
+  if (num_tiles > 0) {
+    // Prime buffer zero.
+    const int physical_page = block_table[b * table_stride + first_page];
+    for (int vi = tid; vi < VECS_PER_TILE; vi += GROUP_SIZE * 32) {
+      const int token_in_tile = vi / VECS_PER_TOKEN;
+      const int vec_in_token = vi - token_in_tile * VECS_PER_TOKEN;
+      const int64_t scalar_offset =
+          (((static_cast<int64_t>(physical_page) * PAGE_SIZE + token_in_tile)
+             * num_kv_heads + kv_head) * (2 * HEAD_DIM))
+          + vec_in_token * 8;
+      copy16_async(shared_vec + vi, kv_cache + scalar_offset);
+    }
+    async_commit();
+    async_wait_all();
+    __syncthreads();
+
+    for (int tile_idx = 0; tile_idx < num_tiles; ++tile_idx) {
+      const int buffer = tile_idx & 1;
+      const int logical_page = first_page + (tile_idx >> 1);
+      const int half_page = tile_idx & 1;
+
+      // Launch the other buffer before doing any arithmetic on this one.
+      if (tile_idx + 1 < num_tiles) {
+        const int next_tile = tile_idx + 1;
+        const int next_page = first_page + (next_tile >> 1);
+        const int next_half = next_tile & 1;
+        const int next_physical = block_table[b * table_stride + next_page];
+        for (int vi = tid; vi < VECS_PER_TILE; vi += GROUP_SIZE * 32) {
+          const int token_in_tile = vi / VECS_PER_TOKEN;
+          const int vec_in_token = vi - token_in_tile * VECS_PER_TOKEN;
+          const int token_in_page = next_half * TILE_TOKENS + token_in_tile;
+          const int64_t scalar_offset =
+              (((static_cast<int64_t>(next_physical) * PAGE_SIZE + token_in_page)
+                 * num_kv_heads + kv_head) * (2 * HEAD_DIM))
+              + vec_in_token * 8;
+          copy16_async(shared_vec + (1 - buffer) * VECS_PER_TILE + vi,
+                       kv_cache + scalar_offset);
+        }
+        async_commit();
+      }
+
+      const __nv_bfloat162* tile2 = reinterpret_cast<const __nv_bfloat162*>(
+          tile + buffer * SCALARS_PER_TILE);
+
+      // Compute all eight scores first. Lane t retains token t's score; this
+      // costs one scalar register per lane and lets us rescale the accumulator
+      // once per tile instead of once per token.
+      float lane_score = -INFINITY;
+#pragma unroll
+      for (int token_in_tile = 0; token_in_tile < TILE_TOKENS; ++token_in_tile) {
+        const int token =
+            logical_page * PAGE_SIZE + half_page * TILE_TOKENS + token_in_tile;
+        if (token < seq_len) {
+          float dot = 0.0f;
+#pragma unroll
+          for (int j = 0; j < PAIRS_PER_LANE; ++j) {
+            const int pair_idx = lane + 32 * j;
+            const float2 kf = __bfloat1622float2(
+                tile2[token_in_tile * HEAD_DIM + pair_idx]);
+            dot = fmaf(q0[j], kf.x, dot);
+            dot = fmaf(q1[j], kf.y, dot);
+          }
+#pragma unroll
+          for (int delta = 16; delta > 0; delta >>= 1) {
+            dot += __shfl_down_sync(0xffffffffu, dot, delta);
+          }
+          const float score = __shfl_sync(0xffffffffu, dot, 0) * scale;
+          if (lane == token_in_tile) lane_score = score;
+        }
+      }
+
+      float tile_max = lane_score;
+#pragma unroll
+      for (int delta = 16; delta > 0; delta >>= 1) {
+        tile_max = fmaxf(tile_max,
+                         __shfl_down_sync(0xffffffffu, tile_max, delta));
+      }
+      float old_scale = 0.0f;
+      if (lane == 0) {
+        const float next_max = fmaxf(running_max, tile_max);
+        old_scale = __expf(running_max - next_max);
+        running_sum *= old_scale;
+        running_max = next_max;
+      }
+      old_scale = __shfl_sync(0xffffffffu, old_scale, 0);
+      const float tile_running_max =
+          __shfl_sync(0xffffffffu, running_max, 0);
+#pragma unroll
+      for (int j = 0; j < PAIRS_PER_LANE; ++j) {
+        acc0[j] *= old_scale;
+        acc1[j] *= old_scale;
+      }
+
+      // Accumulate the tile's V vectors with weights relative to tile max.
+#pragma unroll
+      for (int token_in_tile = 0; token_in_tile < TILE_TOKENS; ++token_in_tile) {
+        const int token =
+            logical_page * PAGE_SIZE + half_page * TILE_TOKENS + token_in_tile;
+        if (token < seq_len) {
+          float token_scale = 0.0f;
+          if (lane == token_in_tile) {
+            token_scale = __expf(lane_score - tile_running_max);
+          }
+          token_scale = __shfl_sync(0xffffffffu, token_scale, token_in_tile);
+          if (lane == 0) running_sum += token_scale;
+#pragma unroll
+          for (int j = 0; j < PAIRS_PER_LANE; ++j) {
+            const int pair_idx = lane + 32 * j;
+            const float2 vf = __bfloat1622float2(
+                tile2[token_in_tile * HEAD_DIM + HEAD_DIM / 2 + pair_idx]);
+            acc0[j] = fmaf(token_scale, vf.x, acc0[j]);
+            acc1[j] = fmaf(token_scale, vf.y, acc1[j]);
+          }
+        }
+      }
+      if (tile_idx + 1 < num_tiles) {
+        async_wait_all();
+        __syncthreads();
+      }
+    }
+  }
+
+  const int64_t partial_base =
+      ((static_cast<int64_t>(b) * num_heads + q_head) * num_splits + split)
+      * HEAD_DIM;
+#pragma unroll
+  for (int j = 0; j < PAIRS_PER_LANE; ++j) {
+    const int pair_idx = lane + 32 * j;
+    reinterpret_cast<float2*>(partial + partial_base)[pair_idx] =
+        make_float2(acc0[j], acc1[j]);
+  }
+  if (lane == 0) {
+    const int64_t si =
+        ((static_cast<int64_t>(b) * num_heads + q_head) * num_splits + split) * 2;
+    stats[si] = running_max;
+    stats[si + 1] = running_sum;
+  }
+
+  // The last split to publish for this (batch, KV-head) performs the reduction
+  // for all of its GQA warps. This replaces a second kernel launch. Every
+  // producer thread fences its own partial writes before the ticket is taken.
+  __syncthreads();
+  __threadfence();
+  __syncthreads();
+  int* last_flag = reinterpret_cast<int*>(tile);
+  if (tid == 0) {
+    const int counter_idx = b * num_kv_heads + kv_head;
+    const int ticket = atomicAdd(counters + counter_idx, 1);
+    if (ticket == num_splits - 1) {
+      atomicExch(counters + counter_idx, 0);
+      *last_flag = 1;
+    } else {
+      *last_flag = 0;
+    }
+  }
+  __syncthreads();
+
+  const bool do_merge = (*last_flag != 0);
+  __syncthreads();
+  if (do_merge) {
+    float* weights = reinterpret_cast<float*>(tile) + warp * num_splits;
+    if (lane == 0) {
+      float global_max = -INFINITY;
+      for (int s = 0; s < num_splits; ++s) {
+        const float m = stats[
+            ((static_cast<int64_t>(b) * num_heads + q_head) * num_splits + s) * 2];
+        global_max = fmaxf(global_max, m);
+      }
+      float denom = 0.0f;
+      for (int s = 0; s < num_splits; ++s) {
+        const int64_t si =
+            ((static_cast<int64_t>(b) * num_heads + q_head) * num_splits + s) * 2;
+        const float local_sum = stats[si + 1];
+        const float w = local_sum == 0.0f ? 0.0f : __expf(stats[si] - global_max);
+        weights[s] = w;
+        denom = fmaf(local_sum, w, denom);
+      }
+      const float inv_denom = 1.0f / denom;
+      for (int s = 0; s < num_splits; ++s) weights[s] *= inv_denom;
+    }
+    __syncwarp();
+
+    float out0[PAIRS_PER_LANE] = {0.0f};
+    float out1[PAIRS_PER_LANE] = {0.0f};
+    for (int s = 0; s < num_splits; ++s) {
+      const float w = weights[s];
+      const int64_t base =
+          ((static_cast<int64_t>(b) * num_heads + q_head) * num_splits + s)
+          * HEAD_DIM;
+#pragma unroll
+      for (int j = 0; j < PAIRS_PER_LANE; ++j) {
+        const int pair_idx = lane + 32 * j;
+        const float2 x = reinterpret_cast<const float2*>(partial + base)[pair_idx];
+        out0[j] = fmaf(w, x.x, out0[j]);
+        out1[j] = fmaf(w, x.y, out1[j]);
+      }
+    }
+    __nv_bfloat162* out2 = reinterpret_cast<__nv_bfloat162*>(
+        output + (static_cast<int64_t>(b) * num_heads + q_head) * HEAD_DIM);
+#pragma unroll
+    for (int j = 0; j < PAIRS_PER_LANE; ++j) {
+      const int pair_idx = lane + 32 * j;
+      out2[pair_idx] = __float22bfloat162_rn(make_float2(out0[j], out1[j]));
+    }
+  }
+}
+
+
+template<int HEAD_DIM, int WARPS_PER_BLOCK=4>
+__global__ void merge_splits_kernel(
+    const float* __restrict__ partial,
+    const float* __restrict__ stats,
+    __nv_bfloat16* __restrict__ output,
+    int total_heads,
+    int num_splits) {
+  const int warp = threadIdx.x >> 5;
+  const int lane = threadIdx.x & 31;
+  const int h = blockIdx.x * WARPS_PER_BLOCK + warp;
+  if (h >= total_heads) return;
+
+  __shared__ float weights[WARPS_PER_BLOCK][64];
+  if (lane == 0) {
+    float global_max = -INFINITY;
+    for (int s = 0; s < num_splits; ++s) {
+      const float m = stats[(static_cast<int64_t>(h) * num_splits + s) * 2];
+      global_max = fmaxf(global_max, m);
+    }
+    float denom = 0.0f;
+    for (int s = 0; s < num_splits; ++s) {
+      const int64_t si = (static_cast<int64_t>(h) * num_splits + s) * 2;
+      const float local_sum = stats[si + 1];
+      const float w = local_sum == 0.0f ? 0.0f : __expf(stats[si] - global_max);
+      weights[warp][s] = w;
+      denom = fmaf(local_sum, w, denom);
+    }
+    const float inv_denom = 1.0f / denom;
+    for (int s = 0; s < num_splits; ++s) weights[warp][s] *= inv_denom;
+  }
+  __syncwarp();
+
+  constexpr int PAIRS_PER_LANE = HEAD_DIM / 64;
+  float out0[PAIRS_PER_LANE] = {0.0f};
+  float out1[PAIRS_PER_LANE] = {0.0f};
+  for (int s = 0; s < num_splits; ++s) {
+    const float w = weights[warp][s];
+    const int64_t base = (static_cast<int64_t>(h) * num_splits + s) * HEAD_DIM;
+#pragma unroll
+    for (int j = 0; j < PAIRS_PER_LANE; ++j) {
+      const int pair_idx = lane + 32 * j;
+      const float2 x = reinterpret_cast<const float2*>(partial + base)[pair_idx];
+      out0[j] = fmaf(w, x.x, out0[j]);
+      out1[j] = fmaf(w, x.y, out1[j]);
+    }
+  }
+  __nv_bfloat162* out2 = reinterpret_cast<__nv_bfloat162*>(
+      output + static_cast<int64_t>(h) * HEAD_DIM);
+#pragma unroll
+  for (int j = 0; j < PAIRS_PER_LANE; ++j) {
+    const int pair_idx = lane + 32 * j;
+    out2[pair_idx] = __float22bfloat162_rn(make_float2(out0[j], out1[j]));
+  }
+}
+
+
+template<int HEAD_DIM, int GROUP_SIZE>
+void launch_typed(
+    const __nv_bfloat16* query,
+    const __nv_bfloat16* kv_cache,
+    const int* block_table,
+    const int* seq_lens,
+    float* partial,
+    float* stats,
+    int* counters,
+    __nv_bfloat16* output,
+    int batch,
+    int num_heads,
+    int num_kv_heads,
+    int max_seq_len,
+    int num_splits,
+    cudaStream_t stream) {
+  constexpr int PAGE_SIZE = 16;
+  const int max_pages = (max_seq_len + PAGE_SIZE - 1) / PAGE_SIZE;
+  const int blocks = batch * num_kv_heads * num_splits;
+  const int threads = GROUP_SIZE * 32;
+  const size_t smem = PAGE_SIZE * 2 * HEAD_DIM * sizeof(__nv_bfloat16);
+  paged_split_kernel<HEAD_DIM, GROUP_SIZE, PAGE_SIZE>
+      <<<blocks, threads, smem, stream>>>(
+          query, kv_cache, block_table, seq_lens, partial, stats, counters, output,
+          batch, num_heads, num_kv_heads, max_pages, num_splits,
+          rsqrtf(static_cast<float>(HEAD_DIM)));
+}
+
+
+void paged_attention_cuda(
+    torch::Tensor query,
+    torch::Tensor kv_cache,
+    torch::Tensor block_table,
+    torch::Tensor seq_lens,
+    torch::Tensor partial,
+    torch::Tensor stats,
+    torch::Tensor counters,
+    torch::Tensor output,
+    int64_t num_kv_heads,
+    int64_t max_seq_len,
+    int64_t page_size,
+    int64_t num_splits) {
+  TORCH_CHECK(query.is_cuda() && kv_cache.is_cuda(), "inputs must be CUDA tensors");
+  TORCH_CHECK(query.scalar_type() == at::kBFloat16, "query must be bf16");
+  TORCH_CHECK(kv_cache.scalar_type() == at::kBFloat16, "KV cache must be bf16");
+  TORCH_CHECK(block_table.scalar_type() == at::kInt, "block table must be int32");
+  TORCH_CHECK(seq_lens.scalar_type() == at::kInt, "sequence lengths must be int32");
+  TORCH_CHECK(page_size == 16, "this kernel is specialized for page_size=16");
+
+  const int batch = query.size(0);
+  const int num_heads = query.size(1);
+  const int head_dim = query.size(2);
+  const int group_size = num_heads / static_cast<int>(num_kv_heads);
+  const c10::cuda::CUDAGuard device_guard(query.device());
+  cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+
+  const auto* q = reinterpret_cast<const __nv_bfloat16*>(query.data_ptr<at::BFloat16>());
+  const auto* kv = reinterpret_cast<const __nv_bfloat16*>(kv_cache.data_ptr<at::BFloat16>());
+  const int* bt = block_table.data_ptr<int>();
+  const int* sl = seq_lens.data_ptr<int>();
+  float* p = partial.data_ptr<float>();
+  float* st = stats.data_ptr<float>();
+  int* ctr = counters.data_ptr<int>();
+  auto* out = reinterpret_cast<__nv_bfloat16*>(output.data_ptr<at::BFloat16>());
+
+  if (head_dim == 128 && group_size == 4) {
+    launch_typed<128, 4>(q, kv, bt, sl, p, st, ctr, out, batch, num_heads,
+                         num_kv_heads, max_seq_len, num_splits, stream);
+  } else if (head_dim == 128 && group_size == 8) {
+    launch_typed<128, 8>(q, kv, bt, sl, p, st, ctr, out, batch, num_heads,
+                         num_kv_heads, max_seq_len, num_splits, stream);
+  } else if (head_dim == 64 && group_size == 4) {
+    launch_typed<64, 4>(q, kv, bt, sl, p, st, ctr, out, batch, num_heads,
+                        num_kv_heads, max_seq_len, num_splits, stream);
+  } else {
+    TORCH_CHECK(false, "unsupported head_dim/group_size combination");
+  }
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+"""
+
+
+_ext = load_inline(
+    name="paged_attention_sm120_sharedkv_v8",
+    cpp_sources=_CPP,
+    cuda_sources=_CUDA,
+    functions=None,
+    extra_cflags=["-O3"],
+    extra_cuda_cflags=["-O3", "--use_fast_math", "--extra-device-vectorization"],
+    with_cuda=True,
+    verbose=False,
+)
+
+
+class Model(nn.Module):
+    def __init__(
+        self,
+        batch: int,
+        num_heads: int,
+        num_kv_heads: int,
+        head_dim: int,
+        seq_len: int,
+        page_size: int,
+    ):
+        super().__init__()
+        assert num_heads % num_kv_heads == 0
+        assert page_size == 16
+        group_size = num_heads // num_kv_heads
+        assert (head_dim, group_size) in ((128, 4), (128, 8), (64, 4))
+
+        self.num_kv_heads = num_kv_heads
+        self.seq_len = seq_len
+        self.page_size = page_size
+
+        # Cold-cache profiling on the 188-SM target shows that roughly 1K
+        # producer blocks are needed to hide page-gather and barrier latency.
+        # The B=32 case reaches that point with eight splits; the smaller grids
+        # benefit from the full sixteen.
+        base_blocks = batch * num_kv_heads
+        max_pages = (seq_len + page_size - 1) // page_size
+        if head_dim == 64:
+            scheduled_splits = 32
+        elif base_blocks >= 128:
+            scheduled_splits = 8
+        else:
+            scheduled_splits = 16
+        self.num_splits = min(64, max_pages, scheduled_splits)
+
+        self.register_buffer(
+            "_partial",
+            torch.empty(batch, num_heads, self.num_splits, head_dim, dtype=torch.float32),
+            persistent=False,
+        )
+        self.register_buffer(
+            "_stats",
+            torch.empty(batch, num_heads, self.num_splits, 2, dtype=torch.float32),
+            persistent=False,
+        )
+        self.register_buffer(
+            "_counters",
+            torch.zeros(batch, num_kv_heads, dtype=torch.int32),
+            persistent=False,
+        )
+        self.register_buffer(
+            "_output",
+            torch.empty(batch, num_heads, head_dim, dtype=torch.bfloat16),
+            persistent=False,
+        )
+
+    def forward(
+        self,
+        query: torch.Tensor,
+        kv_cache: torch.Tensor,
+        block_table: torch.Tensor,
+        seq_lens: torch.Tensor,
+    ) -> torch.Tensor:
+        _ext.run(
+            query, kv_cache, block_table, seq_lens,
+            self._partial, self._stats, self._counters, self._output,
+            self.num_kv_heads, self.seq_len, self.page_size, self.num_splits,
+        )
+        return self._output
+
+
+# Keep the exact data-generation interface used by reference.py.
+BATCH = 8
+NUM_HEADS = 32
+NUM_KV_HEADS = 8
+HEAD_DIM = 128
+SEQ_LEN = 1024
+PAGE_SIZE = 16
+
+
+def get_inputs():
+    B, H, Hkv, D, L, P = (
+        BATCH,
+        NUM_HEADS,
+        NUM_KV_HEADS,
+        HEAD_DIM,
+        SEQ_LEN,
+        PAGE_SIZE,
+    )
+    pages_per_seq = (L + P - 1) // P
+    total_pages = max(B * pages_per_seq + 8, 64)
+    query = torch.randn(B, H, D, dtype=torch.bfloat16) * 0.1
+    kv_cache = torch.randn(total_pages, P, Hkv, 2 * D, dtype=torch.bfloat16) * 0.1
+    block_table = torch.randperm(total_pages)[: B * pages_per_seq].reshape(B, pages_per_seq).int()
+    seq_lens = torch.full((B,), L, dtype=torch.int32)
+    return [query, kv_cache, block_table.contiguous(), seq_lens]
+
+
+def get_init_inputs():
+    return [BATCH, NUM_HEADS, NUM_KV_HEADS, HEAD_DIM, SEQ_LEN, PAGE_SIZE]
