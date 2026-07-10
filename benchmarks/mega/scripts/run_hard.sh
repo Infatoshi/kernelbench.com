@@ -88,16 +88,8 @@ fi
 export KBH_GPU_LOCK_WAIT_TIMEOUT_SECONDS="${KBH_GPU_LOCK_WAIT_TIMEOUT_SECONDS:-7200}"
 MIN_USEFUL_OUTPUT_TOKENS="${KBH_MIN_USEFUL_OUTPUT_TOKENS:-5000}"
 
-# Optional mode for concurrent smoke sweeps: agents can edit/reason in parallel
-# while the harness-owned post-run check.py/benchmark.py path is the only CUDA
-# consumer. This is more reliable than trying to intercept every absolute
-# .venv/bin/python path an agent may discover.
 AGENT_CUDA_DISABLED=false
 GPU_QUEUE_MODE="path_wrapper_gpu_lock"
-if [ "${KBH_DISABLE_AGENT_CUDA:-0}" = "1" ]; then
-    AGENT_CUDA_DISABLED=true
-    GPU_QUEUE_MODE="agent_phase_cuda_guard_harness_gpu_lock"
-fi
 
 # --- Load the per-problem prompt ------------------------------------------
 #
@@ -112,16 +104,6 @@ if [ ! -f "$PROMPT_FILE" ]; then
     exit 1
 fi
 PROMPT="$(cat "$PROMPT_FILE")"
-if [ "${KBH_DISABLE_AGENT_CUDA:-0}" = "1" ]; then
-    PROMPT="${PROMPT}
-
-Parallel sweep note: CUDA is intentionally unavailable during your editing
-phase so many models can work at once without contaminating GPU timings. Do not
-spend time running check.py, benchmark.py, ncu, nsys, or CUDA profiling
-commands. Focus on writing the best final solution.py you can. The
-harness will run check.py and benchmark.py after your session under the GPU
-lock and archive those logs."
-fi
 
 # --- Create an isolated per-run problem workspace -------------------------
 # problem.yaml and shapes.py stay in the workspace because check.py and
@@ -142,26 +124,37 @@ mkdir -p "$PROBLEM_DIR"
 
 # Contamination sandbox: run the agent under bwrap with EVERY source of a prior
 # solution or the optimization recipe hidden, while the toolchain (src, .venv,
-# GPU, outputs/gpu.lock) passes through via --dev-bind. The leak sources are NOT
-# just this benchmark's run archive -- they include the sibling `hard` benchmark's
-# runs (same kernels), the DEVLOG (the optimization journey == the recipe), and
-# the ~/.claude memory (which records the winning recipe). Each is tmpfs'd /
-# blanked only if present, so this works identically on anvil (full repo) and a
-# cloud box (only mega rsync'd). Own run dir stays writable. KBH_SANDBOX=0 to
-# disable; auto-off if bwrap is absent (e.g. verda B200, where userns is denied --
-# there, blank DEVLOG on the box and run on a single-model box instead).
+# GPU, outputs/gpu.lock) passes through via --dev-bind.
+#
+# Leak sources (all must be blanked — 2026-07-09 Grok 4.5 kimi-decode proved
+# that hiding only outputs/runs is not enough):
+#   - this bench's run archive (outputs/runs)
+#   - sibling hard/v3 run archives
+#   - monorepo public/ (published solution.py.txt for Fable/etc — the actual
+#     path Grok used: public/data/mega/code/* and public/runs/*_solution.py.txt)
+#   - results/ (annotations + leaderboard scores named as targets)
+#   - monorepo runs/ HF staging
+#   - DEVLOG (optimization journey == the recipe)
+#   - ~/.claude/projects memory
+# Own run dir stays writable. KBH_SANDBOX=0 to disable; auto-off if bwrap is
+# absent (e.g. verda B200 userns denied — blank public/ + DEVLOG on the box).
 RUNS_DIR="$REPO_ROOT/outputs/runs"
 SIB_PARENT="$(dirname "$REPO_ROOT")"   # benchmarks/ on anvil, $HOME on a cloud box
+MONOREPO_ROOT="$(cd "$REPO_ROOT/../.." && pwd)"  # kernelbench.com monorepo root
 KBH_EMPTY="$RUN_DIR/.kbh_empty"; : > "$KBH_EMPTY"
 KBH_SBX=()
 if [ "${KBH_SANDBOX:-1}" = "1" ] && command -v bwrap >/dev/null 2>&1; then
     KBH_SBX=(bwrap --dev-bind / / --tmpfs "$RUNS_DIR")
     [ -e "$REPO_ROOT/DEVLOG.md" ] && KBH_SBX+=(--ro-bind "$KBH_EMPTY" "$REPO_ROOT/DEVLOG.md")
+    [ -d "$REPO_ROOT/results" ] && KBH_SBX+=(--tmpfs "$REPO_ROOT/results")
     [ -d "$SIB_PARENT/hard" ]     && KBH_SBX+=(--tmpfs "$SIB_PARENT/hard")
     [ -d "$SIB_PARENT/v3" ]       && KBH_SBX+=(--tmpfs "$SIB_PARENT/v3")
+    [ -d "$MONOREPO_ROOT/public" ] && KBH_SBX+=(--tmpfs "$MONOREPO_ROOT/public")
+    [ -d "$MONOREPO_ROOT/runs" ] && KBH_SBX+=(--tmpfs "$MONOREPO_ROOT/runs")
     [ -d "$HOME/.claude/projects" ] && KBH_SBX+=(--tmpfs "$HOME/.claude/projects")
+    # Own archive + problem workspace must remain visible/writable after tmpfs hides.
     KBH_SBX+=(--bind "$RUN_DIR" "$RUN_DIR" --chdir "$PROBLEM_DIR")
-    echo "agent sandbox: bwrap (hidden: mega+hard runs, DEVLOG recipe, ~/.claude memory)"
+    echo "agent sandbox: bwrap (hidden: runs archives, public/ solutions, results/, DEVLOG, ~/.claude memory)"
 fi
 
 PROMPT="${PROMPT}
@@ -202,10 +195,8 @@ REAL_TIMEOUT="$(command -v timeout)"
 REAL_UV_FALLBACK="$REAL_UV"
 REAL_PYTHON_FALLBACK="$REAL_PYTHON"
 LOCK_WRAPPER_DIR="$RUN_DIR/bin"
-AGENT_GUARD_DIR="$RUN_DIR/agent_guard"
 mkdir -p "$LOCK_WRAPPER_DIR" "$RUN_DIR/cache/torch_extensions" \
-    "$RUN_DIR/cache/triton" "$RUN_DIR/cache/cuda" "$RUN_DIR/tmp" \
-    "$AGENT_GUARD_DIR"
+    "$RUN_DIR/cache/triton" "$RUN_DIR/cache/cuda" "$RUN_DIR/tmp"
 
 export KBH_GPU_LOCK="${KBH_GPU_LOCK:-$REPO_ROOT/outputs/gpu.lock}"
 export KBH_GPU_LOCK_LOG="$RUN_DIR/gpu_lock.log"
@@ -216,111 +207,7 @@ export TMPDIR="$RUN_DIR/tmp"
 export TEMP="$RUN_DIR/tmp"
 export TMP="$RUN_DIR/tmp"
 export RUN_DIR REAL_UV REAL_PYTHON REAL_NVIDIA_SMI REAL_NCU REAL_NSYS REAL_NVCC \
-    REAL_UV_FALLBACK REAL_PYTHON_FALLBACK AGENT_GUARD_DIR
-
-cat > "$AGENT_GUARD_DIR/sitecustomize.py" <<'PY'
-"""Block accidental CUDA use during parallel agent-edit phases.
-
-The harness-owned post-run check.py/benchmark.py path runs without
-KBH_AGENT_PHASE and is still allowed to use the GPU under outputs/gpu.lock.
-"""
-from __future__ import annotations
-
-import builtins
-import importlib
-import os
-
-
-if os.environ.get("KBH_AGENT_PHASE") == "1":
-    _orig_import_module = importlib.import_module
-    _orig_import = builtins.__import__
-    _orig_torch_device = None
-
-    def _patch_torch(mod):
-        global _orig_torch_device
-        try:
-            if _orig_torch_device is None:
-                _orig_torch_device = mod.device
-            cuda = getattr(mod, "cuda", None)
-            def _blocked(*args, **kwargs):
-                raise RuntimeError(
-                    "CUDA is disabled during KernelBench parallel agent phase; "
-                    "the harness will run check.py and benchmark.py after generation."
-                )
-
-            def _mentions_cuda(value):
-                try:
-                    if isinstance(value, str):
-                        return value.startswith("cuda")
-                    if getattr(value, "type", None) == "cuda":
-                        return True
-                except Exception:
-                    pass
-                return False
-
-            if cuda is not None:
-                cuda.is_available = lambda: False
-                cuda.device_count = lambda: 0
-                cuda.current_device = _blocked
-                cuda.get_device_name = _blocked
-                cuda.get_device_capability = _blocked
-                cuda.init = _blocked
-                cuda.synchronize = _blocked
-            mod.device = lambda *args, **kwargs: (
-                _blocked() if args and _mentions_cuda(args[0])
-                else _orig_torch_device(*args, **kwargs)
-            )
-            if not getattr(mod, "_kbh_agent_cuda_patched", False):
-                tensor_to = mod.Tensor.to
-                module_to = mod.nn.Module.to
-
-                def guarded_tensor_to(self, *args, **kwargs):
-                    if any(_mentions_cuda(arg) for arg in args) or _mentions_cuda(kwargs.get("device")):
-                        _blocked()
-                    return tensor_to(self, *args, **kwargs)
-
-                def guarded_module_to(self, *args, **kwargs):
-                    if any(_mentions_cuda(arg) for arg in args) or _mentions_cuda(kwargs.get("device")):
-                        _blocked()
-                    return module_to(self, *args, **kwargs)
-
-                mod.Tensor.to = guarded_tensor_to
-                mod.Tensor.cuda = lambda self, *args, **kwargs: _blocked()
-                mod.nn.Module.to = guarded_module_to
-                mod.nn.Module.cuda = lambda self, *args, **kwargs: _blocked()
-                mod._kbh_agent_cuda_patched = True
-            os.environ["CUDA_VISIBLE_DEVICES"] = ""
-        except Exception:
-            pass
-        return mod
-
-    def _guarded_import_module(name, package=None):
-        mod = _orig_import_module(name, package)
-        if name == "torch" or name.startswith("torch."):
-            torch = _orig_import_module("torch")
-            _patch_torch(torch)
-        return mod
-
-    def _guarded_import(name, globals=None, locals=None, fromlist=(), level=0):
-        mod = _orig_import(name, globals, locals, fromlist, level)
-        if name == "torch" or name.startswith("torch."):
-            torch = _orig_import("torch")
-            _patch_torch(torch)
-        return mod
-
-    importlib.import_module = _guarded_import_module
-    builtins.__import__ = _guarded_import
-PY
-
-AGENT_CUDA_ENV=()
-if [ "${KBH_DISABLE_AGENT_CUDA:-0}" = "1" ]; then
-    AGENT_CUDA_ENV=(
-        env
-        CUDA_VISIBLE_DEVICES=
-        KBH_AGENT_PHASE=1
-        PYTHONPATH="$AGENT_GUARD_DIR${PYTHONPATH:+:$PYTHONPATH}"
-    )
-fi
+    REAL_UV_FALLBACK REAL_PYTHON_FALLBACK
 
 cat > "$LOCK_WRAPPER_DIR/gpu-lock-exec" <<'EOF'
 #!/bin/bash
@@ -349,17 +236,6 @@ if [ -n "${RUN_DIR:-}" ] && [[ "$real_abs" == "${RUN_DIR}/bin/"* ]] && [ -n "$fa
 fi
 if [ "${KBH_GPU_LOCK_HELD:-0}" = "1" ]; then
     exec "$real" "$@"
-fi
-if [ "${KBH_AGENT_PHASE:-0}" = "1" ]; then
-    case "$name" in
-        uv|python|python3|nvidia-smi|nvcc)
-            exec "$real" "$@"
-            ;;
-        ncu|nsys)
-            echo "$name is disabled during KernelBench parallel agent phase; official benchmarking runs under the GPU lock after generation." >&2
-            exit 125
-            ;;
-    esac
 fi
 owner_file="${KBH_GPU_LOCK}.owner"
 if [ -f "$owner_file" ]; then
@@ -725,7 +601,7 @@ case "$HARNESS" in
       "models": {
         "hy3": {
           "name": "Hy3",
-          "limit": { "context": 262144, "output": 131072 },
+          "limit": { "context": ${HY3_TOKENHUB_CONTEXT_LIMIT:-196608}, "output": ${HY3_TOKENHUB_OUTPUT_LIMIT:-32000} },
           "tools": true
         }
       }
@@ -733,7 +609,7 @@ case "$HARNESS" in
   }
 }
 JSON
-        ( cd "$PROBLEM_DIR" && "${KBH_SBX[@]}" timeout "$BUDGET_SECONDS" "${AGENT_CUDA_ENV[@]}" \
+        ( cd "$PROBLEM_DIR" && "${KBH_SBX[@]}" timeout "$BUDGET_SECONDS" \
             env XDG_CONFIG_HOME="$HY3_OC_HOME" \
             opencode run --pure --format json -m tokenhub/hy3 "$PROMPT" \
             </dev/null > "$LOG_FILE" 2> "$STDERR_FILE" ) || HARNESS_EXIT=$?
@@ -841,7 +717,7 @@ JSON
 
     cursor)
         # Cursor Agent CLI is installed as `agent` on Anvil.
-        "${KBH_SBX[@]}" timeout "$BUDGET_SECONDS" "${AGENT_CUDA_ENV[@]}" agent \
+        "${KBH_SBX[@]}" timeout "$BUDGET_SECONDS" agent \
             --trust \
             --yolo \
             --print \
@@ -859,7 +735,7 @@ JSON
         if [ -n "$REASONING_EFFORT" ]; then
             EFFORT_ARG=(--effort "$REASONING_EFFORT")
         fi
-        "${KBH_SBX[@]}" timeout "$BUDGET_SECONDS" "${AGENT_CUDA_ENV[@]}" grok \
+        "${KBH_SBX[@]}" timeout "$BUDGET_SECONDS" grok \
             --cwd "$PROBLEM_DIR" \
             --always-approve \
             --permission-mode bypassPermissions \
@@ -875,7 +751,7 @@ JSON
         # OpenCode SST with custom OpenAI-shape providers (deepseek, zai, minimax).
         # Provider/model pair encoded as MODEL="provider/model-id" e.g.
         # "deepseek/deepseek-v4-pro" or "zai/glm-5.1".
-        ( cd "$PROBLEM_DIR" && "${KBH_SBX[@]}" timeout "$BUDGET_SECONDS" "${AGENT_CUDA_ENV[@]}" opencode run \
+        ( cd "$PROBLEM_DIR" && "${KBH_SBX[@]}" timeout "$BUDGET_SECONDS" opencode run \
             --pure --format json -m "$MODEL" "$PROMPT" \
             </dev/null > "$LOG_FILE" 2> "$STDERR_FILE" ) || HARNESS_EXIT=$?
         ;;

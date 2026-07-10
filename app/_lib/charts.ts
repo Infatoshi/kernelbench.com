@@ -9,15 +9,30 @@ import { loadLeaderboard } from "./data"
 
 const REPO_ROOT = process.cwd()
 
+// Formal display names for homepage / chart bars. Prefer adding a row here
+// when a new model is published so labels stay pretty; `displayName()` falls
+// back to the raw model id if a key is missing so charts never silently drop
+// a published row (see AGENTS.md "Publishing results" → site charts).
 export const MODEL_NAMES: Record<string, string> = {
   "claude-opus-4-8": "Claude Opus 4.8",
+  "claude-fable-5": "Claude Fable 5",
+  "claude-sonnet-5": "Claude Sonnet 5",
   "glm-5.2": "GLM-5.2",
   "gpt-5.5": "GPT-5.5",
+  "gpt-5.6-sol": "GPT-5.6 Sol",
+  "grok-4.5": "Grok 4.5",
   "MiniMax-M3": "MiniMax-M3",
   "kimi-k2.7-code": "Kimi K2.7-Code",
   "composer-2.5-fast": "Composer 2.5 Fast",
   "gemini-3.5-flash": "Gemini 3.5 Flash",
   "deepseek-v4-pro": "DeepSeek V4 Pro",
+  "LongCat-2.0": "LongCat 2.0",
+  hy3: "Tencent Hy3",
+  "tencent/hy3-preview": "Tencent Hy3",
+}
+
+function displayName(modelId: string): string {
+  return MODEL_NAMES[modelId] ?? modelId
 }
 
 // GPU series colors — match the published charts (B200 is the NVIDIA accent).
@@ -125,16 +140,27 @@ function markFrontier(points: EffPoint[]): EffPoint[] {
 }
 
 // Short labels for the dense scatter (full names crowd the clustered points).
+// Same fallback rule as MODEL_NAMES — never drop a published model silently.
 const SHORT_NAMES: Record<string, string> = {
   "claude-opus-4-8": "Opus 4.8",
+  "claude-fable-5": "Fable 5",
+  "claude-sonnet-5": "Sonnet 5",
   "glm-5.2": "GLM-5.2",
   "gpt-5.5": "GPT-5.5",
+  "gpt-5.6-sol": "GPT-5.6 Sol",
+  "grok-4.5": "Grok 4.5",
   "MiniMax-M3": "MiniMax",
   "kimi-k2.7-code": "Kimi",
   "composer-2.5-fast": "Composer",
   "gemini-3.5-flash": "Gemini",
   "deepseek-v4-pro": "DeepSeek",
-  "claude-fable-5": "Fable 5",
+  "LongCat-2.0": "LongCat",
+  hy3: "Hy3",
+  "tencent/hy3-preview": "Hy3",
+}
+
+function shortName(modelId: string): string {
+  return SHORT_NAMES[modelId] ?? displayName(modelId)
 }
 
 // Hard GPUs shown on the efficiency chart, all with clean per-model token
@@ -161,8 +187,7 @@ export async function loadEfficiency(): Promise<{ mega: EffByGpu; hard: EffByGpu
     if (!gpu) continue
     const tok = parseInt(f[ix("output_tokens")], 10)
     if (!tok || tok < 1000) continue
-    const name = SHORT_NAMES[f[ix("model")]]
-    if (!name) continue
+    const name = shortName(f[ix("model")])
     ;(megaPts[gpu] ??= []).push({ label: name, x: tok, y: parseFloat(f[ix("score")]), frontier: false })
   }
 
@@ -179,8 +204,7 @@ export async function loadEfficiency(): Promise<{ mega: EffByGpu; hard: EffByGpu
     }
     const pts: EffPoint[] = []
     for (const m of lb.models) {
-      const name = SHORT_NAMES[m.model]
-      if (!name) continue
+      const name = shortName(m.model)
       const pfs: number[] = []
       let tok = 0
       for (const c of Object.values(m.results)) {
@@ -191,9 +215,16 @@ export async function loadEfficiency(): Promise<{ mega: EffByGpu; hard: EffByGpu
       // 50k floor: a model that genuinely solved hard kernels spent >>50k tokens
       // across the deck. Anything less is a stale/truncated-telemetry artifact
       // (e.g. pre-fix runs that never emitted a result event) — exclude it so the
-      // frontier isn't distorted by fake hyper-efficiency points.
+      // frontier isn't distorted by fake hyper-efficiency points. Harnesses that
+      // never record output_tokens (e.g. Grok streaming) are omitted from this
+      // scatter until tokens are backfilled into the leaderboard cell.
       if (pfs.length && tok > 50000) {
-        pts.push({ label: name, x: tok, y: (pfs.reduce((a, b) => a + b, 0) / pfs.length) * 100, frontier: false })
+        pts.push({
+          label: name,
+          x: tok,
+          y: (pfs.reduce((a, b) => a + b, 0) / pfs.length) * 100,
+          frontier: false,
+        })
       }
     }
     hardPts[gpu] = pts
@@ -226,7 +257,10 @@ function assemble(
   decimals: number,
 ): ChartData {
   const series = GPU_SERIES
-  const models = Object.keys(MODEL_NAMES).filter((m) => cell[m])
+  // Include every model present in the published data. Formal names come from
+  // MODEL_NAMES when known; unknown ids still render so a publish cannot
+  // silently omit a new row pending a chart-config edit.
+  const models = Object.keys(cell)
   models.sort(
     (a, b) =>
       Math.max(...series.map((s) => cell[b][s.key] ?? 0)) -
@@ -240,7 +274,7 @@ function assemble(
       if (v > max) max = v
       return v
     })
-    return { label: MODEL_NAMES[m], values }
+    return { label: displayName(m), values }
   })
   return { series, groups, max, suffix, decimals }
 }

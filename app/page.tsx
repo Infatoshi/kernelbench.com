@@ -65,10 +65,10 @@ const benchmarks = [
     href: "/mega",
     title: "Mega",
     description:
-      "Full GPU megakernel build (W4A16 linear decode), 8 frontier models across Blackwell / H100 / B200, scored as speedup over the reference. Contamination-audited in a sandboxed harness.",
+      "Full GPU megakernel build (Kimi-Linear W4A16 decode + RL), frontier models across Blackwell / H100 / B200, scored as speedup over the reference. Contamination-audited; agent sandbox hides prior solutions.",
     stats: [
       ["problem", "megakernel"],
-      ["models", "8"],
+      ["models", "11+"],
       ["GPUs", "3"],
     ],
     hfHref: "https://huggingface.co/datasets/Infatoshi/kernelbench-mega-traces",
@@ -80,11 +80,11 @@ const benchmarks = [
     href: "/hard",
     title: "Hard",
     description:
-      "Curated hard CUDA/Triton deck, frontier-model comparison across RTX PRO 6000 Blackwell, H100 PCIe, and B200, roofline-graded with per-run agent traces.",
+      "Curated hard CUDA/Triton deck — Opus, Fable, Grok 4.5, GPT-5.6 Sol, GLM-5.2, and more — across RTX PRO 6000 Blackwell, H100 PCIe, and B200. Roofline-graded with per-run agent traces.",
     stats: [
       ["problems", "6"],
-      ["models", "8"],
-      ["GPUs", "3"],
+      ["models", "13"],
+      ["GPUs", "3+"],
     ],
     hfHref: "https://huggingface.co/datasets/Infatoshi/kernelbench-hard-traces",
     ghHref:

@@ -41,28 +41,18 @@ const PROBLEMS = [
   { key: "07_w4a16_gemm", label: "W4A16 GEMM" },
 ]
 
-const VISIBLE_MODEL_LABELS = new Set([
-  "codex/gpt-5.5 [2026-05-28 finish xhigh]",
-  "claude/claude-opus-4-7 [2026-05-28 finish max]",
-  "kimi/kimi-k2.6",
-  "opencode/openrouter-pinned/xiaomi/mimo-v2.5-pro",
-  "opencode/deepseek/deepseek-v4-flash",
-  "opencode/deepseek/deepseek-v4-pro",
-  "opencode/zai/glm-5.1",
-  "droid/zai/glm-5.1 [2026-05-08]",
-  "zai-claude/glm-5.1 [2026-05-13]",
-])
+// Legacy v1 allowlist (date-stamped labels). Current boards use
+// environment === "v2_containerized" and show every leaderboard row; keep this
+// only for any non-v2 snapshot still on disk. Do NOT add new models here —
+// publish them into leaderboard.json and they appear automatically.
+const VISIBLE_MODEL_LABELS = new Set<string>([])
 
-const VISIBLE_MODEL_PREFIXES = [
-  "claude/claude-opus-4-8 [2026-05-28 opus48-grok",
-  "claude/claude-opus-4-6 [2026-06-04 opus46",
-  "cursor/composer-2.5-fast [2026-05-28 finish",
-  "gemini/gemini-3.5-flash [2026-05-28 finish",
-  "grok/grok-build [2026-05-28 opus48-grok",
-  "minimax-claude/MiniMax-M3 [2026-06-01",
-]
+const VISIBLE_MODEL_PREFIXES: string[] = []
 
 function isVisibleModel(m: Model) {
+  if (VISIBLE_MODEL_LABELS.size === 0 && VISIBLE_MODEL_PREFIXES.length === 0) {
+    return true
+  }
   return (
     VISIBLE_MODEL_LABELS.has(m.label) ||
     VISIBLE_MODEL_PREFIXES.some((prefix) => m.label.startsWith(prefix))
@@ -77,11 +67,11 @@ const GPU_TARGETS = [
     file: "benchmarks/hard/results/leaderboard.json",
     blurb: (
       <>
-        Leading models (Opus 4.8, GPT-5.5, GLM-5.2, MiniMax-M3, Gemini 3.5
-        Flash, Kimi K2.7-Code) were reswept June 2026 with{" "}
-        <span className="text-[var(--color-fg)]">unlimited time per problem</span>;
-        earlier rows used the original 45-minute budget. Claude Fable 5 on this
-        GPU is the original 45-minute reference; its unlimited resweep is pending.
+        Frontier coding agents on one unlimited autonomous session per problem:{" "}
+        Opus 4.8, Fable 5, Grok 4.5, GPT-5.6 Sol, GLM-5.2, MiniMax-M3, Kimi
+        K2.7-Code, DeepSeek V4 Pro, LongCat 2.0, Gemini 3.5 Flash, Composer, and
+        more. Roofline-graded; every published cell is contamination-checked and
+        reward-hack audited.
       </>
     ),
   },

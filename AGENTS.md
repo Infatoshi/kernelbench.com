@@ -84,6 +84,10 @@ occupied shared GPU that never frees, or a genuinely ambiguous model identity.
 kb sweep kimi-claude kimi-k2.7-code       # all hard problems, parallel containers, unlimited time
 kb publish                                # rebuild leaderboard + viewers from archives
 kb deploy "bench kimi k2.7"               # publish + commit + push (Vercel auto-builds)
+# After first publish of a NEW model: add formal names in app/_lib/charts.ts
+# (MODEL_NAMES + SHORT_NAMES). Charts auto-include every published model id;
+# missing pretty names fall back to the raw slug. See "Site charts after a new
+# model lands" under Hard-won gotchas.
 ```
 Other commands: `kb run <harness> <model> <problem>` (one problem), `kb dev`
 (preview, view from Mac via Tailscale anvil:3000), `kb build`, `kb audit <run_id>`,
@@ -288,10 +292,9 @@ Provider-credit detection must stay credit-specific; do not match plain
 Provider credit/rate classifications should only apply to rows without a
 solution; successful sessions may quote old run logs or result JSON in the
 transcript, and those quotes are not provider failures.
-When `KBH_DISABLE_AGENT_CUDA=1`, agent-phase `uv`/`python`/`python3`,
-`nvidia-smi`, and `nvcc` probes bypass the lock because CUDA is hidden and
-guarded or the probe is harmless; `ncu` and `nsys` fail fast. Harness-owned
-`check.py`/`benchmark.py` still lock normally.
+CUDA must remain available throughout every official agent session. Parallel
+sweeps serialize all GPU-facing commands through `outputs/gpu.lock`; never hide
+CUDA or append instructions that prohibit checking, benchmarking, or profiling.
 Transcript usage extraction also bypasses the lock; it is CPU-only post-processing.
 `benchmark.py` must score `variant=solution` first. Eager / compiled / SOTA
 reference diagnostics are opt-in via `KBH_BENCHMARK_BASELINES=1` (or a
@@ -404,12 +407,11 @@ These apply to every harness route, not just Claude Code:
 - **Timeout starts after the GPU lock.** Use `run_gpu_locked_timeout` for
   `check.py`/`benchmark.py`; do not wrap `timeout` outside `uv run`, or queued
   rows can fail while merely waiting for `outputs/gpu.lock`.
-- **CUDA hiding needs more than PATH wrappers.** `KBH_DISABLE_AGENT_CUDA=1`
-  hides CUDA from OpenCode/Cursor agent phases, but agents can call absolute
-  interpreters such as `.venv/bin/python3`, so the harness also injects an
-  agent-phase `sitecustomize.py` guard and a wrapper-recursion fallback. If you
-  see `REAL_UV=$(which uv)` inside a model command, it must not resolve back to
-  the per-run wrapper or the lock owner can hang.
+- **Never hide CUDA from the agent.** Kernel optimization requires the same
+  live compile/check/benchmark/profile loop for every model. Parallel sessions
+  queue GPU-facing commands through the shared lock. If you see
+  `REAL_UV=$(which uv)` inside a model command, it must not resolve back to the
+  per-run wrapper or the lock owner can hang.
 - **Claude-family harnesses must launch from the archive-local `$PROBLEM_DIR`,**
   not from repo root with only `--add-dir`; otherwise models can write
   `problems/<name>/solution.py` in the source tree and the archived run records
@@ -474,6 +476,14 @@ Most likely causes:
   transcripts live on HuggingFace (`kernelbench-<bench>-traces`); push them with
   `kb push-runs <hard|mega>` (or `kb publish --push`). The site links each run
   to its HF trace — it no longer self-hosts `*.html` viewers.
+- **Site charts after a new model lands (part of every publish).** Homepage
+  bars/scatters read live leaderboard + `public/data/mega/results.csv`, and
+  **include every published model id** even if a pretty name is missing (raw id
+  is used). Still update formal labels so the homepage doesn't show bare
+  slugs: edit `app/_lib/charts.ts` `MODEL_NAMES` (full bar labels) and
+  `SHORT_NAMES` (efficiency scatter). `/hard` v2 boards show every
+  leaderboard row automatically — no page allowlist. After `kb publish`, skim
+  the homepage chart and `/hard` once before `kb deploy`.
 - **Redact on every publish/push pass.** Before uploading HF traces, committing
   `public/runs`, or deploying site artifacts, run
   `uv run python scripts/redaction.py runs public/runs` from the repo root. This
