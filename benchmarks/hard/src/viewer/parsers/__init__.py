@@ -18,6 +18,11 @@ def sniff(path: Path) -> str:
     if not path.exists():
         raise FileNotFoundError(path)
 
+    # Grok Build native session archive (preferred over streaming-json transcript).
+    sp = str(path)
+    if path.name == "chat_history.jsonl" or "/.grok/sessions/" in sp or "\\.grok\\sessions\\" in sp:
+        return "grok"
+
     with open(path) as f:
         for raw in f:
             raw = raw.strip()
@@ -31,6 +36,15 @@ def sniff(path: Path) -> str:
                 # banner lines and detect from the first real JSON line; a
                 # file with no JSON at all is codex stdout text (handled below).
                 continue
+
+            # Grok chat_history: reasoning rows carry encrypted_content + summary.
+            if obj.get("type") == "reasoning" and (
+                "encrypted_content" in obj or isinstance(obj.get("summary"), list)
+            ):
+                return "grok"
+            # Grok tool_result uses tool_call_id (Claude uses tool_use_id inside content).
+            if obj.get("type") == "tool_result" and "tool_call_id" in obj:
+                return "grok"
 
             # Gemini CLI: bare {type:"init", session_id, model} with no subtype,
             # followed by message / tool_use / tool_result / result events.

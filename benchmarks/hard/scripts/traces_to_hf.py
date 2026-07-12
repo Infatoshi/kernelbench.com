@@ -43,16 +43,38 @@ def _ts(base_epoch: int, i: int) -> str:
     return t.strftime("%Y-%m-%dT%H:%M:%S.000Z")
 
 
+def _pick_transcript(run_dir: Path) -> Path | None:
+    """Prefer richest source per harness.
+
+    Grok: agent_home/.grok/sessions/**/chat_history.jsonl has the real tool
+    timeline; harness transcript.jsonl is only token-delta streaming-json.
+    """
+    run_dir = Path(run_dir)
+    # Explicit high-fidelity session files first.
+    for name in ("codex_session.jsonl",):
+        p = run_dir / name
+        if p.exists() and p.stat().st_size > 0:
+            return p
+    grok_histories = sorted(
+        (run_dir / "agent_home" / ".grok" / "sessions").rglob("chat_history.jsonl")
+        if (run_dir / "agent_home" / ".grok" / "sessions").is_dir()
+        else [],
+        key=lambda p: p.stat().st_size,
+        reverse=True,
+    )
+    if grok_histories:
+        return grok_histories[0]
+    for name in ("transcript.jsonl", "transcript.txt"):
+        p = run_dir / name
+        if p.exists() and p.stat().st_size > 0:
+            return p
+    return None
+
+
 def convert(run_dir: Path, out_dir: Path) -> Path | None:
     run_dir = Path(run_dir)
     rid = run_dir.name
-    # pick the richest transcript
-    tpath = None
-    for name in ("codex_session.jsonl", "transcript.jsonl", "transcript.txt"):
-        p = run_dir / name
-        if p.exists() and p.stat().st_size > 0:
-            tpath = p
-            break
+    tpath = _pick_transcript(run_dir)
     if tpath is None:
         return None
     try:
@@ -71,6 +93,17 @@ def convert(run_dir: Path, out_dir: Path) -> Path | None:
     sid = session.session_id or rid
     cwd = _redact(session.cwd or "/workspace")
     model = session.model or "unknown"
+    # Recover model from run_id when parsers leave it as unknown/None
+    if model in (None, "unknown") and "_grok_" in rid:
+        # <ts>_grok_<model>_<problem>
+        after = rid.split("_grok_", 1)[1]
+        # strip trailing _NN_problem
+        mm = re.match(r"(.+?)_\d{2}_", after)
+        model = mm.group(1) if mm else after
+    if model in (None, "unknown") and "_codex_" in rid:
+        after = rid.split("_codex_", 1)[1]
+        mm = re.match(r"(.+?)_\d{2}_", after)
+        model = mm.group(1) if mm else after
     # Human-readable title from the run_id: <model> · <problem>
     _parts = rid.split("_")
     _title = f"{model} · {rid}"
@@ -105,6 +138,23 @@ def convert(run_dir: Path, out_dir: Path) -> Path | None:
         lines.append(rec)
         parent = u
 
+    # Skip giant system prompts / skill dumps that bloat the viewer; keep the
+    # actual user_query / PROMPT and all assistant/tool turns.
+    def _keep_user_text(text: str) -> bool:
+        t = text.lstrip()
+        if t.startswith("<user_query>") or t.startswith("I need you to"):
+            return True
+        if t.startswith("<user_info>"):
+            return False
+        if t.startswith("<system-reminder>") or t.startswith("[system]"):
+            return False
+        if t.startswith("You are Grok") or t.startswith("You are Codex"):
+            return False
+        # keep ordinary short notes; drop multi-KB skill catalogs
+        if len(text) > 12000 and ("SKILL.md" in text or "skills are available" in text):
+            return False
+        return True
+
     for e in session.events:
         if e.role == "assistant":
             blocks: list[dict] = []
@@ -133,27 +183,36 @@ def convert(run_dir: Path, out_dir: Path) -> Path | None:
             emit("assistant", msg)
         elif e.role in ("user", "tool"):
             if e.tool_result is not None:
+                # Cap huge tool dumps so the HF viewer stays responsive
+                body = e.tool_result.content or ""
+                if len(body) > 80000:
+                    body = body[:80000] + "\n…[truncated]"
                 content = [{
                     "type": "tool_result",
                     "tool_use_id": e.tool_result.call_id or _new_uuid(),
-                    "content": _redact(e.tool_result.content or ""),
+                    "content": _redact(body),
                     "is_error": bool(e.tool_result.is_error),
                 }]
                 emit("user", {"role": "user", "content": content})
-            elif e.text:
+            elif e.text and _keep_user_text(e.text):
                 emit("user", {"role": "user", "content": _redact(e.text)})
         elif e.role in ("system", "compaction", "error") and e.text:
-            # carry as a user-role note so it stays visible without a special schema
+            # Drop the full system prompt; keep short end/status notes only.
+            if e.subtype == "system" or len(e.text) > 2000:
+                continue
             label = (e.subtype or e.role)
             emit("user", {"role": "user", "content": _redact(f"[{label}] {e.text}")})
 
-    if not lines:
+    # Need at least one real conversation record beyond the title/mode headers.
+    if len(lines) <= 3:
+        print(f"  SKIP {rid}: no conversation events after convert", file=sys.stderr)
         return None
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     out = out_dir / f"{rid}.jsonl"
     out.write_text("\n".join(json.dumps(ln) for ln in lines) + "\n")
     return out
+
 
 
 def main(argv=None) -> int:

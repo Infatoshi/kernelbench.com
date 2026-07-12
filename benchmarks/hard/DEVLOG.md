@@ -4,6 +4,45 @@ A running record of decisions, dead ends, and lessons. Newest entries on top. Th
 
 ---
 
+## 2026-07-09 - Agent-side CUDA disabling removed
+
+`KBH_DISABLE_AGENT_CUDA` was removed from the harness, parallel launcher, and
+infra-retry launcher. It had been introduced to prevent parallel agents from
+bypassing the shared GPU lock, but hiding CUDA also removed the live
+compile/check/benchmark/profile loop that KernelBench is intended to measure.
+That made disabled and enabled runs incomparable. New runs always expose CUDA;
+parallel GPU commands serialize through `outputs/gpu.lock`. Historical
+`agent_cuda_disabled` metadata remains in archived results for provenance.
+
+## 2026-07-09 - Hy3 TokenHub context wall + host-mode stall watchdog
+
+RTX PRO 6000 TokenHub resweep: 4/6 finished (fp8/paged/moe/w4a16), kda+topk
+looked "hung" for ~8h. RCA (`/tmp/hy3-stall-rca/REPORT.md`, Fable):
+
+1. **TokenHub real input wall is 196608** (= 0.75 × advertised 262144). Live
+   probes of ~200k and ~215k prompts both report `prompt_tokens=196608` (silent
+   truncation, HTTP 200). Latency at the wall is 150–210s; during the incident
+   every boundary request died after ~183s with "upstream model service is
+   abnormal or unreachable". Sibling runs under ~160k passed concurrently.
+2. **OpenCode 1.17.8 session loop** retries that error forever with uncapped
+   `2^n` backoff (observed up to 8192s) and emits nothing to `--format json`
+   transcript — so the session looks dead while parked on timerfds with no
+   TokenHub sockets.
+3. **Host-mode path had no stall watchdog** (`KBH_AGENT_CONTAINER=0` for the
+   local launch); `timeout 0` never fires. Config advertised `context: 262144`
+   so OpenCode compaction threshold (230144) sat *past* the real wall.
+
+Harness fixes:
+- `write_tokenhub_hy3_opencode_config`: default `context=196608`, `output=32000`
+  (override via `HY3_TOKENHUB_CONTEXT_LIMIT` / `HY3_TOKENHUB_OUTPUT_LIMIT`).
+- Host-mode hy3: `run_host_with_stall_watch` on transcript growth + bounded
+  retries; default `KBH_OPENCODE_STALL_SECONDS=1500` (legitimate ~13min gaps
+  observed; multi-hour silence still dies).
+- Mega hy3 config limit aligned to the same measured wall.
+
+Not the 2026-06-09 `@ai-sdk/openai-compatible` mid-stream hang — every request
+here completed with an explicit provider error; client then slept silently.
+
 ## 2026-07-09 - Hy3: retire OpenRouter preview, official TokenHub route
 
 **Published purge:** all `hy3-claude/tencent/hy3-preview` cells removed from

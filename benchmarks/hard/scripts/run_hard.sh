@@ -120,16 +120,8 @@ fi
 export KBH_GPU_LOCK_WAIT_TIMEOUT_SECONDS="${KBH_GPU_LOCK_WAIT_TIMEOUT_SECONDS:-7200}"
 MIN_USEFUL_OUTPUT_TOKENS="${KBH_MIN_USEFUL_OUTPUT_TOKENS:-5000}"
 
-# Optional mode for concurrent smoke sweeps: agents can edit/reason in parallel
-# while the harness-owned post-run check.py/benchmark.py path is the only CUDA
-# consumer. This is more reliable than trying to intercept every absolute
-# .venv/bin/python path an agent may discover.
 AGENT_CUDA_DISABLED=false
 GPU_QUEUE_MODE="path_wrapper_gpu_lock"
-if [ "${KBH_DISABLE_AGENT_CUDA:-0}" = "1" ]; then
-    AGENT_CUDA_DISABLED=true
-    GPU_QUEUE_MODE="agent_phase_cuda_guard_harness_gpu_lock"
-fi
 if [ "$KBH_AGENT_CONTAINER" = "1" ]; then
     if [ "${KBH_AGENT_CONTAINER_SESSION_LOCK:-0}" = "1" ]; then
         # Legacy: the whole agent session holds the GPU lock (fully serial).
@@ -154,16 +146,6 @@ if [ ! -f "$PROMPT_FILE" ]; then
     exit 1
 fi
 PROMPT="$(cat "$PROMPT_FILE")"
-if [ "${KBH_DISABLE_AGENT_CUDA:-0}" = "1" ]; then
-    PROMPT="${PROMPT}
-
-Parallel sweep note: CUDA is intentionally unavailable during your editing
-phase so many models can work at once without contaminating GPU timings. Do not
-spend time running check.py, benchmark.py, ncu, nsys, or CUDA profiling
-commands. Focus on writing the best final solution.py you can. The
-harness will run check.py and benchmark.py after your session under the GPU
-lock and archive those logs."
-fi
 
 # --- Create an isolated per-run problem workspace -------------------------
 # problem.yaml and shapes.py stay in the workspace because check.py and
@@ -242,10 +224,8 @@ REAL_TIMEOUT="$(command -v timeout)"
 REAL_UV_FALLBACK="$REAL_UV"
 REAL_PYTHON_FALLBACK="$REAL_PYTHON"
 LOCK_WRAPPER_DIR="$RUN_DIR/bin"
-AGENT_GUARD_DIR="$RUN_DIR/agent_guard"
 mkdir -p "$LOCK_WRAPPER_DIR" "$RUN_DIR/cache/torch_extensions" \
-    "$RUN_DIR/cache/triton" "$RUN_DIR/cache/cuda" "$RUN_DIR/tmp" \
-    "$AGENT_GUARD_DIR"
+    "$RUN_DIR/cache/triton" "$RUN_DIR/cache/cuda" "$RUN_DIR/tmp"
 
 # The lock lives in its own directory so container runs can bind-mount just
 # the lock (flock is on the inode, so host and container commands serialize
@@ -261,111 +241,7 @@ export TMPDIR="$RUN_DIR/tmp"
 export TEMP="$RUN_DIR/tmp"
 export TMP="$RUN_DIR/tmp"
 export RUN_DIR REAL_UV REAL_PYTHON REAL_NVIDIA_SMI REAL_NCU REAL_NSYS REAL_NVCC \
-    REAL_UV_FALLBACK REAL_PYTHON_FALLBACK AGENT_GUARD_DIR
-
-cat > "$AGENT_GUARD_DIR/sitecustomize.py" <<'PY'
-"""Block accidental CUDA use during parallel agent-edit phases.
-
-The harness-owned post-run check.py/benchmark.py path runs without
-KBH_AGENT_PHASE and is still allowed to use the GPU under outputs/gpu.lock.
-"""
-from __future__ import annotations
-
-import builtins
-import importlib
-import os
-
-
-if os.environ.get("KBH_AGENT_PHASE") == "1":
-    _orig_import_module = importlib.import_module
-    _orig_import = builtins.__import__
-    _orig_torch_device = None
-
-    def _patch_torch(mod):
-        global _orig_torch_device
-        try:
-            if _orig_torch_device is None:
-                _orig_torch_device = mod.device
-            cuda = getattr(mod, "cuda", None)
-            def _blocked(*args, **kwargs):
-                raise RuntimeError(
-                    "CUDA is disabled during KernelBench parallel agent phase; "
-                    "the harness will run check.py and benchmark.py after generation."
-                )
-
-            def _mentions_cuda(value):
-                try:
-                    if isinstance(value, str):
-                        return value.startswith("cuda")
-                    if getattr(value, "type", None) == "cuda":
-                        return True
-                except Exception:
-                    pass
-                return False
-
-            if cuda is not None:
-                cuda.is_available = lambda: False
-                cuda.device_count = lambda: 0
-                cuda.current_device = _blocked
-                cuda.get_device_name = _blocked
-                cuda.get_device_capability = _blocked
-                cuda.init = _blocked
-                cuda.synchronize = _blocked
-            mod.device = lambda *args, **kwargs: (
-                _blocked() if args and _mentions_cuda(args[0])
-                else _orig_torch_device(*args, **kwargs)
-            )
-            if not getattr(mod, "_kbh_agent_cuda_patched", False):
-                tensor_to = mod.Tensor.to
-                module_to = mod.nn.Module.to
-
-                def guarded_tensor_to(self, *args, **kwargs):
-                    if any(_mentions_cuda(arg) for arg in args) or _mentions_cuda(kwargs.get("device")):
-                        _blocked()
-                    return tensor_to(self, *args, **kwargs)
-
-                def guarded_module_to(self, *args, **kwargs):
-                    if any(_mentions_cuda(arg) for arg in args) or _mentions_cuda(kwargs.get("device")):
-                        _blocked()
-                    return module_to(self, *args, **kwargs)
-
-                mod.Tensor.to = guarded_tensor_to
-                mod.Tensor.cuda = lambda self, *args, **kwargs: _blocked()
-                mod.nn.Module.to = guarded_module_to
-                mod.nn.Module.cuda = lambda self, *args, **kwargs: _blocked()
-                mod._kbh_agent_cuda_patched = True
-            os.environ["CUDA_VISIBLE_DEVICES"] = ""
-        except Exception:
-            pass
-        return mod
-
-    def _guarded_import_module(name, package=None):
-        mod = _orig_import_module(name, package)
-        if name == "torch" or name.startswith("torch."):
-            torch = _orig_import_module("torch")
-            _patch_torch(torch)
-        return mod
-
-    def _guarded_import(name, globals=None, locals=None, fromlist=(), level=0):
-        mod = _orig_import(name, globals, locals, fromlist, level)
-        if name == "torch" or name.startswith("torch."):
-            torch = _orig_import("torch")
-            _patch_torch(torch)
-        return mod
-
-    importlib.import_module = _guarded_import_module
-    builtins.__import__ = _guarded_import
-PY
-
-AGENT_CUDA_ENV=()
-if [ "${KBH_DISABLE_AGENT_CUDA:-0}" = "1" ]; then
-    AGENT_CUDA_ENV=(
-        env
-        CUDA_VISIBLE_DEVICES=
-        KBH_AGENT_PHASE=1
-        PYTHONPATH="$AGENT_GUARD_DIR${PYTHONPATH:+:$PYTHONPATH}"
-    )
-fi
+    REAL_UV_FALLBACK REAL_PYTHON_FALLBACK
 
 cat > "$LOCK_WRAPPER_DIR/gpu-lock-exec" <<'EOF'
 #!/bin/bash
@@ -394,17 +270,6 @@ if [ -n "${RUN_DIR:-}" ] && [[ "$real_abs" == "${RUN_DIR}/bin/"* ]] && [ -n "$fa
 fi
 if [ "${KBH_GPU_LOCK_HELD:-0}" = "1" ]; then
     exec "$real" "$@"
-fi
-if [ "${KBH_AGENT_PHASE:-0}" = "1" ]; then
-    case "$name" in
-        uv|python|python3|nvidia-smi|nvcc)
-            exec "$real" "$@"
-            ;;
-        ncu|nsys)
-            echo "$name is disabled during KernelBench parallel agent phase; official benchmarking runs under the GPU lock after generation." >&2
-            exit 125
-            ;;
-    esac
 fi
 owner_file="${KBH_GPU_LOCK}.owner"
 if [ -f "$owner_file" ]; then
@@ -559,6 +424,80 @@ run_docker_locked_timeout() {
     return "$status"
 }
 
+# Host-mode stall watchdog: kill a process tree if watch_log stops growing.
+# Used when KBH_AGENT_CONTAINER=0 (hy3 TokenHub path often runs host-mode because
+# the TRT-LLM image is missing). Mirrors the container stall watchdog above, but
+# targets a PID tree instead of a docker cid. See RCA 2026-07-09: TokenHub
+# boundary failures left opencode in a silent multi-hour retry loop with no
+# transcript growth and no live TokenHub sockets.
+_kill_pid_group() {
+    local pid="$1"
+    local sig="${2:-TERM}"
+    kill "-${sig}" -- "-${pid}" 2>/dev/null || true
+}
+
+run_host_with_stall_watch() {
+    # $1 stall_seconds  $2 watch_log  $3 timeout_seconds (0 = unlimited)  rest = cmd
+    local stall_seconds="$1"
+    local watch_log="$2"
+    local timeout_seconds="$3"
+    shift 3
+    local status=0
+    local watcher_pid=""
+    local cmd_pid=""
+    local stall_marker=""
+
+    set +e
+    # GNU timeout creates a separate process group even with a zero duration
+    # (which means unlimited). That lets the watchdog terminate the complete
+    # command tree without touching this harness process group.
+    "$REAL_TIMEOUT" --kill-after="${KBH_TIMEOUT_KILL_AFTER_SECONDS:-30}s" \
+        "${timeout_seconds}s" "$@" &
+    cmd_pid=$!
+    stall_marker="$RUN_DIR/host_stall_watchdog.$cmd_pid"
+    rm -f "$stall_marker"
+
+    if [ -n "${stall_seconds}" ] && [ "${stall_seconds}" -gt 0 ]; then
+        (
+            while kill -0 "$cmd_pid" 2>/dev/null; do
+                sleep 30
+                now="$(date +%s)"
+                if [ ! -e "$watch_log" ]; then
+                    continue
+                fi
+                mt="$(stat -c %Y "$watch_log" 2>/dev/null || echo "$now")"
+                if [ $((now - mt)) -ge "$stall_seconds" ]; then
+                    : > "$stall_marker"
+                    printf '%s host_stall_watchdog killed pid=%s after %ss of silence on %s\n' \
+                        "$(date -Is)" "$cmd_pid" "$stall_seconds" "$watch_log" \
+                        >> "$RUN_DIR/stall_watchdog.log"
+                    _kill_pid_group "$cmd_pid" TERM
+                    sleep 2
+                    _kill_pid_group "$cmd_pid" KILL
+                    break
+                fi
+            done
+        ) &
+        watcher_pid=$!
+    fi
+
+    wait "$cmd_pid"
+    status=$?
+    if [ -n "$watcher_pid" ]; then
+        # A tripped watchdog must finish its TERM/KILL escalation. On normal
+        # command completion, cancel its polling sleep immediately.
+        if [ -e "$stall_marker" ]; then
+            wait "$watcher_pid" 2>/dev/null || true
+        else
+            kill "$watcher_pid" 2>/dev/null || true
+        fi
+        wait "$watcher_pid" 2>/dev/null || true
+    fi
+    rm -f "$stall_marker"
+    set -e
+    return "$status"
+}
+
 start_nvcf_proxy() {
     if [ -z "${NGC_API_KEY:-${NVIDIA_API_KEY:-${NVCF_API_KEY:-}}}" ]; then
         echo "NGC_API_KEY, NVIDIA_API_KEY, or NVCF_API_KEY is required for nvcf-nemotron" >&2
@@ -675,7 +614,10 @@ JSON
 
 # Tencent Hy3 via TokenHub (official eval route). OpenAI-compatible only —
 # model id `hy3`, NOT hy3-preview / OpenRouter. TENCENT_API_KEY required.
-# Eval guide: reasoning_effort high|no_think, max_tokens up to 262144.
+# Eval guide advertises 262144, but live TokenHub serving silently hard-caps
+# input at 196608 (= 0.75 * 262144; RCA 2026-07-09). Advertise the measured
+# window so OpenCode auto-compaction fires at 196608-32000=164608, before the
+# wall. OpenCode also clamps max_tokens to min(limit.output, 32000).
 write_tokenhub_hy3_opencode_config() {
     if [ -z "${TENCENT_API_KEY:-}" ]; then
         echo "TENCENT_API_KEY is required for hy3 (Tencent TokenHub)" >&2
@@ -683,6 +625,9 @@ write_tokenhub_hy3_opencode_config() {
     fi
     local reasoning_effort="${1:-high}"
     local config_home="$RUN_DIR/opencode_tokenhub_hy3_config"
+    # Measured TokenHub hy3 input wall; override only for deliberate experiments.
+    local hy3_context="${HY3_TOKENHUB_CONTEXT_LIMIT:-196608}"
+    local hy3_output="${HY3_TOKENHUB_OUTPUT_LIMIT:-32000}"
     mkdir -p "$config_home/opencode"
     cat > "$config_home/opencode/opencode.json" <<JSON
 {
@@ -705,8 +650,8 @@ write_tokenhub_hy3_opencode_config() {
         "hy3": {
           "name": "Hy3",
           "limit": {
-            "context": 262144,
-            "output": 131072
+            "context": ${hy3_context},
+            "output": ${hy3_output}
           },
           "tools": true
         }
@@ -1662,14 +1607,55 @@ case "$HARNESS" in
         HY3_OC_HOME="$(write_tokenhub_hy3_opencode_config "$HY3_RE")"
         HY3_OC_MODEL="tokenhub/hy3"
         if [ "$KBH_AGENT_CONTAINER" = "1" ]; then
+            # Container path already has stall watchdog; raise default for hy3
+            # (TokenHub can legitimately take ~13 min on large-context streams).
+            KBH_OPENCODE_STALL_SECONDS="${KBH_OPENCODE_STALL_SECONDS:-1500}" \
             KBH_OPENCODE_CONFIG_FILE="$HY3_OC_HOME/opencode/opencode.json" \
                 run_opencode_container "$HY3_OC_MODEL" \
                 > "$LOG_FILE" 2> "$STDERR_FILE" || HARNESS_EXIT=$?
         else
-            ( cd "$PROBLEM_DIR" && timeout "$BUDGET_SECONDS" "${AGENT_CUDA_ENV[@]}" \
-                env XDG_CONFIG_HOME="$HY3_OC_HOME" \
-                opencode run --pure --format json -m "$HY3_OC_MODEL" "$PROMPT" \
-                </dev/null > "$LOG_FILE" 2> "$STDERR_FILE" ) || HARNESS_EXIT=$?
+            # Host path (common when TRT-LLM image is missing): supervise
+            # transcript growth and retry, same as container opencode.
+            # Default 1500s: TokenHub can legitimately take ~13 min on large
+            # context; silent multi-hour retry loops still trip the watchdog.
+            HY3_STALL_SECONDS="${KBH_OPENCODE_STALL_SECONDS:-1500}"
+            HY3_MAX_ATTEMPTS=$(( ${KBH_OPENCODE_STALL_RETRIES:-2} + 1 ))
+            HY3_ATTEMPT=1
+            HY3_START_TS="$(date +%s)"
+            HARNESS_EXIT=0
+            while :; do
+                HY3_REMAINING=0
+                if [ "$BUDGET_SECONDS" -ne 0 ]; then
+                    HY3_ELAPSED=$(( $(date +%s) - HY3_START_TS ))
+                    HY3_REMAINING=$(( BUDGET_SECONDS - HY3_ELAPSED ))
+                    if [ "$HY3_REMAINING" -le 60 ]; then
+                        HARNESS_EXIT=124
+                        break
+                    fi
+                fi
+                HY3_WD_BEFORE=0
+                [ -f "$RUN_DIR/stall_watchdog.log" ] && HY3_WD_BEFORE="$(wc -l < "$RUN_DIR/stall_watchdog.log")"
+                HARNESS_EXIT=0
+                # Keep earlier attempts for audit, but reset staleness so a
+                # retry receives its own full watchdog window.
+                touch "$LOG_FILE"
+                (
+                    cd "$PROBLEM_DIR" && \
+                    run_host_with_stall_watch "$HY3_STALL_SECONDS" "$LOG_FILE" "$HY3_REMAINING" \
+                        env XDG_CONFIG_HOME="$HY3_OC_HOME" \
+                        opencode run --pure --format json -m "$HY3_OC_MODEL" "$PROMPT"
+                ) </dev/null >> "$LOG_FILE" 2>> "$STDERR_FILE" || HARNESS_EXIT=$?
+                HY3_WD_AFTER=0
+                [ -f "$RUN_DIR/stall_watchdog.log" ] && HY3_WD_AFTER="$(wc -l < "$RUN_DIR/stall_watchdog.log")"
+                if [ "$HY3_WD_AFTER" -gt "$HY3_WD_BEFORE" ] && [ "$HY3_ATTEMPT" -lt "$HY3_MAX_ATTEMPTS" ]; then
+                    HY3_ATTEMPT=$(( HY3_ATTEMPT + 1 ))
+                    printf '%s hy3 host stall retry attempt=%s/%s\n' \
+                        "$(date -Is)" "$HY3_ATTEMPT" "$HY3_MAX_ATTEMPTS" \
+                        >> "$RUN_DIR/stall_watchdog.log"
+                    continue
+                fi
+                break
+            done
         fi
         ;;
 
@@ -1883,7 +1869,7 @@ case "$HARNESS" in
             run_cursor_container \
                 > "$LOG_FILE" 2> "$STDERR_FILE" || HARNESS_EXIT=$?
         else
-            timeout "$BUDGET_SECONDS" "${AGENT_CUDA_ENV[@]}" agent \
+            timeout "$BUDGET_SECONDS" agent \
                 --trust \
                 --yolo \
                 --print \
@@ -1906,7 +1892,7 @@ case "$HARNESS" in
             run_grok_container "$REASONING_EFFORT" \
                 > "$LOG_FILE" 2> "$STDERR_FILE" || HARNESS_EXIT=$?
         else
-        timeout "$BUDGET_SECONDS" "${AGENT_CUDA_ENV[@]}" grok \
+        timeout "$BUDGET_SECONDS" grok \
             --cwd "$PROBLEM_DIR" \
             --always-approve \
             --permission-mode bypassPermissions \
@@ -1927,7 +1913,7 @@ case "$HARNESS" in
             run_opencode_container \
                 > "$LOG_FILE" 2> "$STDERR_FILE" || HARNESS_EXIT=$?
         else
-            ( cd "$PROBLEM_DIR" && timeout "$BUDGET_SECONDS" "${AGENT_CUDA_ENV[@]}" opencode run \
+            ( cd "$PROBLEM_DIR" && timeout "$BUDGET_SECONDS" opencode run \
                 --pure --format json -m "$MODEL" "$PROMPT" \
                 </dev/null > "$LOG_FILE" 2> "$STDERR_FILE" ) || HARNESS_EXIT=$?
         fi
@@ -1942,7 +1928,7 @@ case "$HARNESS" in
         if [ "$KBH_AGENT_CONTAINER" = "1" ]; then
             KBH_OPENCODE_CONFIG_FILE="$OPENCODE_NEMOTRON_CONFIG_HOME/opencode/opencode.json"                 run_opencode_container "$OPENCODE_NEMOTRON_MODEL"                 > "$LOG_FILE" 2> "$STDERR_FILE" || HARNESS_EXIT=$?
         else
-            ( cd "$PROBLEM_DIR" && timeout "$BUDGET_SECONDS" "${AGENT_CUDA_ENV[@]}"                 env XDG_CONFIG_HOME="$OPENCODE_NEMOTRON_CONFIG_HOME"                 opencode run --pure --format json -m "$OPENCODE_NEMOTRON_MODEL" "$PROMPT"                 </dev/null > "$LOG_FILE" 2> "$STDERR_FILE" ) || HARNESS_EXIT=$?
+            ( cd "$PROBLEM_DIR" && timeout "$BUDGET_SECONDS" env XDG_CONFIG_HOME="$OPENCODE_NEMOTRON_CONFIG_HOME"                 opencode run --pure --format json -m "$OPENCODE_NEMOTRON_MODEL" "$PROMPT"                 </dev/null > "$LOG_FILE" 2> "$STDERR_FILE" ) || HARNESS_EXIT=$?
         fi
         ;;
 
@@ -1952,7 +1938,7 @@ case "$HARNESS" in
         # point an archive-local OpenCode config at it.
         start_nvcf_proxy
         NVCF_OPENCODE_CONFIG_HOME="$(write_nvcf_opencode_config "$NVCF_PROXY_BASE_URL")"
-        ( cd "$PROBLEM_DIR" && timeout "$BUDGET_SECONDS" "${AGENT_CUDA_ENV[@]}" \
+        ( cd "$PROBLEM_DIR" && timeout "$BUDGET_SECONDS" \
             env XDG_CONFIG_HOME="$NVCF_OPENCODE_CONFIG_HOME" \
             opencode run --pure --format json -m "nvcf-nemotron/$MODEL" "$PROMPT" \
             </dev/null > "$LOG_FILE" 2> "$STDERR_FILE" ) || HARNESS_EXIT=$?

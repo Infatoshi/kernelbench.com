@@ -15,17 +15,6 @@ def test_post_run_timeout_starts_inside_gpu_lock() -> None:
     assert "timeout 1800 uv run python benchmark.py" not in script
 
 
-def test_agent_phase_probe_commands_do_not_wait_on_gpu_lock() -> None:
-    script = RUN_HARD.read_text()
-    start = script.index('if [ "${KBH_AGENT_PHASE:-0}" = "1" ]; then')
-    end = script.index('owner_file="${KBH_GPU_LOCK}.owner"', start)
-    block = script[start:end]
-    assert "uv|python|python3|nvidia-smi|nvcc)" in block
-    assert "ncu|nsys)" in block
-    assert "exit 125" in block
-    assert "flock" not in block
-
-
 def test_baseline_generator_opts_into_reference_diagnostics() -> None:
     script = RUN_BASELINES.read_text()
     assert "KBH_BENCHMARK_BASELINES=1 timeout 300 uv run python benchmark.py" in script
@@ -73,7 +62,7 @@ def test_grok_uses_headless_cli_and_end_marker() -> None:
     start = script.index("grok)")
     end = script.index(";;", start)
     block = script[start:end]
-    assert 'timeout "$BUDGET_SECONDS" "${AGENT_CUDA_ENV[@]}" grok' in block
+    assert 'timeout "$BUDGET_SECONDS" grok' in block
     assert '--cwd "$PROBLEM_DIR"' in block
     assert "--output-format streaming-json" in block
     assert '"type":"end"' in script
@@ -86,3 +75,14 @@ def test_parallel_launcher_keeps_run_hard_jobs_waitable() -> None:
     assert 'launch_one "$name" "$harness" "$model" "$effort" "$problem"' in script
     assert 'pid="$LAST_LAUNCH_PID"' in script
     assert 'wait "$pid" || true' in script
+
+
+def test_cuda_cannot_be_disabled_for_agent_phase() -> None:
+    script = RUN_HARD.read_text()
+    parallel = LAUNCH_PARALLEL.read_text()
+    retries = (ROOT / "scripts" / "launch_infra_retries.sh").read_text()
+    for text in (script, parallel, retries):
+        assert "KBH_DISABLE_AGENT_CUDA" not in text
+        assert "AGENT_CUDA_ENV" not in text
+        assert "KBH_AGENT_PHASE" not in text
+        assert "CUDA_VISIBLE_DEVICES=" not in text

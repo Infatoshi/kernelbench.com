@@ -76,7 +76,6 @@ launch_one() {
     fi
     (
         export KBH_RUN_GROUP="$RUN_GROUP"
-        export KBH_DISABLE_AGENT_CUDA="${KBH_DISABLE_AGENT_CUDA:-1}"
         export BUDGET_SECONDS="$BUDGET_SECONDS"
         "${cmd[@]}"
     ) > "$log" 2>&1 &

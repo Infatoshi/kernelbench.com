@@ -18,15 +18,15 @@ def test_post_run_timeout_starts_inside_gpu_lock() -> None:
     assert "timeout 1800 uv run python benchmark.py" not in script
 
 
-def test_agent_phase_probe_commands_do_not_wait_on_gpu_lock() -> None:
+def test_cuda_cannot_be_disabled_for_agent_phase() -> None:
     script = RUN_HARD.read_text()
-    start = script.index('if [ "${KBH_AGENT_PHASE:-0}" = "1" ]; then')
-    end = script.index('owner_file="${KBH_GPU_LOCK}.owner"', start)
-    block = script[start:end]
-    assert "uv|python|python3|nvidia-smi|nvcc)" in block
-    assert "ncu|nsys)" in block
-    assert "exit 125" in block
-    assert "flock" not in block
+    parallel = LAUNCH_PARALLEL.read_text()
+    retries = (ROOT / "scripts" / "launch_infra_retries.sh").read_text()
+    for text in (script, parallel, retries):
+        assert "KBH_DISABLE_AGENT_CUDA" not in text
+        assert "AGENT_CUDA_ENV" not in text
+        assert "KBH_AGENT_PHASE" not in text
+        assert "CUDA_VISIBLE_DEVICES=" not in text
 
 
 def test_kda_has_longer_benchmark_timeout_backstop() -> None:
@@ -167,7 +167,7 @@ def test_grok_uses_headless_cli_and_end_marker() -> None:
     start = script.index("grok)")
     end = script.index(";;", start)
     block = script[start:end]
-    assert 'timeout "$BUDGET_SECONDS" "${AGENT_CUDA_ENV[@]}" grok' in block
+    assert 'timeout "$BUDGET_SECONDS" grok' in block
     assert '--cwd "$PROBLEM_DIR"' in block
     assert "--output-format streaming-json" in block
     assert '"type":"end"' in script
@@ -228,7 +228,7 @@ def test_nvcf_nemotron_uses_local_proxy_and_archive_config() -> None:
     assert 'env XDG_CONFIG_HOME="$NVCF_OPENCODE_CONFIG_HOME"' in block
     assert '-m "nvcf-nemotron/$MODEL"' in block
     assert "opencode run --pure --format json" in block
-    assert "droid|kimi|opencode|opencode-nemotron|nvcf-nemotron)" in script
+    assert "droid|kimi|opencode|opencode-nemotron|nvcf-nemotron|hy3|hy3-claude)" in script
 
 
 def test_parallel_launcher_keeps_run_hard_jobs_waitable() -> None:
@@ -271,6 +271,25 @@ def test_opencode_container_has_stall_watchdog_and_retry() -> None:
     assert "KBH_OPENCODE_STALL_SECONDS" in block
     assert "KBH_OPENCODE_STALL_RETRIES" in block
     assert "remaining=$(( BUDGET_SECONDS - elapsed ))" in block
+
+
+def test_hy3_tokenhub_uses_measured_context_wall_and_host_stall_watch() -> None:
+    script = RUN_HARD.read_text()
+    # Live TokenHub hy3 hard-caps input at 196608 (RCA 2026-07-09). Advertising
+    # 262144 put OpenCode compaction past the real wall.
+    cfg = script[script.index("write_tokenhub_hy3_opencode_config()"):script.index("prepare_claude_container_home()")]
+    assert "HY3_TOKENHUB_CONTEXT_LIMIT:-196608" in cfg
+    assert "HY3_TOKENHUB_OUTPUT_LIMIT:-32000" in cfg
+    assert "262144" not in cfg
+    # Host-mode path (KBH_AGENT_CONTAINER=0) must supervise transcript growth.
+    assert "run_host_with_stall_watch()" in script
+    assert "host_stall_watchdog" in script
+    assert 'kill "-${sig}" -- "-${pid}"' in script
+    assert 'touch "$LOG_FILE"' in script
+    assert ') </dev/null >> "$LOG_FILE" 2>> "$STDERR_FILE"' in script
+    hy3 = script[script.index("hy3|hy3-claude)"):script.index("deepseek-claude)")]
+    assert "run_host_with_stall_watch" in hy3
+    assert "KBH_OPENCODE_STALL_SECONDS:-1500" in hy3
 
 
 def test_agent_container_sessions_parallel_with_per_command_lock() -> None:

@@ -44,6 +44,9 @@ _NEED = {
     "minimax-claude": "MINIMAX_API_KEY",
     "deepseek-claude": "DEEPSEEK_API_KEY",
     "qwen-claude": "DASHSCOPE_API_KEY",
+    "longcat-claude": "LONGCAT_API_KEY",
+    "hy3": "TENCENT_API_KEY",
+    "hy3-claude": "TENCENT_API_KEY",  # legacy alias → TokenHub, not Claude Code
     "gemini": "GEMINI_API_KEY",
     "opencode-nemotron": "OPENROUTER_API_KEY",
 }

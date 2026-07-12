@@ -4,6 +4,16 @@ A running record of decisions, dead ends, and lessons. Newest entries on top. Th
 
 ---
 
+## 2026-07-09 - Agent-side CUDA disabling removed
+
+`KBH_DISABLE_AGENT_CUDA` was removed from the harness, parallel launcher, and
+infra-retry launcher. It had been introduced to prevent parallel agents from
+bypassing the shared GPU lock, but hiding CUDA also removed the live
+compile/check/benchmark/profile loop that KernelBench is intended to measure.
+That made disabled and enabled runs incomparable. New runs always expose CUDA;
+parallel GPU commands serialize through `outputs/gpu.lock`. Historical
+`agent_cuda_disabled` metadata remains in archived results for provenance.
+
 ## 2026-07-01 — fable-5 lands 14.3x on 01_rl_grid_ppo; SPS credibility cap recalibrated 20x → 100x
 
 First fable-5 (Claude Code, effort max) run on the RL deck: 14.2961x

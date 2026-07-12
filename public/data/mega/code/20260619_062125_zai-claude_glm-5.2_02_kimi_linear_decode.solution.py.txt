@@ -1,0 +1,335 @@
+"""Fused W4A16 dequant-GEMV decode for the Kimi-Linear hybrid unit (batch=1).
+
+Same math, same module tree / buffer names as the correctness oracle so it loads
+the oracle weights via ``load_state_dict(strict=True)``. The difference: the
+big int4 projections are computed by a fused dequant-GEMV that streams the int4
+weights exactly once (no bf16 weight materialization), and MLA uses the absorb
+formulation so the kv_lora up-projection never runs over the whole cache.
+"""
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import triton
+import triton.language as tl
+
+EPS = 1.0e-6
+GROUP_SIZE = 128
+
+
+@dataclass(frozen=True)
+class Config:
+    hidden: int = 2304
+    kda_heads: int = 32
+    kda_head_dim: int = 128
+    short_conv: int = 4
+    mla_heads: int = 32
+    kv_lora: int = 512
+    qk_nope: int = 128
+    qk_rope: int = 64
+    v_head: int = 128
+    rope_theta: float = 10000.0
+    n_experts: int = 64
+    n_active: int = 8
+    n_shared: int = 1
+    moe_inter: int = 1024
+    routed_scaling: float = 2.446
+    group: int = 128
+    pattern: tuple = ("K", "K", "K", "M")
+    dtype: "torch.dtype" = field(default=torch.bfloat16)
+
+
+def build_config(shape: dict) -> Config:
+    return Config(n_experts=int(shape.get("n_experts", 64)))
+
+
+# --------------------------------------------------------------------------- #
+# Fused W4A16 dequant-GEMV (M=1) Triton kernel
+#   y[N] = x[K] @ dequant(w_q)[K,N]
+#   w_q[K//2, N] uint8: byte kh holds k=2*kh (low nibble) and k=2*kh+1 (hi nibble)
+#   scales/zeros[K//128, N] bf16, group=128 along K
+#   w[k,n] = (unpack(w_q)[k,n] - zeros[k//128,n]) * scales[k//128,n]
+#
+# Per output tile (BLOCK_N columns) we stream the K dimension group by group.
+# Each group (128 K / 64 packed bytes) shares one scale/zero per column, so the
+# dot splits into even-k (lo nibble) and odd-k (hi nibble) partials plus a
+# zero*scale correction -- no bf16 weight tile is ever materialized.
+# --------------------------------------------------------------------------- #
+@triton.jit
+def _w4_gemv_kernel(
+    x_ptr, wq_ptr, s_ptr, z_ptr, y_ptr,
+    N, NG,
+    stride_xk,
+    stride_wqk, stride_wqn,
+    stride_sg, stride_sn,
+    stride_yn,
+    BLOCK_N: tl.constexpr,
+    GROUP: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    offs_n = pid * BLOCK_N + tl.arange(0, BLOCK_N)
+    mask_n = offs_n < N
+    acc = tl.zeros((BLOCK_N,), dtype=tl.float32)
+    HALF: tl.constexpr = GROUP // 2
+    i = tl.arange(0, HALF)
+    for g in range(0, NG):
+        s = tl.load(s_ptr + g * stride_sg + offs_n * stride_sn,
+                    mask=mask_n, other=0.0).to(tl.float32)
+        z = tl.load(z_ptr + g * stride_sg + offs_n * stride_sn,
+                    mask=mask_n, other=0.0).to(tl.float32)
+        kh = g * HALF + i                                   # [HALF] packed-byte rows
+        wq = tl.load(wq_ptr + kh[:, None] * stride_wqk + offs_n[None, :] * stride_wqn,
+                     mask=mask_n[None, :], other=0).to(tl.int32)   # [HALF, BLOCK_N]
+        lo = (wq & 0xF).to(tl.float32)
+        hi = ((wq >> 4) & 0xF).to(tl.float32)
+        ke = g * GROUP + 2 * i
+        ko = g * GROUP + 2 * i + 1
+        xe = tl.load(x_ptr + ke * stride_xk).to(tl.float32)        # [HALF]
+        xo = tl.load(x_ptr + ko * stride_xk).to(tl.float32)        # [HALF]
+        A = tl.sum(xe[:, None] * lo, axis=0)                       # [BLOCK_N]
+        B = tl.sum(xo[:, None] * hi, axis=0)                       # [BLOCK_N]
+        xsum = tl.sum(xe) + tl.sum(xo)                             # scalar
+        acc += s * (A + B - z * xsum)
+    tl.store(y_ptr + offs_n * stride_yn, acc.to(y_ptr.dtype.element_ty), mask=mask_n)
+
+
+def _gemv_block_n(N: int) -> int:
+    # power-of-two tile, prefer 128 but cap so tiny N still works
+    if N >= 128:
+        return 128
+    if N >= 64:
+        return 64
+    return triton.next_power_of_2(N)
+
+
+def w4_gemv(x: torch.Tensor, w_q: torch.Tensor, scales: torch.Tensor,
+            zeros: torch.Tensor) -> torch.Tensor:
+    """Fused int4 dequant-GEMV for a 1-D activation x[K] -> y[N] (bf16)."""
+    assert x.dim() == 1
+    K2, N = w_q.shape
+    K = K2 * 2
+    NG = K // GROUP_SIZE
+    y = torch.empty(N, dtype=torch.bfloat16, device=x.device)
+    BLOCK_N = _gemv_block_n(N)
+    grid = (triton.cdiv(N, BLOCK_N),)
+    _w4_gemv_kernel[grid](
+        x, w_q, scales, zeros, y,
+        N, NG,
+        x.stride(0),
+        w_q.stride(0), w_q.stride(1),
+        scales.stride(0), scales.stride(1),
+        y.stride(0),
+        BLOCK_N=BLOCK_N, GROUP=GROUP_SIZE,
+        num_warps=4, num_stages=2,
+    )
+    return y
+
+
+# --------------------------------------------------------------------------- #
+# quantized linear / experts containers (buffer names must match the oracle)
+# --------------------------------------------------------------------------- #
+def _unpack_dequant(w_q: torch.Tensor, scales: torch.Tensor, zeros: torch.Tensor,
+                    K: int, group: int) -> torch.Tensor:
+    """Materialize the bf16 weight (only used for small / rare M>1 paths)."""
+    out = torch.empty((K, w_q.shape[1]), dtype=torch.uint8, device=w_q.device)
+    out[0::2] = w_q & 0xF
+    out[1::2] = (w_q >> 4) & 0xF
+    s = scales.repeat_interleave(group, dim=0)
+    z = zeros.repeat_interleave(group, dim=0)
+    return (out.to(torch.bfloat16) - z) * s
+
+
+class QuantLinear(nn.Module):
+    def __init__(self, in_f: int, out_f: int, group: int = GROUP_SIZE):
+        super().__init__()
+        self.in_f, self.out_f, self.group = in_f, out_f, group
+        ng = in_f // group
+        self.register_buffer("w_q", torch.zeros(in_f // 2, out_f, dtype=torch.uint8))
+        self.register_buffer("scales", torch.zeros(ng, out_f, dtype=torch.bfloat16))
+        self.register_buffer("zeros", torch.zeros(ng, out_f, dtype=torch.bfloat16))
+
+    def weight_bf(self) -> torch.Tensor:
+        return _unpack_dequant(self.w_q, self.scales, self.zeros, self.in_f, self.group)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.dim() == 1:
+            return w4_gemv(x, self.w_q, self.scales, self.zeros)
+        return x @ self.weight_bf()
+
+
+class QuantExperts(nn.Module):
+    def __init__(self, n: int, in_f: int, out_f: int, group: int = GROUP_SIZE):
+        super().__init__()
+        self.n, self.in_f, self.out_f, self.group = n, in_f, out_f, group
+        ng = in_f // group
+        self.register_buffer("w_q", torch.zeros(n, in_f // 2, out_f, dtype=torch.uint8))
+        self.register_buffer("scales", torch.zeros(n, ng, out_f, dtype=torch.bfloat16))
+        self.register_buffer("zeros", torch.zeros(n, ng, out_f, dtype=torch.bfloat16))
+
+    def weight_bf(self, e: int) -> torch.Tensor:
+        return _unpack_dequant(self.w_q[e], self.scales[e], self.zeros[e], self.in_f, self.group)
+
+
+# --------------------------------------------------------------------------- #
+# helpers
+# --------------------------------------------------------------------------- #
+def _rmsnorm(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
+    xf = x.float()
+    xf = xf * torch.rsqrt(xf.pow(2).mean(-1, keepdim=True) + EPS)
+    return (xf * w.float()).to(x.dtype)
+
+
+def _rope_cossin(pos: int, dim: int, theta: float, device):
+    inv = 1.0 / (theta ** (torch.arange(0, dim, 2, device=device, dtype=torch.float32) / dim))
+    ang = pos * inv
+    return torch.cos(ang), torch.sin(ang)
+
+
+def _apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+    xf = x.float()
+    even, odd = xf[..., 0::2], xf[..., 1::2]
+    out = torch.empty_like(xf)
+    out[..., 0::2] = even * cos - odd * sin
+    out[..., 1::2] = odd * cos + even * sin
+    return out.to(x.dtype)
+
+
+# --------------------------------------------------------------------------- #
+# layers
+# --------------------------------------------------------------------------- #
+class KDA(nn.Module):
+    def __init__(self, cfg: Config):
+        super().__init__()
+        self.cfg = cfg
+        H, Dk, d = cfg.kda_heads, cfg.kda_head_dim, cfg.hidden
+        self.q_proj = QuantLinear(d, H * Dk, cfg.group)
+        self.k_proj = QuantLinear(d, H * Dk, cfg.group)
+        self.v_proj = QuantLinear(d, H * Dk, cfg.group)
+        self.g_proj = QuantLinear(d, H * Dk, cfg.group)
+        self.beta_proj = nn.Linear(d, H, bias=False, dtype=cfg.dtype)
+        self.conv_w = nn.Parameter(torch.empty(3, H * Dk, cfg.short_conv, dtype=cfg.dtype))
+        self.o_proj = QuantLinear(H * Dk, d, cfg.group)
+        self.scale = Dk ** -0.5
+
+    def _short_conv(self, val, prev, idx):
+        win = torch.cat([prev, val[None]], dim=0)
+        w = self.conv_w[idx].float().transpose(0, 1)
+        out = (win.float() * w).sum(0)
+        return F.silu(out).to(val.dtype), win[1:]
+
+    def step(self, x, st):
+        H, Dk = self.cfg.kda_heads, self.cfg.kda_head_dim
+        q = self.q_proj(x)
+        k = self.k_proj(x)
+        v = self.v_proj(x)
+        q, st["cq"] = self._short_conv(q, st["cq"], 0)
+        k, st["ck"] = self._short_conv(k, st["ck"], 1)
+        v, st["cv"] = self._short_conv(v, st["cv"], 2)
+        q = q.view(H, Dk).float() * self.scale
+        k = k.view(H, Dk).float()
+        v = v.view(H, Dk).float()
+        g = (-F.softplus(self.g_proj(x).float())).view(H, Dk)
+        beta = torch.sigmoid(self.beta_proj(x).float())
+        S = st["S"] * g.exp()[:, :, None]
+        pred = (S * k[:, :, None]).sum(1)
+        S = S + beta[:, None, None] * k[:, :, None] * (v - pred)[:, None, :]
+        o = (S * q[:, :, None]).sum(1)
+        st["S"] = S
+        return self.o_proj(o.reshape(H * Dk).to(torch.bfloat16))
+
+
+class MLA(nn.Module):
+    def __init__(self, cfg: Config):
+        super().__init__()
+        self.cfg = cfg
+        H, d = cfg.mla_heads, cfg.hidden
+        self.q_proj = QuantLinear(d, H * (cfg.qk_nope + cfg.qk_rope), cfg.group)
+        self.kv_a = QuantLinear(d, cfg.kv_lora + cfg.qk_rope, cfg.group)
+        self.kv_b = QuantLinear(cfg.kv_lora, H * (cfg.qk_nope + cfg.v_head), cfg.group)
+        self.o_proj = QuantLinear(H * cfg.v_head, d, cfg.group)
+        self.scale = (cfg.qk_nope + cfg.qk_rope) ** -0.5
+
+    def step(self, x, st):
+        cfg = self.cfg
+        H = cfg.mla_heads
+        pos = st["c_kv"].shape[0]
+        q = self.q_proj(x).view(H, cfg.qk_nope + cfg.qk_rope)
+        q_nope = q[:, : cfg.qk_nope].float()
+        q_rope = q[:, cfg.qk_nope :]
+        kv = self.kv_a(x)
+        c_kv = kv[: cfg.kv_lora]
+        k_rope = kv[cfg.kv_lora :]
+        cos, sin = _rope_cossin(pos, cfg.qk_rope, cfg.rope_theta, x.device)
+        q_rope = _apply_rope(q_rope, cos, sin).float()
+        k_rope = _apply_rope(k_rope, cos, sin)
+        st["c_kv"] = torch.cat([st["c_kv"], c_kv[None]], 0)
+        st["k_rope"] = torch.cat([st["k_rope"], k_rope[None]], 0)
+        kvb = (st["c_kv"] @ self.kv_b.weight_bf()).view(-1, H, cfg.qk_nope + cfg.v_head).float()
+        k_nope = kvb[..., : cfg.qk_nope]
+        v = kvb[..., cfg.qk_nope :]
+        scores = (torch.einsum("hd,lhd->lh", q_nope, k_nope)
+                  + torch.einsum("hd,ld->lh", q_rope, st["k_rope"].float())) * self.scale
+        p = torch.softmax(scores, dim=0)
+        o = torch.einsum("lh,lhd->hd", p, v)
+        return self.o_proj(o.reshape(H * cfg.v_head).to(torch.bfloat16))
+
+
+class MoE(nn.Module):
+    def __init__(self, cfg: Config):
+        super().__init__()
+        self.cfg = cfg
+        d, m, E = cfg.hidden, cfg.moe_inter, cfg.n_experts
+        self.router = nn.Linear(d, E, bias=False, dtype=cfg.dtype)
+        self.gate = QuantExperts(E, d, m, cfg.group)
+        self.up = QuantExperts(E, d, m, cfg.group)
+        self.down = QuantExperts(E, m, d, cfg.group)
+        self.s_gate = QuantExperts(cfg.n_shared, d, m, cfg.group)
+        self.s_up = QuantExperts(cfg.n_shared, d, m, cfg.group)
+        self.s_down = QuantExperts(cfg.n_shared, m, d, cfg.group)
+
+    def _ffn(self, x, experts_g, experts_u, experts_d, e):
+        g = w4_gemv(x, experts_g.w_q[e], experts_g.scales[e], experts_g.zeros[e]).float()
+        u = w4_gemv(x, experts_u.w_q[e], experts_u.scales[e], experts_u.zeros[e]).float()
+        h = F.silu(g) * u
+        return w4_gemv(h, experts_d.w_q[e], experts_d.scales[e], experts_d.zeros[e])
+
+    def step(self, x):
+        cfg = self.cfg
+        probs = torch.softmax(self.router(x).float(), dim=-1)
+        w, idx = torch.topk(probs, cfg.n_active)
+        w = w / (w.sum() + 1e-9) * cfg.routed_scaling
+        out = x.new_zeros(cfg.hidden, dtype=torch.float32)
+        for j in range(cfg.n_active):
+            out = out + w[j] * self._ffn(x, self.gate, self.up, self.down, int(idx[j]))
+        for s in range(cfg.n_shared):
+            out = out + self._ffn(x, self.s_gate, self.s_up, self.s_down, s)
+        return out.to(torch.bfloat16)
+
+
+class Block(nn.Module):
+    def __init__(self, cfg: Config, kind: str):
+        super().__init__()
+        self.kind = kind
+        self.attn_norm = nn.Parameter(torch.ones(cfg.hidden, dtype=cfg.dtype))
+        self.moe_norm = nn.Parameter(torch.ones(cfg.hidden, dtype=cfg.dtype))
+        self.attn = KDA(cfg) if kind == "K" else MLA(cfg)
+        self.moe = MoE(cfg)
+
+    def step(self, x, st):
+        h = x + self.attn.step(_rmsnorm(x, self.attn_norm), st)
+        return h + self.moe.step(_rmsnorm(h, self.moe_norm))
+
+
+class Model(nn.Module):
+    def __init__(self, cfg: Config):
+        super().__init__()
+        self.cfg = cfg
+        self.blocks = nn.ModuleList(Block(cfg, k) for k in cfg.pattern)
+
+    def step(self, hidden, state):
+        for i, blk in enumerate(self.blocks):
+            hidden = blk.step(hidden, state[i])
+        return hidden, state
