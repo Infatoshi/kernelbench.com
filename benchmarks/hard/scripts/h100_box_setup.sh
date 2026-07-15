@@ -9,15 +9,22 @@ PHASE="${1:?pre|verify}"
 
 pre() {
   echo "=== [1/5] driver R580 ==="
+  # Blackwell datacenter GPUs (B200/GB200) refuse the proprietary kernel
+  # module ("requires use of the NVIDIA open kernel modules" in dmesg);
+  # install the -open flavor there. H100/RTX PRO take either.
+  DRIVER_PKG=cuda-drivers-580
+  if nvidia-smi -L 2>/dev/null | grep -q "B200\|GB200" || lspci -nn 2>/dev/null | grep -qi "10de:2901"; then
+    DRIVER_PKG=nvidia-open-580
+  fi
   sudo apt-get update -qq
   sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
-    -o Dpkg::Options::=--force-overwrite cuda-drivers-580 || true
+    -o Dpkg::Options::=--force-overwrite "$DRIVER_PKG" || true
   # clear any half-removed older branch that blocks the transition
   sudo dpkg --remove --force-all libnvidia-extra-570 libnvidia-gl-570 2>/dev/null || true
   sudo dpkg --configure -a || true
   sudo apt-get install -f -y -o Dpkg::Options::=--force-overwrite || true
   sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
-    -o Dpkg::Options::=--force-overwrite cuda-drivers-580
+    -o Dpkg::Options::=--force-overwrite "$DRIVER_PKG"
   sudo DEBIAN_FRONTEND=noninteractive apt-get purge -y \
     'nvidia-fabricmanager-570' 'libnvidia-common-570' 'nvidia-firmware-570' 2>/dev/null || true
   sudo apt-get autoremove -y || true
