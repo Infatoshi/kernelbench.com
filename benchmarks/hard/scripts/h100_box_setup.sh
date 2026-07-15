@@ -46,7 +46,7 @@ verify() {
   echo "uv:"; ~/.local/bin/uv --version 2>/dev/null || uv --version
   echo "docker root:"; docker info 2>/dev/null | grep -i "Docker Root"
   echo "ctk mode:"; grep -E '^\s*mode' /etc/nvidia-container-runtime/config.toml
-  echo "gpus-all test:"; docker run --rm --gpus all nvcr.io/nvidia/tensorrt-llm/release:latest nvidia-smi -L 2>&1 | tail -1
+  echo "gpus-all test:"; docker run --rm --gpus all nvcr.io/nvidia/tensorrt-llm/release:1.2.1 nvidia-smi -L 2>&1 | tail -1
   echo "df:"; df -h / /ephemeral | grep -vE Filesystem
 }
 
