@@ -2401,3 +2401,55 @@ present, leave it alone and report it as concurrent machine state.
 - **Removing problem.yaml + shapes.py from the model's view.** Currently they sit in the workspace because check.py and benchmark.py import them. Refactor option: pre-render their content into the prompt (already done) and have check.py / benchmark.py read yaml/shapes from a sibling private directory. Closes a small information leak. Not currently load-bearing.
 
 - **Per-problem prompt voice consistency.** All seven prompts hand-written in one session, same voice, same four-paragraph structure. If we add an 8th problem (Metal lightning attn) or add a second hardware target, the temptation will be to write that prompt in a different style. Resist. The voice is part of the experimental control.
+
+---
+
+## 2026-07-15 — kinetic-0715 (Moonshot) and the "preserved thinking" 400
+
+Wiring Moonshot's new `kinetic-0715` through Claude Code (`kinetic-claude`
+harness, same Anthropic endpoint as kimi-claude but a separate
+`MOONSHOT_API_KEY`) hit a deterministic session-killer: a few tool-use turns
+in, every request 400s with *"under preserved thinking, every assistant
+message must pass back its thinking content, but assistant message at index N
+is missing it."*
+
+Root cause, established by capturing Claude Code's exact failing request with
+a logging proxy and bisecting it via direct replays: **the model itself
+sometimes emits assistant messages with no thinking block** (plain tool_use
+turns), and Moonshot's validator then rejects any request that replays that
+history — the endpoint 400s the model's own prior output. Verbatim replay →
+400; identical body with a placeholder thinking block injected into each
+thinkingless assistant message → 200. Not fixable by request params: fails
+with `thinking: adaptive`, `thinking: enabled+budget`, and no thinking param
+at all. kimi-k2.7-code never trips this because it emits thinking in every
+assistant message (92/92 in the June topk run); kinetic skips it on some
+turns.
+
+Fix: `scripts/kinetic_thinking_proxy.py`, a stdlib-only local rewriting proxy
+that injects `{"type":"thinking","thinking":"(continuing)","signature":""}`
+into any thinkingless assistant message on `/v1/messages` and passes
+everything else (including SSE) through. The `kinetic-claude` branches in
+hard and mega `run_hard.sh` launch it per-run (container mode reaches it via
+the docker bridge IP). Gotcha that cost an hour: Claude Code posts to
+`/v1/messages?beta=true`, so the path match must strip the query string.
+
+Validation: a breaker prompt forcing ~14 sequential tool calls + task-tool
+usage 400s in 3 turns without the proxy, and completes 30 turns clean through
+it. A 420s harness smoke on `01_fp8_gemm` then produced a **correct** fp8
+GEMM at 0.106 peak fraction with zero 400s. Remove the proxy once Moonshot
+fixes the validator server-side (worth reporting in the Moonshot Slack: the
+one-line repro is "replay any kinetic history containing one of its own
+thinkingless assistant messages").
+
+**Update, same day:** the proxy is retired; `CLAUDE_CODE_EFFORT_LEVEL=max`
+alone eliminates the 400 at the source — bisected: the breaker prompt that
+dies at turn 3 by default completes 29/29 turns with thinking present in
+every assistant message once effort is max (kinetic thinks on every turn, so
+the validator never sees a thinkingless message to reject). The
+kinetic-claude branches now set `CLAUDE_CODE_EFFORT_LEVEL=max` (also the
+right call for bench comparability — matches the Opus `--effort max`
+convention) and hit `https://api.moonshot.ai/anthropic` directly;
+`kinetic_thinking_proxy.py` was deleted (recoverable from this entry / git
+history if kinetic ever skips thinking at effort max — the residual risk is
+behavioral, not contractual, and a hit would surface as a deterministic 400
+→ retryable_infra_failure).

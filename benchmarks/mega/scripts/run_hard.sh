@@ -526,6 +526,48 @@ case "$HARNESS" in
             > "$LOG_FILE" 2> "$STDERR_FILE" || HARNESS_EXIT=$?
         ;;
 
+    kinetic-claude)
+        # Claude Code routed to Moonshot's Anthropic-compatible endpoint for
+        # kinetic-0715. Requires MOONSHOT_API_KEY (KIMI_API_KEY 401s on it).
+        # ENABLE_TOOL_SEARCH=false + CLAUDE_CODE_SUBAGENT_MODEL per Moonshot's
+        # Claude Code guide.
+        if [ -z "${MOONSHOT_API_KEY:-}" ]; then
+            echo "MOONSHOT_API_KEY is required for kinetic-claude" >&2
+            exit 1
+        fi
+        # Moonshot's validator 400s histories containing the model's own
+        # thinkingless assistant messages; CLAUDE_CODE_EFFORT_LEVEL=max below
+        # makes kinetic think on every turn, which avoids ever creating that
+        # message shape (bisect-verified 2026-07-15, see hard DEVLOG).
+        KINETIC_CLAUDE_ALIAS="${KINETIC_CLAUDE_ALIAS:-opus}"
+        KINETIC_CLAUDE_HAIKU_MODEL="${KINETIC_CLAUDE_HAIKU_MODEL:-$MODEL}"
+        ( cd "$PROBLEM_DIR" && \
+            export ANTHROPIC_AUTH_TOKEN="$MOONSHOT_API_KEY" && \
+            export ANTHROPIC_BASE_URL="${KINETIC_ANTHROPIC_BASE_URL:-https://api.moonshot.ai/anthropic}" && \
+            export API_TIMEOUT_MS="${API_TIMEOUT_MS:-3000000}" && \
+            export CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC="${CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC:-1}" && \
+            export CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS="${CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS:-1}" && \
+            export CLAUDE_CODE_MAX_RETRIES="${CLAUDE_CODE_MAX_RETRIES:-1000000}" && \
+            export CLAUDE_CODE_MAX_OUTPUT_TOKENS="${CLAUDE_CODE_MAX_OUTPUT_TOKENS:-128000}" && \
+            export ANTHROPIC_MODEL="$MODEL" && \
+            export ANTHROPIC_DEFAULT_HAIKU_MODEL="$KINETIC_CLAUDE_HAIKU_MODEL" && \
+            export ANTHROPIC_DEFAULT_SONNET_MODEL="$MODEL" && \
+            export ANTHROPIC_DEFAULT_OPUS_MODEL="$MODEL" && \
+            export ENABLE_TOOL_SEARCH="${ENABLE_TOOL_SEARCH:-false}" && \
+                export CLAUDE_CODE_EFFORT_LEVEL="${CLAUDE_CODE_EFFORT_LEVEL:-max}" && \
+            export CLAUDE_CODE_SUBAGENT_MODEL="$MODEL" && \
+            "${KBH_SBX[@]}" timeout "$BUDGET_SECONDS" claude \
+                --dangerously-skip-permissions \
+                --print --verbose \
+                --output-format stream-json \
+                --settings "$CLAUDE_KBH_SETTINGS" \
+                --model "$KINETIC_CLAUDE_ALIAS" \
+                --disallowedTools ExitPlanMode EnterPlanMode AskUserQuestion \
+                --add-dir "$PROBLEM_DIR" \
+                -p "$PROMPT" ) \
+            > "$LOG_FILE" 2> "$STDERR_FILE" || HARNESS_EXIT=$?
+        ;;
+
     longcat-claude)
         # Claude Code routed to Meituan LongCat's Anthropic-compatible endpoint.
         # Requires LONGCAT_API_KEY. Pass MODEL=LongCat-2.0.
@@ -758,7 +800,7 @@ JSON
 
     *)
         echo "Unknown harness: $HARNESS" >&2
-        echo "Supported: claude, zai-claude, minimax-claude, kimi-claude, longcat-claude, hy3, deepseek-claude, ccr-claude, codex, kimi, droid, gemini, cursor, grok, opencode" >&2
+        echo "Supported: claude, zai-claude, minimax-claude, kimi-claude, kinetic-claude, longcat-claude, hy3, deepseek-claude, ccr-claude, codex, kimi, droid, gemini, cursor, grok, opencode" >&2
         exit 1
         ;;
 esac
@@ -789,7 +831,7 @@ fi
 
 SESSION_COMPLETE=true
 case "$HARNESS" in
-    claude|zai-claude|minimax-claude|kimi-claude|longcat-claude|deepseek-claude|ccr-claude|cursor|gemini)
+    claude|zai-claude|minimax-claude|kimi-claude|kinetic-claude|longcat-claude|deepseek-claude|ccr-claude|cursor|gemini)
         if ! grep -q '"type":"result"' "$CHECK_FILE" 2>/dev/null; then
             SESSION_COMPLETE=false
         fi

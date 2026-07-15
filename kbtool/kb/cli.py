@@ -34,12 +34,13 @@ kb — KernelBench operator CLI   (repo: {root})
   kb help
 
 Keys live in ~/.env_vars. Bench a new model: add its key, then  kb sweep <harness> <model>.
-Harnesses: claude codex cursor gemini grok opencode | zai-claude minimax-claude kimi-claude deepseek-claude qwen-claude
+Harnesses: claude codex cursor gemini grok opencode | zai-claude minimax-claude kimi-claude kinetic-claude deepseek-claude qwen-claude
 """
 
 # harness -> required env key for preflight
 _NEED = {
     "kimi-claude": "KIMI_API_KEY",
+    "kinetic-claude": "MOONSHOT_API_KEY",  # kinetic-0715; KIMI_API_KEY 401s on it
     "zai-claude": "ZAI_API_KEY",
     "minimax-claude": "MINIMAX_API_KEY",
     "deepseek-claude": "DEEPSEEK_API_KEY",

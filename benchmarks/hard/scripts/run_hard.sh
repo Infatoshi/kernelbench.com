@@ -1512,6 +1512,84 @@ case "$HARNESS" in
         fi
         ;;
 
+    kinetic-claude)
+        # Claude Code routed to Moonshot's Anthropic-compatible endpoint for
+        # kinetic-0715. Same base URL as kimi-claude but a DIFFERENT key:
+        # requires MOONSHOT_API_KEY (KIMI_API_KEY 401s on kinetic-0715).
+        # Reasoning model: thinking tokens count toward max_tokens, so keep
+        # CLAUDE_CODE_MAX_OUTPUT_TOKENS high (default 128000 below).
+        # ENABLE_TOOL_SEARCH=false + CLAUDE_CODE_SUBAGENT_MODEL per Moonshot's
+        # Claude Code guide.
+        if [ -z "${MOONSHOT_API_KEY:-}" ]; then
+            echo "MOONSHOT_API_KEY is required for kinetic-claude" >&2
+            exit 1
+        fi
+        # Moonshot's validator 400s histories containing the model's own
+        # thinkingless assistant messages; CLAUDE_CODE_EFFORT_LEVEL=max below
+        # makes kinetic think on every turn, which avoids ever creating that
+        # message shape (bisect-verified 2026-07-15, see DEVLOG).
+        KINETIC_CLAUDE_ALIAS="${KINETIC_CLAUDE_ALIAS:-opus}"
+        KINETIC_CLAUDE_HAIKU_MODEL="${KINETIC_CLAUDE_HAIKU_MODEL:-$MODEL}"
+        if [ "$KBH_AGENT_CONTAINER" = "1" ]; then
+            CLAUDE_CONTAINER_ENV_NAMES=(
+                ANTHROPIC_BASE_URL API_TIMEOUT_MS
+                CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC
+                CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS
+                ENABLE_TOOL_SEARCH CLAUDE_CODE_SUBAGENT_MODEL
+                CLAUDE_CODE_EFFORT_LEVEL
+                CLAUDE_CODE_MAX_RETRIES CLAUDE_CODE_MAX_OUTPUT_TOKENS
+                ANTHROPIC_MODEL
+                ANTHROPIC_DEFAULT_HAIKU_MODEL ANTHROPIC_DEFAULT_SONNET_MODEL
+                ANTHROPIC_DEFAULT_OPUS_MODEL
+            )
+            CLAUDE_CONTAINER_EXTRA_CLAUDE_ARGS=(--disallowedTools ExitPlanMode EnterPlanMode AskUserQuestion)
+            ( export ANTHROPIC_AUTH_TOKEN="$MOONSHOT_API_KEY" && \
+                export ANTHROPIC_BASE_URL="${KINETIC_ANTHROPIC_BASE_URL:-https://api.moonshot.ai/anthropic}" && \
+                export API_TIMEOUT_MS="${API_TIMEOUT_MS:-3000000}" && \
+                export CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC="${CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC:-1}" && \
+                export CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS="${CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS:-1}" && \
+                export CLAUDE_CODE_MAX_RETRIES="${CLAUDE_CODE_MAX_RETRIES:-1000000}" && \
+                export CLAUDE_CODE_MAX_OUTPUT_TOKENS="${CLAUDE_CODE_MAX_OUTPUT_TOKENS:-128000}" && \
+                export ANTHROPIC_MODEL="$MODEL" && \
+                export ANTHROPIC_DEFAULT_HAIKU_MODEL="$KINETIC_CLAUDE_HAIKU_MODEL" && \
+                export ANTHROPIC_DEFAULT_SONNET_MODEL="$MODEL" && \
+                export ANTHROPIC_DEFAULT_OPUS_MODEL="$MODEL" && \
+                export ENABLE_TOOL_SEARCH="${ENABLE_TOOL_SEARCH:-false}" && \
+                export CLAUDE_CODE_EFFORT_LEVEL="${CLAUDE_CODE_EFFORT_LEVEL:-max}" && \
+                export CLAUDE_CODE_SUBAGENT_MODEL="$MODEL" && \
+                run_claude_container "" "$KINETIC_CLAUDE_ALIAS" 0 ) \
+                > "$LOG_FILE" 2> "$STDERR_FILE" || HARNESS_EXIT=$?
+            CLAUDE_CONTAINER_ENV_NAMES=()
+            CLAUDE_CONTAINER_EXTRA_CLAUDE_ARGS=()
+        else
+        ( cd "$PROBLEM_DIR" && \
+            export ANTHROPIC_AUTH_TOKEN="$MOONSHOT_API_KEY" && \
+            export ANTHROPIC_BASE_URL="${KINETIC_ANTHROPIC_BASE_URL:-https://api.moonshot.ai/anthropic}" && \
+            export API_TIMEOUT_MS="${API_TIMEOUT_MS:-3000000}" && \
+            export CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC="${CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC:-1}" && \
+                export CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS="${CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS:-1}" && \
+            export CLAUDE_CODE_MAX_RETRIES="${CLAUDE_CODE_MAX_RETRIES:-1000000}" && \
+            export CLAUDE_CODE_MAX_OUTPUT_TOKENS="${CLAUDE_CODE_MAX_OUTPUT_TOKENS:-128000}" && \
+            export ANTHROPIC_MODEL="$MODEL" && \
+            export ANTHROPIC_DEFAULT_HAIKU_MODEL="$KINETIC_CLAUDE_HAIKU_MODEL" && \
+            export ANTHROPIC_DEFAULT_SONNET_MODEL="$MODEL" && \
+            export ANTHROPIC_DEFAULT_OPUS_MODEL="$MODEL" && \
+                export ENABLE_TOOL_SEARCH="${ENABLE_TOOL_SEARCH:-false}" && \
+                export CLAUDE_CODE_EFFORT_LEVEL="${CLAUDE_CODE_EFFORT_LEVEL:-max}" && \
+                export CLAUDE_CODE_SUBAGENT_MODEL="$MODEL" && \
+            timeout "$BUDGET_SECONDS" claude \
+                --dangerously-skip-permissions \
+                --print --verbose \
+                --output-format stream-json \
+                --settings "$CLAUDE_KBH_SETTINGS" \
+                --model "$KINETIC_CLAUDE_ALIAS" \
+                --disallowedTools ExitPlanMode EnterPlanMode AskUserQuestion \
+                --add-dir "$PROBLEM_DIR" \
+                -p "$PROMPT" ) \
+            > "$LOG_FILE" 2> "$STDERR_FILE" || HARNESS_EXIT=$?
+        fi
+        ;;
+
     longcat-claude)
         # Claude Code routed to Meituan's Anthropic-compatible endpoint for
         # LongCat-2.0. Requires LONGCAT_API_KEY in the environment or
@@ -1946,7 +2024,7 @@ case "$HARNESS" in
 
     *)
         echo "Unknown harness: $HARNESS" >&2
-        echo "Supported: claude, zai-claude, minimax-claude, kimi-claude, longcat-claude, hy3, deepseek-claude, qwen-claude, ccr-claude, codex, kimi, droid, gemini, cursor, grok, opencode, opencode-nemotron, nvcf-nemotron" >&2
+        echo "Supported: claude, zai-claude, minimax-claude, kimi-claude, kinetic-claude, longcat-claude, hy3, deepseek-claude, qwen-claude, ccr-claude, codex, kimi, droid, gemini, cursor, grok, opencode, opencode-nemotron, nvcf-nemotron" >&2
         exit 1
         ;;
 esac
@@ -1977,7 +2055,7 @@ fi
 
 SESSION_COMPLETE=true
 case "$HARNESS" in
-    claude|zai-claude|minimax-claude|kimi-claude|longcat-claude|deepseek-claude|qwen-claude|ccr-claude|cursor|gemini)
+    claude|zai-claude|minimax-claude|kimi-claude|kinetic-claude|longcat-claude|deepseek-claude|qwen-claude|ccr-claude|cursor|gemini)
         if ! grep -q '"type":"result"' "$CHECK_FILE" 2>/dev/null; then
             SESSION_COMPLETE=false
         fi
