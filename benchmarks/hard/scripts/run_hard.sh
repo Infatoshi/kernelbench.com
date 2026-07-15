@@ -793,7 +793,7 @@ run_claude_container() {
     local -a docker_args=(
         run --rm
         --cidfile "$cidfile"
-        --gpus all
+        --gpus "${KBH_CONTAINER_GPUS:-all}"
         --network "$KBH_AGENT_CONTAINER_NETWORK"
         --cap-add CAP_PERFMON
         --security-opt no-new-privileges
@@ -857,7 +857,7 @@ run_codex_container() {
     local -a docker_args=(
         run --rm
         --cidfile "$cidfile"
-        --gpus all
+        --gpus "${KBH_CONTAINER_GPUS:-all}"
         --network "$KBH_AGENT_CONTAINER_NETWORK"
         --cap-add CAP_PERFMON
         --security-opt no-new-privileges
@@ -911,7 +911,7 @@ run_opencode_container() {
     local -a docker_args=(
         run --rm
         --cidfile "$cidfile"
-        --gpus all
+        --gpus "${KBH_CONTAINER_GPUS:-all}"
         --network "$KBH_AGENT_CONTAINER_NETWORK"
         --cap-add CAP_PERFMON
         --security-opt no-new-privileges
@@ -1002,7 +1002,7 @@ run_droid_container() {
     local -a docker_args=(
         run --rm
         --cidfile "$cidfile"
-        --gpus all
+        --gpus "${KBH_CONTAINER_GPUS:-all}"
         --network "$KBH_AGENT_CONTAINER_NETWORK"
         --cap-add CAP_PERFMON
         --security-opt no-new-privileges
@@ -1067,7 +1067,7 @@ run_grok_container() {
     local -a docker_args=(
         run --rm
         --cidfile "$cidfile"
-        --gpus all
+        --gpus "${KBH_CONTAINER_GPUS:-all}"
         --network "$KBH_AGENT_CONTAINER_NETWORK"
         --cap-add CAP_PERFMON
         --security-opt no-new-privileges
@@ -1124,7 +1124,7 @@ run_gemini_container() {
     local -a docker_args=(
         run --rm
         --cidfile "$cidfile"
-        --gpus all
+        --gpus "${KBH_CONTAINER_GPUS:-all}"
         --network "$KBH_AGENT_CONTAINER_NETWORK"
         --cap-add CAP_PERFMON
         --security-opt no-new-privileges
@@ -1176,7 +1176,7 @@ run_cursor_container() {
     local -a docker_args=(
         run --rm
         --cidfile "$cidfile"
-        --gpus all
+        --gpus "${KBH_CONTAINER_GPUS:-all}"
         --network "$KBH_AGENT_CONTAINER_NETWORK"
         --cap-add CAP_PERFMON
         --security-opt no-new-privileges
