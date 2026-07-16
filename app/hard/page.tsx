@@ -68,10 +68,9 @@ const GPU_TARGETS = [
     blurb: (
       <>
         Frontier coding agents on one unlimited autonomous session per problem:{" "}
-        Opus 4.8, Fable 5, Grok 4.5, GPT-5.6 Sol, GLM-5.2, MiniMax-M3, Kimi
-        K2.7-Code, DeepSeek V4 Pro, LongCat 2.0, Gemini 3.5 Flash, Composer, and
-        more. Roofline-graded; every published cell is contamination-checked and
-        reward-hack audited.
+        Opus 4.8, Fable 5, Grok 4.5, GPT-5.6 Sol, GLM-5.2, MiniMax-M3, DeepSeek
+        V4 Pro, LongCat 2.0, and more. Roofline-graded; every published cell is
+        contamination-checked and reward-hack audited.
       </>
     ),
   },
@@ -82,10 +81,10 @@ const GPU_TARGETS = [
     file: "benchmarks/hard/results/leaderboard.h100.json",
     blurb: (
       <>
-        Eight models (Opus 4.8, GPT-5.5, GLM-5.2, MiniMax-M3, Gemini 3.5 Flash,
-        DeepSeek V4 Pro, Kimi K2.7-Code, Composer 2.5 Fast) on a single H100
-        PCIe with the same containerized harness and roofline grading as the
-        Blackwell deck; peak fraction is measured against H100 dense peaks.
+        Opus 4.8, Fable 5, GLM-5.2, MiniMax-M3, DeepSeek V4 Pro, and LongCat 2.0
+        on a single H100 PCIe with the same containerized harness and roofline
+        grading as the Blackwell deck; peak fraction is measured against H100
+        dense peaks.
       </>
     ),
   },
@@ -116,8 +115,8 @@ const GPU_TARGETS = [
         memory-bound cells (paged attention, top-k, W4A16) port cleanly and lead
         the board, with paged-attention decode reaching ~66% of the 936 GB/s
         ceiling; the bf16 compute cells (KDA, sonic-MoE) run against Ampere&rsquo;s
-        much lower bf16 peak. GLM-5.2 ties codex and Composer 2.5 at a clean 5/5
-        and its paged-attention kernel holds the board&rsquo;s top bandwidth
+        much lower bf16 peak. GLM-5.2 is a clean 5/5 and its paged-attention
+        kernel holds the board&rsquo;s top bandwidth
         fraction (~66%). Only MiniMax-M3 is partial (4/5) &mdash; its sweep was
         cut short by provider rate limits.
       </>

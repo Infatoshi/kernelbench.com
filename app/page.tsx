@@ -84,7 +84,7 @@ const benchmarks = [
       "Curated hard CUDA/Triton deck — Opus, Fable, Grok 4.5, GPT-5.6 Sol, GLM-5.2, and more — across RTX PRO 6000 Blackwell, H100 PCIe, and B200. Roofline-graded with per-run agent traces.",
     stats: [
       ["problems", "6"],
-      ["models", "13"],
+      ["models", "8"],
       ["GPUs", "3+"],
     ],
     hfHref: "https://huggingface.co/datasets/Infatoshi/kernelbench-hard-traces",
