@@ -12,7 +12,7 @@ REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$REPO_ROOT"
 
 RUN_GROUP="${KBH_RUN_GROUP:-sweep_$(date +%Y%m%d_%H%M%S)}"
-BUDGET_SECONDS="${KBH_BUDGET_SECONDS:-2700}"
+BUDGET_SECONDS="${KBH_BUDGET_SECONDS:-0}"
 HARNESS_CONCURRENCY="${KBH_HARNESS_CONCURRENCY:-2}"
 PROBLEMS="${KBH_PROBLEMS:-problems/02_kimi_linear_decode}"
 SWEEP_DIR="$REPO_ROOT/outputs/sweeps/$RUN_GROUP"

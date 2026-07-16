@@ -76,9 +76,9 @@ RUN_ID="$(basename "$RUN_DIR")"
 RUN_GROUP="${KBH_RUN_GROUP:-}"
 
 # Wall-clock ceiling per run. Methodology is unlimited-time: the model runs until
-# it decides it is done. Default is a large 6h ceiling; smoke-test with a small
-# override (e.g. BUDGET_SECONDS=300).
-BUDGET_SECONDS="${BUDGET_SECONDS:-21600}"
+# it decides it is done. Default 0 = no cap (GNU timeout treats 0 as unlimited),
+# matching hard. Smoke-test with a small override (e.g. BUDGET_SECONDS=300).
+BUDGET_SECONDS="${BUDGET_SECONDS:-0}"
 CHECK_TIMEOUT_SECONDS="${KBH_CHECK_TIMEOUT_SECONDS:-180}"
 if [ "$PROBLEM_NAME" = "02_kda_cutlass" ]; then
     BENCHMARK_TIMEOUT_SECONDS="${KBH_BENCHMARK_TIMEOUT_02_KDA_CUTLASS_SECONDS:-${KBH_BENCHMARK_TIMEOUT_SECONDS:-7200}}"
