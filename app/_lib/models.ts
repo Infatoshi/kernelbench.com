@@ -384,3 +384,199 @@ export function barsForBench(
       : "mean peak fraction of roofline (valid cells)"
   return { bench, axis, rows, maxValue }
 }
+
+// ---- AA-style vertical column charts ---------------------------------------
+//
+// Scoring conventions (KEEP SIMPLE AND AUDITABLE — every number below is
+// plain arithmetic over public/data/models.json; a fresh agent conversation
+// should be able to recompute any chart value by hand):
+//
+// 1) HARD / CUDA performance chart, one column per model:
+//      score_m = mean(peak_fraction) over the model's VALID cells on the
+//                bench's canonical board (valid = correct AND audited-clean;
+//                problems with no valid cell are EXCLUDED from the mean).
+//    Worked example (real data): glm-5.2 has 6/6 valid hard cells whose mean
+//    peak fraction is 0.2614 -> bar renders 26.1% of roofline.
+//    Why no per-problem weighting: a raw mean under-weights launch-bound
+//    problems, it can never be swayed by them — topk's ~0.02 ceiling adds at
+//    most 0.02/6 = 0.3 points to a 6-problem mean, while fp8/KDA (~0.3-0.5)
+//    dominate. That is the same convention the published leaderboard uses.
+//
+// 2) MEGA performance chart:
+//      score_m = max(speedup) over the model's valid cells on the canonical
+//                board. Each cell's score is already the run's geomean
+//                decode speedup vs the optimized-PyTorch baseline across
+//                contexts; the model's best published cell wins.
+//    Worked example (real data): claude-fable-5's best valid mega cell is
+//    18.715 -> bar renders 18.7x.
+//
+// 3) CORRECTNESS chart (single "compiled" chart below the perf charts):
+//      pct_m = 100 * passed / total, summed over the CANONICAL boards of
+//              every bench the model has any published cells on (a bench the
+//              model never attempted does not enter the denominator).
+//    Worked example (real data): grok-4.5 is 6/6 hard + 1/2 mega + 4/4 cuda
+//    = 11/12 = 91.67% -> bar label rounds to "92%". A model that attempted a
+//    bench and solved nothing renders a real 0% label; a model with no cells
+//    anywhere renders no bar.
+//
+// 4) Column ORDER is shared across all four charts (correctness % desc ->
+//    total passed desc -> slug) so a model sits in the same slot on every
+//    panel; charts disagree only in bar height, like AA's index views.
+//
+// 5) A model with no valid cell on a chart keeps its column slot but renders
+//    no bar (per product decision 2026-07-16: "just don't render the bar,
+//    we'll fill that percentage in automatically" as new results land).
+
+export interface ColPoint {
+  slug: string
+  name: string
+  lab: string
+  /** bar value in bench-native units (fraction 0..1, speedup, or 0..100 pct);
+   *  null = no result yet -> no bar rendered */
+  value: number | null
+  /** top-of-bar label, e.g. "26.1%" / "18.72x"; null when value is null */
+  display: string | null
+  brand: Brand
+}
+
+export interface ColChart {
+  title: string
+  /** formula in words, rendered under the title so the math is on-page */
+  subtitle: string
+  /** y-axis unit: "%" renders labels as percents of a fraction axis (0..1
+   *  data), "x" as raw multipliers, "pct" as 0..100 percents */
+  unit: "%" | "x" | "pct"
+  columns: ColPoint[]
+  /** y-axis top (data units); 100 for the pct chart */
+  maxValue: number
+}
+
+/** Per-model correctness across canonical boards: { pct, passed, total }. */
+function correctnessOf(index: ModelIndex, m: ModelEntry): {
+  pct: number | null
+  passed: number
+  total: number
+} {
+  const order: Bench[] = ["mega", "hard", "cuda"]
+  let passed = 0
+  let total = 0
+  for (const b of order) {
+    const blk = m.benches[b]
+    if (!blk) continue
+    const attempted = Object.keys(blk.cells).length > 0
+    if (!attempted && blk.total_problems === 0) continue
+    passed += blk.passed
+    total += blk.total_problems
+  }
+  if (total === 0) return { pct: null, passed, total }
+  return { pct: (100 * passed) / total, passed, total }
+}
+
+/**
+ * Canonical column order, shared by every chart: correctness % desc ->
+ * total passed desc -> slug. Models with no attempted bench (pct null) sink
+ * to the right, ordered by slug.
+ */
+export function columnOrder(index: ModelIndex): ModelEntry[] {
+  return [...index.models].sort((am, bm) => {
+    const a = correctnessOf(index, am)
+    const b = correctnessOf(index, bm)
+    const ap = a.pct ?? -1
+    const bp = b.pct ?? -1
+    if (bp !== ap) return bp - ap
+    if (b.passed !== a.passed) return b.passed - a.passed
+    return am.slug.localeCompare(bm.slug)
+  })
+}
+
+/**
+ * Round the data max up to a "nice" axis top: smallest 4-step grid that
+ * covers `v`. Step ladder doubles as the gridline spacing.
+ * Examples: hard max 0.2614 -> 0.4 (lines at .1/.2/.3/.4);
+ *           mega max 18.715  -> 20  (lines at 5/10/15/20).
+ */
+export function niceCeil(v: number): number {
+  const steps = [0.02, 0.05, 0.1, 0.2, 0.25, 0.5, 1, 2, 2.5, 5, 10, 20, 25, 50, 100]
+  for (const s of steps) if (4 * s >= v) return 4 * s
+  return Math.ceil(v)
+}
+
+/** Vertical-column data for one bench's canonical board. Every model keeps a
+ *  slot; models with no valid cell on the bench get value/display = null. */
+export function columnsForBench(
+  index: ModelIndex,
+  bench: Bench,
+  ordered?: ModelEntry[],
+): ColChart {
+  const models = ordered ?? columnOrder(index)
+  const columns: ColPoint[] = []
+  let maxValue = 0
+  for (const m of models) {
+    let value: number | null = null
+    const block = m.benches[bench]
+    if (block) {
+      const vals = Object.values(block.cells).filter(
+        (c) => c.valid && c.score != null,
+      )
+      if (vals.length > 0) {
+        value =
+          bench === "mega"
+            ? Math.max(...vals.map((c) => c.score!))
+            : vals.reduce((s, c) => s + c.score!, 0) / vals.length
+      }
+    }
+    if (value != null && value > maxValue) maxValue = value
+    columns.push({
+      slug: m.slug,
+      name: m.name,
+      lab: m.lab,
+      value,
+      display:
+        value == null
+          ? null
+          : bench === "mega"
+            ? `${value.toFixed(2)}x`
+            : `${(value * 100).toFixed(1)}%`,
+      brand: brandFor(m.lab, m.slug),
+    })
+  }
+  const label = BENCH_LABELS[bench]
+  const gpuRaw = index.benches[bench]?.gpu
+  const gpu =
+    typeof gpuRaw === "string" ? gpuRaw : (gpuRaw as { name?: string } | undefined)?.name ?? "RTX PRO 6000"
+  return {
+    title: `${label} performance`,
+    subtitle:
+      bench === "mega"
+        ? `best decode speedup vs optimized-PyTorch baseline over valid (correct + audited-clean) cells · ${gpu}`
+        : `mean peak fraction of roofline over valid (correct + audited-clean) cells · ${gpu}`,
+    unit: bench === "mega" ? "x" : "%",
+    columns,
+    maxValue: niceCeil(maxValue),
+  }
+}
+
+/** The single "compiled" correctness chart: % of published problems each
+ *  model gets correct, summed over canonical boards of attempted benches. */
+export function columnsForCorrectness(index: ModelIndex, ordered?: ModelEntry[]): ColChart {
+  const models = ordered ?? columnOrder(index)
+  const columns: ColPoint[] = models.map((m) => {
+    const { pct } = correctnessOf(index, m)
+    return {
+      slug: m.slug,
+      name: m.name,
+      lab: m.lab,
+      value: pct,
+      display: pct == null ? null : `${pct.toFixed(0)}%`,
+      brand: brandFor(m.lab, m.slug),
+    }
+  })
+  return {
+    title: "Correctness",
+    subtitle:
+      "published problems correct, summed over attempted benches (passed / total on canonical boards)",
+    unit: "pct",
+    columns,
+    maxValue: 100,
+  }
+}

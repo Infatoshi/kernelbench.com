@@ -2,9 +2,9 @@ import Link from "next/link"
 import { GroupedBars } from "./home-charts"
 import { EfficiencyChart } from "./efficiency-chart"
 import { loadMegaChart, loadHardChart, loadEfficiency } from "@/app/_lib/charts"
-import { barsForBench } from "@/app/_lib/models"
+import { columnOrder, columnsForBench, columnsForCorrectness } from "@/app/_lib/models"
 import { loadModelIndex } from "@/app/_lib/models.server"
-import { ModelMetricChart } from "@/app/_components/model-metric-chart"
+import { ModelScoreboards } from "@/app/_components/model-columns"
 
 const HUGGING_FACE_LOGO =
   "https://huggingface.co/front/assets/huggingface_logo-noborder.svg"
@@ -134,11 +134,14 @@ export default async function HomePage() {
     loadEfficiency(),
     loadModelIndex(),
   ])
-  const barViews = {
-    mega: barsForBench(modelIdx, "mega"),
-    hard: barsForBench(modelIdx, "hard"),
-    cuda: barsForBench(modelIdx, "cuda"),
-  }
+  // One shared column order across all charts (correctness desc -> passed
+  // desc -> slug, see columnOrder) so a model sits in the same slot on every
+  // panel; models with no result on a bench keep their slot but no bar.
+  const ordered = columnOrder(modelIdx)
+  const perfCharts = (["mega", "hard", "cuda"] as const).map((b) =>
+    columnsForBench(modelIdx, b, ordered),
+  )
+  const correctnessChart = columnsForCorrectness(modelIdx, ordered)
   const charts: Record<string, React.ReactNode> = {
     "/mega": (
       <GroupedBars
@@ -162,28 +165,24 @@ export default async function HomePage() {
         dangerouslySetInnerHTML={{ __html: JSON.stringify(citationGraph) }}
       />
       <h1 className="sr-only">Agentic GPU kernel benchmark results</h1>
-      <p className="text-sm text-[var(--color-fg-muted)]">
-        For business inquiries reach out to{" "}
-        <a href="mailto:elliot@arledge.net" className="font-bold text-[var(--color-fg-bright)]">
-          elliot@arledge.net
-        </a>
-        .
-      </p>
       <section aria-label="Models" className="space-y-4">
         <div>
           <h2 className="text-xl font-semibold text-[var(--color-fg-bright)]">
             Models
           </h2>
           <p className="text-xs text-[var(--color-fg-muted)] mt-1.5 leading-relaxed">
-            Frontier coding models on the kernel decks: one bar per model,
-            colored by lab. Pick a benchmark; click a model for its per-problem
-            cells, audit chips, and full integrity record. Correctness first:
-            models group by valid passes (audited-clean correct cells), then
-            order by score. The flagged count lists audited sessions that
-            failed the reward-hack review; it never changes the order.
+            Frontier coding models on the kernel decks, AA-style. Performance
+            is disaggregated per benchmark (Mega / Hard / CUDA, bars colored by
+            lab), and the last chart is compiled correctness: the percentage of
+            published problems each model gets correct across the benches it
+            attempted. A model with no result on a board keeps its column slot
+            but no bar. Scores use plain, on-page math: mean peak fraction over
+            valid cells, best decode speedup, passed&nbsp;/&nbsp;total. Click a
+            column for per-problem cells, audit chips, and the model&apos;s
+            integrity record.
           </p>
         </div>
-        <ModelMetricChart views={barViews} />
+        <ModelScoreboards perf={perfCharts} correctness={correctnessChart} />
       </section>
 
       <section aria-label="Benchmarks" className="space-y-4">
@@ -276,6 +275,13 @@ export default async function HomePage() {
       </section>
 
       <section className="space-y-5">
+        <p className="text-sm text-[var(--color-fg-muted)]">
+          For business inquiries reach out to{" "}
+          <a href="mailto:elliot@arledge.net" className="font-bold text-[var(--color-fg-bright)]">
+            elliot@arledge.net
+          </a>
+          .
+        </p>
         <h2 className="text-xl font-semibold text-[var(--color-fg-bright)]">
           Design principles
         </h2>
