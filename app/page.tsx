@@ -2,6 +2,8 @@ import Link from "next/link"
 import { GroupedBars } from "./home-charts"
 import { EfficiencyChart } from "./efficiency-chart"
 import { loadMegaChart, loadHardChart, loadEfficiency } from "@/app/_lib/charts"
+import { loadModelIndex, rowsForIndex } from "@/app/_lib/models"
+import { ModelBoard } from "@/app/_components/model-list"
 
 const HUGGING_FACE_LOGO =
   "https://huggingface.co/front/assets/huggingface_logo-noborder.svg"
@@ -125,11 +127,13 @@ const benchmarks = [
 ]
 
 export default async function HomePage() {
-  const [megaChart, hardChart, efficiency] = await Promise.all([
+  const [megaChart, hardChart, efficiency, modelIdx] = await Promise.all([
     loadMegaChart(),
     loadHardChart(),
     loadEfficiency(),
+    loadModelIndex(),
   ])
+  const { board: modelBoard, sink: modelSink } = rowsForIndex(modelIdx)
   const charts: Record<string, React.ReactNode> = {
     "/mega": (
       <GroupedBars
@@ -160,6 +164,24 @@ export default async function HomePage() {
         </a>
         .
       </p>
+      <section aria-label="Models" className="space-y-4">
+        <div>
+          <h2 className="text-xl font-semibold text-[var(--color-fg-bright)]">
+            Models
+          </h2>
+          <p className="text-xs text-[var(--color-fg-muted)] mt-1.5 leading-relaxed">
+            Frontier coding models, one row each, across all published boards.
+            Ranked by benchmarks fully passed, then mean normalized performance.
+            Accuracy-first: a cell only counts when it compiles, passes
+            correctness, and survives the reward-hack audit. The flagged badge
+            shows audited sessions that failed that review (over all audited
+            sessions for the model); it never changes the rank. Click a model
+            for per-problem cells, audit chips, and its full integrity record.
+          </p>
+        </div>
+        <ModelBoard board={modelBoard} sink={modelSink} showBadges />
+      </section>
+
       <section aria-label="Benchmarks" className="space-y-4">
         {benchmarks.map((benchmark) => (
           <article key={benchmark.href} className="benchmark-card">

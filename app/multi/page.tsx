@@ -1,10 +1,9 @@
 import Link from "next/link"
-import { LeaderboardTable, type HardRunRecord } from "../hard/leaderboard-table"
 
 // KernelBench-Multi: the multi-GPU (NVLink) sibling of the hard bench. Graded on
 // busbw (achieved NVLink bus bandwidth / NVLink peak), never TFLOPS. The deck is
 // six communication-dominated problems on an 8xH100 SXM (NVSwitch) node.
-// No runs yet — this page stands up the table + deck so results can drop in.
+// No runs yet — this page stands up the coming-soon card + deck.
 
 const REPO_TREE =
   "https://github.com/Infatoshi/kernelbench.com/blob/master/benchmarks/multi"
@@ -18,39 +17,7 @@ const MULTI_PROBLEMS = [
   { key: "06_fp8_reducescatter_grad", label: "fp8 ReduceScatter Grad" },
 ] as const
 
-const NO_RUN = { label: "no run", tone: "muted" as const }
-
-function placeholderRow(problem: { key: string; label: string }): HardRunRecord {
-  return {
-    key: `${problem.key}:pending`,
-    runId: null,
-    model: "—",
-    harness: "—",
-    gpu: "8×H100",
-    problem: problem.label,
-    problemKey: problem.key,
-    date: null,
-    time: null,
-    compiled: NO_RUN,
-    correct: NO_RUN,
-    auditFlags: [],
-    explanation: null,
-    peakFraction: null,
-    speedPct: null,
-    isWinner: false,
-    referenceUrl: `${REPO_TREE}/problems-h100x8/${problem.key}/reference.py`,
-    solutionUrl: null,
-    transcriptUrl: null,
-    scored: "0/0",
-    note: "awaiting first run",
-    title: "no run yet",
-    searchText: `${problem.label} ${problem.key} no run`,
-  }
-}
-
 export default function MultiPage() {
-  const rows = MULTI_PROBLEMS.map(placeholderRow)
-
   return (
     <div className="hard-page space-y-12">
       <section>
@@ -81,7 +48,26 @@ export default function MultiPage() {
       </section>
 
       <section>
-        <LeaderboardTable rows={rows} />
+        <div className="cell-grid">
+          {MULTI_PROBLEMS.map((p) => (
+            <div key={p.key} className="cell-card">
+              <div className="cell-card-head">
+                <span className="cell-card-problem">{p.label}</span>
+                <span className="status-pill status-pill-muted">coming soon</span>
+              </div>
+              <div className="cell-card-links">
+                <a
+                  className="link-chip"
+                  href={`${REPO_TREE}/problems-h100x8/${p.key}/reference.py`}
+                  target="_blank"
+                  rel="noreferrer"
+                >
+                  reference
+                </a>
+              </div>
+            </div>
+          ))}
+        </div>
         <p className="text-xs text-[var(--color-fg)] mt-3 max-w-4xl leading-relaxed">
           Methodology and the full problem deck live in the{" "}
           <Link href={`${REPO_TREE}/SPEC.md`} className="underline underline-offset-2">

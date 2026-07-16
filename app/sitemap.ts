@@ -2,6 +2,7 @@ import type { MetadataRoute } from "next"
 
 const routes = [
   { path: "", priority: 1.0 },
+  { path: "/models", priority: 0.9 },
   { path: "/hard", priority: 0.9 },
   { path: "/mega", priority: 0.9 },
   { path: "/cuda", priority: 0.85 },

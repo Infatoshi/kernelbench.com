@@ -1,157 +1,41 @@
 import Link from "next/link"
-import { readdir } from "node:fs/promises"
-import { join } from "node:path"
-import {
-  loadLeaderboard,
-  loadAnnotations,
-  loadRunAudits,
-  type Cell,
-  type Model,
-  type RunAudit,
-} from "@/app/_lib/data"
-import { LeaderboardTable, type HardRunRecord } from "./leaderboard-table"
+import { loadModelIndex, rowsForBench } from "@/app/_lib/models"
+import { ModelGpuBoard, type GpuView } from "@/app/_components/model-board"
 
-// Full agent transcripts now live on HuggingFace (per-run trace files); the
-// site keeps only the raw submitted-kernel files (<run_id>_solution.py.txt).
-const HARD_TRACES_HF = "https://huggingface.co/datasets/Infatoshi/kernelbench-hard-traces"
-
-function hardTraceUrl(runId: string): string {
-  return `${HARD_TRACES_HF}/blob/main/${runId}.jsonl`
-}
-
-async function loadAvailableSolutions(): Promise<Set<string>> {
-  try {
-    const entries = await readdir(join(process.cwd(), "public/runs"))
-    return new Set(
-      entries
-        .filter((n) => n.endsWith("_solution.py.txt"))
-        .map((n) => n.slice(0, -"_solution.py.txt".length)),
-    )
-  } catch {
-    return new Set()
-  }
-}
-
-const PROBLEMS = [
-  { key: "01_fp8_gemm", label: "FP8 GEMM" },
-  { key: "02_kda_cutlass", label: "KimiDeltaAttention CUTLASS" },
-  { key: "03_paged_attention", label: "Paged Attention" },
-  { key: "05_topk_bitonic", label: "TopK Bitonic" },
-  { key: "06_sonic_moe_swiglu", label: "Sonic MoE" },
-  { key: "07_w4a16_gemm", label: "W4A16 GEMM" },
-]
-
-// Legacy v1 allowlist (date-stamped labels). Current boards use
-// environment === "v2_containerized" and show every leaderboard row; keep this
-// only for any non-v2 snapshot still on disk. Do NOT add new models here —
-// publish them into leaderboard.json and they appear automatically.
-const VISIBLE_MODEL_LABELS = new Set<string>([])
-
-const VISIBLE_MODEL_PREFIXES: string[] = []
-
-function isVisibleModel(m: Model) {
-  if (VISIBLE_MODEL_LABELS.size === 0 && VISIBLE_MODEL_PREFIXES.length === 0) {
-    return true
-  }
-  return (
-    VISIBLE_MODEL_LABELS.has(m.label) ||
-    VISIBLE_MODEL_PREFIXES.some((prefix) => m.label.startsWith(prefix))
-  )
-}
-
-const GPU_TARGETS = [
-  {
-    key: "rtx",
-    label: "RTX PRO 6000",
-    runtime: "unlimited",
-    file: "benchmarks/hard/results/leaderboard.json",
-    blurb: (
-      <>
-        Frontier coding agents on one unlimited autonomous session per problem:{" "}
-        Opus 4.8, Fable 5, Grok 4.5, GPT-5.6 Sol, GLM-5.2, MiniMax-M3, DeepSeek
-        V4 Pro, LongCat 2.0, and more. Roofline-graded; every published cell is
-        contamination-checked and reward-hack audited.
-      </>
-    ),
-  },
-  {
-    key: "h100",
-    label: "H100 PCIe",
-    runtime: "limited",
-    file: "benchmarks/hard/results/leaderboard.h100.json",
-    blurb: (
-      <>
-        Opus 4.8, Fable 5, GLM-5.2, MiniMax-M3, DeepSeek V4 Pro, and LongCat 2.0
-        on a single H100 PCIe with the same containerized harness and roofline
-        grading as the Blackwell deck; peak fraction is measured against H100
-        dense peaks.
-      </>
-    ),
-  },
-  {
-    key: "b200",
-    label: "B200",
-    runtime: "limited",
-    file: "benchmarks/hard/results/leaderboard.b200.json",
-    blurb: (
-      <>
-        The same eight models on a single NVIDIA B200 (SM100 Blackwell, HBM3e)
-        with the identical containerized harness and roofline grading; peak
-        fraction is measured against B200 dense peaks (fp8 4500, bf16 2250
-        TFLOPS), so the same kernel reads as a smaller fraction of a much higher
-        ceiling.
-      </>
-    ),
-  },
-  {
-    key: "rtx3090",
-    label: "RTX 3090",
-    file: "benchmarks/hard/results/leaderboard.rtx3090.json",
-    blurb: (
-      <>
-        The first consumer/Ampere part in the set: a single RTX 3090 (SM86,
-        GDDR6X, 936 GB/s). Ampere has no FP8 tensor cores, so the FP8 GEMM
-        problem is dropped entirely &mdash; five problems, not six. The
-        memory-bound cells (paged attention, top-k, W4A16) port cleanly and lead
-        the board, with paged-attention decode reaching ~66% of the 936 GB/s
-        ceiling; the bf16 compute cells (KDA, sonic-MoE) run against Ampere&rsquo;s
-        much lower bf16 peak. GLM-5.2 is a clean 5/5 and its paged-attention
-        kernel holds the board&rsquo;s top bandwidth
-        fraction (~66%). Only MiniMax-M3 is partial (4/5) &mdash; its sweep was
-        cut short by provider rate limits.
-      </>
-    ),
-  },
-] as const
+// KernelBench-Hard: per-op kernel deck. Ranked model list per GPU board;
+// run-level forensics live on /runs and the per-model pages.
 
 export default async function HardPage() {
-  const [annotations, audits, hasViewer] = await Promise.all([
-    loadAnnotations(),
-    loadRunAudits(),
-    loadAvailableSolutions(),
-  ])
-  const boards = await Promise.all(
-    GPU_TARGETS.map(async (target) => ({
-      target,
-      lb: await loadLeaderboard(target.file),
-    })),
-  )
-  const rows = boards.flatMap(({ target, lb }) => {
-    const models = [...lb.models].sort(compareModelRows)
-    // The v2 containerized sweep is already a curated single-environment run,
-    // so it bypasses the v1 hand-picked visibility allowlist and shows every row.
-    const isV2 = (lb as { environment?: string }).environment === "v2_containerized"
-    const visibleModels = isV2 ? models : models.filter(isVisibleModel)
-    const winners = findVisibleWinners(visibleModels, annotations, audits)
-    return buildRunRows(
-      visibleModels,
-      annotations,
-      audits,
-      hasViewer,
-      winners,
-      target.label,
-    )
-  })
+  const idx = await loadModelIndex()
+  const gpuLabels = idx.benches.hard?.gpu_labels ?? {}
+
+  const mk = (gpu?: string): { board: ReturnType<typeof rowsForBench>["board"]; sink: ReturnType<typeof rowsForBench>["sink"] } =>
+    rowsForBench(idx, "hard", gpu)
+
+  const views: GpuView[] = [
+    {
+      key: "rtxpro6000",
+      label: gpuLabels.rtxpro6000 ?? "RTX PRO 6000",
+      blurb:
+        "Unlimited time per problem. The frozen lab board — every published cell is contamination-checked and reward-hack audited.",
+      ...mk(),
+    },
+    {
+      key: "h100",
+      label: gpuLabels.h100 ?? "H100 PCIe",
+      ...mk("h100"),
+    },
+    {
+      key: "b200",
+      label: gpuLabels.b200 ?? "B200",
+      ...mk("b200"),
+    },
+    {
+      key: "rtx3090",
+      label: gpuLabels.rtx3090 ?? "RTX 3090",
+      ...mk("rtx3090"),
+    },
+  ]
 
   return (
     <div className="hard-page space-y-12">
@@ -160,34 +44,28 @@ export default async function HardPage() {
           hard
         </h1>
         <p className="text-sm text-[var(--color-fg)] mb-2">
-          All GPUs in one table &mdash; use the GPU column filter to focus on one
-          board. Peak fraction (SOL) is measured against each GPU&rsquo;s own
-          roofline, so cells are comparable within a GPU, not across GPUs.
+          One ranked model list per GPU board &mdash; use the toggle to switch.
+          Peak fraction (SOL) is measured against each GPU&rsquo;s own roofline,
+          so scores are comparable within a GPU, not across GPUs.
         </p>
         <p className="text-xs text-[var(--color-fg-muted)] mb-6 max-w-4xl leading-relaxed">
-          RTX PRO 6000 rows run with{" "}
-          <span className="text-[var(--color-fg)]">unlimited time per problem</span>;
-          H100 / B200 / RTX 3090 boards mix unlimited-time resweeps with earlier
-          45-minute-budget rows. Hardware notes for each GPU are below the table.
+          Ranked by valid passes (audited-clean correct cells), then mean
+          normalized performance (cell &divide; board best per problem). The
+          flagged badge counts audited sessions that failed the reward-hack
+          review; it never changes the rank. Click a model for its per-problem
+          cells, audit chips, and integrity record. Hardware notes for each GPU
+          are below the list.
         </p>
       </section>
 
       <section>
-        <LeaderboardTable rows={rows} />
+        <ModelGpuBoard views={views} />
         <p className="text-xs text-[var(--color-fg)] mt-3 max-w-4xl leading-relaxed">
           Browse the{" "}
           <Link href="/runs" className="underline underline-offset-2">
             run index
           </Link>
           {" "}for transcripts, submitted solutions, checks, timing, and costs.
-          {" "}Full historical and diagnostic rows are still available in{" "}
-          <Link
-            href="https://github.com/Infatoshi/kernelbench.com/blob/master/benchmarks/hard/results/leaderboard.json"
-            className="underline underline-offset-2"
-          >
-            leaderboard.json
-          </Link>
-          .
         </p>
       </section>
 
@@ -196,638 +74,43 @@ export default async function HardPage() {
           hardware notes
         </h2>
         <div className="space-y-3">
-          {GPU_TARGETS.map((g) => (
-            <p
-              key={g.key}
-              className="text-xs text-[var(--color-fg-muted)] max-w-4xl leading-relaxed"
-            >
-              <span className="text-[var(--color-fg)] font-semibold">{g.label}.</span>{" "}
-              {g.blurb}
-            </p>
-          ))}
+          <p className="text-xs text-[var(--color-fg-muted)] max-w-4xl leading-relaxed">
+            <span className="text-[var(--color-fg)] font-semibold">RTX PRO 6000.</span>{" "}
+            Frontier coding agents on one unlimited autonomous session per problem:{" "}
+            Opus 4.8, Fable 5, Grok 4.5, GPT-5.6 Sol, GLM-5.2, MiniMax-M3, DeepSeek
+            V4 Pro, LongCat 2.0, and more. Roofline-graded; every published cell is
+            contamination-checked and reward-hack audited.
+          </p>
+          <p className="text-xs text-[var(--color-fg-muted)] max-w-4xl leading-relaxed">
+            <span className="text-[var(--color-fg)] font-semibold">H100 PCIe.</span>{" "}
+            Opus 4.8, Fable 5, GLM-5.2, MiniMax-M3, DeepSeek V4 Pro, and LongCat 2.0
+            on a single H100 PCIe with the same containerized harness and roofline
+            grading as the Blackwell deck; peak fraction is measured against H100
+            dense peaks.
+          </p>
+          <p className="text-xs text-[var(--color-fg-muted)] max-w-4xl leading-relaxed">
+            <span className="text-[var(--color-fg)] font-semibold">B200.</span>{" "}
+            The same models on a single NVIDIA B200 (SM100 Blackwell, HBM3e)
+            with the identical containerized harness and roofline grading; peak
+            fraction is measured against B200 dense peaks (fp8 4500, bf16 2250
+            TFLOPS), so the same kernel reads as a smaller fraction of a much higher
+            ceiling.
+          </p>
+          <p className="text-xs text-[var(--color-fg-muted)] max-w-4xl leading-relaxed">
+            <span className="text-[var(--color-fg)] font-semibold">RTX 3090.</span>{" "}
+            The first consumer/Ampere part in the set: a single RTX 3090 (SM86,
+            GDDR6X, 936 GB/s). Ampere has no FP8 tensor cores, so the FP8 GEMM
+            problem is dropped entirely &mdash; five problems, not six. The
+            memory-bound cells (paged attention, top-k, W4A16) port cleanly and lead
+            the board, with paged-attention decode reaching ~66% of the 936 GB/s
+            ceiling; the bf16 compute cells (KDA, sonic-MoE) run against Ampere&rsquo;s
+            much lower bf16 peak. GLM-5.2 is a clean 5/5 and its paged-attention
+            kernel holds the board&rsquo;s top bandwidth
+            fraction (~66%). Only MiniMax-M3 is partial &mdash; its sweep was
+            cut short by provider rate limits.
+          </p>
         </div>
       </section>
-
     </div>
   )
-}
-
-type RunStatusTone = "good" | "bad" | "warn" | "muted"
-
-type RunStatus = HardRunRecord["compiled"]
-
-type RunRow = HardRunRecord
-
-function status(
-  label: string,
-  tone: RunStatusTone,
-  annotationSeverity?: "bad" | "warn",
-  annotationLabel?: string,
-): RunStatus {
-  return { label, tone, annotationSeverity, annotationLabel }
-}
-
-function buildRunRows(
-  models: Model[],
-  annotations: Map<string, { verdict: string; summary?: string }>,
-  audits: Map<string, RunAudit>,
-  hasViewer: Set<string>,
-  winners: Map<string, string>,
-  gpu: string,
-): RunRow[] {
-  const rows: RunRow[] = []
-  for (const m of models) {
-    for (const p of PROBLEMS) {
-      const cell = m.results[p.key]
-      const model = shortLabel(m.label)
-      const harness = harnessLabel(m.harness)
-      if (!cell) {
-        rows.push(missingRunRow(model, harness, gpu, p))
-        continue
-      }
-
-      const annot = annotations.get(cell.run_id)
-      const audit = audits.get(cell.run_id)
-      const isWinner = winners.get(p.key) === cell.run_id
-      const title = cellTitle(cell, hasViewer.has(cell.run_id), annot, isWinner, audit)
-      const runAt = runDateParts(cell.run_id)
-      const hasRunViewer = hasViewer.has(cell.run_id)
-      const compiled = compiledStatus(cell)
-      const correct = correctnessStatus(cell, annot, audit)
-      const note = audit?.summary || annot?.summary || cell.failure_reason || "run details"
-      const auditFlags = auditFlagsFor(annot, audit)
-      const explanation =
-        audit?.summary || annot?.summary || cell.invalid_reason || cell.failure_reason || null
-      rows.push({
-        key: `${gpu}:${cell.run_id}`,
-        runId: cell.run_id,
-        model,
-        harness,
-        gpu,
-        problem: p.label,
-        problemKey: p.key,
-        date: runAt.date,
-        time: runAt.time,
-        compiled,
-        correct,
-        auditFlags,
-        explanation,
-        peakFraction: cell.peak_fraction,
-        speedPct: cell.peak_fraction == null ? null : cell.peak_fraction * 100,
-        isWinner,
-        referenceUrl: referenceUrlFor(p.key),
-        solutionUrl: hasRunViewer ? `/runs/${cell.run_id}_solution.py.txt` : null,
-        transcriptUrl: hardTraceUrl(cell.run_id),
-        scored: `${m.pass_count}/${m.total_runs}`,
-        note,
-        title,
-        searchText: [
-          model,
-          harness,
-          gpu,
-          p.label,
-          p.key,
-          cell.run_id,
-          compiled.label,
-          correct.label,
-          auditFlags.join(" "),
-          explanation,
-          note,
-          annot?.verdict,
-          annot?.summary,
-          `scored ${m.pass_count}/${m.total_runs}`,
-        ]
-          .filter(Boolean)
-          .join(" "),
-      })
-    }
-  }
-  return rows
-}
-
-function missingRunRow(
-  model: string,
-  harness: string,
-  gpu: string,
-  problem: { key: string; label: string },
-): RunRow {
-  return {
-    key: `${gpu}:${model}:${harness}:${problem.key}:missing`,
-    runId: null,
-    model,
-    harness,
-    gpu,
-    problem: problem.label,
-    problemKey: problem.key,
-    date: null,
-    time: null,
-    compiled: status("no run", "muted"),
-    correct: status("no run", "muted"),
-    auditFlags: [],
-    explanation: null,
-    peakFraction: null,
-    speedPct: null,
-    isWinner: false,
-    referenceUrl: referenceUrlFor(problem.key),
-    solutionUrl: null,
-    transcriptUrl: null,
-    scored: "0/0",
-    note: "no run",
-    title: "no run",
-    searchText: `${model} ${harness} ${gpu} ${problem.label} ${problem.key} no run`,
-  }
-}
-
-function findVisibleWinners(
-  models: Model[],
-  annotations: Map<string, { verdict: string; summary?: string }>,
-  audits: Map<string, RunAudit>,
-) {
-  const winners = new Map<string, string>()
-  for (const p of PROBLEMS) {
-    let bestRunId: string | null = null
-    let bestPeak = -Infinity
-    for (const m of models) {
-      const cell = m.results[p.key]
-      if (!cell?.correct || cell.peak_fraction == null || cell.invalid_reason) {
-        continue
-      }
-      if (isInvalidAudit(annotations.get(cell.run_id), audits.get(cell.run_id))) {
-        continue
-      }
-      if (cell.peak_fraction > bestPeak) {
-        bestPeak = cell.peak_fraction
-        bestRunId = cell.run_id
-      }
-    }
-    if (bestRunId) winners.set(p.key, bestRunId)
-  }
-  return winners
-}
-
-function correctnessStatus(
-  cell: Cell,
-  annot?: { verdict: string; summary?: string },
-  audit?: RunAudit,
-): RunStatus {
-  if (cell.invalid_reason || isInvalidAudit(annot, audit)) {
-    return status("invalid", "bad", "bad", "invalid or quarantined")
-  }
-  if (cell.correct) {
-    if (
-      annot &&
-      ["rubric_leak", "bug", "interesting", "contamination"].includes(annot.verdict)
-    ) {
-      return status(
-        "pass",
-        "good",
-        annot.verdict === "bug" || annot.verdict === "contamination" ? "bad" : "warn",
-        `annotated ${annot.verdict}`,
-      )
-    }
-    return status("pass", "good")
-  }
-  if (annot?.verdict === "harness_limited")
-    return status("infra", "warn", "warn", "harness-limited")
-  if (cell.failure_reason === "provider_rate_limited") return status("rate", "bad")
-  if (cell.failure_reason === "provider_early_stop") return status("early", "warn")
-  if (cell.failure_reason === "timeout") return status("time", "warn")
-  if (cell.failure_reason === "no_solution") return status("no sol", "bad")
-  if (cell.has_solution) return status("fail", "bad")
-  return status("err", "bad")
-}
-
-function auditFlagsFor(
-  annot: { verdict: string; summary?: string } | undefined,
-  audit: RunAudit | undefined,
-) {
-  const flags = new Set<string>()
-  for (const flag of audit?.flags ?? []) flags.add(flag)
-  if (annot && annot.verdict !== "clean") flags.add(annot.verdict)
-  return [...flags]
-}
-
-function isInvalidAudit(
-  annot: { verdict: string; summary?: string } | undefined,
-  audit: RunAudit | undefined,
-) {
-  return (
-    audit?.invalid ||
-    annot?.verdict === "reward_hack" ||
-    annot?.verdict === "contamination"
-  )
-}
-
-function compiledStatus(cell: Cell): RunStatus {
-  if (!cell.has_solution) return status("no sol", "muted")
-  if (
-    cell.correct ||
-    cell.peak_fraction != null ||
-    cell.check_exit_code === 0 ||
-    cell.benchmark_exit_code === 0
-  ) {
-    return status("yes", "good")
-  }
-  if (cell.check_exit_code != null || cell.benchmark_exit_code != null) {
-    return status("failed", "bad")
-  }
-  return status("unknown", "warn")
-}
-
-function referenceUrlFor(problem: string) {
-  return `/code?f=${encodeURIComponent(`/data/hard/references/${problem}_reference.py.txt`)}`
-}
-
-function renderCorrectness(
-  cell: Cell,
-  annot?: { verdict: string; summary?: string },
-) {
-  if (cell.invalid_reason || annot?.verdict === "reward_hack") {
-    return (
-      <>
-        <StatusPill tone="bad">invalid</StatusPill>
-        <AnnotationBadge severity="bad" label="invalid or reward hack" />
-      </>
-    )
-  }
-  if (cell.correct) {
-    const badge =
-      annot && ["rubric_leak", "bug", "interesting"].includes(annot.verdict) ? (
-        <AnnotationBadge
-          severity={annot.verdict === "bug" ? "bad" : "warn"}
-          label={`annotated ${annot.verdict}`}
-        />
-      ) : null
-    return (
-      <>
-        <StatusPill tone="good">pass</StatusPill>
-        {badge}
-      </>
-    )
-  }
-  if (cell.failure_reason === "provider_rate_limited") return <StatusPill tone="bad">rate</StatusPill>
-  if (cell.failure_reason === "provider_early_stop") return <StatusPill tone="warn">early</StatusPill>
-  if (cell.failure_reason === "timeout") return <StatusPill tone="warn">time</StatusPill>
-  if (cell.failure_reason === "no_solution") return <StatusPill tone="bad">no sol</StatusPill>
-  if (cell.has_solution) return <StatusPill tone="bad">fail</StatusPill>
-  return <StatusPill tone="bad">err</StatusPill>
-}
-
-function renderCompiled(cell: Cell) {
-  if (!cell.has_solution) return <StatusPill tone="muted">no sol</StatusPill>
-  if (
-    cell.correct ||
-    cell.peak_fraction != null ||
-    cell.check_exit_code === 0 ||
-    cell.benchmark_exit_code === 0
-  ) {
-    return <StatusPill tone="good">yes</StatusPill>
-  }
-  if (cell.check_exit_code != null || cell.benchmark_exit_code != null) {
-    return <StatusPill tone="bad">failed</StatusPill>
-  }
-  return <StatusPill tone="warn">unknown</StatusPill>
-}
-
-function renderSpeed(cell: Cell, isWinner: boolean) {
-  if (cell.peak_fraction == null) return <span className="cell-missing">-</span>
-  const pct = cell.peak_fraction * 100
-  return (
-    <div className="speed-cell">
-      <div className="speed-readout">
-        <span className={isWinner ? "cell-score cell-winner" : "cell-score"}>
-          {pct.toFixed(1)}%
-        </span>
-      </div>
-      <div className="speed-bar" title={`peak_fraction ${cell.peak_fraction.toFixed(4)}`}>
-        <div
-          className={isWinner ? "speed-fill speed-fill-winner" : "speed-fill"}
-          style={{ width: `${Math.min(100, Math.max(0, pct))}%` }}
-        />
-      </div>
-    </div>
-  )
-}
-
-function renderTokens(cell: Cell) {
-  const usage = cell.usage ?? {}
-  return (
-    <div className="stacked-cell" title={tokenTitle(cell)}>
-      <span>out {fmtCompact(usage.output_tokens)}</span>
-      <span>think {fmtCompact(usage.reasoning_tokens)}</span>
-      <span>cache {fmtCompact((usage.cache_read_tokens ?? 0) + (usage.cache_creation_tokens ?? 0))}</span>
-    </div>
-  )
-}
-
-function renderRuntime(cell: Cell) {
-  return (
-    <div className="stacked-cell" title={runtimeTitle(cell)}>
-      <span>agent {fmtMaybeDurationText(cell.elapsed_seconds)}</span>
-      <span>check {fmtMaybeDurationText(cell.check_elapsed_seconds)}</span>
-      <span>bench {fmtMaybeDurationText(cell.benchmark_elapsed_seconds)}</span>
-    </div>
-  )
-}
-
-function StatusPill({
-  tone,
-  children,
-}: {
-  tone: "good" | "bad" | "warn" | "muted"
-  children: React.ReactNode
-}) {
-  return <span className={`status-pill status-pill-${tone}`}>{children}</span>
-}
-
-function runDate(runId: string) {
-  const parts = runDateParts(runId)
-  if (!parts.date || !parts.time) return <span className="cell-missing">-</span>
-  return (
-    <div className="stacked-cell">
-      <span>{parts.date}</span>
-      <span>{parts.time}</span>
-    </div>
-  )
-}
-
-function runDateParts(runId: string) {
-  const m = runId.match(/^(\d{4})(\d{2})(\d{2})_(\d{2})(\d{2})(\d{2})/)
-  if (!m) return { date: null, time: null }
-  return {
-    date: `${m[1]}-${m[2]}-${m[3]}`,
-    time: `${m[4]}:${m[5]}:${m[6]}`,
-  }
-}
-
-function fmtCompact(value: number | null | undefined) {
-  if (value == null) return "-"
-  if (Math.abs(value) >= 1_000_000) return `${(value / 1_000_000).toFixed(1)}m`
-  if (Math.abs(value) >= 1_000) return `${(value / 1_000).toFixed(1)}k`
-  return fmtInt(value)
-}
-
-function fmtMaybeDurationText(value: number | null | undefined) {
-  return value == null ? "-" : fmtDuration(value)
-}
-
-function tokenTitle(cell: Cell) {
-  const usage = cell.usage ?? {}
-  return [
-    usage.input_tokens != null ? `input ${fmtInt(usage.input_tokens)}` : null,
-    usage.output_tokens != null ? `output ${fmtInt(usage.output_tokens)}` : null,
-    usage.reasoning_tokens != null ? `reasoning ${fmtInt(usage.reasoning_tokens)}` : null,
-    usage.cache_read_tokens != null ? `cache read ${fmtInt(usage.cache_read_tokens)}` : null,
-    usage.cache_creation_tokens != null
-      ? `cache write ${fmtInt(usage.cache_creation_tokens)}`
-      : null,
-    usage.total_cost_usd != null ? `cost $${usage.total_cost_usd.toFixed(4)}` : null,
-    cell.output_tokens_per_second != null
-      ? `${cell.output_tokens_per_second.toFixed(1)} out tok/s`
-      : null,
-  ].filter(Boolean).join("\n")
-}
-
-function runtimeTitle(cell: Cell) {
-  return [
-    cell.total_elapsed_seconds != null ? `total ${fmtDuration(cell.total_elapsed_seconds)}` : null,
-    cell.elapsed_seconds != null ? `agent ${fmtDuration(cell.elapsed_seconds)}` : null,
-    cell.check_elapsed_seconds != null ? `check ${fmtDuration(cell.check_elapsed_seconds)}` : null,
-    cell.benchmark_elapsed_seconds != null
-      ? `benchmark ${fmtDuration(cell.benchmark_elapsed_seconds)}`
-      : null,
-    cell.gpu_lock_wait_seconds_total != null
-      ? `GPU wait ${fmtDuration(cell.gpu_lock_wait_seconds_total)}`
-      : null,
-    cell.gpu_lock_active_seconds_total != null
-      ? `GPU active ${fmtDuration(cell.gpu_lock_active_seconds_total)}`
-      : null,
-  ].filter(Boolean).join("\n")
-}
-
-function compareModelRows(a: Model, b: Model) {
-  const labelDiff = shortLabel(a.label).localeCompare(shortLabel(b.label))
-  if (labelDiff !== 0) return labelDiff
-  const harnessDiff = harnessLabel(a.harness).localeCompare(harnessLabel(b.harness))
-  if (harnessDiff !== 0) return harnessDiff
-  if (b.pass_count !== a.pass_count) return b.pass_count - a.pass_count
-  const bRate = b.total_runs ? b.pass_count / b.total_runs : 0
-  const aRate = a.total_runs ? a.pass_count / a.total_runs : 0
-  if (bRate !== aRate) return bRate - aRate
-  const peakDiff = bestPeak(b.results) - bestPeak(a.results)
-  if (peakDiff !== 0) return peakDiff
-  return a.label.localeCompare(b.label)
-}
-
-function bestPeak(results: Model["results"]) {
-  return Math.max(
-    -1,
-    ...Object.values(results).map((cell) => cell.peak_fraction ?? -1),
-  )
-}
-
-function shortLabel(label: string) {
-  return label
-    .replace("codex/gpt-5.5 [2026-05-28 finish xhigh]", "GPT-5.5")
-    .replace("codex/gpt-5.5 [xhigh]", "GPT-5.5")
-    .replace("claude/claude-opus-4-7 [2026-05-28 finish max]", "Claude Opus 4.7")
-    .replace("claude/claude-opus-4-8 [2026-05-28 opus48-grok max]", "Claude Opus 4.8")
-    .replace("claude/claude-opus-4-6 [2026-06-04 opus46 max]", "Claude Opus 4.6")
-    .replace("claude/claude-opus-4-7 [max]", "Claude Opus 4.7 [max]")
-    .replace("cursor/composer-2.5-fast [2026-05-28 finish]", "Composer 2.5 Fast")
-    .replace("gemini/gemini-3.5-flash [2026-05-28 finish]", "Gemini 3.5 Flash")
-    .replace("grok/grok-build [2026-05-28 opus48-grok max]", "Grok Build")
-    .replace("grok/grok-4.5 [max]", "Grok 4.5")
-    .replace("grok/grok-4.5", "Grok 4.5")
-    .replace("kimi/kimi-k2.6", "Kimi K2.6")
-    .replace("opencode/openrouter-pinned/xiaomi/mimo-v2.5-pro", "MiMo v2.5 Pro")
-    .replace("opencode/deepseek/deepseek-v4-flash", "DeepSeek V4 Flash")
-    .replace("opencode/deepseek/deepseek-v4-pro", "DeepSeek V4 Pro")
-    .replace("openrouter-google-ai-studio/google/", "or-google/")
-    .replace("openrouter-alibaba/qwen/", "or-qwen/")
-    .replace("zai-claude/glm-5.1 [2026-05-13]", "GLM-5.1")
-    .replace("droid/zai/glm-5.1 [2026-05-08]", "GLM-5.1")
-    .replace("opencode/zai/glm-5.1 [2026-05-08]", "GLM-5.1")
-    .replace("opencode/zai/glm-5.1", "GLM-5.1")
-    .replace("minimax-claude/MiniMax-M3 [2026-06-01]", "MiniMax M3")
-    .replace("minimax-claude/MiniMax-M3 [2026-06-01 max]", "MiniMax M3")
-    .replace("minimax-claude/MiniMax-M3", "MiniMax M3")
-    .replace("claude/claude-opus-4-8 [max]", "Claude Opus 4.8")
-    .replace("claude/claude-opus-4-8", "Claude Opus 4.8")
-    .replace("claude/claude-fable-5 [max]", "Claude Fable 5 [max]")
-    .replace("cursor/composer-2.5-fast", "Composer 2.5 Fast")
-    .replace("cursor/composer-2.5", "Composer 2.5")
-    .replace("gemini/gemini-3.5-flash", "Gemini 3.5 Flash")
-    .replace("gemini/gemini-3.1-pro-preview", "Gemini 3.1 Pro")
-    .replace("deepseek-claude/deepseek-v4-pro", "DeepSeek V4 Pro")
-    .replace("kimi-claude/kimi-k2.7-code", "Kimi K2.7-Code")
-    .replace("hy3-claude/tencent/hy3-preview", "Tencent Hy3")
-    .replace("hy3-claude/hy3", "Tencent Hy3")
-    .replace("hy3/hy3", "Tencent Hy3")
-    .replace("hy3/tokenhub/hy3", "Tencent Hy3")
-    .replace("longcat-claude/LongCat-2.0", "Meituan LongCat 2.0")
-    .replace("zai-claude/glm-5.2", "GLM-5.2")
-    .replace("opencode/openrouter-pinned/", "or/")
-    .replace("opencode/", "")
-    .replace("codex/", "")
-    .replace("claude/", "")
-    .replace("kimi/", "")
-}
-
-function harnessLabel(harness: string) {
-  const labels: Record<string, string> = {
-    claude: "Claude Code",
-    codex: "Codex",
-    opencode: "Opencode",
-    droid: "droid",
-    kimi: "kimi",
-    cursor: "Cursor",
-    gemini: "Gemini CLI",
-    grok: "Grok CLI",
-    "zai-claude": "Claude Code",
-    "minimax-claude": "Claude Code",
-    "deepseek-claude": "Claude Code",
-    "kimi-claude": "Claude Code",
-    hy3: "OpenCode",
-    "hy3-claude": "OpenCode",
-  }
-  // Provider models routed through Claude Code (the "<provider>-claude" harnesses)
-  // are all just Claude Code; only the underlying model differs.
-  // Exception: hy3-claude is a legacy alias for TokenHub Hy3 via OpenCode.
-  if (harness === "hy3" || harness === "hy3-claude") return "OpenCode"
-  if (harness.endsWith("-claude")) return "Claude Code"
-  return labels[harness] ?? harness
-}
-
-function AnnotationBadge({
-  severity,
-  label,
-}: {
-  severity: "bad" | "warn"
-  label: string
-}) {
-  return (
-    <span
-      className={`annotation-badge annotation-badge-${severity}`}
-      title={label}
-      aria-label={label}
-    >
-      !
-    </span>
-  )
-}
-
-function cellTitle(
-  cell: {
-    run_id: string
-    correct: boolean
-    peak_fraction: number | null
-    failure_reason?: string | null
-    retryable_infra_failure?: boolean | null
-    minimum_useful_output_tokens?: number | null
-    elapsed_seconds?: number | null
-    total_elapsed_seconds?: number | null
-    check_elapsed_seconds?: number | null
-    benchmark_elapsed_seconds?: number | null
-    check_exit_code?: number | null
-    benchmark_exit_code?: number | null
-    output_tokens_per_second?: number | null
-    usage?: {
-      input_tokens?: number | null
-      output_tokens?: number | null
-      cache_read_tokens?: number | null
-      cache_creation_tokens?: number | null
-      reasoning_tokens?: number | null
-      total_cost_usd?: number | null
-    }
-    session_complete?: boolean
-    harness_exit_code?: number | null
-    agent_cuda_disabled?: boolean
-    gpu_queue_mode?: string | null
-    gpu_lock_calls?: number | null
-    gpu_lock_wait_seconds_total?: number | null
-    gpu_lock_active_seconds_total?: number | null
-  },
-  hasViewer: boolean,
-  annotation?: { verdict: string; summary?: string },
-  isWinner?: boolean,
-  audit?: RunAudit,
-) {
-  const usage = cell.usage ?? {}
-  const status =
-    cell.failure_reason === "pass"
-      ? null
-      : cell.correct && cell.failure_reason === "benchmark_timeout"
-        ? "benchmark timed out after correctness passed"
-        : cell.correct && cell.failure_reason
-          ? `status ${cell.failure_reason}`
-          : cell.failure_reason
-            ? `failure ${cell.failure_reason}`
-            : null
-  const parts = [
-    cell.run_id,
-    hasViewer ? "click to open transcript viewer" : "transcript viewer unavailable",
-    isWinner ? "visible winner for this problem" : null,
-    status,
-    cell.retryable_infra_failure ? "retryable infra failure" : null,
-    cell.minimum_useful_output_tokens != null
-      ? `min useful output ${fmtInt(cell.minimum_useful_output_tokens)} tok`
-      : null,
-    cell.session_complete === false ? "session incomplete" : null,
-    cell.harness_exit_code != null ? `exit ${cell.harness_exit_code}` : null,
-    cell.elapsed_seconds != null ? `agent ${fmtDuration(cell.elapsed_seconds)}` : null,
-    cell.total_elapsed_seconds != null
-      ? `total ${fmtDuration(cell.total_elapsed_seconds)}`
-      : null,
-    cell.check_elapsed_seconds != null
-      ? `check ${fmtDuration(cell.check_elapsed_seconds)}`
-      : null,
-    cell.check_exit_code != null ? `check exit ${cell.check_exit_code}` : null,
-    cell.benchmark_elapsed_seconds != null
-      ? `bench ${fmtDuration(cell.benchmark_elapsed_seconds)}`
-      : null,
-    cell.benchmark_exit_code != null
-      ? `bench exit ${cell.benchmark_exit_code}`
-      : null,
-    usage.input_tokens != null ? `in ${fmtInt(usage.input_tokens)} tok` : null,
-    usage.output_tokens != null ? `out ${fmtInt(usage.output_tokens)} tok` : null,
-    usage.cache_read_tokens != null
-      ? `cache read ${fmtInt(usage.cache_read_tokens)} tok`
-      : null,
-    usage.cache_creation_tokens != null
-      ? `cache write ${fmtInt(usage.cache_creation_tokens)} tok`
-      : null,
-    usage.reasoning_tokens != null
-      ? `reasoning ${fmtInt(usage.reasoning_tokens)} tok`
-      : null,
-    cell.output_tokens_per_second != null
-      ? `${cell.output_tokens_per_second.toFixed(1)} out tok/s`
-      : null,
-    usage.total_cost_usd != null ? `$${usage.total_cost_usd.toFixed(4)}` : null,
-    cell.gpu_queue_mode ? `queue ${cell.gpu_queue_mode}` : null,
-    cell.gpu_lock_calls != null ? `GPU lock calls ${cell.gpu_lock_calls}` : null,
-    cell.gpu_lock_wait_seconds_total != null
-      ? `GPU lock wait ${fmtDuration(cell.gpu_lock_wait_seconds_total)}`
-      : null,
-    cell.gpu_lock_active_seconds_total != null
-      ? `GPU lock active ${fmtDuration(cell.gpu_lock_active_seconds_total)}`
-      : null,
-    cell.agent_cuda_disabled ? "agent CUDA disabled" : null,
-    annotation ? `annotation ${annotation.verdict}` : null,
-    annotation?.summary ? `annotation summary: ${annotation.summary}` : null,
-    audit?.flags.length ? `audit flags ${audit.flags.join(", ")}` : null,
-    audit?.summary ? audit.summary : null,
-  ]
-  return parts.filter(Boolean).join("\n")
-}
-
-function fmtDuration(seconds: number) {
-  if (seconds < 60) return `${seconds}s`
-  const min = Math.floor(seconds / 60)
-  const sec = seconds % 60
-  return `${min}m ${sec}s`
-}
-
-function fmtInt(n: number) {
-  return new Intl.NumberFormat("en-US").format(n)
 }
