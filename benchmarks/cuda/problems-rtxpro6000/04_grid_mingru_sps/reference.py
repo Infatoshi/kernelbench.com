@@ -55,10 +55,14 @@ class Model(nn.Module):
         self.reset_parameters(0)
 
     def reset_parameters(self, seed: int = 0) -> None:
+        # Generate on CPU then copy so this works for params already on CUDA
+        # (torch 2.13+ rejects a CPU generator used with CUDA tensors).
         g = torch.Generator(device="cpu")
         g.manual_seed(seed)
         for p in self.parameters():
-            p.data.normal_(0.0, 0.02, generator=g)
+            tmp = torch.empty(p.shape, dtype=p.dtype, device="cpu")
+            tmp.normal_(0.0, 0.02, generator=g)
+            p.data.copy_(tmp)
 
     def forward(self, obs: torch.Tensor, state: torch.Tensor):
         return policy_forward(self, obs, state)

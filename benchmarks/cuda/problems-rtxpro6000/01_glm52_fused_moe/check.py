@@ -10,9 +10,9 @@ import yaml
 REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_ROOT))
 
+from src.eval import cuda_language as cl  # noqa: E402
 from src.eval.correctness import check_correctness  # noqa: E402
 from src.eval.cuda_language import collect_solution_sources  # noqa: E402
-from src.eval import cuda_language as cl  # noqa: E402
 from src.eval.numeric_stress import (  # noqa: E402
     numeric_stress_cases,
     numeric_stress_context,

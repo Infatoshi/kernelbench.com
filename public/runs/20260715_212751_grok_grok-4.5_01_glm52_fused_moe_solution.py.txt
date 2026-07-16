@@ -1,0 +1,477 @@
+"""GLM-5.2-class fused MoE — CUDA implementation.
+
+vLLM-style fused weights + GLM routing (E=256, top_k=8, n_shared=1):
+  w1: (…, 2*I, H) gate|up packed; w2: (…, H, I) down.
+
+Path:
+  1. Shared expert FFN over all tokens (ATen/cuBLAS bf16).
+  2. Device histogram + bucket-sort of (token, expert, weight) by expert.
+  3. Per-expert on a pool of CUDA streams (overlapped small GEMMs):
+     gather → gate|up GEMM → silu_mul → down GEMM → atomic weighted scatter.
+  4. float32 accumulate, cast to bf16.
+
+Custom CUDA: hist/scan/bucket, gather, silu_and_mul, scatter, cast.
+"""
+from __future__ import annotations
+
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+_CUDA_SRC = r"""
+#include <torch/extension.h>
+#include <ATen/cuda/CUDAContext.h>
+#include <c10/cuda/CUDAGuard.h>
+#include <cuda_runtime.h>
+#include <cuda_bf16.h>
+#include <cstdint>
+#include <vector>
+
+#ifndef MOE_NSTREAMS
+#define MOE_NSTREAMS 8
+#endif
+
+__device__ __forceinline__ float silu_f(float x) {
+  return x / (1.0f + expf(-x));
+}
+
+__global__ void silu_and_mul_kernel(
+    const __nv_bfloat16* __restrict__ in,
+    __nv_bfloat16* __restrict__ out,
+    int64_t N, int I) {
+  int64_t idx = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+  int64_t total = N * I;
+  if (idx >= total) return;
+  int64_t row = idx / I;
+  int col = (int)(idx - row * I);
+  const __nv_bfloat16* rp = in + row * (2 * (int64_t)I);
+  float g = __bfloat162float(rp[col]);
+  float u = __bfloat162float(rp[I + col]);
+  out[idx] = __float2bfloat16(silu_f(g) * u);
+}
+
+// Atomic scatter — safe across concurrent streams writing the same tokens
+__global__ void weighted_scatter_atomic_kernel(
+    float* __restrict__ out,
+    const __nv_bfloat16* __restrict__ y,
+    const __nv_bfloat16* __restrict__ scale,
+    const int64_t* __restrict__ token_idx,
+    int64_t N, int H) {
+  int64_t idx = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+  int64_t total = N * H;
+  if (idx >= total) return;
+  int64_t row = idx / H;
+  int col = (int)(idx - row * H);
+  float s = __bfloat162float(scale[row]);
+  float v = __bfloat162float(y[row * (int64_t)H + col]) * s;
+  int64_t t = token_idx[row];
+  atomicAdd(out + t * (int64_t)H + col, v);
+}
+
+// Non-atomic (single-stream sequential)
+__global__ void weighted_scatter_kernel(
+    float* __restrict__ out,
+    const __nv_bfloat16* __restrict__ y,
+    const __nv_bfloat16* __restrict__ scale,
+    const int64_t* __restrict__ token_idx,
+    int64_t N, int H) {
+  int64_t idx = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+  int64_t total = N * H;
+  if (idx >= total) return;
+  int64_t row = idx / H;
+  int col = (int)(idx - row * H);
+  float s = __bfloat162float(scale[row]);
+  float v = __bfloat162float(y[row * (int64_t)H + col]) * s;
+  int64_t t = token_idx[row];
+  out[t * (int64_t)H + col] += v;
+}
+
+__global__ void hist_kernel(
+    const int64_t* __restrict__ ids, int* __restrict__ counts,
+    int64_t n, int E) {
+  int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= n) return;
+  int64_t e = ids[i];
+  if ((unsigned)e < (unsigned)E) atomicAdd(counts + (int)e, 1);
+}
+
+__global__ void exclusive_scan_kernel(
+    const int* __restrict__ counts, int* __restrict__ offsets, int E) {
+  __shared__ int tmp[256];
+  int tid = threadIdx.x;
+  int v = (tid < E) ? counts[tid] : 0;
+  tmp[tid] = v;
+  __syncthreads();
+  for (int off = 1; off < 256; off <<= 1) {
+    int t = (tid >= off) ? tmp[tid - off] : 0;
+    __syncthreads();
+    if (tid >= off) tmp[tid] += t;
+    __syncthreads();
+  }
+  if (tid < E) offsets[tid] = tmp[tid] - v;
+}
+
+__global__ void build_buckets_kernel(
+    const int64_t* __restrict__ ids,
+    int* __restrict__ cursor,
+    int64_t* __restrict__ sorted_token,
+    __nv_bfloat16* __restrict__ sorted_w,
+    const __nv_bfloat16* __restrict__ weights,
+    int64_t T, int top_k, int E) {
+  int64_t flat = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+  int64_t n = T * top_k;
+  if (flat >= n) return;
+  int64_t e = ids[flat];
+  if ((unsigned)e >= (unsigned)E) return;
+  int pos = atomicAdd(cursor + (int)e, 1);
+  sorted_token[pos] = flat / top_k;
+  sorted_w[pos] = weights[flat];
+}
+
+__global__ void gather_rows_kernel(
+    const __nv_bfloat16* __restrict__ x,
+    const int64_t* __restrict__ token_idx,
+    __nv_bfloat16* __restrict__ out,
+    int64_t N, int H) {
+  int64_t idx = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+  int64_t total = N * H;
+  if (idx >= total) return;
+  int64_t row = idx / H;
+  int col = (int)(idx - row * H);
+  int64_t t = token_idx[row];
+  out[row * (int64_t)H + col] = x[t * (int64_t)H + col];
+}
+
+__global__ void add_bf16_to_f32_kernel(
+    float* __restrict__ out, const __nv_bfloat16* __restrict__ y, int64_t n) {
+  int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < n) out[i] += __bfloat162float(y[i]);
+}
+
+__global__ void f32_to_bf16_kernel(
+    const float* __restrict__ in, __nv_bfloat16* __restrict__ out, int64_t n) {
+  int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < n) out[i] = __float2bfloat16(in[i]);
+}
+
+static inline int grid1d(int64_t n, int threads) {
+  int64_t blocks = (n + threads - 1) / threads;
+  if (blocks > 2147483647LL) blocks = 2147483647LL;
+  return (int)blocks;
+}
+
+static void silu_and_mul_s(torch::Tensor in, torch::Tensor out, cudaStream_t stream) {
+  int64_t N = in.size(0);
+  int I = (int)out.size(1);
+  if (N == 0) return;
+  silu_and_mul_kernel<<<grid1d(N * I, 256), 256, 0, stream>>>(
+      reinterpret_cast<const __nv_bfloat16*>(in.data_ptr()),
+      reinterpret_cast<__nv_bfloat16*>(out.data_ptr()),
+      N, I);
+}
+
+static torch::Tensor expert_ffn_s(
+    const torch::Tensor& x,
+    const torch::Tensor& w1,
+    const torch::Tensor& w2,
+    cudaStream_t stream) {
+  // Bind ATen ops to this stream
+  at::cuda::CUDAStreamGuard guard(
+      at::cuda::getStreamFromExternal(stream, at::cuda::current_device()));
+  auto gate_up = at::mm(x, w1.transpose(0, 1));
+  int64_t n = gate_up.size(0);
+  int64_t I = gate_up.size(1) / 2;
+  auto h = at::empty({n, I}, gate_up.options());
+  silu_and_mul_s(gate_up, h, stream);
+  return at::mm(h, w2.transpose(0, 1));
+}
+
+static torch::Tensor expert_ffn(
+    const torch::Tensor& x,
+    const torch::Tensor& w1,
+    const torch::Tensor& w2) {
+  auto stream = at::cuda::getCurrentCUDAStream().stream();
+  return expert_ffn_s(x, w1, w2, stream);
+}
+
+torch::Tensor fused_moe_forward(
+    torch::Tensor x,
+    torch::Tensor expert_ids,
+    torch::Tensor expert_weights,
+    torch::Tensor w1_routed,
+    torch::Tensor w2_routed,
+    torch::Tensor w1_shared,
+    torch::Tensor w2_shared) {
+  const at::cuda::CUDAGuard device_guard(x.device());
+  auto default_stream = at::cuda::getCurrentCUDAStream();
+  cudaStream_t main_stream = default_stream.stream();
+
+  TORCH_CHECK(x.is_cuda() && x.scalar_type() == at::kBFloat16);
+  TORCH_CHECK(expert_ids.is_cuda() && expert_ids.scalar_type() == at::kLong);
+  TORCH_CHECK(expert_weights.is_cuda());
+
+  x = x.contiguous();
+  expert_ids = expert_ids.contiguous();
+  expert_weights = expert_weights.contiguous();
+  w1_routed = w1_routed.contiguous();
+  w2_routed = w2_routed.contiguous();
+  w1_shared = w1_shared.contiguous();
+  w2_shared = w2_shared.contiguous();
+
+  const int64_t T = x.size(0);
+  const int64_t H = x.size(1);
+  const int64_t top_k = expert_ids.size(1);
+  const int64_t E = w1_routed.size(0);
+  const int64_t I = w2_routed.size(2);
+  const int64_t n_shared = w1_shared.size(0);
+  const int64_t n_flat = T * top_k;
+
+  auto out_f32 = at::zeros({T, H}, x.options().dtype(at::kFloat));
+
+  // Shared experts on main stream
+  for (int64_t s = 0; s < n_shared; ++s) {
+    auto y = expert_ffn(x, w1_shared[s], w2_shared[s]);
+    add_bf16_to_f32_kernel<<<grid1d(y.numel(), 256), 256, 0, main_stream>>>(
+        out_f32.data_ptr<float>(),
+        reinterpret_cast<const __nv_bfloat16*>(y.data_ptr()), y.numel());
+  }
+
+  if (n_flat == 0) {
+    auto out = at::empty({T, H}, x.options());
+    f32_to_bf16_kernel<<<grid1d(out_f32.numel(), 256), 256, 0, main_stream>>>(
+        out_f32.data_ptr<float>(),
+        reinterpret_cast<__nv_bfloat16*>(out.data_ptr()),
+        out_f32.numel());
+    return out;
+  }
+
+  auto counts = at::zeros({E}, x.options().dtype(at::kInt));
+  hist_kernel<<<grid1d(n_flat, 256), 256, 0, main_stream>>>(
+      expert_ids.data_ptr<int64_t>(), counts.data_ptr<int>(),
+      n_flat, (int)E);
+
+  auto offsets = at::empty({E}, counts.options());
+  exclusive_scan_kernel<<<1, 256, 0, main_stream>>>(
+      counts.data_ptr<int>(), offsets.data_ptr<int>(), (int)E);
+
+  auto cursor = offsets.clone();
+  auto sorted_token = at::empty({n_flat}, expert_ids.options());
+  auto sorted_w = at::empty({n_flat}, expert_weights.options());
+  build_buckets_kernel<<<grid1d(n_flat, 256), 256, 0, main_stream>>>(
+      expert_ids.data_ptr<int64_t>(),
+      cursor.data_ptr<int>(),
+      sorted_token.data_ptr<int64_t>(),
+      reinterpret_cast<__nv_bfloat16*>(sorted_w.data_ptr()),
+      reinterpret_cast<const __nv_bfloat16*>(expert_weights.data_ptr()),
+      T, (int)top_k, (int)E);
+
+  auto counts_cpu = counts.cpu();
+  auto offsets_cpu = offsets.cpu();
+  const int* counts_h = counts_cpu.data_ptr<int>();
+  const int* offsets_h = offsets_cpu.data_ptr<int>();
+
+  // Collect active experts
+  std::vector<int> active_e, active_n, active_off;
+  active_e.reserve((size_t)E);
+  int max_n = 0;
+  for (int e = 0; e < (int)E; ++e) {
+    if (counts_h[e] > 0) {
+      active_e.push_back(e);
+      active_n.push_back(counts_h[e]);
+      active_off.push_back(offsets_h[e]);
+      if (counts_h[e] > max_n) max_n = counts_h[e];
+    }
+  }
+  const int G = (int)active_e.size();
+  if (G == 0) {
+    auto out = at::empty({T, H}, x.options());
+    f32_to_bf16_kernel<<<grid1d(out_f32.numel(), 256), 256, 0, main_stream>>>(
+        out_f32.data_ptr<float>(),
+        reinterpret_cast<__nv_bfloat16*>(out.data_ptr()),
+        out_f32.numel());
+    return out;
+  }
+
+  // Use multi-stream when many small experts (avg load small)
+  const bool use_streams = (T < 2048) && (G >= 4);
+  const int NS = use_streams ? MOE_NSTREAMS : 1;
+
+  // Per-stream workspace: (NS, max_n, H)
+  auto x_bufs = at::empty({NS, max_n, H}, x.options());
+
+  if (!use_streams) {
+    // Sequential fast path (large T — GPU already saturated)
+    auto x_buf = x_bufs[0];
+    for (int i = 0; i < G; ++i) {
+      int n = active_n[i];
+      int start = active_off[i];
+      int e = active_e[i];
+      auto tok_e = sorted_token.narrow(0, start, n);
+      auto w_e = sorted_w.narrow(0, start, n);
+      auto x_e = x_buf.narrow(0, 0, n);
+      gather_rows_kernel<<<grid1d((int64_t)n * H, 256), 256, 0, main_stream>>>(
+          reinterpret_cast<const __nv_bfloat16*>(x.data_ptr()),
+          tok_e.data_ptr<int64_t>(),
+          reinterpret_cast<__nv_bfloat16*>(x_e.data_ptr()),
+          n, (int)H);
+      auto y = expert_ffn(x_e, w1_routed[e], w2_routed[e]);
+      weighted_scatter_kernel<<<grid1d((int64_t)n * H, 256), 256, 0, main_stream>>>(
+          out_f32.data_ptr<float>(),
+          reinterpret_cast<const __nv_bfloat16*>(y.data_ptr()),
+          reinterpret_cast<const __nv_bfloat16*>(w_e.data_ptr()),
+          tok_e.data_ptr<int64_t>(),
+          n, (int)H);
+    }
+  } else {
+    // Cached non-blocking side streams (created once)
+    static cudaStream_t streams[MOE_NSTREAMS];
+    static cudaEvent_t ready_ev, done_ev[MOE_NSTREAMS];
+    static bool streams_ready = false;
+    if (!streams_ready) {
+      for (int s = 0; s < MOE_NSTREAMS; ++s) {
+        cudaStreamCreateWithFlags(&streams[s], cudaStreamNonBlocking);
+        cudaEventCreateWithFlags(&done_ev[s], cudaEventDisableTiming);
+      }
+      cudaEventCreateWithFlags(&ready_ev, cudaEventDisableTiming);
+      streams_ready = true;
+    }
+
+    cudaEventRecord(ready_ev, main_stream);
+    for (int s = 0; s < NS; ++s) {
+      cudaStreamWaitEvent(streams[s], ready_ev, 0);
+    }
+
+    for (int i = 0; i < G; ++i) {
+      int s = i % NS;
+      int n = active_n[i];
+      int start = active_off[i];
+      int e = active_e[i];
+      cudaStream_t st = streams[s];
+
+      auto tok_e = sorted_token.narrow(0, start, n);
+      auto w_e = sorted_w.narrow(0, start, n);
+      auto x_e = x_bufs[s].narrow(0, 0, n);
+
+      gather_rows_kernel<<<grid1d((int64_t)n * H, 256), 256, 0, st>>>(
+          reinterpret_cast<const __nv_bfloat16*>(x.data_ptr()),
+          tok_e.data_ptr<int64_t>(),
+          reinterpret_cast<__nv_bfloat16*>(x_e.data_ptr()),
+          n, (int)H);
+
+      auto y = expert_ffn_s(x_e, w1_routed[e], w2_routed[e], st);
+
+      weighted_scatter_atomic_kernel<<<grid1d((int64_t)n * H, 256), 256, 0, st>>>(
+          out_f32.data_ptr<float>(),
+          reinterpret_cast<const __nv_bfloat16*>(y.data_ptr()),
+          reinterpret_cast<const __nv_bfloat16*>(w_e.data_ptr()),
+          tok_e.data_ptr<int64_t>(),
+          n, (int)H);
+    }
+
+    // Join streams back to main
+    for (int s = 0; s < NS; ++s) {
+      cudaEventRecord(done_ev[s], streams[s]);
+      cudaStreamWaitEvent(main_stream, done_ev[s], 0);
+    }
+  }
+
+  auto out = at::empty({T, H}, x.options());
+  f32_to_bf16_kernel<<<grid1d(out_f32.numel(), 256), 256, 0, main_stream>>>(
+      out_f32.data_ptr<float>(),
+      reinterpret_cast<__nv_bfloat16*>(out.data_ptr()),
+      out_f32.numel());
+  return out;
+}
+"""
+
+_CPP_SRC = r"""
+torch::Tensor fused_moe_forward(
+    torch::Tensor x,
+    torch::Tensor expert_ids,
+    torch::Tensor expert_weights,
+    torch::Tensor w1_routed,
+    torch::Tensor w2_routed,
+    torch::Tensor w1_shared,
+    torch::Tensor w2_shared);
+"""
+
+_ext = None
+
+
+def _get_ext():
+    global _ext
+    if _ext is None:
+        _ext = load_inline(
+            name="glm52_fused_moe_v4b_streams",
+            cpp_sources=_CPP_SRC,
+            cuda_sources=_CUDA_SRC,
+            functions=["fused_moe_forward"],
+            extra_cuda_cflags=[
+                "-O3",
+                "--use_fast_math",
+                "-U__CUDA_NO_HALF_OPERATORS__",
+                "-U__CUDA_NO_HALF_CONVERSIONS__",
+                "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
+                "-U__CUDA_NO_HALF2_OPERATORS__",
+            ],
+            verbose=False,
+        )
+    return _ext
+
+
+class Model(nn.Module):
+    def __init__(
+        self,
+        T: int,
+        E: int,
+        top_k: int,
+        n_shared: int,
+        H: int,
+        I: int,
+    ):
+        super().__init__()
+        self.T, self.E, self.top_k = T, E, top_k
+        self.n_shared, self.H, self.I = n_shared, H, I
+        self.w1_routed = nn.Parameter(torch.empty(E, 2 * I, H, dtype=torch.bfloat16))
+        self.w2_routed = nn.Parameter(torch.empty(E, H, I, dtype=torch.bfloat16))
+        self.w1_shared = nn.Parameter(
+            torch.empty(n_shared, 2 * I, H, dtype=torch.bfloat16)
+        )
+        self.w2_shared = nn.Parameter(
+            torch.empty(n_shared, H, I, dtype=torch.bfloat16)
+        )
+        for p in self.parameters():
+            nn.init.normal_(p, std=0.02)
+        if torch.cuda.is_available():
+            _get_ext()
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        expert_ids: torch.Tensor,
+        expert_weights: torch.Tensor,
+    ) -> torch.Tensor:
+        return _get_ext().fused_moe_forward(
+            x,
+            expert_ids,
+            expert_weights,
+            self.w1_routed,
+            self.w2_routed,
+            self.w1_shared,
+            self.w2_shared,
+        )
+
+
+T, E, top_k, n_shared, H, I = 4096, 256, 8, 1, 4096, 2048
+
+
+def get_init_inputs():
+    return [T, E, top_k, n_shared, H, I]
+
+
+def get_inputs():
+    x = torch.randn(T, H, dtype=torch.bfloat16)
+    logits = torch.randn(T, E) + torch.linspace(0.3, 0.0, E).unsqueeze(0)
+    vals, ids = torch.topk(logits, k=top_k, dim=-1)
+    weights = torch.softmax(vals, dim=-1).to(torch.bfloat16)
+    return [x, ids.to(torch.int64), weights]

@@ -1,5 +1,62 @@
 # KernelBench-CUDA — DEVLOG
 
+## 2026-07-16 — Pre-debut deck repairs: torch 2.13 init fixes, numeric stress, 03 long-ctx
+
+Caught by the Grok 4.5 cell audits before the first publish (legal because the
+deck is still unpublished):
+
+1. **torch 2.13 rejects CPU generators on CUDA tensors.** Two template sites
+   hard-crashed independent of any solution: `04 reference.reset_parameters`
+   (check.py calls it after `.to(device)`) and `03 check.py _reinit`. Grok's 04
+   run tripped `template_mutated` by fixing the first with a bit-exact
+   CPU-draw-then-`copy_` hunk (audit verified `torch.equal` against the
+   original stream); Grok's 03 solution monkey-patched
+   `torch.nn.init.normal_` at import to survive the second (also bitwise
+   faithful). Both templates now carry the CPU-draw-then-copy pattern at the
+   source level — identical generator streams — so future solutions need
+   neither workaround. The 04 run was invalidated by the guard despite clean
+   intent (verdict `interesting`, not reward hack); rerun launched on the
+   fixed deck. Post-hoc, its solution passes the full strict battery and
+   benchmarks geomean peak_fraction 0.3728.
+2. **Numeric stress wired into the deck.** `_CASES` now covers 01 (hidden
+   ×1e-2 / ×8), 02 (qkv ×1e-2 / ×8), 04 (obs+state ×1e-2 / ×8, policy_forward
+   section only — env_step/run synthesize inputs internally and are
+   position-exact). 03 gets NO scale cases by construction: `run()`
+   synthesizes inputs from the seed (nothing external to scale) and RMSNorm
+   makes the stack weight-scale invariant, so input/state scaling cannot bite.
+3. **Two tolerances calibrated against measured noise, not guesses.** 04
+   `small_obs_state`: hard's `_TINY_FP32` atol 1e-7 is below the fp32
+   machine-epsilon floor for this pipeline — the audited kernel measures
+   4.6e-7 reorder noise (44/196608 bad at atol 1e-7), so the case uses
+   atol 1e-6 (≈3x margin, still ~100x tighter than a wrong-gate signature).
+   01 `large_hidden`: at 8x hidden, output magnitudes reach ~370 (mean ~57)
+   and even an idealized bf16 pipeline (fp32 matmuls, bf16 silu*up
+   intermediate) measures max_abs=2.0. The final case is atol 1.5 / rtol 5e-2:
+   the smallest point passing the audited kernel at every check variant
+   (min margin +0.49; floor sim +1.03) while wrong/cached kernels diverge by
+   O(mean magnitude) ~57. Floor/scan harnesses: `backfill/` scratch
+   (ephemeral). **Gotcha worth remembering:** the pass predicate is
+   `torch.allclose(ref, sol)` whose rtol multiplies |sol| (asymmetric), but
+   check.py's diagnostic `bad=` count uses |ref| — a scan built on the
+   diagnostic semantics undercounts and picks atol 1.0, which then fails the
+   same kernel at seed 123 by −0.006. Calibrate against the actual predicate,
+   across ALL seeds the check runs (42/123/456), not just seed 42: the failing
+   element moved between seeds.
+4. **03 hardening is a long-ctx spot check.** check.py used to top out at
+   ctx 512, so numerics at 2k+ were verified by no one (audit finding on the
+   passing Grok cell). Measured on that kernel: max_abs is a CONSTANT 0.0625
+   at both ctx 2048 and ctx 8192 (a per-layer bf16 rounding constant, not
+   accumulation), reference wall time ~13s at 8k. check.py now runs one
+   (seed 42, ctx 8192, decode 16) comparison at the same 0.08 tolerance.
+5. **04 peak_sps stays 150M**, derivation now documented in problem.yaml: the
+   first audited fused CUDA baseline sustains ~50-61M sps (pf 0.33-0.41), so
+   150M is an aspirational roofline-proxy ceiling, not a best-known-kernel
+   number. Do not fit the ceiling to the kernel.
+
+All published cells are re-validated against this final surface before the
+board debuts (backfill checks run the archived solutions through the current
+check.py + numeric_stress.py; 01/02/03/04 PASS, with 04's fresh rerun pending).
+
 ## 2026-07-15 — Latency-anchored relative scoring (standing metric decision)
 
 Peak fraction is the wrong headline for cells whose roofline ceiling is

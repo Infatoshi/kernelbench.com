@@ -20,6 +20,11 @@ sys.path.insert(0, str(REPO_ROOT))
 from src.eval import cuda_language as cl  # noqa: E402
 from src.eval.correctness import check_correctness  # noqa: E402
 from src.eval.cuda_language import collect_solution_sources  # noqa: E402
+from src.eval.numeric_stress import (  # noqa: E402
+    numeric_stress_cases,
+    numeric_stress_context,
+    tolerance_for_case,
+)
 
 
 def main():
@@ -75,24 +80,27 @@ def main():
         obs = torch.randn(n, reference.OBS_DIM, device=device)
         state = torch.randn(n, reference.GRU_LAYERS, reference.HIDDEN, device=device) * 0.1
 
-        with torch.no_grad():
-            r_logits, r_state, r_val = reference.policy_forward(ref_model, obs, state)
-            if hasattr(solution, "policy_forward"):
-                s_logits, s_state, s_val = solution.policy_forward(sol_model, obs, state)
-            else:
-                s_logits, s_state, s_val = sol_model(obs, state)
+        for case in numeric_stress_cases(meta.get("name", "")):
+            with numeric_stress_context(ref_model, sol_model, [obs, state], case) as (c_obs, c_state):
+                with torch.no_grad():
+                    r_logits, r_state, r_val = reference.policy_forward(ref_model, c_obs, c_state)
+                    if hasattr(solution, "policy_forward"):
+                        s_logits, s_state, s_val = solution.policy_forward(sol_model, c_obs, c_state)
+                    else:
+                        s_logits, s_state, s_val = sol_model(c_obs, c_state)
 
-        for name, ref_t, sol_t in [
-            ("logits", r_logits, s_logits),
-            ("state", r_state, s_state),
-            ("value", r_val, s_val),
-        ]:
-            ok, msg = check_correctness(
-                ref_t.float(), sol_t.float(), dtype=torch.float32, override={"float32": tol}
-            )
-            if not ok:
-                print(f"FAIL: seed {seed} policy_forward {name}: {msg}")
-                sys.exit(1)
+            case_tol = tolerance_for_case({"float32": tol}, case)
+            for name, ref_t, sol_t in [
+                ("logits", r_logits, s_logits),
+                ("state", r_state, s_state),
+                ("value", r_val, s_val),
+            ]:
+                ok, msg = check_correctness(
+                    ref_t.float(), sol_t.float(), dtype=torch.float32, override=case_tol
+                )
+                if not ok:
+                    print(f"FAIL: seed {seed} case {case.name} policy_forward {name}: {msg}")
+                    sys.exit(1)
 
         # env_step with fixed actions
         agent = torch.randint(0, reference.BOARD, (n, 2), device=device).float()

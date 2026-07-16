@@ -13,15 +13,19 @@ import yaml
 REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_ROOT))
 
+from src.eval import cuda_language as cl  # noqa: E402
 from src.eval.correctness import check_correctness  # noqa: E402
 from src.eval.cuda_language import collect_solution_sources  # noqa: E402
-from src.eval import cuda_language as cl  # noqa: E402
+from src.eval.numeric_stress import (  # noqa: E402
+    numeric_stress_cases,
+    numeric_stress_context,
+    tolerance_for_case,
+)
 
 
 def main():
     try:
         import reference
-        import shapes
         import solution
     except Exception as e:
         print(f"FAIL: import error: {e}")
@@ -71,16 +75,21 @@ def main():
         for seed in (42, 123):
             torch.manual_seed(seed)
             torch.cuda.manual_seed_all(seed)
-            inputs = [t.to(device) for t in reference.get_inputs()]
-            with torch.no_grad():
-                ref_out = ref_model(*inputs)
-                sol_out = sol_model(*inputs)
-            ok, msg = check_correctness(
-                ref_out.float(), sol_out.float(), dtype=torch.bfloat16, override=tol
-            )
-            if not ok:
-                print(f"FAIL: shape {shape_idx} seed {seed}: {msg}")
-                sys.exit(1)
+            base_inputs = [t.to(device) for t in reference.get_inputs()]
+            for case in numeric_stress_cases(meta.get("name", "")):
+                with numeric_stress_context(ref_model, sol_model, base_inputs, case) as inputs:
+                    with torch.no_grad():
+                        ref_out = ref_model(*inputs)
+                        sol_out = sol_model(*inputs)
+                ok, msg = check_correctness(
+                    ref_out.float(),
+                    sol_out.float(),
+                    dtype=torch.bfloat16,
+                    override=tolerance_for_case(tol, case),
+                )
+                if not ok:
+                    print(f"FAIL: shape {shape_idx} seed {seed} case {case.name}: {msg}")
+                    sys.exit(1)
 
     print("PASS")
 

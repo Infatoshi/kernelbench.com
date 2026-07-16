@@ -14,9 +14,9 @@ import yaml
 REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_ROOT))
 
+from src.eval import cuda_language as cl  # noqa: E402
 from src.eval.correctness import check_correctness  # noqa: E402
 from src.eval.cuda_language import collect_solution_sources  # noqa: E402
-from src.eval import cuda_language as cl  # noqa: E402
 import reference as ref  # noqa: E402
 import shapes as shape_mod  # noqa: E402
 
@@ -26,7 +26,12 @@ def _reinit(model: torch.nn.Module, seed: int) -> None:
     g.manual_seed(seed)
     for p in model.parameters():
         if p.dim() >= 2:
-            torch.nn.init.normal_(p, std=0.02, generator=g)
+            # Draw on CPU then copy so this works for params already on CUDA
+            # (torch 2.13+ rejects a CPU generator used with CUDA tensors).
+            tmp = torch.empty(p.shape, dtype=p.dtype, device="cpu")
+            tmp.normal_(0.0, 0.02, generator=g)
+            with torch.no_grad():
+                p.copy_(tmp)
         else:
             torch.nn.init.ones_(p)
 
@@ -104,6 +109,40 @@ def main():
             if not ok:
                 print(f"FAIL: seed={seed} ctx={ctx} decode_steps={dec}: {msg}")
                 sys.exit(1)
+
+    # Long-ctx spot check: CHECK_SHAPES tops out at ctx 512, but drift could in
+    # principle accumulate over thousands of cached positions. Measured on the
+    # audited Grok 4.5 kernel (2026-07-16): max_abs is a constant 0.0625 at
+    # BOTH ctx 2048 and ctx 8192 (a per-layer bf16 rounding constant, not
+    # accumulation), and reference wall time at 8k is ~13s, so one seed at
+    # ctx 8192 is a cheap, real long-range numeric gate. Same tolerance.
+    seed, ctx, dec = 42, 8192, 16
+    max_seq = ctx + dec + 8
+    ref_model = ref.Model(ref.NUM_LAYERS, max_seq).to(device).eval()
+    _reinit(ref_model, seed)
+    sol_model = solution.Model(ref.NUM_LAYERS, max_seq).to(device).eval()
+    try:
+        sol_model.load_state_dict(ref_model.state_dict(), strict=True)
+    except RuntimeError as e:
+        print(f"FAIL: long-ctx state_dict mismatch: {e}")
+        sys.exit(1)
+    ref_out = ref.run(ctx, dec, seed, model=ref_model, max_seq=max_seq)
+    try:
+        sol_out = solution.run(ctx, dec, seed, model=sol_model)
+    except TypeError:
+        sol_out = solution.run(ctx, dec, seed)
+    if "last_hidden" not in sol_out:
+        print("FAIL: solution.run must return dict with last_hidden")
+        sys.exit(1)
+    ok, msg = check_correctness(
+        ref_out["last_hidden"].float().cpu(),
+        sol_out["last_hidden"].float().cpu(),
+        dtype=torch.bfloat16,
+        override=tol,
+    )
+    if not ok:
+        print(f"FAIL: long-ctx spot check seed={seed} ctx={ctx} decode_steps={dec}: {msg}")
+        sys.exit(1)
 
     print("PASS")
 

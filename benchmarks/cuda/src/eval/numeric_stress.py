@@ -91,6 +91,61 @@ _CASES: dict[str, tuple[NumericStressCase, ...]] = {
             tolerance={"bfloat16": {"atol": 1.0, "rtol": 5e-2}},
         ),
     ),
+    # --- KernelBench-CUDA deck (benchmarks/cuda/problems-rtxpro6000) ---
+    "01_glm52_fused_moe": (
+        # Hidden states only (index 0); index 1 is int64 expert ids, index 2 is
+        # softmax expert weights (scaling those changes routing semantics).
+        NumericStressCase("small_hidden", input_scales={0: 1e-2}, tolerance=_MED_BF16),
+        # atol 1.5 at 8x hidden: output magnitudes reach ~370 (mean ~57), and
+        # the intrinsic floor for a legitimate bf16 pipeline (fp32 matmuls with
+        # a bf16 silu*up intermediate) measures max_abs=2.0. Calibrated against
+        # the REAL pass predicate (torch.allclose sol-side rtol — ref-side
+        # scanning undercounts) across all effective check variants (T=256 cap,
+        # T=1) x seeds 42/123/456: atol 1.0 fails the audited Grok kernel at
+        # seed 123 (margin -0.006); 1.5 passes with min margin +0.49 (floor
+        # sim: +1.03 min). Wrong/cached kernels diverge by O(mean magnitude)
+        # ~57, so teeth remain. Measured 2026-07-16, see DEVLOG.
+        NumericStressCase(
+            "large_hidden",
+            input_scales={0: 8.0},
+            tolerance={"bfloat16": {"atol": 1.5, "rtol": 5e-2}},
+        ),
+    ),
+    "02_deepseek_nsa": (
+        # q, k, v are inputs 0, 1, 2.
+        NumericStressCase(
+            "small_qkv",
+            input_scales={0: 1e-2, 1: 1e-2, 2: 1e-2},
+            tolerance=_MED_BF16,
+        ),
+        NumericStressCase(
+            "large_qkv",
+            input_scales={0: 8.0, 1: 8.0, 2: 8.0},
+            tolerance={"bfloat16": {"atol": 5e-2, "rtol": 5e-2}},
+        ),
+    ),
+    # 03_megaqwen_decode has no scale cases: run() generates its inputs
+    # internally from the seed (nothing external to scale) and RMSNorm makes
+    # the network largely weight-scale invariant. Hardening is a long-ctx
+    # spot check in check.py instead (see DEVLOG 2026-07-16).
+    "04_grid_mingru_sps": (
+        # Only the policy_forward section of check.py takes external tensors
+        # (obs=0, state=1); env_step/run generate inputs internally and are
+        # position-exact, so those sections stay nominal-only.
+        # atol 1e-6: measured fused-CUDA-vs-eager-fp32 reorder noise is 4.6e-7
+        # on the audited Grok kernel; 1e-7 (hard's topk constant) is below the
+        # fp32 machine-epsilon floor for this pipeline.
+        NumericStressCase(
+            "small_obs_state",
+            input_scales={0: 1e-2, 1: 1e-2},
+            tolerance={"float32": {"atol": 1e-6, "rtol": 1e-4}},
+        ),
+        NumericStressCase(
+            "large_obs_state",
+            input_scales={0: 8.0, 1: 8.0},
+            tolerance={"float32": {"atol": 1e-1, "rtol": 1e-4}},
+        ),
+    ),
 }
 
 
