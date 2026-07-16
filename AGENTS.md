@@ -13,26 +13,34 @@ benchmarks. It lives on Anvil at `~/kernelbench.com` (the GPU box, where evals
 run). The Mac has a secondary clone you `git pull` when working there; Anvil is
 canonical. Deploys go out from Anvil.
 
-## The two active benches — know which one you're writing to
+## The active benches — know which one you're writing to
 
-There are **two** active benches plus one archive. They share the same `src/`
-harness, run archive, and roofline machinery, so the developer guide in
-[Working in a bench](#working-in-a-bench-hard--mega) below applies to both —
-only the deck, the entry command, and the wall-clock budget differ:
+There are **three** single-GPU active benches (Hard, Mega, CUDA), plus Multi
+(WIP multi-GPU) and the v3 archive. Hard / Mega / CUDA share the same harness,
+run archive, and roofline machinery — only the deck, language rules, entry
+command, and wall-clock budget differ:
 
-| | `benchmarks/hard/` | `benchmarks/mega/` |
-| --- | --- | --- |
-| What | per-op kernel deck | full fused **megakernels** |
-| Deck | `01_fp8_gemm`, `02_kda_cutlass`, `03_paged_attention`, `05_topk_bitonic`, `06_sonic_moe_swiglu`, `07_w4a16_gemm` (6) | `01_rl_grid_ppo` (PufferLib-style grid-foraging PPO training), `02_kimi_linear_decode` (Kimi-Linear W4A16 decode, the published board) (2) |
-| Drive it with | the `kb` CLI / `uv run kbh run` (from any cwd) | `cd benchmarks/mega && ./scripts/run_hard.sh ...` |
-| Wall-clock | **unlimited** (`BUDGET_SECONDS=0`) | still capped (`BUDGET_SECONDS` 2700 local / 10800 cloud) |
-| Published to | `/hard` | not yet on the site |
+| | `benchmarks/hard/` | `benchmarks/mega/` | `benchmarks/cuda/` |
+| --- | --- | --- | --- |
+| What | per-op kernel deck (CUDA **or** Triton) | full fused **megakernels** | **CUDA-only** writing deck |
+| Deck | `01_fp8_gemm`, `02_kda_cutlass`, `03_paged_attention`, `05_topk_bitonic`, `06_sonic_moe_swiglu`, `07_w4a16_gemm` (6) | `01_rl_grid_ppo`, `02_kimi_linear_decode` (2) | `01_rmsnorm_residual`, `02_online_softmax`, `03_grid_mingru_sps` (3) |
+| Drive it with | the `kb` CLI / `uv run kbh run` (from any cwd) | `cd benchmarks/mega && ./scripts/run_hard.sh ...` | `cd benchmarks/cuda && uv run kbh run ...` (or `./scripts/run_hard.sh`) |
+| Wall-clock | **unlimited** (`BUDGET_SECONDS=0`) | **unlimited** (`BUDGET_SECONDS=0`, since 2026-07-15) | **unlimited** (same as hard) |
+| Published to | `/hard` | `/mega` | `/cuda` (coming soon) |
+| Why separate | frozen lab board — do **not** change prompts after publish | frozen lab board for fused megakernels | isolated place to force CUDA and grade Triton/DSL cheats without moving Hard/Mega goalposts |
 
 **How to tell which you're editing:** your cwd (`benchmarks/hard` vs
-`benchmarks/mega`), the problem names above, and the entry command. When in
-doubt, check the deck — `01_fp8_gemm` is hard, `01_rl_grid_ppo` is mega. Mega
-reuses hard's harness/archive/roofline machinery; the old operation-level deck
-was removed from mega.
+`benchmarks/mega` vs `benchmarks/cuda`), the problem names above, and the entry
+command. When in doubt, check the deck — `01_fp8_gemm` is hard, `01_rl_grid_ppo`
+is mega, `01_rmsnorm_residual` is cuda. Mega and CUDA reuse hard's
+harness/archive/roofline machinery.
+
+**KernelBench-CUDA language gate:** `src/eval/cuda_language.py` hard-fails
+Triton (`@triton.jit`, `triton.language`), kernel DSLs (CuteDSL, TileLang,
+ThunderKittens Python), and pure PyTorch op chains with no CUDA evidence
+(`load_inline` / `__global__` / `.cu` / PTX / CUTLASS C++). Sidecars:
+`cuda_language.json`, `framework.txt`. Fusion on `03_grid_mingru_sps` is
+optional (SPS metric). See `benchmarks/cuda/SPEC.md` + `DEVLOG.md`.
 
 `benchmarks/v3/` is the **archive** (RTX 3090 / H100 / B200, a separate harness
 living in its own repo). It keeps its own `benchmarks/v3/AGENTS.md`; ignore it
@@ -51,6 +59,8 @@ benchmarks/hard/           KernelBench-Hard eval — the per-op deck
   scripts/ src/                eval code
   problems-rtxpro6000/         the deck — per-GPU sets: -rtxpro6000 (default, RTX PRO 6000), -h100, -b200, -3090
 benchmarks/mega/           KernelBench-Mega eval — megakernel deck (single problems/; reuses hard's machinery)
+benchmarks/cuda/           KernelBench-CUDA eval — CUDA-only deck (Triton/DSL fail); /cuda
+benchmarks/multi/          KernelBench-Multi eval — 8×H100 NVLink (WIP); /multi
 benchmarks/v3/             KernelBench-v3 eval — archived (keeps its own AGENTS.md)
 environments/              Prime Intellect `verifiers` mirrors (kernel_hard / kernel_mega / kernel_v3)
 media/                     tracked chart generators (kbh_theme.py + make_*.py + generate_dark_plots.py)
@@ -463,7 +473,7 @@ Most likely causes:
 2. **CUDA_HOME pointing at 12.8** — harness script already sets `CUDA_HOME=/usr/local/cuda-13`; make sure you sourced it.
 3. **`sota.py` import fails** — the SOTA dep isn't installed. Check `problem.yaml` for the pinned version; install with `uv pip install <spec>`.
 4. **Agent CLI not authenticated** — `claude`, `codex`, `kimi` each need their own auth. Check `~/.env_vars` and each CLI's `info` / `whoami` command.
-5. **Agent stopped before writing anything** — hard runs are unlimited-time (no wall-clock cap; `BUDGET_SECONDS=0` in `run_hard.sh`), so a no-solution row is a real failure mode (early stop / provider error), not a budget cutoff; record it. **Mega delta:** mega still has a wall-clock cap (`BUDGET_SECONDS` 2700 local / 10800 cloud), so a mega no-solution row may genuinely be a budget cutoff — raise `BUDGET_SECONDS` or record it.
+5. **Agent stopped before writing anything** — hard runs are unlimited-time (no wall-clock cap; `BUDGET_SECONDS=0` in `run_hard.sh`), so a no-solution row is a real failure mode (early stop / provider error), not a budget cutoff; record it. Mega is unlimited too (cap removed 2026-07-15); the same applies there.
 
 ## Hard-won gotchas
 
