@@ -1,16 +1,19 @@
 import Link from "next/link"
-import { loadModelIndex, rowsForBench } from "@/app/_lib/models"
+import { barsForBench, rowsForBench } from "@/app/_lib/models"
+import { loadModelIndex } from "@/app/_lib/models.server"
 import { ModelGpuBoard, type GpuView } from "@/app/_components/model-board"
 
-// KernelBench-Hard: per-op kernel deck. Ranked model list per GPU board;
-// run-level forensics live on /runs and the per-model pages.
+// KernelBench-Hard: per-op kernel deck. AA-style model bar chart per GPU
+// board; run-level forensics live on /runs and the per-model pages.
 
 export default async function HardPage() {
   const idx = await loadModelIndex()
   const gpuLabels = idx.benches.hard?.gpu_labels ?? {}
 
-  const mk = (gpu?: string): { board: ReturnType<typeof rowsForBench>["board"]; sink: ReturnType<typeof rowsForBench>["sink"] } =>
-    rowsForBench(idx, "hard", gpu)
+  const mk = (gpu?: string): Pick<GpuView, "bars" | "sink"> => ({
+    bars: barsForBench(idx, "hard", gpu),
+    sink: gpu ? [] : rowsForBench(idx, "hard").sink,
+  })
 
   const views: GpuView[] = [
     {
@@ -44,17 +47,16 @@ export default async function HardPage() {
           hard
         </h1>
         <p className="text-sm text-[var(--color-fg)] mb-2">
-          One ranked model list per GPU board &mdash; use the toggle to switch.
-          Peak fraction (SOL) is measured against each GPU&rsquo;s own roofline,
-          so scores are comparable within a GPU, not across GPUs.
+          One bar per model, colored by lab &mdash; use the toggle to switch
+          GPU boards. Peak fraction (SOL) is measured against each GPU&rsquo;s
+          own roofline, so scores are comparable within a GPU, not across GPUs.
         </p>
         <p className="text-xs text-[var(--color-fg-muted)] mb-6 max-w-4xl leading-relaxed">
-          Ranked by valid passes (audited-clean correct cells), then mean
-          normalized performance (cell &divide; board best per problem). The
-          flagged badge counts audited sessions that failed the reward-hack
-          review; it never changes the rank. Click a model for its per-problem
-          cells, audit chips, and integrity record. Hardware notes for each GPU
-          are below the list.
+          Correctness first: models group by valid passes (audited-clean correct
+          cells), then order by mean peak fraction. The flagged count lists
+          audited sessions that failed the reward-hack review; it never changes
+          the order. Click a model for its per-problem cells, audit chips, and
+          integrity record. Hardware notes for each GPU are below the chart.
         </p>
       </section>
 

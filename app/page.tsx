@@ -2,8 +2,10 @@ import Link from "next/link"
 import { GroupedBars } from "./home-charts"
 import { EfficiencyChart } from "./efficiency-chart"
 import { loadMegaChart, loadHardChart, loadEfficiency } from "@/app/_lib/charts"
-import { loadModelIndex, rowsForIndex } from "@/app/_lib/models"
-import { ModelBoard } from "@/app/_components/model-list"
+import { barsForBench, rowsForIndex } from "@/app/_lib/models"
+import { loadModelIndex } from "@/app/_lib/models.server"
+import { ModelMetricChart } from "@/app/_components/model-metric-chart"
+import { ModelList } from "@/app/_components/model-list"
 
 const HUGGING_FACE_LOGO =
   "https://huggingface.co/front/assets/huggingface_logo-noborder.svg"
@@ -133,7 +135,12 @@ export default async function HomePage() {
     loadEfficiency(),
     loadModelIndex(),
   ])
-  const { board: modelBoard, sink: modelSink } = rowsForIndex(modelIdx)
+  const { sink: modelSink } = rowsForIndex(modelIdx)
+  const barViews = {
+    mega: barsForBench(modelIdx, "mega"),
+    hard: barsForBench(modelIdx, "hard"),
+    cuda: barsForBench(modelIdx, "cuda"),
+  }
   const charts: Record<string, React.ReactNode> = {
     "/mega": (
       <GroupedBars
@@ -170,16 +177,23 @@ export default async function HomePage() {
             Models
           </h2>
           <p className="text-xs text-[var(--color-fg-muted)] mt-1.5 leading-relaxed">
-            Frontier coding models, one row each, across all published boards.
-            Ranked by benchmarks fully passed, then mean normalized performance.
-            Accuracy-first: a cell only counts when it compiles, passes
-            correctness, and survives the reward-hack audit. The flagged badge
-            shows audited sessions that failed that review (over all audited
-            sessions for the model); it never changes the rank. Click a model
-            for per-problem cells, audit chips, and its full integrity record.
+            Frontier coding models on the kernel decks: one bar per model,
+            colored by lab. Pick a benchmark; click a model for its per-problem
+            cells, audit chips, and full integrity record. Correctness first:
+            models group by valid passes (audited-clean correct cells), then
+            order by score. The flagged count lists audited sessions that
+            failed the reward-hack review; it never changes the order.
           </p>
         </div>
-        <ModelBoard board={modelBoard} sink={modelSink} showBadges />
+        <ModelMetricChart views={barViews} />
+        {modelSink.length > 0 && (
+          <div className="model-sink-section">
+            <p className="model-sink-label">
+              No valid published results — audited sessions below were flagged or invalid
+            </p>
+            <ModelList rows={modelSink} sink showBadges />
+          </div>
+        )}
       </section>
 
       <section aria-label="Benchmarks" className="space-y-4">

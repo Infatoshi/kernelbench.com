@@ -1,5 +1,6 @@
 import Link from "next/link"
-import { loadModelIndex, rowsForBench } from "@/app/_lib/models"
+import { barsForBench, rowsForBench } from "@/app/_lib/models"
+import { loadModelIndex } from "@/app/_lib/models.server"
 import { ModelGpuBoard, type GpuView } from "@/app/_components/model-board"
 
 // KernelBench-Mega: whole-block megakernels. Ranked model list per GPU board.
@@ -15,7 +16,10 @@ export default async function MegaPage() {
   const idx = await loadModelIndex()
   const gpuLabels = idx.benches.mega?.gpu_labels ?? {}
 
-  const mk = (gpu?: string) => rowsForBench(idx, "mega", gpu)
+  const mk = (gpu?: string): Pick<GpuView, "bars" | "sink"> => ({
+    bars: barsForBench(idx, "mega", gpu),
+    sink: gpu ? [] : rowsForBench(idx, "mega").sink,
+  })
 
   const views: GpuView[] = [
     {
@@ -57,10 +61,10 @@ export default async function MegaPage() {
         <p className="text-xs text-[var(--color-fg-muted)] mb-6 max-w-4xl leading-relaxed">
           Each run gets a single autonomous session with unlimited wall-clock;
           models self-terminate well under three hours (the longest run so far
-          is ~2.5h). Rows are ranked by valid passes, then mean normalized
-          speedup (cell &divide; board best). The flagged badge counts audited
-          sessions that failed the reward-hack or megakernel-authenticity
-          review; it never changes the rank.
+          is ~2.5h). One bar per model, colored by lab; models group by valid
+          passes, then order by best decode speedup. The flagged badge counts
+          audited sessions that failed the reward-hack or megakernel-authenticity
+          review; it never changes the order.
         </p>
       </section>
 

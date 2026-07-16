@@ -150,11 +150,27 @@ def cmd_publish(root: Path, args: list[str]) -> int:
     if not script:
         sys.exit(f"kb publish: no publish script for bench '{bench}' (hard|mega|cuda)")
     pub = _bench_dir(root, bench) / "scripts" / script
-    if not push:
-        return _exec([str(pub)])
-    # --push: publish, then upload the published runs' traces to HF.
     subprocess.run([str(pub)], check=True)
+    rc = _rebuild_model_index(root)
+    if rc != 0:
+        return rc
+    if not push:
+        return 0
+    # --push: publish, then upload the published runs' traces to HF.
     return cmd_push_runs(root, [bench])
+
+
+def _rebuild_model_index(root: Path) -> int:
+    """Regenerate public/data/models.json (the model-centric site reads it).
+    Runs after every bench publish; the builder joins all benches."""
+    script = root / "scripts" / "build_model_index.py"
+    if not script.exists():
+        return 0
+    print("kb: rebuilding public/data/models.json")
+    return subprocess.run(
+        ["uv", "run", "--with", "pyyaml", "python", str(script)],
+        cwd=root,
+    ).returncode
 
 
 def _leaderboard_run_ids(bench_dir: Path) -> list[str]:

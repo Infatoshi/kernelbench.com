@@ -5,12 +5,12 @@ import {
   FLAG_VERDICTS,
   auditChipClass,
   benchValue,
-  loadModelIndex,
   problemLabel,
   type Bench,
   type GpuBlock,
   type ModelCell,
 } from "@/app/_lib/models"
+import { loadModelIndex } from "@/app/_lib/models.server"
 
 // One static page per published model (and per audited-but-unpublished model,
 // whose page carries the integrity record). Everything renders from

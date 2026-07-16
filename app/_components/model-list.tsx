@@ -101,27 +101,3 @@ export function ModelList({
     </div>
   )
 }
-
-export function ModelBoard({
-  board,
-  sink,
-  showBadges,
-}: {
-  board: ModelRow[]
-  sink: ModelRow[]
-  showBadges?: boolean
-}) {
-  return (
-    <>
-      <ModelList rows={board} showBadges={showBadges} />
-      {sink.length > 0 && (
-        <div className="model-sink-section">
-          <p className="model-sink-label">
-            No valid published results — audited sessions below were flagged or invalid
-          </p>
-          <ModelList rows={sink} showBadges={showBadges} sink />
-        </div>
-      )}
-    </>
-  )
-}

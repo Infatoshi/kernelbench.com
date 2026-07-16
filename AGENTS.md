@@ -502,8 +502,14 @@ Most likely causes:
   **include every published model id** even if a pretty name is missing (raw id
   is used). Still update formal labels so the homepage doesn't show bare
   slugs: edit `app/_lib/charts.ts` `MODEL_NAMES` (full bar labels) and
-  `SHORT_NAMES` (efficiency scatter). `/hard` v2 boards show every
-  leaderboard row automatically — no page allowlist. After `kb publish`, skim
+  `SHORT_NAMES` (efficiency scatter). The model-centric views (homepage
+  Models chart, `/models`, `/models/[slug]`, and the model bars on
+  `/hard` / `/mega` / `/cuda`) read `public/data/models.json`, which
+  `kb publish` now regenerates automatically via
+  `scripts/build_model_index.py` (run it by hand if publishing outside `kb`).
+  New labs need a brand entry (bar color + `public/logos/labs/<lab>.svg`) in
+  `app/_lib/models.ts` `LAB_BRANDS`; missing logos fall back to a letter
+  chip. After `kb publish`, skim
   the homepage chart and `/hard` once before `kb deploy`.
 - **Redact on every publish/push pass.** Before uploading HF traces, committing
   `public/runs`, or deploying site artifacts, run
