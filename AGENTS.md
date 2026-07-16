@@ -448,6 +448,17 @@ enable it in broad preflight/sweeps with `KBH_USE_MINIMAX_M3_CLAUDE=1`.
 - `outputs/runs/<ts>_..../solution.py` — final agent-written kernel
 - `outputs/runs/<ts>_..../roofline.png` — visual: peak line, eager/compile/SOTA/solution points per shape
 
+**Headline metric rule (standing, 2026-07-15).** Where a roofline ceiling is
+structurally unreadable (launch-overhead-bound, e.g. topk's ~0.02 ceiling, or
+dense-equivalent FLOPs a correct sparse kernel never executes, e.g. cuda
+`02_deepseek_nsa`), the headline is **milliseconds**, not peak fraction:
+per-shape ms is ground truth; the persisted score is geomean speedup vs the
+deck's FROZEN eager-reference anchor (frozen at deck publication, so
+historical cells never re-grade); the site renders a best..worst linear span
+across published models as presentation only (never persisted to
+leaderboard.json; a new best shifts the span on render, it does not re-grade
+cells). Full design: `benchmarks/cuda/DEVLOG.md` + `SPEC.md`.
+
 Run `uv run python scripts/roofline_plot.py outputs/runs/<ts>_...` to (re)generate the plot.
 
 ### Testing

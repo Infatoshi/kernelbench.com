@@ -30,6 +30,17 @@ off-alignment / serving tails (e.g. T=4127, S not multiple of NSA block_size).
   numeric last_hidden (no tokenizer)
 - 04: SPS vs `peak_sps` (150M)
 
+**Latency-anchored relative scoring (standing rule, 2026-07-15).** Where a
+roofline ceiling is structurally unreadable (dense-equivalent FLOPs that a
+correct sparse kernel never executes, e.g. 02; launch-overhead-bound ceilings
+like hard's topk), the headline is **milliseconds**, not peak fraction:
+per-shape ms is ground truth; the persisted score is geomean speedup vs the
+deck's FROZEN eager-reference anchor (eager_ms/solution_ms, frozen at deck
+publication so historical cells never re-grade); the site additionally renders
+a best..worst linear span across published models as a pure presentation layer
+(never written to leaderboard.json). peak_fraction stays as a context column.
+Full rationale in DEVLOG.md.
+
 
 ## Harness
 
@@ -43,4 +54,5 @@ uv run kbh run grok grok-4.5 problems-rtxpro6000/01_vllm_fused_moe
 - Softmax/RMSNorm-only tutorial cells
 - Paged-attn rematch of Hard
 - MLA isolate (use mega decode instead)
-- Lightning / Mamba in v1
+- Lightning / Mamba
+- Spec-decode tree attention (rejected 2026-07-15; deck stays at four)

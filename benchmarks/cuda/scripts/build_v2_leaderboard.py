@@ -1,9 +1,9 @@
-"""Build results/leaderboard_v2.json from the 2026-06-10/11 containerized sweep.
+"""Build results/leaderboard_v2.json from run archives (KernelBench-CUDA).
 
 v2 environment: KBH_AGENT_CONTAINER=1, parallel sessions, per-command GPU lock,
-6-problem deck. Applies audit verdicts from results/annotations/: reward_hack
-cells are kept visible but marked invalid and excluded from ceiling ranking;
-rubric_leak/interesting are valid but flagged.
+4-problem CUDA-only deck. Applies audit verdicts from results/annotations/:
+reward_hack cells are kept visible but marked invalid and excluded from
+ceiling ranking; rubric_leak/interesting are valid but flagged.
 """
 import glob
 import json
@@ -23,8 +23,7 @@ from src.hardware import get as get_hw  # noqa: E402
 # preserves the original Blackwell leaderboard; set KBH_HARDWARE=H100 on the
 # H100 box so the generated block reports Hopper specs.
 _hw = get_hw(os.environ.get("KBH_HARDWARE", "RTX_PRO_6000"))
-PROBLEMS = ["01_fp8_gemm","02_kda_cutlass","03_paged_attention",
-            "05_topk_bitonic","06_sonic_moe_swiglu","07_w4a16_gemm"]
+PROBLEMS = ["01_glm52_fused_moe","02_deepseek_nsa","03_megaqwen_decode","04_grid_mingru_sps"]
 
 # run_id -> (verdict, summary)
 ann = {}
@@ -52,19 +51,6 @@ PUBLISHED: set[str] = set()
 if _MANIFEST_PATH and os.path.exists(_MANIFEST_PATH):
     PUBLISHED = set(json.load(open(_MANIFEST_PATH)).get("run_ids", []))
     print(f"  curation manifest: {len(PUBLISHED)} run_ids ({_MANIFEST_PATH})", file=sys.stderr)
-# Roofline was corrected 2026-06-14 (peak_tflops 2.5x too low). Compute-regime
-# problems (graded on TFLOPS) scored before the fix need peak_fraction x0.4;
-# memory-regime problems (graded on bandwidth, unchanged) and post-fix runs do not.
-_ROOFLINE_FIX_EPOCH = "20260614_000000"
-_COMPUTE_RESCALE = {"02_kda_cutlass": 0.4, "06_sonic_moe_swiglu": 0.4}
-def _rescale_pf(pf, prob, rid):
-    if pf is None:
-        return None
-    f = _COMPUTE_RESCALE.get(prob)
-    if f is not None and rid[:15] < _ROOFLINE_FIX_EPOCH:
-        return pf * f
-    return pf
-
 cells = defaultdict(dict)  # (harness,model,effort) -> problem -> list of result dicts
 _TS_RE = re.compile(r"outputs/runs/(\d{8}_\d{6})")
 def _contaminated(run_dir, rid):
@@ -103,7 +89,7 @@ for rj in glob.glob(str(RUNS_DIR/"2026*/result.json")):
         "run_id": rid, "correct": bool(r.get("correct")),
         "has_solution": has_sol_file or bool(r.get("has_solution")),
         "has_check": has_check,
-        "peak_fraction": _rescale_pf(r.get("peak_fraction"), prob, rid),
+        "peak_fraction": r.get("peak_fraction"),
         "elapsed_seconds": r.get("agent_wall_seconds") or r.get("total_elapsed_seconds"),
         "harness_exit_code": r.get("harness_exit_code"),
     })
@@ -198,7 +184,7 @@ for p in PROBLEMS:
 out = {
     "schema_version": 2,
     "environment": "v2_containerized",
-    "environment_notes": "KBH_AGENT_CONTAINER=1, parallel sessions, per-command GPU lock, nvcc 13.2, torch 2.11+cu130; 6-problem deck",
+    "environment_notes": "KBH_AGENT_CONTAINER=1, parallel sessions, per-command GPU lock, nvcc 13.2, torch 2.11+cu130; 4-problem CUDA-only deck (language gate: Triton/DSL fail)",
     "hardware": {"name":_hw.name,"sm":_hw.sm,"vram_gb":_hw.vram_gb,"peak_bandwidth_gb_s":_hw.peak_bandwidth_gb_s},
     "problems": PROBLEMS,
     "models": sorted(models, key=lambda m: -m["valid_pass_count"]),

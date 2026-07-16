@@ -10,7 +10,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_ROOT))
 
 from src.eval.roofline import compute_gbps, compute_tflops, peak_fraction  # noqa: E402
-from src.eval.timing import time_variant  # noqa: E402
+from src.eval.timing import benchmark_baselines_enabled, time_variant  # noqa: E402
 from src.hardware import get as get_hw  # noqa: E402
 
 
@@ -24,6 +24,7 @@ def main():
     peak_tflops = hw.peak_tflops_dense.get(meta["peak_tflops_key"], 0.0)
     num_perf_trials = int(meta.get("num_perf_trials", 15))
     device = torch.device("cuda:0")
+    include_baselines = benchmark_baselines_enabled("02_DEEPSEEK_NSA")
     sol_fractions: list[float] = []
 
     for shape_idx, shape in enumerate(shapes.SHAPES):
@@ -32,6 +33,7 @@ def main():
         reference.S = shape["S"]
         reference.D = shape["D"]
         init_args = reference.get_init_inputs()
+        ref_model = reference.Model(*init_args).to(device).eval()
         sol_model = solution.Model(*init_args).to(device).eval()
         torch.manual_seed(2026)
         inputs = [t.to(device) for t in reference.get_inputs()]
@@ -48,6 +50,14 @@ def main():
             f"tflops={tflops:.3f} gbps={gbps:.3f} ms={ms_sol:.3f}",
             flush=True,
         )
+        if include_baselines and shape["S"] <= 1024:
+            ms_e = time_variant(ref_model, inputs, shape_idx=shape_idx, variant="eager", iters=3)
+            print(
+                f"shape={shape_idx} variant=eager "
+                f"tflops={compute_tflops(flops, ms_e):.3f} gbps={compute_gbps(bytes_moved, ms_e):.3f} "
+                f"ms={ms_e:.3f}",
+                flush=True,
+            )
         frac = peak_fraction(tflops, peak_tflops)
         sol_fractions.append(frac)
         print(f"shape={shape_idx} solution_peak_fraction={frac:.4f}")

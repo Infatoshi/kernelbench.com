@@ -1,5 +1,42 @@
 # KernelBench-CUDA — DEVLOG
 
+## 2026-07-15 — Latency-anchored relative scoring (standing metric decision)
+
+Peak fraction is the wrong headline for cells whose roofline ceiling is
+structurally unreadable. Two live examples: hard's `05_topk_bitonic`, where the
+~0.02 ceiling is launch-overhead-bound for EVERY model, and cuda's
+`02_deepseek_nsa`, where the dense-equivalent FLOPs baseline can never be
+attained by a correct *sparse* kernel (Grok 4.5's first clean pass scored
+0.0177 and "0.0177" tells a reader nothing). For those, grade and display on
+**milliseconds**, not peak fraction.
+
+The design (user decision 2026-07-15; implement per this when wiring publish):
+
+1. **ms per shape stays the ground truth.** result.json already records
+   shape-by-shape times; the leaderboard builder must carry per-shape ms for
+   the solution variant so every displayed number is reproducible from the
+   archive.
+2. **Persisted headline = geomean speedup vs a FROZEN anchor.** Anchor is the
+   deck's eager torch reference (`reference.Model`), timed per shape at deck
+   publication and committed alongside the problem (eager_ms per shape).
+   Score per shape = eager_ms / solution_ms; problem score = geomean over the
+   shape sweep. The anchor is frozen at publication with the deck, so a
+   published cell's score never changes afterward — same frozen-board rule as
+   prompts.
+3. **Best..worst linear span is a PRESENTATION layer only.** On the site, also
+   show the board-relative position: with `t` a cell's geomean ms,
+   scaled = (worst - t) / (worst - best) across published models
+   (worst -> 0, best -> 1; degenerate span 0 -> all 1). Computed at site build
+   from the current board, NEVER persisted into leaderboard.json. When a new
+   best lands, the span shift is a site render change, not a re-grade of
+   historical cells — the same rule that keeps labs trusting the board.
+4. **peak_fraction is demoted to context**, shown as a secondary column
+   ("roofline attainability"), never the sort key on structurally unreachable
+   ceilings. It stays the headline where the ceiling is real (MoE, GEMM).
+5. **Cross-bench reach: presentation only.** hard's topk cell gets the same
+   ms + span DISPLAY treatment; hard and mega graders, prompts, and
+   leaderboard.json schemas stay frozen. No hard/mega cell is re-graded.
+
 ## 2026-07-15 — Why a third single-GPU bench (and why not touch Hard/Mega)
 
 Hard and Mega are live boards that labs already care about. Changing a prompt,
@@ -36,6 +73,9 @@ for "best kernel on the metal." It is the wrong axis for "can you write CUDA."
 - `02_deepseek_nsa` — NSA-inspired block top-n + sliding window + sparse attn.
 - `03_megaqwen_decode` — Qwen3-0.6B geometry (4-layer slice); improve Infatoshi/MegaQwen.
 - `04_grid_mingru_sps` — RL sim SPS; fusion optional.
+
+Deck is frozen at four. Spec-decode tree attention was floated as a fifth and
+rejected (user decision 2026-07-15); do not re-pitch it.
 
 Smoke 2026-07-16: all four references run on PRO 6000; MoE `check.py` PASS with
 minimal CUDA silu_mul solution (language gate `cuda_raw`); Triton gate fails as

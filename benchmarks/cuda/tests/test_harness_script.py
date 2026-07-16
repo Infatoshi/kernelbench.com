@@ -29,12 +29,13 @@ def test_cuda_cannot_be_disabled_for_agent_phase() -> None:
 
 
 def test_all_op_benchmarks_score_solution_first() -> None:
-    """Op-level (roofline) benches time solution first; SPS benches are separate."""
+    """Op-level (roofline) benches time solution first; throughput benches are separate."""
     assert BENCHMARKS
     for path in BENCHMARKS:
         text = path.read_text()
         if "regime: throughput" in (path.parent / "problem.yaml").read_text():
-            assert "sps=" in text or "peak_sps" in text, path
+            # throughput benches grade on their own peak: SPS (04) or tok/s (03)
+            assert "sps=" in text or "peak_sps" in text or "tok_s=" in text or "peak_tok_s" in text, path
             continue
         assert "benchmark_baselines_enabled" in text, path
         assert "time_variant" in text, path

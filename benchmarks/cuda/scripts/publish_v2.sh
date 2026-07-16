@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Rebuild the v2 leaderboard + transcript viewers from the run archives.
-# Run from benchmarks/hard (or anywhere; paths resolve from script location).
+# Run from benchmarks/cuda (or anywhere; paths resolve from script location).
 # Writes results/leaderboard.json (site data) and public/runs/*.html (viewers).
 set -euo pipefail
 HARD_DIR="$(cd "$(dirname "$0")/.." && pwd)"
@@ -24,7 +24,7 @@ pp = {p:{"n_attempted":d["n_models"],"n_passed":d["n_valid_passes"],
       for p,d in v["per_problem"].items()}
 out = {"schema_version":1,"environment":"v2_containerized","hardware":v["hardware"],
        "problems":v["problems"],"models":models,"per_problem":pp,
-       "generated_from_summary":{"input":"benchmarks/hard/outputs/runs","tag":"v2","imported_rows":len(models)}}
+       "generated_from_summary":{"input":"benchmarks/cuda/outputs/runs","tag":"v2","imported_rows":len(models)}}
 json.dump(out, open("results/leaderboard.json","w"), indent=2)
 print(f"  wrote results/leaderboard.json ({len(models)} models)")
 PY

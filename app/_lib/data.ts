@@ -149,14 +149,16 @@ export async function loadLeaderboard(
   return JSON.parse(text)
 }
 
-export async function loadAnnotations(): Promise<Map<string, Annotation>> {
+export async function loadAnnotations(
+  dir = "benchmarks/hard/results/annotations",
+): Promise<Map<string, Annotation>> {
   const map = new Map<string, Annotation>()
-  const dir = join(REPO_ROOT, "benchmarks/hard/results/annotations")
+  const full = join(REPO_ROOT, dir)
   try {
-    const entries = await readdir(dir)
+    const entries = await readdir(full)
     for (const name of entries) {
       if (!name.endsWith(".yaml")) continue
-      const text = await readFile(join(dir, name), "utf-8")
+      const text = await readFile(join(full, name), "utf-8")
       const a = parseAnnotationYaml(text)
       if (a) map.set(a.run_id, a)
     }
