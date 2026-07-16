@@ -1283,7 +1283,7 @@ LOG_FILE="${RUN_DIR}/transcript.jsonl"
 STDERR_FILE="${RUN_DIR}/stderr.log"
 
 echo "========================================"
-echo "KERNELBENCH-HARD RUN"
+echo "KERNELBENCH-CUDA RUN"
 echo "========================================"
 echo "Harness:    $HARNESS"
 echo "Model:      $MODEL"

@@ -79,7 +79,10 @@ RUN_GROUP="${KBH_RUN_GROUP:-}"
 # it decides it is done. Default 0 = no cap (GNU timeout treats 0 as unlimited),
 # matching hard. Smoke-test with a small override (e.g. BUDGET_SECONDS=300).
 BUDGET_SECONDS="${BUDGET_SECONDS:-0}"
-CHECK_TIMEOUT_SECONDS="${KBH_CHECK_TIMEOUT_SECONDS:-180}"
+# check.py must cover venv repair + cold CUDA extension compile + numeric
+# stress; 180s killed a valid B200 sonic run on 2026-07-16 (cold rebuild took
+# ~9 min). Keep this generous — a hung check still dies at the cap.
+CHECK_TIMEOUT_SECONDS="${KBH_CHECK_TIMEOUT_SECONDS:-1800}"
 if [ "$PROBLEM_NAME" = "02_kda_cutlass" ]; then
     BENCHMARK_TIMEOUT_SECONDS="${KBH_BENCHMARK_TIMEOUT_02_KDA_CUTLASS_SECONDS:-${KBH_BENCHMARK_TIMEOUT_SECONDS:-7200}}"
 else
