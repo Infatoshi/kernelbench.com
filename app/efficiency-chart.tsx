@@ -94,7 +94,7 @@ export function EfficiencyChart({ mega, hard }: { mega: EffByGpu; hard: EffByGpu
           const lx = cx + (right ? -10 : 10)
           const ly = cy - 9 - level * 15
           return (
-            <g key={p.label}>
+            <g key={`${p.label}-${p.x}-${p.y}`}>
               <line x1={cx} y1={cy} x2={lx} y2={ly - 3} className="eff-leader" />
               <circle cx={cx} cy={cy} r={6} className={p.frontier ? "eff-dot on" : "eff-dot"} />
               <text x={lx} y={ly} textAnchor={right ? "end" : "start"}

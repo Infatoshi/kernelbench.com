@@ -473,20 +473,58 @@ function correctnessOf(index: ModelIndex, m: ModelEntry): {
 }
 
 /**
+ * Display curation for the AA-style column charts (homepage + /models):
+ * slugs hidden because they are superseded by a newer sibling or were never
+ * more than zero-result entries. This is a PRESENTATION filter over
+ * models.json — the data, /models/[slug] pages, and per-bench boards are
+ * untouched. New slugs auto-appear (e.g. the kinetic model lands on publish
+ * with no edit here).
+ *
+ * Curated roster (2026-07-16, per product decision — "one model per lab"):
+ *   Anthropic  fable-5, opus-4-8, sonnet-5      OpenAI   5.6-sol, 5.5
+ *   xAI        grok-4.5                          Z.ai     glm-5.2 (5.1 dropped)
+ *   DeepSeek   v4-pro (flash dropped)            MiniMax  m3 (m2.7 dropped)
+ *   Cursor     composer-2.5-fast                 Meituan  longcat-2.0
+ *   Moonshot   kinetic model when it lands (k2.6/k2.7 dropped)
+ *   Google     gemini-3.1-pro-preview (3.5-flash dropped)
+ */
+export const CHART_HIDDEN_SLUGS = new Set([
+  "claude-opus-4-6",
+  "claude-opus-4-7",
+  "glm-5.1",
+  "custom:glm-5.1-[z.ai-coding-plan]-0",
+  "kimi-k2.6",
+  "kimi-k2.7-code",
+  "minimax-m2.7",
+  "deepseek-v4-flash",
+  "grok-build",
+  "gemini-3.5-flash",
+  "qwen3.6-27b",
+  "qwen3.6-max-preview",
+  "qwen3.6-plus",
+  "qwen3.7-max",
+  "fugu-ultra",
+  "nemotron-3-ultra-550b-a55b",
+  "mimo-v2.5-pro",
+])
+
+/**
  * Canonical column order, shared by every chart: correctness % desc ->
  * total passed desc -> slug. Models with no attempted bench (pct null) sink
- * to the right, ordered by slug.
+ * to the right, ordered by slug. CHART_HIDDEN_SLUGS are filtered out first.
  */
 export function columnOrder(index: ModelIndex): ModelEntry[] {
-  return [...index.models].sort((am, bm) => {
-    const a = correctnessOf(index, am)
-    const b = correctnessOf(index, bm)
-    const ap = a.pct ?? -1
-    const bp = b.pct ?? -1
-    if (bp !== ap) return bp - ap
-    if (b.passed !== a.passed) return b.passed - a.passed
-    return am.slug.localeCompare(bm.slug)
-  })
+  return [...index.models]
+    .filter((m) => !CHART_HIDDEN_SLUGS.has(m.slug))
+    .sort((am, bm) => {
+      const a = correctnessOf(index, am)
+      const b = correctnessOf(index, bm)
+      const ap = a.pct ?? -1
+      const bp = b.pct ?? -1
+      if (bp !== ap) return bp - ap
+      if (b.passed !== a.passed) return b.passed - a.passed
+      return am.slug.localeCompare(bm.slug)
+    })
 }
 
 /**
