@@ -28,7 +28,7 @@ kb — KernelBench operator CLI   (repo: {root})
   kb build                                      next build
   kb audit <run_id>                             print a run's result + annotation verdict
   kb lint <run_id|--all>                        static reward-hack tripwire (scans solution.py)
-  kb contamination <hard|mega|v3|path> [--published <lb.json>]   cross-run contamination audit
+  kb contamination <hard|mega|cuda|v3|path> [--published <lb.json>]   cross-run contamination audit
   kb traces-to-hf <out_dir> [run_dirs...]       convert run transcripts to HF agent-trace JSONL
   kb push-runs <hard|mega> [--dataset R] [--dry-run]   convert published runs' traces and push to HF
   kb help

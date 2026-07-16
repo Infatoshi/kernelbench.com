@@ -25,6 +25,7 @@ const citationGraph = {
         "https://github.com/Infatoshi/kernelbench.com",
         "https://github.com/Infatoshi/kernelbench.com/tree/master/benchmarks/mega",
         "https://github.com/Infatoshi/kernelbench.com/tree/master/benchmarks/hard",
+        "https://github.com/Infatoshi/kernelbench.com/tree/master/benchmarks/cuda",
         "https://huggingface.co/datasets/Infatoshi/kernelbench-mega-traces",
         "https://huggingface.co/datasets/Infatoshi/kernelbench-hard-traces",
       ],
@@ -89,6 +90,21 @@ const benchmarks = [
     hfHref: "https://huggingface.co/datasets/Infatoshi/kernelbench-hard-traces",
     ghHref:
       "https://github.com/Infatoshi/kernelbench.com/tree/master/benchmarks/hard",
+    comingSoon: false,
+  },
+  {
+    href: "/cuda",
+    title: "CUDA",
+    description:
+      "CUDA-only writing deck — Triton/DSL fail the gate. Four hard cells: GLM-5.2 fused MoE (256 experts + shared), DeepSeek NSA, MegaQwen decode (2k–128k), RL grid+MinGRU SPS. Hard/Mega stay frozen.",
+    stats: [
+      ["problems", "4"],
+      ["gate", "CUDA-only"],
+      ["GPU", "RTX PRO 6000"],
+    ],
+    hfHref: null,
+    ghHref:
+      "https://github.com/Infatoshi/kernelbench.com/tree/master/benchmarks/cuda",
     comingSoon: false,
   },
   {
