@@ -660,6 +660,53 @@ JSON
             </dev/null > "$LOG_FILE" 2> "$STDERR_FILE" ) || HARNESS_EXIT=$?
         ;;
 
+    tinker|inkling)
+        # Thinking Machines Inkling: OpenCode -> Tinker OpenAI-compat (beta).
+        # Same route as the hard bench; key THINKING_MACHINES_API_KEY
+        # (TINKER_API_KEY honored). 64K context tier, output <= 32000.
+        TINKER_KEY_VAL="${THINKING_MACHINES_API_KEY:-${TINKER_API_KEY:-}}"
+        if [ -z "$TINKER_KEY_VAL" ]; then
+            echo "STOP: tinker needs \$THINKING_MACHINES_API_KEY (Tinker / Thinking Machines)" >&2
+            exit 1
+        fi
+        case "$MODEL" in
+            ""|inkling|Inkling|thinkingmachines/Inkling|tinker/thinkingmachines/Inkling) ;;
+            *)
+                echo "STOP: tinker harness only serves thinkingmachines/Inkling (got '$MODEL')" >&2
+                exit 1
+                ;;
+        esac
+        TINKER_OC_HOME="$RUN_DIR/opencode_tinker_config"
+        mkdir -p "$TINKER_OC_HOME/opencode"
+        cat > "$TINKER_OC_HOME/opencode/opencode.json" <<JSON
+{
+  "\$schema": "https://opencode.ai/config.json",
+  "permission": { "external_directory": "deny" },
+  "provider": {
+    "tinker": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "Thinking Machines Tinker",
+      "options": {
+        "baseURL": "${TINKER_BASE_URL:-https://tinker.thinkingmachines.dev/services/tinker-prod/oai/api/v1}",
+        "apiKey": "${TINKER_KEY_VAL}"
+      },
+      "models": {
+        "thinkingmachines/Inkling": {
+          "name": "Inkling",
+          "limit": { "context": ${TINKER_CONTEXT_LIMIT:-65536}, "output": ${TINKER_OUTPUT_LIMIT:-32000} },
+          "tools": true
+        }
+      }
+    }
+  }
+}
+JSON
+        ( cd "$PROBLEM_DIR" && "${KBH_SBX[@]}" timeout "$BUDGET_SECONDS" \
+            env XDG_CONFIG_HOME="$TINKER_OC_HOME" \
+            opencode run --pure --format json -m tinker/thinkingmachines/Inkling "$PROMPT" \
+            </dev/null > "$LOG_FILE" 2> "$STDERR_FILE" ) || HARNESS_EXIT=$?
+        ;;
+
     deepseek-claude)
         # Claude Code routed to DeepSeek's Anthropic-compatible endpoint.
         # Requires DEEPSEEK_API_KEY. Pass MODEL=deepseek-v4-pro.

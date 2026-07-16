@@ -666,6 +666,52 @@ JSON
     printf '%s\n' "$config_home"
 }
 
+# Thinking Machines Inkling via the Tinker OpenAI-compatible endpoint (beta).
+# Docs: tinker-docs.thinkingmachines.ai/compatible-apis/openai + the OpenCode
+# deployment tutorial. Key: THINKING_MACHINES_API_KEY (TINKER_API_KEY also
+# honored). Standard tier serves a 64K context window (256K is a separately
+# priced variant); max_tokens up to 32000 verified live 2026-07-16.
+write_tinker_opencode_config() {
+    local tinker_key="${THINKING_MACHINES_API_KEY:-${TINKER_API_KEY:-}}"
+    if [ -z "$tinker_key" ]; then
+        echo "THINKING_MACHINES_API_KEY is required for the tinker harness" >&2
+        return 1
+    fi
+    local config_home="$RUN_DIR/opencode_tinker_config"
+    local tinker_context="${TINKER_CONTEXT_LIMIT:-65536}"
+    local tinker_output="${TINKER_OUTPUT_LIMIT:-32000}"
+    mkdir -p "$config_home/opencode"
+    cat > "$config_home/opencode/opencode.json" <<JSON
+{
+  "\$schema": "https://opencode.ai/config.json",
+  "permission": {
+    "external_directory": "deny"
+  },
+  "provider": {
+    "tinker": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "Thinking Machines Tinker",
+      "options": {
+        "baseURL": "${TINKER_BASE_URL:-https://tinker.thinkingmachines.dev/services/tinker-prod/oai/api/v1}",
+        "apiKey": "${tinker_key}"
+      },
+      "models": {
+        "thinkingmachines/Inkling": {
+          "name": "Inkling",
+          "limit": {
+            "context": ${tinker_context},
+            "output": ${tinker_output}
+          },
+          "tools": true
+        }
+      }
+    }
+  }
+}
+JSON
+    printf '%s\n' "$config_home"
+}
+
 prepare_claude_container_home() {
     # $1: copy Anthropic credentials (1, default) or not (0). Claude-compat
     # reroutes (Z.ai / MiniMax) authenticate via ANTHROPIC_AUTH_TOKEN and must
@@ -1732,6 +1778,70 @@ case "$HARNESS" in
                     HY3_ATTEMPT=$(( HY3_ATTEMPT + 1 ))
                     printf '%s hy3 host stall retry attempt=%s/%s\n' \
                         "$(date -Is)" "$HY3_ATTEMPT" "$HY3_MAX_ATTEMPTS" \
+                        >> "$RUN_DIR/stall_watchdog.log"
+                    continue
+                fi
+                break
+            done
+        fi
+        ;;
+
+    tinker|inkling)
+        # Thinking Machines Inkling: OpenCode -> Tinker OpenAI-compat (beta).
+        #   base:  https://tinker.thinkingmachines.dev/services/tinker-prod/oai/api/v1
+        #   model: thinkingmachines/Inkling (975B/41B-active MoE, 2026-07-15)
+        #   key:   THINKING_MACHINES_API_KEY (TINKER_API_KEY also honored)
+        # Same OpenCode host/container shape as hy3; no reasoning_effort knob.
+        if [ -z "${THINKING_MACHINES_API_KEY:-}" ] && [ -z "${TINKER_API_KEY:-}" ]; then
+            echo "STOP: tinker needs \$THINKING_MACHINES_API_KEY (Tinker / Thinking Machines)" >&2
+            exit 1
+        fi
+        case "$MODEL" in
+            ""|inkling|Inkling|thinkingmachines/Inkling|tinker/thinkingmachines/Inkling)
+                MODEL="thinkingmachines/Inkling" ;;
+            *)
+                echo "STOP: tinker harness only serves thinkingmachines/Inkling (got '$MODEL')" >&2
+                exit 1
+                ;;
+        esac
+        TINKER_OC_HOME="$(write_tinker_opencode_config)"
+        TINKER_OC_MODEL="tinker/thinkingmachines/Inkling"
+        if [ "$KBH_AGENT_CONTAINER" = "1" ]; then
+            KBH_OPENCODE_CONFIG_FILE="$TINKER_OC_HOME/opencode/opencode.json" \
+                run_opencode_container "$TINKER_OC_MODEL" \
+                > "$LOG_FILE" 2> "$STDERR_FILE" || HARNESS_EXIT=$?
+        else
+            TINKER_STALL_SECONDS="${KBH_OPENCODE_STALL_SECONDS:-900}"
+            TINKER_MAX_ATTEMPTS=$(( ${KBH_OPENCODE_STALL_RETRIES:-2} + 1 ))
+            TINKER_ATTEMPT=1
+            TINKER_START_TS="$(date +%s)"
+            HARNESS_EXIT=0
+            while :; do
+                TINKER_REMAINING=0
+                if [ "$BUDGET_SECONDS" -ne 0 ]; then
+                    TINKER_ELAPSED=$(( $(date +%s) - TINKER_START_TS ))
+                    TINKER_REMAINING=$(( BUDGET_SECONDS - TINKER_ELAPSED ))
+                    if [ "$TINKER_REMAINING" -le 60 ]; then
+                        HARNESS_EXIT=124
+                        break
+                    fi
+                fi
+                TINKER_WD_BEFORE=0
+                [ -f "$RUN_DIR/stall_watchdog.log" ] && TINKER_WD_BEFORE="$(wc -l < "$RUN_DIR/stall_watchdog.log")"
+                HARNESS_EXIT=0
+                touch "$LOG_FILE"
+                (
+                    cd "$PROBLEM_DIR" && \
+                    run_host_with_stall_watch "$TINKER_STALL_SECONDS" "$LOG_FILE" "$TINKER_REMAINING" \
+                        env XDG_CONFIG_HOME="$TINKER_OC_HOME" \
+                        opencode run --pure --format json -m "$TINKER_OC_MODEL" "$PROMPT"
+                ) </dev/null >> "$LOG_FILE" 2>> "$STDERR_FILE" || HARNESS_EXIT=$?
+                TINKER_WD_AFTER=0
+                [ -f "$RUN_DIR/stall_watchdog.log" ] && TINKER_WD_AFTER="$(wc -l < "$RUN_DIR/stall_watchdog.log")"
+                if [ "$TINKER_WD_AFTER" -gt "$TINKER_WD_BEFORE" ] && [ "$TINKER_ATTEMPT" -lt "$TINKER_MAX_ATTEMPTS" ]; then
+                    TINKER_ATTEMPT=$(( TINKER_ATTEMPT + 1 ))
+                    printf '%s tinker host stall retry attempt=%s/%s\n' \
+                        "$(date -Is)" "$TINKER_ATTEMPT" "$TINKER_MAX_ATTEMPTS" \
                         >> "$RUN_DIR/stall_watchdog.log"
                     continue
                 fi

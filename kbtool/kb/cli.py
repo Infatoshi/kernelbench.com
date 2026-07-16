@@ -22,7 +22,7 @@ kb — KernelBench operator CLI   (repo: {root})
 
   kb sweep <harness> <model> [effort]          full deck sweep, parallel containers, unlimited time
   kb run <harness> <model> <problem> [effort]  one problem (problem = e.g. 05_topk_bitonic)
-  kb publish [bench]                            rebuild leaderboard + viewers from archives (default: hard)
+  kb publish [bench]                            rebuild leaderboard + viewers from archives (default: hard; benches: hard|mega|cuda)
   kb deploy [message]                           publish, commit, push -> Vercel deploys
   kb dev                                        preview site locally (anvil:3000 via Tailscale)
   kb build                                      next build
@@ -30,7 +30,7 @@ kb — KernelBench operator CLI   (repo: {root})
   kb lint <run_id|--all>                        static reward-hack tripwire (scans solution.py)
   kb contamination <hard|mega|cuda|v3|path> [--published <lb.json>]   cross-run contamination audit
   kb traces-to-hf <out_dir> [run_dirs...]       convert run transcripts to HF agent-trace JSONL
-  kb push-runs <hard|mega> [--dataset R] [--dry-run]   convert published runs' traces and push to HF
+  kb push-runs <hard|mega|cuda> [--dataset R] [--dry-run]   convert published runs' traces and push to HF
   kb help
 
 Keys live in ~/.env_vars. Bench a new model: add its key, then  kb sweep <harness> <model>.
@@ -46,6 +46,8 @@ _NEED = {
     "deepseek-claude": "DEEPSEEK_API_KEY",
     "qwen-claude": "DASHSCOPE_API_KEY",
     "longcat-claude": "LONGCAT_API_KEY",
+    "tinker": "THINKING_MACHINES_API_KEY",
+    "inkling": "THINKING_MACHINES_API_KEY",
     "hy3": "TENCENT_API_KEY",
     "hy3-claude": "TENCENT_API_KEY",  # legacy alias → TokenHub, not Claude Code
     "gemini": "GEMINI_API_KEY",
@@ -144,9 +146,9 @@ def cmd_publish(root: Path, args: list[str]) -> int:
     push = "--push" in args
     args = [a for a in args if a != "--push"]
     bench = args[0] if args else "hard"
-    script = {"hard": "publish_v2.sh", "mega": "publish_mega.sh"}.get(bench)
+    script = {"hard": "publish_v2.sh", "mega": "publish_mega.sh", "cuda": "publish_v2.sh"}.get(bench)
     if not script:
-        sys.exit(f"kb publish: no publish script for bench '{bench}' (hard|mega)")
+        sys.exit(f"kb publish: no publish script for bench '{bench}' (hard|mega|cuda)")
     pub = _bench_dir(root, bench) / "scripts" / script
     if not push:
         return _exec([str(pub)])
@@ -178,8 +180,8 @@ def cmd_push_runs(root: Path, args: list[str]) -> int:
         dataset = args[i + 1]
         del args[i:i + 2]
     bench = args[0] if args else "hard"
-    if bench not in ("hard", "mega"):
-        sys.exit("kb push-runs: only hard|mega have trace datasets (v3 is archived)")
+    if bench not in ("hard", "mega", "cuda"):
+        sys.exit("kb push-runs: only hard|mega|cuda have trace datasets (v3 is archived)")
     bench_dir = _bench_dir(root, bench)
     dataset = dataset or f"Infatoshi/kernelbench-{bench}-traces"
 
@@ -192,9 +194,10 @@ def cmd_push_runs(root: Path, args: list[str]) -> int:
     listfile = root / "runs" / bench / "_rids.txt"
     listfile.write_text("\n".join(rids) + "\n")
 
-    # Mega reuses hard's transcript parser/converter machinery.
+    # Other benches reuse hard's transcript parser/converter machinery if the
+    # rsynced local copy is missing (mega/cuda normally carry their own).
     conv = bench_dir / "scripts" / "traces_to_hf.py"
-    if not conv.exists() and bench == "mega":
+    if not conv.exists():
         conv = _bench_dir(root, "hard") / "scripts" / "traces_to_hf.py"
     print(f"converting {len(rids)} published run traces -> {staging} ...")
     bench_env = {k: v for k, v in os.environ.items() if k != "VIRTUAL_ENV"}
@@ -223,8 +226,10 @@ def cmd_push_runs(root: Path, args: list[str]) -> int:
 def cmd_deploy(root: Path, args: list[str]) -> int:
     msg = args[0] if args else "publish kernelbench results"
     subprocess.run([str(_bench_dir(root, "hard") / "scripts" / "publish_v2.sh")], check=True)
+    subprocess.run([str(_bench_dir(root, "cuda") / "scripts" / "publish_v2.sh")], check=True)
     os.chdir(root)
-    subprocess.run(["git", "add", "-A", "benchmarks/hard/results", "public/runs", "app"], check=True)
+    subprocess.run(["git", "add", "-A", "benchmarks/hard/results", "benchmarks/cuda/results",
+                    "public/runs", "app"], check=True)
     rc = subprocess.run(
         ["git", "-c", "user.email=elliot@arledge.net", "commit", "-m", msg]
     ).returncode
