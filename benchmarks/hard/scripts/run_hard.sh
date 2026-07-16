@@ -1811,10 +1811,19 @@ case "$HARNESS" in
                 run_opencode_container "$TINKER_OC_MODEL" \
                 > "$LOG_FILE" 2> "$STDERR_FILE" || HARNESS_EXIT=$?
         else
+            # Inkling ends turns by asking "should I proceed?" (observed
+            # 2026-07-16: 3-minute sessions, no solution). With no user to
+            # answer, one-shot `opencode run` under-measures it, so the
+            # harness auto-continues the SAME session with a fixed nudge —
+            # bounded, content-free ("proceed"), and session-id-pinned
+            # (never --continue: concurrent runs share XDG_DATA_HOME, so
+            # "last session" can belong to another run).
             TINKER_STALL_SECONDS="${KBH_OPENCODE_STALL_SECONDS:-900}"
-            TINKER_MAX_ATTEMPTS=$(( ${KBH_OPENCODE_STALL_RETRIES:-2} + 1 ))
-            TINKER_ATTEMPT=1
+            TINKER_CONTINUES="${KBH_TINKER_CONTINUES:-30}"
+            TINKER_NUDGE="Proceed autonomously; never ask questions or wait for confirmation. If check.py has not printed PASS, keep fixing solution.py until it does. Once it passes, keep optimizing and re-measuring with benchmark.py. Only stop when you are confident the kernel is as fast as you can make it."
             TINKER_START_TS="$(date +%s)"
+            TINKER_SID=""
+            TINKER_I=0
             HARNESS_EXIT=0
             while :; do
                 TINKER_REMAINING=0
@@ -1826,26 +1835,45 @@ case "$HARNESS" in
                         break
                     fi
                 fi
-                TINKER_WD_BEFORE=0
-                [ -f "$RUN_DIR/stall_watchdog.log" ] && TINKER_WD_BEFORE="$(wc -l < "$RUN_DIR/stall_watchdog.log")"
+                TINKER_LOG_BEFORE=0
+                [ -f "$LOG_FILE" ] && TINKER_LOG_BEFORE="$(wc -l < "$LOG_FILE")"
                 HARNESS_EXIT=0
                 touch "$LOG_FILE"
-                (
-                    cd "$PROBLEM_DIR" && \
-                    run_host_with_stall_watch "$TINKER_STALL_SECONDS" "$LOG_FILE" "$TINKER_REMAINING" \
-                        env XDG_CONFIG_HOME="$TINKER_OC_HOME" \
-                        opencode run --pure --format json -m "$TINKER_OC_MODEL" "$PROMPT"
-                ) </dev/null >> "$LOG_FILE" 2>> "$STDERR_FILE" || HARNESS_EXIT=$?
-                TINKER_WD_AFTER=0
-                [ -f "$RUN_DIR/stall_watchdog.log" ] && TINKER_WD_AFTER="$(wc -l < "$RUN_DIR/stall_watchdog.log")"
-                if [ "$TINKER_WD_AFTER" -gt "$TINKER_WD_BEFORE" ] && [ "$TINKER_ATTEMPT" -lt "$TINKER_MAX_ATTEMPTS" ]; then
-                    TINKER_ATTEMPT=$(( TINKER_ATTEMPT + 1 ))
-                    printf '%s tinker host stall retry attempt=%s/%s\n' \
-                        "$(date -Is)" "$TINKER_ATTEMPT" "$TINKER_MAX_ATTEMPTS" \
-                        >> "$RUN_DIR/stall_watchdog.log"
-                    continue
+                if [ "$TINKER_I" -eq 0 ]; then
+                    (
+                        cd "$PROBLEM_DIR" && \
+                        run_host_with_stall_watch "$TINKER_STALL_SECONDS" "$LOG_FILE" "$TINKER_REMAINING" \
+                            env XDG_CONFIG_HOME="$TINKER_OC_HOME" \
+                            opencode run --pure --format json -m "$TINKER_OC_MODEL" "$PROMPT"
+                    ) </dev/null >> "$LOG_FILE" 2>> "$STDERR_FILE" || HARNESS_EXIT=$?
+                else
+                    (
+                        cd "$PROBLEM_DIR" && \
+                        run_host_with_stall_watch "$TINKER_STALL_SECONDS" "$LOG_FILE" "$TINKER_REMAINING" \
+                            env XDG_CONFIG_HOME="$TINKER_OC_HOME" \
+                            opencode run --pure --format json -m "$TINKER_OC_MODEL" \
+                                -s "$TINKER_SID" "$TINKER_NUDGE"
+                    ) </dev/null >> "$LOG_FILE" 2>> "$STDERR_FILE" || HARNESS_EXIT=$?
                 fi
-                break
+                TINKER_LOG_AFTER=0
+                [ -f "$LOG_FILE" ] && TINKER_LOG_AFTER="$(wc -l < "$LOG_FILE")"
+                TINKER_GROWTH=$(( TINKER_LOG_AFTER - TINKER_LOG_BEFORE ))
+                TINKER_SID="$(grep -ao '"sessionID":"[^"]*"' "$LOG_FILE" | tail -1 | cut -d'"' -f4)"
+                if [ -z "$TINKER_SID" ]; then
+                    break  # no session materialized (auth/transport failure)
+                fi
+                # Done when a continue produces almost nothing new while a
+                # solution exists: the model has genuinely decided it's done.
+                if [ "$TINKER_I" -gt 0 ] && [ "$TINKER_GROWTH" -lt 12 ] && [ -f "$PROBLEM_DIR/solution.py" ]; then
+                    break
+                fi
+                TINKER_I=$(( TINKER_I + 1 ))
+                if [ "$TINKER_I" -gt "$TINKER_CONTINUES" ]; then
+                    break
+                fi
+                printf '%s tinker auto-continue %s/%s (growth=%s)\n' \
+                    "$(date -Is)" "$TINKER_I" "$TINKER_CONTINUES" "$TINKER_GROWTH" \
+                    >> "$RUN_DIR/tinker_continues.log"
             done
         fi
         ;;

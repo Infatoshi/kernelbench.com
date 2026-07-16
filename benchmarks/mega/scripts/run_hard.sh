@@ -701,10 +701,44 @@ JSON
   }
 }
 JSON
-        ( cd "$PROBLEM_DIR" && "${KBH_SBX[@]}" timeout "$BUDGET_SECONDS" \
-            env XDG_CONFIG_HOME="$TINKER_OC_HOME" \
-            opencode run --pure --format json -m tinker/thinkingmachines/Inkling "$PROMPT" \
-            </dev/null > "$LOG_FILE" 2> "$STDERR_FILE" ) || HARNESS_EXIT=$?
+        # Auto-continue: Inkling ends turns asking "should I proceed?"
+        # (2026-07-16), so re-prompt the same session (id-pinned) with a
+        # fixed nudge until a continue adds nothing while solution.py exists.
+        TINKER_CONTINUES="${KBH_TINKER_CONTINUES:-30}"
+        TINKER_NUDGE="Proceed autonomously; never ask questions or wait for confirmation. If check.py has not printed PASS, keep fixing solution.py until it does. Once it passes, keep optimizing and re-measuring with benchmark.py. Only stop when you are confident the kernel is as fast as you can make it."
+        TINKER_SID=""
+        TINKER_I=0
+        HARNESS_EXIT=0
+        while :; do
+            TINKER_LOG_BEFORE=0
+            [ -f "$LOG_FILE" ] && TINKER_LOG_BEFORE="$(wc -l < "$LOG_FILE")"
+            HARNESS_EXIT=0
+            if [ "$TINKER_I" -eq 0 ]; then
+                ( cd "$PROBLEM_DIR" && "${KBH_SBX[@]}" timeout "$BUDGET_SECONDS" \
+                    env XDG_CONFIG_HOME="$TINKER_OC_HOME" \
+                    opencode run --pure --format json -m tinker/thinkingmachines/Inkling "$PROMPT" \
+                    </dev/null >> "$LOG_FILE" 2>> "$STDERR_FILE" ) || HARNESS_EXIT=$?
+            else
+                ( cd "$PROBLEM_DIR" && "${KBH_SBX[@]}" timeout "$BUDGET_SECONDS" \
+                    env XDG_CONFIG_HOME="$TINKER_OC_HOME" \
+                    opencode run --pure --format json -m tinker/thinkingmachines/Inkling \
+                        -s "$TINKER_SID" "$TINKER_NUDGE" \
+                    </dev/null >> "$LOG_FILE" 2>> "$STDERR_FILE" ) || HARNESS_EXIT=$?
+            fi
+            TINKER_LOG_AFTER=0
+            [ -f "$LOG_FILE" ] && TINKER_LOG_AFTER="$(wc -l < "$LOG_FILE")"
+            TINKER_GROWTH=$(( TINKER_LOG_AFTER - TINKER_LOG_BEFORE ))
+            TINKER_SID="$(grep -ao '"sessionID":"[^"]*"' "$LOG_FILE" | tail -1 | cut -d'"' -f4)"
+            [ -z "$TINKER_SID" ] && break
+            if [ "$TINKER_I" -gt 0 ] && [ "$TINKER_GROWTH" -lt 12 ] && [ -f "$PROBLEM_DIR/solution.py" ]; then
+                break
+            fi
+            TINKER_I=$(( TINKER_I + 1 ))
+            [ "$TINKER_I" -gt "$TINKER_CONTINUES" ] && break
+            printf '%s tinker auto-continue %s/%s (growth=%s)\n' \
+                "$(date -Is)" "$TINKER_I" "$TINKER_CONTINUES" "$TINKER_GROWTH" \
+                >> "$RUN_DIR/tinker_continues.log"
+        done
         ;;
 
     deepseek-claude)
