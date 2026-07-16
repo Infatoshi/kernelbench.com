@@ -2,10 +2,9 @@ import Link from "next/link"
 import { GroupedBars } from "./home-charts"
 import { EfficiencyChart } from "./efficiency-chart"
 import { loadMegaChart, loadHardChart, loadEfficiency } from "@/app/_lib/charts"
-import { barsForBench, rowsForIndex } from "@/app/_lib/models"
+import { barsForBench } from "@/app/_lib/models"
 import { loadModelIndex } from "@/app/_lib/models.server"
 import { ModelMetricChart } from "@/app/_components/model-metric-chart"
-import { ModelList } from "@/app/_components/model-list"
 
 const HUGGING_FACE_LOGO =
   "https://huggingface.co/front/assets/huggingface_logo-noborder.svg"
@@ -135,7 +134,6 @@ export default async function HomePage() {
     loadEfficiency(),
     loadModelIndex(),
   ])
-  const { sink: modelSink } = rowsForIndex(modelIdx)
   const barViews = {
     mega: barsForBench(modelIdx, "mega"),
     hard: barsForBench(modelIdx, "hard"),
@@ -186,14 +184,6 @@ export default async function HomePage() {
           </p>
         </div>
         <ModelMetricChart views={barViews} />
-        {modelSink.length > 0 && (
-          <div className="model-sink-section">
-            <p className="model-sink-label">
-              No valid published results — audited sessions below were flagged or invalid
-            </p>
-            <ModelList rows={modelSink} sink showBadges />
-          </div>
-        )}
       </section>
 
       <section aria-label="Benchmarks" className="space-y-4">

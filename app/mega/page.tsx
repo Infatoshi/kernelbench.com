@@ -1,5 +1,5 @@
 import Link from "next/link"
-import { barsForBench, rowsForBench } from "@/app/_lib/models"
+import { barsForBench } from "@/app/_lib/models"
 import { loadModelIndex } from "@/app/_lib/models.server"
 import { ModelGpuBoard, type GpuView } from "@/app/_components/model-board"
 
@@ -16,9 +16,8 @@ export default async function MegaPage() {
   const idx = await loadModelIndex()
   const gpuLabels = idx.benches.mega?.gpu_labels ?? {}
 
-  const mk = (gpu?: string): Pick<GpuView, "bars" | "sink"> => ({
+  const mk = (gpu?: string): Pick<GpuView, "bars"> => ({
     bars: barsForBench(idx, "mega", gpu),
-    sink: gpu ? [] : rowsForBench(idx, "mega").sink,
   })
 
   const views: GpuView[] = [

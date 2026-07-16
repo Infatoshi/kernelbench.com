@@ -1,8 +1,7 @@
 import Link from "next/link"
-import { barsForBench, rowsForBench } from "@/app/_lib/models"
+import { barsForBench } from "@/app/_lib/models"
 import { loadModelIndex } from "@/app/_lib/models.server"
 import { ModelBars } from "@/app/_components/model-bars"
-import { ModelList } from "@/app/_components/model-list"
 
 // KernelBench-CUDA: CUDA-only sibling of hard. Triton/DSL fail the language
 // gate. Four-problem deck on RTX PRO 6000.
@@ -13,8 +12,7 @@ const REPO_TREE =
 export default async function CudaPage() {
   const idx = await loadModelIndex()
   const bars = barsForBench(idx, "cuda")
-  const { sink } = rowsForBench(idx, "cuda")
-  const hasRuns = bars.rows.length > 0 || sink.length > 0
+  const hasRuns = bars.rows.length > 0
 
   return (
     <div className="hard-page space-y-12">
@@ -43,17 +41,12 @@ export default async function CudaPage() {
 
       <section>
         {hasRuns ? (
-          <>
+          <div className="chart-panel">
+            <div className="chart-panel-head">
+              <span className="chart-panel-title">RTX PRO 6000 leaderboard</span>
+            </div>
             <ModelBars view={bars} />
-            {sink.length > 0 && (
-              <div className="model-sink-section">
-                <p className="model-sink-label">
-                  No valid published results — audited sessions below were flagged or invalid
-                </p>
-                <ModelList rows={sink} sink />
-              </div>
-            )}
-          </>
+          </div>
         ) : (
           <p className="text-xs text-[var(--color-fg-muted)]">
             Results will populate here as sweeps complete.
