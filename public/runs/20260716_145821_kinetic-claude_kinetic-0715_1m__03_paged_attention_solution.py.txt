@@ -1,0 +1,546 @@
+"""Paged attention decode — v5: direct 256-bit loads (Kernel C topology).
+
+Structure per call (two kernels; fused variant traps on GB202 when global
+atomics mix with the deep pipeline, see notes):
+  kernel 1 `paged_partial`: grid (S*NGRP, B), 128 threads (4 warps) per CTA.
+      D=128: warp w covers tokens {4w..4w+3} of each page; 8-lane octs hold one
+             token row (256B = 8 x 32B loads), acc in registers (16 dims/lane).
+      D=64:  warp w covers tokens {8w..8w+7} spanning two pages; 4-lane quads
+             hold one token row (128B = 4 x 32B loads).
+      All loads are ld.global.nc.L2::cache_hint.v8.f32 with an evict_first
+      policy — the pattern that measures ~1.77 TB/s on this GPU.
+      Online softmax in exp2 domain; partials (fp32 m,l,acc) to global.
+  kernel 2 `paged_reduce`: combines S partials into bf16 out (one CTA per
+      (batch, head-subgroup)).
+"""
+import math
+import os
+
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+os.environ.setdefault("TORCH_CUDA_ARCH_LIST", "12.0a")
+
+_CUDA_SRC = r"""
+#include <torch/extension.h>
+#include <ATen/cuda/CUDAContext.h>
+#include <cuda_bf16.h>
+#include <cstdint>
+
+#define DEVFN __device__ __forceinline__
+
+constexpr float LOG2E = 1.4426950408889634f;
+
+DEVFN float2 unpack2(uint32_t u) {
+    __nv_bfloat162 h = *reinterpret_cast<__nv_bfloat162*>(&u);
+    return __bfloat1622float2(h);
+}
+
+// ---- 256-bit streaming load with L2 evict_first ----
+struct Vec32 { uint32_t w[8]; };
+DEVFN Vec32 ldg256_ef(const void* p) {
+    Vec32 v;
+    asm volatile(
+        "{ .reg .b64 pol; createpolicy.fractional.L2::evict_first.b64 pol, 1.0;\n"
+        "ld.global.nc.L2::cache_hint.v8.b32 {%0,%1,%2,%3,%4,%5,%6,%7}, [%8], pol; }"
+        : "=r"(v.w[0]), "=r"(v.w[1]), "=r"(v.w[2]), "=r"(v.w[3]),
+          "=r"(v.w[4]), "=r"(v.w[5]), "=r"(v.w[6]), "=r"(v.w[7])
+        : "l"(p));
+    return v;
+}
+
+// unconditional shfl helpers (volatile so ptxas cannot predicate them off)
+DEVFN void l2_prefetch(const void* p, int bytes) {
+    asm volatile(
+        "{ .reg .b64 pol; createpolicy.fractional.L2::evict_first.b64 pol, 1.0;\n"
+        "cp.async.bulk.prefetch.L2.global.L2::cache_hint [%0], %1, pol; }"
+        :: "l"(p), "r"(bytes));
+}
+
+DEVFN void bfly1(float& v, int lane_off) {
+    float r;
+    asm volatile("shfl.sync.bfly.b32 %0, %1, %2, 0x1f, 0xffffffff;" : "=f"(r) : "f"(v), "r"(lane_off));
+    v += r;
+}
+
+// ================= kernel 1 =================
+// ROW_LANES = lanes per row (8 for D=128, 4 for D=64); EPL = elems per lane (16).
+// PF = prefetch depth (pages of K+V held in registers ahead of compute).
+template <int D, int GS, int PF, bool PREF>
+__global__ __launch_bounds__(128) void paged_partial(
+    const __nv_bfloat16* __restrict__ q,
+    const __nv_bfloat16* __restrict__ kv,      // (nb, 16, Hkv, 2D)
+    const int* __restrict__ block_table,       // (B, max_blocks)
+    const int* __restrict__ seq_lens,          // (B,)
+    float* __restrict__ part_acc,              // (B, NGRP, S, GS, D)
+    float* __restrict__ part_ml,               // (B, NGRP, S, GS, 2)
+    __nv_bfloat16* __restrict__ out,           // (B, H, D); used only when S == 1
+    int H, int NGRP, int G, int S, int pps, int max_blocks, int pfd, float qk_scale)
+{
+    constexpr int gn = GS;
+    constexpr int EPL = 16;                 // bf16 elems per lane (32B slice)
+    constexpr int ROW_LANES = D / EPL;      // 8 | 4
+    constexpr int TOK_W = 32 / ROW_LANES;   // tokens per warp per load: 4 | 8
+    constexpr int NW = 4;                   // warps per CTA
+    constexpr int TOK_ITER = NW * TOK_W;    // tokens per CTA iteration: 16 | 32
+    constexpr int PITER = TOK_ITER / 16;    // pages per iteration: 1 | 2
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    const int rl = lane % ROW_LANES;        // lane index within row
+    const int tk = lane / ROW_LANES;        // token index within warp's load
+
+    const int b = blockIdx.y;
+    const int s = blockIdx.x / NGRP;
+    const int gv = blockIdx.x % NGRP;
+    const int g0 = gv * GS;
+    const int hkv = g0 / G;
+
+    const int L = seq_lens[b];
+    const int pages_b = (L + 15) >> 4;
+    const int p0 = s * pps;
+    const int p1 = min(p0 + pps, pages_b);
+    const int np = p1 - p0;
+
+    __shared__ float sh_ml[4][gn][2];
+    __shared__ float sh_acc[4][gn][D];
+    const int* bt_row = block_table + (long)b * max_blocks + p0;
+    __syncthreads();
+
+    long pb = ((((long)b * NGRP) + gv) * S + s);
+    float* ml_out = part_ml + pb * gn * 2;
+    float* acc_out = part_acc + pb * gn * D;
+
+    float m[gn], l[gn], acc[gn][EPL];
+    #pragma unroll
+    for (int g = 0; g < gn; g++) {
+        m[g] = -INFINITY; l[g] = 0.f;
+        #pragma unroll
+        for (int e = 0; e < EPL; e++) acc[g][e] = 0.f;
+    }
+
+    if (np > 0) {
+        Vec32 qv[gn];
+        #pragma unroll
+        for (int g = 0; g < gn; g++) {
+            qv[g] = ldg256_ef(q + ((long)b * H + g0 + g) * D + rl * EPL);
+        }
+
+        // this thread's token within the iteration: it = warp*TOK_W + tk
+        //   D=128: tokens {4w + tk}, one page per iteration
+        //   D=64 : tokens {8w + tk} = it ; page = it/16, tok = it%16, two pages/iter
+        const int it = warp * TOK_W + tk;
+        const int pg_off = it >> 4;         // 0 (both D=128) or 0/1 (D=64)
+        const int my_tok = it & 15;
+        const long row_stride = (long)(H / G) * 2 * D;   // elements per token slot
+        const long page_stride = 16 * row_stride;
+        const long row_off_in_page = (long)my_tok * row_stride + (long)hkv * 2 * D + rl * EPL;
+
+        auto row_ptr = [&](int pi) -> const __nv_bfloat16* {
+            const int pg = min(pi + pg_off, np - 1);   // stay in-range for dead lanes
+            const int blk = bt_row[pg];
+            return kv + (long)blk * page_stride + row_off_in_page;
+        };
+
+        // ring of PF page-buffers; iteration count = ceil(np / PITER)
+        const int n_it = (np + PITER - 1) / PITER;
+        Vec32 kb[PF], vb[PF];
+        #pragma unroll
+        for (int f = 0; f < PF; f++) {
+            if (f < n_it) {
+                kb[f] = ldg256_ef(row_ptr(f * PITER));
+                vb[f] = ldg256_ef(row_ptr(f * PITER) + D);
+            }
+        }
+
+        // prologue L2 prefetch: pull PFD pages ahead for this CTA's slice
+        if (PREF && threadIdx.x == 0) {
+            switch (pfd) {
+              case 1: l2_prefetch(kv + (unsigned long long)(unsigned)bt_row[0] * page_stride, page_stride); break;
+              case 2: { l2_prefetch(kv + (unsigned long long)(unsigned)bt_row[0] * page_stride, page_stride);
+                        if (np > 1) l2_prefetch(kv + (unsigned long long)(unsigned)bt_row[1] * page_stride, page_stride); } break;
+              default: {
+                  for (int f = 0; f < pfd && f < np; f++)
+                      l2_prefetch(kv + (unsigned long long)(unsigned)bt_row[f] * page_stride, page_stride);
+              } break;
+            }
+        }
+
+        int ring = 0;
+        for (int base_pi = 0; base_pi < np; base_pi += PITER, ring = (ring + 1) % PF) {
+            const int load_pi = base_pi + PF * PITER;
+            Vec32 kvv = kb[ring];
+            Vec32 vvv = vb[ring];
+            if (load_pi < np) {
+                kb[ring] = ldg256_ef(row_ptr(load_pi));
+                vb[ring] = ldg256_ef(row_ptr(load_pi) + D);
+            }
+            if (PREF && threadIdx.x == 0 && base_pi + pfd < np) {
+                const unsigned blk = (unsigned)bt_row[base_pi + pfd];
+                l2_prefetch(kv + (unsigned long long)blk * page_stride, page_stride);
+            }
+
+            const int tt = (p0 + base_pi + pg_off) * 16 + my_tok;
+            const bool live = (base_pi + pg_off) < np && tt < L;
+
+            float sc[gn];
+            #pragma unroll
+            for (int g = 0; g < gn; g++) {
+                float part = 0.f;
+                #pragma unroll
+                for (int iw = 0; iw < 8; iw++) {
+                    float2 kk = unpack2(kvv.w[iw]);
+                    float2 qq = unpack2(qv[g].w[iw]);
+                    part = fmaf(qq.x, kk.x, part);
+                    part = fmaf(qq.y, kk.y, part);
+                }
+                // butterfly within this row's lanes (ROW_LANES consecutive lanes)
+                bfly1(part, 1); bfly1(part, 2);
+                if (ROW_LANES == 8) bfly1(part, 4);
+                sc[g] = live ? part * qk_scale : -INFINITY;
+            }
+
+            #pragma unroll
+            for (int g = 0; g < gn; g++) {
+                float m_new = fmaxf(m[g], sc[g]);
+                float c = (m[g] == m_new) ? 1.f : exp2f(m[g] - m_new);
+                float pw = (sc[g] == -INFINITY) ? 0.f : exp2f(sc[g] - m_new);
+                l[g] = l[g] * c + pw;
+                #pragma unroll
+                for (int iw = 0; iw < 8; iw++) {
+                    float2 vv = unpack2(vvv.w[iw]);
+                    acc[g][iw * 2 + 0] = acc[g][iw * 2 + 0] * c + pw * vv.x;
+                    acc[g][iw * 2 + 1] = acc[g][iw * 2 + 1] * c + pw * vv.y;
+                }
+                m[g] = m_new;
+            }
+        }
+    }
+
+    // ---- merge token streams within warp over shfl: streams are ROW_LANES-lane
+    // groups at stride ROW_LANES: partner lanes are (lane ^ (ROW_LANES * k)) for k in {1,2,4,8,16}/{ROW_LANES}.
+    constexpr int NST = 32 / ROW_LANES;   // streams per warp: 4 | 8
+    #pragma unroll
+    for (int g = 0; g < gn; g++) {
+        #pragma unroll
+        for (int step = 1; step < NST; step <<= 1) {
+            int off = step * ROW_LANES;
+            float m2 = __shfl_xor_sync(0xffffffffu, m[g], off);
+            float l2 = __shfl_xor_sync(0xffffffffu, l[g], off);
+            float acc2[EPL];
+            #pragma unroll
+            for (int e = 0; e < EPL; e++) acc2[e] = __shfl_xor_sync(0xffffffffu, acc[g][e], off);
+            float M = fmaxf(m[g], m2);
+            float c1 = (m[g] == M) ? 1.f : exp2f(m[g] - M);
+            float c2 = (m2 == M) ? 1.f : exp2f(m2 - M);
+            l[g] = l[g] * c1 + l2 * c2;
+            #pragma unroll
+            for (int e = 0; e < EPL; e++) acc[g][e] = acc[g][e] * c1 + acc2[e] * c2;
+            m[g] = M;
+        }
+    }
+
+    // ---- merge across warps via shared ----
+    #pragma unroll
+    for (int g = 0; g < gn; g++) {
+        if (rl == 0) { sh_ml[warp][g][0] = m[g]; sh_ml[warp][g][1] = l[g]; }
+        #pragma unroll
+        for (int e = 0; e < EPL; e++) {
+            // lanes with same rl hold the same dims across streams; after the tree
+            // merge every lane has the full warp sum for its dims.
+            sh_acc[warp][g][rl * EPL + e] = acc[g][e];
+        }
+    }
+    __syncthreads();
+
+    if (S == 1) {
+        // single split: this CTA is the whole (b,gv) unit -> normalized output directly
+        for (int i = threadIdx.x; i < gn * D; i += blockDim.x) {
+            int g = i / D;
+            float M = -INFINITY;
+            #pragma unroll
+            for (int w = 0; w < 4; w++) M = fmaxf(M, sh_ml[w][g][0]);
+            float num = 0.f, den = 0.f;
+            #pragma unroll
+            for (int w = 0; w < 4; w++) {
+                float m_w = sh_ml[w][g][0];
+                float c = (M == -INFINITY) ? 0.f : exp2f(m_w - M);
+                num += c * sh_acc[w][g][i - g * D];
+                den += c * sh_ml[w][g][1];
+            }
+            float o = (den > 0.f) ? num / den : 0.f;
+            out[((long)b * H + g0 + g) * D + (i - g * D)] = __float2bfloat16(o);
+        }
+        return;
+    }
+    for (int i = threadIdx.x; i < gn * D; i += blockDim.x) {
+        int g = i / D;
+        float M = -INFINITY;
+        #pragma unroll
+        for (int w = 0; w < 4; w++) M = fmaxf(M, sh_ml[w][g][0]);
+        float num = 0.f, den = 0.f;
+        #pragma unroll
+        for (int w = 0; w < 4; w++) {
+            float m_w = sh_ml[w][g][0];
+            float c = (M == -INFINITY) ? 0.f : exp2f(m_w - M);
+            num += c * sh_acc[w][g][i - g * D];
+            den += c * sh_ml[w][g][1];
+        }
+        acc_out[i] = num;
+        if (i - g * D == 0) { ml_out[g * 2 + 0] = M; ml_out[g * 2 + 1] = den; }
+    }
+}
+
+// ================= kernel 2 =================
+template <int D, int GS>
+__global__ __launch_bounds__(256) void paged_reduce(
+    const float* __restrict__ part_acc,
+    const float* __restrict__ part_ml,
+    __nv_bfloat16* __restrict__ out,
+    int H, int NGRP, int G, int S)
+{
+    constexpr int gn = GS;
+    const int b = blockIdx.y;
+    const int gv = blockIdx.x;
+    const int g0 = gv * GS;
+
+    extern __shared__ float wsm[];
+    float* shM = wsm + S * gn;
+    float* shDen = shM + gn;
+    const long ml_base = ((long)b * NGRP + gv) * S * gn * 2;
+    const long acc_base = ((long)b * NGRP + gv) * S * gn * D;
+
+    for (int idx = threadIdx.x; idx < S * gn; idx += blockDim.x) wsm[idx] = part_ml[ml_base + idx * 2];
+    __syncthreads();
+    if (threadIdx.x < gn) {
+        float M = -INFINITY;
+        for (int ss = 0; ss < S; ss++) M = fmaxf(M, wsm[ss * gn + threadIdx.x]);
+        float den = 0.f;
+        for (int ss = 0; ss < S; ss++) {
+            float w = (M == -INFINITY) ? 0.f : exp2f(wsm[ss * gn + threadIdx.x] - M);
+            wsm[ss * gn + threadIdx.x] = w;
+            den += w * part_ml[ml_base + (ss * gn + threadIdx.x) * 2 + 1];
+        }
+        shM[threadIdx.x] = M;
+        shDen[threadIdx.x] = den;
+    }
+    __syncthreads();
+    for (int i = threadIdx.x; i < gn * D; i += blockDim.x) {
+        int g = i / D, dd = i % D;
+        float num = 0.f;
+        for (int ss = 0; ss < S; ss++) num += wsm[ss * gn + g] * part_acc[acc_base + (ss * gn + g) * D + dd];
+        float den = shDen[g];
+        float o = (den > 0.f) ? num / den : 0.f;
+        out[((long)b * H + g0 + g) * D + dd] = __float2bfloat16(o);
+    }
+}
+
+static inline int cdiv(int a, int b) { return (a + b - 1) / b; }
+
+torch::Tensor paged_forward(torch::Tensor q, torch::Tensor kv, torch::Tensor block_table,
+                            torch::Tensor seq_lens, torch::Tensor part_acc, torch::Tensor part_ml,
+                            int64_t target_ctas, int64_t pf_req, int64_t forced_gs, int64_t pfd_req) {
+    const bool use_prefetch = (kv.numel() * kv.element_size()) <= (64LL << 20);
+    auto qc = q.contiguous();
+    auto kvc = kv.contiguous();
+    auto btc = (block_table.scalar_type() == at::kInt) ? block_table : block_table.to(at::kInt);
+    auto slc = (seq_lens.scalar_type() == at::kInt) ? seq_lens : seq_lens.to(at::kInt);
+    slc = slc.contiguous();
+    const int B = q.size(0), H = q.size(1), D = q.size(2);
+    const int Hkv = kv.size(2);
+    const int P = kv.size(1);
+    TORCH_CHECK(P == 16 && (D == 64 || D == 128) && kv.size(3) == 2 * D && H % Hkv == 0);
+    const int G = H / Hkv;
+    const int max_blocks = btc.size(1);
+    const float qk_scale = (float)(1.0 / std::sqrt((double)D)) * LOG2E;
+
+    auto out = at::empty({B, H, D}, q.options());
+
+    int GS = (G % 4 == 0) ? 4 : ((G % 2 == 0) ? 2 : 1);
+    if (G < 4) GS = G;
+    if (forced_gs > 0 && G % forced_gs == 0 && (forced_gs == 1 || forced_gs == 2 || forced_gs == 4)) GS = (int)forced_gs;
+    const int NGRP = H / GS;
+
+    int s_des = (int)std::max<long>(1, target_ctas / std::max(1, B * NGRP));
+    s_des = std::min(s_des, max_blocks);
+    int pps = cdiv(max_blocks, s_des);
+    pps = std::max(pps, cdiv(max_blocks, 64));
+    const int S = cdiv(max_blocks, pps);
+
+    TORCH_CHECK(part_acc.numel() >= (long)B * NGRP * S * GS * D);
+    TORCH_CHECK(part_ml.numel() >= (long)B * NGRP * S * GS * 2);
+
+    dim3 grid(S * NGRP, B);
+    const __nv_bfloat16* qp = reinterpret_cast<const __nv_bfloat16*>(qc.data_ptr());
+    const __nv_bfloat16* kvp = reinterpret_cast<const __nv_bfloat16*>(kvc.data_ptr());
+    const int* btp = btc.data_ptr<int>();
+    const int* slp = slc.data_ptr<int>();
+    float* pap = part_acc.data_ptr<float>();
+    float* pmlp = part_ml.data_ptr<float>();
+    __nv_bfloat16* op = reinterpret_cast<__nv_bfloat16*>(out.data_ptr());
+    auto stream = at::cuda::getCurrentCUDAStream();
+
+    const int pfdv = (int)pfd_req;
+    int pf = (int)pf_req;
+    #define LAUNCH(DD, GG, PF) do { \
+        if (use_prefetch) { \
+            paged_partial<DD, GG, PF, true><<<grid, 128, 0, stream>>>( \
+                qp, kvp, btp, slp, pap, pmlp, op, H, NGRP, G, S, pps, max_blocks, pfdv, qk_scale); \
+        } else { \
+            paged_partial<DD, GG, PF, false><<<grid, 128, 0, stream>>>( \
+                qp, kvp, btp, slp, pap, pmlp, op, H, NGRP, G, S, pps, max_blocks, pfdv, qk_scale); \
+        } \
+        if (S > 1) { \
+            dim3 rgrid(NGRP, B); \
+            int rsmem = (S * GG + 2 * GG) * 4; \
+            paged_reduce<DD, GG><<<rgrid, 256, rsmem, stream>>>(pap, pmlp, op, H, NGRP, G, S); \
+        } \
+    } while (0)
+    #define LAUNCH_PF(DD, GG) do { \
+        if (pf == 1) LAUNCH(DD, GG, 1); \
+        else if (pf == 3) LAUNCH(DD, GG, 3); \
+        else LAUNCH(DD, GG, 2); \
+    } while (0)
+
+    if (D == 128) {
+        if (GS == 1) LAUNCH_PF(128, 1);
+        else if (GS == 2) LAUNCH_PF(128, 2);
+        else LAUNCH_PF(128, 4);
+    } else {
+        if (GS == 1) LAUNCH_PF(64, 1);
+        else if (GS == 2) LAUNCH_PF(64, 2);
+        else LAUNCH_PF(64, 4);
+    }
+    #undef LAUNCH_PF
+    #undef LAUNCH
+    return out;
+}
+"""
+
+_CPP_SRC = r"""
+#include <torch/extension.h>
+torch::Tensor paged_forward(torch::Tensor q, torch::Tensor kv, torch::Tensor block_table,
+                            torch::Tensor seq_lens, torch::Tensor part_acc, torch::Tensor part_ml,
+                            int64_t target_ctas, int64_t pf_req, int64_t forced_gs, int64_t pfd_req);
+"""
+
+_ext = None
+
+
+def _get_ext():
+    global _ext
+    if _ext is None:
+        _ext = load_inline(
+            name="paged_attn_v5pre",
+            cpp_sources=[_CPP_SRC],
+            cuda_sources=[_CUDA_SRC],
+            functions=["paged_forward"],
+            extra_cuda_cflags=[
+                "-O3",
+                "--generate-code=arch=compute_120a,code=sm_120a",
+                "-lineinfo",
+            ],
+            verbose=False,
+        )
+    return _ext
+
+
+_get_ext()
+
+
+def _torch_fallback(query, kv_cache, block_table, seq_lens, scale):
+    B, H, D = query.shape
+    Hkv = kv_cache.shape[2]
+    G = H // Hkv
+    P = kv_cache.shape[1]
+    qf = query.float()
+    out = torch.empty(B, H, D, dtype=torch.float32, device=query.device)
+    for b in range(B):
+        L = int(seq_lens[b].item())
+        if L <= 0:
+            out[b].zero_()
+            continue
+        npages = (L + P - 1) // P
+        pages = block_table[b, :npages].long()
+        kv = kv_cache.index_select(0, pages).reshape(-1, Hkv, 2 * D)[:L]
+        k = kv[..., :D].float().repeat_interleave(G, dim=1)
+        v = kv[..., D:].float().repeat_interleave(G, dim=1)
+        scores = torch.einsum("hd,lhd->hl", qf[b], k) * scale
+        mx = scores.amax(dim=-1, keepdim=True)
+        p = torch.exp(scores - mx)
+        probs = p / p.sum(dim=-1, keepdim=True)
+        out[b] = torch.einsum("hl,lhd->hd", probs, v)
+    return out.to(query.dtype)
+
+
+class Model(nn.Module):
+    def __init__(self, batch, num_heads, num_kv_heads, head_dim, seq_len, page_size):
+        super().__init__()
+        assert num_heads % num_kv_heads == 0
+        self.batch = batch
+        self.num_heads = num_heads
+        self.num_kv_heads = num_kv_heads
+        self.head_dim = head_dim
+        self.seq_len = seq_len
+        self.page_size = page_size
+        self.group_size = num_heads // num_kv_heads
+        self.scale = 1.0 / math.sqrt(head_dim)
+        self.register_buffer("_dummy", torch.zeros(1, dtype=torch.bfloat16), persistent=False)
+        self._target_ctas = int(os.environ.get("KBH_PA_TARGET_CTAS", "752"))
+        self._pf = int(os.environ.get("KBH_PA_PF", "1"))
+        self._gs = int(os.environ.get("KBH_PA_GS", "2"))
+        self._pfd = int(os.environ.get("KBH_PA_PFD", "2"))
+        self._ws = None
+        gsz = self.group_size
+        gs_knob = 2 if gsz % 2 == 0 else 1
+        self._gs_eff = self._gs if (gsz % self._gs == 0) else gs_knob
+        self._fast = (
+            self.page_size == 16
+            and self.head_dim in (64, 128)
+            and self.group_size >= 1
+        )
+
+    def _workspace(self, B, H, device):
+        if self._ws is not None and self._ws[0].numel() >= B * H * 64 * (self.head_dim + 2):
+            return self._ws
+        part_acc = torch.empty(B * H * 64 * (self.head_dim + 2), dtype=torch.float32, device=device)
+        part_ml = torch.empty(B * H * 64 * 2, dtype=torch.float32, device=device)
+        self._ws = (part_acc, part_ml)
+        return self._ws
+
+    def forward(self, query, kv_cache, block_table, seq_lens):
+        if self._fast and query.is_cuda and query.dtype == torch.bfloat16:
+            try:
+                pa, pm = self._workspace(query.shape[0], query.shape[1], query.device)
+                return _get_ext().paged_forward(query, kv_cache, block_table, seq_lens, pa, pm,
+                                                self._target_ctas, self._pf, self._gs_eff, self._pfd)
+            except RuntimeError:
+                pass
+        return _torch_fallback(query, kv_cache, block_table, seq_lens, self.scale)
+
+    # bypass nn.Module.__call__ dispatch overhead: hooks are unused
+    __call__ = forward
+
+
+BATCH = 8
+NUM_HEADS = 32
+NUM_KV_HEADS = 8
+HEAD_DIM = 128
+SEQ_LEN = 1024
+PAGE_SIZE = 16
+
+
+def get_inputs():
+    B, H, Hkv, D, L, P = BATCH, NUM_HEADS, NUM_KV_HEADS, HEAD_DIM, SEQ_LEN, PAGE_SIZE
+    pages_per_seq = (L + P - 1) // P
+    total_pages = max(B * pages_per_seq + 8, 64)
+    query = torch.randn(B, H, D, dtype=torch.bfloat16) * 0.1
+    kv_cache = torch.randn(total_pages, P, Hkv, 2 * D, dtype=torch.bfloat16) * 0.1
+    perm = torch.randperm(total_pages)[: B * pages_per_seq].reshape(B, pages_per_seq).int()
+    block_table = perm.contiguous()
+    seq_lens = torch.full((B,), L, dtype=torch.int32)
+    return [query, kv_cache, block_table, seq_lens]
+
+
+def get_init_inputs():
+    return [BATCH, NUM_HEADS, NUM_KV_HEADS, HEAD_DIM, SEQ_LEN, PAGE_SIZE]

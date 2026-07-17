@@ -1,0 +1,675 @@
+"""Top-K MoE FFN up-projection: grouped GEMM with fused SwiGLU.
+
+per expert e:  h_e = silu(x_e @ W_gate[e]) * (x_e @ W_up[e])
+
+Implementation: custom SM120 (consumer Blackwell) grouped GEMM written with the
+CUTLASS CuTe DSL. Consumer Blackwell has no tcgen05; peak bf16 comes from
+warp-level mma.sync.m16n8k16, so the kernel is a TMA + ldmatrix + warp-MMA
+warp-specialized persistent kernel:
+
+  - persistent grid (~#SMs CTAs); flat tile list (expert, n_blk, m_blk); the
+    owning expert of each tile is found by device-side binary search over a
+    tile-count prefix tensor (variable-length grouped scheduling, no host sync)
+  - 8 MMA warps (MmaF16BF16Op 16x8k16, atom layout (4,2,1)) + 1 TMA DMA warp,
+    3-4 stage TMA->smem->ldmatrix pipeline (nvRTC-locked max 232 regs/thread)
+  - two accumulators per tile (gate, up) so the SwiGLU epilogue is elementwise
+  - A rows beyond an expert's range are loaded but never stored (row-predicated)
+
+A Triton grouped-GEMM fallback handles shapes/conditions the fast path does
+not cover (and any DSL import failure).
+"""
+from __future__ import annotations
+
+import torch
+import torch.nn as nn
+
+OP_TYPE = "grouped_gemm_swiglu"
+SUPPORTED_PRECISIONS = ["bf16"]
+
+# ---------------------------------------------------------------------------
+# Fast path: CuTe DSL SM120 grouped GEMM + fused SwiGLU
+# ---------------------------------------------------------------------------
+_DSL_OK = False
+try:
+    import cuda.bindings.driver as _cuda_drv
+    import cutlass
+    import cutlass.cute as cute
+    import cutlass.pipeline as pipeline
+    import cutlass.utils as utils
+    import cutlass.utils.hopper_helpers as sm90_utils
+    from cutlass import Boolean, Float32, Int32, const_expr
+    from cutlass.cute.nvgpu import cpasync, warp, warpgroup
+    from cutlass.pipeline import make_pipeline_state, pipeline_init_arrive, pipeline_init_wait
+    from cutlass.utils import LayoutEnum
+    from cutlass.cute.runtime import from_dlpack
+
+    _DSL_OK = True
+except Exception:  # pragma: no cover - environment without the DSL
+    _DSL_OK = False
+
+
+if _DSL_OK:
+
+    class MoeUpSwigluSm120:
+        def __init__(self, tile_shape_mnk=(128, 64, 64), ab_stage=3, n_fastest=False):
+            self.cta_tile_shape_mnk = tuple(tile_shape_mnk)
+            self.ab_stage = ab_stage
+            self.n_fastest = n_fastest
+            self.a_dtype = cutlass.BFloat16
+            self.b_dtype = cutlass.BFloat16
+            self.acc_dtype = Float32
+            self.d_dtype = cutlass.BFloat16
+            self.mma_inst_mnk = (16, 8, 16)
+            self.num_mma_warps = 8
+            self.num_threads_per_warp_group = 128
+            self.mma_warp_groups = self.num_mma_warps // 4
+            self.threads_per_cta = (self.mma_warp_groups + 1) * self.num_threads_per_warp_group
+            self.ab_load_warp_id = self.num_mma_warps
+            self.num_regs_load = 40
+            self.num_regs_mma = 232
+            self.buffer_align_bytes = 1024
+
+        @staticmethod
+        def _make_tiled_mma():
+            op = warp.MmaF16BF16Op(cutlass.BFloat16, Float32, (16, 8, 16))
+            tC = cute.make_layout((4, 2, 1))
+            permutation_n = cute.make_ordered_layout((8, 2, 2), order=(0, 2, 1))
+            permutation_mnk = (64, permutation_n, 16)
+            return cute.make_tiled_mma(op, tC, permutation_mnk=permutation_mnk)
+
+        @cute.jit
+        def __call__(
+            self,
+            mA: cute.Tensor,      # (T_perm, H) bf16, k-major
+            mBg: cute.Tensor,     # (N, K, E) bf16, n-major
+            mBu: cute.Tensor,     # (N, K, E) bf16, n-major
+            mD: cute.Tensor,      # (T_perm, N) bf16, n-major output
+            mOff: cute.Tensor,    # (E+1,) int32 device
+            mPref: cute.Tensor,   # (E+1,) int32 device
+            num_ctas: Int32,
+            stream: _cuda_drv.CUstream,
+        ):
+            tile_m, tile_n, tile_k = self.cta_tile_shape_mnk
+            self.tiled_mma = self._make_tiled_mma()
+            a_smem_layout_atom = warpgroup.make_smem_layout_atom(
+                sm90_utils.get_smem_layout_atom(LayoutEnum.ROW_MAJOR, self.a_dtype, tile_k),
+                self.a_dtype,
+            )
+            a_smem_layout_staged = cute.tile_to_shape(
+                a_smem_layout_atom, (tile_m, tile_k, self.ab_stage), order=(0, 1, 2)
+            )
+            b_smem_layout_atom = warpgroup.make_smem_layout_atom(
+                sm90_utils.get_smem_layout_atom(LayoutEnum.COL_MAJOR, self.b_dtype, tile_n),
+                self.b_dtype,
+            )
+            b_smem_layout_staged = cute.tile_to_shape(
+                b_smem_layout_atom, (tile_n, tile_k, self.ab_stage), order=(1, 0, 2)
+            )
+            a_smem_layout = cute.slice_(a_smem_layout_staged, (None, None, 0))
+            b_smem_layout = cute.slice_(b_smem_layout_staged, (None, None, 0))
+
+            tma_op = cpasync.CopyBulkTensorTileG2SOp()
+            tma_atom_a, tma_tensor_a = cpasync.make_tiled_tma_atom(
+                tma_op, mA, a_smem_layout, (tile_m, tile_k)
+            )
+            tma_atom_bg, tma_tensor_bg = cpasync.make_tiled_tma_atom(
+                tma_op, mBg, b_smem_layout, (tile_n, tile_k)
+            )
+            tma_atom_bu, tma_tensor_bu = cpasync.make_tiled_tma_atom(
+                tma_op, mBu, b_smem_layout, (tile_n, tile_k)
+            )
+            a_bytes = cute.size_in_bytes(self.a_dtype, a_smem_layout)
+            b_bytes = cute.size_in_bytes(self.b_dtype, b_smem_layout)
+            self.num_tma_load_bytes = a_bytes + 2 * b_bytes
+
+            @cute.struct
+            class SharedStorage:
+                sA: cute.struct.Align[
+                    cute.struct.MemRange[self.a_dtype, cute.cosize(a_smem_layout_staged)],
+                    self.buffer_align_bytes,
+                ]
+                sBg: cute.struct.Align[
+                    cute.struct.MemRange[self.b_dtype, cute.cosize(b_smem_layout_staged)],
+                    self.buffer_align_bytes,
+                ]
+                sBu: cute.struct.Align[
+                    cute.struct.MemRange[self.b_dtype, cute.cosize(b_smem_layout_staged)],
+                    self.buffer_align_bytes,
+                ]
+                ab_mbar: cute.struct.MemRange[cutlass.Int64, self.ab_stage * 2]
+
+            self.shared_storage = SharedStorage
+
+            self.prefix_kernel(
+                mOff, mPref, Int32(tile_m),
+                cute.ceil_div(cute.size(mD, mode=[1]), tile_n),
+            ).launch(grid=(1, 1, 1), block=(32, 1, 1), stream=stream)
+
+            self.kernel(
+                self.tiled_mma,
+                tma_atom_a, tma_tensor_a,
+                tma_atom_bg, tma_tensor_bg,
+                tma_atom_bu, tma_tensor_bu,
+                mD, mOff, mPref,
+                a_smem_layout_staged,
+                b_smem_layout_staged,
+            ).launch(
+                grid=(num_ctas, 1, 1),
+                block=[self.threads_per_cta, 1, 1],
+                stream=stream,
+                min_blocks_per_mp=1,
+            )
+
+        @cute.kernel
+        def prefix_kernel(self, mOff: cute.Tensor, mPref: cute.Tensor, tile_m: Int32, n_blocks_all: Int32):
+            tidx, _, _ = cute.arch.thread_idx()
+            num_experts = cute.size(mOff, mode=[0]) - 1
+            if tidx == 0:
+                s = Int32(0)
+                mPref[0] = 0
+                for i in cutlass.range(num_experts, unroll=1):
+                    a = mOff[i]
+                    b = mOff[i + 1]
+                    s += cute.ceil_div(b - a, tile_m) * n_blocks_all
+                    mPref[i + 1] = s
+
+        @cute.kernel
+        def kernel(
+            self,
+            tiled_mma: cute.TiledMma,
+            tma_atom_a: cute.CopyAtom,
+            mA_mk: cute.Tensor,
+            tma_atom_bg: cute.CopyAtom,
+            mBg_e: cute.Tensor,
+            tma_atom_bu: cute.CopyAtom,
+            mBu_e: cute.Tensor,
+            mD: cute.Tensor,
+            mOff: cute.Tensor,
+            mPref: cute.Tensor,
+            a_smem_layout_staged: cute.ComposedLayout,
+            b_smem_layout_staged: cute.ComposedLayout,
+        ):
+            warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
+
+            if warp_idx == self.ab_load_warp_id:
+                cpasync.prefetch_descriptor(tma_atom_a)
+                cpasync.prefetch_descriptor(tma_atom_bg)
+                cpasync.prefetch_descriptor(tma_atom_bu)
+
+            smem = utils.SmemAllocator()
+            storage = smem.allocate(self.shared_storage)
+
+            ab_pipeline = pipeline.PipelineTmaAsync.create(
+                num_stages=self.ab_stage,
+                producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, 1),
+                consumer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, self.num_mma_warps),
+                tx_count=self.num_tma_load_bytes,
+                barrier_storage=storage.ab_mbar.data_ptr(),
+                cta_layout_vmnk=cute.make_layout((1, 1, 1, 1)),
+                defer_sync=True,
+            )
+
+            pipeline_init_arrive(cluster_shape_mn=(1, 1), is_relaxed=True)
+
+            sA = storage.sA.get_tensor(a_smem_layout_staged.outer, swizzle=a_smem_layout_staged.inner)
+            sBg = storage.sBg.get_tensor(b_smem_layout_staged.outer, swizzle=b_smem_layout_staged.inner)
+            sBu = storage.sBu.get_tensor(b_smem_layout_staged.outer, swizzle=b_smem_layout_staged.inner)
+
+            tile_m, tile_n, tile_k = self.cta_tile_shape_mnk
+            n_blocks = cute.ceil_div(cute.size(mD, mode=[1]), tile_n)
+            num_experts = cute.size(mOff, mode=[0]) - 1
+            total_work = mPref[num_experts]
+            bid = cute.arch.block_idx()[0]
+            num_ctas = cute.arch.grid_dim()[0]
+
+            pipeline_init_wait(cluster_shape_mn=(1, 1))
+
+            # ---------------------------- DMA warp ----------------------------
+            if warp_idx >= self.ab_load_warp_id:
+                cute.arch.setmaxregister_decrease(self.num_regs_load)
+            if warp_idx == self.ab_load_warp_id:
+                ab_producer_state = make_pipeline_state(
+                    pipeline.PipelineUserType.Producer, self.ab_stage
+                )
+                work = Int32(bid)
+                while work < total_work:
+                    e, m_blk, n_blk = self.decode_work(mOff, mPref, work, tile_m, n_blocks)
+                    row0 = mOff[e]
+                    mA_e = cute.domain_offset((row0, 0), mA_mk)
+                    gA = cute.local_tile(mA_e, (tile_m, tile_k), (m_blk, None))
+                    mBg_s = mBg_e[None, None, e]
+                    gBg = cute.local_tile(mBg_s, (tile_n, tile_k), (n_blk, None))
+                    mBu_s = mBu_e[None, None, e]
+                    gBu = cute.local_tile(mBu_s, (tile_n, tile_k), (n_blk, None))
+
+                    tAsA, tAgA = cpasync.tma_partition(
+                        tma_atom_a, 0, cute.make_layout(1),
+                        cute.group_modes(sA, 0, 2), cute.group_modes(gA, 0, 2),
+                    )
+                    tBsBg, tBgBg = cpasync.tma_partition(
+                        tma_atom_bg, 0, cute.make_layout(1),
+                        cute.group_modes(sBg, 0, 2), cute.group_modes(gBg, 0, 2),
+                    )
+                    tBsBu, tBgBu = cpasync.tma_partition(
+                        tma_atom_bu, 0, cute.make_layout(1),
+                        cute.group_modes(sBu, 0, 2), cute.group_modes(gBu, 0, 2),
+                    )
+                    len_k = cute.size(mA_e, mode=[1])
+                    k_tile_cnt = cute.ceil_div(len_k, tile_k)
+                    peek_empty_status = Boolean(True)
+                    if 0 < k_tile_cnt:
+                        peek_empty_status = ab_pipeline.producer_try_acquire(ab_producer_state)
+                    for k_tile in cutlass.range(k_tile_cnt, unroll=1):
+                        ab_pipeline.producer_acquire(ab_producer_state, peek_empty_status)
+                        tma_bar_ptr = ab_pipeline.producer_get_barrier(ab_producer_state)
+                        smem_idx = ab_producer_state.index
+                        cute.copy(tma_atom_a, tAgA[None, k_tile], tAsA[None, smem_idx], tma_bar_ptr=tma_bar_ptr)
+                        cute.copy(tma_atom_bg, tBgBg[None, k_tile], tBsBg[None, smem_idx], tma_bar_ptr=tma_bar_ptr)
+                        cute.copy(tma_atom_bu, tBgBu[None, k_tile], tBsBu[None, smem_idx], tma_bar_ptr=tma_bar_ptr)
+                        ab_pipeline.producer_commit(ab_producer_state)
+                        ab_producer_state.advance()
+                        peek_empty_status = Boolean(True)
+                        if k_tile + 1 < k_tile_cnt:
+                            peek_empty_status = ab_pipeline.producer_try_acquire(ab_producer_state)
+                    work += num_ctas
+                ab_pipeline.producer_tail(ab_producer_state)
+
+            # ---------------------------- MMA warps ----------------------------
+            if warp_idx < self.num_mma_warps:
+                cute.arch.setmaxregister_increase(self.num_regs_mma)
+                tidx, _, _ = cute.arch.thread_idx()
+
+                atom_copy_ldmatrix_A = cute.make_copy_atom(
+                    warp.LdMatrix8x8x16bOp(False, 4), self.a_dtype
+                )
+                atom_copy_ldmatrix_B = cute.make_copy_atom(
+                    warp.LdMatrix8x8x16bOp(True, 4), self.b_dtype
+                )
+                smem_tiled_copy_A = cute.make_tiled_copy_A(atom_copy_ldmatrix_A, tiled_mma)
+                smem_tiled_copy_B = cute.make_tiled_copy_B(atom_copy_ldmatrix_B, tiled_mma)
+                thr_copy_ldmatrix_A = smem_tiled_copy_A.get_slice(tidx)
+                thr_copy_ldmatrix_B = smem_tiled_copy_B.get_slice(tidx)
+                tCsA_copy_view = thr_copy_ldmatrix_A.partition_S(sA)
+                tCsBg_copy_view = thr_copy_ldmatrix_B.partition_S(sBg)
+                tCsBu_copy_view = thr_copy_ldmatrix_B.partition_S(sBu)
+
+                thr_mma = tiled_mma.get_slice(tidx)
+                acc_g = cute.make_rmem_tensor(thr_mma.partition_shape_C((tile_m, tile_n)), Float32)
+                acc_u = cute.make_rmem_tensor(thr_mma.partition_shape_C((tile_m, tile_n)), Float32)
+                tCsA = thr_mma.partition_A(sA)
+                tCsBg = thr_mma.partition_B(sBg)
+                tCsBu = thr_mma.partition_B(sBu)
+                tCrA = thr_mma.make_fragment_A(tCsA[None, None, None, 0])
+                tCrBg = thr_mma.make_fragment_B(tCsBg[None, None, None, 0])
+                tCrBu = thr_mma.make_fragment_B(tCsBu[None, None, None, 0])
+                tCrA_copy_view = smem_tiled_copy_A.retile(tCrA)
+                tCrBg_copy_view = smem_tiled_copy_B.retile(tCrBg)
+                tCrBu_copy_view = smem_tiled_copy_B.retile(tCrBu)
+                num_k_blocks = cute.size(tCrA, mode=[2])
+
+                ab_read_state = make_pipeline_state(
+                    pipeline.PipelineUserType.Consumer, self.ab_stage
+                )
+                work = Int32(bid)
+                while work < total_work:
+                    e, m_blk, n_blk = self.decode_work(mOff, mPref, work, tile_m, n_blocks)
+                    row0 = mOff[e]
+                    row1 = mOff[e + 1]
+                    len_k = cute.size(mA_mk, mode=[1])
+                    k_tile_cnt = cute.ceil_div(len_k, tile_k)
+
+                    acc_g.fill(0.0)
+                    acc_u.fill(0.0)
+
+                    peek_ab_full_status = Boolean(True)
+                    if 0 < k_tile_cnt:
+                        peek_ab_full_status = ab_pipeline.consumer_try_wait(ab_read_state)
+                    ab_pipeline.consumer_wait(ab_read_state, peek_ab_full_status)
+                    tCsA_p = tCsA_copy_view[None, None, None, ab_read_state.index]
+                    tCsBg_p = tCsBg_copy_view[None, None, None, ab_read_state.index]
+                    tCsBu_p = tCsBu_copy_view[None, None, None, ab_read_state.index]
+                    cute.copy(smem_tiled_copy_A, tCsA_p[None, None, 0], tCrA_copy_view[None, None, 0])
+                    cute.copy(smem_tiled_copy_B, tCsBg_p[None, None, 0], tCrBg_copy_view[None, None, 0])
+                    cute.copy(smem_tiled_copy_B, tCsBu_p[None, None, 0], tCrBu_copy_view[None, None, 0])
+
+                    for k_tile in cutlass.range(k_tile_cnt - 1, unroll=1):
+                        for k in cutlass.range_constexpr(num_k_blocks):
+                            k_next = 0 if k + 1 == num_k_blocks else k + 1
+                            if const_expr(k == num_k_blocks - 1):
+                                cute.arch.fence_view_async_shared()
+                                cute.arch.sync_warp()
+                                ab_pipeline.consumer_release(ab_read_state)
+                                ab_read_state.advance()
+                                peek_ab_full_status = ab_pipeline.consumer_try_wait(ab_read_state)
+                                tCsA_p = tCsA_copy_view[None, None, None, ab_read_state.index]
+                                tCsBg_p = tCsBg_copy_view[None, None, None, ab_read_state.index]
+                                tCsBu_p = tCsBu_copy_view[None, None, None, ab_read_state.index]
+                                ab_pipeline.consumer_wait(ab_read_state, peek_ab_full_status)
+                            cute.copy(smem_tiled_copy_A, tCsA_p[None, None, k_next], tCrA_copy_view[None, None, k_next])
+                            cute.copy(smem_tiled_copy_B, tCsBg_p[None, None, k_next], tCrBg_copy_view[None, None, k_next])
+                            cute.copy(smem_tiled_copy_B, tCsBu_p[None, None, k_next], tCrBu_copy_view[None, None, k_next])
+                            cute.gemm(tiled_mma, acc_g, tCrA[None, None, k], tCrBg[None, None, k], acc_g)
+                            cute.gemm(tiled_mma, acc_u, tCrA[None, None, k], tCrBu[None, None, k], acc_u)
+
+                    # last k-tile (drain)
+                    if 0 < k_tile_cnt:
+                        for k in cutlass.range_constexpr(num_k_blocks):
+                            k_next = 0 if k + 1 == num_k_blocks else k + 1
+                            if const_expr(k == num_k_blocks - 1):
+                                cute.arch.fence_view_async_shared()
+                                cute.arch.sync_warp()
+                                ab_pipeline.consumer_release(ab_read_state)
+                                ab_read_state.advance()
+                            if const_expr(k_next > 0):
+                                cute.copy(smem_tiled_copy_A, tCsA_p[None, None, k_next], tCrA_copy_view[None, None, k_next])
+                                cute.copy(smem_tiled_copy_B, tCsBg_p[None, None, k_next], tCrBg_copy_view[None, None, k_next])
+                                cute.copy(smem_tiled_copy_B, tCsBu_p[None, None, k_next], tCrBu_copy_view[None, None, k_next])
+                            cute.gemm(tiled_mma, acc_g, tCrA[None, None, k], tCrBg[None, None, k], acc_g)
+                            cute.gemm(tiled_mma, acc_u, tCrA[None, None, k], tCrBu[None, None, k], acc_u)
+
+                    # ---- SwiGLU epilogue with row predication ----
+                    mD_e = cute.domain_offset((row0, 0), mD)
+                    gD = cute.local_tile(mD_e, (tile_m, tile_n), (m_blk, n_blk))
+                    tCgD = thr_mma.partition_C(gD)
+                    cD = cute.make_identity_tensor((tile_m, tile_n))
+                    tCcD = thr_mma.partition_C(cD)
+                    rows_valid = row1 - (row0 + m_blk * tile_m)
+
+                    full_tile = rows_valid >= tile_m
+                    tCrD = cute.make_rmem_tensor(
+                        thr_mma.partition_shape_C((tile_m, tile_n)), self.d_dtype
+                    )
+                    for i in cutlass.range_constexpr(cute.size(acc_g)):
+                        g = acc_g[i]
+                        u = acc_u[i]
+                        s = g / (1.0 + cute.arch.exp(-g))
+                        tCrD[i] = cutlass.BFloat16(s * u)
+                    if full_tile:
+                        # packed bf16x2 stores (pairs are adjacent in val order)
+                        tCrD32 = cute.recast_tensor(tCrD, cutlass.Int32)
+                        tCgD32 = cute.recast_tensor(tCgD, cutlass.Int32)
+                        for j in cutlass.range_constexpr(cute.size(tCgD32)):
+                            tCgD32[j] = tCrD32[j]
+                    else:
+                        for i in cutlass.range_constexpr(cute.size(tCgD)):
+                            if tCcD[i][0] < rows_valid:
+                                tCgD[i] = tCrD[i]
+                    work += num_ctas
+
+        @cute.jit
+        def decode_work(self, mOff, mPref, work: Int32, tile_m: int, n_blocks: Int32):
+            # binary search expert e with pref[e] <= work < pref[e+1]
+            num_experts = cute.size(mPref, mode=[0]) - 1
+            lo = Int32(0)
+            hi = Int32(num_experts)
+            while lo + 1 < hi:
+                mid = (lo + hi) // 2
+                v = mPref[mid]
+                if v <= work:
+                    lo = mid
+                else:
+                    hi = mid
+            e = lo
+            base = mPref[e]
+            local = work - base
+            cnt = mOff[e + 1] - mOff[e]
+            mtiles = cute.ceil_div(cnt, tile_m)
+            n_blk = Int32(0)
+            m_blk = Int32(0)
+            if const_expr(self.n_fastest):
+                n_blk = local % n_blocks
+                m_blk = local // n_blocks
+            else:
+                n_blk = local // mtiles
+                m_blk = local % mtiles
+            return e, m_blk, n_blk
+
+
+_dsl_plan_cache: dict = {}
+
+
+class _DslPlan:
+    """Compiled kernel + cached cute-tensor wrappers for one (E, H, I, config).
+
+    Weight wrappers are built once (parameter storage does not move; stress
+    cases mutate values in-place via copy_, which keeps the same pointer, so
+    re-wrapping per call is unnecessary). Activation / output wrappers are
+    rebuilt whenever their data pointer changes.
+    """
+
+    def __init__(self, model, dev, cfg):
+        E, I = model.E, model.I
+        BM, BN, BK, ST, n_fastest = cfg
+        self.cfg = cfg
+        self.E = E
+        self.sm_count = torch.cuda.get_device_properties(dev).multi_processor_count
+        moe = MoeUpSwigluSm120(tile_shape_mnk=(BM, BN, BK), ab_stage=ST, n_fastest=n_fastest)
+        self.mBg = from_dlpack(
+            model.W_gate.detach().permute(2, 1, 0), assumed_align=16
+        ).mark_layout_dynamic(leading_dim=0)
+        self.mBu = from_dlpack(
+            model.W_up.detach().permute(2, 1, 0), assumed_align=16
+        ).mark_layout_dynamic(leading_dim=0)
+        self.pref = torch.zeros(E + 1, dtype=torch.int32, device=dev)
+        self.mPref = from_dlpack(self.pref, assumed_align=4)
+        # compile now (uses model's actual buffers as prototypes)
+        stream = _cuda_drv.CUstream(torch.cuda.current_stream(dev).cuda_stream)
+        self.stream = stream
+        mA = from_dlpack(torch.empty(1, model.H, dtype=torch.bfloat16, device=dev), assumed_align=16).mark_layout_dynamic(leading_dim=1)
+        mD = from_dlpack(torch.empty(1, I, dtype=torch.bfloat16, device=dev), assumed_align=16).mark_layout_dynamic(leading_dim=1)
+        mOff = from_dlpack(self.pref, assumed_align=4)
+        self.compiled = cute.compile(
+            moe, mA, self.mBg, self.mBu, mD, mOff, self.mPref,
+            cutlass.Int32(self.sm_count), stream,
+        )
+
+    def _wrap(self, t, leading_dim):
+        return from_dlpack(t, assumed_align=16).mark_layout_dynamic(leading_dim=leading_dim)
+
+    def run(self, hidden_states, expert_offsets, out):
+        mA = self._wrap(hidden_states, 1)
+        mD = self._wrap(out, 1)
+        mOff = from_dlpack(expert_offsets, assumed_align=4)
+        self.compiled(
+            mA, self.mBg, self.mBu, mD, mOff, self.mPref,
+            cutlass.Int32(self.sm_count), self.stream,
+        )
+        return out
+
+
+def _pick_cfg(T_total, H, I, E, K):
+    # (BM, BN, BK, ST, n_fastest) — tuned on RTX PRO 6000 in quiet conditions
+    exact = {
+        (32768, 4096, 1536, 128, 8): (256, 64, 64, 2, False),
+        (4096, 2048, 1024, 64, 4): (128, 64, 64, 3, False),
+        (16384, 2048, 4096, 64, 8): (256, 64, 64, 2, False),
+    }
+    cfg = exact.get((T_total, H, I, E, K))
+    if cfg is not None:
+        return cfg
+    # heuristic fallback
+    if T_total * K >= 65536 and H >= 64:
+        return (256, 64, 64, 2, False)
+    return (128, 64, 64, 3, False)
+
+
+def _dsl_forward(self, hidden_states, expert_offsets, model_shape):
+    T_total, H, I, E, K = model_shape  # noqa: E741
+    dev = hidden_states.device
+    T_perm, _ = hidden_states.shape
+    out = torch.empty(T_perm, I, dtype=torch.bfloat16, device=dev)
+    cfg = _pick_cfg(T_total, H, I, E, K)
+    cfg_key = (
+        dev.index, E, H, I,
+        self.W_gate.data_ptr(), self.W_up.data_ptr(),
+    ) + cfg
+    plan = _dsl_plan_cache.get(cfg_key)
+    if plan is None:
+        plan = _DslPlan(self, dev, cfg)
+        _dsl_plan_cache[cfg_key] = plan
+    return plan.run(hidden_states, expert_offsets, out)
+
+
+# ---------------------------------------------------------------------------
+# Fallback path: Triton grouped GEMM + fused SwiGLU (robust for odd shapes)
+# ---------------------------------------------------------------------------
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def _tile_prefix_kernel(off_ptr, pref_ptr, E: tl.constexpr, BM: tl.constexpr, NB: tl.constexpr):
+    # single-program serial scan: pref[e] = sum_{i<e} ceil(cnt_i/BM)*NB
+    s = 0
+    tl.store(pref_ptr, 0)
+    for i in range(E):
+        a = tl.load(off_ptr + i)
+        b = tl.load(off_ptr + i + 1)
+        s += (b - a + BM - 1) // BM * NB
+        tl.store(pref_ptr + i + 1, s)
+
+
+@triton.jit
+def _moe_up_silu_kernel(
+    a_ptr, off_ptr, pref_ptr, wg_ptr, wu_ptr, c_ptr,
+    T_perm,
+    H: tl.constexpr, I: tl.constexpr, E: tl.constexpr,
+    BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr,
+):
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    total = tl.load(pref_ptr + E)
+    if pid_m >= total:
+        return
+    lo = 0
+    hi = E
+    while lo + 1 < hi:
+        mid = (lo + hi) // 2
+        v = tl.load(pref_ptr + mid)
+        if v <= pid_m:
+            lo = mid
+        else:
+            hi = mid
+    e = lo
+    tile_base = tl.load(pref_ptr + e)
+    row_start = tl.load(off_ptr + e)
+    row_end = tl.load(off_ptr + e + 1)
+    m_blk = pid_m - tile_base
+    offs_m = row_start + m_blk * BM + tl.arange(0, BM)
+    mask_m = offs_m < row_end
+    offs_n = pid_n * BN + tl.arange(0, BN)
+    mask_n = offs_n < I
+    offs_k = tl.arange(0, BK)
+    a_ptrs = a_ptr + offs_m[:, None] * H + offs_k[None, :]
+    w_base = e.to(tl.int64) * H * I
+    wg_ptrs = wg_ptr + w_base + offs_k[:, None] * I + offs_n[None, :]
+    wu_ptrs = wu_ptr + w_base + offs_k[:, None] * I + offs_n[None, :]
+    acc_g = tl.zeros((BM, BN), dtype=tl.float32)
+    acc_u = tl.zeros((BM, BN), dtype=tl.float32)
+    for _k in range(0, H, BK):
+        a = tl.load(a_ptrs, mask=mask_m[:, None], other=0.0)
+        wg = tl.load(wg_ptrs, mask=mask_n[None, :], other=0.0)
+        wu = tl.load(wu_ptrs, mask=mask_n[None, :], other=0.0)
+        acc_g = tl.dot(a, wg, acc_g)
+        acc_u = tl.dot(a, wu, acc_u)
+        a_ptrs += BK
+        wg_ptrs += BK * I
+        wu_ptrs += BK * I
+    out = acc_g * tl.sigmoid(acc_g) * acc_u
+    c_ptrs = c_ptr + offs_m[:, None] * I + offs_n[None, :]
+    tl.store(c_ptrs, out.to(tl.bfloat16), mask=mask_m[:, None] & mask_n[None, :])
+
+
+def _triton_forward(self, hidden_states, expert_offsets):
+    T_perm, H = hidden_states.shape
+    E, I = self.E, self.I
+    dev = hidden_states.device
+    out = torch.empty(T_perm, I, dtype=torch.bfloat16, device=dev)
+    BM, BN, BK = 128, 128, 64
+    offs64 = expert_offsets.to(torch.int64)
+    counts = (offs64[1:] - offs64[:-1] + (BM - 1)) // BM
+    pref = torch.zeros(E + 1, dtype=torch.int32, device=dev)
+    pref[1:] = torch.cumsum(counts, dim=0).to(torch.int32)
+    max_tiles = (T_perm + BM - 1) // BM + E
+    grid = (max_tiles, (I + BN - 1) // BN)
+    _moe_up_silu_kernel[grid](
+        hidden_states, expert_offsets, pref, self.W_gate, self.W_up, out,
+        T_perm, H=H, I=I, E=E, BM=BM, BN=BN, BK=BK,
+        num_warps=8, num_stages=3,
+    )
+    return out
+
+
+class Model(nn.Module):
+    def __init__(self, T_total: int, H: int, I: int, E: int, K: int):  # noqa: E741
+        super().__init__()
+        self.T_total = T_total
+        self.H = H
+        self.I = I
+        self.E = E
+        self.K = K
+        self.W_gate = nn.Parameter(torch.empty(E, H, I, dtype=torch.bfloat16))
+        self.W_up = nn.Parameter(torch.empty(E, H, I, dtype=torch.bfloat16))
+        nn.init.normal_(self.W_gate, std=0.02)
+        nn.init.normal_(self.W_up, std=0.02)
+
+    def _fast_ok(self, hidden_states) -> bool:
+        H, I = self.H, self.I
+        return (
+            _DSL_OK
+            and hidden_states.dtype == torch.bfloat16
+            and hidden_states.stride(1) == 1
+            and H % 64 == 0
+            and I % 64 == 0
+            and self.E >= 1
+        )
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,   # (T_perm, H) bf16
+        expert_offsets: torch.Tensor,  # (E+1,) int32
+    ) -> torch.Tensor:
+        if hidden_states.dtype != torch.bfloat16:
+            hidden_states = hidden_states.bfloat16()
+        if not hidden_states.is_contiguous():
+            hidden_states = hidden_states.contiguous()
+        expert_offsets = expert_offsets.contiguous().to(torch.int32).contiguous()
+        if self._fast_ok(hidden_states) and hidden_states.shape[0] > 0:
+            try:
+                return _dsl_forward(
+                    self, hidden_states, expert_offsets,
+                    (self.T_total, self.H, self.I, self.E, self.K),
+                )
+            except Exception:
+                pass
+        return _triton_forward(self, hidden_states, expert_offsets)
+
+
+# Module-level shape shims rewritten by check.py / benchmark.py per shape.
+T_total = 32768
+H = 4096
+I = 1536  # noqa: E741
+E = 128
+K = 8
+
+
+def _build_routing(T_total: int, E: int, K: int, device: str = "cpu") -> torch.Tensor:
+    T_perm = T_total * K
+    base = T_perm // E
+    rem = T_perm - base * E
+    counts = torch.full((E,), base, dtype=torch.int32, device=device)
+    counts[:rem] += 1
+    offsets = torch.zeros(E + 1, dtype=torch.int32, device=device)
+    offsets[1:] = torch.cumsum(counts, dim=0)
+    return offsets
+
+
+def get_inputs():
+    T_perm = T_total * K
+    hidden_states = torch.randn(T_perm, H, dtype=torch.bfloat16) * 0.1
+    expert_offsets = _build_routing(T_total, E, K)
+    return [hidden_states, expert_offsets]
+
+
+def get_init_inputs():
+    return [T_total, H, I, E, K]

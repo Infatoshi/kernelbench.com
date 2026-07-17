@@ -1,0 +1,769 @@
+"""Custom top-k kernel for RTX PRO 6000 (SM120).
+
+Single-launch CUDA kernel:
+  - (value, index) pairs are packed into a sortable u64 key whose unsigned
+    order is exactly the reference topk(largest=True) order:
+    NaN > +inf > ... > -inf, ties by smaller index.
+  - Each warp streams float4 chunks, filters candidates against a running
+    K-th key threshold into a per-warp shared ring buffer, and drains full
+    32-candidate batches through a warp bitonic ordering network + bitonic
+    merge into a warp-distributed sorted K-list.
+  - 8 warps per block tournament-merge in shared memory.
+  - A row is optionally split across P blocks; per-block top-K lists go to a
+    small persistent workspace and the last block for the row (atomicInc
+    ticket) merges them and writes the final sorted values + int64 indices.
+"""
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+_CUDA_SRC = r"""
+// Top-K kernel v4: u64 sortable keys; per-thread register collect+sort (K<=32);
+// warp-shared ring + batched bitonic (K=64); hierarchical ticket-tree final
+// merge for multi-block rows; fast METH_FASTCALL host path.
+#include <torch/extension.h>
+#include <torch/csrc/autograd/python_variable.h>
+#include <torch/csrc/Exceptions.h>
+#include <ATen/cuda/CUDAContext.h>
+#include <c10/cuda/CUDACachingAllocator.h>
+#include <cuda_runtime.h>
+#include <math_constants.h>
+
+#define FULL_MASK 0xffffffffu
+
+typedef unsigned long long u64;
+typedef unsigned int u32;
+
+// (float value, int index) -> u64 key: unsigned order == reference topk
+// (largest=True) order: NaN > +inf > normal > -inf, ties by smaller index.
+__device__ __forceinline__ u64 make_key(float v, int i) {
+    u32 b = __float_as_uint(v);
+    b ^= (b & 0x80000000u) ? 0xFFFFFFFFu : 0x80000000u;
+    return ((u64)b << 32) | ((u32)i ^ 0xFFFFFFFFu);
+}
+// weakest possible key: -inf value, ~INT_MAX index (no real element ties it)
+#define PAD_KEY 0x007FFFFF80000000ULL
+
+__device__ __forceinline__ void key_to_pair(u64 k, float& v, int& i) {
+    u32 b = (u32)(k >> 32);
+    b = (b & 0x80000000u) ? (b ^ 0x80000000u) : ~b;
+    v = __uint_as_float(b);
+    i = (int)((u32)k ^ 0xFFFFFFFFu);
+}
+
+// register bitonic full ordering of LEN keys (desc)
+template <int LEN>
+__device__ __forceinline__ void sort_reg_desc(u64 (&r)[LEN]) {
+    #pragma unroll
+    for (int size = 2; size <= LEN; size <<= 1) {
+        #pragma unroll
+        for (int stride = size >> 1; stride > 0; stride >>= 1) {
+            #pragma unroll
+            for (int j = 0; j < LEN; ++j) {
+                const int q = j ^ stride;
+                if (q > j) {
+                    const bool desc = ((j & size) == 0);
+                    if ((r[q] > r[j]) == desc) { const u64 t = r[j]; r[j] = r[q]; r[q] = t; }
+                }
+            }
+        }
+    }
+}
+
+// per-thread collect: unsorted fill of CAP slots (+ replace-min overflow), one sort.
+// result r[0..CAP) sorted desc; slots beyond stream length are PAD_KEY.
+template <int TPB, int CAP>
+__device__ __forceinline__ void thread_collect(const float4* __restrict__ xv4,
+                                               int f4_begin, int f4_end, int row_f4,
+                                               u64 (&r)[CAP], const int tid) {
+    const int D = f4_end - f4_begin;
+    // phase 1: issue all loads (in-flight parallelism)
+    float4 fs[CAP / 4];
+    #pragma unroll
+    for (int fi = 0; fi < CAP / 4; ++fi) {
+        const int jj = tid + fi * TPB;
+        fs[fi] = (jj < D) ? xv4[f4_begin + jj] : make_float4(0.f, 0.f, 0.f, 0.f);
+    }
+    // phase 2: keys
+    #pragma unroll
+    for (int fi = 0; fi < CAP / 4; ++fi) {
+        const int jj = tid + fi * TPB;
+        const bool valid = jj < D;
+        const int eb = (f4_begin + jj) * 4 - row_f4 * 4;
+        #pragma unroll
+        for (int e = 0; e < 4; ++e) {
+            const float4 f = fs[fi];
+            const float v = (e == 0) ? f.x : (e == 1) ? f.y : (e == 2) ? f.z : f.w;
+            r[fi * 4 + e] = valid ? make_key(v, eb + e) : PAD_KEY;
+        }
+    }
+    if (tid + (CAP / 4) * TPB < D) {   // overflow exists for some lane
+        u64 rmin = r[0];
+        #pragma unroll
+        for (int j = 1; j < CAP; ++j) { if (r[j] < rmin) rmin = r[j]; }
+        for (int jj = tid + (CAP / 4) * TPB; jj < D; jj += TPB) {
+            const float4 f = xv4[f4_begin + jj];
+            const int eb = (f4_begin + jj) * 4 - row_f4 * 4;
+            #pragma unroll
+            for (int e = 0; e < 4; ++e) {
+                const float v = (e == 0) ? f.x : (e == 1) ? f.y : (e == 2) ? f.z : f.w;
+                const u64 key = make_key(v, eb + e);
+                if (key > rmin) {
+                    #pragma unroll
+                    for (int j = 0; j < CAP; ++j) { if (r[j] == rmin) { r[j] = key; rmin = 0; } }
+                    rmin = r[0];
+                    #pragma unroll
+                    for (int j = 1; j < CAP; ++j) { if (r[j] < rmin) rmin = r[j]; }
+                }
+            }
+        }
+    }
+    sort_reg_desc<CAP>(r);
+}
+
+// ---------------- warp-distributed endgame merges ----------------
+template <int K>
+__device__ __forceinline__ void clean_desc(u64& key, const int lane) {
+    #pragma unroll
+    for (int stride = K / 2; stride > 0; stride >>= 1) {
+        const u64 o = __shfl_xor_sync(FULL_MASK, key, stride);
+        const bool low = ((lane & stride) == 0);
+        if ((low ? (o > key) : (o < key))) key = o;
+    }
+}
+
+__device__ __forceinline__ void clean_desc64(u64& lo, u64& hi, const int lane) {
+    if (hi > lo) { const u64 t = lo; lo = hi; hi = t; }
+    #pragma unroll
+    for (int stride = 16; stride > 0; stride >>= 1) {
+        const bool low = ((lane & stride) == 0);
+        {
+            const u64 o = __shfl_xor_sync(FULL_MASK, lo, stride);
+            if ((low ? (o > lo) : (o < lo))) lo = o;
+        }
+        {
+            const u64 o = __shfl_xor_sync(FULL_MASK, hi, stride);
+            if ((low ? (o > hi) : (o < hi))) hi = o;
+        }
+    }
+}
+
+template <int K>
+__device__ __forceinline__ void merge_descB_into_A(u64& a0, u64& a1, u64 b0, u64 b1, const int lane) {
+    if (K == 64) {
+        if (b0 > a0) a0 = b0;
+        if (b1 > a1) a1 = b1;
+        clean_desc64(a0, a1, lane);
+    } else {
+        if (b0 > a0) a0 = b0;
+        clean_desc<K>(a0, lane);
+    }
+}
+
+template <int K>
+__device__ __forceinline__ void load_rev_B(const u64* __restrict__ bk, u64& b0, u64& b1, const int lane) {
+    b0 = PAD_KEY; b1 = PAD_KEY;
+    if (K == 64) {
+        b0 = bk[63 - lane];
+        b1 = bk[31 - lane];
+    } else if (lane < K) {
+        b0 = bk[K - 1 - lane];
+    }
+}
+
+template <int K>
+__device__ __forceinline__ void load_A(const u64* __restrict__ ak, u64& a0, u64& a1, const int lane) {
+    a0 = PAD_KEY; a1 = PAD_KEY;
+    if (lane < K) a0 = ak[lane];
+    if (K == 64) a1 = ak[32 + lane];
+}
+
+template <int K>
+__device__ __forceinline__ void store_A(u64* __restrict__ ak, u64 a0, u64 a1, const int lane) {
+    if (lane < K) ak[lane] = a0;
+    if (K == 64) ak[32 + lane] = a1;
+}
+
+// redundant intra-warp register tree on sorted desc K lists
+template <int K>
+__device__ __forceinline__ void warp_merge_lists(u64 (&r)[K], const int src_lane) {
+    #pragma unroll
+    for (int j = 0; j < K; ++j) {
+        const u64 b = __shfl_sync(FULL_MASK, r[K - 1 - j], src_lane);
+        if (b > r[j]) r[j] = b;
+    }
+    #pragma unroll
+    for (int stride = K / 2; stride > 0; stride >>= 1) {
+        #pragma unroll
+        for (int j = 0; j < K; ++j) {
+            if ((j & stride) == 0) {
+                const int t = j + stride;
+                if (r[t] > r[j]) { const u64 tmp = r[j]; r[j] = r[t]; r[t] = tmp; }
+            }
+        }
+    }
+}
+
+// workspace (global) reads must bypass L1: lines can be stale from a prior
+// kernel launch on this SM (L1 is not coherent across SMs). Writes go .cg too.
+template <int K>
+__device__ __forceinline__ void load_rev_B_g(const u64* __restrict__ bk, u64& b0, u64& b1, const int lane) {
+    b0 = PAD_KEY; b1 = PAD_KEY;
+    if (K == 64) {
+        b0 = __ldcg(&bk[63 - lane]);
+        b1 = __ldcg(&bk[31 - lane]);
+    } else if (lane < K) {
+        b0 = __ldcg(&bk[K - 1 - lane]);
+    }
+}
+
+template <int K>
+__device__ __forceinline__ void load_A_g(const u64* __restrict__ ak, u64& a0, u64& a1, const int lane) {
+    a0 = PAD_KEY; a1 = PAD_KEY;
+    if (lane < K) a0 = __ldcg(&ak[lane]);
+    if (K == 64) a1 = __ldcg(&ak[32 + lane]);
+}
+
+template <int K>
+__device__ __forceinline__ void store_A_g(u64* __restrict__ ak, u64 a0, u64 a1, const int lane) {
+    if (lane < K) __stcg(&ak[lane], a0);
+    if (K == 64) __stcg(&ak[32 + lane], a1);
+}
+
+// ---------------- hierarchical final merge (ticket tree) -------------------
+// Called after the block wrote its partial list to wsk level-0 and did
+// __threadfence. The final winner writes outputs; others return.
+// wsk per row: 2*P*K u64 (two ping-pong levels). counters: P u32 per row.
+template <int K>
+__device__ __forceinline__ void hier_merge_and_write(u64* __restrict__ wsk,
+                                                     unsigned int* __restrict__ counters,
+                                                     int row, int P, int p,
+                                                     int k_real,
+                                                     float* __restrict__ outv,
+                                                     long* __restrict__ outi,
+                                                     int lane, int wid) {
+    __shared__ u64 mg[2][K];
+    __shared__ unsigned int tick;
+    u64* base = wsk + (long)row * (2 * P * K);
+    u64* cur = base;
+    u64* nxt = base + P * K;
+    u32* crow = counters + (long)row * P;
+    int idx = p;
+    int lists = P;
+    int coff = 0;
+    while (lists > 1) {
+        const int G = (lists >= 4) ? 4 : 2;
+        const int group = idx / G;
+        __syncthreads();
+        if (threadIdx.x == 0) tick = atomicInc(&crow[coff + group], G - 1);
+        __syncthreads();
+        if (tick != G - 1) return;
+        __threadfence();
+        {
+            const u64* gbase = cur + (long)group * G * K;
+            if (G == 2) {
+                if (wid == 0) {
+                    u64 b0, b1, x0, x1;
+                    load_rev_B_g<K>(gbase + K, b0, b1, lane);
+                    load_A_g<K>(gbase, x0, x1, lane);
+                    merge_descB_into_A<K>(x0, x1, b0, b1, lane);
+                    store_A_g<K>(nxt + (long)group * K, x0, x1, lane);
+                }
+            } else {
+                __syncthreads();
+                if (wid == 0) {
+                    u64 b0, b1, x0, x1;
+                    load_rev_B_g<K>(gbase + K, b0, b1, lane);
+                    load_A_g<K>(gbase, x0, x1, lane);
+                    merge_descB_into_A<K>(x0, x1, b0, b1, lane);
+                    store_A<K>(&mg[0][0], x0, x1, lane);
+                } else if (wid == 1) {
+                    u64 b0, b1, x0, x1;
+                    load_rev_B_g<K>(gbase + 3 * K, b0, b1, lane);
+                    load_A_g<K>(gbase + 2 * K, x0, x1, lane);
+                    merge_descB_into_A<K>(x0, x1, b0, b1, lane);
+                    store_A<K>(&mg[1][0], x0, x1, lane);
+                }
+                __syncthreads();
+                if (wid == 0) {
+                    u64 b0, b1, x0, x1;
+                    load_rev_B<K>(&mg[1][0], b0, b1, lane);
+                    load_A<K>(&mg[0][0], x0, x1, lane);
+                    merge_descB_into_A<K>(x0, x1, b0, b1, lane);
+                    store_A_g<K>(nxt + (long)group * K, x0, x1, lane);
+                }
+            }
+        }
+        __threadfence();
+        idx = group;
+        lists /= G;
+        coff += lists;   // counters used at this level == new lists
+        { u64* t = cur; cur = nxt; nxt = t; }
+    }
+    // idx == 0; winner writes outputs from cur[0..K)
+    if (wid == 0) {
+        u64 x0, x1;
+        load_A_g<K>(cur, x0, x1, lane);
+        #pragma unroll
+        for (int e = 0; e < (K == 64 ? 2 : 1); ++e) {
+            const int pos = lane + e * 32;
+            if (pos < k_real) {
+                float v; int i2;
+                key_to_pair((e == 0) ? x0 : x1, v, i2);
+                outv[(long)row * k_real + pos] = v;
+                outi[(long)row * k_real + pos] = (long)i2;
+            }
+        }
+    }
+}
+
+
+// ---------------- shared tournament block-reduce ----------------
+// DLIST distinct sorted-32 desc lists in shared -> block top-K (K in {32,64}).
+// For K=64, each 32-list is padded to 64-wide (upper half = PAD) before the
+// first merge; subsequent rounds merge full 64-lists.
+template <int TPB, int K, int DLIST>
+__device__ __forceinline__ void block_reduce_shared(u64* __restrict__ shr,   // [DLIST][K]
+                                                    const int lane, const int wid) {
+    constexpr int NUM_WARPS = TPB / 32;
+    for (int lists = DLIST; lists > 1; lists >>= 1) {
+        const int half = lists >> 1;
+        for (int w = wid; w < half; w += NUM_WARPS) {
+            u64 b0, b1, x0, x1;
+            load_rev_B<K>(shr + (long)(w + half) * K, b0, b1, lane);
+            load_A<K>(shr + (long)w * K, x0, x1, lane);
+            merge_descB_into_A<K>(x0, x1, b0, b1, lane);
+            store_A<K>(shr + (long)w * K, x0, x1, lane);
+        }
+        __syncthreads();
+    }
+}
+
+// ---------------- kernels -------------------
+template <int TPB, int K, int CAP>
+__global__ void __launch_bounds__(TPB) topk_kernel_small(
+        const float4* __restrict__ xv4,
+        int n, int m, int P,
+        int k_real,
+        float* __restrict__ outv, long* __restrict__ outi,
+        u64* __restrict__ wsk, unsigned int* __restrict__ counters) {
+    const int p = blockIdx.x % P;
+    const int row = blockIdx.x / P;
+    const int lane = threadIdx.x & 31;
+    const int wid = threadIdx.x >> 5;
+    const int tid = threadIdx.x;
+
+    const int row_f4 = row * (n / 4);
+    const int chunk0 = p * m;
+    const int chunk1 = min(n, chunk0 + m);
+    const int f4_begin = row_f4 + chunk0 / 4;
+    const int f4_end = row_f4 + chunk1 / 4;
+
+    constexpr int NUM_WARPS = TPB / 32;
+    u64 rc[CAP];
+    thread_collect<TPB, CAP>(xv4, f4_begin, f4_end, row_f4, rc, tid);
+
+    // K-list: first min(CAP,K) sorted entries, padded to K
+    u64 r[K];
+    #pragma unroll
+    for (int j = 0; j < K; ++j) r[j] = (j < CAP) ? rc[j] : PAD_KEY;
+
+    if (K == 32) {
+        // two register rounds: cohort of 4 threads -> distinct sorted-32
+        warp_merge_lists<K>(r, lane ^ 1);
+        warp_merge_lists<K>(r, lane ^ 2);
+        constexpr int DLIST = NUM_WARPS * 8;
+        __shared__ u64 shr[DLIST][32];
+        if ((lane & 3) == 0) {
+            const int slot = wid * 8 + (lane >> 2);
+            #pragma unroll
+            for (int j = 0; j < 32; ++j) shr[slot][j] = r[j];
+        }
+        __syncthreads();
+        block_reduce_shared<TPB, 32, NUM_WARPS * 8>(&shr[0][0], lane, wid);
+        if (P == 1) {
+            if (wid == 0) {
+                u64 x0, x1;
+                load_A<32>(&shr[0][0], x0, x1, lane);
+                if (lane < k_real) {
+                    float v; int i2;
+                    key_to_pair(x0, v, i2);
+                    outv[(long)row * k_real + lane] = v;
+                    outi[(long)row * k_real + lane] = (long)i2;
+                }
+            }
+            return;
+        }
+        u64* wsk_slot = wsk + (long)row * (2 * P * K) + (long)p * K;
+        if (wid == 0) {
+            u64 x0, x1;
+            load_A<32>(&shr[0][0], x0, x1, lane);
+            store_A_g<32>(wsk_slot, x0, x1, lane);
+        }
+        __threadfence();
+        hier_merge_and_write<32>(wsk, counters, row, P, p, k_real, outv, outi, lane, wid);
+        return;
+    }
+
+    #pragma unroll
+    for (int d = 1; d < 32; d <<= 1) {
+        warp_merge_lists<K>(r, lane ^ d);
+    }
+
+    __shared__ u64 sk[NUM_WARPS][K];
+    if (lane < K) {
+        u64 val = PAD_KEY;
+        #pragma unroll
+        for (int j = 0; j < K; ++j) { if (j == lane) val = r[j]; }
+        sk[wid][lane] = val;
+    }
+    __syncthreads();
+
+    for (int lists = NUM_WARPS; lists > 1; lists >>= 1) {
+        const int half = lists >> 1;
+        if (wid < half) {
+            u64 b0, b1, x0, x1;
+            load_rev_B<K>(&sk[wid + half][0], b0, b1, lane);
+            load_A<K>(&sk[wid][0], x0, x1, lane);
+            merge_descB_into_A<K>(x0, x1, b0, b1, lane);
+            store_A<K>(&sk[wid][0], x0, x1, lane);
+        }
+        __syncthreads();
+    }
+
+    if (P == 1) {
+        if (wid == 0) {
+            u64 x0, x1;
+            load_A<K>(&sk[0][0], x0, x1, lane);
+            if (lane < k_real) {
+                float v; int i2;
+                key_to_pair(x0, v, i2);
+                outv[(long)row * k_real + lane] = v;
+                outi[(long)row * k_real + lane] = (long)i2;
+            }
+        }
+        return;
+    }
+
+    u64* wsk_slot = wsk + (long)row * (2 * P * K) + (long)p * K;
+    if (wid == 0) {
+        u64 x0, x1;
+        load_A<K>(&sk[0][0], x0, x1, lane);
+        store_A_g<K>(wsk_slot, x0, x1, lane);
+    }
+    __threadfence();
+    hier_merge_and_write<K>(wsk, counters, row, P, p, k_real, outv, outi, lane, wid);
+}
+
+template <int TPB>
+__global__ void __launch_bounds__(TPB) topk_kernel_64(
+        const float4* __restrict__ xv4,
+        int n, int m, int P,
+        int k_real,
+        float* __restrict__ outv, long* __restrict__ outi,
+        u64* __restrict__ wsk, unsigned int* __restrict__ counters) {
+    constexpr int NUM_WARPS = TPB / 32;
+    const int p = blockIdx.x % P;
+    const int row = blockIdx.x / P;
+    const int lane = threadIdx.x & 31;
+    const int wid = threadIdx.x >> 5;
+    const int tid = threadIdx.x;
+
+    const int row_f4 = row * (n / 4);
+    const int chunk0 = p * m;
+    const int chunk1 = min(n, chunk0 + m);
+    const int f4_begin = row_f4 + chunk0 / 4;
+    const int f4_end = row_f4 + chunk1 / 4;
+
+    // per-thread collect into sorted-32 (CAP up to 32), then 2 register rounds
+    u64 rc[32];
+    thread_collect<TPB, 32>(xv4, f4_begin, f4_end, row_f4, rc, tid);
+    u64 r[32];
+    #pragma unroll
+    for (int j = 0; j < 32; ++j) r[j] = rc[j];
+    warp_merge_lists<32>(r, lane ^ 1);
+    warp_merge_lists<32>(r, lane ^ 2);
+    // third round per 8-lane group: merge across 4-lane cohorts into a sorted
+    // sorted-64 list, split so half the group holds top-32, other half bottom-32
+    {
+        u64 hi[32], lo[32];
+        #pragma unroll
+        for (int j = 0; j < 32; ++j) {
+            const u64 b = __shfl_sync(FULL_MASK, r[31 - j], lane ^ 4);
+            const int sel = (r[j] > b) ? 0 : 1;
+            hi[j] = sel ? b : r[j];
+            lo[j] = sel ? r[j] : b;
+        }
+        #pragma unroll
+        for (int stride = 16; stride > 0; stride >>= 1) {
+            #pragma unroll
+            for (int j = 0; j < 32; ++j) {
+                if ((j & stride) == 0) {
+                    const int q = j + stride;
+                    if (hi[q] > hi[j]) { const u64 t = hi[j]; hi[j] = hi[q]; hi[q] = t; }
+                    if (lo[q] > lo[j]) { const u64 t = lo[j]; lo[j] = lo[q]; lo[q] = t; }
+                }
+            }
+        }
+        // lower 4-lane half of an 8-group -> top-32; upper half -> bottom-32
+        constexpr int DLIST = NUM_WARPS * 4;
+        __shared__ u64 shr[DLIST][64];
+        const int slot = (threadIdx.x >> 3);
+        const bool top_half = ((lane & 4) == 0);
+        #pragma unroll
+        for (int j = 0; j < 32; ++j) {
+            if (top_half) shr[slot][j] = hi[j];
+            else shr[slot][32 + j] = lo[j];
+        }
+        __syncthreads();
+
+        block_reduce_shared<TPB, 64, NUM_WARPS * 4>(&shr[0][0], lane, wid);
+
+        if (P == 1) {
+            if (wid == 0) {
+                u64 x0, x1;
+                load_A<64>(&shr[0][0], x0, x1, lane);
+                #pragma unroll
+                for (int e = 0; e < 2; ++e) {
+                    const int pos = lane + e * 32;
+                    if (pos < k_real) {
+                        float v; int i2;
+                        key_to_pair((e == 0) ? x0 : x1, v, i2);
+                        outv[(long)row * k_real + pos] = v;
+                        outi[(long)row * k_real + pos] = (long)i2;
+                    }
+                }
+            }
+            return;
+        }
+
+        u64* wsk_slot = wsk + (long)row * (2 * P * 64) + (long)p * 64;
+        if (wid == 0) {
+            u64 x0, x1;
+            load_A<64>(&shr[0][0], x0, x1, lane);
+            store_A_g<64>(wsk_slot, x0, x1, lane);
+        }
+        __threadfence();
+        hier_merge_and_write<64>(wsk, counters, row, P, p, k_real, outv, outi, lane, wid);
+    }
+}
+
+template <int TPB>
+__global__ void __launch_bounds__(TPB) topk_kernel_argmax(
+        const float4* __restrict__ xv4,
+        int n, int m, int P,
+        int k_real,
+        float* __restrict__ outv, long* __restrict__ outi,
+        u64* __restrict__ wsk, unsigned int* __restrict__ counters) {
+    (void)m; (void)P; (void)k_real; (void)wsk; (void)counters;
+    const int row = blockIdx.x;
+    const int lane = threadIdx.x & 31;
+    const int wid = threadIdx.x >> 5;
+    const int row_f4 = row * (n / 4);
+    const int D = n / 4;
+    // thread max
+    u64 best = PAD_KEY;
+    for (int jt = 0; jt < D; jt += TPB) {
+        const int jj = jt + threadIdx.x;
+        if (jj < D) {
+            const float4 f = xv4[row_f4 + jj];
+            const int eb = (row_f4 + jj) * 4 - row_f4 * 4;
+            #pragma unroll
+            for (int e = 0; e < 4; ++e) {
+                const float v = (e == 0) ? f.x : (e == 1) ? f.y : (e == 2) ? f.z : f.w;
+                const u64 key = make_key(v, eb + e);
+                if (key > best) best = key;
+            }
+        }
+    }
+    // intra-warp reduce
+    #pragma unroll
+    for (int d = 16; d > 0; d >>= 1) {
+        const u64 o = __shfl_xor_sync(FULL_MASK, best, d);
+        if (o > best) best = o;
+    }
+    __shared__ u64 sw[TPB / 32];
+    if (lane == 0) sw[wid] = best;
+    __syncthreads();
+    if (wid == 0) {
+        u64 b2 = (lane < TPB / 32) ? sw[lane] : PAD_KEY;
+        #pragma unroll
+        for (int d = 16; d > 0; d >>= 1) {
+            const u64 o = __shfl_xor_sync(FULL_MASK, b2, d);
+            if (o > b2) b2 = o;
+        }
+        if (lane == 0) {
+            float v; int i2;
+            key_to_pair(b2, v, i2);
+            outv[row] = v;
+            outi[row] = (long)i2;
+        }
+    }
+}
+
+// ---------------- host -------------------
+// persistent workspace: never returned, never aliases outputs; each call's
+// reads are covered by writes from that same launch; ticket counters return
+// to zero after each launch (atomicInc wraparound).
+struct Workspace {
+    u64* wsk = nullptr;
+    unsigned int* counters = nullptr;
+    size_t pair_capacity = 0;      // in u64 elements
+    size_t counter_capacity = 0;
+};
+static Workspace g_ws;
+
+static void ensure_workspace(size_t u64_needed, size_t counters_needed, cudaStream_t stream) {
+    if (u64_needed > g_ws.pair_capacity) {
+        if (g_ws.wsk) cudaFree(g_ws.wsk);
+        size_t cap = u64_needed * 2;
+        cudaMalloc(&g_ws.wsk, cap * sizeof(u64));
+        g_ws.pair_capacity = cap;
+    }
+    if (counters_needed > g_ws.counter_capacity) {
+        if (g_ws.counters) cudaFree(g_ws.counters);
+        size_t cap = counters_needed * 2;
+        cudaMalloc(&g_ws.counters, cap * sizeof(unsigned int));
+        g_ws.counter_capacity = cap;
+        cudaMemsetAsync(g_ws.counters, 0, cap * sizeof(unsigned int), stream);
+    }
+}
+
+// make two tensors (f32 values, i64 indices) sharing one fresh storage
+static inline void make_outputs(int64_t batch, int64_t k, at::Tensor& v, at::Tensor& i) {
+    const int64_t nelem = batch * k;
+    const int64_t vbytes = nelem * 4;
+    const int64_t pad = (8 - (vbytes & 7)) & 7;
+    const int64_t nbytes = vbytes + pad + nelem * 8;
+    auto* allocator = c10::cuda::CUDACachingAllocator::get();
+    auto storage = c10::make_intrusive<c10::StorageImpl>(
+        c10::StorageImpl::use_byte_size_t(), nbytes,
+        allocator->allocate(nbytes), allocator, false);
+    const auto ks = c10::DispatchKeySet(c10::DispatchKey::CUDA);
+    v = at::detail::make_tensor<c10::TensorImpl>(
+        c10::Storage(storage), ks, caffe2::TypeMeta::Make<float>());
+    v.unsafeGetTensorImpl()->set_sizes_and_strides({batch, k}, {k, 1}, std::optional<int64_t>(0));
+    i = at::detail::make_tensor<c10::TensorImpl>(
+        c10::Storage(std::move(storage)), ks, caffe2::TypeMeta::Make<int64_t>());
+    i.unsafeGetTensorImpl()->set_sizes_and_strides({batch, k}, {k, 1}, std::optional<int64_t>((vbytes + pad) / 8));
+}
+
+static inline int pick_TPB(int64_t batch, int64_t n, int64_t k) {
+    if (batch >= 64) return 512;   // big-batch shapes: more warps per block
+    return 256;
+}
+static inline int pick_P(int64_t batch, int64_t n, int64_t k) {
+    if (batch >= 128) return 1;
+    if (batch >= 64) return 1;
+    if (batch >= 32) return 4;
+    if (batch >= 16) return 4;
+    return 16;
+}
+
+static PyObject* topk_fast(PyObject* /*self*/, PyObject* const* args, Py_ssize_t nargs) {
+    HANDLE_TH_ERRORS
+    const at::Tensor& x = THPVariable_Unpack(args[0]);
+    const int64_t k = PyLong_AsLongLong(args[1]);
+    const int64_t batch = x.size(0);
+    const int64_t n = x.size(1);
+    TORCH_CHECK(n % 4 == 0, "n must be a multiple of 4");
+
+    at::Tensor v, i;
+    make_outputs(batch, k, v, i);
+
+    int P = pick_P(batch, n, k);
+    const int64_t m = ((n + P - 1) / P + 3) & ~3LL;
+    int K = (k <= 8) ? 8 : (k <= 16) ? 16 : (k <= 32) ? 32 : 64;
+    const int64_t tpb = pick_TPB(batch, n, k);
+    // CAP: elems per thread (x4 elems/f4), pow2, clamped [8, 32]
+    const int64_t f4_per_thread = (m / 4 + tpb - 1) / tpb;
+    int CAP = 8;
+    while (CAP / 4 < f4_per_thread && CAP < 32) CAP <<= 1;
+
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+    if (P > 1) {
+        ensure_workspace((size_t)batch * 2 * P * K, (size_t)batch * P, stream);
+    }
+
+    const float4* xv4 = reinterpret_cast<const float4*>(x.data_ptr<float>());
+    float* vp = reinterpret_cast<float*>(v.data_ptr());
+    long* ip = reinterpret_cast<long*>(i.data_ptr());
+    dim3 grid(batch * P);
+
+    #define LAUNCH_SMALL(TPB_, K_, CAP_) topk_kernel_small<TPB_, K_, CAP_><<<grid, TPB_, 0, stream>>>(xv4, (int)n, (int)m, P, (int)k, vp, ip, g_ws.wsk, g_ws.counters)
+    #define LAUNCH64(TPB_) topk_kernel_64<TPB_><<<grid, TPB_, 0, stream>>>(xv4, (int)n, (int)m, P, (int)k, vp, ip, g_ws.wsk, g_ws.counters)
+    #define DISPATCH32(TPB_) \
+        do { if (CAP == 16) LAUNCH_SMALL(TPB_, 32, 16); else LAUNCH_SMALL(TPB_, 32, 32); } while (0)
+    #define DISPATCH_LE16(TPB_) \
+        do { if (K == 16) { if (CAP == 8) LAUNCH_SMALL(TPB_, 16, 8); else if (CAP == 16) LAUNCH_SMALL(TPB_, 16, 16); else LAUNCH_SMALL(TPB_, 16, 32); } \
+        else { if (CAP == 8) LAUNCH_SMALL(TPB_, 8, 8); else if (CAP == 16) LAUNCH_SMALL(TPB_, 8, 16); else LAUNCH_SMALL(TPB_, 8, 32); } } while (0)
+    if (k == 1 && batch >= 64) {
+        if (tpb == 512) topk_kernel_argmax<512><<<grid, 512, 0, stream>>>(xv4, (int)n, (int)m, P, (int)k, vp, ip, g_ws.wsk, g_ws.counters);
+        else topk_kernel_argmax<256><<<grid, 256, 0, stream>>>(xv4, (int)n, (int)m, P, (int)k, vp, ip, g_ws.wsk, g_ws.counters);
+    } else if (K == 64) { LAUNCH64(256); }
+    else if (K == 32) { if (tpb == 256) DISPATCH32(256); else DISPATCH32(512); }
+    else if (tpb == 256) DISPATCH_LE16(256);
+    else if (tpb == 512) DISPATCH_LE16(512);
+    else DISPATCH_LE16(1024);
+    #undef LAUNCH_SMALL
+    #undef LAUNCH64
+    #undef DISPATCH32
+    #undef DISPATCH_LE16
+    PyObject* out = PyTuple_New(2);
+    PyTuple_SET_ITEM(out, 0, THPVariable_Wrap(std::move(v)));
+    PyTuple_SET_ITEM(out, 1, THPVariable_Wrap(std::move(i)));
+    return out;
+    END_HANDLE_TH_ERRORS
+}
+
+static PyMethodDef fast_methods[] = {
+    {"topk", (PyCFunction)(void*)topk_fast, METH_FASTCALL, nullptr},
+    {nullptr, nullptr, 0, nullptr}
+};
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    PyModule_AddFunctions(m.ptr(), fast_methods);
+}
+
+"""
+
+_ext = load_inline(
+    name="topk_bitonic_final",
+    cpp_sources="",
+    cuda_sources=_CUDA_SRC,
+    extra_cuda_cflags=["-O3"],
+    verbose=False,
+)
+
+_topk = _ext.topk
+
+
+class Model(nn.Module):
+    """Top-k over the last dim of a 2D tensor (see reference.Model)."""
+
+    def __init__(self, batch: int, n: int, k: int):
+        super().__init__()
+        self.batch, self.n, self.k = batch, n, k
+        self.register_buffer("_dummy", torch.zeros(1))
+
+    def forward(self, x: torch.Tensor):
+        return _topk(x, self.k)
+
+    # Bypass nn.Module._call_impl hook machinery on the hot path.
+    def __call__(self, x: torch.Tensor):
+        return _topk(x, self.k)
+
+
+# Module-level shims rebuilt by check.py / benchmark.py per shape.
+batch = 64
+n = 8192
+k = 8
+
+
+def get_inputs():
+    x = torch.randn(batch, n, dtype=torch.float32)
+    return [x]
+
+
+def get_init_inputs():
+    return [batch, n, k]

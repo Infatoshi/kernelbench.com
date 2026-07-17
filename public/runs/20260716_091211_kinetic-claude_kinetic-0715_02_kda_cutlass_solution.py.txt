@@ -1,0 +1,757 @@
+"""KDA (Kimi Delta Attention) forward, chunk form — custom Triton kernel pipeline.
+
+Three-kernel chunked implementation built on tl.dot tensor-core GEMMs:
+
+  K1 (intra, per (b,h,chunk)):  in-chunk gate cumsum; decay-factorised
+      Aqk = (s*q*e^{G-Gl}) @ (k*e^{Gl-G})^T and Akk = (k*e^{G-Gl}) @ (k*e^{Gl-G})^T
+      (Gl = G at chunk end), strict-lower/beta masking, forward-substitution
+      UT transform -> Ainv; w = Ainv @ (beta*e^G*k), u = Ainv @ (beta*v).
+      Stores Aqk (masked incl. diag, scaled), kn (=k*e^{Gl-G}, doubles as kg),
+      w, u, qg (=s*q*e^G), el (=e^{Gl} per channel).
+  K2 (scan, per (b,h,v-slice)): sequential over chunks:
+      store h_i (chunk-start state), v_new = u - w @ h_i,
+      S <- S * el + kn^T @ v_new.
+  K3 (out,  per (b,h,chunk)): o = qg @ h_i + (masked Aqk) @ v_new.
+
+All GEMM inputs bf16, accumulation fp32. chunk_size 64 assumed (T % 64 == 0),
+K / V arbitrary powers of two (the benchmark uses K=V=128).
+"""
+from __future__ import annotations
+
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+from torch.utils.cpp_extension import load_inline
+
+RCP_LN2 = tl.constexpr(1.4426950408889634)  # 1/ln(2): keep decay in log2 domain, use exp2
+
+
+# ===========================================================================
+# CUDA kernels (hand-written mma.sync m16n8k16 + cp.async pipeline)
+# ===========================================================================
+CUDA_SRC = r"""
+#include <torch/extension.h>
+#include <cuda_bf16.h>
+
+using bf16 = __nv_bfloat16;
+#define DINLINE __device__ __forceinline__
+
+DINLINE unsigned smem_u32(const void* p) {
+    return static_cast<unsigned>(__cvta_generic_to_shared(p));
+}
+DINLINE void ldmatrix_x4(unsigned& r0, unsigned& r1, unsigned& r2, unsigned& r3, unsigned addr) {
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+                 : "=r"(r0), "=r"(r1), "=r"(r2), "=r"(r3) : "r"(addr));
+}
+DINLINE void ldmatrix_x2_trans(unsigned& r0, unsigned& r1, unsigned addr) {
+    asm volatile("ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%0,%1}, [%2];\n"
+                 : "=r"(r0), "=r"(r1) : "r"(addr));
+}
+DINLINE void ldmatrix_x4_trans(unsigned& r0, unsigned& r1, unsigned& r2, unsigned& r3, unsigned addr) {
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+                 : "=r"(r0), "=r"(r1), "=r"(r2), "=r"(r3) : "r"(addr));
+}
+DINLINE void stmatrix_x4(unsigned addr, unsigned r0, unsigned r1, unsigned r2, unsigned r3) {
+    asm volatile("stmatrix.sync.aligned.m8n8.x4.shared.b16 [%0], {%1,%2,%3,%4};\n"
+                 :: "r"(addr), "r"(r0), "r"(r1), "r"(r2), "r"(r3));
+}
+DINLINE void mma_bf16(float& c0, float& c1, float& c2, float& c3,
+                      unsigned a0, unsigned a1, unsigned a2, unsigned a3,
+                      unsigned b0, unsigned b1) {
+    asm volatile(
+        "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
+        "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+        : "+f"(c0), "+f"(c1), "+f"(c2), "+f"(c3)
+        : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+}
+DINLINE void cp_async_16(unsigned smem, const void* gmem) {
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" :: "r"(smem), "l"(gmem));
+}
+DINLINE void cp_commit() { asm volatile("cp.async.commit_group;\n"); }
+template <int N>
+DINLINE void cp_wait() { asm volatile("cp.async.wait_group %0;\n" :: "n"(N)); }
+DINLINE unsigned pack_bf16(float a, float b) {
+    unsigned r;
+    asm volatile("cvt.rn.bf16x2.f32 %0, %1, %2;\n" : "=r"(r) : "f"(b), "f"(a));
+    return r;
+}
+
+// ---------------------------------------------------------------------------
+// Scan kernel: one block per (bh, v-slice of 32). 8 warps.
+//   for each chunk i: h[i] = S; vn = u - w @ S; S = S * el + kn^T @ vn
+// ---------------------------------------------------------------------------
+#define BV 32
+#define BT 64
+#define DK 128
+#define PADW 8
+#define PADH 8
+
+struct ScanParams {
+    const bf16* kn; const bf16* w; const bf16* u; const float* el;
+    bf16* h; bf16* vnew;
+    int T, NT, H, K, V;
+};
+
+__global__ void __launch_bounds__(256, 1) scan_kernel(ScanParams p) {
+    extern __shared__ char smem_raw[];
+    bf16 (*s_w)[DK + PADW]   = reinterpret_cast<bf16(*)[DK + PADW]>(smem_raw);
+    bf16 (*s_kn)[DK + PADW]  = s_w + 2 * BT;
+    bf16 (*s_u)[BV + PADW]   = reinterpret_cast<bf16(*)[BV + PADW]>(s_kn + 2 * BT);
+    bf16 (*s_vn)[BV + PADW]  = s_u + 2 * BT;
+    bf16 (*s_h)[BV + PADH]   = reinterpret_cast<bf16(*)[BV + PADH]>(s_vn + BT);
+    float* s_el              = reinterpret_cast<float*>(s_h + DK);
+
+    const int i_bh = blockIdx.x;
+    const int i_v = blockIdx.y;
+    const int i_b = i_bh / p.H;
+    const int i_h = i_bh % p.H;
+    const int tid = threadIdx.x;
+    const int warp = tid / 32;
+    const int lane = tid % 32;
+    const int NT = p.NT, H = p.H, K = p.K, V = p.V;
+
+    const long base_qk = (long)(i_b * p.T) * H * K + (long)i_h * K;
+    const long base_v = (long)(i_b * p.T) * H * V + (long)i_h * V + i_v * BV;
+    bf16* base_h = p.h + ((long)i_bh * NT) * K * V + i_v * BV;
+
+    auto prefetch = [&](int it) {
+        if (it >= NT) return;
+        const bf16* gw = p.w + base_qk + (long)it * BT * H * K;
+        const bf16* gkn = p.kn + base_qk + (long)it * BT * H * K;
+        const bf16* gu = p.u + base_v + (long)it * BT * H * V;
+        const float* gel = p.el + ((long)i_bh * NT + it) * K;
+        bf16* dw = (bf16*)(s_w + (it & 1) * BT);
+        bf16* dkn = (bf16*)(s_kn + (it & 1) * BT);
+        bf16* du = (bf16*)(s_u + (it & 1) * BT);
+        float* del = s_el + (it & 1) * DK;
+        for (int i = tid; i < BT * DK / 8; i += 256) {
+            int r = (i * 8) / DK, c = (i * 8) % DK;
+            cp_async_16(smem_u32(dw + r * (DK + PADW) + c), gw + (long)r * H * K + c);
+            cp_async_16(smem_u32(dkn + r * (DK + PADW) + c), gkn + (long)r * H * K + c);
+        }
+        for (int i = tid; i < BT * BV / 8; i += 256) {
+            int r = (i * 8) / BV, c = (i * 8) % BV;
+            cp_async_16(smem_u32(du + r * (BV + PADW) + c), gu + (long)r * H * V + c);
+        }
+        for (int i = tid; i < DK / 4; i += 256)
+            cp_async_16(smem_u32(del + i * 4), gel + i * 4);
+    };
+
+    prefetch(0);
+    cp_commit();
+
+    float S[4][4];
+#pragma unroll
+    for (int i = 0; i < 4; i++)
+        for (int j = 0; j < 4; j++) S[i][j] = 0.f;
+
+    // h[0] = 0
+    {
+        int r = warp * 16 + lane / 4;
+#pragma unroll
+        for (int nf = 0; nf < 4; nf++) {
+            int c = nf * 8 + (lane % 4) * 2;
+            *reinterpret_cast<unsigned*>(base_h + (long)r * V + c) = 0u;
+            *reinterpret_cast<unsigned*>(base_h + (long)(r + 8) * V + c) = 0u;
+        }
+    }
+
+    for (int it = 0; it < NT; it++) {
+        bf16* cw = (bf16*)(s_w + (it & 1) * BT);
+        bf16* ckn = (bf16*)(s_kn + (it & 1) * BT);
+        bf16* cu = (bf16*)(s_u + (it & 1) * BT);
+        float* cel = s_el + (it & 1) * DK;
+
+        cp_wait<0>();
+        __syncthreads();
+        prefetch(it + 1);
+        cp_commit();
+
+        // ---- dot1: acc = -u + w @ h (skip mma at it==0, S==0) ----
+        int wm1 = warp % 4, wn1 = warp / 4;
+        float vn[2][4];
+#pragma unroll
+        for (int nf = 0; nf < 2; nf++) {
+            int r = wm1 * 16 + lane / 4;
+            int c = wn1 * 16 + nf * 8 + (lane % 4) * 2;
+            unsigned u01 = *reinterpret_cast<unsigned*>(&cu[r * (BV + PADW) + c]);
+            unsigned u23 = *reinterpret_cast<unsigned*>(&cu[(r + 8) * (BV + PADW) + c]);
+            float2 f01 = __bfloat1622float2(*reinterpret_cast<__nv_bfloat162*>(&u01));
+            float2 f23 = __bfloat1622float2(*reinterpret_cast<__nv_bfloat162*>(&u23));
+            vn[nf][0] = -f01.x; vn[nf][1] = -f01.y;
+            vn[nf][2] = -f23.x; vn[nf][3] = -f23.y;
+        }
+#pragma unroll
+        for (int ks = 0; ks < DK / 16 && it > 0; ks++) {
+            unsigned a0, a1, a2, a3;
+            {
+                int r = wm1 * 16 + (lane & 15);
+                int c = ks * 16 + (lane >= 16 ? 8 : 0);
+                ldmatrix_x4(a0, a1, a2, a3, smem_u32(cw + r * (DK + PADW) + c));
+            }
+#pragma unroll
+            for (int nf = 0; nf < 2; nf++) {
+                unsigned b0, b1;
+                int rr = ks * 16 + (lane & 15);
+                int cc = wn1 * 16 + nf * 8;
+                ldmatrix_x2_trans(b0, b1, smem_u32(&s_h[rr][cc]));
+                mma_bf16(vn[nf][0], vn[nf][1], vn[nf][2], vn[nf][3], a0, a1, a2, a3, b0, b1);
+            }
+        }
+        // vn = -( -u + w@h ) = u - w@h
+        long base_vn = base_v + (long)it * BT * H * V;
+        unsigned packed[2][2];
+#pragma unroll
+        for (int nf = 0; nf < 2; nf++) {
+            int r = wm1 * 16 + lane / 4;
+            int c = wn1 * 16 + nf * 8 + (lane % 4) * 2;
+            packed[nf][0] = pack_bf16(-vn[nf][0], -vn[nf][1]);
+            packed[nf][1] = pack_bf16(-vn[nf][2], -vn[nf][3]);
+            *reinterpret_cast<unsigned*>(p.vnew + base_vn + (long)r * H * V + c) = packed[nf][0];
+            *reinterpret_cast<unsigned*>(p.vnew + base_vn + (long)(r + 8) * H * V + c) = packed[nf][1];
+        }
+        {
+            int r = wm1 * 16 + (lane & 7) + ((lane / 8) & 1) * 8;
+            int c = wn1 * 16 + (lane / 16) * 8;
+            stmatrix_x4(smem_u32(&s_vn[r][c]), packed[0][0], packed[0][1], packed[1][0], packed[1][1]);
+        }
+        __syncthreads();
+
+        // ---- S *= el; dot2: S += kn^T @ vn ----
+        float el0 = cel[warp * 16 + lane / 4];
+        float el1 = cel[warp * 16 + lane / 4 + 8];
+#pragma unroll
+        for (int nf = 0; nf < 4; nf++) {
+            S[nf][0] *= el0; S[nf][1] *= el0;
+            S[nf][2] *= el1; S[nf][3] *= el1;
+        }
+#pragma unroll
+        for (int ks = 0; ks < BT / 16; ks++) {
+            unsigned a0, a1, a2, a3;
+            {
+                int t = ks * 16 + (lane & 7) + ((lane / 16) * 8);
+                int ch = warp * 16 + ((lane / 8) & 1) * 8;
+                ldmatrix_x4_trans(a0, a1, a2, a3, smem_u32(ckn + t * (DK + PADW) + ch));
+            }
+#pragma unroll
+            for (int nf = 0; nf < 4; nf++) {
+                unsigned b0, b1;
+                int rr = ks * 16 + (lane & 15);
+                ldmatrix_x2_trans(b0, b1, smem_u32(&s_vn[rr][nf * 8]));
+                mma_bf16(S[nf][0], S[nf][1], S[nf][2], S[nf][3], a0, a1, a2, a3, b0, b1);
+            }
+        }
+        // pack S -> s_h + global h[it+1]
+        {
+            int r = warp * 16 + lane / 4;
+            unsigned ph[4][2];
+#pragma unroll
+            for (int nf = 0; nf < 4; nf++) {
+                ph[nf][0] = pack_bf16(S[nf][0], S[nf][1]);
+                ph[nf][1] = pack_bf16(S[nf][2], S[nf][3]);
+                int c = nf * 8 + (lane % 4) * 2;
+                if (it + 1 < NT) {
+                    *reinterpret_cast<unsigned*>(base_h + (long)(it + 1) * K * V + (long)r * V + c) = ph[nf][0];
+                    *reinterpret_cast<unsigned*>(base_h + (long)(it + 1) * K * V + (long)(r + 8) * V + c) = ph[nf][1];
+                }
+            }
+#pragma unroll
+            for (int nfp = 0; nfp < 2; nfp++) {
+                int rr = warp * 16 + (lane & 7) + ((lane / 8) & 1) * 8;
+                int cc = nfp * 16 + (lane / 16) * 8;
+                stmatrix_x4(smem_u32(&s_h[rr][cc]), ph[2 * nfp][0], ph[2 * nfp][1],
+                            ph[2 * nfp + 1][0], ph[2 * nfp + 1][1]);
+            }
+        }
+        __syncthreads();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Output kernel: o = qg @ h + Aqk @ v_new, per (bh, chunk). 8 warps.
+// ---------------------------------------------------------------------------
+struct OutParams {
+    const bf16* qg; const bf16* h; const bf16* Aqk; const bf16* vnew; bf16* o;
+    int T, NT, H, K, V;
+};
+
+__global__ void __launch_bounds__(256, 1) out_kernel(OutParams p) {
+    extern __shared__ char smem_raw[];
+    bf16 (*s_qg)[DK + PADW]  = reinterpret_cast<bf16(*)[DK + PADW]>(smem_raw);   // [64][136]
+    bf16 (*s_h)[DK + PADW]   = s_qg + BT;                                       // [128][136]
+    bf16 (*s_A)[BT + PADW]   = reinterpret_cast<bf16(*)[BT + PADW]>(s_h + DK);  // [64][72]
+    bf16 (*s_vn)[DK + PADW]  = reinterpret_cast<bf16(*)[DK + PADW]>(s_A + BT);  // [64][136]
+
+    const int i_c = blockIdx.x;
+    const int i_bh = blockIdx.y;
+    const int i_b = i_bh / p.H;
+    const int i_h = i_bh % p.H;
+    const int tid = threadIdx.x;
+    const int warp = tid / 32;
+    const int lane = tid % 32;
+    const int H = p.H, K = p.K, V = p.V, NT = p.NT;
+
+    const long row_qk = ((long)(i_b * NT + i_c) * BT) * H * K + (long)i_h * K;
+    const long row_v = ((long)(i_b * NT + i_c) * BT) * H * V + (long)i_h * V;
+    const long row_A = ((long)(i_b * NT + i_c) * BT) * H * BT + (long)i_h * BT;
+    const bf16* gh = p.h + ((long)i_bh * p.NT + i_c) * K * V;
+
+    // stage everything
+    for (int i = tid; i < BT * DK / 8; i += 256) {
+        int r = (i * 8) / DK, c = (i * 8) % DK;
+        cp_async_16(smem_u32(&s_qg[r][c]), p.qg + row_qk + (long)r * H * K + c);
+        cp_async_16(smem_u32(&s_vn[r][c]), p.vnew + row_v + (long)r * H * V + c);
+    }
+    for (int i = tid; i < DK * DK / 8; i += 256) {
+        int r = (i * 8) / DK, c = (i * 8) % DK;
+        cp_async_16(smem_u32(&s_h[r][c]), gh + (long)r * V + c);
+    }
+    for (int i = tid; i < BT * BT / 8; i += 256) {
+        int r = (i * 8) / BT, c = (i * 8) % BT;
+        cp_async_16(smem_u32(&s_A[r][c]), p.Aqk + row_A + (long)r * H * BT + c);
+    }
+    cp_commit();
+    cp_wait<0>();
+    __syncthreads();
+
+    int wm = warp % 4, wn = warp / 4;   // warp covers 16m x 64n
+    float acc[8][4];
+#pragma unroll
+    for (int i = 0; i < 8; i++)
+        for (int j = 0; j < 4; j++) acc[i][j] = 0.f;
+
+    // dot1: qg (64x128) @ h (128x128)
+#pragma unroll
+    for (int ks = 0; ks < DK / 16; ks++) {
+        unsigned a0, a1, a2, a3;
+        {
+            int r = wm * 16 + (lane & 15);
+            int c = ks * 16 + (lane >= 16 ? 8 : 0);
+            ldmatrix_x4(a0, a1, a2, a3, smem_u32(&s_qg[r][c]));
+        }
+#pragma unroll
+        for (int nf = 0; nf < 8; nf++) {
+            unsigned b0, b1;
+            int rr = ks * 16 + (lane & 15);
+            int cc = wn * 64 + nf * 8;
+            ldmatrix_x2_trans(b0, b1, smem_u32(&s_h[rr][cc]));
+            mma_bf16(acc[nf][0], acc[nf][1], acc[nf][2], acc[nf][3], a0, a1, a2, a3, b0, b1);
+        }
+    }
+    // dot2: Aqk (64x64) @ vn (64x128)
+#pragma unroll
+    for (int ks = 0; ks < BT / 16; ks++) {
+        unsigned a0, a1, a2, a3;
+        {
+            int r = wm * 16 + (lane & 15);
+            int c = ks * 16 + (lane >= 16 ? 8 : 0);
+            ldmatrix_x4(a0, a1, a2, a3, smem_u32(&s_A[r][c]));
+        }
+#pragma unroll
+        for (int nf = 0; nf < 8; nf++) {
+            unsigned b0, b1;
+            int rr = ks * 16 + (lane & 15);
+            int cc = wn * 64 + nf * 8;
+            ldmatrix_x2_trans(b0, b1, smem_u32(&s_vn[rr][cc]));
+            mma_bf16(acc[nf][0], acc[nf][1], acc[nf][2], acc[nf][3], a0, a1, a2, a3, b0, b1);
+        }
+    }
+    // store o
+    bf16* go = p.o + row_v;
+#pragma unroll
+    for (int nf = 0; nf < 8; nf++) {
+        int r = wm * 16 + lane / 4;
+        int c = wn * 64 + nf * 8 + (lane % 4) * 2;
+        *reinterpret_cast<unsigned*>(go + (long)r * H * V + c) = pack_bf16(acc[nf][0], acc[nf][1]);
+        *reinterpret_cast<unsigned*>(go + (long)(r + 8) * H * V + c) = pack_bf16(acc[nf][2], acc[nf][3]);
+    }
+}
+
+torch::Tensor out_forward(torch::Tensor qg, torch::Tensor h, torch::Tensor Aqk,
+                          torch::Tensor vnew, torch::Tensor o, long T, long NT, long H) {
+    OutParams p;
+    p.qg = reinterpret_cast<const bf16*>(qg.data_ptr());
+    p.h = reinterpret_cast<const bf16*>(h.data_ptr());
+    p.Aqk = reinterpret_cast<const bf16*>(Aqk.data_ptr());
+    p.vnew = reinterpret_cast<const bf16*>(vnew.data_ptr());
+    p.o = reinterpret_cast<bf16*>(o.data_ptr());
+    p.T = T; p.NT = NT; p.H = H; p.K = 128; p.V = 128;
+    dim3 grid(NT, qg.size(0) * H);
+    size_t smem = 64 * (DK + PADW) * 2 + 128 * (DK + PADW) * 2 + 64 * (BT + PADW) * 2 + 64 * (DK + PADW) * 2;
+    static bool init = false;
+    if (!init) {
+        cudaFuncSetAttribute(out_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem);
+        init = true;
+    }
+    out_kernel<<<grid, 256, smem>>>(p);
+    return o;
+}
+
+torch::Tensor scan_forward(torch::Tensor kn, torch::Tensor w, torch::Tensor u,
+                           torch::Tensor el, torch::Tensor h, torch::Tensor vnew,
+                           long T, long NT, long H) {    ScanParams p;
+    p.kn = reinterpret_cast<const bf16*>(kn.data_ptr());
+    p.w = reinterpret_cast<const bf16*>(w.data_ptr());
+    p.u = reinterpret_cast<const bf16*>(u.data_ptr());
+    p.el = el.data_ptr<float>();
+    p.h = reinterpret_cast<bf16*>(h.data_ptr());
+    p.vnew = reinterpret_cast<bf16*>(vnew.data_ptr());
+    p.T = T; p.NT = NT; p.H = H; p.K = 128; p.V = 128;
+    long BH = kn.size(0) * H;
+    dim3 grid(BH, 128 / BV);
+    size_t smem = 2 * 64 * (DK + PADW) * 2 * 2 + 2 * 64 * (BV + PADW) * 2 + 64 * (BV + PADW) * 2 + 128 * (BV + PADH) * 2 + 2 * DK * 4;
+    static bool init = false;
+    if (!init) {
+        cudaFuncSetAttribute(scan_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem);
+        init = true;
+    }
+    scan_kernel<<<grid, 256, smem>>>(p);
+    return h;
+}
+"""
+
+CPP_SRC = """
+torch::Tensor scan_forward(torch::Tensor kn, torch::Tensor w, torch::Tensor u, torch::Tensor el, torch::Tensor h, torch::Tensor vnew, long T, long NT, long H);
+torch::Tensor out_forward(torch::Tensor qg, torch::Tensor h, torch::Tensor Aqk, torch::Tensor vnew, torch::Tensor o, long T, long NT, long H);
+"""
+
+_cuda_mod = None
+
+
+def _get_cuda():
+    global _cuda_mod
+    if _cuda_mod is None:
+        _cuda_mod = load_inline(
+            name="kda_cuda_v2",
+            cpp_sources=CPP_SRC,
+            cuda_sources=CUDA_SRC,
+            functions=["scan_forward", "out_forward"],
+            extra_cuda_cflags=["-O3", "-gencode=arch=compute_120a,code=sm_120a"],
+            verbose=False,
+        )
+    return _cuda_mod
+
+
+# ---------------------------------------------------------------------------
+# K1: intra-chunk kernel
+# ---------------------------------------------------------------------------
+@triton.jit
+def _subst16(M):
+    """Forward substitution (reference loop) on one strictly-lower 16x16 tile.
+    Returns M_loop + I16, i.e. (I16 - M)^{-1}."""
+    o = tl.arange(0, 16)
+    for i in tl.static_range(1, 16):
+        row = tl.sum(tl.where((o == i)[:, None], M, 0.0), axis=0)
+        upd = tl.sum(row[:, None] * M, axis=0)
+        row = row + upd
+        M = tl.where((o == i)[:, None], row[None, :], M)
+    return M + tl.where(o[:, None] == o[None, :], 1.0, 0.0)
+
+
+@triton.jit
+def _split_blocks(x):
+    """(64,64) -> 16 tiles (16,16) in row-major block order (bi,bj)."""
+    xr = tl.reshape(x, (4, 16, 4, 16))        # (bi, ri, bj, ci)
+    xr = tl.permute(xr, (1, 3, 0, 2))         # (ri, ci, bi, bj)
+    xr = tl.reshape(xr, (16, 16, 2, 2, 2, 2))  # (ri, ci, bih, bil, bjh, bjl)
+    a0, a1 = tl.split(xr)
+    b00, b01 = tl.split(a0)
+    b10, b11 = tl.split(a1)
+    c000, c001 = tl.split(b00)
+    c010, c011 = tl.split(b01)
+    c100, c101 = tl.split(b10)
+    c110, c111 = tl.split(b11)
+    d00, d01 = tl.split(c000)   # d_i0/d_i1: bi = i; bj fixed by c-level
+    d10, d11 = tl.split(c001)
+    d20, d21 = tl.split(c010)
+    d30, d31 = tl.split(c011)
+    d40, d41 = tl.split(c100)
+    d50, d51 = tl.split(c101)
+    d60, d61 = tl.split(c110)
+    d70, d71 = tl.split(c111)
+    return (d00, d40, d20, d60,
+            d10, d50, d30, d70,
+            d01, d41, d21, d61,
+            d11, d51, d31, d71)
+
+
+@triton.jit
+def _hcat(a, b):
+    """(M,N),(M,N) -> (M,2N) column concat."""
+    return tl.reshape(tl.permute(tl.join(a, b), (0, 2, 1)), (a.shape[0], 2 * a.shape[1]))
+
+
+@triton.jit
+def _vcat(a, b):
+    """(M,N),(M,N) -> (2M,N) row concat."""
+    return tl.reshape(tl.permute(tl.join(a, b), (2, 0, 1)), (2 * a.shape[0], a.shape[1]))
+
+
+@triton.jit
+def _blocked_inv(b_A):
+    """(64,64) strictly-lower fp32 (already negated+masked) -> Ainv (64,64) fp32
+    with unit diagonal. Exact block forward substitution in 16x16 tiles."""
+    A00, A01, A02, A03, A10, A11, A12, A13, A20, A21, A22, A23, A30, A31, A32, A33 = _split_blocks(b_A)
+    D0 = _subst16(A00)
+    D1 = _subst16(A11)
+    D2 = _subst16(A22)
+    D3 = _subst16(A33)
+    X10 = tl.dot(D1, tl.dot(A10, D0, input_precision="tf32"), input_precision="tf32")
+    X20 = tl.dot(D2, tl.dot(A20, D0, input_precision="tf32") + tl.dot(A21, X10, input_precision="tf32"), input_precision="tf32")
+    X21 = tl.dot(D2, tl.dot(A21, D1, input_precision="tf32"), input_precision="tf32")
+    X30 = tl.dot(D3, tl.dot(A30, D0, input_precision="tf32") + tl.dot(A31, X10, input_precision="tf32") + tl.dot(A32, X20, input_precision="tf32"), input_precision="tf32")
+    X31 = tl.dot(D3, tl.dot(A31, D1, input_precision="tf32") + tl.dot(A32, X21, input_precision="tf32"), input_precision="tf32")
+    X32 = tl.dot(D3, tl.dot(A32, D2, input_precision="tf32"), input_precision="tf32")
+    Z = tl.zeros((16, 16), dtype=tl.float32)
+    r0 = _hcat(_hcat(D0, Z), _hcat(Z, Z))
+    r1 = _hcat(_hcat(X10, D1), _hcat(Z, Z))
+    r2 = _hcat(_hcat(X20, X21), _hcat(D2, Z))
+    r3 = _hcat(_hcat(X30, X31), _hcat(X32, D3))
+    return _vcat(_vcat(r0, r1), _vcat(r2, r3))
+
+
+@triton.jit
+def _kda_intra_kernel(
+    q, k, v, g, beta,
+    kn_o, w_o, u_o, qg_o, Aqk_o, el_o,
+    scale,
+    NT,
+    H: tl.constexpr, K: tl.constexpr, V: tl.constexpr,
+    BT: tl.constexpr,
+):
+    i_c = tl.program_id(0)
+    i_bh = tl.program_id(1)
+    i_b = i_bh // H
+    i_h = i_bh % H
+
+    o_t = tl.arange(0, BT)
+    o_k = tl.arange(0, K)
+    o_v = tl.arange(0, V)
+
+    row_qk = (i_b * NT + i_c) * BT * H * K + i_h * K
+    row_v = (i_b * NT + i_c) * BT * H * V + i_h * V
+
+    p_g = g + row_qk + o_t[:, None] * (H * K) + o_k[None, :]
+    p_k = k + row_qk + o_t[:, None] * (H * K) + o_k[None, :]
+    p_q = q + row_qk + o_t[:, None] * (H * K) + o_k[None, :]
+    p_v = v + row_v + o_t[:, None] * (H * V) + o_v[None, :]
+    p_beta = beta + (i_b * NT + i_c) * BT * H + i_h + o_t * H
+
+    b_g = tl.load(p_g)                             # fp32 (BT,K)
+    b_beta = tl.load(p_beta).to(tl.float32)        # (BT,)
+    b_k = tl.load(p_k).to(tl.float32)              # (BT,K)
+
+    # in-chunk cumsum in log2 domain
+    b_gl2 = tl.cumsum(b_g, axis=0) * RCP_LN2       # (BT,K)
+    b_glast = tl.sum(b_g, axis=0) * RCP_LN2        # (K,)
+    b_dg = b_gl2 - b_glast[None, :]                # G - Gl (log2)
+
+    b_ep = tl.math.exp2(b_dg)                      # e^{G-Gl}
+    b_en = tl.math.exp2(-b_dg)                     # e^{Gl-G}
+    b_el = tl.math.exp2(b_glast)                   # e^{Gl} (K,)
+
+    b_kp = b_k * b_ep                              # fp32
+    b_kn16 = (b_k * b_en).to(tl.bfloat16)
+    b_kp16 = b_kp.to(tl.bfloat16)
+
+    # store kn (KSDA "kg": used by K2 state update) and el
+    tl.store(kn_o + row_qk + o_t[:, None] * (H * K) + o_k[None, :], b_kn16)
+    tl.store(el_o + (i_bh * NT + i_c) * K + o_k, b_el)
+
+    b_q = tl.load(p_q).to(tl.float32)
+    b_qe = b_q * (b_ep * scale)
+    b_qs16 = b_qe.to(tl.bfloat16)                  # s*q*e^{G-Gl}
+    tl.store(qg_o + row_qk + o_t[:, None] * (H * K) + o_k[None, :],
+             (b_qe * b_el[None, :]).to(tl.bfloat16))  # s*q*e^{G}
+
+    # --- Aqk: keep s <= t (incl. diag) ---
+    b_Aqk = tl.dot(b_qs16, tl.trans(b_kn16))
+    m_le = o_t[:, None] >= o_t[None, :]
+    b_Aqk = tl.where(m_le, b_Aqk, 0.0)
+    tl.store(Aqk_o + (i_b * NT + i_c) * BT * H * BT + i_h * BT
+             + o_t[:, None] * (H * BT) + o_t[None, :], b_Aqk.to(tl.bfloat16))
+
+    # --- Akk raw: strictly lower, negated, beta on rows ---
+    b_Akk = tl.dot(b_kp16, tl.trans(b_kn16))
+    m_lt = o_t[:, None] > o_t[None, :]
+    b_A = tl.where(m_lt, -b_beta[:, None] * b_Akk, 0.0)
+
+    # ---- forward substitution (sequential rows) -> Ainv (unit lower) ----
+    for i in tl.static_range(1, BT):
+        row = tl.sum(tl.where((o_t == i)[:, None], b_A, 0.0), axis=0)
+        upd = tl.sum(row[:, None] * b_A, axis=0)
+        b_A = tl.where((o_t == i)[:, None], (row + upd)[None, :], b_A)
+    m_I = o_t[:, None] == o_t[None, :]
+    b_A = b_A + tl.where(m_I, 1.0, 0.0)
+    b_A16 = b_A.to(tl.bfloat16)
+
+    # w = Ainv @ (beta * e^{G} * k); u = Ainv @ (beta * v)
+    b_kb = (b_kp * b_el[None, :] * b_beta[:, None]).to(tl.bfloat16)
+    b_w = tl.dot(b_A16, b_kb)
+    tl.store(w_o + row_qk + o_t[:, None] * (H * K) + o_k[None, :], b_w.to(tl.bfloat16))
+
+    b_vb = (tl.load(p_v).to(tl.float32) * b_beta[:, None]).to(tl.bfloat16)
+    b_u = tl.dot(b_A16, b_vb)
+    tl.store(u_o + row_v + o_t[:, None] * (H * V) + o_v[None, :], b_u.to(tl.bfloat16))
+
+
+# ---------------------------------------------------------------------------
+# K2: sequential state scan
+# ---------------------------------------------------------------------------
+@triton.jit
+def _kda_scan_kernel(
+    kn, w, u, el, h_o, vnew_o,
+    T, NT,
+    H: tl.constexpr, K: tl.constexpr, V: tl.constexpr,
+    BT: tl.constexpr, BV: tl.constexpr,
+):
+    i_bh = tl.program_id(0)
+    i_v = tl.program_id(1)
+    i_b = i_bh // H
+    i_h = i_bh % H
+
+    o_t = tl.arange(0, BT)
+    o_k = tl.arange(0, K)
+    o_v = i_v * BV + tl.arange(0, BV)
+
+    b_h = tl.zeros((K, BV), dtype=tl.float32)
+
+    base_qk = i_b * T * H * K + i_h * K
+    base_v = i_b * T * H * V + i_h * V
+    p_h = h_o + i_bh * NT * K * V + o_k[:, None] * V + o_v[None, :]
+
+    for i_t in range(NT):
+        # store chunk-start state
+        tl.store(p_h + i_t * K * V, b_h.to(tl.bfloat16))
+
+        row_qk = base_qk + i_t * BT * H * K
+        row_v = base_v + i_t * BT * H * V
+
+        b_w = tl.load(w + row_qk + o_t[:, None] * (H * K) + o_k[None, :])
+        b_u = tl.load(u + row_v + o_t[:, None] * (H * V) + o_v[None, :]).to(tl.float32)
+        b_vn = b_u - tl.dot(b_w, b_h.to(tl.bfloat16))
+        b_vn16 = b_vn.to(tl.bfloat16)
+        tl.store(vnew_o + row_v + o_t[:, None] * (H * V) + o_v[None, :], b_vn16)
+
+        b_kn = tl.load(kn + row_qk + o_t[:, None] * (H * K) + o_k[None, :])
+        b_el = tl.load(el + (i_bh * NT + i_t) * K + o_k)
+        b_h = b_h * b_el[:, None] + tl.dot(tl.trans(b_kn), b_vn16)
+
+
+# ---------------------------------------------------------------------------
+# K3: output kernel
+# ---------------------------------------------------------------------------
+@triton.jit
+def _kda_out_kernel(
+    qg, h, Aqk, vnew, o,
+    T, NT,
+    H: tl.constexpr, K: tl.constexpr, V: tl.constexpr,
+    BT: tl.constexpr,
+):
+    i_c = tl.program_id(0)
+    i_bh = tl.program_id(1)
+    i_b = i_bh // H
+    i_h = i_bh % H
+
+    o_t = tl.arange(0, BT)
+    o_k = tl.arange(0, K)
+    o_v = tl.arange(0, V)
+
+    row_qk = (i_b * NT + i_c) * BT * H * K + i_h * K
+    row_v = (i_b * NT + i_c) * BT * H * V + i_h * V
+
+    b_qg = tl.load(qg + row_qk + o_t[:, None] * (H * K) + o_k[None, :])
+    b_h = tl.load(h + i_bh * NT * K * V + i_c * K * V + o_k[:, None] * V + o_v[None, :])
+    b_o = tl.dot(b_qg, b_h)
+
+    b_A = tl.load(Aqk + (i_b * NT + i_c) * BT * H * BT + i_h * BT
+                  + o_t[:, None] * (H * BT) + o_t[None, :])
+    b_vn = tl.load(vnew + row_v + o_t[:, None] * (H * V) + o_v[None, :])
+    b_o += tl.dot(b_A, b_vn)
+
+    tl.store(o + row_v + o_t[:, None] * (H * V) + o_v[None, :], b_o.to(tl.bfloat16))
+
+
+# ---------------------------------------------------------------------------
+# Host-side wrapper
+# ---------------------------------------------------------------------------
+def kda_chunk_forward(
+    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
+    g: torch.Tensor, beta: torch.Tensor, scale: float,
+    chunk_size: int = 64,
+) -> torch.Tensor:
+    B, T, H, K = q.shape
+    V = v.shape[-1]
+    BT = chunk_size
+    NT = T // BT
+    assert T % BT == 0
+
+    q = q.contiguous(); k = k.contiguous(); v = v.contiguous()
+    g = g.contiguous(); beta = beta.contiguous()
+
+    dev = q.device
+    bf = torch.bfloat16
+    BH = B * H
+
+    kn = torch.empty(B, T, H, K, dtype=bf, device=dev)
+    w = torch.empty(B, T, H, K, dtype=bf, device=dev)
+    u = torch.empty(B, T, H, V, dtype=bf, device=dev)
+    qg = torch.empty(B, T, H, K, dtype=bf, device=dev)
+    Aqk = torch.empty(B, T, H, BT, dtype=bf, device=dev)
+    el = torch.empty(B, H, NT, K, dtype=torch.float32, device=dev)
+    h = torch.empty(B, H, NT, K, V, dtype=bf, device=dev)
+    v_new = torch.empty(B, T, H, V, dtype=bf, device=dev)
+    o = torch.empty(B, T, H, V, dtype=bf, device=dev)
+
+    _kda_intra_kernel[(NT, BH)](
+        q, k, v, g, beta, kn, w, u, qg, Aqk, el, scale,
+        NT, H=H, K=K, V=V, BT=BT, num_warps=4,
+    )
+    _get_cuda().scan_forward(kn, w, u, el, h, v_new, T, NT, H)
+    _get_cuda().out_forward(qg, h, Aqk, v_new, o, T, NT, H)
+    return o
+
+
+class Model(nn.Module):
+    """KDA forward (chunk form). No learned parameters; all inputs are activations."""
+
+    def __init__(self, B: int, T: int, H: int, K: int, V: int, chunk_size: int = 64):
+        super().__init__()
+        self.B, self.T, self.H, self.K, self.V = B, T, H, K, V
+        self.chunk_size = chunk_size
+        self.scale = float(K) ** -0.5
+        self.register_buffer("_dummy", torch.zeros(1), persistent=False)
+
+    def forward(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        g: torch.Tensor,
+        beta: torch.Tensor,
+    ) -> torch.Tensor:
+        return kda_chunk_forward(q, k, v, g, beta, scale=self.scale, chunk_size=self.chunk_size)
+
+
+# Module-level shape shims (overridden by check.py / benchmark.py per shape).
+B = 2
+T = 1024
+H = 8
+K = 128
+V = 128
+CHUNK_SIZE = 64
+
+
+def get_inputs():
+    torch.manual_seed(0)
+    q = torch.randn(B, T, H, K, dtype=torch.bfloat16) * 0.1
+    k = torch.randn(B, T, H, K, dtype=torch.bfloat16) * 0.1
+    v = torch.randn(B, T, H, V, dtype=torch.bfloat16) * 0.1
+    g = (torch.randn(B, T, H, K, dtype=torch.float32) * 0.1 - 0.05)
+    beta = torch.sigmoid(torch.randn(B, T, H, dtype=torch.bfloat16))
+    return [q, k, v, g, beta]
+
+
+def get_init_inputs():
+    return [B, T, H, K, V, CHUNK_SIZE]

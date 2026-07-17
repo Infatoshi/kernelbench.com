@@ -1,0 +1,682 @@
+"""DeepSeek NSA-style block-select sparse attention - CUDA implementation (SM120).
+
+Semantics (matches reference.nsa_attend): block importance = mean causal (q.k)/sqrt(D)
+per 64-key block; top-8 blocks + 64-token sliding window; softmax attention over
+the selected keys only. See check.py / problem.yaml.
+
+Pipeline (3 kernels):
+  K1 kbar_kernel:   block-mean keys Kbar (mean(q.k) == q.mean(k)), transposed
+                    layout so scoring is a small coalesced GEMV, never dense QK^T.
+  K2 select_kernel: batched top-8 selection for tiles of queries sharing one key
+                    block; fp32 importances from smem-staged Kbar + exact causal
+                    prefix dot for the current block. Writes per-query block lists.
+  K3 attn_kernel:   per-query gather + two-pass softmax attention: cp.async
+                    3-deep pipeline over 32-row segments, padded rows
+                    (bank-conflict-free dots), bf16x2 vector V accumulation,
+                    fp32 scores/softmax, bf16 output.
+
+A vectorized PyTorch fallback covers shapes outside the CUDA fast path.
+"""
+from __future__ import annotations
+
+import math
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+OP_TYPE = "deepseek_nsa"
+SUPPORTED_PRECISIONS = ["bf16"]
+HARDWARE_REQUIRED = ["RTX_PRO_6000"]
+
+B, H, S, D = 1, 16, 1024, 64
+BLOCK_SIZE = 64
+TOP_N_BLOCKS = 8
+SLIDING_WINDOW = 64
+
+CUDA_SRC = r"""
+#include <torch/extension.h>
+#include <ATen/cuda/CUDAContext.h>
+#include <cuda_bf16.h>
+#include <cuda_runtime.h>
+
+#define NT 256
+#define NBMAX 128
+#define TOPN 8
+#define BSIZE 64
+#define MAXKEYS 576
+#define NSEGMAX 20
+#define FULLMASK 0xffffffffu
+#define NEGINF (-1e30f)
+
+using bf16 = __nv_bfloat16;
+
+// ---------------------------------------------------------------------------
+// K1: block-mean keys, transposed layout  Kbar_T[(bh*D + d)*NB + bi]
+// ---------------------------------------------------------------------------
+template <int D>
+__global__ void kbar_kernel(const bf16* __restrict__ K, float* __restrict__ KbarT,
+                            int S, int nblocks) {
+    const int bi = blockIdx.x;
+    const int bh = blockIdx.y;
+    const int rows = min(BSIZE, S - bi * BSIZE);
+    const bf16* kb = K + ((long)bh * S + (long)bi * BSIZE) * D;
+    __shared__ float part[128];
+    constexpr int NSUB = 128 / D;
+    const int d = threadIdx.x % D;
+    const int sub = threadIdx.x / D;
+    float acc = 0.f;
+    for (int j = sub; j < rows; j += NSUB)
+        acc += __bfloat162float(kb[(long)j * D + d]);
+    if (NSUB > 1) {
+        part[threadIdx.x] = acc;
+        __syncthreads();
+        if (sub == 0) {
+            float tot = part[d];
+            for (int s2 = 1; s2 < NSUB; s2++) tot += part[s2 * D + d];
+            KbarT[((long)bh * D + d) * nblocks + bi] = tot / (float)rows;
+        }
+    } else {
+        KbarT[((long)bh * D + d) * nblocks + bi] = acc / (float)rows;
+    }
+}
+
+__device__ __forceinline__ void cp_async16(void* smem_dst, const void* gmem_src) {
+    unsigned sdst = (unsigned)__cvta_generic_to_shared(smem_dst);
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"(sdst), "l"(gmem_src));
+}
+__device__ __forceinline__ void cp_commit() { asm volatile("cp.async.commit_group;\n"); }
+template <int N>
+__device__ __forceinline__ void cp_wait() { asm volatile("cp.async.wait_group %0;\n" ::"n"(N)); }
+
+__device__ __forceinline__ void stage_async(bf16* dst, const bf16* src, int nchunks16, int tid) {
+    const char* g = (const char*)src;
+    char* s = (char*)dst;
+    for (int c = tid; c < nchunks16; c += NT) cp_async16(s + c * 16, g + c * 16);
+    cp_commit();
+}
+
+// ---------------------------------------------------------------------------
+// K2: batched top-8 selection.
+// grid: (ceil(S/QT), BH). Tile of QT queries shares one key block cb.
+// smem: [qbuf QT*D f32][kblk 64*D bf16][kbarc CHUNK*D f32][imp QT*NBMAX f32][pj QT*JG]
+// ---------------------------------------------------------------------------
+template <int D, int QT, int CHUNK>
+__global__ void __launch_bounds__(NT)
+select_kernel(const bf16* __restrict__ Q, const bf16* __restrict__ K,
+              const float* __restrict__ KbarT, short* __restrict__ sel_out,
+              int S, int nblocks, float scale) {
+    extern __shared__ char smem_raw[];
+    float* qbuf = (float*)smem_raw;                 // QT*D
+    bf16* kblk = (bf16*)(qbuf + QT * D);            // BSIZE*D
+    float* kbarc = (float*)(kblk + BSIZE * D);      // CHUNK*D
+    float* imp = kbarc + CHUNK * D;                 // QT*NBMAX
+    float* pj = imp + QT * NBMAX;                   // QT*8 scratch
+
+    const int bh = blockIdx.y;
+    const int t0 = blockIdx.x * QT;
+    if (t0 >= S) return;
+    const int tid = threadIdx.x;
+    const int qrows = min(QT, S - t0);
+    const int cb = t0 >> 6;
+    const int nvalid = cb + 1;
+    constexpr int JG = 8;                            // j-groups (NT/QT = 256/32)
+
+    // stage Q tile -> fp32 smem
+    {
+        const bf16* qsrc = Q + ((long)bh * S + t0) * D;
+        for (int i = tid; i < qrows * D; i += NT) qbuf[i] = __bfloat162float(qsrc[i]);
+    }
+    // stage current block K rows (clamped to S for a partial last block)
+    const int kblk_rows = min(BSIZE, S - cb * BSIZE);
+    stage_async(kblk, K + ((long)bh * S + cb * BSIZE) * D, kblk_rows * (D / 8), tid);
+    // init imp to NEGINF while copies fly
+    for (int i = tid; i < QT * NBMAX; i += NT) imp[i] = NEGINF;
+    cp_wait<0>();
+    __syncthreads();
+
+    // ---- causal prefix importance for the shared current block ----
+    {
+        const int qi = tid >> 3;                   // 0..31
+        const int jg = tid & 7;
+        const int off = t0 - (cb << 6);            // 0 or 32
+        float acc = 0.f;
+        if (qi < qrows) {
+            const int cnt = off + qi + 1;
+            const float* q4 = qbuf + qi * D;
+            for (int j = jg; j < cnt; j += JG) {
+                const uint4* r4 = (const uint4*)(kblk + j * D);
+                float dacc = 0.f;
+#pragma unroll
+                for (int dd = 0; dd < D / 8; dd++) {
+                    uint4 raw = r4[dd];
+                    const __nv_bfloat162* h2 = (const __nv_bfloat162*)&raw;
+                    float2 f0 = __bfloat1622float2(h2[0]);
+                    float2 f1 = __bfloat1622float2(h2[1]);
+                    float2 f2 = __bfloat1622float2(h2[2]);
+                    float2 f3 = __bfloat1622float2(h2[3]);
+                    const float* qd = q4 + dd * 8;
+                    dacc = fmaf(f0.x, qd[0], dacc); dacc = fmaf(f0.y, qd[1], dacc);
+                    dacc = fmaf(f1.x, qd[2], dacc); dacc = fmaf(f1.y, qd[3], dacc);
+                    dacc = fmaf(f2.x, qd[4], dacc); dacc = fmaf(f2.y, qd[5], dacc);
+                    dacc = fmaf(f3.x, qd[6], dacc); dacc = fmaf(f3.y, qd[7], dacc);
+                }
+                acc += dacc;
+            }
+        }
+        pj[tid] = acc;
+        __syncthreads();
+        if (tid < qrows) {
+            float tot = 0.f;
+#pragma unroll
+            for (int g2 = 0; g2 < JG; g2++) tot += pj[tid * JG + g2];
+            const int cnt = off + tid + 1;
+            imp[tid * NBMAX + cb] = tot * scale / (float)cnt;
+        }
+        __syncthreads();
+    }
+
+    // ---- Kbar importances in chunks ----
+    for (int c0 = 0; c0 < cb; c0 += CHUNK) {
+        const int cn = min(CHUNK, cb - c0);
+        for (int i = tid; i < D * cn; i += NT) {
+            const int dd = i / cn;
+            const int j = i - dd * cn;
+            kbarc[dd * CHUNK + j] = KbarT[((long)bh * D + dd) * nblocks + c0 + j];
+        }
+        __syncthreads();
+        const int qi = tid >> 3;
+        const int bg = tid & 7;
+        if (qi < qrows) {
+            const float* q4 = qbuf + qi * D;
+#pragma unroll 2
+            for (int j = bg; j < cn; j += 8) {
+                float a0 = 0.f, a1 = 0.f, a2 = 0.f, a3 = 0.f;
+                for (int dd = 0; dd < D; dd += 4) {
+                    a0 = fmaf(kbarc[(dd + 0) * CHUNK + j], q4[dd + 0], a0);
+                    a1 = fmaf(kbarc[(dd + 1) * CHUNK + j], q4[dd + 1], a1);
+                    a2 = fmaf(kbarc[(dd + 2) * CHUNK + j], q4[dd + 2], a2);
+                    a3 = fmaf(kbarc[(dd + 3) * CHUNK + j], q4[dd + 3], a3);
+                }
+                imp[qi * NBMAX + c0 + j] = ((a0 + a1) + (a2 + a3)) * scale;
+            }
+        }
+        __syncthreads();
+    }
+
+    // ---- top-8 per query (one warp per query), pad tail with -1 ----
+    {
+        const int warp = tid >> 5, lane = tid & 31;
+        for (int qi = warp; qi < qrows; qi += NT / 32) {
+            float* row = imp + qi * NBMAX;
+            float bv = NEGINF;
+            int bb = -1;
+            int nsel = 0;
+#pragma unroll
+            for (int r = 0; r < TOPN; r++) {
+                bv = NEGINF; bb = -1;
+                for (int bi = lane; bi < nvalid; bi += 32) {
+                    float v = row[bi];
+                    if (v > NEGINF && (v > bv || (v == bv && bi > bb))) { bv = v; bb = bi; }
+                }
+                for (int off2 = 16; off2; off2 >>= 1) {
+                    float ov = __shfl_xor_sync(FULLMASK, bv, off2);
+                    int ob = __shfl_xor_sync(FULLMASK, bb, off2);
+                    if (ov > NEGINF && (ov > bv || (ov == bv && ob > bb))) { bv = ov; bb = ob; }
+                }
+                if (bb < 0) break;
+                if (lane == 0) {
+                    sel_out[((long)bh * S + t0 + qi) * TOPN + r] = (short)bb;
+                    nsel = r + 1;
+                }
+                for (int bi = lane; bi < nvalid; bi += 32)
+                    if (bi == bb) row[bi] = NEGINF;
+                __syncwarp();
+            }
+            if (lane == 0) {
+                short* so = sel_out + ((long)bh * S + t0 + qi) * TOPN;
+                for (int r = nsel; r < TOPN; r++) so[r] = -1;
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// K3: per-query gather + two-pass softmax attention (v1 attention, no select)
+// ANT threads per CTA; scores use TPK = ANT/64 threads per key.
+// Staging rows are padded (stride D+PAD bf16) so consecutive rows rotate
+// across smem banks (conflict-free dots and V reads).
+// ---------------------------------------------------------------------------
+#define PADROW 8
+#define RWORDS ((D + PADROW) / 8)                       // uint4 per padded row
+
+template <int D, int TPK>
+__device__ __forceinline__ float dot_row_smem(const bf16* stage, int j, const float4* q4, int g) {
+    constexpr int PT = D / (8 * TPK);                   // uint4 chunks per thread
+    constexpr int RW = (D + PADROW) / 8;
+    const uint4* s4 = (const uint4*)stage;
+    float acc0 = 0.f, acc1 = 0.f;
+#pragma unroll
+    for (int c = 0; c < PT; c += 2) {
+#pragma unroll
+        for (int cc = 0; cc < 2; cc++) {
+            if (c + cc < PT) {
+                uint4 raw = s4[j * RW + g * PT + c + cc];
+                float4 qa = q4[(g * PT + c + cc) * 2];
+                float4 qb = q4[(g * PT + c + cc) * 2 + 1];
+                const __nv_bfloat162* h2 = (const __nv_bfloat162*)&raw;
+                float2 f0 = __bfloat1622float2(h2[0]);
+                float2 f1 = __bfloat1622float2(h2[1]);
+                float2 f2 = __bfloat1622float2(h2[2]);
+                float2 f3 = __bfloat1622float2(h2[3]);
+                if (cc == 0) {
+                    acc0 = fmaf(f0.x, qa.x, acc0); acc0 = fmaf(f0.y, qa.y, acc0);
+                    acc0 = fmaf(f1.x, qa.z, acc0); acc0 = fmaf(f1.y, qa.w, acc0);
+                    acc0 = fmaf(f2.x, qb.x, acc0); acc0 = fmaf(f2.y, qb.y, acc0);
+                    acc0 = fmaf(f3.x, qb.z, acc0); acc0 = fmaf(f3.y, qb.w, acc0);
+                } else {
+                    acc1 = fmaf(f0.x, qa.x, acc1); acc1 = fmaf(f0.y, qa.y, acc1);
+                    acc1 = fmaf(f1.x, qa.z, acc1); acc1 = fmaf(f1.y, qa.w, acc1);
+                    acc1 = fmaf(f2.x, qb.x, acc1); acc1 = fmaf(f2.y, qb.y, acc1);
+                    acc1 = fmaf(f3.x, qb.z, acc1); acc1 = fmaf(f3.y, qb.w, acc1);
+                }
+            }
+        }
+    }
+    return acc0 + acc1;
+}
+
+template <int ANT>
+__device__ __forceinline__ float blk_max(float v, float* red, int tid) {
+    constexpr int WARPS = ANT / 32;
+    for (int off = 16; off; off >>= 1) v = fmaxf(v, __shfl_down_sync(FULLMASK, v, off));
+    if ((tid & 31) == 0) red[tid >> 5] = v;
+    __syncthreads();
+    if (tid < 32) {
+        v = (tid < WARPS) ? red[tid] : NEGINF;
+        for (int off = WARPS >> 1; off; off >>= 1) v = fmaxf(v, __shfl_down_sync(FULLMASK, v, off));
+        if (tid == 0) red[0] = v;
+    }
+    __syncthreads();
+    return red[0];
+}
+template <int ANT>
+__device__ __forceinline__ float blk_sum(float v, float* red, int tid) {
+    constexpr int WARPS = ANT / 32;
+    for (int off = 16; off; off >>= 1) v += __shfl_down_sync(FULLMASK, v, off);
+    if ((tid & 31) == 0) red[tid >> 5] = v;
+    __syncthreads();
+    if (tid < 32) {
+        v = (tid < WARPS) ? red[tid] : 0.f;
+        for (int off = WARPS >> 1; off; off >>= 1) v += __shfl_down_sync(FULLMASK, v, off);
+        if (tid == 0) red[0] = v;
+    }
+    __syncthreads();
+    return red[0];
+}
+
+// stage rows of a (S,D) bf16 matrix into a padded-stride smem buffer
+template <int D>
+__device__ __forceinline__ void stage_async_n(bf16* dst, const bf16* src, int len, int tid, int nt) {
+    constexpr int RW = (D + PADROW) / 8;                // uint4 per padded row
+    const int nchunks = len * (D / 8);
+    const char* g = (const char*)src;
+    char* s = (char*)dst;
+    for (int c = tid; c < nchunks; c += nt) {
+        const int row = c / (D / 8);
+        const int off16 = c - row * (D / 8);
+        cp_async16(s + (row * RW + off16) * 16, g + c * 16);
+    }
+    cp_commit();
+}
+
+template <int D, int ANT, int SEGCAP, int PD>
+__global__ void __launch_bounds__(ANT)
+attn_kernel(const bf16* __restrict__ Q, const bf16* __restrict__ K,
+            const bf16* __restrict__ V, const short* __restrict__ sel_in,
+            bf16* __restrict__ O, int B, int H, int S, float scale) {
+    constexpr int TPK = ANT / 64;                       // threads per key in phase 1
+    constexpr int RSTRIDE = D + PADROW;                 // padded row stride (bf16)
+    constexpr int NPAIR = D / 2;                        // bf16x2 pairs per row
+    constexpr int KGV = ANT / NPAIR;                    // key groups in phase 2
+    constexpr int NBUF = PD + 1;                        // stage buffers
+    extern __shared__ char smem_raw[];
+    bf16* stage = (bf16*)smem_raw;                      // NBUF * SEGCAP * RSTRIDE bf16
+    float* q_s = (float*)(smem_raw + (long)NBUF * SEGCAP * RSTRIDE * 2); // D floats
+    float* scores_s = q_s + D;                          // 576 floats
+    float* opart = scores_s + MAXKEYS;                  // KGV*D floats
+    float* red_s = opart + KGV * D;                     // 32 floats
+    int* seg_lo = (int*)(red_s + 32);                   // 10
+    int* seg_len = seg_lo + NSEGMAX;                    // 10
+    int* seg_off = seg_len + NSEGMAX;                   // 10
+    int* cnt_s = seg_off + NSEGMAX;                     // nseg, nkeys
+
+    const int xid = blockIdx.x;
+    const int t = xid % S;
+    const int bh = xid / S;
+    const int tid = threadIdx.x;
+    const int w0 = max(0, t + 1 - BSIZE);
+    const bf16* Kbh = K + (long)bh * S * D;
+    const bf16* Vbh = V + (long)bh * S * D;
+
+    if (tid < D) q_s[tid] = __bfloat162float(Q[((long)bh * S + t) * D + tid]);
+    // ---- load selection + build segments (warp 0 lane 0) ----
+    __syncthreads();
+    if (tid == 0) {
+        int off = 0, nseg = 0;
+        const short* si = sel_in + (long)xid * TOPN;
+        for (int r = 0; r < TOPN; r++) {
+            int bi = si[r];
+            if (bi < 0) break;
+            int lo = bi * BSIZE;
+            int hi = min(min(lo + BSIZE, t + 1), w0);
+            for (int b0 = lo; b0 < hi; b0 += SEGCAP) {
+                int c = min(hi - b0, SEGCAP);
+                seg_lo[nseg] = b0; seg_len[nseg] = c; seg_off[nseg] = off;
+                off += c; nseg++;
+            }
+        }
+        int a = w0, b = t + 1;
+        for (; a < b; a += SEGCAP) {
+            int c = min(b - a, SEGCAP);
+            seg_lo[nseg] = a; seg_len[nseg] = c; seg_off[nseg] = off;
+            off += c; nseg++;
+        }
+        cnt_s[0] = nseg;
+        cnt_s[1] = off;
+    }
+    __syncthreads();
+    const int nseg = cnt_s[0];
+    const int nkeys = cnt_s[1];
+    const float4* q4 = (const float4*)q_s;
+
+    // ---- phase 1: stage K segments, compute scores ----
+#pragma unroll
+    for (int p = 0; p < PD; p++)
+        if (p < nseg) stage_async_n<D>(stage + p * SEGCAP * RSTRIDE,
+                                       Kbh + (long)seg_lo[p] * D, seg_len[p], tid, ANT);
+    for (int s = 0; s < nseg; s++) {
+        bf16* buf = stage + (s % NBUF) * SEGCAP * RSTRIDE;
+        if (s + PD < nseg) {
+            stage_async_n<D>(stage + ((s + PD) % NBUF) * SEGCAP * RSTRIDE,
+                             Kbh + (long)seg_lo[s + PD] * D, seg_len[s + PD], tid, ANT);
+            cp_wait<PD>();
+        } else if (s + 2 == nseg) {
+            cp_wait<1>();
+        } else {
+            cp_wait<0>();
+        }
+        __syncthreads();
+        const int len = seg_len[s];
+        const int j = tid / TPK, g = tid % TPK;
+        float acc = 0.f;
+        if (j < len) acc = dot_row_smem<D, TPK>(buf, j, q4, g);
+        for (int off = 1; off < TPK; off <<= 1) acc += __shfl_xor_sync(FULLMASK, acc, off);
+        if (g == 0 && j < len) scores_s[seg_off[s] + j] = acc * scale;
+        __syncthreads();
+    }
+
+    // ---- softmax normalize ----
+    {
+        float m = NEGINF;
+        for (int i = tid; i < nkeys; i += ANT) m = fmaxf(m, scores_s[i]);
+        m = blk_max<ANT>(m, red_s, tid);
+        float l = 0.f;
+        for (int i = tid; i < nkeys; i += ANT) {
+            float p = __expf(scores_s[i] - m);
+            scores_s[i] = p;
+            l += p;
+        }
+        blk_sum<ANT>(l, red_s, tid);
+    }
+
+    // ---- phase 2: stage V segments, accumulate (bf16x2 vector reads) ----
+#pragma unroll
+    for (int p = 0; p < PD; p++)
+        if (p < nseg) stage_async_n<D>(stage + p * SEGCAP * RSTRIDE,
+                                       Vbh + (long)seg_lo[p] * D, seg_len[p], tid, ANT);
+    const int dp = tid % NPAIR;                         // dim pair owned
+    const int kg = tid / NPAIR;                         // key group
+    float oa0 = 0.f, oa1 = 0.f;
+    const float rsum = red_s[0];
+    for (int s = 0; s < nseg; s++) {
+        const bf16* buf = stage + (s % NBUF) * SEGCAP * RSTRIDE;
+        if (s + PD < nseg) {
+            stage_async_n<D>(stage + ((s + PD) % NBUF) * SEGCAP * RSTRIDE,
+                             Vbh + (long)seg_lo[s + PD] * D, seg_len[s + PD], tid, ANT);
+            cp_wait<PD>();
+        } else if (s + 2 == nseg) {
+            cp_wait<1>();
+        } else {
+            cp_wait<0>();
+        }
+        __syncthreads();
+        const int len = seg_len[s];
+        const int soff = seg_off[s];
+        const float* p = scores_s + soff;
+#pragma unroll 2
+        for (int j = kg; j < len; j += KGV) {
+            const float pj = p[j];
+            const float2 vv = __bfloat1622float2(*(const __nv_bfloat162*)&buf[j * RSTRIDE + dp * 2]);
+            oa0 = fmaf(pj, vv.x, oa0);
+            oa1 = fmaf(pj, vv.y, oa1);
+        }
+        __syncthreads();
+    }
+    opart[kg * D + dp * 2] = oa0;
+    opart[kg * D + dp * 2 + 1] = oa1;
+    __syncthreads();
+    if (tid < D) {
+        float acc = opart[tid];
+        for (int s2 = 1; s2 < KGV; s2++) acc += opart[s2 * D + tid];
+        O[((long)bh * S + t) * D + tid] = __float2bfloat16(acc / rsum);
+    }
+}
+// ---------------------------------------------------------------------------
+// host
+// ---------------------------------------------------------------------------
+torch::Tensor nsa_forward_v2(torch::Tensor Q, torch::Tensor K, torch::Tensor V, long variant) {
+    const int Bn = Q.size(0), Hn = Q.size(1), Sn = Q.size(2), Dn = Q.size(3);
+    const int BH = Bn * Hn;
+    const int nblocks = (Sn + BSIZE - 1) / BSIZE;
+    TORCH_CHECK(nblocks <= NBMAX, "S too large for fast path");
+    auto O = torch::empty_like(Q);
+    auto Kbar = torch::empty({(long)BH * Dn * nblocks},
+                             torch::TensorOptions().dtype(torch::kFloat32).device(Q.device()));
+    auto sel = torch::empty({(long)BH * Sn * TOPN},
+                            torch::TensorOptions().dtype(torch::kInt16).device(Q.device()));
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    const float scale = (float)(1.0 / std::sqrt((double)Dn));
+
+    dim3 g1(nblocks, BH);
+    dim3 g3(BH * Sn);
+    const int PAD = PADROW;
+    if (Dn == 64) {
+        kbar_kernel<64><<<g1, 128, 0, stream>>>(
+            (const bf16*)K.data_ptr(), Kbar.data_ptr<float>(), Sn, nblocks);
+        constexpr int QT = 32, CHUNK = 32;
+        dim3 gs((Sn + QT - 1) / QT, BH);
+        const int smem_s = QT * 64 * 4 + BSIZE * 64 * 2 + CHUNK * 64 * 4 + QT * NBMAX * 4 + NT * 4;
+        select_kernel<64, QT, CHUNK><<<gs, NT, smem_s, stream>>>(
+            (const bf16*)Q.data_ptr(), (const bf16*)K.data_ptr(), Kbar.data_ptr<float>(),
+            (short*)sel.data_ptr(), Sn, nblocks, scale);
+        const int RSTR = 64 + PAD;
+        switch (variant) {
+            case 1: {  // 256 thr, 32-row segs, 3-buf
+                const int smem = 3 * 32 * RSTR * 2 + (64 + MAXKEYS + 8 * 64 + 32) * 4 + 76 * 4;
+                attn_kernel<64, 256, 32, 2><<<g3, 256, smem, stream>>>(
+                    (const bf16*)Q.data_ptr(), (const bf16*)K.data_ptr(), (const bf16*)V.data_ptr(),
+                    (const short*)sel.data_ptr(), (bf16*)O.data_ptr(), Bn, Hn, Sn, scale);
+                break; }
+            case 2: {  // 512 thr, 64-row segs, 2-buf
+                const int smem = 2 * BSIZE * RSTR * 2 + (64 + MAXKEYS + 16 * 64 + 32) * 4 + 76 * 4;
+                attn_kernel<64, 512, 64, 1><<<g3, 512, smem, stream>>>(
+                    (const bf16*)Q.data_ptr(), (const bf16*)K.data_ptr(), (const bf16*)V.data_ptr(),
+                    (const short*)sel.data_ptr(), (bf16*)O.data_ptr(), Bn, Hn, Sn, scale);
+                break; }
+            case 3: {  // 512 thr, 32-row segs, 3-buf
+                const int smem = 3 * 32 * RSTR * 2 + (64 + MAXKEYS + 16 * 64 + 32) * 4 + 76 * 4;
+                attn_kernel<64, 512, 32, 2><<<g3, 512, smem, stream>>>(
+                    (const bf16*)Q.data_ptr(), (const bf16*)K.data_ptr(), (const bf16*)V.data_ptr(),
+                    (const short*)sel.data_ptr(), (bf16*)O.data_ptr(), Bn, Hn, Sn, scale);
+                break; }
+            default: { // 256 thr, 64-row segs, 2-buf (baseline)
+                const int smem = 2 * BSIZE * RSTR * 2 + (64 + MAXKEYS + 8 * 64 + 32) * 4 + 76 * 4;
+                attn_kernel<64, 256, 64, 1><<<g3, 256, smem, stream>>>(
+                    (const bf16*)Q.data_ptr(), (const bf16*)K.data_ptr(), (const bf16*)V.data_ptr(),
+                    (const short*)sel.data_ptr(), (bf16*)O.data_ptr(), Bn, Hn, Sn, scale);
+                break; }
+        }
+    } else if (Dn == 128) {
+        kbar_kernel<128><<<g1, 128, 0, stream>>>(
+            (const bf16*)K.data_ptr(), Kbar.data_ptr<float>(), Sn, nblocks);
+        constexpr int QT = 16, CHUNK = 16;
+        dim3 gs((Sn + QT - 1) / QT, BH);
+        const int smem_s = QT * 128 * 4 + BSIZE * 128 * 2 + CHUNK * 128 * 4 + QT * NBMAX * 4 + NT * 4;
+        select_kernel<128, QT, CHUNK><<<gs, NT, smem_s, stream>>>(
+            (const bf16*)Q.data_ptr(), (const bf16*)K.data_ptr(), Kbar.data_ptr<float>(),
+            (short*)sel.data_ptr(), Sn, nblocks, scale);
+        const int RSTR = 128 + PAD;
+        switch (variant) {
+            case 1: {  // 256 thr, 32-row segs, 3-buf
+                const int smem = 3 * 32 * RSTR * 2 + (128 + MAXKEYS + 4 * 128 + 32) * 4 + 76 * 4;
+                attn_kernel<128, 256, 32, 2><<<g3, 256, smem, stream>>>(
+                    (const bf16*)Q.data_ptr(), (const bf16*)K.data_ptr(), (const bf16*)V.data_ptr(),
+                    (const short*)sel.data_ptr(), (bf16*)O.data_ptr(), Bn, Hn, Sn, scale);
+                break; }
+            case 2: {  // 512 thr, 64-row segs, 2-buf (baseline d128)
+                const int smem = 2 * BSIZE * RSTR * 2 + (128 + MAXKEYS + 8 * 128 + 32) * 4 + 76 * 4;
+                attn_kernel<128, 512, 64, 1><<<g3, 512, smem, stream>>>(
+                    (const bf16*)Q.data_ptr(), (const bf16*)K.data_ptr(), (const bf16*)V.data_ptr(),
+                    (const short*)sel.data_ptr(), (bf16*)O.data_ptr(), Bn, Hn, Sn, scale);
+                break; }
+            case 3: {  // 512 thr, 32-row segs, 3-buf
+                const int smem = 3 * 32 * RSTR * 2 + (128 + MAXKEYS + 8 * 128 + 32) * 4 + 76 * 4;
+                attn_kernel<128, 512, 32, 2><<<g3, 512, smem, stream>>>(
+                    (const bf16*)Q.data_ptr(), (const bf16*)K.data_ptr(), (const bf16*)V.data_ptr(),
+                    (const short*)sel.data_ptr(), (bf16*)O.data_ptr(), Bn, Hn, Sn, scale);
+                break; }
+            default: { // 256 thr, 64-row segs, 2-buf
+                const int smem = 2 * BSIZE * RSTR * 2 + (128 + MAXKEYS + 4 * 128 + 32) * 4 + 76 * 4;
+                attn_kernel<128, 256, 64, 1><<<g3, 256, smem, stream>>>(
+                    (const bf16*)Q.data_ptr(), (const bf16*)K.data_ptr(), (const bf16*)V.data_ptr(),
+                    (const short*)sel.data_ptr(), (bf16*)O.data_ptr(), Bn, Hn, Sn, scale);
+                break; }
+        }
+    } else {
+        TORCH_CHECK(false, "unsupported head dim");
+    }
+    return O;
+}
+"""
+
+
+
+CPP_SRC = "torch::Tensor nsa_forward_v2(torch::Tensor Q, torch::Tensor K, torch::Tensor V, long variant);"
+
+_ext = None
+
+
+def _build():
+    global _ext
+    if _ext is not None:
+        return _ext
+    from torch.utils.cpp_extension import load_inline
+
+    _ext = load_inline(
+        name="nsa_sparse_attn_v4",
+        cpp_sources=[CPP_SRC],
+        cuda_sources=[CUDA_SRC],
+        functions=["nsa_forward_v2"],
+        verbose=False,
+        extra_cflags=["-O3", "-std=c++17"],
+        extra_cuda_cflags=[
+            "-O3",
+            "-std=c++17",
+            "--use_fast_math",
+            "-gencode=arch=compute_120a,code=sm_120a",
+        ],
+    )
+    return _ext
+
+
+def _nsa_torch_fallback(q, k, v, bs=64, topn=8, win=64):
+    """Vectorized PyTorch port of the reference semantics.
+
+    Correctness safety net for shapes outside the CUDA fast path
+    (D not in {64,128} or S > 8192). Not used by the public deck.
+    """
+    qf, kf, vf = q.float(), k.float(), v.float()
+    Bb, Hh, Ss, Dd = qf.shape
+    scale = 1.0 / math.sqrt(Dd)
+    nblocks = (Ss + bs - 1) // bs
+    device = qf.device
+    out = torch.empty_like(qf)
+    ar = torch.arange(Ss, device=device)
+    for b in range(Bb):
+        for h in range(Hh):
+            sc = (qf[b, h] @ kf[b, h].transpose(0, 1)) * scale  # (S,S) fp32
+            imp = torch.full((Ss, nblocks), -1e9, device=device)
+            for bi in range(nblocks):
+                s0 = bi * bs
+                s1 = min(s0 + bs, Ss)
+                col = sc[:, s0:s1]  # (S, len)
+                cc = col.cumsum(1)
+                # rows t >= s0: causal prefix over columns [s0, min(t, s1-1)]
+                t_lo = s0
+                tvec_r = ar[t_lo:]
+                idx = torch.clamp(tvec_r - s0, max=s1 - s0 - 1)
+                rowsum = cc[t_lo:].gather(1, idx.unsqueeze(1)).squeeze(1)
+                cnt = (idx + 1).float()
+                imp[t_lo:, bi] = rowsum / cnt
+            k_ = min(topn, nblocks)
+            topv, topi = torch.topk(imp, k=k_, dim=1)
+            # selected mask over keys, causal, union sliding window
+            keymask = qf.new_zeros((Ss, Ss), dtype=torch.bool)
+            tvec = ar.unsqueeze(1)
+            for r in range(k_):
+                bi_r = topi[:, r : r + 1]  # (S,1)
+                lo = bi_r * bs
+                valid = (topv[:, r : r + 1] > -1e8) & (lo <= tvec)
+                inblk = (ar.unsqueeze(0) >= lo) & (ar.unsqueeze(0) < lo + bs) & (ar.unsqueeze(0) <= tvec)
+                keymask |= inblk & valid
+            w0 = torch.clamp(tvec - win + 1, min=0)
+            keymask |= (ar.unsqueeze(0) >= w0) & (ar.unsqueeze(0) <= tvec)
+            sc_masked = sc.masked_fill(~keymask, float("-inf"))
+            att = torch.softmax(sc_masked, dim=-1)
+            out[b, h] = att @ vf[b, h]
+    return out
+
+
+class Model(nn.Module):
+    def __init__(self, B: int, H: int, S: int, D: int):
+        super().__init__()
+        self.B, self.H, self.S, self.D = B, H, S, D
+        self.register_buffer("_dummy", torch.zeros(1, dtype=torch.bfloat16))
+        self._ext = None
+        if D in (64, 128) and S <= 8192:
+            try:
+                self._ext = _build()
+            except Exception:
+                self._ext = None
+
+    def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+        if (
+            self._ext is not None
+            and q.is_cuda
+            and q.dtype == torch.bfloat16
+            and q.dim() == 4
+            and q.size(-1) in (64, 128)
+            and q.size(2) <= 8192
+        ):
+            # variant 1: 256 threads, 32-row segments, 3-deep cp.async pipeline
+            return self._ext.nsa_forward_v2(q.contiguous(), k.contiguous(), v.contiguous(), 1)
+        return _nsa_torch_fallback(q, k, v, BLOCK_SIZE, TOP_N_BLOCKS, SLIDING_WINDOW).to(torch.bfloat16)
+
+
+# Eagerly build the extension at import so compile cost is outside the timed path.
+if torch.cuda.is_available():
+    try:
+        _build()
+    except Exception:
+        pass

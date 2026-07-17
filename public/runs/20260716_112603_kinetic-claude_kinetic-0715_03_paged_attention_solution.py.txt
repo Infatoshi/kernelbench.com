@@ -1,0 +1,916 @@
+"""Paged-attention decode: custom fused CUDA flash-decoding kernel (SM120).
+
+Single fused kernel launch, cp.async pipelined:
+  - Grid = one CTA per (batch, chunk, kv_head) work item (kv_head fastest so
+    concurrent CTAs read whole pages densely). Each warp streams its token
+    range through an SS-stage cp.async pipeline into shared memory.
+  - For G=8, pairs of warps cover the same tokens; each warp handles only
+    G/2 query heads (KV fetched once, L2 dedups), halving register pressure.
+  - Online flash softmax in exp2 domain, fp32 accumulators.
+  - Last CTA to finish a (batch, kv_head) pair (atomic ticket) reduces all
+    chunk partials and writes the final bf16 output; the ticket self-resets.
+"""
+import math
+
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+OP_TYPE = "attention"
+SUPPORTED_PRECISIONS = ["bf16"]
+HARDWARE_REQUIRED = ["RTX_PRO_6000", "H100", "B200"]
+
+BATCH = 8
+NUM_HEADS = 32
+NUM_KV_HEADS = 8
+HEAD_DIM = 128
+SEQ_LEN = 1024
+PAGE_SIZE = 16
+
+_CUDA_SRC = r"""
+#include <torch/extension.h>
+#include <ATen/cuda/CUDAContext.h>
+#include <cuda_bf16.h>
+#include <cstdlib>
+
+using bf16 = __nv_bfloat16;
+using bf162 = __nv_bfloat162;
+
+#define SS 6
+#define NEG_INF (-1e30f)
+
+__device__ __forceinline__ float2 bf2_to_f2(uint32_t u) {
+    bf162 h = *reinterpret_cast<bf162*>(&u);
+    return __bfloat1622float2(h);
+}
+
+__device__ __forceinline__ void cp_async16(uint32_t smem, const void* gptr, int src_bytes, uint64_t pol) {
+    asm volatile("cp.async.cg.shared.global.L2::cache_hint [%0], [%1], 16, %2, %3;\n"
+                 ::"r"(smem), "l"(gptr), "r"(src_bytes), "l"(pol));
+}
+__device__ __forceinline__ uint64_t mkpolicy(int mode) {
+    uint64_t pol = 0;
+    if (mode == 0) asm volatile("createpolicy.fractional.L2::evict_first.b64 %0, 1.0;" : "=l"(pol));
+    else if (mode == 1) asm volatile("createpolicy.fractional.L2::evict_last.b64 %0, 1.0;" : "=l"(pol));
+    else asm volatile("createpolicy.fractional.L2::evict_normal.b64 %0, 1.0;" : "=l"(pol));
+    return pol;
+}
+
+// ---------- mma helpers ----------
+__device__ __forceinline__ void ldsm_x4(uint32_t* r, uint32_t a) {
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];"
+                 : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "r"(a));
+}
+__device__ __forceinline__ void ldsm_x4_t(uint32_t* r, uint32_t a) {
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, [%4];"
+                 : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "r"(a));
+}
+__device__ __forceinline__ void mma16816(float* c, const uint32_t* a, const uint32_t* b) {
+    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
+                 "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+                 : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
+                 : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
+}
+__device__ __forceinline__ void mma1688(float* c, const uint32_t* a, uint32_t b) {
+    asm volatile("mma.sync.aligned.m16n8k8.row.col.f32.bf16.bf16.f32 "
+                 "{%0,%1,%2,%3}, {%4,%5}, {%6}, {%0,%1,%2,%3};"
+                 : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
+                 : "r"(a[0]), "r"(a[1]), "r"(b));
+}
+__device__ __forceinline__ void cp_commit() { asm volatile("cp.async.commit_group;\n"); }
+template <int N>
+__device__ __forceinline__ void cp_wait() { asm volatile("cp.async.wait_group %0;\n" ::"n"(N)); }
+
+template <int D, int G, int CT, int NW>
+__global__ void __launch_bounds__(NW * 32, 5)
+paged_fused(const bf16* __restrict__ qp,
+            const bf16* __restrict__ kvp,
+            const int*  __restrict__ btp,
+            const int*  __restrict__ slp,
+            float* __restrict__ part,
+            int*   __restrict__ counters,
+            bf16*  __restrict__ out,
+            const int Hkv, const int max_pages, const int nch,
+            const float k_scale, const int pshift, const int pol_mode)
+{
+    constexpr int QK_LANES = D / 8;
+    constexpr int TPG      = 2 * QK_LANES;
+    constexpr int TPI      = 32 / TPG;
+    constexpr int RANGES   = (G == 8) ? 2 : 1;     // token-range replicas
+    constexpr int GW       = G / RANGES;           // query heads per warp
+    constexpr int TSET     = NW / RANGES;          // distinct token ranges
+    constexpr int W_TOK    = CT / TSET;
+    constexpr int W_IT     = W_TOK / TPI;
+    constexpr int ROW      = G * (D + 2);
+    constexpr bool QF32    = false;  // keep q as bf16, unpack in the loop (saves 16 regs)
+
+    const int item  = blockIdx.x;
+    const int b     = item / (Hkv * nch);
+    const int r     = item % (Hkv * nch);
+    const int chunk = r / Hkv;
+    const int hkv   = r % Hkv;
+    const int L     = slp[b];
+    const int t0    = chunk * CT;
+
+    if (L <= 0) {
+        if (chunk == 0 && hkv == 0) {
+            for (int i = threadIdx.x; i < G * Hkv * D; i += blockDim.x) {
+                const int h = i / D, d = i % D;
+                out[((size_t)b * (Hkv * G) + h) * D + d] = __float2bfloat16(0.f);
+            }
+        }
+        return;
+    }
+    if (t0 >= L) return;
+
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    const int tg   = lane / TPG;
+    const int lpos = lane % TPG;
+    const bool isK = lpos < QK_LANES;
+    const int lv   = isK ? lpos : (lpos - QK_LANES);
+    const int range_id = warp % TSET;
+    const int role     = warp / TSET;
+
+    const int    page_mask  = (1 << pshift) - 1;
+    const size_t row_bytes  = ((size_t)1 << pshift) * Hkv * (2 * D) * 2;
+    const size_t tok_stride = (size_t)Hkv * (2 * D) * 2;
+    const size_t lane_off   = (size_t)(isK ? (lv * 8) : (D + lv * 8)) * 2;
+
+    __shared__ __align__(16) char kv_stages[NW][SS][512];
+    // merge buffers alias the (fully drained) stage memory: all real cp.async
+    // ops have completed by the time the token loop exits
+    float* acc_flat = reinterpret_cast<float*>(kv_stages);
+    #define ACC_SH(vg_, g_, d_) acc_flat[((size_t)(vg_) * GW + (g_)) * D + (d_)]
+    __shared__ float msh[NW * TPI][GW];
+    __shared__ float lsh[NW * TPI][GW];
+    __shared__ int   flag_sh;
+
+    const char* kvb = reinterpret_cast<const char*>(kvp)
+                    + (size_t)hkv * (2 * D) * 2 + lane_off;
+    const int* bt_row = btp + (size_t)b * max_pages;
+    const int tw = t0 + range_id * W_TOK;
+
+    // page-id cache (warp token range spans a bounded number of pages)
+    const int pg0 = tw >> pshift;
+    const int npg = min(((tw + W_TOK - 1) >> pshift) - pg0, 4);
+    int pid[5];
+    #pragma unroll
+    for (int j = 0; j < 5; ++j) {
+        const int idx = min(pg0 + min(j, npg), max_pages - 1);
+        pid[j] = __ldg(bt_row + idx);
+    }
+    const bool pid_ok = (((tw + W_TOK - 1) >> pshift) - pg0) <= 4;
+
+    const uint32_t stage_base = (uint32_t)__cvta_generic_to_shared(&kv_stages[warp][0][0]) + lane * 16;
+
+    uint64_t l2pol = mkpolicy(pol_mode);
+
+    #define PGID(t_)                                                                    \
+        ({                                                                              \
+            int pgv_;                                                                   \
+            if (pid_ok) {                                                               \
+                const int pi_ = ((t_) >> pshift) - pg0;                                 \
+                pgv_ = pi_ == 0 ? pid[0] : (pi_ == 1 ? pid[1] : (pi_ == 2 ? pid[2] : (pi_ == 3 ? pid[3] : pid[4]))); \
+            } else {                                                                    \
+                pgv_ = __ldg(bt_row + min((t_) >> pshift, max_pages - 1));              \
+            }                                                                           \
+            pgv_;                                                                       \
+        })
+    #define ISSUE(s_)                                                                   \
+    {                                                                                   \
+        const int t_ = tw + (s_) * TPI + tg;                                            \
+        const int pg_ = PGID(t_);                                                       \
+        const char* src_ = kvb + (size_t)pg_ * row_bytes                                \
+                         + (size_t)(t_ & page_mask) * tok_stride;                       \
+        cp_async16(stage_base + ((s_) % SS) * 512, src_, (t_ < L) ? 16 : 0, l2pol);   \
+    }
+
+    #pragma unroll
+    for (int s = 0; s < SS - 1; ++s) { if (s < W_IT) ISSUE(s); cp_commit(); }
+
+    // query fragments (K lanes only)
+    float qf[QF32 ? GW : 1][8];
+    uint4 qreg[QF32 ? 1 : GW];
+    if (isK) {
+        const bf16* qb = qp + ((size_t)b * (Hkv * G) + (size_t)(hkv * G + role * GW)) * D + lv * 8;
+        if (QF32) {
+            #pragma unroll
+            for (int g = 0; g < GW; ++g) {
+                const uint4 qr = __ldg(reinterpret_cast<const uint4*>(qb + (size_t)g * D));
+                const uint32_t* qx = reinterpret_cast<const uint32_t*>(&qr);
+                #pragma unroll
+                for (int i = 0; i < 4; ++i) {
+                    const float2 f = bf2_to_f2(qx[i]);
+                    qf[g][2 * i] = f.x; qf[g][2 * i + 1] = f.y;
+                }
+            }
+        } else {
+            #pragma unroll
+            for (int g = 0; g < GW; ++g)
+                qreg[g] = __ldg(reinterpret_cast<const uint4*>(qb + (size_t)g * D));
+        }
+    }
+
+    float m[GW], l[GW], acc[GW][8];
+    #pragma unroll
+    for (int g = 0; g < GW; ++g) {
+        m[g] = NEG_INF; l[g] = 0.f;
+        #pragma unroll
+        for (int i = 0; i < 8; ++i) acc[g][i] = 0.f;
+    }
+
+    for (int it = 0; it < W_IT; ++it) {
+        if (it + SS - 1 < W_IT) ISSUE(it + SS - 1);
+        cp_commit();
+        cp_wait<SS - 1>();
+        __syncwarp();
+
+        const uint4 kvv = *reinterpret_cast<const uint4*>(&kv_stages[warp][it % SS][lane * 16]);
+        const uint32_t* kx = reinterpret_cast<const uint32_t*>(&kvv);
+        float kf8[8];
+        #pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const float2 f = bf2_to_f2(kx[i]);
+            kf8[2 * i] = f.x; kf8[2 * i + 1] = f.y;
+        }
+        const int t = tw + it * TPI + tg;
+        const bool valid = t < L;
+
+        #pragma unroll
+        for (int g = 0; g < GW; ++g) {
+            float s = 0.f;
+            if (isK) {
+                if (QF32) {
+                    #pragma unroll
+                    for (int i = 0; i < 8; ++i) s = fmaf(kf8[i], qf[g][i], s);
+                } else {
+                    const uint32_t* qx = reinterpret_cast<const uint32_t*>(&qreg[g]);
+                    #pragma unroll
+                    for (int i = 0; i < 4; ++i) {
+                        const float2 f = bf2_to_f2(qx[i]);
+                        s = fmaf(kf8[2 * i], f.x, s);
+                        s = fmaf(kf8[2 * i + 1], f.y, s);
+                    }
+                }
+            }
+            #pragma unroll
+            for (int o = QK_LANES / 2; o > 0; o >>= 1)
+                s += __shfl_xor_sync(0xffffffffu, s, o, TPG);
+            s = __shfl_xor_sync(0xffffffffu, s, QK_LANES, TPG);
+            s = valid ? (s * k_scale) : NEG_INF;
+            const float mn = fmaxf(m[g], s);
+            const bool dead = mn == NEG_INF;
+            const float p  = dead ? 0.f : exp2f(s - mn);
+            const float c  = dead ? 1.f : exp2f(m[g] - mn);
+            l[g] = l[g] * c + p;
+            m[g] = mn;
+            if (!isK) {
+                if (c != 1.f) {
+                    #pragma unroll
+                    for (int i = 0; i < 8; ++i) acc[g][i] *= c;
+                }
+                #pragma unroll
+                for (int i = 0; i < 8; ++i) acc[g][i] = fmaf(p, kf8[i], acc[g][i]);
+            }
+        }
+    }
+
+    // ---- merge token-groups in shared (each V-half tracks its own m/l/acc;
+    // K lanes carry clobbered scores and are never read for state) ----
+    __syncthreads();  // stages are dead past this point; safe to alias
+    const int vg = warp * TPI + tg;
+    if (lane % TPG == QK_LANES) {
+        #pragma unroll
+        for (int g = 0; g < GW; ++g) { msh[vg][g] = m[g]; lsh[vg][g] = l[g]; }
+    }
+    if (!isK) {
+        #pragma unroll
+        for (int g = 0; g < GW; ++g) {
+            #pragma unroll
+            for (int i = 0; i < 8; ++i) ACC_SH(vg, g, lv * 8 + i) = acc[g][i];
+        }
+    }
+    __syncthreads();
+
+    float* row = part + (((size_t)b * Hkv + hkv) * nch + chunk) * (size_t)ROW;
+    for (int dd = threadIdx.x; dd < D; dd += NW * 32) {
+        #pragma unroll
+        for (int g = 0; g < G; ++g) {
+            const int rl  = g / GW;      // which token-replica role
+            const int gl  = g % GW;
+            float M = NEG_INF;
+            #pragma unroll
+            for (int rr = 0; rr < TSET * TPI; ++rr)
+                M = fmaxf(M, msh[(rl * TSET + rr % TSET) * TPI + rr / TSET][gl]);
+            float lt = 0.f, o = 0.f;
+            #pragma unroll
+            for (int rr = 0; rr < TSET * TPI; ++rr) {
+                const int w = (rl * TSET + rr % TSET) * TPI + rr / TSET;
+                const float e = exp2f(msh[w][gl] - M);
+                lt += lsh[w][gl] * e;
+                o  += ACC_SH(w, gl, dd) * e;
+            }
+            float* rp = row + g * (D + 2);
+            rp[dd] = o;
+            if (dd == 0) { rp[D] = M; rp[D + 1] = lt; }
+        }
+    }
+
+    __threadfence();
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        const int nch_b = (L + CT - 1) / CT;
+        const int old = atomicAdd(counters + (size_t)b * Hkv + hkv, 1);
+        flag_sh = (old == nch_b - 1) ? 1 : 0;
+    }
+    __syncthreads();
+
+    if (flag_sh) {
+        __threadfence();
+        const size_t ctr = (size_t)b * Hkv + hkv;
+        const int nch_b = (L + CT - 1) / CT;
+        const float* seg = part + ctr * nch * (size_t)ROW;
+        constexpr int ND = (D + NW * 32 - 1) / (NW * 32);
+        #pragma unroll 1
+        for (int g = 0; g < G; ++g) {
+            float M[ND], lt[ND], o[ND];
+            #pragma unroll
+            for (int j = 0; j < ND; ++j) { M[j] = NEG_INF; lt[j] = 0.f; o[j] = 0.f; }
+            const float* r0 = seg + (size_t)g * (D + 2);
+            for (int i = 0; i < nch_b; ++i) {
+                const float* r = r0 + (size_t)i * ROW;
+                const float mi = r[D];
+                const float li = r[D + 1];
+                #pragma unroll
+                for (int j = 0; j < ND; ++j) {
+                    const int dd = threadIdx.x + j * (NW * 32);
+                    const float ai = (dd < D) ? r[dd] : 0.f;
+                    const float Mn = fmaxf(M[j], mi);
+                    const float c  = exp2f(M[j] - Mn);
+                    const float e  = exp2f(mi - Mn);
+                    o[j]  = o[j] * c + ai * e;
+                    lt[j] = lt[j] * c + li * e;
+                    M[j]  = Mn;
+                }
+            }
+            #pragma unroll
+            for (int j = 0; j < ND; ++j) {
+                const int dd = threadIdx.x + j * (NW * 32);
+                if (dd < D) {
+                    const float v = (lt[j] > 0.f) ? (o[j] / lt[j]) : 0.f;
+                    out[((size_t)b * (Hkv * G) + (size_t)hkv * G + g) * D + dd] = __float2bfloat16(v);
+                }
+            }
+        }
+        if (threadIdx.x == 0) counters[ctr] = 0;
+    }
+}
+
+
+// Tensor-core flash-decode item kernel: 8-token batches, cp.async pipelined,
+// QK via m16n8k16 (x4 ldmatrix covers 2 k-chunks), softmax in C-fragments,
+// PV via m16n8k8 (P fragments pass straight through).
+template <int D, int G, int CT, int NW>
+__global__ void __launch_bounds__(NW * 32, 3)
+paged_mma(const bf16* __restrict__ qp,
+          const bf16* __restrict__ kvp,
+          const int*  __restrict__ btp,
+          const int*  __restrict__ slp,
+          float* __restrict__ part,
+          int*   __restrict__ counters,
+          bf16*  __restrict__ out,
+          const int Hkv, const int max_pages, const int nch,
+          const float k_scale, const int pshift, const int pol_mode)
+{
+    constexpr int TKS   = 8;
+    constexpr int ROWB  = 4 * D + 32;      // padded smem token-row bytes
+    constexpr int STB   = TKS * ROWB;
+    constexpr int SSM   = 2;
+    constexpr int DC    = D / 16;
+    constexpr int ND    = D / 8;
+    constexpr int W_TOK = CT / NW;
+    constexpr int W_IT  = W_TOK / TKS;
+    constexpr int ROW   = G * (D + 2);
+    constexpr int TPC   = (D == 128) ? 1 : 2;   // tokens per cp.async instr
+    constexpr int VOFF  = 2 * D;                // V byte offset in token row
+
+    static_assert(W_TOK % TKS == 0, "W_TOK must be a multiple of 8");
+
+    const int item  = blockIdx.x;
+    const int b     = item / (Hkv * nch);
+    const int r     = item % (Hkv * nch);
+    const int chunk = r / Hkv;
+    const int hkv   = r % Hkv;
+    const int L     = slp[b];
+    const int t0    = chunk * CT;
+
+    if (L <= 0) {
+        if (chunk == 0 && hkv == 0) {
+            for (int i = threadIdx.x; i < G * Hkv * D; i += blockDim.x) {
+                const int h = i / D, d = i % D;
+                out[((size_t)b * (Hkv * G) + h) * D + d] = __float2bfloat16(0.f);
+            }
+        }
+        return;
+    }
+    if (t0 >= L) return;
+
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+
+    const int    page_mask  = (1 << pshift) - 1;
+    const size_t row_bytes  = ((size_t)1 << pshift) * Hkv * (2 * D) * 2;
+    const size_t tok_stride = (size_t)Hkv * (2 * D) * 2;
+
+    __shared__ __align__(16) char kv_stages[NW][SSM][STB];
+    float* acc_flat = reinterpret_cast<float*>(kv_stages);
+    #define ACC_SH(vg_, g_, d_) acc_flat[((size_t)(vg_) * G + (g_)) * D + (d_)]
+    __shared__ float msh[NW][G];
+    __shared__ float lsh[NW][G];
+    __shared__ int   flag_sh;
+
+    const uint64_t l2pol = mkpolicy(pol_mode);
+
+    const char* kvb = reinterpret_cast<const char*>(kvp) + (size_t)hkv * (2 * D) * 2;
+    const int* bt_row = btp + (size_t)b * max_pages;
+    const int tw = t0 + warp * W_TOK;
+
+    const int pg0 = tw >> pshift;
+    const int npg = min(((tw + W_TOK - 1) >> pshift) - pg0, 4);
+    int pid[5];
+    #pragma unroll
+    for (int j = 0; j < 5; ++j) {
+        const int idx = min(pg0 + min(j, npg), max_pages - 1);
+        pid[j] = __ldg(bt_row + idx);
+    }
+    const bool pid_ok = (((tw + W_TOK - 1) >> pshift) - pg0) <= 4;
+
+    #define PGID(t_)                                                                    \
+        ({                                                                              \
+            int pgv_;                                                                   \
+            if (pid_ok) {                                                               \
+                const int pi_ = ((t_) >> pshift) - pg0;                                 \
+                pgv_ = pi_ == 0 ? pid[0] : (pi_ == 1 ? pid[1] : (pi_ == 2 ? pid[2] : (pi_ == 3 ? pid[3] : pid[4]))); \
+            } else {                                                                    \
+                pgv_ = __ldg(bt_row + min((t_) >> pshift, max_pages - 1));              \
+            }                                                                           \
+            pgv_;                                                                       \
+        })
+
+    // one cp.async instr covers TPC tokens (32 lanes x 16B = 512B); lane's token
+    // and byte offset within the token row depend on TPC
+    #define ISSUE(s_)                                                                   \
+    {                                                                                   \
+        const int idt0_ = tw + (s_) * TKS;                                              \
+        char* slot_ = &kv_stages[warp][(s_) % SSM][0];                                  \
+        _Pragma("unroll")                                                               \
+        for (int k_ = 0; k_ < TKS / TPC; ++k_) {                                        \
+            const int tk_ = idt0_ + k_ * TPC + ((TPC == 2) ? (lane >> 4) : 0);          \
+            const int off_ = ((TPC == 2) ? (lane & 15) : lane) * 16;                    \
+            const int pg_ = PGID(tk_);                                                  \
+            const char* src_ = kvb + (size_t)pg_ * row_bytes                            \
+                             + (size_t)(tk_ & page_mask) * tok_stride + off_;           \
+            char* dst_ = slot_ + (TPC == 2 ? (k_ * 2 + (lane >> 4)) * ROWB : k_ * ROWB) + off_; \
+            cp_async16((uint32_t)__cvta_generic_to_shared(dst_), src_, (tk_ < L) ? 16 : 0, l2pol); \
+        }                                                                               \
+    }
+
+    #pragma unroll
+    for (int s = 0; s < SSM - 1; ++s) { if (s < W_IT) ISSUE(s); cp_commit(); }
+
+    // ---- A fragments (Q) loaded straight to registers ----
+    // a0 = (row lane/4, cols 2t+2dc*8/..); A tile mapping:
+    // r0: rows 0-7 ?? lane holds (g, 2t,2t+1),(g+8,...),(g,2t+8..),(g+8,2t+8..)=
+    uint32_t afrag[DC][4];
+    {
+        const bf16* qh = qp + ((size_t)b * (Hkv * G) + (size_t)hkv * G) * D;
+        const int rq = lane >> 2;          // row (head) this lane's first half
+        const int cq = (lane & 3) * 2;     // col pair base within 16-dim chunk
+        const int r0v = rq, r1v = rq + 8;
+        const bf16* q0 = qh + (size_t)r0v * D + cq;
+        const bf16* q1 = qh + (size_t)r1v * D + cq;
+        #pragma unroll
+        for (int dc = 0; dc < DC; ++dc) {
+            uint32_t lo0 = 0, hi0 = 0, lo1 = 0, hi1 = 0;
+            if (r0v < G) {
+                lo0 = __ldg(reinterpret_cast<const uint32_t*>(q0 + dc * 16));
+                hi0 = __ldg(reinterpret_cast<const uint32_t*>(q0 + dc * 16 + 8));
+            }
+            if (r1v < G) {
+                lo1 = __ldg(reinterpret_cast<const uint32_t*>(q1 + dc * 16));
+                hi1 = __ldg(reinterpret_cast<const uint32_t*>(q1 + dc * 16 + 8));
+            }
+            afrag[dc][0] = lo0; afrag[dc][1] = lo1;
+            afrag[dc][2] = hi0; afrag[dc][3] = hi1;
+        }
+    }
+
+    float acc[ND][4];
+    float m[2], l[2];
+    #pragma unroll
+    for (int j = 0; j < ND; ++j) {
+        #pragma unroll
+        for (int i = 0; i < 4; ++i) acc[j][i] = 0.f;
+    }
+    m[0] = m[1] = -1e20f; l[0] = l[1] = 0.f;
+
+    for (int it = 0; it < W_IT; ++it) {
+        if (it + SSM - 1 < W_IT) ISSUE(it + SSM - 1);
+        cp_commit();
+        cp_wait<SSM - 1>();
+        __syncwarp();
+
+        const char* slot = &kv_stages[warp][it % SSM][0];
+        const uint32_t slot_b = (uint32_t)__cvta_generic_to_shared(slot);
+        const int bt0 = tw + it * TKS;
+
+        // ---- QK ----
+        float sfrag[4];
+        #pragma unroll
+        for (int i = 0; i < 4; ++i) sfrag[i] = 0.f;
+        #pragma unroll
+        for (int dc2 = 0; dc2 < DC / 2; ++dc2) {
+            uint32_t bfr[4];
+            // x4 non-trans: lanes 0-7: tokens 0-7 @dc0; 8-15: tokens 0-7 @dc0+16B;
+            // 16-23: tokens 0-7 @dc1 (=+32B); 24-31: tokens 0-7 @dc1+16B
+            const uint32_t ad = slot_b + (lane & 7) * ROWB + dc2 * 64 + (lane >> 3) * 16;
+            ldsm_x4(bfr, ad);
+            mma16816(sfrag, afrag[dc2 * 2], bfr);
+            mma16816(sfrag, afrag[dc2 * 2 + 1], bfr + 2);
+        }
+
+        // ---- softmax in fragments ----
+        // scale + column masking
+        #pragma unroll
+        for (int h = 0; h < 2; ++h) {
+            #pragma unroll
+            for (int j = 0; j < 2; ++j) {
+                const int tok = bt0 + 2 * (lane & 3) + j;
+                sfrag[2 * h + j] = (tok < L) ? (sfrag[2 * h + j] * k_scale) : -1e20f;
+            }
+        }
+        float corr[2];
+        #pragma unroll
+        for (int h = 0; h < 2; ++h) {
+            float mx = fmaxf(sfrag[2 * h], sfrag[2 * h + 1]);
+            mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, 1));
+            mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, 2));
+            const float mn = fmaxf(m[h], mx);
+            corr[h] = exp2f(m[h] - mn);
+            m[h] = mn;
+        }
+        float lsum[2] = {0.f, 0.f};
+        #pragma unroll
+        for (int h = 0; h < 2; ++h) {
+            #pragma unroll
+            for (int j = 0; j < 2; ++j) {
+                const int tok = bt0 + 2 * (lane & 3) + j;
+                const float p = (tok < L) ? exp2f(sfrag[2 * h + j] - m[h]) : 0.f;
+                lsum[h] += p;
+                sfrag[2 * h + j] = p;
+            }
+            lsum[h] += __shfl_xor_sync(0xffffffffu, lsum[h], 1);
+            lsum[h] += __shfl_xor_sync(0xffffffffu, lsum[h], 2);
+            l[h] = l[h] * corr[h] + lsum[h];
+        }
+        uint32_t pa[2];
+        { const __nv_bfloat162 t_ = __floats2bfloat162_rn(sfrag[0], sfrag[1]); pa[0] = *reinterpret_cast<const uint32_t*>(&t_); }
+        { const __nv_bfloat162 t_ = __floats2bfloat162_rn(sfrag[2], sfrag[3]); pa[1] = *reinterpret_cast<const uint32_t*>(&t_); }
+
+        #pragma unroll
+        for (int j = 0; j < ND; ++j) {
+            acc[j][0] *= corr[0]; acc[j][1] *= corr[0];
+            acc[j][2] *= corr[1]; acc[j][3] *= corr[1];
+        }
+
+        // ---- PV ----
+        #pragma unroll
+        for (int dq = 0; dq < ND / 4; ++dq) {
+            uint32_t vfr[4];
+            // x4.trans: lanes i*8..i*8+7: token rows 0-7 @ VOFF+dq*64+i*16
+            const uint32_t ad = slot_b + (lane & 7) * ROWB + VOFF + dq * 64 + (lane >> 3) * 16;
+            ldsm_x4_t(vfr, ad);
+            #pragma unroll
+            for (int j = 0; j < 4; ++j)
+                mma1688(acc[dq * 4 + j], pa, vfr[j]);
+        }
+    }
+
+    // ---- merge token-ranges (warps) in shared ----
+    __syncthreads();
+    const int row0 = lane >> 2;
+    const int tokq = 2 * (lane & 3);
+    if (row0 < G) {
+        #pragma unroll
+        for (int j = 0; j < ND; ++j) {
+            ACC_SH(warp, row0, j * 8 + tokq)     = acc[j][0];
+            ACC_SH(warp, row0, j * 8 + tokq + 1) = acc[j][1];
+        }
+    }
+    if ((row0 + 8) < G) {
+        #pragma unroll
+        for (int j = 0; j < ND; ++j) {
+            ACC_SH(warp, row0 + 8, j * 8 + tokq)     = acc[j][2];
+            ACC_SH(warp, row0 + 8, j * 8 + tokq + 1) = acc[j][3];
+        }
+    }
+    if ((lane & 3) == 0) {
+        if (row0 < G)       { msh[warp][row0] = m[0];       lsh[warp][row0] = l[0]; }
+        if ((row0 + 8) < G) { msh[warp][row0 + 8] = m[1];   lsh[warp][row0 + 8] = l[1]; }
+    }
+    __syncthreads();
+
+    float* row = part + (((size_t)b * Hkv + hkv) * nch + chunk) * (size_t)ROW;
+    for (int dd = threadIdx.x; dd < D; dd += NW * 32) {
+        #pragma unroll
+        for (int g = 0; g < G; ++g) {
+            float M = -1e20f;
+            #pragma unroll
+            for (int w = 0; w < NW; ++w) M = fmaxf(M, msh[w][g]);
+            float lt = 0.f, o = 0.f;
+            #pragma unroll
+            for (int w = 0; w < NW; ++w) {
+                const float e = exp2f(msh[w][g] - M);
+                lt += lsh[w][g] * e;
+                o  += ACC_SH(w, g, dd) * e;
+            }
+            float* rp = row + g * (D + 2);
+            rp[dd] = o;
+            if (dd == 0) { rp[D] = M; rp[D + 1] = lt; }
+        }
+    }
+
+    __threadfence();
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        const int nch_b = (L + CT - 1) / CT;
+        const int old = atomicAdd(counters + (size_t)b * Hkv + hkv, 1);
+        flag_sh = (old == nch_b - 1) ? 1 : 0;
+    }
+    __syncthreads();
+
+    if (flag_sh) {
+        __threadfence();
+        const size_t ctr = (size_t)b * Hkv + hkv;
+        const int nch_b = (L + CT - 1) / CT;
+        const float* seg = part + ctr * nch * (size_t)ROW;
+        constexpr int NDD = (D + NW * 32 - 1) / (NW * 32);
+        #pragma unroll 1
+        for (int g = 0; g < G; ++g) {
+            float M[NDD], lt[NDD], o[NDD];
+            #pragma unroll
+            for (int j = 0; j < NDD; ++j) { M[j] = NEG_INF; lt[j] = 0.f; o[j] = 0.f; }
+            const float* r0 = seg + (size_t)g * (D + 2);
+            for (int i = 0; i < nch_b; ++i) {
+                const float* r = r0 + (size_t)i * ROW;
+                const float mi = r[D];
+                const float li = r[D + 1];
+                #pragma unroll
+                for (int j = 0; j < NDD; ++j) {
+                    const int dd = threadIdx.x + j * (NW * 32);
+                    const float ai = (dd < D) ? r[dd] : 0.f;
+                    const float Mn = fmaxf(M[j], mi);
+                    const float c  = exp2f(M[j] - Mn);
+                    const float e  = exp2f(mi - Mn);
+                    o[j]  = o[j] * c + ai * e;
+                    lt[j] = lt[j] * c + li * e;
+                    M[j]  = Mn;
+                }
+            }
+            #pragma unroll
+            for (int j = 0; j < NDD; ++j) {
+                const int dd = threadIdx.x + j * (NW * 32);
+                if (dd < D) {
+                    const float v = (lt[j] > 0.f) ? (o[j] / lt[j]) : 0.f;
+                    out[((size_t)b * (Hkv * G) + (size_t)hkv * G + g) * D + dd] = __float2bfloat16(v);
+                }
+            }
+        }
+        if (threadIdx.x == 0) counters[ctr] = 0;
+    }
+}
+
+torch::Tensor paged_fwd(torch::Tensor q, torch::Tensor kv, torch::Tensor bt,
+                        torch::Tensor sl, torch::Tensor partials, torch::Tensor counters,
+                        double scale, int64_t pshift, int64_t nch, int64_t chunk,
+                        int64_t nw, int64_t pol)
+{
+    const int B   = q.size(0);
+    const int H   = q.size(1);
+    const int D   = q.size(2);
+    const int Hkv = kv.size(2);
+    const int G   = H / Hkv;
+    const int max_pages = bt.size(1);
+    const int n_items = B * Hkv * (int)nch;
+
+    auto out = torch::empty_like(q);
+    auto stream = at::cuda::getCurrentCUDAStream();
+    const float k_scale = (float)(scale * 1.44269504088896340736);
+
+    const bf16* qp = reinterpret_cast<const bf16*>(q.data_ptr());
+    const bf16* kp = reinterpret_cast<const bf16*>(kv.data_ptr());
+    const int*  bp = bt.data_ptr<int>();
+    const int*  sp = sl.data_ptr<int>();
+    float* pp = partials.data_ptr<float>();
+    int*   cp = counters.data_ptr<int>();
+    bf16*  op = reinterpret_cast<bf16*>(out.data_ptr());
+
+    #define LAUNCH(D_, G_, CT_)                                                          \
+        paged_fused<D_, G_, CT_, 4><<<n_items, 4 * 32, 0, stream>>>(                     \
+            qp, kp, bp, sp, pp, cp, op, Hkv, max_pages, (int)nch, k_scale, (int)pshift, (int)pol)
+    #define LAUNCH_MMA(D_, G_, CT_)                                                      \
+        paged_mma<D_, G_, CT_, 2><<<n_items, 2 * 32, 0, stream>>>(                       \
+            qp, kp, bp, sp, pp, cp, op, Hkv, max_pages, (int)nch, k_scale, (int)pshift, (int)pol)
+    #define LAUNCH_MMA1(D_, G_, CT_)                                                     \
+        paged_mma<D_, G_, CT_, 1><<<n_items, 1 * 32, 0, stream>>>(                       \
+            qp, kp, bp, sp, pp, cp, op, Hkv, max_pages, (int)nch, k_scale, (int)pshift, (int)pol)
+
+    static int impl = -1;
+    if (impl < 0) { const char* e = getenv("PA_IMPL"); impl = e ? atoi(e) : 1; }
+    if (impl == 1 && (chunk == 64 || chunk == 128) &&
+        ((D == 128 && (G == 4 || G == 8)) || (D == 64 && G == 4))) {
+        if      (D == 128 && G == 4 && chunk == 64)  { LAUNCH_MMA(128, 4, 64);  return out; }
+        if      (D == 128 && G == 4 && chunk == 128) { LAUNCH_MMA(128, 4, 128); return out; }
+        if      (D == 64  && G == 4 && chunk == 64)  { LAUNCH_MMA(64, 4, 64);   return out; }
+        if      (D == 64  && G == 4 && chunk == 128) { LAUNCH_MMA(64, 4, 128);  return out; }
+    }
+    if (D == 128 && G == 4) {
+        if      (chunk == 64)  LAUNCH(128, 4, 64);
+        else if (chunk == 128) LAUNCH(128, 4, 128);
+        else if (chunk == 192) LAUNCH(128, 4, 192);
+        else                   LAUNCH(128, 4, 256);
+    } else if (D == 128 && G == 8) {
+        static int nw1 = -1;
+        if (nw1 < 0) { const char* e = getenv("PA_MMA_NW"); nw1 = e ? atoi(e) : 2; }
+        if      (chunk == 64  && nw1 == 1) LAUNCH_MMA1(128, 8, 64);
+        else if (chunk == 128 && nw1 == 1) LAUNCH_MMA1(128, 8, 128);
+        else if (chunk == 64)  LAUNCH_MMA(128, 8, 64);
+        else if (chunk == 128) LAUNCH_MMA(128, 8, 128);
+        else TORCH_CHECK(false, "unsupported chunk ", chunk, " for G=8");
+    } else if (D == 64 && G == 4) {
+        if      (chunk == 64)  LAUNCH(64, 4, 64);
+        else if (chunk == 128) LAUNCH(64, 4, 128);
+        else if (chunk == 192) LAUNCH(64, 4, 192);
+        else                   LAUNCH(64, 4, 256);
+    } else {
+        TORCH_CHECK(false, "unsupported (D,G): ", D, " ", G);
+    }
+    return out;
+}
+"""
+
+_CPP_SRC = """
+torch::Tensor paged_fwd(torch::Tensor q, torch::Tensor kv, torch::Tensor bt,
+                        torch::Tensor sl, torch::Tensor partials, torch::Tensor counters,
+                        double scale, int64_t pshift, int64_t nch, int64_t chunk,
+                        int64_t nw, int64_t pol);
+"""
+
+_ext = None
+import os as _os
+_ENV_CHUNK = int(_os.environ.get("PA_CHUNK", "0"))
+_ENV_POL_0 = int(_os.environ.get("PA_POL0", _os.environ.get("PA_POL", "0")))
+_ENV_POL_1 = int(_os.environ.get("PA_POL1", _os.environ.get("PA_POL", "0")))
+
+
+_EXT_FN = None
+
+
+def _get_ext():
+    global _ext, _EXT_FN
+    if _ext is None:
+        _ext = load_inline(
+            name="paged_attn_decode_v4",
+            cpp_sources=_CPP_SRC,
+            cuda_sources=_CUDA_SRC,
+            functions=["paged_fwd"],
+            extra_cuda_cflags=["-O3", "--use_fast_math", "-lineinfo"],
+            verbose=False,
+        )
+        _EXT_FN = _ext.paged_fwd
+    return _ext
+
+
+class Model(nn.Module):
+    """Single-query paged attention decode (custom fused CUDA kernel)."""
+
+    def __init__(
+        self,
+        batch: int,
+        num_heads: int,
+        num_kv_heads: int,
+        head_dim: int,
+        seq_len: int,
+        page_size: int,
+    ):
+        super().__init__()
+        assert num_heads % num_kv_heads == 0, "num_heads must be a multiple of num_kv_heads (GQA)"
+        self.batch = batch
+        self.num_heads = num_heads
+        self.num_kv_heads = num_kv_heads
+        self.head_dim = head_dim
+        self.seq_len = seq_len
+        self.page_size = page_size
+        self.group_size = num_heads // num_kv_heads
+        self.scale = 1.0 / math.sqrt(head_dim)
+        self.register_buffer("_dummy", torch.zeros(1, dtype=torch.bfloat16), persistent=False)
+        self._ws = {}
+        _get_ext()
+        # precompute shape-derived launch parameters
+        self._pshift = page_size.bit_length() - 1
+        pairs = batch * num_kv_heads
+        lmax = ((seq_len + page_size - 1) // page_size) * page_size
+        items128 = pairs * ((lmax + 127) // 128)
+        self._chunk = 64 if 750 <= items128 < 3000 else 128
+        self._pages_nominal = (seq_len + page_size - 1) // page_size
+        self._nch_nominal = (lmax + self._chunk - 1) // self._chunk
+        self._nch = self._nch_nominal
+        self._ws_key = (batch, num_kv_heads, self._nch, self.group_size, head_dim)
+        self._wsv = None
+
+    def _fallback(self, query, kv_cache, block_table, seq_lens):
+        B, H, D = query.shape
+        Hkv = self.num_kv_heads
+        G = self.group_size
+        P = self.page_size
+        max_pages = block_table.size(1)
+        kv = kv_cache.index_select(0, block_table.reshape(-1).long())
+        kv = kv.reshape(B, max_pages * P, Hkv, 2 * D)
+        k = kv[..., :D].repeat_interleave(G, dim=2).float()
+        v = kv[..., D:].repeat_interleave(G, dim=2).float()
+        qf = query.float()
+        scores = torch.einsum("bhd,blhd->bhl", qf, k) * self.scale
+        tok = torch.arange(max_pages * P, device=query.device)[None, None, :]
+        scores = scores.masked_fill(tok >= seq_lens[:, None, None].long(), float("-inf"))
+        probs = torch.softmax(scores, dim=-1)
+        o = torch.einsum("bhl,blhd->bhd", probs, v)
+        return o.to(query.dtype)
+
+    def forward(self, query, kv_cache, block_table, seq_lens):
+        import os
+        B, H, D = query.shape
+        Hkv = kv_cache.size(2)
+        G = H // Hkv
+        P = self.page_size
+
+        fast = (
+            query.dtype == torch.bfloat16
+            and block_table.dtype == torch.int32
+            and seq_lens.dtype == torch.int32
+            and query.is_contiguous()
+            and kv_cache.is_contiguous()
+            and block_table.is_contiguous()
+            and seq_lens.is_contiguous()
+        )
+        if not fast:
+            return self._fallback(query, kv_cache, block_table, seq_lens)
+
+        ws = self._wsv
+        if block_table.size(1) == self._pages_nominal and ws is not None:
+            return _EXT_FN(query, kv_cache, block_table, seq_lens, ws[0], ws[1],
+                           self.scale, self._pshift, self._nch_nominal, self._chunk, 4,
+                           _ENV_POL_1 if G == 8 else _ENV_POL_0)
+        # general path: derive launch parameters from this call's tensors
+        dev = query.device
+        max_pages = block_table.size(1)
+        pairs = B * Hkv
+        items128 = pairs * ((max_pages * P + 127) // 128)
+        chunk = 64 if 750 <= items128 < 3000 else 128
+        nch = (max_pages * P + chunk - 1) // chunk
+        key = (B, Hkv, nch, G, D)
+        wsc = self._ws.get(key)
+        if wsc is None or wsc[0].device != dev:
+            partials = torch.empty(B * Hkv * nch * G * (D + 2), dtype=torch.float32, device=dev)
+            counters = torch.zeros(B * Hkv, dtype=torch.int32, device=dev)
+            wsc = (partials, counters)
+            self._ws[key] = wsc
+        if max_pages == self._pages_nominal:
+            self._wsv = wsc
+        return _EXT_FN(query, kv_cache, block_table, seq_lens, wsc[0], wsc[1],
+                       self.scale, self._pshift, nch, chunk, 4,
+                       _ENV_POL_1 if G == 8 else _ENV_POL_0)
+
+    # Bypass nn.Module.__call__ hook machinery (saves ~2-4us/launch on the hot path).
+    __call__ = forward
+
+
+def get_inputs():
+    B = BATCH
+    H = NUM_HEADS
+    Hkv = NUM_KV_HEADS
+    D = HEAD_DIM
+    L = SEQ_LEN
+    P = PAGE_SIZE
+    pages_per_seq = (L + P - 1) // P
+    total_pages = max(B * pages_per_seq + 8, 64)
+    query = torch.randn(B, H, D, dtype=torch.bfloat16) * 0.1
+    kv_cache = torch.randn(total_pages, P, Hkv, 2 * D, dtype=torch.bfloat16) * 0.1
+    perm = torch.randperm(total_pages)[: B * pages_per_seq].reshape(B, pages_per_seq).int()
+    block_table = perm.contiguous()
+    seq_lens = torch.full((B,), L, dtype=torch.int32)
+    return [query, kv_cache, block_table, seq_lens]
+
+
+def get_init_inputs():
+    return [BATCH, NUM_HEADS, NUM_KV_HEADS, HEAD_DIM, SEQ_LEN, PAGE_SIZE]

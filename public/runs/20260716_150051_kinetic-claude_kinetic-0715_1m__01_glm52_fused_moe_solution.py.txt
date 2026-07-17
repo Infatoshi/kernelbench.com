@@ -1,0 +1,1055 @@
+"""GLM-5.2-class fused MoE — hand-written CUDA (bf16 mma.m16n8k16, sm_120).
+
+Pipeline per forward:
+  1. `prepare`        : single-CTA grouping kernel. Builds, for the
+                        T*(top_k+n_shared) activations, per-expert sorted
+                        token/weight lists + a compact
+                        (tile -> expert, m-start, m-count) map. No host sync.
+  2. `moe_gemm1_dual` : grouped SwiGLU GEMM. Each CTA computes the gate and
+                        up panels of W1[e] in ONE shared K-loop (co-panel:
+                        A fragments feed both panels), then applies
+                        h = silu(gate)*up in registers and writes bf16 h.
+  3. `moe_gemm2`      : grouped GEMM h @ W2[e].T over 128-column panels;
+                        epilogue scales by routing weight and
+                        red.add.v2.f32-scatters into an fp32 out.
+  4. cast fp32 -> bf16.
+
+Numeric design: all matmul accumulation is fp32 (tensor-core mma with f32
+accumulators); h is stored bf16 (a standard bf16-pipeline intermediate);
+routing weights are applied in fp32; expert outputs are accumulated in fp32
+via atomicAdd, matching the fp32 reference accumulation within tolerance.
+
+Kernel structure (bf16, SM120):
+  - cp.async multi-stage (3-deep, 2 CTAs/SM) K-pipeline with L2::256B
+    prefetch on streamed operands — the SM100-class smem budget (100 KB) is
+    spent as <32 KB per stage so two CTAs stay resident per SM
+  - ldmatrix operand loads from 16B-padded smem rows (bank-conflict-free)
+  - inline PTX mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32
+  - empty commit groups at the K-loop tail keep the wait predicate uniform
+  - grouped-tile raster: n-fastest so same-expert B slabs hit 128 MB L2
+  - 64-row MoE tiles balance padded-M waste vs CTA parallelism across the
+    whole serving sweep (T=1 decode to T=8192 prefill)
+"""
+from __future__ import annotations
+
+import os
+
+import torch
+import torch.nn as nn
+
+os.environ.setdefault("TORCH_CUDA_ARCH_LIST", "12.0")
+
+OP_TYPE = "glm52_fused_moe"
+SUPPORTED_PRECISIONS = ["bf16"]
+HARDWARE_REQUIRED = ["RTX_PRO_6000"]
+
+T, E, top_k, n_shared, H, I = 4096, 256, 8, 1, 4096, 2048
+
+_CPP_SRC = r"""
+#include <torch/extension.h>
+torch::Tensor moe_forward(torch::Tensor x, torch::Tensor expert_ids,
+                          torch::Tensor expert_weights, torch::Tensor w1r,
+                          torch::Tensor w2r, torch::Tensor w1s, torch::Tensor w2s);
+std::vector<torch::Tensor> moe_debug(torch::Tensor x, torch::Tensor expert_ids,
+                                     torch::Tensor expert_weights, torch::Tensor w1r,
+                                     torch::Tensor w2r, torch::Tensor w1s, torch::Tensor w2s);
+"""
+
+_CUDA_SRC = r"""
+#include <torch/extension.h>
+#include <ATen/cuda/CUDAContext.h>
+#include <cuda_bf16.h>
+#include <cuda_runtime.h>
+#include <cstdint>
+
+using bf16 = __nv_bfloat16;
+
+#define DEV_INLINE __device__ __forceinline__
+
+// ---------------------------------------------------------------- utilities
+DEV_INLINE unsigned smem_u32addr(const void* p) {
+    unsigned addr;
+    asm volatile("{ .reg .u64 u64addr; cvta.to.shared.u64 u64addr, %1; cvt.u32.u64 %0, u64addr; }"
+                 : "=r"(addr) : "l"(p));
+    return addr;
+}
+
+// cp.async cache policy for streamed operands (selected per-launch).
+DEV_INLINE void cp16(unsigned smem_dst, const void* gsrc, bool full, int pf_mode) {
+    int sz = full ? 16 : 0;
+    if (pf_mode == 1) {
+        asm volatile("cp.async.cg.shared.global.L2::128B [%0], [%1], 16, %2;"
+                     :: "r"(smem_dst), "l"(gsrc), "r"(sz));
+    } else if (pf_mode == 2) {
+        asm volatile("cp.async.cg.shared.global.L2::256B [%0], [%1], 16, %2;"
+                     :: "r"(smem_dst), "l"(gsrc), "r"(sz));
+    } else {
+        asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;"
+                     :: "r"(smem_dst), "l"(gsrc), "r"(sz));
+    }
+}
+
+DEV_INLINE void cp_commit() { asm volatile("cp.async.commit_group;"); }
+
+template <int N>
+DEV_INLINE void cp_wait() { asm volatile("cp.async.wait_group %0;" :: "n"(N)); }
+
+DEV_INLINE void ldmatrix_x4(unsigned addr, unsigned& r0, unsigned& r1, unsigned& r2, unsigned& r3) {
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];"
+                 : "=r"(r0), "=r"(r1), "=r"(r2), "=r"(r3) : "r"(addr));
+}
+
+DEV_INLINE void mma_16816(float& d0, float& d1, float& d2, float& d3,
+                          unsigned a0, unsigned a1, unsigned a2, unsigned a3,
+                          unsigned b0, unsigned b1) {
+    asm volatile(
+        "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
+        "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+        : "+f"(d0), "+f"(d1), "+f"(d2), "+f"(d3)
+        : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+}
+
+DEV_INLINE void red_add_v2(float* addr, float v0, float v1) {
+    asm volatile("red.global.add.v2.f32 [%0], {%1, %2};" :: "l"(addr), "f"(v0), "f"(v1));
+}
+
+DEV_INLINE float silu(float x) { return x / (1.0f + __expf(-x)); }
+
+// ---------------------------------------------------------------- prepare
+// Single-block kernel: build per-expert sorted token list + tile map.
+// Entries: i in [0, T*top_k)     -> token i/top_k, expert expert_ids[i], w = expert_weights[i]
+//          i in [T*top_k, N)     -> shared: token j%T, expert E + j/T, w = 1
+__global__ void prepare_kernel(
+    const int64_t* __restrict__ expert_ids,
+    const bf16* __restrict__ expert_weights,
+    int T, int E, int top_k, int n_shared, int BM,
+    int* __restrict__ tile_expert, int* __restrict__ tile_mstart,
+    int* __restrict__ tile_mcount, int* __restrict__ total_tiles,
+    int* __restrict__ sorted_token, float* __restrict__ sorted_weight) {
+    const int Etot = E + n_shared;
+    const int N = T * (top_k + n_shared);
+    extern __shared__ int sdata[];
+    int* scount = sdata;          // [Etot]
+    int* sfill = sdata + Etot;    // [Etot]
+    int* sstart = sfill + Etot;   // [Etot+1]
+    int* soff2 = sstart + Etot + 1;  // [Etot]
+
+    const int tid = threadIdx.x;
+    for (int e = tid; e < Etot; e += blockDim.x) { scount[e] = 0; }
+    __syncthreads();
+
+    // pass 1: count per expert
+    for (int i = tid; i < N; i += blockDim.x) {
+        int e;
+        if (i < T * top_k) e = (int)__ldg(expert_ids + i);
+        else e = E + (i - T * top_k) / T;
+        atomicAdd(&scount[e], 1);
+    }
+    __syncthreads();
+
+    // prefix sum (single thread) -> sstart[e] = region start in sorted arrays
+    if (tid == 0) {
+        int acc = 0;
+        for (int e = 0; e < Etot; ++e) {
+            sstart[e] = acc;
+            sfill[e] = acc;
+            acc += scount[e];
+        }
+        sstart[Etot] = acc;
+    }
+    __syncthreads();
+
+    // pass 2: scatter entries into sorted arrays
+    for (int i = tid; i < N; i += blockDim.x) {
+        int e, tok;
+        float w;
+        if (i < T * top_k) {
+            e = (int)__ldg(expert_ids + i);
+            tok = i / top_k;
+            w = __bfloat162float(__ldg(expert_weights + i));
+        } else {
+            int j = i - T * top_k;
+            e = E + j / T;
+            tok = j % T;
+            w = 1.0f;
+        }
+        int pos = atomicAdd(&sfill[e], 1);
+        sorted_token[pos] = tok;
+        sorted_weight[pos] = w;
+    }
+    __syncthreads();
+
+    // pass 3: parallel tile map: per-thread tiles, tiny scan, parallel write.
+    // sfill = tiles per expert; soff2 = tile offsets; sstart = region starts.
+    if (tid < Etot) {
+        sfill[tid] = (scount[tid] + BM - 1) / BM;
+    }
+    __syncthreads();
+    if (tid == 0) {
+        int acc = 0;
+        for (int e = 0; e < Etot; ++e) {
+            soff2[e] = acc;
+            acc += sfill[e];
+        }
+        soff2[Etot] = acc;
+        total_tiles[0] = acc;
+    }
+    __syncthreads();
+    if (tid < Etot) {
+        int t = soff2[tid];
+        int start = sstart[tid];
+        int cnt = scount[tid];
+        for (int m0 = 0; m0 < cnt; m0 += BM) {
+            tile_expert[t] = tid;
+            tile_mstart[t] = start + m0;
+            tile_mcount[t] = min(BM, cnt - m0);
+            ++t;
+        }
+    }
+}
+
+// ---------------------------------------------------------------- mma GEMM
+// One generic pipelined K-pass: acc(+=) = A_tile @ B.T over the full K dim.
+// A rows come from a functor; B is a dense (BNP x K) slab starting at Bptr.
+// smem rows padded by PAD elems (bank-conflict-free ldmatrix).
+
+constexpr int BK = 32;        // elems per K stage
+constexpr int PAD = 8;        // smem row pad in elems (16B)
+constexpr int SK = BK + PAD;  // padded row stride (elems)
+
+template <int BM, int BNP, int WM, int WN, int STL = 3, int MIB = 2>
+struct GemmCfg {
+    static constexpr int WARPS = WM * WN;
+    static constexpr int THREADS = WARPS * 32;
+    static constexpr int MINB = MIB;
+    static constexpr int MT = BM / WM;
+    static constexpr int NT = BNP / WN;
+    static constexpr int MTILES = MT / 16;      // m16 tiles per warp
+    static constexpr int NTILES = NT / 8;       // n8 tiles per warp
+    static constexpr int A_STAGE_ELEMS = BM * SK;
+    static constexpr int B_STAGE_ELEMS = BNP * SK;
+    static constexpr int STAGES = STL;
+    static constexpr int SMEM_BYTES = STL * (A_STAGE_ELEMS + B_STAGE_ELEMS) * 2;
+};
+
+// AFn: (int r) -> const bf16* gmem row for A row r (K elems wide).
+template <int BM, int BNP, int WM, int WN, int STL, typename AFn>
+DEV_INLINE void gemm_kpass(char* smem, const int K, const int mcount,
+                           AFn a_row, const bf16* Bg, const int pf_mode,
+                           float acc[GemmCfg<BM, BNP, WM, WN, STL>::MTILES]
+                                  [GemmCfg<BM, BNP, WM, WN, STL>::NTILES][4]) {
+    using Cfg = GemmCfg<BM, BNP, WM, WN, STL>;
+    bf16* As = reinterpret_cast<bf16*>(smem);
+    bf16* Bs = reinterpret_cast<bf16*>(smem) + Cfg::STAGES * Cfg::A_STAGE_ELEMS;
+
+    const int tid = threadIdx.x;
+    const int lane = tid & 31;
+    const int warp = tid >> 5;
+    const int wm = warp % WM;
+    const int wn = warp / WM;
+    const int warp_m0 = wm * Cfg::MT;
+    const int warp_n0 = wn * Cfg::NT;
+
+    const int k_iters = K / BK;
+    constexpr int UROW = BK / 8;                       // 16B units per smem row
+    constexpr int A_ITERS = (BM * UROW + Cfg::THREADS - 1) / Cfg::THREADS;
+    constexpr int B_ITERS = (BNP * UROW + Cfg::THREADS - 1) / Cfg::THREADS;
+
+    // per-thread loader mapping (constant across stages): row + chunk -> ptr
+    const bf16* a_ptr[A_ITERS];
+    int a_dst[A_ITERS];
+    bool a_ok[A_ITERS];
+    #pragma unroll
+    for (int it = 0; it < A_ITERS; ++it) {
+        int u = tid + it * Cfg::THREADS;
+        int r = u / UROW;
+        int c = u % UROW;
+        a_ok[it] = r < mcount;
+        a_ptr[it] = a_row(a_ok[it] ? r : 0) + c * 8;
+        a_dst[it] = r * SK + c * 8;
+    }
+    const bf16* b_ptr[B_ITERS];
+    int b_dst[B_ITERS];
+    #pragma unroll
+    for (int it = 0; it < B_ITERS; ++it) {
+        int u = tid + it * Cfg::THREADS;
+        int r = u / UROW;
+        int c = u % UROW;
+        b_ptr[it] = Bg + (size_t)r * K + c * 8;
+        b_dst[it] = r * SK + c * 8;
+    }
+
+    auto issue_stage = [&](int k_iter, int slot) {
+        const int k0 = k_iter * BK;
+        bf16* as = As + slot * Cfg::A_STAGE_ELEMS;
+        bf16* bs = Bs + slot * Cfg::B_STAGE_ELEMS;
+        #pragma unroll
+        for (int it = 0; it < A_ITERS; ++it)
+            cp16(smem_u32addr(reinterpret_cast<char*>(as) + a_dst[it] * 2),
+                 a_ptr[it] + k0, a_ok[it], pf_mode);
+        #pragma unroll
+        for (int it = 0; it < B_ITERS; ++it)
+            cp16(smem_u32addr(reinterpret_cast<char*>(bs) + b_dst[it] * 2),
+                 b_ptr[it] + k0, true, pf_mode);
+        cp_commit();
+    };
+
+    #pragma unroll
+    for (int s = 0; s < Cfg::STAGES - 1; ++s) issue_stage(s, s);
+
+    unsigned a_frag[2][Cfg::MTILES][4];
+    unsigned b_frag[2][Cfg::NTILES][2];
+
+    auto load_a = [&](int slot, int kk, int buf) {
+        #pragma unroll
+        for (int mt = 0; mt < Cfg::MTILES; ++mt) {
+            int row = warp_m0 + mt * 16 + (lane & 15);
+            int col = kk * 16 + ((lane >> 4) << 3);
+            unsigned addr = smem_u32addr(As + slot * Cfg::A_STAGE_ELEMS + row * SK + col);
+            ldmatrix_x4(addr, a_frag[buf][mt][0], a_frag[buf][mt][1], a_frag[buf][mt][2], a_frag[buf][mt][3]);
+        }
+    };
+    auto load_b = [&](int slot, int kk, int buf) {
+        #pragma unroll
+        for (int ntp = 0; ntp < Cfg::NTILES / 2; ++ntp) {
+            int row = warp_n0 + ntp * 16 + (lane & 7) + ((lane & 16) ? 8 : 0);
+            int col = kk * 16 + ((lane & 8) ? 8 : 0);
+            unsigned addr = smem_u32addr(Bs + slot * Cfg::B_STAGE_ELEMS + row * SK + col);
+            ldmatrix_x4(addr,
+                        b_frag[buf][ntp * 2][0], b_frag[buf][ntp * 2][1],
+                        b_frag[buf][ntp * 2 + 1][0], b_frag[buf][ntp * 2 + 1][1]);
+        }
+    };
+
+    constexpr int KSUB = BK / 16;
+    int next_stage = Cfg::STAGES - 1;
+    int slot = 0;
+
+    cp_wait<Cfg::STAGES - 2>();
+    __syncthreads();
+    load_a(0, 0, 0);
+    load_b(0, 0, 0);
+
+    for (int s = 0; s < k_iters; ++s) {
+        #pragma unroll
+        for (int ks = 0; ks < KSUB; ++ks) {
+            if (ks + 1 < KSUB) { load_a(slot, ks + 1, (ks + 1) & 1); load_b(slot, ks + 1, (ks + 1) & 1); }
+            #pragma unroll
+            for (int mt = 0; mt < Cfg::MTILES; ++mt)
+                #pragma unroll
+                for (int nt = 0; nt < Cfg::NTILES; ++nt)
+                    mma_16816(acc[mt][nt][0], acc[mt][nt][1], acc[mt][nt][2], acc[mt][nt][3],
+                              a_frag[ks & 1][mt][0], a_frag[ks & 1][mt][1], a_frag[ks & 1][mt][2], a_frag[ks & 1][mt][3],
+                              b_frag[ks & 1][nt][0], b_frag[ks & 1][nt][1]);
+        }
+        if (s + 1 < k_iters) {
+            // Uniform commit-group accounting at the tail: commit an EMPTY
+            // group when no stage is issued so cp_wait<STAGES-2> still
+            // guarantees stage s+1 landed (tail-of-loop race otherwise).
+            if (next_stage < k_iters) { issue_stage(next_stage, next_stage % Cfg::STAGES); ++next_stage; }
+            else { cp_commit(); }
+            cp_wait<Cfg::STAGES - 2>();
+            __syncthreads();
+            slot = (slot + 1) % Cfg::STAGES;
+            load_a(slot, 0, 0);
+            load_b(slot, 0, 0);
+        }
+    }
+    // last stage committed-wait clarity: nothing real outstanding here.
+}
+
+// ---------------------------------------------------------------- dual (co-panel) gemm1
+// gate and up panels share ONE K-loop: A fragments are loaded once per k16
+// and feed both panels. B smem holds both panels' rows (2*BNP per stage).
+template <int BM, int BNP, int WM, int WN, int STL, typename AFn>
+DEV_INLINE void gemm_dual(char* smem, const int K, const int mcount,
+                          AFn a_row, const bf16* Bgate, const bf16* Bup, const int pf_mode,
+                          float accg[GemmCfg<BM, BNP, WM, WN, STL>::MTILES]
+                                 [GemmCfg<BM, BNP, WM, WN, STL>::NTILES][4],
+                          float accu[GemmCfg<BM, BNP, WM, WN, STL>::MTILES]
+                                 [GemmCfg<BM, BNP, WM, WN, STL>::NTILES][4]) {
+    using Cfg = GemmCfg<BM, BNP, WM, WN, STL>;
+    constexpr int B_STAGE_ELEMS = 2 * BNP * SK;
+    bf16* As = reinterpret_cast<bf16*>(smem);
+    bf16* Bs = reinterpret_cast<bf16*>(smem) + Cfg::STAGES * Cfg::A_STAGE_ELEMS;
+
+    const int tid = threadIdx.x;
+    const int lane = tid & 31;
+    const int warp = tid >> 5;
+    const int wm = warp % WM;
+    const int wn = warp / WM;
+    const int warp_m0 = wm * Cfg::MT;
+    const int warp_n0 = wn * Cfg::NT;
+
+    const int k_iters = K / BK;
+    constexpr int UROW = BK / 8;
+    constexpr int A_ITERS = (BM * UROW + Cfg::THREADS - 1) / Cfg::THREADS;
+    constexpr int B_ITERS = (2 * BNP * UROW + Cfg::THREADS - 1) / Cfg::THREADS;
+
+    const bf16* a_ptr[A_ITERS];
+    int a_dst[A_ITERS];
+    bool a_ok[A_ITERS];
+    #pragma unroll
+    for (int it = 0; it < A_ITERS; ++it) {
+        int u = tid + it * Cfg::THREADS;
+        int r = u / UROW;
+        int c = u % UROW;
+        a_ok[it] = r < mcount;
+        a_ptr[it] = a_row(a_ok[it] ? r : 0) + c * 8;
+        a_dst[it] = r * SK + c * 8;
+    }
+    const bf16* b_ptr[B_ITERS];
+    int b_dst[B_ITERS];
+    #pragma unroll
+    for (int it = 0; it < B_ITERS; ++it) {
+        int u = tid + it * Cfg::THREADS;
+        int r = u / UROW;  // row in [0, 2*BNP): [0,BNP) gate, [BNP,2BNP) up
+        int c = u % UROW;
+        bool up = r >= BNP;
+        b_ptr[it] = (up ? Bup + (size_t)(r - BNP) * K : Bgate + (size_t)r * K) + c * 8;
+        b_dst[it] = r * SK + c * 8;
+    }
+
+    auto issue_stage = [&](int k_iter, int slot) {
+        const int k0 = k_iter * BK;
+        bf16* as = As + slot * Cfg::A_STAGE_ELEMS;
+        bf16* bs = Bs + slot * B_STAGE_ELEMS;
+        #pragma unroll
+        for (int it = 0; it < A_ITERS; ++it)
+            cp16(smem_u32addr(reinterpret_cast<char*>(as) + a_dst[it] * 2),
+                 a_ptr[it] + k0, a_ok[it], pf_mode);
+        #pragma unroll
+        for (int it = 0; it < B_ITERS; ++it)
+            cp16(smem_u32addr(reinterpret_cast<char*>(bs) + b_dst[it] * 2),
+                 b_ptr[it] + k0, true, pf_mode);
+        cp_commit();
+    };
+
+    #pragma unroll
+    for (int s = 0; s < Cfg::STAGES - 1; ++s) issue_stage(s, s);
+
+    unsigned a_frag[2][Cfg::MTILES][4];
+    unsigned b_frag[2][2][Cfg::NTILES][2];
+
+    auto load_a = [&](int slot, int kk, int buf) {
+        #pragma unroll
+        for (int mt = 0; mt < Cfg::MTILES; ++mt) {
+            int row = warp_m0 + mt * 16 + (lane & 15);
+            int col = kk * 16 + ((lane >> 4) << 3);
+            unsigned addr = smem_u32addr(As + slot * Cfg::A_STAGE_ELEMS + row * SK + col);
+            ldmatrix_x4(addr, a_frag[buf][mt][0], a_frag[buf][mt][1], a_frag[buf][mt][2], a_frag[buf][mt][3]);
+        }
+    };
+    auto load_b = [&](int slot, int kk, int buf) {
+        #pragma unroll
+        for (int p = 0; p < 2; ++p) {
+            #pragma unroll
+            for (int ntp = 0; ntp < Cfg::NTILES / 2; ++ntp) {
+                int row = p * BNP + warp_n0 + ntp * 16 + (lane & 7) + ((lane & 16) ? 8 : 0);
+                int col = kk * 16 + ((lane & 8) ? 8 : 0);
+                unsigned addr = smem_u32addr(Bs + slot * B_STAGE_ELEMS + row * SK + col);
+                ldmatrix_x4(addr,
+                            b_frag[buf][p][ntp * 2][0], b_frag[buf][p][ntp * 2][1],
+                            b_frag[buf][p][ntp * 2 + 1][0], b_frag[buf][p][ntp * 2 + 1][1]);
+            }
+        }
+    };
+
+    constexpr int KSUB = BK / 16;
+    int next_stage = Cfg::STAGES - 1;
+    int slot = 0;
+
+    cp_wait<Cfg::STAGES - 2>();
+    __syncthreads();
+    load_a(0, 0, 0);
+    load_b(0, 0, 0);
+
+    for (int s = 0; s < k_iters; ++s) {
+        #pragma unroll
+        for (int ks = 0; ks < KSUB; ++ks) {
+            if (ks + 1 < KSUB) { load_a(slot, ks + 1, (ks + 1) & 1); load_b(slot, ks + 1, (ks + 1) & 1); }
+            #pragma unroll
+            for (int mt = 0; mt < Cfg::MTILES; ++mt) {
+                #pragma unroll
+                for (int nt = 0; nt < Cfg::NTILES; ++nt) {
+                    mma_16816(accg[mt][nt][0], accg[mt][nt][1], accg[mt][nt][2], accg[mt][nt][3],
+                              a_frag[ks & 1][mt][0], a_frag[ks & 1][mt][1], a_frag[ks & 1][mt][2], a_frag[ks & 1][mt][3],
+                              b_frag[ks & 1][0][nt][0], b_frag[ks & 1][0][nt][1]);
+                    mma_16816(accu[mt][nt][0], accu[mt][nt][1], accu[mt][nt][2], accu[mt][nt][3],
+                              a_frag[ks & 1][mt][0], a_frag[ks & 1][mt][1], a_frag[ks & 1][mt][2], a_frag[ks & 1][mt][3],
+                              b_frag[ks & 1][1][nt][0], b_frag[ks & 1][1][nt][1]);
+                }
+            }
+        }
+        if (s + 1 < k_iters) {
+            if (next_stage < k_iters) { issue_stage(next_stage, next_stage % Cfg::STAGES); ++next_stage; }
+            else { cp_commit(); }
+            cp_wait<Cfg::STAGES - 2>();
+            __syncthreads();
+            slot = (slot + 1) % Cfg::STAGES;
+            load_a(slot, 0, 0);
+            load_b(slot, 0, 0);
+        }
+    }
+}
+
+template <int BM, int BNP, int WM, int WN, int STL, int MIB = 2>
+struct DualCfg {
+    static constexpr int THREADS = WM * WN * 32;
+    static constexpr int MINB = MIB;
+    static constexpr int SMEM_BYTES = STL * (BM + 2 * BNP) * SK * 2;
+};
+
+// gemm1 (dual): h = silu(x @ Wg.T) * (x @ Wu.T) in a single K-loop.
+template <int BM, int BNP, int WM, int WN, int STL>
+__global__ void __launch_bounds__(DualCfg<BM, BNP, WM, WN, STL>::THREADS, DualCfg<BM, BNP, WM, WN, STL>::MINB)
+moe_gemm1_dual_kernel(
+    const bf16* __restrict__ x,
+    const int* __restrict__ sorted_token,
+    const int* __restrict__ tile_expert, const int* __restrict__ tile_mstart,
+    const int* __restrict__ tile_mcount, const int* __restrict__ total_tiles,
+    const bf16* __restrict__ w1r, const bf16* __restrict__ w1s,
+    const int H, const int I, const int E,
+    bf16* __restrict__ hbuf, const int pf_mode, const int raster) {
+    using Cfg = GemmCfg<BM, BNP, WM, WN, STL>;
+
+    const int lin = blockIdx.y * gridDim.x + blockIdx.x;
+    int tile, nit;
+    if (raster != 0) { nit = lin % gridDim.x; tile = lin / gridDim.x; }
+    else { tile = lin % gridDim.y; nit = lin / gridDim.y; }
+    if (tile >= __ldg(total_tiles)) return;
+    const int e = __ldg(tile_expert + tile);
+    const int mstart = __ldg(tile_mstart + tile);
+    const int mcount = __ldg(tile_mcount + tile);
+    const bf16* W = (e < E) ? (w1r + (size_t)e * 2 * (size_t)I * H)
+                            : (w1s + (size_t)(e - E) * 2 * (size_t)I * H);
+    const int n0 = nit * BNP;
+
+    extern __shared__ char smem[];
+
+    const int K = H;
+    auto a_row = [&](int r) -> const bf16* {
+        return x + (size_t)__ldg(sorted_token + mstart + r) * K;
+    };
+
+    float accg[Cfg::MTILES][Cfg::NTILES][4];
+    float accu[Cfg::MTILES][Cfg::NTILES][4];
+    #pragma unroll
+    for (int mt = 0; mt < Cfg::MTILES; ++mt)
+        #pragma unroll
+        for (int nt = 0; nt < Cfg::NTILES; ++nt)
+            #pragma unroll
+            for (int q = 0; q < 4; ++q) { accg[mt][nt][q] = 0.f; accu[mt][nt][q] = 0.f; }
+
+    gemm_dual<BM, BNP, WM, WN, STL>(smem, K, mcount, a_row,
+                                    W + (size_t)n0 * K, W + (size_t)(I + n0) * K, pf_mode,
+                                    accg, accu);
+
+    // epilogue: h = silu(gate) * up, bf16 pairs
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    const int warp_m0 = (warp % WM) * Cfg::MT;
+    const int warp_n0 = (warp / WM) * Cfg::NT;
+    #pragma unroll
+    for (int mt = 0; mt < Cfg::MTILES; ++mt) {
+        #pragma unroll
+        for (int half = 0; half < 2; ++half) {
+            int r = warp_m0 + mt * 16 + (lane >> 2) + half * 8;
+            if (r >= mcount) continue;
+            size_t hrow = (size_t)(mstart + r) * I;
+            #pragma unroll
+            for (int nt = 0; nt < Cfg::NTILES; ++nt) {
+                int c = n0 + warp_n0 + nt * 8 + (lane & 3) * 2;
+                float g0 = accg[mt][nt][half * 2 + 0];
+                float g1 = accg[mt][nt][half * 2 + 1];
+                float u0 = accu[mt][nt][half * 2 + 0];
+                float u1 = accu[mt][nt][half * 2 + 1];
+                __nv_bfloat162 pk = __floats2bfloat162_rn(silu(g0) * u0, silu(g1) * u1);
+                *reinterpret_cast<__nv_bfloat162*>(hbuf + hrow + c) = pk;
+            }
+        }
+    }
+}
+
+// gemm1: h = silu(x @ Wg.T) * (x @ Wu.T), two K-passes (gate, up).
+// gridDim.x = I/BNP, gridDim.y = tile bound.
+template <int BM, int BNP, int WM, int WN, int STL = 3, int MIB = 2>
+__global__ void __launch_bounds__(GemmCfg<BM, BNP, WM, WN, STL, MIB>::THREADS, GemmCfg<BM, BNP, WM, WN, STL, MIB>::MINB)
+moe_gemm1_kernel(
+    const bf16* __restrict__ x,
+    const int* __restrict__ sorted_token,
+    const int* __restrict__ tile_expert, const int* __restrict__ tile_mstart,
+    const int* __restrict__ tile_mcount, const int* __restrict__ total_tiles,
+    const bf16* __restrict__ w1r, const bf16* __restrict__ w1s,
+    const int H, const int I, const int E,
+    bf16* __restrict__ hbuf, const int pf_mode, const int raster) {
+    using Cfg = GemmCfg<BM, BNP, WM, WN, STL>;
+
+    const int lin = blockIdx.y * gridDim.x + blockIdx.x;
+    int tile, nit;
+    if (raster != 0) { nit = lin % gridDim.x; tile = lin / gridDim.x; }
+    else { tile = lin % gridDim.y; nit = lin / gridDim.y; }
+    if (tile >= __ldg(total_tiles)) return;
+    const int e = __ldg(tile_expert + tile);
+    const int mstart = __ldg(tile_mstart + tile);
+    const int mcount = __ldg(tile_mcount + tile);
+    const bf16* W = (e < E) ? (w1r + (size_t)e * 2 * (size_t)I * H)
+                            : (w1s + (size_t)(e - E) * 2 * (size_t)I * H);
+    const int n0 = nit * BNP;  // h-column block in [0, I)
+
+    extern __shared__ char smem[];
+
+    const int K = H;
+    auto a_row = [&](int r) -> const bf16* {
+        return x + (size_t)__ldg(sorted_token + mstart + r) * K;
+    };
+
+    float acc[2][Cfg::MTILES][Cfg::NTILES][4];
+    #pragma unroll
+    for (int p = 0; p < 2; ++p)
+        #pragma unroll
+        for (int mt = 0; mt < Cfg::MTILES; ++mt)
+            #pragma unroll
+            for (int nt = 0; nt < Cfg::NTILES; ++nt)
+                #pragma unroll
+                for (int q = 0; q < 4; ++q) acc[p][mt][nt][q] = 0.f;
+
+    // gate pass: B rows [n0, n0+BNP) of W (gate block rows [0,I))
+    gemm_kpass<BM, BNP, WM, WN, STL>(smem, K, mcount, a_row, W + (size_t)n0 * K, pf_mode, acc[0]);
+    __syncthreads();
+    // up pass: B rows [I+n0, I+n0+BNP)
+    gemm_kpass<BM, BNP, WM, WN, STL>(smem, K, mcount, a_row, W + (size_t)(I + n0) * K, pf_mode, acc[1]);
+
+    // epilogue: h = silu(gate) * up, bf16 pairs
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    const int warp_m0 = (warp % WM) * Cfg::MT;
+    const int warp_n0 = (warp / WM) * Cfg::NT;
+    #pragma unroll
+    for (int mt = 0; mt < Cfg::MTILES; ++mt) {
+        #pragma unroll
+        for (int half = 0; half < 2; ++half) {
+            int r = warp_m0 + mt * 16 + (lane >> 2) + half * 8;
+            if (r >= mcount) continue;
+            size_t hrow = (size_t)(mstart + r) * I;
+            #pragma unroll
+            for (int nt = 0; nt < Cfg::NTILES; ++nt) {
+                int c = n0 + warp_n0 + nt * 8 + (lane & 3) * 2;
+                float g0 = acc[0][mt][nt][half * 2 + 0];
+                float g1 = acc[0][mt][nt][half * 2 + 1];
+                float u0 = acc[1][mt][nt][half * 2 + 0];
+                float u1 = acc[1][mt][nt][half * 2 + 1];
+                __nv_bfloat162 pk = __floats2bfloat162_rn(silu(g0) * u0, silu(g1) * u1);
+                *reinterpret_cast<__nv_bfloat162*>(hbuf + hrow + c) = pk;
+            }
+        }
+    }
+}
+
+// gemm2: out_f32[token, :] += weight * (h @ W2[e].T).
+// gridDim.x = H/BNP, gridDim.y = tile bound.
+template <int BM, int BNP, int WM, int WN, int STL = 3, int MIB = 2>
+__global__ void __launch_bounds__(GemmCfg<BM, BNP, WM, WN, STL, MIB>::THREADS, GemmCfg<BM, BNP, WM, WN, STL, MIB>::MINB)
+moe_gemm2_kernel(
+    const bf16* __restrict__ hbuf,
+    const int* __restrict__ sorted_token, const float* __restrict__ sorted_weight,
+    const int* __restrict__ tile_expert, const int* __restrict__ tile_mstart,
+    const int* __restrict__ tile_mcount, const int* __restrict__ total_tiles,
+    const bf16* __restrict__ w2r, const bf16* __restrict__ w2s,
+    const int H, const int I, const int E,
+    float* __restrict__ out_f32, const int pf_mode, const int raster, const int ns) {
+    using Cfg = GemmCfg<BM, BNP, WM, WN, STL>;
+
+    const int lin = blockIdx.y * gridDim.x + blockIdx.x;
+    int tile, nit;
+    if (raster != 0) { nit = lin % gridDim.x; tile = lin / gridDim.x; }
+    else { tile = lin % gridDim.y; nit = lin / gridDim.y; }
+    if (tile >= __ldg(total_tiles)) return;
+    const int e = __ldg(tile_expert + tile);
+    const int mstart = __ldg(tile_mstart + tile);
+    const int mcount = __ldg(tile_mcount + tile);
+    const bf16* W = (e < E) ? (w2r + (size_t)e * (size_t)H * I)
+                            : (w2s + (size_t)(e - E) * (size_t)H * I);
+    const int n0 = nit * BNP;  // out column block in [0, H)
+
+    extern __shared__ char smem[];
+
+    const int K = I;
+    auto a_row = [&](int r) -> const bf16* {
+        return hbuf + (size_t)(mstart + r) * K;
+    };
+
+    float acc[1][Cfg::MTILES][Cfg::NTILES][4];
+    #pragma unroll
+    for (int mt = 0; mt < Cfg::MTILES; ++mt)
+        #pragma unroll
+        for (int nt = 0; nt < Cfg::NTILES; ++nt)
+            #pragma unroll
+            for (int q = 0; q < 4; ++q) acc[0][mt][nt][q] = 0.f;
+
+    gemm_kpass<BM, BNP, WM, WN, STL>(smem, K, mcount, a_row, W + (size_t)n0 * K, pf_mode, acc[0]);
+
+    // epilogue: weighted scatter via vector fp32 atomic reduction. (Plain
+    // stores were considered for shared-expert tiles but race with routed
+    // red.add traffic on the same output locations.)
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    const int warp_m0 = (warp % WM) * Cfg::MT;
+    const int warp_n0 = (warp / WM) * Cfg::NT;
+    #pragma unroll
+    for (int mt = 0; mt < Cfg::MTILES; ++mt) {
+        #pragma unroll
+        for (int half = 0; half < 2; ++half) {
+            int r = warp_m0 + mt * 16 + (lane >> 2) + half * 8;
+            if (r >= mcount) continue;
+            int tok = __ldg(sorted_token + mstart + r);
+            float w = __ldg(sorted_weight + mstart + r);
+            float* orow = out_f32 + (size_t)tok * H;
+            #pragma unroll
+            for (int nt = 0; nt < Cfg::NTILES; ++nt) {
+                int c = n0 + warp_n0 + nt * 8 + (lane & 3) * 2;
+                red_add_v2(orow + c,
+                           acc[0][mt][nt][half * 2 + 0] * w,
+                           acc[0][mt][nt][half * 2 + 1] * w);
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------- dispatch
+std::vector<torch::Tensor> moe_forward_impl(torch::Tensor x, torch::Tensor expert_ids,
+                               torch::Tensor expert_weights, torch::Tensor w1r,
+                               torch::Tensor w2r, torch::Tensor w1s, torch::Tensor w2s,
+                               bool debug) {
+    const int T = x.size(0);
+    const int H = x.size(1);
+    const int E = w1r.size(0);
+    const int I = w1r.size(1) / 2;
+    const int top_k = expert_ids.size(1);
+    const int ns = w1s.size(0);
+    const int Etot = E + ns;
+    const int N = T * (top_k + ns);
+
+    auto stream = at::cuda::getCurrentCUDAStream();
+    const int pf_mode = []() {
+        const char* v = getenv("GLM52_PREF");
+        int m = v ? atoi(v) : 2;  // L2::256B prefetch streams weights best
+        return (m >= 0 && m <= 2) ? m : 2;
+    }();
+    auto opts_i = torch::TensorOptions().dtype(torch::kInt32).device(x.device());
+    auto opts_f = torch::TensorOptions().dtype(torch::kFloat).device(x.device());
+    auto opts_b = torch::TensorOptions().dtype(torch::kBFloat16).device(x.device());
+
+    const int v1 = []() { const char* s = getenv("GLM52_G1"); return s ? atoi(s) : 9; }();
+    const int v2 = []() { const char* s = getenv("GLM52_G2"); return s ? atoi(s) : 7; }();
+
+    // config selection: the default everywhere is the 64-row co-panel dual
+    // with real 3-stage pipelines (v1=9); two-pass/128-row paths are
+    // kept for experiments. "tiny" (decode-scale) uses 32x64 slabs.
+    const double avgq = (double)N / (double)Etot;
+    const bool big = (avgq >= 96.0);
+    const bool tiny = (avgq < 8.0) && !getenv("GLM52_NOTINY");
+    const int BM = tiny ? 32 : ((v1 == 9) ? 64 : (big ? 128 : 32));
+    const int BNP = (v1 == 9 || big || tiny) ? 64 : 128;
+    const int bound = (N + BM - 1) / BM + Etot + 1;
+
+    auto tile_expert = torch::empty({bound}, opts_i);
+    auto tile_mstart = torch::empty({bound}, opts_i);
+    auto tile_mcount = torch::empty({bound}, opts_i);
+    auto total_tiles = torch::empty({1}, opts_i);
+    auto sorted_token = torch::empty({N}, opts_i);
+    auto sorted_weight = torch::empty({N}, opts_f);
+
+    int prep_smem = (4 * Etot + 1) * sizeof(int) + 64;
+    prepare_kernel<<<1, 1024, prep_smem, stream>>>(
+        expert_ids.data_ptr<int64_t>(),
+        reinterpret_cast<const bf16*>(expert_weights.data_ptr<at::BFloat16>()),
+        T, E, top_k, ns, BM,
+        tile_expert.data_ptr<int>(), tile_mstart.data_ptr<int>(),
+        tile_mcount.data_ptr<int>(), total_tiles.data_ptr<int>(),
+        sorted_token.data_ptr<int>(), sorted_weight.data_ptr<float>());
+
+    auto hbuf = torch::empty({(int64_t)N, (int64_t)I}, opts_b);
+    auto out_f32 = torch::zeros({(int64_t)T, (int64_t)H}, opts_f);
+
+    dim3 g1(I / BNP, bound, 1);
+    dim3 g2(H / BNP, bound, 1);
+
+    const bf16* xp = reinterpret_cast<const bf16*>(x.data_ptr<at::BFloat16>());
+    const bf16* hp = reinterpret_cast<const bf16*>(hbuf.data_ptr<at::BFloat16>());
+    const bf16* w1rp = reinterpret_cast<const bf16*>(w1r.data_ptr<at::BFloat16>());
+    const bf16* w1sp = reinterpret_cast<const bf16*>(w1s.data_ptr<at::BFloat16>());
+    const bf16* w2rp = reinterpret_cast<const bf16*>(w2r.data_ptr<at::BFloat16>());
+    const bf16* w2sp = reinterpret_cast<const bf16*>(w2s.data_ptr<at::BFloat16>());
+
+    const int raster = []() { const char* s = getenv("GLM52_RASTER"); return s ? atoi(s) : 1; }();
+
+    int* stp = sorted_token.data_ptr<int>();
+    float* swp = sorted_weight.data_ptr<float>();
+    int* tep = tile_expert.data_ptr<int>();
+    int* tmp = tile_mstart.data_ptr<int>();
+    int* tcp = tile_mcount.data_ptr<int>();
+    int* ttp = total_tiles.data_ptr<int>();
+
+    if (big) {
+        if (v1 == 2) {
+            using D = DualCfg<128, 64, 4, 2, 2>;
+            static bool s_a = false;
+            if (!s_a) { cudaFuncSetAttribute(moe_gemm1_dual_kernel<128, 64, 4, 2, 2>, cudaFuncAttributeMaxDynamicSharedMemorySize, D::SMEM_BYTES); s_a = true; }
+            moe_gemm1_dual_kernel<128, 64, 4, 2, 2><<<g1, D::THREADS, D::SMEM_BYTES, stream>>>(
+                xp, stp, tep, tmp, tcp, ttp, w1rp, w1sp, H, I, E, const_cast<bf16*>(hp), pf_mode, raster);
+        } else if (v1 == 3) {
+            using D = DualCfg<128, 64, 2, 2, 2>;
+            static bool s_a = false;
+            if (!s_a) { cudaFuncSetAttribute(moe_gemm1_dual_kernel<128, 64, 2, 2, 2>, cudaFuncAttributeMaxDynamicSharedMemorySize, D::SMEM_BYTES); s_a = true; }
+            moe_gemm1_dual_kernel<128, 64, 2, 2, 2><<<g1, D::THREADS, D::SMEM_BYTES, stream>>>(
+                xp, stp, tep, tmp, tcp, ttp, w1rp, w1sp, H, I, E, const_cast<bf16*>(hp), pf_mode, raster);
+        } else if (v1 == 4) {
+            using D = DualCfg<128, 64, 4, 2, 3>;
+            static bool s_a = false;
+            if (!s_a) { cudaFuncSetAttribute(moe_gemm1_dual_kernel<128, 64, 4, 2, 3>, cudaFuncAttributeMaxDynamicSharedMemorySize, D::SMEM_BYTES); s_a = true; }
+            moe_gemm1_dual_kernel<128, 64, 4, 2, 3><<<g1, D::THREADS, D::SMEM_BYTES, stream>>>(
+                xp, stp, tep, tmp, tcp, ttp, w1rp, w1sp, H, I, E, const_cast<bf16*>(hp), pf_mode, raster);
+        } else if (v1 == 7) {
+            // 128-wide two-pass: real STL=3 pipeline, 32x64 warp tiles, 1 CTA/SM
+            using Cfg = GemmCfg<128, 128, 4, 2, 3, 1>;
+            static bool s_a7 = false;
+            if (!s_a7) { cudaFuncSetAttribute(moe_gemm1_kernel<128, 128, 4, 2, 3, 1>, cudaFuncAttributeMaxDynamicSharedMemorySize, Cfg::SMEM_BYTES); s_a7 = true; }
+            dim3 g1x(I / 128, bound, 1);
+            moe_gemm1_kernel<128, 128, 4, 2, 3, 1><<<g1x, Cfg::THREADS, Cfg::SMEM_BYTES, stream>>>(
+                xp, stp, tep, tmp, tcp, ttp, w1rp, w1sp, H, I, E, const_cast<bf16*>(hp), pf_mode, raster);
+        } else if (v1 == 9) {
+            // 64-row co-panel dual, 2 CTAs/SM + real STL=3 pipeline
+            using D = DualCfg<64, 64, 2, 2, 3>;
+            static bool s_a9 = false;
+            if (!s_a9) { cudaFuncSetAttribute(moe_gemm1_dual_kernel<64, 64, 2, 2, 3>, cudaFuncAttributeMaxDynamicSharedMemorySize, D::SMEM_BYTES); s_a9 = true; }
+            moe_gemm1_dual_kernel<64, 64, 2, 2, 3><<<g1, D::THREADS, D::SMEM_BYTES, stream>>>(
+                xp, stp, tep, tmp, tcp, ttp, w1rp, w1sp, H, I, E, const_cast<bf16*>(hp), pf_mode, raster);
+        } else if (v1 == 1) {
+            using Cfg = GemmCfg<128, 64, 2, 2>;
+            static bool s_a = false;
+            if (!s_a) { cudaFuncSetAttribute(moe_gemm1_kernel<128, 64, 2, 2>, cudaFuncAttributeMaxDynamicSharedMemorySize, Cfg::SMEM_BYTES); s_a = true; }
+            moe_gemm1_kernel<128, 64, 2, 2><<<g1, Cfg::THREADS, Cfg::SMEM_BYTES, stream>>>(
+                xp, stp, tep, tmp, tcp, ttp, w1rp, w1sp, H, I, E, const_cast<bf16*>(hp), pf_mode, raster);
+        } else {
+            using Cfg = GemmCfg<128, 64, 4, 2>;
+            static bool s_a = false;
+            if (!s_a) { cudaFuncSetAttribute(moe_gemm1_kernel<128, 64, 4, 2>, cudaFuncAttributeMaxDynamicSharedMemorySize, Cfg::SMEM_BYTES); s_a = true; }
+            moe_gemm1_kernel<128, 64, 4, 2><<<g1, Cfg::THREADS, Cfg::SMEM_BYTES, stream>>>(
+                xp, stp, tep, tmp, tcp, ttp, w1rp, w1sp, H, I, E, const_cast<bf16*>(hp), pf_mode, raster);
+        }
+        if (v2 == 9) {
+            using Cfg = GemmCfg<64, 64, 2, 2>;
+            static bool s_b9 = false;
+            if (!s_b9) { cudaFuncSetAttribute(moe_gemm2_kernel<64, 64, 2, 2>, cudaFuncAttributeMaxDynamicSharedMemorySize, Cfg::SMEM_BYTES); s_b9 = true; }
+            dim3 g2x(H / 64, bound, 1);
+            moe_gemm2_kernel<64, 64, 2, 2><<<g2x, Cfg::THREADS, Cfg::SMEM_BYTES, stream>>>(
+                hp, stp, swp, tep, tmp, tcp, ttp, w2rp, w2sp, H, I, E, out_f32.data_ptr<float>(), pf_mode, raster, ns);
+        } else if (v2 == 7) {
+            using Cfg = GemmCfg<64, 128, 2, 2>;
+            static bool s_b7 = false;
+            if (!s_b7) { cudaFuncSetAttribute(moe_gemm2_kernel<64, 128, 2, 2>, cudaFuncAttributeMaxDynamicSharedMemorySize, Cfg::SMEM_BYTES); s_b7 = true; }
+            dim3 g2x(H / 128, bound, 1);
+            moe_gemm2_kernel<64, 128, 2, 2><<<g2x, Cfg::THREADS, Cfg::SMEM_BYTES, stream>>>(
+                hp, stp, swp, tep, tmp, tcp, ttp, w2rp, w2sp, H, I, E, out_f32.data_ptr<float>(), pf_mode, raster, ns);
+        } else if (v2 == 1) {
+            using Cfg = GemmCfg<128, 64, 2, 2>;
+            static bool s_b = false;
+            if (!s_b) { cudaFuncSetAttribute(moe_gemm2_kernel<128, 64, 2, 2>, cudaFuncAttributeMaxDynamicSharedMemorySize, Cfg::SMEM_BYTES); s_b = true; }
+            moe_gemm2_kernel<128, 64, 2, 2><<<g2, Cfg::THREADS, Cfg::SMEM_BYTES, stream>>>(
+                hp, stp, swp, tep, tmp, tcp, ttp, w2rp, w2sp, H, I, E, out_f32.data_ptr<float>(), pf_mode, raster, ns);
+        } else {
+            using Cfg = GemmCfg<128, 64, 4, 2>;
+            static bool s_b = false;
+            if (!s_b) { cudaFuncSetAttribute(moe_gemm2_kernel<128, 64, 4, 2>, cudaFuncAttributeMaxDynamicSharedMemorySize, Cfg::SMEM_BYTES); s_b = true; }
+            moe_gemm2_kernel<128, 64, 4, 2><<<g2, Cfg::THREADS, Cfg::SMEM_BYTES, stream>>>(
+                hp, stp, swp, tep, tmp, tcp, ttp, w2rp, w2sp, H, I, E, out_f32.data_ptr<float>(), pf_mode, raster, ns);
+        }
+    } else if (tiny) {
+        // decode-scale: 64-wide slabs -> 2x the CTAs to fill SMs at tiny T.
+        using D = DualCfg<32, 64, 1, 2, 2>;
+        using Cfg2 = GemmCfg<32, 64, 1, 2>;
+        static bool s_a = false;
+        if (!s_a) {
+            cudaFuncSetAttribute(moe_gemm1_dual_kernel<32, 64, 1, 2, 2>, cudaFuncAttributeMaxDynamicSharedMemorySize, D::SMEM_BYTES);
+            cudaFuncSetAttribute(moe_gemm2_kernel<32, 64, 1, 2>, cudaFuncAttributeMaxDynamicSharedMemorySize, Cfg2::SMEM_BYTES);
+            s_a = true;
+        }
+        moe_gemm1_dual_kernel<32, 64, 1, 2, 2><<<g1, D::THREADS, D::SMEM_BYTES, stream>>>(
+            xp, stp, tep, tmp, tcp, ttp, w1rp, w1sp, H, I, E, const_cast<bf16*>(hp), pf_mode, raster);
+        moe_gemm2_kernel<32, 64, 1, 2><<<g2, Cfg2::THREADS, Cfg2::SMEM_BYTES, stream>>>(
+            hp, stp, swp, tep, tmp, tcp, ttp, w2rp, w2sp, H, I, E, out_f32.data_ptr<float>(), pf_mode, raster, ns);
+    } else if (v1 == 9) {
+        // default memory-shape path: 64-row co-panel dual, real STL=3 pipeline
+        using D = DualCfg<64, 64, 2, 2, 3>;
+        static bool s_a9m = false;
+        if (!s_a9m) { cudaFuncSetAttribute(moe_gemm1_dual_kernel<64, 64, 2, 2, 3>, cudaFuncAttributeMaxDynamicSharedMemorySize, D::SMEM_BYTES); s_a9m = true; }
+        dim3 g1x(I / 64, bound, 1);
+        moe_gemm1_dual_kernel<64, 64, 2, 2, 3><<<g1x, D::THREADS, D::SMEM_BYTES, stream>>>(
+            xp, stp, tep, tmp, tcp, ttp, w1rp, w1sp, H, I, E, const_cast<bf16*>(hp), pf_mode, raster);
+        using Cfg = GemmCfg<64, 64, 2, 2>;
+        static bool s_b9m = false;
+        if (!s_b9m) { cudaFuncSetAttribute(moe_gemm2_kernel<64, 64, 2, 2>, cudaFuncAttributeMaxDynamicSharedMemorySize, Cfg::SMEM_BYTES); s_b9m = true; }
+        dim3 g2x(H / 64, bound, 1);
+        moe_gemm2_kernel<64, 64, 2, 2><<<g2x, Cfg::THREADS, Cfg::SMEM_BYTES, stream>>>(
+            hp, stp, swp, tep, tmp, tcp, ttp, w2rp, w2sp, H, I, E, out_f32.data_ptr<float>(), pf_mode, raster, ns);
+    } else if (v1 == 6) {
+        // small-BNP memory-shape variant: 64-wide slabs, 4 CTAs/SM
+        using D = DualCfg<32, 64, 1, 2, 2>;
+        using Cfg2 = GemmCfg<32, 64, 1, 2>;
+        static bool s_a6 = false;
+        if (!s_a6) {
+            cudaFuncSetAttribute(moe_gemm1_dual_kernel<32, 64, 1, 2, 2>, cudaFuncAttributeMaxDynamicSharedMemorySize, D::SMEM_BYTES);
+            cudaFuncSetAttribute(moe_gemm2_kernel<32, 64, 1, 2>, cudaFuncAttributeMaxDynamicSharedMemorySize, Cfg2::SMEM_BYTES);
+            s_a6 = true;
+        }
+        dim3 g1x(I / 64, bound, 1);
+        dim3 g2x(H / 64, bound, 1);
+        moe_gemm1_dual_kernel<32, 64, 1, 2, 2><<<g1x, D::THREADS, D::SMEM_BYTES, stream>>>(
+            xp, stp, tep, tmp, tcp, ttp, w1rp, w1sp, H, I, E, const_cast<bf16*>(hp), pf_mode, raster);
+        moe_gemm2_kernel<32, 64, 1, 2><<<g2x, Cfg2::THREADS, Cfg2::SMEM_BYTES, stream>>>(
+            hp, stp, swp, tep, tmp, tcp, ttp, w2rp, w2sp, H, I, E, out_f32.data_ptr<float>(), pf_mode, raster, ns);
+    } else {
+        if (v1 == 2) {
+            using D = DualCfg<32, 128, 1, 4, 2>;
+            static bool s_a = false;
+            if (!s_a) { cudaFuncSetAttribute(moe_gemm1_dual_kernel<32, 128, 1, 4, 2>, cudaFuncAttributeMaxDynamicSharedMemorySize, D::SMEM_BYTES); s_a = true; }
+            moe_gemm1_dual_kernel<32, 128, 1, 4, 2><<<g1, D::THREADS, D::SMEM_BYTES, stream>>>(
+                xp, stp, tep, tmp, tcp, ttp, w1rp, w1sp, H, I, E, const_cast<bf16*>(hp), pf_mode, raster);
+        } else {
+            using Cfg = GemmCfg<32, 128, 1, 4>;
+            static bool s_a = false;
+            if (!s_a) { cudaFuncSetAttribute(moe_gemm1_kernel<32, 128, 1, 4>, cudaFuncAttributeMaxDynamicSharedMemorySize, Cfg::SMEM_BYTES); s_a = true; }
+            moe_gemm1_kernel<32, 128, 1, 4><<<g1, Cfg::THREADS, Cfg::SMEM_BYTES, stream>>>(
+                xp, stp, tep, tmp, tcp, ttp, w1rp, w1sp, H, I, E, const_cast<bf16*>(hp), pf_mode, raster);
+        }
+        using Cfg = GemmCfg<32, 128, 1, 4>;
+        static bool s_b = false;
+        if (!s_b) { cudaFuncSetAttribute(moe_gemm2_kernel<32, 128, 1, 4>, cudaFuncAttributeMaxDynamicSharedMemorySize, Cfg::SMEM_BYTES); s_b = true; }
+        moe_gemm2_kernel<32, 128, 1, 4><<<g2, Cfg::THREADS, Cfg::SMEM_BYTES, stream>>>(
+            hp, stp, swp, tep, tmp, tcp, ttp, w2rp, w2sp, H, I, E, out_f32.data_ptr<float>(), pf_mode, raster, ns);
+    }
+
+    cudaError_t err = cudaGetLastError();
+    TORCH_CHECK(err == cudaSuccess, "moe kernel launch failed: ", cudaGetErrorString(err));
+
+    if (debug) {
+        return {out_f32, hbuf, tile_expert, tile_mstart, tile_mcount,
+                total_tiles, sorted_token, sorted_weight};
+    }
+    return {out_f32.to(torch::kBFloat16)};
+}
+
+torch::Tensor moe_forward(torch::Tensor x, torch::Tensor expert_ids,
+                          torch::Tensor expert_weights, torch::Tensor w1r,
+                          torch::Tensor w2r, torch::Tensor w1s, torch::Tensor w2s) {
+    return moe_forward_impl(std::move(x), std::move(expert_ids), std::move(expert_weights),
+                            std::move(w1r), std::move(w2r), std::move(w1s), std::move(w2s), false)[0];
+}
+
+std::vector<torch::Tensor> moe_debug(torch::Tensor x, torch::Tensor expert_ids,
+                                     torch::Tensor expert_weights, torch::Tensor w1r,
+                                     torch::Tensor w2r, torch::Tensor w1s, torch::Tensor w2s) {
+    return moe_forward_impl(std::move(x), std::move(expert_ids), std::move(expert_weights),
+                            std::move(w1r), std::move(w2r), std::move(w1s), std::move(w2s), true);
+}
+"""
+
+_ext = None
+
+
+def _get_ext():
+    global _ext
+    if _ext is None:
+        from torch.utils.cpp_extension import load_inline
+
+        _ext = load_inline(
+            name="glm52_fused_moe_v1",
+            cpp_sources=_CPP_SRC,
+            cuda_sources=_CUDA_SRC,
+            functions=["moe_forward", "moe_debug"],
+            extra_cuda_cflags=["-O3", "-std=c++17", "-lineinfo"],
+            verbose=False,
+        )
+    return _ext
+
+
+# Eager fp32 fallback for geometries the CUDA kernel does not target
+# (benchmark geometry always takes the CUDA path).
+def _reference_forward(model, x, expert_ids, expert_weights):
+    import torch.nn.functional as F
+
+    T, H = x.shape
+    out = torch.zeros(T, H, device=x.device, dtype=torch.float32)
+    xf = x.float()
+    for s in range(model.n_shared):
+        I_half = model.w1_shared.shape[1] // 2
+        w1 = model.w1_shared[s].float()
+        gate = xf @ w1[:I_half].T
+        up = xf @ w1[I_half:].T
+        out = out + (F.silu(gate) * up) @ model.w2_shared[s].float().T
+    wts = expert_weights.float()
+    for e in range(model.E):
+        mask = expert_ids == e
+        if not mask.any():
+            continue
+        token_idx, k_idx = mask.nonzero(as_tuple=True)
+        x_e = xf[token_idx]
+        w_e = wts[token_idx, k_idx]
+        I_half = model.w1_routed.shape[1] // 2
+        w1 = model.w1_routed[e].float()
+        gate = x_e @ w1[:I_half].T
+        up = x_e @ w1[I_half:].T
+        y = (F.silu(gate) * up) @ model.w2_routed[e].float().T
+        out.index_add_(0, token_idx, y * w_e.unsqueeze(1))
+    return out.to(torch.bfloat16)
+
+
+class Model(nn.Module):
+    def __init__(self, T: int, E: int, top_k: int, n_shared: int, H: int, I: int):
+        super().__init__()
+        self.T, self.E, self.top_k = T, E, top_k
+        self.n_shared, self.H, self.I = n_shared, H, I
+        self.w1_routed = nn.Parameter(torch.empty(E, 2 * I, H, dtype=torch.bfloat16))
+        self.w2_routed = nn.Parameter(torch.empty(E, H, I, dtype=torch.bfloat16))
+        self.w1_shared = nn.Parameter(torch.empty(n_shared, 2 * I, H, dtype=torch.bfloat16))
+        self.w2_shared = nn.Parameter(torch.empty(n_shared, H, I, dtype=torch.bfloat16))
+        for p in self.parameters():
+            nn.init.normal_(p, std=0.02)
+
+    def forward(self, x, expert_ids, expert_weights):
+        x = x.contiguous()
+        expert_ids = expert_ids.to(torch.int64).contiguous()
+        expert_weights = expert_weights.contiguous()
+        H_, I_ = self.H, self.I
+        cuda_ok = (
+            x.is_cuda
+            and H_ % 64 == 0
+            and I_ % 128 == 0
+            and H_ % 32 == 0
+            and I_ % 32 == 0
+            and x.dtype == torch.bfloat16
+        )
+        if cuda_ok:
+            return _get_ext().moe_forward(
+                x,
+                expert_ids,
+                expert_weights.to(torch.bfloat16),
+                self.w1_routed,
+                self.w2_routed,
+                self.w1_shared,
+                self.w2_shared,
+            )
+        return _reference_forward(self, x, expert_ids, expert_weights)
+
+
+def get_init_inputs():
+    return [T, E, top_k, n_shared, H, I]
+
+
+def get_inputs():
+    x = torch.randn(T, H, dtype=torch.bfloat16)
+    logits = torch.randn(T, E) + torch.linspace(0.3, 0.0, E).unsqueeze(0)
+    vals, ids = torch.topk(logits, k=top_k, dim=-1)
+    weights = torch.softmax(vals, dim=-1).to(torch.bfloat16)
+    return [x, ids.to(torch.int64), weights]

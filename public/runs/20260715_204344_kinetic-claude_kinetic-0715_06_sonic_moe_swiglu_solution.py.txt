@@ -1,0 +1,576 @@
+"""Grouped GEMM + fused SwiGLU MoE up-projection for RTX PRO 6000 (SM120).
+
+Custom TMA + mbarrier pipelined mma.sync kernel with device-side tile scheduling
+(Triton fallback for odd shapes). See kernel docstring in CUDA source below.
+"""
+from __future__ import annotations
+
+import os
+import torch
+import torch.nn as nn
+
+_CUDA_SRC = r'''
+// Grouped GEMM + fused SwiGLU for MoE up-projection on SM120 (RTX PRO 6000).
+// TMA + mbarrier pipelined, warp-specialized producer.
+//
+//   h_e = silu(x_e @ W_gate[e]) * (x_e @ W_up[e])
+//
+// CTA tile: BM=128 rows x 256 cols (128 gate + same 128 up columns), BK=32.
+// 8 consumer warps (2x4), warp tile 64x64; +1 producer warp for TMA issues.
+// 4-stage pipeline; per stage: A box (32el x 128r) SW64, B = 4 strip boxes
+// (64el x 32r) SW128. mbarrier full/empty per stage.
+#include <cuda.h>
+#include <cuda_bf16.h>
+#include <torch/extension.h>
+#include <ATen/cuda/CUDAContext.h>
+#include <cstdint>
+
+namespace moe_swiglu {
+
+constexpr int BM = 128;
+constexpr int BN_HALF = 128;
+constexpr int BK = 32;
+constexpr int STAGES = 4;
+constexpr int THREADS = 256;
+constexpr int CONSUMER_THREADS = 256;
+
+constexpr int A_STAGE_BYTES = BM * BK * 2;              // 8 KB
+constexpr int B_STAGE_BYTES = BK * 2 * BN_HALF * 2;     // 16 KB
+constexpr int STAGE_BYTES = A_STAGE_BYTES + B_STAGE_BYTES;
+
+__device__ __forceinline__ int swz_a(int r, int c) { return c ^ ((r >> 1) & 3); }
+__device__ __forceinline__ int swz_b(int r, int c) { return c ^ (r & 7); }
+
+__device__ __forceinline__ unsigned smem_u32(const void* p) {
+  return static_cast<unsigned>(__cvta_generic_to_shared(p));
+}
+
+__device__ __forceinline__ void ldmatrix_x4(unsigned addr, unsigned& r0, unsigned& r1,
+                                            unsigned& r2, unsigned& r3) {
+  asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+               : "=r"(r0), "=r"(r1), "=r"(r2), "=r"(r3)
+               : "r"(addr));
+}
+
+__device__ __forceinline__ void ldmatrix_x4_trans(unsigned addr, unsigned& r0, unsigned& r1,
+                                                  unsigned& r2, unsigned& r3) {
+  asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+               : "=r"(r0), "=r"(r1), "=r"(r2), "=r"(r3)
+               : "r"(addr));
+}
+
+__device__ __forceinline__ void mma_16816(float& c0, float& c1, float& c2, float& c3,
+                                          unsigned a0, unsigned a1, unsigned a2, unsigned a3,
+                                          unsigned b0, unsigned b1) {
+  asm volatile(
+      "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
+      "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+      : "+f"(c0), "+f"(c1), "+f"(c2), "+f"(c3)
+      : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+}
+
+__device__ __forceinline__ float sigmoid_fast(float x) {
+  float t;
+  asm("tanh.approx.f32 %0, %1;\n" : "=f"(t) : "f"(x * 0.5f));
+  return 0.5f * t + 0.5f;
+}
+
+__device__ __forceinline__ void mbar_init(unsigned bar, unsigned count) {
+  asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;\n" ::"r"(bar), "r"(count));
+}
+__device__ __forceinline__ void mbar_expect_tx(unsigned bar, unsigned bytes) {
+  asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;\n" ::"r"(bar), "r"(bytes));
+}
+__device__ __forceinline__ void mbar_arrive(unsigned bar) {
+  asm volatile("mbarrier.arrive.shared::cta.b64 _, [%0];\n" ::"r"(bar));
+}
+__device__ __forceinline__ void mbar_wait(unsigned bar, unsigned parity) {
+  unsigned done = 0;
+  while (!done) {
+    asm volatile(
+        "{.reg .pred p; mbarrier.try_wait.parity.shared::cta.b64 p, [%1], %2; "
+        "selp.u32 %0, 1, 0, p;}\n"
+        : "=r"(done)
+        : "r"(bar), "r"(parity));
+  }
+}
+
+__global__ void setup_tiles(const int* __restrict__ offsets, int* __restrict__ tile_starts, int E) {
+  int carried = 0;
+  for (int base = 0; base < E; base += 32) {
+    int e = base + (int)(threadIdx.x & 31);
+    int tiles = 0;
+    if (e < E) {
+      int n = offsets[e + 1] - offsets[e];
+      tiles = (n + BM - 1) / BM;
+    }
+    int x = tiles;
+#pragma unroll
+    for (int d = 1; d < 32; d <<= 1) {
+      int y = __shfl_up_sync(0xffffffffu, x, d);
+      if ((int)(threadIdx.x & 31) >= d) x += y;
+    }
+    if (e < E) tile_starts[e] = carried + x - tiles;
+    carried += __shfl_sync(0xffffffffu, x, 31);
+  }
+  if (threadIdx.x == 0) tile_starts[E] = carried;
+}
+
+// ---------------------------------------------------------------------------
+// Main kernel (fast path: H % 32 == 0, I % 128 == 0).
+// ---------------------------------------------------------------------------
+__global__ void __launch_bounds__(THREADS, 1) moe_swiglu_tma_kernel(
+    const __grid_constant__ CUtensorMap tmap_x,
+    const __grid_constant__ CUtensorMap tmap_wg,
+    const __grid_constant__ CUtensorMap tmap_wu,
+    __nv_bfloat16* __restrict__ OUT,
+    const int* __restrict__ offsets,
+    const int* __restrict__ tile_starts,
+    int H, int I, int E) {
+  extern __shared__ __align__(128) char smem[];
+  char* A_base = smem;
+  char* B_base = smem + STAGES * A_STAGE_BYTES;
+  char* bar_base = smem + STAGES * (A_STAGE_BYTES + B_STAGE_BYTES);
+  unsigned full_bar[STAGES], empty_bar[STAGES];
+#pragma unroll
+  for (int s = 0; s < STAGES; ++s) {
+    full_bar[s] = smem_u32(bar_base + s * 8);
+    empty_bar[s] = smem_u32(bar_base + (STAGES + s) * 8);
+  }
+
+  const int tid = threadIdx.x;
+  const int warp = tid >> 5;
+  const int lane = tid & 31;
+  const int pid_n = blockIdx.x;
+  const int pid_m = (int)blockIdx.y;
+
+  const int total_m_tiles = tile_starts[E];
+
+  // early-exit CTAs (beyond work range) do nothing at all.
+  const bool active = pid_m < total_m_tiles;
+
+  if (active && tid == 0) {
+#pragma unroll
+    for (int s = 0; s < STAGES; ++s) {
+      mbar_init(full_bar[s], 1);
+      mbar_init(empty_bar[s], 8);
+    }
+    asm volatile("fence.proxy.async.shared::cta;\n");
+  }
+  __syncthreads();
+  if (!active) return;
+
+  // Binary search expert: starts[e] <= pid_m < starts[e+1]
+  int lo = 0, hi = E - 1;
+  while (hi > lo) {
+    int mid = (lo + hi + 1) >> 1;
+    if (tile_starts[mid] <= pid_m) lo = mid;
+    else hi = mid - 1;
+  }
+  const int e = lo;
+  const int row_lo = offsets[e];
+  const int row_hi = offsets[e + 1];
+  const int m0 = (pid_m - tile_starts[e]) * BM;
+  const int row_start = row_lo + m0;
+  const int n0 = pid_n * BN_HALF;
+
+  const int KT = H / BK;
+
+  // TMA issue for one k-tile into stage s (single thread).
+  auto tma_issue = [&](int kt, int s) {
+    int kbase = kt * BK;
+    unsigned dst_a = smem_u32(A_base + s * A_STAGE_BYTES);
+    unsigned dst_b = smem_u32(B_base + s * B_STAGE_BYTES);
+    mbar_expect_tx(full_bar[s], STAGE_BYTES);
+    asm volatile(
+        "cp.async.bulk.tensor.2d.shared::cluster.global.tile.mbarrier::complete_tx::bytes "
+        "[%0], [%1, {%2, %3}], [%4];\n" ::"r"(dst_a), "l"(&tmap_x), "r"(kbase), "r"(row_start),
+        "r"(full_bar[s])
+        : "memory");
+    asm volatile(
+        "cp.async.bulk.tensor.3d.shared::cluster.global.tile.mbarrier::complete_tx::bytes "
+        "[%0], [%1, {%2, %3, %4}], [%5];\n" ::"r"(dst_b), "l"(&tmap_wg),
+        "r"(n0), "r"(kbase), "r"(e), "r"(full_bar[s]) : "memory");
+    asm volatile(
+        "cp.async.bulk.tensor.3d.shared::cluster.global.tile.mbarrier::complete_tx::bytes "
+        "[%0], [%1, {%2, %3, %4}], [%5];\n" ::"r"(dst_b + 4096), "l"(&tmap_wg),
+        "r"(n0 + 64), "r"(kbase), "r"(e), "r"(full_bar[s]) : "memory");
+    asm volatile(
+        "cp.async.bulk.tensor.3d.shared::cluster.global.tile.mbarrier::complete_tx::bytes "
+        "[%0], [%1, {%2, %3, %4}], [%5];\n" ::"r"(dst_b + 8192), "l"(&tmap_wu),
+        "r"(n0), "r"(kbase), "r"(e), "r"(full_bar[s]) : "memory");
+    asm volatile(
+        "cp.async.bulk.tensor.3d.shared::cluster.global.tile.mbarrier::complete_tx::bytes "
+        "[%0], [%1, {%2, %3, %4}], [%5];\n" ::"r"(dst_b + 12288), "l"(&tmap_wu),
+        "r"(n0 + 64), "r"(kbase), "r"(e), "r"(full_bar[s]) : "memory");
+  };
+
+  // -------------------- consumer warps --------------------
+  const int wr = warp >> 2;
+  const int wc = warp & 3;
+
+  unsigned fA[2][4][4];
+  unsigned fB[2][8][2];
+  float acc[4][8][4];
+
+  auto load_frags = [&](int stage_idx, int j, int buf) {
+    const char* A_st = A_base + stage_idx * A_STAGE_BYTES;
+    const char* B_st = B_base + stage_idx * B_STAGE_BYTES;
+#pragma unroll
+    for (int f = 0; f < 4; ++f) {
+      int r = wr * 64 + f * 16 + (lane & 15);
+      int c = 2 * j + (lane >> 4);
+      unsigned addr = smem_u32(A_st + r * 64 + (swz_a(r, c) << 4));
+      ldmatrix_x4(addr, fA[buf][f][0], fA[buf][f][1], fA[buf][f][2], fA[buf][f][3]);
+    }
+    int brow = j * 16 + (lane & 15);
+    int coff = lane >> 4;
+#pragma unroll
+    for (int g = 0; g < 2; ++g) {
+      int col = wc * 32 + g * 16;
+      unsigned addr = smem_u32(B_st + (col >> 6) * 4096 + brow * 128 +
+                               (swz_b(brow, ((col & 63) >> 3) + coff) << 4));
+      ldmatrix_x4_trans(addr, fB[buf][g * 2][0], fB[buf][g * 2][1],
+                        fB[buf][g * 2 + 1][0], fB[buf][g * 2 + 1][1]);
+    }
+#pragma unroll
+    for (int g = 0; g < 2; ++g) {
+      int col = 128 + wc * 32 + g * 16;
+      unsigned addr = smem_u32(B_st + (col >> 6) * 4096 + brow * 128 +
+                               (swz_b(brow, ((col & 63) >> 3) + coff) << 4));
+      ldmatrix_x4_trans(addr, fB[buf][4 + g * 2][0], fB[buf][4 + g * 2][1],
+                        fB[buf][4 + g * 2 + 1][0], fB[buf][4 + g * 2 + 1][1]);
+    }
+  };
+
+#pragma unroll
+  for (int f = 0; f < 4; ++f)
+#pragma unroll
+    for (int n = 0; n < 8; ++n)
+#pragma unroll
+      for (int i = 0; i < 4; ++i) acc[f][n][i] = 0.f;
+
+  auto mma_buf = [&](int buf) {
+#pragma unroll
+    for (int n = 0; n < 8; ++n) {
+#pragma unroll
+      for (int f = 0; f < 4; ++f) {
+        mma_16816(acc[f][n][0], acc[f][n][1], acc[f][n][2], acc[f][n][3],
+                  fA[buf][f][0], fA[buf][f][1], fA[buf][f][2], fA[buf][f][3],
+                  fB[buf][n][0], fB[buf][n][1]);
+      }
+    }
+  };
+
+  if (tid == 0) {
+#pragma unroll
+    for (int s = 0; s < STAGES - 1; ++s) {
+      if (s < KT) tma_issue(s, s);
+    }
+  }
+  // software-pipelined fragment loads: wait for stage kt+1 while mma'ing tile kt.
+  mbar_wait(full_bar[0], 0);
+  load_frags(0, 0, 0);  // tile 0, k16=0 -> buf0
+  // steady-state loop with the producer guard resolved by construction:
+  for (int kt = 0; kt < KT; ++kt) {
+    const int stage = kt & (STAGES - 1);
+    load_frags(stage, 1, 1);  // tile kt, k16=1 -> buf1
+    mma_buf(0);
+    __syncwarp();
+    if (lane == 0) mbar_arrive(empty_bar[stage]);
+    {
+      const int nstage = (kt + 1) & (STAGES - 1);
+      if (kt + 1 < KT) mbar_wait(full_bar[nstage], ((kt + 1) >> 2) & 1);
+      load_frags(nstage, 0, 0);  // next ktile k16=0 -> buf0
+    }
+    {
+      int gq = kt + STAGES - 1;
+      int s2 = gq & (STAGES - 1);
+      if (warp == s2 && lane == 0 && gq < KT) {
+        int reuse = gq >> 2;
+        if (reuse >= 1) mbar_wait(empty_bar[s2], (reuse - 1) & 1);
+        tma_issue(gq, s2);
+      }
+    }
+    mma_buf(1);
+  }
+
+  // ---- Epilogue: y = silu(g) * u, store bf16 --------------------------------
+#pragma unroll
+  for (int f = 0; f < 4; ++f) {
+#pragma unroll
+    for (int n = 0; n < 4; ++n) {
+#pragma unroll
+      for (int i = 0; i < 4; i += 2) {
+        float g0 = acc[f][n][i], g1 = acc[f][n][i + 1];
+        float u0 = acc[f][n + 4][i], u1 = acc[f][n + 4][i + 1];
+        float y0 = g0 * sigmoid_fast(g0) * u0;
+        float y1 = g1 * sigmoid_fast(g1) * u1;
+        __nv_bfloat162 hv = __floats2bfloat162_rn(y0, y1);
+        int r = wr * 64 + f * 16 + (lane >> 2) + (i & 2 ? 8 : 0);
+        int c = n0 + wc * 32 + n * 8 + (lane & 3) * 2;
+        if (row_start + r < row_hi) {
+          *(__nv_bfloat162*)(OUT + (long long)(row_start + r) * I + c) = hv;
+        }
+      }
+    }
+  }
+}
+
+}  // namespace moe_swiglu
+
+at::Tensor moe_swiglu_forward(at::Tensor X, at::Tensor offsets, at::Tensor WG, at::Tensor WU,
+                              at::Tensor tile_starts) {
+  const int T_perm = X.size(0);
+  const int H = X.size(1);
+  const int E = WG.size(0);
+  const int I = WG.size(2);
+
+  auto OUT = at::empty({T_perm, I}, X.options());
+
+  moe_swiglu::setup_tiles<<<1, 32, 0, at::cuda::getCurrentCUDAStream()>>>(
+      offsets.data_ptr<int>(), tile_starts.data_ptr<int>(), E);
+
+  TORCH_CHECK(H % 32 == 0 && I % 128 == 0, "fast path requires H%32==0, I%128==0");
+
+  CUtensorMap tmap_x, tmap_wg, tmap_wu;
+  {
+    cuuint64_t gdim[2] = {(cuuint64_t)H, (cuuint64_t)T_perm};
+    cuuint64_t gstride[1] = {(cuuint64_t)H * 2};
+    cuuint32_t box[2] = {32, moe_swiglu::BM};
+    cuuint32_t estr[2] = {1, 1};
+    CUresult r = cuTensorMapEncodeTiled(
+        &tmap_x, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 2, X.data_ptr(), gdim, gstride, box, estr,
+        CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_64B,
+        CU_TENSOR_MAP_L2_PROMOTION_L2_128B, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+    TORCH_CHECK(r == CUDA_SUCCESS, "encode tmap_x failed");
+  }
+  {
+    cuuint64_t gdim[3] = {(cuuint64_t)I, (cuuint64_t)H, (cuuint64_t)E};
+    cuuint64_t gstride[2] = {(cuuint64_t)I * 2, (cuuint64_t)H * I * 2};
+    cuuint32_t box[3] = {64, moe_swiglu::BK, 1};
+    cuuint32_t estr[3] = {1, 1, 1};
+    CUresult r = cuTensorMapEncodeTiled(
+        &tmap_wg, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 3, WG.data_ptr(), gdim, gstride, box, estr,
+        CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B,
+        CU_TENSOR_MAP_L2_PROMOTION_L2_128B, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+    TORCH_CHECK(r == CUDA_SUCCESS, "encode tmap_wg failed");
+    r = cuTensorMapEncodeTiled(
+        &tmap_wu, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 3, WU.data_ptr(), gdim, gstride, box, estr,
+        CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B,
+        CU_TENSOR_MAP_L2_PROMOTION_L2_128B, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+    TORCH_CHECK(r == CUDA_SUCCESS, "encode tmap_wu failed");
+  }
+
+  dim3 grid(I / 128, (T_perm + moe_swiglu::BM - 1) / moe_swiglu::BM + E);
+  constexpr int smem = moe_swiglu::STAGES * moe_swiglu::STAGE_BYTES + 128;
+  static bool attr_set = false;
+  if (!attr_set) {
+    cudaFuncSetAttribute((const void*)moe_swiglu::moe_swiglu_tma_kernel,
+                         cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+    attr_set = true;
+  }
+  moe_swiglu::moe_swiglu_tma_kernel<<<grid, moe_swiglu::THREADS, smem,
+                                    at::cuda::getCurrentCUDAStream()>>>(
+      tmap_x, tmap_wg, tmap_wu, (__nv_bfloat16*)OUT.data_ptr(),
+      offsets.data_ptr<int>(), tile_starts.data_ptr<int>(), H, I, E);
+  return OUT;
+}
+
+
+'''
+
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def _setup_tiles_kernel(offsets_ptr, tile_starts_ptr, E: tl.constexpr, BLOCK_M: tl.constexpr, PAD_E: tl.constexpr):
+    idx = tl.arange(0, PAD_E)
+    mask = idx < (E + 1)
+    offs = tl.load(offsets_ptr + idx, mask=mask, other=0)
+    offs_next = tl.load(offsets_ptr + idx + 1, mask=idx < E, other=0)
+    counts = offs_next - offs
+    tiles = (counts + BLOCK_M - 1) // BLOCK_M
+    tiles = tl.where(idx < E, tiles, 0)
+    csum = tl.cumsum(tiles, axis=0)
+    starts = csum - tiles
+    total = tl.sum(tiles, axis=0)
+    out_starts = tl.where(idx < E, starts, total)
+    tl.store(tile_starts_ptr + idx, out_starts, mask=mask)
+
+
+@triton.jit
+def _moe_swiglu_kernel(
+    X, WG, WU, OUT,
+    offsets_ptr, tile_starts_ptr,
+    T_perm, K_dim, N_dim,
+    E: tl.constexpr, LOG2_E: tl.constexpr,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+):
+    pid_n = tl.program_id(0)
+    pid_m = tl.program_id(1)
+    total_m_tiles = tl.load(tile_starts_ptr + E)
+    if pid_m >= total_m_tiles:
+        return
+    lo = tl.zeros((), dtype=tl.int32)
+    hi = tl.full((), E - 1, dtype=tl.int32)
+    for _ in tl.static_range(LOG2_E):
+        mid = (lo + hi + 1) // 2
+        s = tl.load(tile_starts_ptr + mid)
+        if s <= pid_m:
+            lo = mid
+        else:
+            hi = mid - 1
+    e = lo
+    tile_start_e = tl.load(tile_starts_ptr + e)
+    row_start = tl.load(offsets_ptr + e)
+    row_end = tl.load(offsets_ptr + e + 1)
+    m0 = (pid_m - tile_start_e) * BLOCK_M
+    offs_m = m0 + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+    rows = row_start + offs_m
+    row_mask = rows < row_end
+    WG_e = WG + e.to(tl.int64) * K_dim * N_dim
+    WU_e = WU + e.to(tl.int64) * K_dim * N_dim
+    a_ptrs = X + rows[:, None] * K_dim + offs_k[None, :]
+    g_ptrs = WG_e + offs_k[:, None] * N_dim + offs_n[None, :]
+    u_ptrs = WU_e + offs_k[:, None] * N_dim + offs_n[None, :]
+    acc_g = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    acc_u = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    for k in range(0, K_dim, BLOCK_K):
+        a = tl.load(a_ptrs, mask=row_mask[:, None], other=0.0)
+        g = tl.load(g_ptrs)
+        u = tl.load(u_ptrs)
+        acc_g = tl.dot(a, g, acc_g)
+        acc_u = tl.dot(a, u, acc_u)
+        a_ptrs += BLOCK_K
+        g_ptrs += BLOCK_K * N_dim
+        u_ptrs += BLOCK_K * N_dim
+    y = acc_g * tl.sigmoid(acc_g) * acc_u
+    out_ptrs = OUT + rows[:, None] * N_dim + offs_n[None, :]
+    tl.store(out_ptrs, y.to(tl.bfloat16), mask=row_mask[:, None])
+
+
+def _next_pow2(x: int) -> int:
+    v = 1
+    while v < x:
+        v *= 2
+    return v
+
+
+_ext = None
+
+
+def _build_ext():
+    global _ext
+    if _ext is not None:
+        return _ext
+    from torch.utils.cpp_extension import load_inline
+
+    _ext = load_inline(
+        name="moe_swiglu_sm120_tma",
+        cpp_sources=(
+            "at::Tensor moe_swiglu_forward(at::Tensor X, at::Tensor offsets, at::Tensor WG, "
+            "at::Tensor WU, at::Tensor tile_starts);"
+        ),
+        cuda_sources=[_CUDA_SRC],
+        functions=["moe_swiglu_forward"],
+        extra_cuda_cflags=[
+            "-O3",
+            "-std=c++17",
+            "--use_fast_math",
+            "-gencode=arch=compute_120a,code=sm_120a",
+        ],
+        extra_ldflags=["-lcuda"],
+        verbose=False,
+    )
+    return _ext
+
+
+class Model(nn.Module):
+    def __init__(self, T_total: int, H: int, I: int, E: int, K: int):  # noqa: E741
+        super().__init__()
+        self.T_total = T_total
+        self.H = H
+        self.I = I
+        self.E = E
+        self.K = K
+        self.W_gate = nn.Parameter(torch.empty(E, H, I, dtype=torch.bfloat16))
+        self.W_up = nn.Parameter(torch.empty(E, H, I, dtype=torch.bfloat16))
+        nn.init.normal_(self.W_gate, std=0.02)
+        nn.init.normal_(self.W_up, std=0.02)
+        self._tile_starts: torch.Tensor | None = None
+        self._ext_mod = None
+
+    def _ensure(self, device):
+        if self._ext_mod is None:
+            try:
+                self._ext_mod = _build_ext()
+            except Exception:
+                self._ext_mod = False
+        if self._tile_starts is None or self._tile_starts.device != device:
+            self._tile_starts = torch.empty(self.E + 1, dtype=torch.int32, device=device)
+
+    def _forward_triton(self, hidden_states, expert_offsets):
+        T_perm, H = hidden_states.shape
+        E, _, I = self.W_gate.shape  # noqa: E741
+        device = hidden_states.device
+        tile_starts = self._tile_starts
+        BLOCK_M, BLOCK_N, BLOCK_K = 128, 128, 64
+        pad_e = _next_pow2(E + 1)
+        _setup_tiles_kernel[(1,)](expert_offsets, tile_starts, E, BLOCK_M, pad_e, num_warps=1)
+        out = torch.empty(T_perm, I, dtype=torch.bfloat16, device=device)
+        n_tiles = triton.cdiv(I, BLOCK_N)
+        max_m_tiles = triton.cdiv(T_perm, BLOCK_M) + E
+        log2_e = max(1, _next_pow2(E).bit_length() - 1)
+        _moe_swiglu_kernel[(n_tiles, max_m_tiles)](
+            hidden_states, self.W_gate, self.W_up, out,
+            expert_offsets, tile_starts, T_perm, H, I,
+            E=E, LOG2_E=log2_e,
+            BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
+            num_warps=8, num_stages=2,
+        )
+        return out
+
+    def forward(self, hidden_states: torch.Tensor, expert_offsets: torch.Tensor) -> torch.Tensor:
+        self._ensure(hidden_states.device)
+        H, I = self.H, self.I  # noqa: E741
+        if self._ext_mod is not False and H % 32 == 0 and I % 128 == 0:
+            try:
+                return self._ext_mod.moe_swiglu_forward(
+                    hidden_states, expert_offsets, self.W_gate, self.W_up, self._tile_starts)
+            except Exception:
+                pass
+        return self._forward_triton(hidden_states, expert_offsets)
+
+
+# Module-level shape shims (rewritten by check.py / benchmark.py per shape).
+T_total = 32768
+H = 4096
+I = 1536  # noqa: E741
+E = 128
+K = 8
+
+
+def _build_routing(T_total: int, E: int, K: int, device: str = "cpu") -> torch.Tensor:
+    T_perm = T_total * K
+    base = T_perm // E
+    rem = T_perm - base * E
+    counts = torch.full((E,), base, dtype=torch.int32, device=device)
+    counts[:rem] += 1
+    offsets = torch.zeros(E + 1, dtype=torch.int32, device=device)
+    offsets[1:] = torch.cumsum(counts, dim=0)
+    return offsets
+
+
+def get_inputs():
+    T_perm = T_total * K
+    hidden_states = torch.randn(T_perm, H, dtype=torch.bfloat16) * 0.1
+    expert_offsets = _build_routing(T_total, E, K)
+    return [hidden_states, expert_offsets]
+
+
+def get_init_inputs():
+    return [T_total, H, I, E, K]
