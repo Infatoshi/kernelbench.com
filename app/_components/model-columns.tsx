@@ -49,41 +49,58 @@ function ColumnChart({ chart }: { chart: ColChart }) {
           ))}
           <span>0</span>
         </div>
-        <div className="colchart-plot">
-          <div className="colchart-cols">
-            {chart.columns.map((c) => {
-              const pct =
-                c.value == null ? null : Math.min(100, (c.value / chart.maxValue) * 100)
-              // AA convention: value inside the bar top when it fits (>= ~16%
-              // of plot height), floated above the bar otherwise.
-              const inside = pct != null && pct >= 16
-              return (
+        {/* bars live alone inside the fixed-height plot (labels in their own
+            row below) so bar height % maps 1:1 onto the gridlines and tall
+            bars can never flex-shrink into a lie */}
+        <div className="colchart-main">
+          <div className="colchart-plot">
+            <div className="colchart-cols">
+              {chart.columns.map((c) => {
+                const pct =
+                  c.value == null ? null : Math.min(100, (c.value / chart.maxValue) * 100)
+                // AA convention: value inside the bar top when it fits (>= ~16%
+                // of plot height), floated above the bar otherwise.
+                const inside = pct != null && pct >= 16
+                return (
+                <Link
+                  key={c.slug}
+                  href={`/models/${c.slug}`}
+                  className="colchart-col no-underline"
+                  title={`${c.name} · ${c.lab}${c.display ? ` · ${c.display}` : " · no result"}`}
+                >
+                  <span
+                    className={`colchart-bar${c.value == null ? " colchart-bar-empty" : ""}`}
+                    style={
+                      pct == null
+                        ? undefined
+                        : {
+                            height: `${pct.toFixed(1)}%`,
+                            background: c.brand.color,
+                          }
+                    }
+                  >
+                    {c.display != null && (
+                      <span
+                        className={`colchart-val ${inside ? "colchart-val-in" : "colchart-val-out"}`}
+                        style={inside ? { color: barTextColor(c.brand.color) } : undefined}
+                      >
+                        {c.display}
+                      </span>
+                    )}
+                  </span>
+                </Link>
+                )
+              })}
+            </div>
+          </div>
+          <div className="colchart-cols colchart-labels">
+            {chart.columns.map((c) => (
               <Link
                 key={c.slug}
                 href={`/models/${c.slug}`}
                 className="colchart-col no-underline"
                 title={`${c.name} · ${c.lab}${c.display ? ` · ${c.display}` : " · no result"}`}
               >
-                <span
-                  className={`colchart-bar${c.value == null ? " colchart-bar-empty" : ""}`}
-                  style={
-                    pct == null
-                      ? undefined
-                      : {
-                          height: `${pct.toFixed(1)}%`,
-                          background: c.brand.color,
-                        }
-                  }
-                >
-                  {c.display != null && (
-                    <span
-                      className={`colchart-val ${inside ? "colchart-val-in" : "colchart-val-out"}`}
-                      style={inside ? { color: barTextColor(c.brand.color) } : undefined}
-                    >
-                      {c.display}
-                    </span>
-                  )}
-                </span>
                 <span className="colchart-x">
                   {c.brand.logo ? (
                     <img src={c.brand.logo} alt="" className="colchart-logo" loading="lazy" />
@@ -95,8 +112,7 @@ function ColumnChart({ chart }: { chart: ColChart }) {
                   <span className="colchart-name">{c.name}</span>
                 </span>
               </Link>
-              )
-            })}
+            ))}
           </div>
         </div>
       </div>

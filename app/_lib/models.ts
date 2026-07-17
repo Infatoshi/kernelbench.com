@@ -115,12 +115,12 @@ export interface Brand {
 
 export const LAB_BRANDS: Record<string, Brand> = {
   Anthropic: { color: "#d97757", logo: "/logos/labs/anthropic.svg" },
-  OpenAI: { color: "#19c37d", logo: null },
+  OpenAI: { color: "#19c37d", logo: "/logos/labs/openai.svg" },
   Google: { color: "#5e97f6", logo: "/logos/labs/google.svg" },
-  xAI: { color: "#e6e6e6", logo: null },
+  xAI: { color: "#e6e6e6", logo: "/logos/labs/xai.svg" },
   DeepSeek: { color: "#5b7cfa", logo: "/logos/labs/deepseek.svg" },
-  "Moonshot AI": { color: "#8b7cf6", logo: null },
-  "Z.ai": { color: "#38b6ff", logo: null },
+  "Moonshot AI": { color: "#8b7cf6", logo: "/logos/labs/moonshot.svg" },
+  "Z.ai": { color: "#38b6ff", logo: "/logos/labs/zai.svg" },
   MiniMax: { color: "#f87171", logo: "/logos/labs/minimax.svg" },
   Meituan: { color: "#ffd60a", logo: "/logos/labs/meituan.svg" },
   NVIDIA: { color: "#76b900", logo: "/logos/labs/nvidia.svg" },
