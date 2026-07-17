@@ -12,30 +12,29 @@ const PAD = { l: 56, r: 18, t: 18, b: 44 }
 
 export function EfficiencyChart({ mega, hard }: { mega: EffByGpu; hard: EffByGpu }) {
   const [tab, setTab] = useState<"mega" | "hard">("mega")
+  // GPU tabs for the active bench; fall back to the other bench's GPUs so the
+  // toggle row never disappears when one side is empty.
   const byGpu = tab === "mega" ? mega : hard
   const gpus = Object.keys(byGpu)
+  const fallbackGpus = Object.keys(tab === "mega" ? hard : mega)
+  const shownGpus = gpus.length ? gpus : fallbackGpus
   // Default H100 when present; tab order is H100 → RTX → B200.
-  const preferred = gpus.includes("H100") ? "H100" : (gpus[0] ?? "")
+  const preferred = shownGpus.includes("H100") ? "H100" : (shownGpus[0] ?? "")
   const [gpu, setGpu] = useState(preferred)
   const activeGpu = byGpu[gpu] ? gpu : preferred
   const data = byGpu[activeGpu]
+  const hasData = Boolean(data && data.points.length)
 
-  if (!data || !data.points.length) {
-    return (
-      <div className="chart-head">
-        <h3 className="chart-title">Performance vs compute</h3>
-      </div>
-    )
-  }
-
-  const fmtY = (v: number) => `${v.toFixed(data.yDecimals)}${data.ySuffix}`
-  const xMax = Math.max(...data.points.map((p) => p.x), 1) * 1.12
-  const yMax = Math.max(...data.points.map((p) => p.y), 1) * 1.16
+  const fmtY = (v: number) => `${v.toFixed(data!.yDecimals)}${data!.ySuffix}`
+  const xMax = hasData ? Math.max(...data!.points.map((p) => p.x), 1) * 1.12 : 1
+  const yMax = hasData ? Math.max(...data!.points.map((p) => p.y), 1) * 1.16 : 1
   const px = (x: number) => PAD.l + (x / xMax) * (W - PAD.l - PAD.r)
   const py = (y: number) => H - PAD.b - (y / yMax) * (H - PAD.t - PAD.b)
-  const frontier = data.points.filter((p) => p.frontier).sort((a, b) => a.x - b.x)
-  const xTicks = niceTicks(xMax, 5)
-  const yTicks = niceTicks(yMax, 5)
+  const frontier = hasData
+    ? data!.points.filter((p) => p.frontier).sort((a, b) => a.x - b.x)
+    : []
+  const xTicks = hasData ? niceTicks(xMax, 5) : []
+  const yTicks = hasData ? niceTicks(yMax, 5) : []
 
   return (
     <div>
@@ -61,55 +60,68 @@ export function EfficiencyChart({ mega, hard }: { mega: EffByGpu; hard: EffByGpu
               </button>
             ))}
           </div>
-          <div className="gpu-toggle" role="group" aria-label="Select GPU">
-            {gpus.map((g) => (
-              <button
-                key={g}
-                type="button"
-                className={g === activeGpu ? "gpu-toggle-btn active" : "gpu-toggle-btn"}
-                aria-pressed={g === activeGpu}
-                onClick={() => setGpu(g)}
-              >
-                {g}
-              </button>
-            ))}
-          </div>
+          {shownGpus.length > 0 && (
+            <div className="gpu-toggle" role="group" aria-label="Select GPU">
+              {shownGpus.map((g) => (
+                <button
+                  key={g}
+                  type="button"
+                  className={g === activeGpu ? "gpu-toggle-btn active" : "gpu-toggle-btn"}
+                  aria-pressed={g === activeGpu}
+                  onClick={() => setGpu(g)}
+                  disabled={!byGpu[g]}
+                >
+                  {g}
+                </button>
+              ))}
+            </div>
+          )}
         </div>
       </div>
 
-      <svg viewBox={`0 0 ${W} ${H}`} className="eff-svg" role="img"
-        aria-label={`${tab} performance versus output tokens on ${activeGpu}`}>
-        {yTicks.map((t) => (
-          <g key={`y${t}`}>
-            <line x1={PAD.l} x2={W - PAD.r} y1={py(t)} y2={py(t)} className="eff-grid" />
-            <text x={PAD.l - 8} y={py(t) + 4} className="eff-tick" textAnchor="end">{fmtY(t)}</text>
-          </g>
-        ))}
-        {xTicks.map((t) => (
-          <text key={`x${t}`} x={px(t)} y={H - PAD.b + 18} className="eff-tick" textAnchor="middle">
-            {Math.round(t / 1000)}k
-          </text>
-        ))}
-        <text x={(W + PAD.l) / 2} y={H - 6} className="eff-axis" textAnchor="middle">output tokens spent</text>
-        <polyline points={frontier.map((p) => `${px(p.x)},${py(p.y)}`).join(" ")} className="eff-frontier" />
-        {placeLabels(data.points, px, py).map(({ p, cx, cy, level, right }) => {
-          const lx = cx + (right ? -10 : 10)
-          const ly = cy - 9 - level * 15
-          return (
-            <g key={`${p.label}-${p.x}-${p.y}`}>
-              <line x1={cx} y1={cy} x2={lx} y2={ly - 3} className="eff-leader" />
-              <circle cx={cx} cy={cy} r={6} className={p.frontier ? "eff-dot on" : "eff-dot"} />
-              <text x={lx} y={ly} textAnchor={right ? "end" : "start"}
-                className={p.frontier ? "eff-label on" : "eff-label"}>{p.label}</text>
-            </g>
-          )
-        })}
-      </svg>
+      {!hasData ? (
+        <p className="chart-subtitle" style={{ marginTop: "1rem" }}>
+          No {tab === "hard" ? "Hard" : "Mega"} points with clean token telemetry
+          for this GPU yet (published cells need output_tokens). Switch tabs or
+          GPU above if another series is available.
+        </p>
+      ) : (
+        <>
+          <svg viewBox={`0 0 ${W} ${H}`} className="eff-svg" role="img"
+            aria-label={`${tab} performance versus output tokens on ${activeGpu}`}>
+            {yTicks.map((t) => (
+              <g key={`y${t}`}>
+                <line x1={PAD.l} x2={W - PAD.r} y1={py(t)} y2={py(t)} className="eff-grid" />
+                <text x={PAD.l - 8} y={py(t) + 4} className="eff-tick" textAnchor="end">{fmtY(t)}</text>
+              </g>
+            ))}
+            {xTicks.map((t) => (
+              <text key={`x${t}`} x={px(t)} y={H - PAD.b + 18} className="eff-tick" textAnchor="middle">
+                {Math.round(t / 1000)}k
+              </text>
+            ))}
+            <text x={(W + PAD.l) / 2} y={H - 6} className="eff-axis" textAnchor="middle">output tokens spent</text>
+            <polyline points={frontier.map((p) => `${px(p.x)},${py(p.y)}`).join(" ")} className="eff-frontier" />
+            {placeLabels(data!.points, px, py).map(({ p, cx, cy, level, right }) => {
+              const lx = cx + (right ? -10 : 10)
+              const ly = cy - 9 - level * 15
+              return (
+                <g key={`${p.label}-${p.x}-${p.y}`}>
+                  <line x1={cx} y1={cy} x2={lx} y2={ly - 3} className="eff-leader" />
+                  <circle cx={cx} cy={cy} r={6} className={p.frontier ? "eff-dot on" : "eff-dot"} />
+                  <text x={lx} y={ly} textAnchor={right ? "end" : "start"}
+                    className={p.frontier ? "eff-label on" : "eff-label"}>{p.label}</text>
+                </g>
+              )
+            })}
+          </svg>
 
-      <p className="eff-legend">
-        <span className="eff-key on" /> on the efficiency frontier (most performance per token)
-        <span className="eff-key" /> dominated (spent more, delivered less)
-      </p>
+          <p className="eff-legend">
+            <span className="eff-key on" /> on the efficiency frontier (most performance per token)
+            <span className="eff-key" /> dominated (spent more, delivered less)
+          </p>
+        </>
+      )}
     </div>
   )
 }

@@ -49,4 +49,9 @@ for row in "${ROWS[@]}"; do
   env $manifest_env KBH_HARDWARE="$hw" KBH_RUNS_DIR="$runs" uv run python scripts/build_v2_leaderboard.py | tail -1
   reshape "$out"
 done
+
+# efficiency chart needs cell-level output_tokens on the committed JSONs
+echo "[tokens] injecting output_tokens into leaderboard*.json ..."
+uv run python scripts/inject_tokens.py
+
 echo "ALL_GPU_BUILDS_DONE"

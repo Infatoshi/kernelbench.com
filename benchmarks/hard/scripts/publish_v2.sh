@@ -83,4 +83,10 @@ done
 rm -f "$SEDF"
 echo "  redacted secrets from viewers"
 uv run python "$REPO_ROOT/scripts/redaction.py" "$REPO_ROOT/public/runs"
+
+# Bake usage.output_tokens into every per-GPU leaderboard so the homepage
+# Performance-vs-compute chart can render Hard on Vercel (runs/ is gitignored).
+echo "[4/4] injecting output_tokens into leaderboard*.json ..."
+uv run python scripts/inject_tokens.py
+
 echo "done. review, then: git push (or: kb deploy \"msg\")"
