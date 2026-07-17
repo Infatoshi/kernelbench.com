@@ -4,9 +4,9 @@ import type { ColChart } from "../_lib/models"
 // AA-style vertical column charts for the model views. Pure server rendering
 // (no toggles, no client state): performance is disaggregated into one chart
 // per bench (Mega / Hard / CUDA), a slim Multi coming-soon panel, and one
-// compiled "Correctness" chart below. All charts share the same column order
-// (see columnOrder in _lib/models.ts) so a model sits in the same slot
-// everywhere; missing results render an empty slot, not a zero bar.
+// compiled "Correctness" chart below. Each chart ranks its own metric —
+// highest score leftmost — and only scored models get a column (see
+// sortColumnsByValue in _lib/models.ts).
 
 const MULTI_PROBLEMS = [
   "AllReduce + Residual",
@@ -19,7 +19,7 @@ const MULTI_PROBLEMS = [
 
 function yLabel(unit: ColChart["unit"], v: number): string {
   if (unit === "pct") return `${v}%`
-  if (unit === "%") return `${Math.round(v * 100)}%`
+  if (unit === "%") return `${+(v * 100).toFixed(1)}%`
   return `${v}`
 }
 

@@ -527,6 +527,16 @@ export function columnOrder(index: ModelIndex): ModelEntry[] {
     })
 }
 
+/** Every chart ranks by its own metric: highest score leftmost, descending
+ *  to the right. Models with no valid result on the chart's bench are
+ *  dropped entirely (AA convention — only scored models get a column); they
+ *  still appear on /models and auto-join the chart when a result publishes. */
+function sortColumnsByValue(columns: ColPoint[]): ColPoint[] {
+  return columns
+    .filter((c) => c.value != null)
+    .sort((a, b) => (b.value! !== a.value! ? b.value! - a.value! : a.slug.localeCompare(b.slug)))
+}
+
 /**
  * Round the data max up to a "nice" axis top: smallest 4-step grid that
  * covers `v`. Step ladder doubles as the gridline spacing.
@@ -534,7 +544,7 @@ export function columnOrder(index: ModelIndex): ModelEntry[] {
  *           mega max 18.715  -> 20  (lines at 5/10/15/20).
  */
 export function niceCeil(v: number): number {
-  const steps = [0.02, 0.05, 0.1, 0.2, 0.25, 0.5, 1, 2, 2.5, 5, 10, 20, 25, 50, 100]
+  const steps = [0.02, 0.025, 0.05, 0.1, 0.2, 0.25, 0.5, 1, 2, 2.5, 5, 10, 20, 25, 50, 100]
   for (const s of steps) if (4 * s >= v) return 4 * s
   return Math.ceil(v)
 }
@@ -578,6 +588,7 @@ export function columnsForBench(
       brand: brandFor(m.lab, m.slug),
     })
   }
+  const ranked = sortColumnsByValue(columns)
   const label = BENCH_LABELS[bench]
   const gpuRaw = index.benches[bench]?.gpu
   const gpu =
@@ -589,7 +600,7 @@ export function columnsForBench(
         ? `best decode speedup vs optimized-PyTorch baseline over valid (correct + audited-clean) cells · ${gpu}`
         : `mean peak fraction of roofline over valid (correct + audited-clean) cells · ${gpu}`,
     unit: bench === "mega" ? "x" : "%",
-    columns,
+    columns: ranked,
     maxValue: niceCeil(maxValue),
   }
 }
@@ -614,7 +625,7 @@ export function columnsForCorrectness(index: ModelIndex, ordered?: ModelEntry[])
     subtitle:
       "published problems correct, summed over attempted benches (passed / total on canonical boards)",
     unit: "pct",
-    columns,
+    columns: sortColumnsByValue(columns),
     maxValue: 100,
   }
 }

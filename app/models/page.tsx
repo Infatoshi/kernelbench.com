@@ -25,8 +25,8 @@ export default async function ModelsPage() {
           disaggregated per benchmark (Mega / Hard / CUDA, bars colored by
           lab), and the last chart is compiled correctness: the percentage of
           published problems each model gets correct across the benches it
-          attempted. A model with no result on a board keeps its column slot
-          but no bar. Click any column for per-problem cells, audit chips, and
+          attempted. Each chart ranks models by its own score, best on the
+          left. Click any column for per-problem cells, audit chips, and
           the model&apos;s full integrity record.
         </p>
       </section>

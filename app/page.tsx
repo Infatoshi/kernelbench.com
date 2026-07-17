@@ -134,9 +134,9 @@ export default async function HomePage() {
     loadEfficiency(),
     loadModelIndex(),
   ])
-  // One shared column order across all charts (correctness desc -> passed
-  // desc -> slug, see columnOrder) so a model sits in the same slot on every
-  // panel; models with no result on a bench keep their slot but no bar.
+  // columnOrder applies the curated roster filter; each chart then re-ranks
+  // its columns by its own metric (highest left -> lowest right) and drops
+  // models with no result on that bench.
   const ordered = columnOrder(modelIdx)
   const perfCharts = (["mega", "hard", "cuda"] as const).map((b) =>
     columnsForBench(modelIdx, b, ordered),
@@ -175,8 +175,8 @@ export default async function HomePage() {
             is disaggregated per benchmark (Mega / Hard / CUDA, bars colored by
             lab), and the last chart is compiled correctness: the percentage of
             published problems each model gets correct across the benches it
-            attempted. A model with no result on a board keeps its column slot
-            but no bar. Scores use plain, on-page math: mean peak fraction over
+            attempted. Each chart ranks models by its own score, best on the
+            left. Scores use plain, on-page math: mean peak fraction over
             valid cells, best decode speedup, passed&nbsp;/&nbsp;total. Click a
             column for per-problem cells, audit chips, and the model&apos;s
             integrity record.
