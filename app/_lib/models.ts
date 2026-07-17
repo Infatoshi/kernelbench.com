@@ -118,12 +118,20 @@ export const FLAG_VERDICTS = new Set([
 export const SITE_HIDDEN_GPUS = new Set(["rtx3090"])
 
 /**
- * Default GPU board for multi-GPU decks (hard / mega entry pages and
- * homepage deep-links). Homepage column charts still score the canonical
- * RTX PRO 6000 board so variants with incomplete multi-GPU coverage (e.g.
- * Kimi K3 256k vs 1M) stay side-by-side for fair comparison.
+ * Default GPU board for multi-GPU decks and the homepage ranking toggle.
+ * Order is presentation order for the homepage tab strip.
  */
 export const DEFAULT_GPU = "b200"
+
+/** Homepage / deck GPU tabs: B200 first, then RTX PRO 6000, then H100. */
+export const HOME_GPU_TABS: { key: string; label: string }[] = [
+  { key: "b200", label: "B200" },
+  { key: "rtxpro6000", label: "RTX PRO 6000" },
+  { key: "h100", label: "H100" },
+]
+
+/** Homepage ranking chart order (Mega → CUDA → Hard). */
+export const HOME_BENCH_ORDER: Bench[] = ["mega", "cuda", "hard"]
 
 /**
  * Lab brand presentation for charts (AA-style: bar color + logo keyed by lab).
@@ -582,21 +590,37 @@ export function niceCeil(v: number): number {
   return Math.ceil(v)
 }
 
-/** Vertical-column data for one bench's canonical board. Every model keeps a
- *  slot; models with no valid cell on the bench get value/display = null. */
+/**
+ * Cells for one (bench, gpu) view. Canonical board (RTX PRO 6000) lives at
+ * the top-level BenchBlock; other GPUs are under block.gpus[key]. CUDA is a
+ * single-GPU deck — always the top-level board regardless of `gpu`.
+ */
+function cellsForBenchGpu(
+  block: BenchBlock | undefined,
+  bench: Bench,
+  gpu?: string,
+): GpuBlock | null {
+  if (!block) return null
+  if (bench === "cuda" || !gpu || gpu === "rtxpro6000") return block
+  return block.gpus?.[gpu] ?? null
+}
+
+/** Vertical-column data for one bench board (optional GPU). Models with no
+ *  valid result on that board are dropped by the ranking sort. */
 export function columnsForBench(
   index: ModelIndex,
   bench: Bench,
   ordered?: ModelEntry[],
+  gpu?: string,
 ): ColChart {
   const models = ordered ?? columnOrder(index)
   const columns: ColPoint[] = []
   let maxValue = 0
   for (const m of models) {
     let value: number | null = null
-    const block = m.benches[bench]
-    if (block) {
-      const vals = Object.entries(block.cells)
+    const view = cellsForBenchGpu(m.benches[bench], bench, gpu)
+    if (view) {
+      const vals = Object.entries(view.cells)
         .filter(
           ([prob, c]) =>
             c.valid &&
@@ -628,18 +652,23 @@ export function columnsForBench(
   }
   const ranked = sortColumnsByValue(columns)
   const label = BENCH_LABELS[bench]
-  const gpuRaw = index.benches[bench]?.gpu
-  const gpu =
-    typeof gpuRaw === "string" ? gpuRaw : (gpuRaw as { name?: string } | undefined)?.name ?? "RTX PRO 6000"
+  const gpuLabels = index.benches[bench]?.gpu_labels ?? {}
+  // CUDA is RTX-only; multi-GPU tabs still name the GPU used for the numbers.
+  const displayGpu =
+    bench === "cuda" || !gpu || gpu === "rtxpro6000"
+      ? (gpuLabels.rtxpro6000 ?? "RTX PRO 6000")
+      : (gpuLabels[gpu] ?? gpu)
   return {
-    title: `${label} performance`,
+    title: `KernelBench ${label}`,
     subtitle:
       bench === "mega"
-        ? `best decode speedup vs optimized-PyTorch baseline over valid (correct + audited-clean) cells · ${gpu}`
-        : `mean peak fraction of roofline over valid (correct + audited-clean) cells · ${gpu}`,
+        ? `best decode speedup vs optimized-PyTorch baseline over valid (correct + audited-clean) cells · ${displayGpu}`
+        : bench === "cuda"
+          ? `mean peak fraction of roofline over valid cells · ${displayGpu} (CUDA-only deck)`
+          : `mean peak fraction of roofline over valid (correct + audited-clean) cells · ${displayGpu}`,
     unit: bench === "mega" ? "x" : "%",
     columns: ranked,
-    maxValue: niceCeil(maxValue),
+    maxValue: niceCeil(maxValue || 0.01),
   }
 }
 

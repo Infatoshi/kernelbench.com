@@ -1,9 +1,14 @@
 import Link from "next/link"
 import { EfficiencyChart } from "./efficiency-chart"
 import { loadEfficiency } from "@/app/_lib/charts"
-import { SITE_HIDDEN_GPUS, columnOrder, columnsForBench, columnsForCorrectness } from "@/app/_lib/models"
+import {
+  HOME_BENCH_ORDER,
+  HOME_GPU_TABS,
+  columnOrder,
+  columnsForBench,
+} from "@/app/_lib/models"
 import { loadModelIndex } from "@/app/_lib/models.server"
-import { ModelScoreboards } from "@/app/_components/model-columns"
+import { HomeRankings } from "@/app/_components/home-rankings"
 
 const HUGGING_FACE_LOGO =
   "https://huggingface.co/front/assets/huggingface_logo-noborder.svg"
@@ -63,9 +68,8 @@ const citationGraph = {
   ],
 }
 
-// Compact bench tiles: the model charts above carry the numbers, so each
-// bench gets a one-liner, GPU deep-links into its board, and the artifact
-// links (GitHub source, HF traces).
+// Compact bench tiles: rankings above carry the numbers; each tile is a
+// deep-link into the board plus artifacts (GitHub source, HF traces).
 const benchmarks = [
   {
     href: "/mega",
@@ -79,6 +83,16 @@ const benchmarks = [
     hfHref: "https://huggingface.co/datasets/Infatoshi/kernelbench-mega-traces",
     ghHref:
       "https://github.com/Infatoshi/kernelbench.com/tree/master/benchmarks/mega",
+    comingSoon: false,
+  },
+  {
+    href: "/cuda",
+    title: "CUDA",
+    tagline: "CUDA-only writing deck — Triton and kernel DSLs fail the language gate.",
+    gpus: [{ label: "RTX PRO 6000", href: "/cuda" }],
+    hfHref: "https://huggingface.co/datasets/Infatoshi/kernelbench-cuda-traces",
+    ghHref:
+      "https://github.com/Infatoshi/kernelbench.com/tree/master/benchmarks/cuda",
     comingSoon: false,
   },
   {
@@ -96,16 +110,6 @@ const benchmarks = [
     comingSoon: false,
   },
   {
-    href: "/cuda",
-    title: "CUDA",
-    tagline: "CUDA-only writing deck — Triton and kernel DSLs fail the language gate.",
-    gpus: [{ label: "RTX PRO 6000", href: "/cuda" }],
-    hfHref: "https://huggingface.co/datasets/Infatoshi/kernelbench-cuda-traces",
-    ghHref:
-      "https://github.com/Infatoshi/kernelbench.com/tree/master/benchmarks/cuda",
-    comingSoon: false,
-  },
-  {
     href: "/multi",
     title: "Multi",
     tagline: "NVLink collectives rewritten as kernels on 8×H100 SXM, graded on busbw.",
@@ -117,121 +121,29 @@ const benchmarks = [
   },
 ]
 
-// Decorative roofline: bandwidth slope into compute roof, dot pulsing at the
-// knee. Pure SVG, drawn once on load.
-function RooflineMotif() {
-  return (
-    <div className="hero-art-panel">
-      <p className="hero-art-cap">the roofline</p>
-      <svg
-        className="hero-art"
-        viewBox="0 0 300 170"
-        aria-hidden="true"
-        fill="none"
-      >
-      <defs>
-        <filter id="roof-glow" x="-40%" y="-40%" width="180%" height="180%">
-          <feGaussianBlur stdDeviation="3.2" result="b" />
-          <feMerge>
-            <feMergeNode in="b" />
-            <feMergeNode in="SourceGraphic" />
-          </feMerge>
-        </filter>
-      </defs>
-      {/* grid */}
-      {[40, 80, 120, 160, 200, 240, 280].map((x) => (
-        <line key={`v${x}`} x1={x} y1="8" x2={x} y2="150" stroke="#2b2b2b" strokeWidth="1" />
-      ))}
-      {[30, 70, 110, 150].map((y) => (
-        <line key={`h${y}`} x1="16" y1={y} x2="292" y2={y} stroke="#2b2b2b" strokeWidth="1" />
-      ))}
-      {/* baseline */}
-      <line x1="16" y1="150" x2="292" y2="150" stroke="#444444" strokeWidth="1" />
-      {/* stragglers (dim dots below the roof) */}
-      {[
-        [60, 120], [95, 96], [130, 118], [175, 92], [215, 104], [250, 78],
-      ].map(([cx, cy]) => (
-        <circle key={`${cx}-${cy}`} cx={cx} cy={cy} r="2.6" fill="#6b7480" />
-      ))}
-      {/* the roof */}
-      <path
-        className="roof-path"
-        d="M 16 150 L 128 38 L 292 38"
-        stroke="#76b900"
-        strokeWidth="2.4"
-        strokeLinejoin="round"
-        filter="url(#roof-glow)"
-      />
-      {/* knee of the roof — the frontier */}
-      <circle className="roof-dot" cx="128" cy="38" r="3.6" fill="#76b900" filter="url(#roof-glow)" />
-      <circle className="roof-dot" cx="128" cy="38" r="8" fill="none" stroke="#76b900" strokeWidth="1" opacity="0.5" />
-      </svg>
-    </div>
-  )
-}
-
 export default async function HomePage() {
   const [efficiency, modelIdx] = await Promise.all([
     loadEfficiency(),
     loadModelIndex(),
   ])
-  // columnOrder applies the curated roster filter; each chart then re-ranks
-  // its columns by its own metric (highest left -> lowest right) and drops
-  // models with no result on that bench.
   const ordered = columnOrder(modelIdx)
-  const perfCharts = (["mega", "hard", "cuda"] as const).map((b) =>
-    columnsForBench(modelIdx, b, ordered),
-  )
-  const correctnessChart = columnsForCorrectness(modelIdx, ordered)
-  const boards = (["mega", "hard", "cuda"] as const).reduce((n, b) => {
-    const g = modelIdx.benches[b]?.gpu_labels
-    return n + (g ? Object.keys(g).filter((k) => !SITE_HIDDEN_GPUS.has(k)).length : 1)
-  }, 0)
+  // Precompute Mega → CUDA → Hard for every GPU tab. CUDA is a single-GPU
+  // deck (always RTX PRO 6000 numbers); mega/hard switch with the tab.
+  const chartsByGpu: Record<string, ReturnType<typeof columnsForBench>[]> = {}
+  for (const g of HOME_GPU_TABS) {
+    chartsByGpu[g.key] = HOME_BENCH_ORDER.map((b) =>
+      columnsForBench(modelIdx, b, ordered, g.key),
+    )
+  }
+
   return (
     <div className="space-y-12">
       <script
         type="application/ld+json"
         dangerouslySetInnerHTML={{ __html: JSON.stringify(citationGraph) }}
       />
-      <section className="hero" aria-label="About">
-        <div className="hero-copy">
-          <p className="hero-kicker">
-            Agentic GPU kernel benchmarks
-            <span className="hero-cursor" aria-hidden="true" />
-          </p>
-          <h1 className="hero-line">
-            Frontier coding agents write the kernels.
-            <br />
-            <span className="dim">The roofline keeps score.</span>
-          </h1>
-          <ul className="hero-stats">
-            <li>
-              <strong>{ordered.length}</strong> models ranked
-            </li>
-            <li>
-              <strong>3</strong> bench decks <span className="accent">+ multi soon</span>
-            </li>
-            <li>
-              <strong>{boards}</strong> GPU boards
-            </li>
-            <li>
-              updated <strong>{new Date(modelIdx.generated).toISOString().slice(0, 10)}</strong>
-            </li>
-          </ul>
-        </div>
-        <RooflineMotif />
-      </section>
 
-      <section aria-label="Models">
-        <div className="section-head">
-          <h2 className="section-title">Rankings</h2>
-          <span className="section-note">
-            each chart ranks by its own score, best left — click a column for
-            cells, audits, and integrity record
-          </span>
-        </div>
-        <ModelScoreboards perf={perfCharts} correctness={correctnessChart} />
-      </section>
+      <HomeRankings gpus={HOME_GPU_TABS} chartsByGpu={chartsByGpu} />
 
       <section aria-label="Benchmarks">
         <div className="section-head">
@@ -428,7 +340,6 @@ export default async function HomePage() {
           </pre>
         </div>
       </details>
-
     </div>
   )
 }
