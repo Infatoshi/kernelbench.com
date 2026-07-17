@@ -12,7 +12,12 @@ const BASELINE_URL = `/code?f=${encodeURIComponent(
   "/data/mega/code/02_kimi_linear_decode.baseline.py.txt",
 )}`
 
-export default async function MegaPage() {
+export default async function MegaPage({
+  searchParams,
+}: {
+  searchParams: Promise<{ gpu?: string }>
+}) {
+  const { gpu } = await searchParams
   const idx = await loadModelIndex()
   const gpuLabels = idx.benches.mega?.gpu_labels ?? {}
 
@@ -68,7 +73,7 @@ export default async function MegaPage() {
       </section>
 
       <section>
-        <ModelGpuBoard views={views} />
+        <ModelGpuBoard views={views} initialGpu={gpu} />
         <p className="text-xs text-[var(--color-fg)] mt-3 max-w-4xl leading-relaxed">
           Click a model for the per-ctx breakdown (speedup at 2k / 8k / 16k
           decode context), audit chips, and its integrity record. The problem&apos;s{" "}

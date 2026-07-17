@@ -1,7 +1,6 @@
 import Link from "next/link"
-import { GroupedBars } from "./home-charts"
 import { EfficiencyChart } from "./efficiency-chart"
-import { loadMegaChart, loadHardChart, loadEfficiency } from "@/app/_lib/charts"
+import { loadEfficiency } from "@/app/_lib/charts"
 import { columnOrder, columnsForBench, columnsForCorrectness } from "@/app/_lib/models"
 import { loadModelIndex } from "@/app/_lib/models.server"
 import { ModelScoreboards } from "@/app/_components/model-columns"
@@ -64,16 +63,19 @@ const citationGraph = {
   ],
 }
 
+// Compact bench tiles: the model charts above carry the numbers, so each
+// bench gets a one-liner, GPU deep-links into its board, and the artifact
+// links (GitHub source, HF traces).
 const benchmarks = [
   {
     href: "/mega",
     title: "Mega",
-    description:
-      "Full GPU megakernel build (Kimi-Linear W4A16 decode + RL), frontier models across Blackwell / H100 / B200, scored as speedup over the reference. Contamination-audited; agent sandbox hides prior solutions.",
-    stats: [
-      ["problem", "megakernel"],
-      ["models", "11+"],
-      ["GPUs", "3"],
+    tagline:
+      "Whole-block megakernels — best decode speedup over an optimized-PyTorch baseline.",
+    gpus: [
+      { label: "RTX PRO 6000", href: "/mega" },
+      { label: "H100", href: "/mega?gpu=h100" },
+      { label: "B200", href: "/mega?gpu=b200" },
     ],
     hfHref: "https://huggingface.co/datasets/Infatoshi/kernelbench-mega-traces",
     ghHref:
@@ -83,12 +85,13 @@ const benchmarks = [
   {
     href: "/hard",
     title: "Hard",
-    description:
-      "Curated hard CUDA/Triton deck — Opus, Fable, Grok 4.5, GPT-5.6 Sol, GLM-5.2, and more — across RTX PRO 6000 Blackwell, H100 PCIe, and B200. Roofline-graded with per-run agent traces.",
-    stats: [
-      ["problems", "6"],
-      ["models", "8"],
-      ["GPUs", "3+"],
+    tagline:
+      "Six-problem CUDA/Triton deck, roofline-graded, one unlimited-time agent session per cell.",
+    gpus: [
+      { label: "RTX PRO 6000", href: "/hard" },
+      { label: "H100", href: "/hard?gpu=h100" },
+      { label: "B200", href: "/hard?gpu=b200" },
+      { label: "RTX 3090", href: "/hard?gpu=rtx3090" },
     ],
     hfHref: "https://huggingface.co/datasets/Infatoshi/kernelbench-hard-traces",
     ghHref:
@@ -98,14 +101,10 @@ const benchmarks = [
   {
     href: "/cuda",
     title: "CUDA",
-    description:
-      "CUDA-only writing deck — Triton/DSL fail the gate. Four hard cells: GLM-5.2 fused MoE (256 experts + shared), DeepSeek NSA, MegaQwen decode (2k–128k), RL grid+MinGRU SPS. Hard/Mega stay frozen.",
-    stats: [
-      ["problems", "4"],
-      ["gate", "CUDA-only"],
-      ["GPU", "RTX PRO 6000"],
-    ],
-    hfHref: null,
+    tagline:
+      "CUDA-only writing deck — Triton and kernel DSLs fail the language gate.",
+    gpus: [{ label: "RTX PRO 6000", href: "/cuda" }],
+    hfHref: "https://huggingface.co/datasets/Infatoshi/kernelbench-cuda-traces",
     ghHref:
       "https://github.com/Infatoshi/kernelbench.com/tree/master/benchmarks/cuda",
     comingSoon: false,
@@ -113,13 +112,9 @@ const benchmarks = [
   {
     href: "/multi",
     title: "Multi",
-    description:
-      "The multi-GPU (NVLink) sibling of Hard: agents rewrite PyTorch + NCCL collectives as fine-grained NVLink kernels on an 8×H100 SXM (NVSwitch) node, graded on busbw — bus-bandwidth efficiency, not TFLOPS. Six communication-dominated problems.",
-    stats: [
-      ["problems", "6"],
-      ["GPUs", "8×H100"],
-      ["metric", "busbw"],
-    ],
+    tagline:
+      "NVLink collectives rewritten as kernels on 8×H100 SXM, graded on busbw.",
+    gpus: [{ label: "8×H100 SXM", href: "/multi" }],
     hfHref: null,
     ghHref:
       "https://github.com/Infatoshi/kernelbench.com/tree/master/benchmarks/multi",
@@ -128,9 +123,7 @@ const benchmarks = [
 ]
 
 export default async function HomePage() {
-  const [megaChart, hardChart, efficiency, modelIdx] = await Promise.all([
-    loadMegaChart(),
-    loadHardChart(),
+  const [efficiency, modelIdx] = await Promise.all([
     loadEfficiency(),
     loadModelIndex(),
   ])
@@ -142,22 +135,6 @@ export default async function HomePage() {
     columnsForBench(modelIdx, b, ordered),
   )
   const correctnessChart = columnsForCorrectness(modelIdx, ordered)
-  const charts: Record<string, React.ReactNode> = {
-    "/mega": (
-      <GroupedBars
-        title="Speedup over reference megakernel"
-        subtitle="Kimi linear-decode megakernel, per model. Pick a GPU."
-        data={megaChart}
-      />
-    ),
-    "/hard": (
-      <GroupedBars
-        title="Percent of hardware roofline"
-        subtitle="Average across solved problems, relative to the GPU's own roofline. Pick a GPU."
-        data={hardChart}
-      />
-    ),
-  }
   return (
     <div className="space-y-12">
       <script
@@ -185,50 +162,42 @@ export default async function HomePage() {
         <ModelScoreboards perf={perfCharts} correctness={correctnessChart} />
       </section>
 
-      <section aria-label="Benchmarks" className="space-y-4">
+      <section aria-label="Benchmarks" className="bench-grid">
         {benchmarks.map((benchmark) => (
-          <article key={benchmark.href} className="benchmark-card">
-            <Link
-              href={benchmark.href}
-              className="benchmark-main no-underline"
-              aria-label={`Open ${benchmark.title} benchmark`}
-            >
-              <div className="flex flex-col gap-5 sm:flex-row sm:items-start sm:justify-between">
-                <div className="max-w-2xl">
-                  <h2 className="text-2xl sm:text-3xl font-semibold tracking-tight text-[var(--color-fg-bright)] flex items-center gap-3">
-                    {benchmark.title}
-                    {benchmark.comingSoon && (
-                      <span className="text-xs font-semibold uppercase tracking-wide px-2 py-1 rounded border border-[var(--color-accent)] text-[var(--color-accent)]">
-                        coming soon
-                      </span>
-                    )}
-                  </h2>
-                  <p className="mt-3 text-sm sm:text-base text-[var(--color-fg)] leading-relaxed">
-                    {benchmark.description}
-                  </p>
-                </div>
-                <span className="benchmark-open" aria-hidden="true">
-                  <svg
-                    viewBox="0 0 24 24"
-                    fill="none"
-                    stroke="currentColor"
-                    strokeLinecap="round"
-                    strokeLinejoin="round"
-                    strokeWidth="1.8"
-                  >
-                    <path d="M7 17 17 7" />
-                    <path d="M9 7h8v8" />
-                  </svg>
-                </span>
-              </div>
-              <div className="mt-6 grid grid-cols-2 gap-3 sm:grid-cols-4">
-                {benchmark.stats.map(([label, value]) => (
-                  <Stat key={label} label={label} value={value} />
-                ))}
-              </div>
-            </Link>
-            {charts[benchmark.href]}
-            <div className="benchmark-footer flex flex-wrap items-center gap-4">
+          <article key={benchmark.href} className="bench-tile">
+            <div className="bench-tile-head">
+              <Link
+                href={benchmark.href}
+                className="bench-tile-title no-underline"
+                aria-label={`Open ${benchmark.title} benchmark`}
+              >
+                {benchmark.title}
+                <svg
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                  strokeWidth="2"
+                  aria-hidden="true"
+                >
+                  <path d="M7 17 17 7" />
+                  <path d="M9 7h8v8" />
+                </svg>
+              </Link>
+              {benchmark.comingSoon && (
+                <span className="bench-tile-soon">coming soon</span>
+              )}
+            </div>
+            <p className="bench-tile-tag">{benchmark.tagline}</p>
+            <div className="bench-tile-gpus" aria-label={`${benchmark.title} GPU boards`}>
+              {benchmark.gpus.map((g) => (
+                <Link key={g.label} href={g.href} className="bench-gpu-chip no-underline">
+                  {g.label}
+                </Link>
+              ))}
+            </div>
+            <div className="bench-tile-links">
               <a
                 href={benchmark.ghHref}
                 target="_blank"
@@ -239,13 +208,13 @@ export default async function HomePage() {
                 <svg
                   viewBox="0 0 24 24"
                   aria-hidden="true"
-                  width="20"
-                  height="20"
+                  width="16"
+                  height="16"
                   fill="currentColor"
                 >
                   <path d="M12 2C6.48 2 2 6.58 2 12.26c0 4.53 2.87 8.37 6.84 9.73.5.1.68-.22.68-.49 0-.24-.01-1.04-.01-1.89-2.78.62-3.37-1.22-3.37-1.22-.45-1.19-1.11-1.5-1.11-1.5-.91-.64.07-.63.07-.63 1 .07 1.53 1.06 1.53 1.06.9 1.57 2.35 1.12 2.92.86.09-.67.35-1.12.63-1.38-2.22-.26-4.55-1.14-4.55-5.07 0-1.12.39-2.03 1.03-2.75-.1-.26-.45-1.3.1-2.71 0 0 .84-.28 2.75 1.05A9.29 9.29 0 0 1 12 6.98c.85 0 1.71.12 2.51.34 1.91-1.33 2.75-1.05 2.75-1.05.55 1.41.2 2.45.1 2.71.64.72 1.03 1.63 1.03 2.75 0 3.94-2.34 4.81-4.57 5.06.36.32.68.94.68 1.9 0 1.38-.01 2.49-.01 2.83 0 .27.18.59.69.49A10.05 10.05 0 0 0 22 12.26C22 6.58 17.52 2 12 2Z" />
                 </svg>
-                <span>GitHub source</span>
+                <span>GitHub</span>
               </a>
               {benchmark.hfHref && (
                 <a
@@ -258,13 +227,16 @@ export default async function HomePage() {
                   <img
                     src={HUGGING_FACE_LOGO}
                     alt=""
-                    width="22"
-                    height="22"
+                    width="16"
+                    height="16"
                     loading="lazy"
                   />
-                  <span>Hugging Face runs</span>
+                  <span>Traces</span>
                 </a>
               )}
+              <Link href="/runs" className="hf-link no-underline">
+                <span>Run index</span>
+              </Link>
             </div>
           </article>
         ))}
@@ -421,17 +393,6 @@ function ArtifactLink({ href, label }: { href: string; label: string }) {
     <a href={href} target="_blank" rel="noreferrer" className="artifact-link">
       {label}
     </a>
-  )
-}
-
-function Stat({ label, value }: { label: string; value: string }) {
-  return (
-    <div className="stat-box">
-      <div className="text-[var(--color-fg-muted)]">{label}</div>
-      <div className="text-[var(--color-fg-bright)] font-semibold text-lg">
-        {value}
-      </div>
-    </div>
   )
 }
 

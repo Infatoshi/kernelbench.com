@@ -6,7 +6,12 @@ import { ModelGpuBoard, type GpuView } from "@/app/_components/model-board"
 // KernelBench-Hard: per-op kernel deck. AA-style model bar chart per GPU
 // board; run-level forensics live on /runs and the per-model pages.
 
-export default async function HardPage() {
+export default async function HardPage({
+  searchParams,
+}: {
+  searchParams: Promise<{ gpu?: string }>
+}) {
+  const { gpu } = await searchParams
   const idx = await loadModelIndex()
   const gpuLabels = idx.benches.hard?.gpu_labels ?? {}
 
@@ -60,7 +65,7 @@ export default async function HardPage() {
       </section>
 
       <section>
-        <ModelGpuBoard views={views} />
+        <ModelGpuBoard views={views} initialGpu={gpu} />
         <p className="text-xs text-[var(--color-fg)] mt-3 max-w-4xl leading-relaxed">
           Browse the{" "}
           <Link href="/runs" className="underline underline-offset-2">

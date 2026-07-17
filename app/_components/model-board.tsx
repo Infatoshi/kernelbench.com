@@ -15,9 +15,19 @@ export interface GpuView {
   bars: BarView
 }
 
-export function ModelGpuBoard({ views }: { views: GpuView[] }) {
+export function ModelGpuBoard({
+  views,
+  initialGpu,
+}: {
+  views: GpuView[]
+  /** preselect a board (e.g. from a ?gpu= deep link); falls back to the
+   *  first non-empty view when absent or unknown */
+  initialGpu?: string
+}) {
   const nonEmpty = views.filter((v) => v.bars.rows.length > 0)
-  const [sel, setSel] = useState((nonEmpty[0] ?? views[0])?.key ?? "")
+  const [sel, setSel] = useState(
+    (nonEmpty.find((v) => v.key === initialGpu) ?? nonEmpty[0] ?? views[0])?.key ?? "",
+  )
   const view = (nonEmpty.find((v) => v.key === sel) ?? nonEmpty[0] ?? views[0])!
   return (
     <div className="chart-panel">
