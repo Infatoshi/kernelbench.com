@@ -55,12 +55,15 @@ function ColumnChart({ chart }: { chart: ColChart }) {
         <div className="colchart-main">
           <div className="colchart-plot">
             <div className="colchart-cols">
-              {chart.columns.map((c) => {
+              {chart.columns.map((c, i) => {
                 const pct =
                   c.value == null ? null : Math.min(100, (c.value / chart.maxValue) * 100)
                 // AA convention: value inside the bar top when it fits (>= ~16%
                 // of plot height), floated above the bar otherwise.
                 const inside = pct != null && pct >= 16
+                // columns arrive ranked, so the first three are the podium:
+                // brand-colored light radiating outward, brightest for #1
+                const glow = c.value != null && i < 3 ? ` colchart-glow-${i + 1}` : ""
                 return (
                 <Link
                   key={c.slug}
@@ -69,14 +72,15 @@ function ColumnChart({ chart }: { chart: ColChart }) {
                   title={`${c.name} · ${c.lab}${c.display ? ` · ${c.display}` : " · no result"}`}
                 >
                   <span
-                    className={`colchart-bar${c.value == null ? " colchart-bar-empty" : ""}`}
+                    className={`colchart-bar${c.value == null ? " colchart-bar-empty" : ""}${glow}`}
                     style={
                       pct == null
                         ? undefined
-                        : {
+                        : ({
                             height: `${pct.toFixed(1)}%`,
                             background: c.brand.color,
-                          }
+                            "--glow": c.brand.color,
+                          } as React.CSSProperties)
                     }
                   >
                     {c.display != null && (

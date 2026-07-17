@@ -296,7 +296,7 @@ export default async function HomePage() {
             <strong className="text-[var(--color-fg-bright)]">
               Modern coding-agent harnesses.
             </strong>{" "}
-            Runs use Claude Code, Codex CLI, Cursor, Gemini CLI, Kimi CLI,
+            Runs use Claude Code, Codex CLI, Cursor, Kimi CLI,
             OpenCode, Grok, and MiniMax where those are the natural interfaces.
           </Bullet>
           <Bullet>

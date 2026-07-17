@@ -35,6 +35,13 @@ function displayName(modelId: string): string {
   return MODEL_NAMES[modelId] ?? modelId
 }
 
+/** Models pulled from the site entirely — keep in sync with
+ *  REMOVED_MODEL_SLUGS in models.server.ts. Matches raw leaderboard/CSV ids
+ *  like "gemini/gemini-3.5-flash". */
+export function isRemovedModel(modelId: string): boolean {
+  return /gemini-3\.1-pro|gemini-3\.5-flash/.test(modelId)
+}
+
 // GPU series colors — match the published charts (B200 is the NVIDIA accent).
 export const GPU_SERIES = [
   { key: "RTX PRO 6000", color: "#4d9fff" },
@@ -70,6 +77,7 @@ export async function loadMegaChart(): Promise<ChartData> {
     const f = line.split(",")
     if (f[idx("correct")] !== "true") continue
     const model = f[idx("model")]
+    if (isRemovedModel(model)) continue
     const gpu = MEGA_GPU_LABEL[f[idx("gpu")]]
     if (!gpu) continue
     ;(cell[model] ??= {})[gpu] = parseFloat(f[idx("score")])
@@ -87,6 +95,7 @@ export async function loadHardChart(): Promise<ChartData> {
   for (const [gpu, file] of Object.entries(files)) {
     const lb = await loadLeaderboard(file)
     for (const m of lb.models) {
+      if (isRemovedModel(m.model)) continue
       const pfs = Object.values(m.results)
         .filter((c) => c.correct && c.peak_fraction != null)
         .map((c) => c.peak_fraction as number)
@@ -187,6 +196,7 @@ export async function loadEfficiency(): Promise<{ mega: EffByGpu; hard: EffByGpu
     if (!gpu) continue
     const tok = parseInt(f[ix("output_tokens")], 10)
     if (!tok || tok < 1000) continue
+    if (isRemovedModel(f[ix("model")])) continue
     const name = shortName(f[ix("model")])
     ;(megaPts[gpu] ??= []).push({ label: name, x: tok, y: parseFloat(f[ix("score")]), frontier: false })
   }
@@ -204,6 +214,7 @@ export async function loadEfficiency(): Promise<{ mega: EffByGpu; hard: EffByGpu
     }
     const pts: EffPoint[] = []
     for (const m of lb.models) {
+      if (isRemovedModel(m.model)) continue
       const name = shortName(m.model)
       const pfs: number[] = []
       let tok = 0

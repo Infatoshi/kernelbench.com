@@ -486,7 +486,8 @@ function correctnessOf(index: ModelIndex, m: ModelEntry): {
  *   DeepSeek   v4-pro (flash dropped)            MiniMax  m3 (m2.7 dropped)
  *   Cursor     composer-2.5-fast                 Meituan  longcat-2.0
  *   Moonshot   kinetic model when it lands (k2.6/k2.7 dropped)
- *   Google     gemini-3.1-pro-preview (3.5-flash dropped)
+ *   Google     none — both gemini models removed site-wide (see
+ *              REMOVED_MODEL_SLUGS in models.server.ts)
  */
 export const CHART_HIDDEN_SLUGS = new Set([
   "claude-opus-4-6",
