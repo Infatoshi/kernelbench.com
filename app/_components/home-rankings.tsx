@@ -119,7 +119,7 @@ export function HomeRankings({
   chartsByGpu: Record<string, ColChart[]>
 }) {
   const defaultKey =
-    gpus.find((g) => g.key === DEFAULT_GPU)?.key ?? gpus[0]?.key ?? "b200"
+    gpus.find((g) => g.key === DEFAULT_GPU)?.key ?? gpus[0]?.key ?? "h100"
   const [gpu, setGpu] = useState(defaultKey)
   const active = chartsByGpu[gpu] ? gpu : defaultKey
   const charts = chartsByGpu[active] ?? []

@@ -14,8 +14,8 @@ export function EfficiencyChart({ mega, hard }: { mega: EffByGpu; hard: EffByGpu
   const [tab, setTab] = useState<"mega" | "hard">("mega")
   const byGpu = tab === "mega" ? mega : hard
   const gpus = Object.keys(byGpu)
-  // Prefer B200 when present; tab order is H100 → RTX → B200.
-  const preferred = gpus.includes("B200") ? "B200" : (gpus[0] ?? "")
+  // Default H100 when present; tab order is H100 → RTX → B200.
+  const preferred = gpus.includes("H100") ? "H100" : (gpus[0] ?? "")
   const [gpu, setGpu] = useState(preferred)
   const activeGpu = byGpu[gpu] ? gpu : preferred
   const data = byGpu[activeGpu]

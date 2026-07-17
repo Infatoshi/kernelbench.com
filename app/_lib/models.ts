@@ -119,12 +119,11 @@ export const SITE_HIDDEN_GPUS = new Set(["rtx3090"])
 
 /**
  * Default GPU board for multi-GPU decks and the homepage ranking toggle.
- * Order is presentation order for the homepage tab strip.
+ * Tab strip order is HOME_GPU_TABS; initial selection is DEFAULT_GPU.
  */
-export const DEFAULT_GPU = "b200"
+export const DEFAULT_GPU = "h100"
 
-/** Homepage / deck GPU tabs: H100 → RTX PRO 6000 → B200. Default selection
- *  remains DEFAULT_GPU (B200). */
+/** Homepage / deck GPU tabs: H100 → RTX PRO 6000 → B200. */
 export const HOME_GPU_TABS: { key: string; label: string }[] = [
   { key: "h100", label: "H100" },
   { key: "rtxpro6000", label: "RTX PRO 6000" },

@@ -125,8 +125,8 @@ export type EffByGpu = Record<string, EffData>
 
 // Candidate GPUs in display order; only those with clean token telemetry for a
 // benchmark actually appear (the loader drops empty ones). Tab order matches
-// HOME_GPU_TABS (H100 → RTX PRO 6000 → B200); default selection is still B200
-// via DEFAULT_GPU. RTX 3090 is hidden site-wide (2026-07-17).
+// HOME_GPU_TABS (H100 → RTX PRO 6000 → B200); default selection is H100.
+// RTX 3090 is hidden site-wide (2026-07-17).
 export const EFF_GPU_ORDER = ["H100", "RTX PRO 6000", "B200"]
 const MEGA_GPU_MAP: Record<string, string> = {
   "RTX PRO 6000 Blackwell": "RTX PRO 6000",
