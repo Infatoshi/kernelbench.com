@@ -146,8 +146,12 @@ def best_cell(runs):
 # (run_id >= the campaign launch) must show ONLY its uncapped cells - never a
 # best-of-both Frankenstein across the 45-min and unlimited-time generations.
 # Models with no uncapped run keep all their (45-min) cells as legacy.
+# When the curation manifest is active it supersedes this guard: every run_id
+# in published_runs.json was hand-curated, so cross-generation rows there are
+# deliberate (e.g. Fable 5's June cells + the 2026-07-16 uncapped fp8 rerun).
+# Without this, publishing one uncapped cell silently nuked the rest of the row.
 CAMPAIGN_EPOCH = "20260613_042249"
-for _key, _probs in cells.items():
+for _key, _probs in (cells.items() if not PUBLISHED else []):
     _has_uncapped = any(c["run_id"][:15] >= CAMPAIGN_EPOCH
                         for _lst in _probs.values() for c in _lst)
     if not _has_uncapped:
