@@ -6,6 +6,12 @@ const nextConfig = {
   images: {
     unoptimized: true,
   },
+  experimental: {
+    // Persist the Turbopack module graph across runs — warm `next dev` skips
+    // recompiling unchanged subtrees. (ForBuild exists but is canary-gated in
+    // 16.0.10; revisit on upgrade.)
+    turbopackFileSystemCacheForDev: true,
+  },
   // data.ts reads leaderboards/annotations with dynamic fs paths, so the file
   // tracer can't narrow the pattern and matches the whole repo — including the
   // ~186G gitignored benchmarks/*/outputs run archives that exist only on

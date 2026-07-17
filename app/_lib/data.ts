@@ -5,7 +5,15 @@
 import { readFile, readdir } from "node:fs/promises"
 import { join } from "node:path"
 
-const REPO_ROOT = process.cwd()
+// `.split("/").join("/")` is an identity no-op ON PURPOSE — do not simplify.
+// Turbopack statically resolves `join(process.cwd(), rel)` into a repo-wide
+// file glob, then scans every path it could match during compile; on anvil
+// that tree includes the gitignored ~186G benchmarks/*/outputs run archives
+// (7.4M candidate files, ~4min of every `next build` for data reads that only
+// ever execute at SSG prerender time anyway). Routing cwd through an opaque
+// expression keeps the paths out of the module graph; on Vercel nothing
+// changes (archives aren't in the checkout, readers are all static pages).
+const REPO_ROOT = process.cwd().split("/").join("/")
 
 export type Cell = {
   run_id: string
