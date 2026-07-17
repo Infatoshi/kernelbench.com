@@ -1,5 +1,6 @@
 import type { Metadata } from "next"
 import { JetBrains_Mono } from "next/font/google"
+import { SiteNav } from "@/app/_components/site-nav"
 import "./globals.css"
 
 const mono = JetBrains_Mono({
@@ -51,7 +52,8 @@ export default function RootLayout({
   return (
     <html lang="en" className={mono.variable} data-theme="dark">
       <body className="min-h-screen">
-        <main className="container mx-auto px-4 sm:px-6 max-w-7xl py-10">
+        <SiteNav />
+        <main className="container mx-auto px-4 sm:px-6 max-w-7xl pt-8 pb-12">
           {children}
         </main>
         <Footer />
@@ -62,29 +64,18 @@ export default function RootLayout({
 
 function Footer() {
   return (
-    <footer className="border-t border-[var(--color-border)] mt-16">
-      <div className="container mx-auto max-w-7xl px-4 sm:px-6 py-6 text-xs text-[var(--color-fg-muted)] flex flex-col gap-4">
-        <div className="flex flex-col sm:flex-row gap-2 sm:items-center sm:justify-between">
-          <span>
-            built by{" "}
-            <a href="https://elliotarledge.com">elliot arledge</a>
-            {" · "}
-            <a href="mailto:elliot@arledge.net">elliot@arledge.net</a>
-          </span>
-          <span>
-            source:{" "}
-            <a href="https://github.com/Infatoshi/kernelbench.com">
-              github.com/Infatoshi/kernelbench.com
-            </a>
-          </span>
-        </div>
-        <p className="text-[var(--color-fg-muted)] leading-relaxed">
-          Disclaimer: This site is not affiliated with or endorsed by the
-          authors of Stanford KernelBench. It is an independent website and hub
-          for benchmark runs made by Elliot Arledge (
-          <a href="https://x.com/elliotarledge">x.com/elliotarledge</a>
-          ).
-        </p>
+    <footer className="site-footer">
+      <div className="site-footer-inner">
+        <span className="site-footer-line">
+          built by <a href="https://elliotarledge.com">elliot arledge</a>
+          {" · "}
+          <a href="mailto:elliot@arledge.net">elliot@arledge.net</a>
+          {" · "}
+          <a href="https://github.com/Infatoshi/kernelbench.com">source</a>
+        </span>
+        <span className="site-footer-dim">
+          independent site — not affiliated with Stanford KernelBench
+        </span>
       </div>
     </footer>
   )

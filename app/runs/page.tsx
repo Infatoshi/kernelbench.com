@@ -1,6 +1,7 @@
 import { readdir } from "node:fs/promises"
 import { join } from "node:path"
 import { loadLeaderboard } from "@/app/_lib/data"
+import { PageHead } from "@/app/_components/page-head"
 
 // Full agent transcripts live on HuggingFace (per-run trace JSONL); the site
 // keeps only the raw submitted-kernel files locally. Each row links to its HF
@@ -133,30 +134,43 @@ export default async function RunsIndex({ searchParams }: RunsIndexProps) {
   const noPerf = runs.filter((r) => r.correct && r.peak_fraction === null).length
   const fails = runs.filter((r) => !r.correct && r.has_solution).length
   const errs = runs.filter((r) => !r.correct && !r.has_solution).length
-  const title = harnessFilter ? `${harnessLabel(harnessFilter)} runs` : "all runs"
+  const title = harnessFilter ? `Runs · ${harnessLabel(harnessFilter)}` : "Run index"
 
   return (
-    <div className="space-y-8">
-      <section>
-        <h1 className="prompt cursor text-3xl font-bold text-[var(--color-fg-bright)] glow mb-3">
-          {title}
-        </h1>
-        <p className="text-sm text-[var(--color-fg-muted)] mb-4">
-          {runs.length} runs · {scored} scored · {noPerf} no perf · {fails} fail · {errs} err · sorted by peak_fraction desc
-        </p>
-        {harnessFilter ? (
-          <p className="text-xs text-[var(--color-fg-muted)] mb-4">
-            active filter:{" "}
-            <span className={harnessClass(harnessFilter)}>
-              harness={harnessLabel(harnessFilter)}
-            </span>{" "}
-            · <a href="/runs">clear</a>
+    <div className="space-y-6">
+      <PageHead
+        kicker="Index"
+        title={title}
+        sub={
+          <>
+            <strong>{runs.length}</strong> runs · {scored} scored · {noPerf} no perf ·{" "}
+            {fails} fail · {errs} err
+            {harnessFilter && (
+              <>
+                {" "}
+                · filter{" "}
+                <span className={harnessClass(harnessFilter)}>
+                  harness={harnessLabel(harnessFilter)}
+                </span>{" "}
+                (<a href="/runs">clear</a>)
+              </>
+            )}
+          </>
+        }
+        notes={
+          <p>
+            One row per (model, problem) cell, scored rows sorted by peak
+            fraction desc. Click any row to open the full agent transcript on
+            HuggingFace — every tool call, every reasoning step, the
+            model&apos;s solution.py, and the result. Transcripts are published
+            as per-run JSONL in the{" "}
+            <a href={HARD_TRACES_HF} target="_blank" rel="noreferrer">
+              kernelbench-hard-traces
+            </a>{" "}
+            dataset.
           </p>
-        ) : null}
-        <p className="text-[var(--color-fg)] leading-relaxed max-w-3xl text-sm">
-          One row per (model, problem) cell. Click any row to open the full agent transcript on HuggingFace — every tool call, every reasoning step, the model&apos;s solution.py, and the result. Transcripts are published as per-run JSONL in the <a href={HARD_TRACES_HF} target="_blank" rel="noreferrer">kernelbench-hard-traces</a> dataset.
-        </p>
-      </section>
+        }
+      />
 
       <section className="box overflow-x-auto">
         <table className="term tabular text-xs sm:text-sm">

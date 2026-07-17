@@ -1,4 +1,5 @@
 import Link from "next/link"
+import { PageHead } from "@/app/_components/page-head"
 
 // KernelBench-Multi: the multi-GPU (NVLink) sibling of the hard bench. Graded on
 // busbw (achieved NVLink bus bandwidth / NVLink peak), never TFLOPS. The deck is
@@ -19,63 +20,52 @@ const MULTI_PROBLEMS = [
 
 export default function MultiPage() {
   return (
-    <div className="hard-page space-y-12">
-      <section>
-        <h1 className="text-3xl font-semibold tracking-tight text-[var(--color-fg-bright)] mb-3">
-          multi
-        </h1>
-        <p className="text-sm text-[var(--color-fg)] mb-2">
-          8×H100 SXM (NVSwitch, NVLink4 · ~900 GB/s/GPU)
-          <span className="ml-2 text-xs font-semibold text-[var(--color-accent)]">
-            ● graded on busbw (NVLink bus-bandwidth efficiency)
-          </span>
-        </p>
-        <p className="text-xs text-[var(--color-fg-muted)] mb-6 max-w-4xl leading-relaxed">
-          The multi-GPU sibling of{" "}
-          <Link href="/hard" className="underline underline-offset-2">
-            hard
-          </Link>
-          . A coding agent takes a PyTorch + NCCL reference for a distributed op
-          and rewrites it as a fast, fine-grained NVLink kernel (CUDA / Triton /
-          NVSHMEM / CUDA symmetric memory / ParallelKittens) that beats the NCCL
-          baseline. The graded quantity is{" "}
-          <span className="text-[var(--color-fg)]">busbw</span> — achieved NVLink
-          bus bandwidth ÷ NVLink peak, never TFLOPS — so every problem is
-          deliberately communication-dominated. Six-problem deck, all
-          busbw-graded, each forbidding its bare collective.{" "}
-          <span className="text-[var(--color-fg)]">No runs yet.</span>
-        </p>
-      </section>
+    <div className="space-y-6">
+      <PageHead
+        kicker="Benchmark · Multi"
+        title="The NVLink deck"
+        sub={
+          <>
+            The multi-GPU sibling of <Link href="/hard">hard</Link>: agents
+            rewrite PyTorch + NCCL collectives as fine-grained NVLink kernels on
+            an 8×H100 SXM node (NVSwitch · NVLink4 · ~900 GB/s/GPU), graded on{" "}
+            <strong>busbw</strong> — bus-bandwidth efficiency, never TFLOPS.{" "}
+            <strong>No runs yet.</strong>
+          </>
+        }
+        notes={
+          <p>
+            <strong>The metric.</strong> busbw = achieved NVLink bus bandwidth
+            ÷ NVLink peak, so every problem is deliberately
+            communication-dominated. Six-problem deck, all busbw-graded, each
+            forbidding its bare collective (CUDA / Triton / NVSHMEM / CUDA
+            symmetric memory / ParallelKittens, as long as it beats the NCCL
+            baseline). Methodology and the full deck live in the{" "}
+            <Link href={`${REPO_TREE}/SPEC.md`}>spec</Link>.
+          </p>
+        }
+      />
 
-      <section>
-        <div className="cell-grid">
-          {MULTI_PROBLEMS.map((p) => (
-            <div key={p.key} className="cell-card">
-              <div className="cell-card-head">
-                <span className="cell-card-problem">{p.label}</span>
-                <span className="status-pill status-pill-muted">coming soon</span>
-              </div>
-              <div className="cell-card-links">
-                <a
-                  className="link-chip"
-                  href={`${REPO_TREE}/problems-h100x8/${p.key}/reference.py`}
-                  target="_blank"
-                  rel="noreferrer"
-                >
-                  reference
-                </a>
-              </div>
+      <div className="cell-grid">
+        {MULTI_PROBLEMS.map((p) => (
+          <div key={p.key} className="cell-card">
+            <div className="cell-card-head">
+              <span className="cell-card-problem">{p.label}</span>
+              <span className="status-pill status-pill-muted">coming soon</span>
             </div>
-          ))}
-        </div>
-        <p className="text-xs text-[var(--color-fg)] mt-3 max-w-4xl leading-relaxed">
-          Methodology and the full problem deck live in the{" "}
-          <Link href={`${REPO_TREE}/SPEC.md`} className="underline underline-offset-2">
-            spec
-          </Link>
-          . Results will populate here as sweeps complete on the 8×H100 node.
-        </p>
-      </section>
+            <div className="cell-card-links">
+              <a
+                className="link-chip"
+                href={`${REPO_TREE}/problems-h100x8/${p.key}/reference.py`}
+                target="_blank"
+                rel="noreferrer"
+              >
+                reference
+              </a>
+            </div>
+          </div>
+        ))}
+      </div>
     </div>
   )
 }

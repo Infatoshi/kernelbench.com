@@ -2,6 +2,7 @@ import Link from "next/link"
 import { barsForBench } from "@/app/_lib/models"
 import { loadModelIndex } from "@/app/_lib/models.server"
 import { ModelBars } from "@/app/_components/model-bars"
+import { PageHead } from "@/app/_components/page-head"
 
 // KernelBench-CUDA: CUDA-only sibling of hard. Triton/DSL fail the language
 // gate. Four-problem deck on RTX PRO 6000.
@@ -15,62 +16,52 @@ export default async function CudaPage() {
   const hasRuns = bars.rows.length > 0
 
   return (
-    <div className="hard-page space-y-12">
-      <section>
-        <h1 className="text-3xl font-semibold tracking-tight text-[var(--color-fg-bright)] mb-3">
-          cuda
-        </h1>
-        <p className="text-sm text-[var(--color-fg)] mb-2">
-          RTX PRO 6000 Blackwell (SM120 · GDDR7 · 1.8 TB/s)
-          <span className="ml-2 text-xs font-semibold text-[var(--color-accent)]">
-            ● CUDA-only language gate · Triton / DSL = fail
-          </span>
-        </p>
-        <p className="text-xs text-[var(--color-fg-muted)] mb-6 max-w-4xl leading-relaxed">
-          Isolated CUDA-writing sibling of{" "}
-          <Link href="/hard" className="underline underline-offset-2">
-            hard
-          </Link>
-          . Four hard problems: GLM-5.2 fused MoE (256 routed + 1 shared,
-          top-8), DeepSeek NSA sparse attention, MegaQwen decode (improve
-          baseline; decode-only at 2k–128k), and grid+MinGRU SPS. Hard and Mega
-          prompts stay frozen.{" "}
-          {!hasRuns && <span className="text-[var(--color-fg)]">No runs yet.</span>}
-        </p>
-      </section>
-
-      <section>
-        {hasRuns ? (
-          <div className="chart-panel">
-            <div className="chart-panel-head">
-              <span className="chart-panel-title">RTX PRO 6000 leaderboard</span>
-            </div>
-            <ModelBars view={bars} />
+    <div className="space-y-6">
+      <PageHead
+        kicker="Benchmark · CUDA"
+        title="The CUDA-only deck"
+        sub={
+          <>
+            Hard&apos;s isolated sibling with a language gate: Triton and
+            kernel DSLs fail. Four problems — GLM-5.2 fused MoE, DeepSeek NSA,
+            MegaQwen decode at 2k–128k, grid+MinGRU SPS — on RTX PRO 6000
+            Blackwell (SM120 · GDDR7 · 1.8 TB/s).
+            {!hasRuns && <strong> No runs yet.</strong>}
+          </>
+        }
+        notes={
+          <>
+            <p>
+              <strong>Why separate.</strong> Hard and Mega prompts are frozen
+              lab boards. CUDA exists to force CUDA evidence and grade
+              Triton/DSL cheats without moving their goalposts. Methodology and
+              the full problem deck live in the{" "}
+              <Link href={`${REPO_TREE}/SPEC.md`}>spec</Link>.
+            </p>
+            {hasRuns && (
+              <p>
+                <strong>Artifacts.</strong> Every published cell is
+                contamination-checked and reward-hack audited; full agent
+                traces are on HuggingFace. Browse the{" "}
+                <Link href="/runs">run index</Link> for transcripts, submitted
+                solutions, checks, and timing.
+              </p>
+            )}
+          </>
+        }
+      />
+      {hasRuns ? (
+        <div className="chart-panel">
+          <div className="chart-panel-head">
+            <span className="chart-panel-title">RTX PRO 6000</span>
           </div>
-        ) : (
-          <p className="text-xs text-[var(--color-fg-muted)]">
-            Results will populate here as sweeps complete.
-          </p>
-        )}
-        <p className="text-xs text-[var(--color-fg)] mt-3 max-w-4xl leading-relaxed">
-          Methodology and the full problem deck live in the{" "}
-          <Link
-            href={`${REPO_TREE}/SPEC.md`}
-            className="underline underline-offset-2"
-          >
-            spec
-          </Link>
-          .{" "}
-          {hasRuns &&
-            "Every published cell is contamination-checked and reward-hack audited; full agent traces are on HuggingFace. Browse the "}
-          {hasRuns && (
-            <Link href="/runs" className="underline underline-offset-2">
-              run index
-            </Link>
-          )}
-          {hasRuns && " for transcripts, submitted solutions, checks, and timing."}
+          <ModelBars view={bars} />
+        </div>
+      ) : (
+        <p className="text-xs text-[var(--color-fg-muted)]">
+          Results will populate here as sweeps complete.
         </p>
-      </section>
+      )}
     </div>
   )
 }

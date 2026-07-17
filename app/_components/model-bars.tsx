@@ -60,7 +60,7 @@ export function ModelBars({ view }: { view: BarView }) {
   let lastTier: string | null = null
   return (
     <div className="mbar" role="figure" aria-label={view.axis}>
-      {view.rows.map((row) => {
+      {view.rows.map((row, ri) => {
         const tier = tierKey(row)
         const showTier = tier !== lastTier
         lastTier = tier
@@ -86,7 +86,11 @@ export function ModelBars({ view }: { view: BarView }) {
               <span className="mbar-track">
                 <span
                   className="mbar-fill"
-                  style={{ width: `${pct.toFixed(2)}%`, background: row.brand.color }}
+                  style={{
+                    width: `${pct.toFixed(2)}%`,
+                    background: row.brand.color,
+                    animationDelay: `${Math.min(ri * 50, 500)}ms`,
+                  }}
                 />
               </span>
               <span className="mbar-right">

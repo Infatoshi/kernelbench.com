@@ -3,19 +3,10 @@ import type { ColChart } from "../_lib/models"
 
 // AA-style vertical column charts for the model views. Pure server rendering
 // (no toggles, no client state): performance is disaggregated into one chart
-// per bench (Mega / Hard / CUDA), a slim Multi coming-soon panel, and one
+// per bench (Mega / Hard / CUDA), a slim Multi coming-soon strip, and one
 // compiled "Correctness" chart below. Each chart ranks its own metric —
 // highest score leftmost — and only scored models get a column (see
 // sortColumnsByValue in _lib/models.ts).
-
-const MULTI_PROBLEMS = [
-  "AllReduce + Residual",
-  "ReduceScatter + RMSNorm",
-  "AllGather + fp8 Dequant",
-  "MoE All-to-All",
-  "Ulysses All-to-All",
-  "fp8 ReduceScatter Grad",
-]
 
 function yLabel(unit: ColChart["unit"], v: number): string {
   if (unit === "pct") return `${v}%`
@@ -80,6 +71,8 @@ function ColumnChart({ chart }: { chart: ColChart }) {
                             height: `${pct.toFixed(1)}%`,
                             background: c.brand.color,
                             "--glow": c.brand.color,
+                            // staggered grow-in from the baseline (CSS keyframe)
+                            animationDelay: `${Math.min(i * 55, 550)}ms`,
                           } as React.CSSProperties)
                     }
                   >
@@ -124,31 +117,19 @@ function ColumnChart({ chart }: { chart: ColChart }) {
   )
 }
 
-function MultiComingSoon() {
+function MultiStrip() {
   return (
-    <div className="chart-panel">
-      <div className="chart-panel-head">
-        <span className="chart-panel-title">Multi performance</span>
-        <span className="colchart-sub">8×H100 SXM · graded on busbw, never TFLOPS</span>
-      </div>
-      <div className="mbar-coming">
-        <p className="mbar-coming-head">
-          <span className="mbar-coming-pill">coming soon</span>
-          <span>8×H100 SXM · NVSwitch · NVLink4 · ~900 GB/s/GPU</span>
-        </p>
-        <p className="mbar-coming-blurb">
-          Agents rewrite PyTorch + NCCL collectives as fine-grained NVLink
-          kernels (CUDA / Triton / NVSHMEM / CUDA symmetric memory), graded on
-          busbw — bus-bandwidth efficiency, never TFLOPS.
-        </p>
-        <div className="chip-row" style={{ justifyContent: "center" }}>
-          {MULTI_PROBLEMS.map((p) => (
-            <span key={p} className="link-chip link-chip-muted">
-              {p}
-            </span>
-          ))}
-        </div>
-      </div>
+    <div className="multi-strip">
+      <span className="multi-strip-pill mbar-coming-pill">coming soon</span>
+      <span className="multi-strip-title">Multi</span>
+      <span className="multi-strip-spec">
+        <strong>8×H100 SXM · NVSwitch · NVLink4</strong> — agents rewrite NCCL
+        collectives as fine-grained NVLink kernels, graded on busbw, never
+        TFLOPS
+      </span>
+      <Link href="/multi" className="multi-strip-link">
+        deck →
+      </Link>
     </div>
   )
 }
@@ -166,7 +147,7 @@ export function ModelScoreboards({
       {perf.map((chart) => (
         <ColumnChart key={chart.title} chart={chart} />
       ))}
-      <MultiComingSoon />
+      <MultiStrip />
       <ColumnChart chart={correctness} />
     </div>
   )
