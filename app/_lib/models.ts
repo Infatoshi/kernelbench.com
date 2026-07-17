@@ -96,6 +96,13 @@ export const PROBLEM_LABELS: Record<string, string> = {
   "02_online_softmax": "Online Softmax",
 }
 
+/** Mega problems held out of the ranking value (the chart's best-cell max)
+ *  because the flagship roster hasn't gone head-to-head on them yet — a model
+ *  can't outrank another on a problem the other never attempted. Cells stay
+ *  visible in boards and per-model detail. Mirrors PERF_EXCLUDE in
+ *  scripts/build_model_index.py. */
+const MEGA_RANK_EXCLUDE = new Set(["01_rl_grid_ppo"])
+
 export const FLAG_VERDICTS = new Set([
   "reward_hack",
   "contamination",
@@ -361,7 +368,14 @@ export function barsForBench(
     const model = index.models.find((m) => m.slug === row.slug)!
     const block = model.benches[bench]!
     const view: GpuBlock = gpu ? block.gpus[gpu]! : block
-    const vals = Object.values(view.cells).filter((c) => c.valid && c.score != null)
+    const vals = Object.entries(view.cells)
+      .filter(
+        ([prob, c]) =>
+          c.valid &&
+          c.score != null &&
+          !(bench === "mega" && MEGA_RANK_EXCLUDE.has(prob)),
+      )
+      .map(([, c]) => c)
     let value = 0
     if (vals.length > 0) {
       if (bench === "mega") {
@@ -411,9 +425,12 @@ export function barsForBench(
 //
 // 2) MEGA performance chart:
 //      score_m = max(speedup) over the model's valid cells on the canonical
-//                board. Each cell's score is already the run's geomean
-//                decode speedup vs the optimized-PyTorch baseline across
-//                contexts; the model's best published cell wins.
+//                board, EXCLUDING problems in MEGA_RANK_EXCLUDE (currently
+//                01_rl_grid_ppo — not head-to-head yet: flagships haven't all
+//                attempted it, so its cells can't set a rank). Each cell's
+//                score is already the run's geomean decode speedup vs the
+//                optimized-PyTorch baseline across contexts; the model's best
+//                published head-to-head cell wins.
 //    Worked example (real data): claude-fable-5's best valid mega cell is
 //    18.715 -> bar renders 18.7x.
 //
@@ -571,9 +588,14 @@ export function columnsForBench(
     let value: number | null = null
     const block = m.benches[bench]
     if (block) {
-      const vals = Object.values(block.cells).filter(
-        (c) => c.valid && c.score != null,
-      )
+      const vals = Object.entries(block.cells)
+        .filter(
+          ([prob, c]) =>
+            c.valid &&
+            c.score != null &&
+            !(bench === "mega" && MEGA_RANK_EXCLUDE.has(prob)),
+        )
+        .map(([, c]) => c)
       if (vals.length > 0) {
         value =
           bench === "mega"
