@@ -118,6 +118,14 @@ export const FLAG_VERDICTS = new Set([
 export const SITE_HIDDEN_GPUS = new Set(["rtx3090"])
 
 /**
+ * Default GPU board for multi-GPU decks (hard / mega entry pages and
+ * homepage deep-links). Homepage column charts still score the canonical
+ * RTX PRO 6000 board so variants with incomplete multi-GPU coverage (e.g.
+ * Kimi K3 256k vs 1M) stay side-by-side for fair comparison.
+ */
+export const DEFAULT_GPU = "b200"
+
+/**
  * Lab brand presentation for charts (AA-style: bar color + logo keyed by lab).
  * Logos are white-fill SVGs vendored from simple-icons into public/logos/labs.
  * Labs without a vendored mark render a letter chip instead.

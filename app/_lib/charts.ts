@@ -124,9 +124,10 @@ export type EffData = {
 export type EffByGpu = Record<string, EffData>
 
 // Candidate GPUs in display order; only those with clean token telemetry for a
-// benchmark actually appear (the loader drops empty ones). RTX 3090 is hidden
+// benchmark actually appear (the loader drops empty ones). B200 first so the
+// efficiency chart defaults to it on the homepage. RTX 3090 is hidden
 // site-wide (2026-07-17) — its entries below are dropped with it.
-export const EFF_GPU_ORDER = ["RTX PRO 6000", "H100", "B200"]
+export const EFF_GPU_ORDER = ["B200", "H100", "RTX PRO 6000"]
 const MEGA_GPU_MAP: Record<string, string> = {
   "RTX PRO 6000 Blackwell": "RTX PRO 6000",
   H100: "H100",
@@ -177,9 +178,10 @@ function shortName(modelId: string): string {
 
 // Hard GPUs shown on the efficiency chart, all with clean per-model token
 // telemetry: RTX (re-extracted), B200 + H100 (fresh resweeps with caches on
-// /ephemeral and parallel=3/budget=12000 so sessions complete). RTX 3090 is
-// unpublished. The 50k token floor below drops any stale/truncated artifacts.
-const HARD_EFF_GPUS = ["RTX PRO 6000", "H100", "B200"]
+// /ephemeral and parallel=3/budget=12000 so sessions complete). B200 first so
+// the homepage default matches the deck boards. RTX 3090 is unpublished. The
+// 50k token floor below drops any stale/truncated artifacts.
+const HARD_EFF_GPUS = ["B200", "H100", "RTX PRO 6000"]
 
 // Performance vs compute (output tokens), per GPU. Hard tokens are read from the
 // committed leaderboard cells (output_tokens baked in by inject_tokens.py) so the

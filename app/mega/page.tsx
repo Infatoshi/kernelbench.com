@@ -1,5 +1,5 @@
 import Link from "next/link"
-import { barsForBench } from "@/app/_lib/models"
+import { DEFAULT_GPU, barsForBench } from "@/app/_lib/models"
 import { loadModelIndex } from "@/app/_lib/models.server"
 import { ModelGpuBoard, type GpuView } from "@/app/_components/model-board"
 import { PageHead } from "@/app/_components/page-head"
@@ -26,14 +26,15 @@ export default async function MegaPage({
     bars: barsForBench(idx, "mega", gpu),
   })
 
+  // B200 first: default entry view (see DEFAULT_GPU).
   const views: GpuView[] = [
+    { key: "b200", label: gpuLabels.b200 ?? "B200", ...mk("b200") },
     {
       key: "rtxpro6000",
       label: gpuLabels.rtxpro6000 ?? "RTX PRO 6000 Blackwell",
       ...mk(),
     },
     { key: "h100", label: gpuLabels.h100 ?? "H100", ...mk("h100") },
-    { key: "b200", label: gpuLabels.b200 ?? "B200", ...mk("b200") },
   ]
 
   return (
@@ -81,7 +82,7 @@ export default async function MegaPage({
           </>
         }
       />
-      <ModelGpuBoard views={views} initialGpu={gpu} />
+      <ModelGpuBoard views={views} initialGpu={gpu ?? DEFAULT_GPU} />
     </div>
   )
 }
