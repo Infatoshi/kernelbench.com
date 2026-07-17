@@ -43,8 +43,8 @@ export default async function HardBlogPage() {
         </h1>
         <p className="text-sm text-[var(--color-fg)] leading-relaxed">
           Background notes for the Hard leaderboard: problem ceilings, known
-          caveats, the FP8 constraint rerun, and what changed from v3. The
-          operational leaderboard lives on <Link href="/hard">/hard</Link>.
+          caveats, and the FP8 constraint rerun. The operational leaderboard
+          lives on <Link href="/hard">/hard</Link>.
         </p>
       </section>
 
@@ -174,14 +174,13 @@ export default async function HardBlogPage() {
 
       <section>
         <h2 className="text-xl font-semibold text-[var(--color-fg-bright)] mb-3">
-          what changed from v3
+          design choices
         </h2>
         <ul className="space-y-2 text-sm leading-relaxed list-none pl-0 max-w-3xl">
-          <Bullet>One GPU instead of three: RTX PRO 6000 Blackwell.</Bullet>
-          <Bullet>A smaller hand-designed problem deck instead of 43-58 problems per GPU.</Bullet>
+          <Bullet>One primary GPU deck (RTX PRO 6000 Blackwell), plus H100/B200 boards with the same problems.</Bullet>
+          <Bullet>A small hand-designed problem deck, not dozens of ops per GPU.</Bullet>
           <Bullet>Real coding-agent CLIs as the harness: claude code, codex, opencode, droid, kimi, cursor, gemini-cli, grok build.</Bullet>
-          <Bullet>Wall-clock budgets, not turn limits.</Bullet>
-          <Bullet>peak_fraction grounded in physical hardware ceilings instead of raw speedup ratios.</Bullet>
+          <Bullet>Unlimited agent sessions; peak_fraction grounded in physical hardware ceilings.</Bullet>
           <Bullet>Per-cell annotations with verdict, quotes from solution.py, and implication notes.</Bullet>
         </ul>
       </section>

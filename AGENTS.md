@@ -51,7 +51,6 @@ unless you're specifically working the archive.
 ```
 app/ public/              the website (Next.js 16, Tailwind v4)
   app/_lib/data.ts             reads benchmark data at build time
-  public/data/v3/results.csv   /v3 reads this
 benchmarks/hard/           KernelBench-Hard eval — the per-op deck
   results/leaderboard.json     /hard reads this (v2 site-shaped data)
   results/annotations/*.yaml   per-cell reward-hack / clean verdicts
@@ -61,7 +60,7 @@ benchmarks/hard/           KernelBench-Hard eval — the per-op deck
 benchmarks/mega/           KernelBench-Mega eval — megakernel deck (single problems/; reuses hard's machinery)
 benchmarks/cuda/           KernelBench-CUDA eval — CUDA-only deck (Triton/DSL fail); /cuda
 benchmarks/multi/          KernelBench-Multi eval — 8×H100 NVLink (WIP); /multi
-benchmarks/v3/             KernelBench-v3 eval — archived (keeps its own AGENTS.md)
+benchmarks/v3/             offline eval archive only (not on the website; keeps its own AGENTS.md)
 environments/              Prime Intellect `verifiers` mirrors (kernel_hard / kernel_mega / kernel_v3)
 media/                     tracked chart generators (kbh_theme.py + make_*.py + generate_dark_plots.py)
 runs/                      gitignored HF staging (kb publish fills it, pushes to HF)

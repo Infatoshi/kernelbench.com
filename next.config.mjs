@@ -12,6 +12,18 @@ const nextConfig = {
     // 16.0.10; revisit on upgrade.)
     turbopackFileSystemCacheForDev: true,
   },
+  // Old KernelBench-v3 site paths — product is retired from the website.
+  async redirects() {
+    return [
+      { source: "/v3", destination: "/", permanent: true },
+      { source: "/v3/:path*", destination: "/", permanent: true },
+      { source: "/blog/v3", destination: "/blog", permanent: true },
+      { source: "/blog/v3/:path*", destination: "/blog", permanent: true },
+      { source: "/kernelbench-v3", destination: "/", permanent: true },
+      { source: "/kernelbench-v3/:path*", destination: "/", permanent: true },
+      { source: "/data/v3/:path*", destination: "/", permanent: true },
+    ]
+  },
   // data.ts reads leaderboards/annotations with dynamic fs paths, so the file
   // tracer can't narrow the pattern and matches the whole repo — including the
   // ~186G gitignored benchmarks/*/outputs run archives that exist only on
