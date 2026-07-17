@@ -1,0 +1,1050 @@
+"""Kimi-Linear W4A16 hybrid decode -- single-launch fused megakernel.
+
+The whole per-token forward (3x KDA + 1x MLA attention, 4x MoE, RMSNorms,
+residual adds, KDA recurrent-state update, MLA latent-cache append) is fused
+into ONE cooperative CUDA kernel launch. int4 dequant is fused into every GEMV:
+packed nibbles are streamed once and dequantized in registers (group-128
+asymmetric, exactly the reference format), never materialized to bf16.
+
+Structure per layer: GEMV phases write k-partial slots (non-atomic), tiny
+reduce phases combine slots into bf16-rounded activations (matching reference
+rounding points), state/attention phases do the KDA recurrence and the
+flash-decoding MLA attention with kv_b absorbed into the latent space (no
+materialized [L, H, D] k/v -- the latent cache is read twice, not expanded).
+Grid-wide sequencing uses cooperative grid.sync().
+"""
+from __future__ import annotations
+
+import math
+import os
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from dataclasses import dataclass, field
+
+OP_TYPE = "kimi_linear_w4a16_decode"
+HARDWARE_REQUIRED = ["RTX_PRO_6000"]
+EPS = 1.0e-6
+GROUP_SIZE = 128
+
+
+@dataclass(frozen=True)
+class Config:
+    hidden: int = 2304
+    kda_heads: int = 32
+    kda_head_dim: int = 128
+    short_conv: int = 4
+    mla_heads: int = 32
+    kv_lora: int = 512
+    qk_nope: int = 128
+    qk_rope: int = 64
+    v_head: int = 128
+    rope_theta: float = 10000.0
+    n_experts: int = 64
+    n_active: int = 8
+    n_shared: int = 1
+    moe_inter: int = 1024
+    routed_scaling: float = 2.446
+    group: int = 128
+    pattern: tuple = ("K", "K", "K", "M")
+    dtype: torch.dtype = field(default=torch.bfloat16)
+
+
+def build_config(shape: dict) -> Config:
+    return Config(n_experts=int(shape.get("n_experts", 64)))
+
+
+# --------------------------------------------------------------------------- #
+# module classes mirroring reference.py exactly (same state_dict names)
+# --------------------------------------------------------------------------- #
+class QuantLinear(nn.Module):
+    def __init__(self, in_f: int, out_f: int, group: int = GROUP_SIZE):
+        super().__init__()
+        self.in_f, self.out_f, self.group = in_f, out_f, group
+        ng = in_f // group
+        self.register_buffer("w_q", torch.zeros(in_f // 2, out_f, dtype=torch.uint8))
+        self.register_buffer("scales", torch.zeros(ng, out_f, dtype=torch.bfloat16))
+        self.register_buffer("zeros", torch.zeros(ng, out_f, dtype=torch.bfloat16))
+
+
+class QuantExperts(nn.Module):
+    def __init__(self, n: int, in_f: int, out_f: int, group: int = GROUP_SIZE):
+        super().__init__()
+        self.n, self.in_f, self.out_f, self.group = n, in_f, out_f, group
+        ng = in_f // group
+        self.register_buffer("w_q", torch.zeros(n, in_f // 2, out_f, dtype=torch.uint8))
+        self.register_buffer("scales", torch.zeros(n, ng, out_f, dtype=torch.bfloat16))
+        self.register_buffer("zeros", torch.zeros(n, ng, out_f, dtype=torch.bfloat16))
+
+
+class KDA(nn.Module):
+    def __init__(self, cfg: Config):
+        super().__init__()
+        self.cfg = cfg
+        H, Dk, d = cfg.kda_heads, cfg.kda_head_dim, cfg.hidden
+        self.q_proj = QuantLinear(d, H * Dk, cfg.group)
+        self.k_proj = QuantLinear(d, H * Dk, cfg.group)
+        self.v_proj = QuantLinear(d, H * Dk, cfg.group)
+        self.g_proj = QuantLinear(d, H * Dk, cfg.group)
+        self.beta_proj = nn.Linear(d, H, bias=False, dtype=cfg.dtype)
+        self.conv_w = nn.Parameter(torch.empty(3, H * Dk, cfg.short_conv, dtype=cfg.dtype))
+        self.o_proj = QuantLinear(H * Dk, d, cfg.group)
+        self.scale = Dk ** -0.5
+
+
+class MLA(nn.Module):
+    def __init__(self, cfg: Config):
+        super().__init__()
+        self.cfg = cfg
+        H, d = cfg.mla_heads, cfg.hidden
+        self.q_proj = QuantLinear(d, H * (cfg.qk_nope + cfg.qk_rope), cfg.group)
+        self.kv_a = QuantLinear(d, cfg.kv_lora + cfg.qk_rope, cfg.group)
+        self.kv_b = QuantLinear(cfg.kv_lora, H * (cfg.qk_nope + cfg.v_head), cfg.group)
+        self.o_proj = QuantLinear(H * cfg.v_head, d, cfg.group)
+        self.scale = (cfg.qk_nope + cfg.qk_rope) ** -0.5
+
+
+class MoE(nn.Module):
+    def __init__(self, cfg: Config):
+        super().__init__()
+        self.cfg = cfg
+        d, m, E = cfg.hidden, cfg.moe_inter, cfg.n_experts
+        self.router = nn.Linear(d, E, bias=False, dtype=cfg.dtype)
+        self.gate = QuantExperts(E, d, m, cfg.group)
+        self.up = QuantExperts(E, d, m, cfg.group)
+        self.down = QuantExperts(E, m, d, cfg.group)
+        self.s_gate = QuantExperts(cfg.n_shared, d, m, cfg.group)
+        self.s_up = QuantExperts(cfg.n_shared, d, m, cfg.group)
+        self.s_down = QuantExperts(cfg.n_shared, m, d, cfg.group)
+
+
+class Block(nn.Module):
+    def __init__(self, cfg: Config, kind: str):
+        super().__init__()
+        self.kind = kind
+        self.attn_norm = nn.Parameter(torch.ones(cfg.hidden, dtype=cfg.dtype))
+        self.moe_norm = nn.Parameter(torch.ones(cfg.hidden, dtype=cfg.dtype))
+        self.attn = KDA(cfg) if kind == "K" else MLA(cfg)
+        self.moe = MoE(cfg)
+
+
+# --------------------------------------------------------------------------- #
+# CUDA megakernel
+# --------------------------------------------------------------------------- #
+CUDA_SRC = r"""
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <cuda_bf16.h>
+#include <cooperative_groups.h>
+#include <c10/cuda/CUDAStream.h>
+#include <c10/cuda/CUDAException.h>
+#include <c10/cuda/CUDAGuard.h>
+
+namespace cg = cooperative_groups;
+
+#define FULLMASK 0xffffffffu
+using bf16 = __nv_bfloat16;
+
+constexpr int D = 2304;          // hidden
+constexpr int C = 4096;          // KDA channels (32*128), o_proj in
+constexpr int H = 32;            // heads
+constexpr int DK = 128;          // head dim
+constexpr int JKV = 512;         // kv lora rank
+constexpr int MOEM = 1024;       // moe intermediate
+constexpr int EPS_F = 0;         // placeholder
+constexpr float EPSF = 1e-6f;
+constexpr float KDA_SCALE = 0.08838834764831845f;   // 128^-0.5
+constexpr float MLA_SCALE = 0.07216878364870322f;   // 192^-0.5
+constexpr float RSCALE = 2.446f;
+
+// ---- flat param slots (must match python builder) ----
+// KDA layer l base = 32*l: +0 norm1, +1 norm2, +2..16 (wq,s,z)*5 [q k v g o],
+// +17 beta_w, +18 conv_w, +19 S, +20 cq, +21 ck, +22 cv
+// MLA base 96: +0 norm1, +1 norm2, +2..13 (wq,s,z)*4 [q kva kvb o], +14 ckv, +15 krope
+// MoE layer l base = 128 + 24*l: +0 router, +1..3 gate, +4..6 up, +7..9 down,
+//                                +10..12 sg, +13..15 su, +16..18 sd
+// workspace base 224:
+#define W_X        (224+0)
+#define W_SLOTQKVG (224+1)
+#define W_BQ       (224+2)
+#define W_BK       (224+3)
+#define W_BV       (224+4)
+#define W_DEC      (224+5)
+#define W_BETA     (224+6)
+#define W_OBUF     (224+7)
+#define W_SLOTO    (224+8)
+#define W_X1       (224+9)
+#define W_LOGITS   (224+10)
+#define W_SLOTGU   (224+11)
+#define W_HH       (224+12)
+#define W_SLOTD    (224+13)
+#define W_TOPW     (224+14)
+#define W_MQBUF    (224+15)
+#define W_MKVBUF   (224+16)
+#define W_SLOTMLAQ (224+17)
+#define W_SLOTKVA  (224+18)
+#define W_QLAT     (224+19)
+#define W_SCORES   (224+20)
+#define W_SSUM     (224+21)
+#define W_PVP      (224+22)
+#define W_HIN      (224+23)
+#define W_TAP      (224+24)
+
+__device__ __forceinline__ unsigned long long gt() {
+  unsigned long long t;
+  asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
+  return t;
+}
+#define TAP(i) do { if (threadIdx.x == 0) ((unsigned long long*)P.p[W_TAP])[blockIdx.x * 64 + (i)] = gt(); } while (0)
+
+struct Params {
+  long long p[384];
+  int L;      // tokens already in cache before this step
+  int scap;   // scores buffer row stride
+};
+
+#define BP(i)  ((bf16*)P.p[i])
+#define CBP(i) ((const bf16*)P.p[i])
+#define FP(i)  ((float*)P.p[i])
+#define U8(i)  ((const uint8_t*)P.p[i])
+
+__device__ __forceinline__ float bf2f(bf16 v) { return __bfloat162float(v); }
+__device__ __forceinline__ float bfr(float v) { return __bfloat162float(__float2bfloat16(v)); }
+__device__ __forceinline__ float siluf(float x) { return x / (1.f + __expf(-x)); }
+
+__device__ __forceinline__ float warp_sum(float v) {
+  #pragma unroll
+  for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(FULLMASK, v, o);
+  return v;
+}
+
+__device__ __forceinline__ void ld_bf16x16(const bf16* p, float* o) {
+  uint4 a = __ldg((const uint4*)p);
+  uint4 b = __ldg((const uint4*)(p + 8));
+  __nv_bfloat162 h;
+  float2 f;
+  h = *(__nv_bfloat162*)&a.x; f = __bfloat1622float2(h); o[0] = f.x; o[1] = f.y;
+  h = *(__nv_bfloat162*)&a.y; f = __bfloat1622float2(h); o[2] = f.x; o[3] = f.y;
+  h = *(__nv_bfloat162*)&a.z; f = __bfloat1622float2(h); o[4] = f.x; o[5] = f.y;
+  h = *(__nv_bfloat162*)&a.w; f = __bfloat1622float2(h); o[6] = f.x; o[7] = f.y;
+  h = *(__nv_bfloat162*)&b.x; f = __bfloat1622float2(h); o[8] = f.x; o[9] = f.y;
+  h = *(__nv_bfloat162*)&b.y; f = __bfloat1622float2(h); o[10] = f.x; o[11] = f.y;
+  h = *(__nv_bfloat162*)&b.z; f = __bfloat1622float2(h); o[12] = f.x; o[13] = f.y;
+  h = *(__nv_bfloat162*)&b.w; f = __bfloat1622float2(h); o[14] = f.x; o[15] = f.y;
+}
+
+// rmsnorm(x)*w into shared xs (values rounded to bf16 exactly like reference),
+// xs staged as fp32. xs must have D floats. red: 32 floats scratch.
+__device__ void stage_rms(const bf16* x, const bf16* w, float* xs, float* red) {
+  const int tid = threadIdx.x;
+  const int lane = tid & 31, wr = tid >> 5;
+  float ss = 0.f;
+  #pragma unroll 1
+  for (int k = tid; k < D; k += blockDim.x) {
+    float xv = bf2f(x[k]);
+    xs[k] = xv;
+    ss += xv * xv;
+  }
+  ss = warp_sum(ss);
+  if (lane == 0) red[wr] = ss;
+  __syncthreads();
+  if (wr == 0) {
+    float t = (lane < (int)(blockDim.x >> 5)) ? red[lane] : 0.f;
+    t = warp_sum(t);
+    if (lane == 0) red[0] = t;
+  }
+  __syncthreads();
+  float r = rsqrtf(red[0] / (float)D + EPSF);
+  #pragma unroll 1
+  for (int k = tid; k < D; k += blockDim.x) xs[k] = bfr(xs[k] * r * bf2f(w[k]));
+  __syncthreads();
+}
+
+// fused int4 dequant GEMV partial: out[n] += sum over k in groups [g0, g0+2)
+// xs: fp32 activations (shared or global). slot: fp32 partial target (+ n0 offset).
+// lane covers 16 consecutive outputs n = n0 + lane*16.
+__device__ __forceinline__ void gemv4m(const uint8_t* __restrict__ wq,
+                                       const bf16* __restrict__ sc,
+                                       const bf16* __restrict__ zz,
+                                       const float* __restrict__ xs,
+                                       float* __restrict__ slot,
+                                       int N, int n, int g0) {
+  if (n >= N) return;
+  float acc[16];
+  #pragma unroll
+  for (int j = 0; j < 16; ++j) acc[j] = 0.f;
+  #pragma unroll
+  for (int g = g0; g < g0 + 2; ++g) {
+    float sv[16], zv[16];
+    ld_bf16x16(sc + (size_t)g * N + n, sv);
+    ld_bf16x16(zz + (size_t)g * N + n, zv);
+    int kb0 = g << 6;
+    const uint8_t* wp = wq + (size_t)kb0 * N + n;
+    #pragma unroll 8
+    for (int r = 0; r < 64; ++r) {
+      uint4 wb = __ldg((const uint4*)(wp + (size_t)r * N));
+      float x0 = xs[2 * (kb0 + r)], x1 = xs[2 * (kb0 + r) + 1];
+      const unsigned char* pb = (const unsigned char*)&wb;
+      #pragma unroll
+      for (int j = 0; j < 16; ++j) {
+        float lo = (float)(int)(pb[j] & 15);
+        float hi = (float)(int)(pb[j] >> 4);
+        acc[j] += (lo - zv[j]) * sv[j] * x0 + (hi - zv[j]) * sv[j] * x1;
+      }
+    }
+  }
+  float4 v;
+  v = make_float4(acc[0], acc[1], acc[2], acc[3]);   *(float4*)(slot + n) = v;
+  v = make_float4(acc[4], acc[5], acc[6], acc[7]);   *(float4*)(slot + n + 4) = v;
+  v = make_float4(acc[8], acc[9], acc[10], acc[11]); *(float4*)(slot + n + 8) = v;
+  v = make_float4(acc[12], acc[13], acc[14], acc[15]);*(float4*)(slot + n + 12) = v;
+}
+
+// plain bf16 GEMV row (warp per output): returns fp32 dot over K elems
+__device__ __forceinline__ float gemv_bf16_row(const bf16* wrow, const float* xs, int K) {
+  const int lane = threadIdx.x & 31;
+  float acc = 0.f;
+  #pragma unroll 2
+  for (int k = lane * 8; k < K; k += 32 * 8) {
+    uint4 v = __ldg((const uint4*)(wrow + k));
+    const __nv_bfloat162* h2 = (const __nv_bfloat162*)&v;
+    #pragma unroll
+    for (int j = 0; j < 4; ++j) {
+      float2 f = __bfloat1622float2(h2[j]);
+      acc += f.x * xs[k + 2 * j] + f.y * xs[k + 2 * j + 1];
+    }
+  }
+  return warp_sum(acc);
+}
+
+// router top-8 (each warp computes redundantly from 64 logits)
+__device__ __forceinline__ void top8(const float* lg, int* idx8, float* w8) {
+  const int lane = threadIdx.x & 31;
+  float e0 = lg[lane], e1 = lg[lane + 32];
+  float mx = fmaxf(e0, e1);
+  #pragma unroll
+  for (int o = 16; o; o >>= 1) mx = fmaxf(mx, __shfl_xor_sync(FULLMASK, mx, o));
+  e0 = __expf(e0 - mx); e1 = __expf(e1 - mx);
+  float S = warp_sum(e0 + e1);
+  int i0 = lane, i1 = lane + 32;
+  #pragma unroll 1
+  for (int k = 0; k < 8; ++k) {
+    float cv = fmaxf(e0, e1);
+    int cand = (e0 >= e1) ? i0 : i1;
+    #pragma unroll
+    for (int o = 16; o; o >>= 1) {
+      float ov = __shfl_xor_sync(FULLMASK, cv, o);
+      int oc = __shfl_xor_sync(FULLMASK, cand, o);
+      if (ov > cv) { cv = ov; cand = oc; }
+    }
+    idx8[k] = cand;
+    w8[k] = cv / S;
+    if (cand == i0) e0 = -1.f;
+    if (cand == i1) e1 = -1.f;
+  }
+  float s8 = w8[0] + w8[1] + w8[2] + w8[3] + w8[4] + w8[5] + w8[6] + w8[7];
+  float inv = RSCALE / (s8 + 1e-9f);
+  #pragma unroll
+  for (int k = 0; k < 8; ++k) w8[k] *= inv;
+}
+
+__device__ __forceinline__ void rope_pair(float e, float o, float ang, float& r0, float& r1) {
+  float c, s;
+  sincosf(ang, &s, &c);
+  r0 = e * c - o * s;
+  r1 = o * c + e * s;
+}
+__device__ __forceinline__ float inv_freq(int pi) {
+  return expf(-9.210340371976184f * (float)pi * (1.f / 32.f));   // 10000^(-2i/64)
+}
+
+__global__ void __launch_bounds__(512, 1) mega(Params P) {
+  extern __shared__ float sm[];
+  float* xs = sm;              // up to 4096 floats
+  float* red = sm + 4096;      // 32 floats scratch
+  float* swz = sm;             // scores phase staging: overlaps xs (different phases)
+  cg::grid_group ggr = cg::this_grid();
+  const int tid = threadIdx.x;
+  const int lane = tid & 31, wr = tid >> 5;
+  const int gw = blockIdx.x * (blockDim.x >> 5) + wr;
+  const int GW = gridDim.x * (blockDim.x >> 5);
+  const int gtid = blockIdx.x * blockDim.x + tid;
+  const int GT = gridDim.x * blockDim.x;
+  const int Lp = P.L + 1;      // tokens after append
+  TAP(0);
+
+  // ---------------- P0: init ----------------
+  {
+    const bf16* hin = (const bf16*)P.p[W_HIN];
+    bf16* x = BP(W_X);
+    for (int i = gtid; i < D; i += GT) x[i] = hin[i];
+    float* obuf = FP(W_OBUF);
+    for (int i = gtid; i < C; i += GT) obuf[i] = 0.f;   // only needed before MLA; harmless
+  }
+  ggr.sync(); TAP(1);
+
+  for (int layer = 0; layer < 4; ++layer) {
+    if (layer < 3) {
+      // ================= KDA attention =================
+      const int kb = 32 * layer;
+      // ---- P1: q/k/v/g gemv partials + beta ----
+      stage_rms(BP(W_X), CBP(kb + 0), xs, red);
+      for (int u = gw; u < 320; u += GW) {
+        if (u < 288) {
+          int proj = u / 72, r = u % 72;
+          int nc = r % 8, kc = r / 8;
+          gemv4m(U8(kb + 2 + 3 * proj), CBP(kb + 3 + 3 * proj), CBP(kb + 4 + 3 * proj),
+                 xs, FP(W_SLOTQKVG) + (size_t)(proj * 9 + kc) * C,
+                 C, nc * 512 + lane * 16, kc * 2);
+        } else {
+          int j = u - 288;
+          float v = gemv_bf16_row(CBP(kb + 17) + (size_t)j * D, xs, D);
+          if (lane == 0) FP(W_BETA)[j] = v;
+        }
+      }
+      ggr.sync(); TAP(2);
+      // ---- P2: reduce + conv + windows + decays ----
+      {
+        float* slot = FP(W_SLOTQKVG);
+        for (int t = gtid; t < 4 * C + 32; t += GT) {
+          if (t < 4 * C) {
+            int w = t >> 12, ch = t & (C - 1);
+            if (w < 3) {
+              float csum = 0.f;
+              #pragma unroll
+              for (int kc = 0; kc < 9; ++kc) csum += slot[(w * 9 + kc) * C + ch];
+              float raw = bfr(csum);
+              bf16* win = BP(kb + 20 + w);
+              const bf16* cw = CBP(kb + 18) + (size_t)(w * C + ch) * 4;
+              float w0 = bf2f(cw[0]), w1 = bf2f(cw[1]), w2 = bf2f(cw[2]), w3 = bf2f(cw[3]);
+              float p0 = bf2f(win[ch]), p1 = bf2f(win[C + ch]), p2 = bf2f(win[2 * C + ch]);
+              float outp = siluf(p0 * w0 + p1 * w1 + p2 * w2 + raw * w3);
+              win[ch] = win[C + ch]; win[C + ch] = win[2 * C + ch];
+              win[2 * C + ch] = __float2bfloat16(raw);
+              float rr = bfr(outp);
+              if (w == 0) FP(W_BQ)[ch] = rr * KDA_SCALE;
+              else if (w == 1) FP(W_BK)[ch] = rr;
+              else FP(W_BV)[ch] = rr;
+            } else {
+              float csum = 0.f;
+              #pragma unroll
+              for (int kc = 0; kc < 9; ++kc) csum += slot[(3 * 9 + kc) * C + ch];
+              float graw = bfr(csum);
+              float sp = graw > 20.f ? graw : log1pf(expf(graw));
+              FP(W_DEC)[ch] = expf(-sp);
+            }
+          } else {
+            int j = t - 4 * C;
+            FP(W_BETA)[j] = 1.f / (1.f + expf(-FP(W_BETA)[j]));
+          }
+        }
+      }
+      ggr.sync(); TAP(3);
+      // ---- P3: recurrent state update + o ----
+      if (gw < 128) {
+        const int h = gw >> 2, dv = ((gw & 3) << 5) + lane;
+        float* S = FP(kb + 19) + (size_t)h * 128 * 128 + dv;
+        const float* kc_ = FP(W_BK) + h * 128;
+        const float* vc_ = FP(W_BV) + h * 128;
+        const float* qc_ = FP(W_BQ) + h * 128;
+        const float* dec = FP(W_DEC) + h * 128;
+        const float bh = FP(W_BETA)[h];
+        const float vd = vc_[dv];
+        float pred = 0.f;
+        #pragma unroll 4
+        for (int i = 0; i < 128; ++i) pred += S[(size_t)i * 128] * kc_[i];
+        const float err = vd - pred;
+        float oacc = 0.f;
+        #pragma unroll 4
+        for (int i = 0; i < 128; ++i) {
+          float s = S[(size_t)i * 128];
+          float sn = s * dec[i] + bh * kc_[i] * err;
+          S[(size_t)i * 128] = sn;
+          oacc += qc_[i] * sn;
+        }
+        FP(W_OBUF)[h * 128 + dv] = bfr(oacc);
+      }
+      ggr.sync(); TAP(4);
+      // ---- P4: o_proj partials ----
+      for (int k = tid; k < C; k += blockDim.x) xs[k] = bfr(FP(W_OBUF)[k]);
+      __syncthreads();
+      for (int u = gw; u < 80; u += GW) {
+        int nc = u % 5, kc = u / 5;
+        gemv4m(U8(kb + 14), CBP(kb + 15), CBP(kb + 16), xs,
+               FP(W_SLOTO) + (size_t)kc * D, D, nc * 512 + lane * 16, kc * 2);
+      }
+      ggr.sync(); TAP(5);
+      // ---- P5: x1 = x + attn ----
+      for (int n = gtid; n < D; n += GT) {
+        float ssum = 0.f;
+        #pragma unroll
+        for (int kc = 0; kc < 16; ++kc) ssum += FP(W_SLOTO)[(size_t)kc * D + n];
+        BP(W_X1)[n] = __float2bfloat16(bf2f(BP(W_X)[n]) + bfr(ssum));
+      }
+      ggr.sync(); TAP(6);
+    } else {
+      // ================= MLA attention =================
+      const int mb = 96;
+      // ---- P1': q + kva gemv ----
+      stage_rms(BP(W_X), CBP(mb + 0), xs, red);
+      for (int u = gw; u < 126; u += GW) {
+        if (u < 108) {
+          int nc = u % 12, kc = u / 12;
+          gemv4m(U8(mb + 2), CBP(mb + 3), CBP(mb + 4), xs,
+                 FP(W_SLOTMLAQ) + (size_t)kc * 6144, 6144, nc * 512 + lane * 16, kc * 2);
+        } else {
+          int u2 = u - 108, nc = u2 % 2, kc = u2 / 2;
+          gemv4m(U8(mb + 5), CBP(mb + 6), CBP(mb + 7), xs,
+                 FP(W_SLOTKVA) + (size_t)kc * 576, 576, nc * 512 + lane * 16, kc * 2);
+        }
+      }
+      ggr.sync(); TAP(7);
+      // ---- P2': reduce, write latent cache row ----
+      for (int t = gtid; t < 6144; t += GT) {
+        float s = 0.f;
+        #pragma unroll
+        for (int kc = 0; kc < 9; ++kc) s += FP(W_SLOTMLAQ)[(size_t)kc * 6144 + t];
+        FP(W_MQBUF)[t] = bfr(s);
+      }
+      for (int t = gtid; t < 576; t += GT) {
+        float s = 0.f;
+        #pragma unroll
+        for (int kc = 0; kc < 9; ++kc) s += FP(W_SLOTKVA)[(size_t)kc * 576 + t];
+        float v = bfr(s);
+        FP(W_MKVBUF)[t] = v;
+        if (t < 512) BP(mb + 14)[(size_t)P.L * 512 + t] = __float2bfloat16(v);
+      }
+      ggr.sync(); TAP(8);
+      // ---- P3': q-side absorb (kv_b k-nope) + rope ----
+      for (int u = gw; u < 513; u += GW) {
+        if (u < 512) {
+          int h = u >> 4, rpc = u & 15;
+          int rp0 = rpc << 4;
+          int l8 = lane & 7, l4 = lane >> 3;
+          int d0 = l8 << 4;
+          int g = rp0 >> 6;
+          float sv[16], zv[16], qv[16];
+          ld_bf16x16(CBP(mb + 9) + (size_t)g * 8192 + h * 256 + d0, sv);
+          ld_bf16x16(CBP(mb + 10) + (size_t)g * 8192 + h * 256 + d0, zv);
+          #pragma unroll
+          for (int j = 0; j < 16; ++j) qv[j] = FP(W_MQBUF)[h * 192 + d0 + j];
+          const uint8_t* wq = U8(mb + 8) + h * 256 + d0;
+          #pragma unroll 2
+          for (int pass = 0; pass < 4; ++pass) {
+            int rp = rp0 + l4 + pass * 4;
+            uint4 wb = __ldg((const uint4*)(wq + (size_t)rp * 8192));
+            const unsigned char* pb = (const unsigned char*)&wb;
+            float al = 0.f, ah = 0.f;
+            #pragma unroll
+            for (int j = 0; j < 16; ++j) {
+              float lo = (float)(int)(pb[j] & 15);
+              float hi = (float)(int)(pb[j] >> 4);
+              al += (lo - zv[j]) * sv[j] * qv[j];
+              ah += (hi - zv[j]) * sv[j] * qv[j];
+            }
+            #pragma unroll
+            for (int o = 1; o < 8; o <<= 1) {
+              al += __shfl_xor_sync(FULLMASK, al, o);
+              ah += __shfl_xor_sync(FULLMASK, ah, o);
+            }
+            if (l8 == 0) {
+              FP(W_QLAT)[h * 576 + 2 * rp] = al * MLA_SCALE;
+              FP(W_QLAT)[h * 576 + 2 * rp + 1] = ah * MLA_SCALE;
+            }
+          }
+          if (rpc == 0) {
+            // rope q_rope part -> qlat[h, 512:576]
+            int pi = lane;
+            float e = FP(W_MQBUF)[h * 192 + 128 + 2 * pi];
+            float o = FP(W_MQBUF)[h * 192 + 128 + 2 * pi + 1];
+            float r0, r1;
+            rope_pair(e, o, (float)P.L * inv_freq(pi), r0, r1);
+            FP(W_QLAT)[h * 576 + 512 + 2 * pi] = bfr(r0) * MLA_SCALE;
+            FP(W_QLAT)[h * 576 + 512 + 2 * pi + 1] = bfr(r1) * MLA_SCALE;
+          }
+        } else {
+          // k_rope row -> cache
+          int pi = lane;
+          float e = FP(W_MKVBUF)[512 + 2 * pi];
+          float o = FP(W_MKVBUF)[512 + 2 * pi + 1];
+          float r0, r1;
+          rope_pair(e, o, (float)P.L * inv_freq(pi), r0, r1);
+          BP(mb + 15)[(size_t)P.L * 64 + 2 * pi] = __float2bfloat16(r0);
+          BP(mb + 15)[(size_t)P.L * 64 + 2 * pi + 1] = __float2bfloat16(r1);
+        }
+      }
+      ggr.sync(); TAP(9);
+      // ---- P4': scores ----
+      {
+        // stage qlat -> swz [h][j][lane]
+        for (int idx = tid; idx < 32 * 18 * 32; idx += blockDim.x) {
+          int h = idx / (18 * 32);
+          int rem = idx % (18 * 32);
+          int j = rem >> 5, l = rem & 31;
+          int r = (j < 16) ? (l * 16 + j) : (512 + l * 2 + (j - 16));
+          swz[idx] = FP(W_QLAT)[h * 576 + r];
+        }
+        __syncthreads();
+        int TC = (Lp + 383) / 384;
+        if (TC < 8) TC = 8;
+        if (TC > 48) TC = 48;
+        int units = (Lp + TC - 1) / TC;
+        for (int u = blockIdx.x; u < units; u += gridDim.x) {
+          int t0 = u * TC, t1 = min(t0 + TC, Lp);
+          for (int t = t0; t < t1; ++t) {
+            uint4 c0 = __ldg((const uint4*)(BP(mb + 14) + (size_t)t * 512 + lane * 16));
+            uint4 c1 = __ldg((const uint4*)(BP(mb + 14) + (size_t)t * 512 + lane * 16 + 8));
+            uint kr = __ldg((const uint*)(BP(mb + 15) + (size_t)t * 64 + lane * 2));
+            float cf[16];
+            {
+              const __nv_bfloat162* h2 = (const __nv_bfloat162*)&c0;
+              #pragma unroll
+              for (int j = 0; j < 4; ++j) { float2 f = __bfloat1622float2(h2[j]); cf[2 * j] = f.x; cf[2 * j + 1] = f.y; }
+              const __nv_bfloat162* h3 = (const __nv_bfloat162*)&c1;
+              #pragma unroll
+              for (int j = 0; j < 4; ++j) { float2 f = __bfloat1622float2(h3[j]); cf[8 + 2 * j] = f.x; cf[8 + 2 * j + 1] = f.y; }
+            }
+            __nv_bfloat162 k2 = *(__nv_bfloat162*)&kr;
+            float2 kf = __bfloat1622float2(k2);
+            int hh = wr;
+            const float* sw0 = swz + hh * 18 * 32 + lane;
+            float acc = 0.f;
+            #pragma unroll
+            for (int j = 0; j < 16; ++j) acc += sw0[j * 32] * cf[j];
+            acc += sw0[16 * 32] * kf.x + sw0[17 * 32] * kf.y;
+            acc = warp_sum(acc);
+            if (lane == 0) FP(W_SCORES)[(size_t)hh * P.scap + t] = acc;
+          }
+        }
+      }
+      ggr.sync(); TAP(10);
+      // ---- P5': softmax (unnormalized; scale factor kept) ----
+      if (gw < 32) {
+        int h = gw;
+        float* sc = FP(W_SCORES) + (size_t)h * P.scap;
+        float mx = -1e30f;
+        #pragma unroll 2
+        for (int l = lane; l < Lp; l += 32) mx = fmaxf(mx, sc[l]);
+        #pragma unroll
+        for (int o = 16; o; o >>= 1) mx = fmaxf(mx, __shfl_xor_sync(FULLMASK, mx, o));
+        float es = 0.f;
+        #pragma unroll 2
+        for (int l = lane; l < Lp; l += 32) { float e = __expf(sc[l] - mx); sc[l] = e; es += e; }
+        es = warp_sum(es);
+        if (lane == 0) FP(W_SSUM)[h] = es;
+      }
+      ggr.sync(); TAP(11);
+      // ---- P6': p @ c partials (lane = head, r-chunk 16, l-chunk) ----
+      {
+        int NLCH = 128;
+        int chunk = (Lp + NLCH - 1) / NLCH;
+        int nlc = (Lp + chunk - 1) / chunk;
+        int units = 32 * nlc;
+        for (int u = gw; u < units; u += GW) {
+          int rt = u & 3, rc = (u >> 2) & 7, lc = u >> 5;
+          int rr = rc * 64 + rt * 16;
+          int l0 = lc * chunk, l1 = min(l0 + chunk, Lp);
+          if (l0 >= l1) continue;
+          const bf16* ck = BP(mb + 14) + rr;
+          const float* prow = FP(W_SCORES) + (size_t)lane * P.scap;
+          float ns = 1.f / FP(W_SSUM)[lane];
+          float acc[16];
+          #pragma unroll
+          for (int j = 0; j < 16; ++j) acc[j] = 0.f;
+          #pragma unroll 2
+          for (int t = l0; t < l1; ++t) {
+            uint4 a = __ldg((const uint4*)(ck + (size_t)t * 512));
+            uint4 b = __ldg((const uint4*)(ck + (size_t)t * 512 + 8));
+            float cf[16];
+            const __nv_bfloat162* h2 = (const __nv_bfloat162*)&a;
+            #pragma unroll
+            for (int j = 0; j < 4; ++j) { float2 f = __bfloat1622float2(h2[j]); cf[2 * j] = f.x; cf[2 * j + 1] = f.y; }
+            const __nv_bfloat162* h3 = (const __nv_bfloat162*)&b;
+            #pragma unroll
+            for (int j = 0; j < 4; ++j) { float2 f = __bfloat1622float2(h3[j]); cf[8 + 2 * j] = f.x; cf[8 + 2 * j + 1] = f.y; }
+            float p = __ldg(prow + t) * ns;
+            #pragma unroll
+            for (int j = 0; j < 16; ++j) acc[j] += p * cf[j];
+          }
+          float* dst = FP(W_PVP) + ((size_t)lc * 32 + lane) * 512 + rr;
+          #pragma unroll
+          for (int j = 0; j < 16; ++j) dst[j] = acc[j];
+        }
+        // zero obuf for upcoming atomics
+        for (int i = gtid; i < C; i += GT) FP(W_OBUF)[i] = 0.f;
+      }
+      ggr.sync(); TAP(12);
+      // ---- P7': o-side absorb (kv_b v) with inline pv reduction ----
+      {
+        int NLCH = 128;
+        int chunk = (Lp + NLCH - 1) / NLCH;
+        int nlc = (Lp + chunk - 1) / chunk;
+        for (int u = gw; u < 64; u += GW) {
+          int rpc = u & 7, hc = u >> 3;
+          int hsel = lane >> 3, l8 = lane & 7;
+          int h = hc * 4 + hsel;
+          int dv0 = l8 << 4;
+          int rp0 = rpc << 5;
+          int g = rp0 >> 6;
+          float sv[16], zv[16];
+          ld_bf16x16(CBP(mb + 9) + (size_t)g * 8192 + h * 256 + 128 + dv0, sv);
+          ld_bf16x16(CBP(mb + 10) + (size_t)g * 8192 + h * 256 + 128 + dv0, zv);
+          float acc[16];
+          #pragma unroll
+          for (int j = 0; j < 16; ++j) acc[j] = 0.f;
+          const uint8_t* wq = U8(mb + 8) + h * 256 + 128 + dv0;
+          for (int pass = 0; pass < 32; ++pass) {
+            int rp = rp0 + pass;
+            const float* base = FP(W_PVP) + (size_t)h * 512 + 2 * rp;
+            float pve = 0.f, pvo = 0.f;
+            for (int lc = 0; lc < nlc; ++lc) {
+              pve += base[(size_t)lc * 32 * 512];
+              pvo += base[(size_t)lc * 32 * 512 + 1];
+            }
+            uint4 wb = __ldg((const uint4*)(wq + (size_t)rp * 8192));
+            const unsigned char* pb = (const unsigned char*)&wb;
+            #pragma unroll
+            for (int j = 0; j < 16; ++j) {
+              float lo = (float)(int)(pb[j] & 15);
+              float hi = (float)(int)(pb[j] >> 4);
+              acc[j] += (lo - zv[j]) * sv[j] * pve + (hi - zv[j]) * sv[j] * pvo;
+            }
+          }
+          float* dst = FP(W_OBUF) + h * 128 + dv0;
+          #pragma unroll
+          for (int j = 0; j < 16; ++j) atomicAdd(dst + j, acc[j]);
+        }
+      }
+      ggr.sync(); TAP(13);
+      // ---- P8'/P9': o_proj partials + x1 ----
+      for (int k = tid; k < C; k += blockDim.x) xs[k] = bfr(FP(W_OBUF)[k]);
+      __syncthreads();
+      for (int u = gw; u < 80; u += GW) {
+        int nc = u % 5, kc = u / 5;
+        gemv4m(U8(mb + 11), CBP(mb + 12), CBP(mb + 13), xs,
+               FP(W_SLOTO) + (size_t)kc * D, D, nc * 512 + lane * 16, kc * 2);
+      }
+      ggr.sync(); TAP(14);
+      for (int n = gtid; n < D; n += GT) {
+        float ssum = 0.f;
+        #pragma unroll
+        for (int kc = 0; kc < 16; ++kc) ssum += FP(W_SLOTO)[(size_t)kc * D + n];
+        BP(W_X1)[n] = __float2bfloat16(bf2f(BP(W_X)[n]) + bfr(ssum));
+      }
+      ggr.sync(); TAP(15);
+    }
+
+    // ================= MoE (all layers) =================
+    {
+      const int mb = 128 + 24 * layer;
+      const bf16* n2 = CBP(layer < 3 ? 32 * layer + 1 : 97);
+      // ---- router logits: blocks 0..1 ----
+      if (blockIdx.x < 2) stage_rms(BP(W_X1), n2, xs, red);
+      if (gw < 64) {
+        float v = gemv_bf16_row(CBP(mb + 0) + (size_t)gw * D, xs, D);
+        if (lane == 0) FP(W_LOGITS)[gw] = v;
+      }
+      ggr.sync(); TAP(16);
+      // ---- gate/up partials ----
+      stage_rms(BP(W_X1), n2, xs, red);
+      {
+        int idx8[8];
+        float w8[8];
+        top8(FP(W_LOGITS), idx8, w8);
+        if (gw == 0) {
+          if (lane < 8) { ((int*)FP(W_TOPW))[lane] = idx8[lane]; FP(W_TOPW)[8 + lane] = w8[lane]; }
+        }
+        for (int u = gw; u < 324; u += GW) {
+          int e = u / 36, r = u % 36;
+          int pr = r / 18, rr = r % 18;
+          int nc = rr % 2, kc = rr / 2;
+          const uint8_t* wq;
+          const bf16* sc; const bf16* zz;
+          if (e < 8) {
+            int ee = idx8[e];
+            wq = U8(mb + 1 + 3 * pr) + (size_t)ee * (1152 * MOEM);
+            sc = CBP(mb + 2 + 3 * pr) + (size_t)ee * (18 * MOEM);
+            zz = CBP(mb + 3 + 3 * pr) + (size_t)ee * (18 * MOEM);
+          } else {
+            wq = U8(mb + 10 + 3 * pr);
+            sc = CBP(mb + 11 + 3 * pr);
+            zz = CBP(mb + 12 + 3 * pr);
+          }
+          gemv4m(wq, sc, zz, xs, FP(W_SLOTGU) + (size_t)((e * 2 + pr) * 9 + kc) * MOEM,
+                 MOEM, nc * 512 + lane * 16, kc * 2);
+        }
+      }
+      ggr.sync(); TAP(17);
+      // ---- hh = silu(g)*u ----
+      for (int t = gtid; t < 9 * MOEM; t += GT) {
+        int e = t / MOEM, n = t % MOEM;
+        float gs = 0.f, us = 0.f;
+        #pragma unroll
+        for (int kc = 0; kc < 9; ++kc) {
+          gs += FP(W_SLOTGU)[((e * 2 + 0) * 9 + kc) * MOEM + n];
+          us += FP(W_SLOTGU)[((e * 2 + 1) * 9 + kc) * MOEM + n];
+        }
+        FP(W_HH)[t] = siluf(gs) * us;
+      }
+      ggr.sync(); TAP(18);
+      // ---- down partials ----
+      {
+        int idx8[8];
+        float w8[8];
+        top8(FP(W_LOGITS), idx8, w8);
+        for (int u = gw; u < 180; u += GW) {
+          int e = u / 20, r = u % 20;
+          int nc = r % 5, kc = r / 5;
+          const uint8_t* wq; const bf16* sc; const bf16* zz;
+          if (e < 8) {
+            int ee = idx8[e];
+            wq = U8(mb + 7) + (size_t)ee * (512 * D);
+            sc = CBP(mb + 8) + (size_t)ee * (8 * D);
+            zz = CBP(mb + 9) + (size_t)ee * (8 * D);
+          } else {
+            wq = U8(mb + 16); sc = CBP(mb + 17); zz = CBP(mb + 18);
+          }
+          const float* xhh = FP(W_HH) + e * MOEM;
+          gemv4m(wq, sc, zz, xhh, FP(W_SLOTD) + (size_t)(e * 4 + kc) * D,
+                 D, nc * 512 + lane * 16, kc * 2);
+        }
+        // also stash expert weights in a place P10 can read quickly (already stored)
+      }
+      ggr.sync(); TAP(19);
+      // ---- x2 = x1 + sum_e w_e * ffn_e ----
+      {
+        const float* topw = FP(W_TOPW);
+        for (int n = gtid; n < D; n += GT) {
+          float acc = 0.f;
+          for (int e = 0; e < 8; ++e) {
+            float we = topw[8 + e];
+            #pragma unroll
+            for (int kc = 0; kc < 4; ++kc) acc += we * FP(W_SLOTD)[((size_t)(e * 4 + kc)) * D + n];
+          }
+          #pragma unroll
+          for (int kc = 0; kc < 4; ++kc) acc += FP(W_SLOTD)[((size_t)(8 * 4 + kc)) * D + n];
+          BP(W_X)[n] = __float2bfloat16(bf2f(BP(W_X1)[n]) + bfr(acc));
+        }
+      }
+      ggr.sync(); TAP(20);
+    }
+  }
+}
+
+// --------------------------------------------------------------------------- //
+static int g_nblocks = 0;
+constexpr int SHMEM_BYTES = 75776;  // swz staging 73728 + slack
+
+void run(at::Tensor pack, at::Tensor hin, int64_t L, int64_t scap) {
+  TORCH_CHECK(pack.is_cpu() && pack.scalar_type() == at::kLong, "pack must be cpu int64");
+  TORCH_CHECK(pack.numel() >= 384, "pack too small");
+  Params P;
+  const int64_t* pd = pack.data_ptr<int64_t>();
+  for (int i = 0; i < 384; ++i) P.p[i] = (long long)pd[i];
+  P.p[W_HIN] = (long long)hin.data_ptr();
+  P.L = (int)L;
+  P.scap = (int)scap;
+  if (g_nblocks == 0) {
+    cudaFuncSetAttribute((const void*)mega, cudaFuncAttributeMaxDynamicSharedMemorySize, SHMEM_BYTES);
+    int occ = 0;
+    cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occ, mega, 512, SHMEM_BYTES);
+    TORCH_CHECK(occ >= 1, "kernel does not fit");
+    int nsm = 0;
+    cudaDeviceGetAttribute(&nsm, cudaDevAttrMultiProcessorCount, 0);
+    g_nblocks = occ * nsm;
+  }
+  void* args[] = {(void*)&P};
+  auto stream = at::cuda::getCurrentCUDAStream();
+  cudaError_t e = cudaLaunchCooperativeKernel((const void*)mega, dim3(g_nblocks), dim3(512), args, SHMEM_BYTES, stream.stream());
+  TORCH_CHECK(e == cudaSuccess, "coop launch failed: ", cudaGetErrorString(e));
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+"""
+
+_ext = None
+
+
+def _get_ext():
+    global _ext
+    if _ext is None:
+        from torch.utils.cpp_extension import load_inline
+
+        _ext = load_inline(
+            name="kimi_mega_v1",
+            cpp_sources="void run(at::Tensor pack, at::Tensor hin, int64_t L, int64_t scap);",
+            cuda_sources=CUDA_SRC,
+            functions=["run"],
+            extra_cuda_cflags=["-O3"],
+            verbose=False,
+        )
+    return _ext
+
+
+# --------------------------------------------------------------------------- #
+# workspace layout
+# --------------------------------------------------------------------------- #
+def _align(x, a=256):
+    return (x + a - 1) // a * a
+
+
+class Model(nn.Module):
+    def __init__(self, cfg: Config):
+        super().__init__()
+        self.cfg = cfg
+        self.blocks = nn.ModuleList(Block(cfg, k) for k in cfg.pattern)
+        self._st = None
+        self._pack = None
+        self._ws = None
+        self._ckv = None
+        self._krope = None
+        self._ckv_cap = 0
+        self._x_ret = None
+        self._scap = 32768
+
+    def _ensure_ws(self):
+        if self._ws is not None:
+            return
+        dev = torch.device("cuda:0")
+        # fp32 element offsets
+        off = 0
+        layouts = [
+            ("x", 2304 * 2),                      # bf16
+            ("slot_qkvg", 4 * 9 * 4096 * 4),
+            ("bufq", 4096 * 4), ("bufk", 4096 * 4), ("bufv", 4096 * 4),
+            ("dec", 4096 * 4), ("beta", 32 * 4), ("obuf", 4096 * 4),
+            ("slot_o", 16 * 2304 * 4),
+            ("x1", 2304 * 2),                     # bf16
+            ("logits", 64 * 4),
+            ("slot_gu", 9 * 2 * 9 * 1024 * 4),
+            ("hh", 9 * 1024 * 4),
+            ("slot_d", 9 * 4 * 2304 * 4),
+            ("topw", 16 * 4),
+            ("mqbuf", 6144 * 4), ("mkvbuf", 576 * 4),
+            ("slot_mlaq", 9 * 6144 * 4), ("slot_kva", 9 * 576 * 4),
+            ("qlat", 32 * 576 * 4),
+            ("scores", 32 * self._scap * 4),
+            ("ssum", 32 * 4),
+            ("pvp", 128 * 32 * 512 * 4),
+            ("tap", 256 * 64 * 8),
+        ]
+        offsets = {}
+        for name, nbytes in layouts:
+            off = _align(off)
+            offsets[name] = off
+            off += nbytes
+        ws = torch.empty(off, dtype=torch.uint8, device=dev)
+        self._ws = ws
+        self._ws_off = offsets
+        base = ws.data_ptr()
+        self._ws_ptr = {k: base + v for k, v in offsets.items()}
+        self._x_ret = ws[offsets["x"]:offsets["x"] + 2304 * 2].view(torch.bfloat16)
+        _get_ext()
+
+    def _fill_pack(self, state):
+        P = [0] * 384
+        dev0 = torch.device("cuda:0")
+        for l in range(3):
+            blk = self.blocks[l]
+            a = blk.attn
+            base = 32 * l
+            P[base + 0] = blk.attn_norm.data_ptr()
+            P[base + 1] = blk.moe_norm.data_ptr()
+            for pi, name in enumerate(["q_proj", "k_proj", "v_proj", "g_proj", "o_proj"]):
+                q = getattr(a, name)
+                P[base + 2 + 3 * pi] = q.w_q.data_ptr()
+                P[base + 3 + 3 * pi] = q.scales.data_ptr()
+                P[base + 4 + 3 * pi] = q.zeros.data_ptr()
+            P[base + 17] = a.beta_proj.weight.data_ptr()
+            P[base + 18] = a.conv_w.data_ptr()
+            st = state[l]
+            P[base + 19] = st["S"].data_ptr()
+            P[base + 20] = st["cq"].data_ptr()
+            P[base + 21] = st["ck"].data_ptr()
+            P[base + 22] = st["cv"].data_ptr()
+        blk = self.blocks[3]
+        a = blk.attn
+        base = 96
+        P[base + 0] = blk.attn_norm.data_ptr()
+        P[base + 1] = blk.moe_norm.data_ptr()
+        for pi, name in enumerate(["q_proj", "kv_a", "kv_b", "o_proj"]):
+            q = getattr(a, name)
+            P[base + 2 + 3 * pi] = q.w_q.data_ptr()
+            P[base + 3 + 3 * pi] = q.scales.data_ptr()
+            P[base + 4 + 3 * pi] = q.zeros.data_ptr()
+        P[base + 14] = self._ckv.data_ptr()
+        P[base + 15] = self._krope.data_ptr()
+        for l in range(4):
+            moe = self.blocks[l].moe
+            base = 128 + 24 * l
+            P[base + 0] = moe.router.weight.data_ptr()
+            for pi, name in enumerate(["gate", "up", "down", "s_gate", "s_up", "s_down"]):
+                q = getattr(moe, name)
+                P[base + 1 + 3 * pi] = q.w_q.data_ptr()
+                P[base + 2 + 3 * pi] = q.scales.data_ptr()
+                P[base + 3 + 3 * pi] = q.zeros.data_ptr()
+        names = ["x", "slot_qkvg", "bufq", "bufk", "bufv", "dec", "beta", "obuf",
+                 "slot_o", "x1", "logits", "slot_gu", "hh", "slot_d", "topw",
+                 "mqbuf", "mkvbuf", "slot_mlaq", "slot_kva", "qlat", "scores", "ssum", "pvp"]
+        for i, nm in enumerate(names):
+            P[224 + i] = self._ws_ptr[nm]
+        P[224 + 24] = self._ws_ptr["tap"]
+        self._pack = torch.tensor(P, dtype=torch.int64)
+
+    def step(self, hidden, state):
+        assert torch.cuda.is_available()
+        self._ensure_ws()
+        ext = _get_ext()
+        L = state[3]["c_kv"].shape[0]
+        fresh = state is not self._st
+        if fresh:
+            # adapt MLA cache: persistent capacity buffers
+            need = L + 1
+            if need > self._ckv_cap or self._ckv is None:
+                cap = max(self._ckv_cap * 2, L + 1024, 16384 + 1024)
+                new_ckv = torch.empty(cap, 512, dtype=torch.bfloat16, device=hidden.device)
+                new_kr = torch.empty(cap, 64, dtype=torch.bfloat16, device=hidden.device)
+                if self._ckv is not None and self._ckv_cap > 0:
+                    prev = self._st[3]["c_kv"].shape[0]
+                    new_ckv[:prev].copy_(self._ckv[:prev])
+                    new_kr[:prev].copy_(self._krope[:prev])
+                self._ckv, self._krope = new_ckv, new_kr
+                self._ckv_cap = cap
+            cur = state[3]["c_kv"]
+            if self._ckv[:L].data_ptr() != cur.data_ptr():
+                self._ckv[:L].copy_(cur)
+                self._krope[:L].copy_(state[3]["k_rope"])
+            self._st = state
+            self._fill_pack(state)
+        ext.run(self._pack, hidden, L, self._scap)
+        state[3]["c_kv"] = self._ckv[: L + 1]
+        state[3]["k_rope"] = self._krope[: L + 1]
+        return self._x_ret, state
+
+
+def init_state(cfg: Config, context_len: int, seed: int) -> list:
+    dev = torch.device("cuda:0")
+    g = torch.Generator(device=dev).manual_seed(seed)
+    H, Dk = cfg.kda_heads, cfg.kda_head_dim
+    C = H * Dk
+    state = []
+    for kind in cfg.pattern:
+        if kind == "K":
+            state.append({
+                "S": torch.randn(H, Dk, Dk, device=dev, generator=g) * 0.05,
+                "cq": torch.randn(cfg.short_conv - 1, C, device=dev, generator=g, dtype=cfg.dtype) * 0.1,
+                "ck": torch.randn(cfg.short_conv - 1, C, device=dev, generator=g, dtype=cfg.dtype) * 0.1,
+                "cv": torch.randn(cfg.short_conv - 1, C, device=dev, generator=g, dtype=cfg.dtype) * 0.1,
+            })
+        else:
+            state.append({
+                "c_kv": torch.randn(context_len, cfg.kv_lora, device=dev, generator=g, dtype=cfg.dtype) * 0.1,
+                "k_rope": torch.randn(context_len, cfg.qk_rope, device=dev, generator=g, dtype=cfg.dtype) * 0.1,
+            })
+    return state
+
+
+def init_token(cfg: Config, seed: int) -> torch.Tensor:
+    dev = torch.device("cuda:0")
+    g = torch.Generator(device=dev).manual_seed(seed + 1)
+    return torch.randn(cfg.hidden, device=dev, generator=g, dtype=cfg.dtype) * 0.25

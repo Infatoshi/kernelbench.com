@@ -108,6 +108,19 @@ def megakernel_authentic(run_id: str, annotations_dir: Path) -> bool | None:
     return d.get("megakernel_authentic")
 
 
+def annotation_verdict(run_id: str, annotations_dir: Path) -> str | None:
+    """Verdict from the manual audit annotation (clean | reward_hack | ...)."""
+    f = annotations_dir / f"{run_id}.yaml"
+    if not f.exists():
+        return None
+    try:
+        import yaml
+        d = yaml.safe_load(f.read_text()) or {}
+    except Exception:
+        return None
+    return d.get("verdict")
+
+
 def _constraints(problem: str) -> dict:
     y = _HERE / "problems" / problem / "problem.yaml"
     if not y.exists():
@@ -210,11 +223,17 @@ def main() -> None:
         if not (run_dir / "gpu").exists():
             continue
         # Contamination tripwire: drop runs that read other runs' archives.
+        # A manual audit verdict of `clean` (which includes a contamination read
+        # of the transcript) overrides the tripwire, mirroring hard's builder;
+        # anything unaudited or non-clean stays excluded.
+        rid = d.get("run_id", run_dir.name)
         nc = contamination(run_dir)
         if nc >= 1:
-            print(f"  EXCLUDED (contaminated, read {nc} other archive(s)): {run_dir.name}")
-            continue
-        rid = d.get("run_id", run_dir.name)
+            if annotation_verdict(rid, annotations_dir) == "clean":
+                print(f"  KEPT (tripwire: {nc} archive ref(s); manual audit verdict=clean): {run_dir.name}")
+            else:
+                print(f"  EXCLUDED (contaminated, read {nc} other archive(s)): {run_dir.name}")
+                continue
         # Megakernel authenticity gate: drop runs the judge audit marked as not a
         # genuine fused megakernel (graph/compile/per-op-loop). None = unjudged, kept.
         if megakernel_authentic(rid, annotations_dir) is False:
