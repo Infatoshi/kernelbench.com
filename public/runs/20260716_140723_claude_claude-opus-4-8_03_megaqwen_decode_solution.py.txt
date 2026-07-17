@@ -1,0 +1,882 @@
+"""MegaQwen-geometry multi-layer decode as a single persistent CUDA megakernel.
+
+Qwen3-0.6B block geometry (hidden=1024, inter=3072, 16 Q / 8 KV heads, head_dim=128),
+4 stacked layers, batch=1 decode against a growing bf16 KV cache, on SM120 Blackwell.
+
+Design notes
+------------
+The whole decode loop (n_steps x num_layers) is ONE cooperative kernel launch, so a
+decode step costs zero launch overhead.  Work is partitioned so that *every* block is
+busy in *every* stage, and the barrier count is held to 5 grid.sync() per layer:
+
+    stage 1  residual mix + RMSNorm (recomputed redundantly per block) + QKV GEMV
+    --- grid.sync ---
+    stage 2  GQA attention over the KV cache (block = one (kv_head, ctx-chunk))
+    --- grid.sync ---
+    stage 3  O projection (split-K), accumulated with atomicAdd
+    --- grid.sync ---
+    stage 4  attn residual + post RMSNorm (redundant) + gate/up GEMV
+    --- grid.sync ---
+    stage 5  SwiGLU + down projection (split-K), accumulated with atomicAdd
+    --- grid.sync ---
+
+Two structural tricks keep the barrier count down:
+
+*   RMSNorm needs a full 1024-vector reduction.  Rather than compute it in one block and
+    broadcast (which costs an extra barrier and leaves 187 SMs idle), every block reloads
+    the 2KB residual and redoes the reduction itself.  It is L2-resident and free.
+
+*   Softmax normally needs a running max, which forces a second barrier to combine the
+    per-chunk (m, l, acc) partials.  Here Q and K are both RMS-normalised, so
+    ||q|| <= sqrt(head_dim)*max|q_norm| and likewise for k, and RoPE is a rotation and
+    preserves norms.  Cauchy-Schwarz therefore bounds every score:
+
+        |q.k| / sqrt(D) <= ||q|| * ||k|| / sqrt(D) <= ||q|| * max_i|k_norm_i| =: M
+
+    Softmax is shift-invariant, so using this *precomputed* M in place of the true row max
+    is exact, and exp(s - M) <= 1 can never overflow.  With |s| <= M the smallest term is
+    exp(-2M) ~ 1.5e-10 for this geometry, so it cannot underflow either (asserted at load
+    time).  That removes the per-position accumulator rescale from the inner loop AND lets
+    chunks combine with a plain atomicAdd instead of a second barrier.
+
+Numerics follow the eager formulation: bf16 weights/KV in memory, upconverted on load,
+fp32 everywhere inside a block, bf16 rounding only at the layer boundary, at the KV cache
+store, and on the step input mix -- the same three places the eager model rounds.
+"""
+from __future__ import annotations
+
+import math
+import os
+
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+OP_TYPE = "megaqwen_decode"
+SUPPORTED_PRECISIONS = ["bf16"]
+HARDWARE_REQUIRED = ["RTX_PRO_6000"]
+
+HIDDEN = 1024
+INTERMEDIATE = 3072
+NUM_Q = 16
+NUM_KV = 8
+HEAD_DIM = 128
+NUM_LAYERS = 4
+EPS = 1e-6
+
+# 11 warps x 188 SMs = 2068 warps.  Chosen so every GEMV stage divides near-evenly:
+# QKV 4096 tasks / 2068 = 1.98 -> 2 rounds (99%), gate+up 6144 / 2068 = 2.97 -> 3 (99%),
+# O and down are split-K'd to 4096 tasks each -> 99%.  A round number like 8 or 16 warps
+# lands just above an integer and wastes 25-30% of the grid on the tail round.
+BLOCK_WARPS = int(os.environ.get("MQ_WARPS", "11"))
+BLOCK_THREADS = BLOCK_WARPS * 32
+GRID_BLOCKS = int(os.environ.get("MQ_BLOCKS", "0"))  # 0 = one block per SM
+
+# L2 eviction-policy fractions (runtime kernel args, so they are tunable without a
+# rebuild). L2_STREAM: fraction of KV loads tagged evict_first. L2_KEEP: fraction of
+# weight loads tagged evict_last. 0.0 == evict_normal == default LRU.
+#
+# Measured on this GPU (ctx 2048 / 8192, us/step, idle box):
+#   keep=0 stream=0  177.2 / 248.4   (default LRU)
+#   keep=0 stream=1  132.4 / 202.5   <-- best, 1.34x / 1.23x
+#   keep=1 stream=1  132.6 / 202.8   (evict_last on weights adds nothing)
+#   keep=1 stream=0  184.0 / 253.8   (evict_last alone is WORSE than default)
+# Stopping the KV stream from evicting the weights is the entire win; once it does,
+# plain LRU keeps the 125.8 MB weight set resident on its own.
+#
+# `keep` was re-swept at 0/.25/.5/.75/1 on a *contended* box (where the weights are
+# demonstrably NOT resident) on the theory that evict_last would defend them against a
+# neighbour's L2 traffic. It does not: every fraction landed inside 0.4%
+# (352.99..353.23 us) over two passes. `stream` still paid 1.23-1.26x there. So the
+# weights' residency is decided by what else is on the GPU, not by our eviction
+# priority; the knob stays (runtime-tunable, 0 = plain evict_normal) but is measured
+# inert on this part.
+L2_KEEP = float(os.environ.get("MQ_L2_KEEP", "0.0"))
+L2_STREAM = float(os.environ.get("MQ_L2_STREAM", "1.0"))
+
+_CUDA_SRC = r"""
+#include <cuda_runtime.h>
+#include <cuda_bf16.h>
+#include <cooperative_groups.h>
+#include <ATen/cuda/CUDAContext.h>
+#include <c10/util/Exception.h>
+#include <cstdio>
+#include <cstdlib>
+
+namespace cg = cooperative_groups;
+typedef __nv_bfloat16 bf16;
+
+#define HID    1024
+#define INTER  3072
+#define NQ     16
+#define NKV    8
+#define HD     128
+#define ROT    64
+#define QKV_ROWS 4096
+#define RMS_EPS 1e-6f
+
+#define OSPLIT 4
+#define DSPLIT 4
+#define O_KC   ((NQ*HD)/OSPLIT)   /* 512 */
+#define D_KC   (INTER/DSPLIT)     /* 768 */
+
+#ifndef NW
+#define NW 11
+#endif
+#define NTHREADS (NW*32)
+
+/* shared-memory union area: max(h[1024], act[3072], attn_out[2048], NW*256 + 520) */
+#define SU_ATTN (NW*256 + 520)
+#define SU_MAX3 (SU_ATTN > 3072 ? SU_ATTN : 3072)
+#define SU (SU_MAX3 > 2048 ? SU_MAX3 : 2048)
+
+struct LayerW {
+    const bf16* input_ln;
+    const bf16* q_proj;
+    const bf16* k_proj;
+    const bf16* v_proj;
+    const bf16* q_norm;
+    const bf16* k_norm;
+    const bf16* o_proj;
+    const bf16* post_ln;
+    const bf16* gate_proj;
+    const bf16* up_proj;
+    const bf16* down_proj;
+    float knorm_absmax;   /* max_i |k_norm_i| -- the Cauchy-Schwarz score bound factor */
+};
+
+struct KVRef {
+    bf16* k;
+    bf16* v;
+    long long s_head;   /* elements between kv heads */
+    long long s_pos;    /* elements between positions */
+};
+
+__device__ __forceinline__ float warp_sum(float v) {
+    #pragma unroll
+    for (int o = 16; o; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
+    return v;
+}
+
+__device__ __forceinline__ float fast_exp2(float x) {
+    float r;
+    asm("ex2.approx.ftz.f32 %0, %1;" : "=f"(r) : "f"(x));
+    return r;
+}
+
+/* ---------------------------------------------------------------------------
+   L2 residency control.
+
+   The 4-layer weight set is 125.8 MB and this GPU's L2 is 128 MB, so the weights
+   very nearly fit -- but they are re-read every single decode step while the KV
+   cache is streamed past exactly once per step and never reused.  Under plain LRU
+   the KV stream is always the most-recently-used thing and evicts the weights, so
+   every step re-fetches all 125.8 MB from DRAM.  Tagging weight loads "evict_last"
+   and KV loads "evict_first" inverts that.
+
+   On sm_120 the direct `.L2::evict_*` load modifier is only legal on 256-bit
+   (.v4.b64) loads, so the general lever at 128/64-bit width is an explicit cache
+   policy descriptor built with createpolicy + `.L2::cache_hint`.  The fraction is a
+   runtime register operand, so the keep/stream ratio is tunable without a rebuild;
+   fraction 0 degenerates to evict_normal, i.e. exactly the default behaviour.
+   --------------------------------------------------------------------------- */
+__device__ __forceinline__ unsigned long long policy_keep(float frac) {
+    unsigned long long p;
+    asm volatile("createpolicy.fractional.L2::evict_last.b64 %0, %1;" : "=l"(p) : "f"(frac));
+    return p;
+}
+__device__ __forceinline__ unsigned long long policy_stream(float frac) {
+    unsigned long long p;
+    asm volatile("createpolicy.fractional.L2::evict_first.b64 %0, %1;" : "=l"(p) : "f"(frac));
+    return p;
+}
+__device__ __forceinline__ uint4 ldg128_pol(const void* p, unsigned long long pol) {
+    uint4 v;
+    asm volatile("ld.global.nc.L2::cache_hint.v4.b32 {%0,%1,%2,%3}, [%4], %5;"
+                 : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w) : "l"(p), "l"(pol));
+    return v;
+}
+__device__ __forceinline__ uint2 ldg64_pol(const void* p, unsigned long long pol) {
+    uint2 v;
+    asm volatile("ld.global.nc.L2::cache_hint.v2.b32 {%0,%1}, [%2], %3;"
+                 : "=r"(v.x), "=r"(v.y) : "l"(p), "l"(pol));
+    return v;
+}
+
+/* 8 bf16 weights x 8 fp32 activations -> fp32 accumulate */
+__device__ __forceinline__ void fma8(float& a, const uint4& w, const float* __restrict__ x) {
+    const __nv_bfloat162* b = reinterpret_cast<const __nv_bfloat162*>(&w);
+    #pragma unroll
+    for (int t = 0; t < 4; ++t) {
+        float2 f = __bfloat1622float2(b[t]);
+        a = fmaf(f.x, x[2 * t], a);
+        a = fmaf(f.y, x[2 * t + 1], a);
+    }
+}
+
+/* One warp dots a bf16 weight row against an fp32 activation vector held in shared mem.
+   NITER = span/256 is a compile-time constant so the loop fully unrolls: all NITER
+   LDG.128s issue back-to-back and sit in flight together.  With a runtime trip count the
+   compiler cannot hoist them, and 11 warps x 1 load x 512B = 5.6KB/SM in flight is right
+   at the Little's-law floor for saturating DRAM (BW/SM * latency ~= 5.7KB). */
+template<int NITER>
+__device__ __forceinline__ float warp_dot(const bf16* __restrict__ w,
+                                          const float* __restrict__ xs,
+                                          int lane, int k0, unsigned long long pol) {
+    float acc = 0.f;
+    uint4 wv[NITER];
+    #pragma unroll
+    for (int i = 0; i < NITER; ++i)
+        wv[i] = ldg128_pol(w + k0 + lane * 8 + i * 256, pol);
+    #pragma unroll
+    for (int i = 0; i < NITER; ++i)
+        fma8(acc, wv[i], xs + k0 + lane * 8 + i * 256);
+    return warp_sum(acc);
+}
+
+/* block-wide sum of a per-thread value; result broadcast via smem scratch */
+__device__ __forceinline__ float block_sum(float v, float* red, int tid, int lane, int warp) {
+    v = warp_sum(v);
+    if (lane == 0) red[warp] = v;
+    __syncthreads();
+    if (tid < 32) {
+        float t = (tid < NW) ? red[tid] : 0.f;
+        #pragma unroll
+        for (int o = 16; o; o >>= 1) t += __shfl_xor_sync(0xffffffffu, t, o);
+        if (tid == 0) red[NW] = t;
+    }
+    __syncthreads();
+    return red[NW];
+}
+
+__global__ void __launch_bounds__(NTHREADS, 1)
+mq_decode(const LayerW* __restrict__ LW,
+          const KVRef* __restrict__ KV,
+          int num_layers,
+          float* __restrict__ g_qkv,
+          float* __restrict__ g_num,
+          float* __restrict__ g_den,
+          float* __restrict__ g_oout,
+          float* __restrict__ g_dout,
+          float* __restrict__ g_gate,
+          float* __restrict__ g_up,
+          float* __restrict__ g_rope,
+          const float* __restrict__ g_ropeinv,
+          const bf16* __restrict__ g_rand,
+          bf16* __restrict__ g_hidden,
+          int start_pos, int n_steps,
+          float l2_keep, float l2_stream)
+{
+    cg::grid_group grid = cg::this_grid();
+    const unsigned long long POL_W  = policy_keep(l2_keep);     /* weights: stay in L2 */
+    const unsigned long long POL_KV = policy_stream(l2_stream); /* KV: stream, don't evict weights */
+
+    __shared__ float sm[1024 + 1024 + SU];
+    __shared__ float s_red[NW + 1];
+    __shared__ float s_M[2];
+    __shared__ float s_rd[NQ];
+    float* s_resid  = sm;
+    float* s_resid2 = sm + 1024;
+    float* s_u      = sm + 2048;
+
+    const int tid  = threadIdx.x;
+    const int lane = tid & 31;
+    const int warp = tid >> 5;
+    const int bid  = blockIdx.x;
+    const int nb   = gridDim.x;
+    const int gwarp = bid * NW + warp;
+    const int NWG   = nb * NW;
+
+    const float QSCALE = rsqrtf((float)HD) * 1.4426950408889634f;  /* 1/sqrt(D) * log2(e) */
+
+    for (int step = 0; step < n_steps; ++step) {
+        const int pos = start_pos + step;
+        const bf16* randv = g_rand + (size_t)step * HID;
+
+        for (int layer = 0; layer < num_layers; ++layer) {
+            const LayerW w = LW[layer];
+            const KVRef kv = KV[layer];
+
+            /* ---------------- stage 1: residual + RMSNorm + QKV ---------------- */
+            if (step == 0 && layer == 0) {
+                for (int j = tid; j < HID; j += NTHREADS) {
+                    float r = __bfloat162float(randv[j]);
+                    float h = __bfloat162float(g_hidden[j]);
+                    s_resid[j] = __bfloat162float(__float2bfloat16(0.5f * r + 0.5f * h));
+                }
+            } else if (layer == 0) {
+                for (int j = tid; j < HID; j += NTHREADS) {
+                    float h = __bfloat162float(__float2bfloat16(s_resid2[j] + g_dout[j]));
+                    float r = __bfloat162float(randv[j]);
+                    s_resid[j] = __bfloat162float(__float2bfloat16(0.5f * r + 0.5f * h));
+                }
+            } else {
+                for (int j = tid; j < HID; j += NTHREADS)
+                    s_resid[j] = __bfloat162float(__float2bfloat16(s_resid2[j] + g_dout[j]));
+            }
+            __syncthreads();
+
+            {
+                float ss = 0.f;
+                for (int j = tid; j < HID; j += NTHREADS) { float v = s_resid[j]; ss += v * v; }
+                float tot = block_sum(ss, s_red, tid, lane, warp);
+                float sc = rsqrtf(tot / (float)HID + RMS_EPS);
+                for (int j = tid; j < HID; j += NTHREADS)
+                    s_u[j] = s_resid[j] * sc * __bfloat162float(w.input_ln[j]);
+            }
+
+            /* clear the accumulators this layer will atomically fold into */
+            if (bid == 0) {
+                for (int j = tid; j < NQ * HD; j += NTHREADS) g_num[j] = 0.f;
+                if (tid < NQ) g_den[tid] = 0.f;
+            } else if (bid == 1) {
+                for (int j = tid; j < HID; j += NTHREADS) g_oout[j] = 0.f;
+            } else if (bid == 2 && layer == 0) {
+                /* RoPE angles for this position, shared by all 4 layers. Must be the
+                   accurate sincosf, NOT __sincosf: at pos=131071 the angle is ~131071 rad
+                   and the fast intrinsic's range reduction falls apart there. This is also
+                   why the extension is NOT built with --use_fast_math, which would silently
+                   rewrite sincosf -> __sincosf and corrupt the long-context shapes (which
+                   check.py never exercises -- it tops out at ctx 8192). */
+                if (tid < ROT) {
+                    float s, c;
+                    sincosf((float)pos * g_ropeinv[tid], &s, &c);
+                    g_rope[tid] = c;
+                    g_rope[ROT + tid] = s;
+                }
+            }
+            __syncthreads();
+
+            for (int row = gwarp; row < QKV_ROWS; row += NWG) {
+                const bf16* wr;
+                if (row < NQ * HD)                  wr = w.q_proj + (size_t)row * HID;
+                else if (row < NQ * HD + NKV * HD)  wr = w.k_proj + (size_t)(row - NQ * HD) * HID;
+                else                                wr = w.v_proj + (size_t)(row - NQ * HD - NKV * HD) * HID;
+                float v = warp_dot<HID / 256>(wr, s_u, lane, 0, POL_W);
+                if (lane == 0) g_qkv[row] = v;
+            }
+            grid.sync();
+
+            /* ---------------- stage 2: GQA attention ---------------- */
+            {
+                const int head = bid % NKV;
+                const int ck   = bid / NKV;
+                const int nck  = (nb - head + NKV - 1) / NKV;
+                float* s_part = s_u;              /* [NW][2][128] warp partials */
+                float* s_qk   = s_u + NW * 256;   /* q0[128] q1[128] knew[128] vnew[128] */
+
+                if (warp < 4) {
+                    const float* raw;
+                    const bf16* nrm;
+                    bool rope;
+                    if (warp == 0)      { raw = g_qkv + (2 * head) * HD;     nrm = w.q_norm; rope = true; }
+                    else if (warp == 1) { raw = g_qkv + (2 * head + 1) * HD; nrm = w.q_norm; rope = true; }
+                    else if (warp == 2) { raw = g_qkv + NQ * HD + head * HD; nrm = w.k_norm; rope = true; }
+                    else                { raw = g_qkv + NQ * HD + NKV * HD + head * HD; nrm = nullptr; rope = false; }
+
+                    float x[4];
+                    #pragma unroll
+                    for (int t = 0; t < 4; ++t) x[t] = raw[lane * 4 + t];
+
+                    if (nrm != nullptr) {
+                        float ss = 0.f;
+                        #pragma unroll
+                        for (int t = 0; t < 4; ++t) ss += x[t] * x[t];
+                        ss = warp_sum(ss);
+                        float sc = rsqrtf(ss / (float)HD + RMS_EPS);
+                        #pragma unroll
+                        for (int t = 0; t < 4; ++t)
+                            x[t] = x[t] * sc * __bfloat162float(nrm[lane * 4 + t]);
+                    }
+                    if (rope) {
+                        float p[4];
+                        #pragma unroll
+                        for (int t = 0; t < 4; ++t) p[t] = __shfl_xor_sync(0xffffffffu, x[t], 16);
+                        #pragma unroll
+                        for (int t = 0; t < 4; ++t) {
+                            int d  = lane * 4 + t;
+                            int fi = (d < ROT) ? d : (d - ROT);
+                            float c = g_rope[fi], s = g_rope[ROT + fi];
+                            x[t] = (d < ROT) ? (x[t] * c - p[t] * s) : (p[t] * s + x[t] * c);
+                        }
+                    }
+                    /* Cauchy-Schwarz score bound for the two q heads this block serves */
+                    if (warp < 2) {
+                        float ss = 0.f;
+                        #pragma unroll
+                        for (int t = 0; t < 4; ++t) ss += x[t] * x[t];
+                        ss = warp_sum(ss);
+                        if (lane == 0)
+                            s_M[warp] = sqrtf(ss) * w.knorm_absmax * 1.4426950408889634f;
+                    }
+                    float* dst = s_qk + warp * HD;
+                    #pragma unroll
+                    for (int t = 0; t < 4; ++t) dst[lane * 4 + t] = x[t];
+                }
+                __syncthreads();
+
+                /* the new k/v land in the cache bf16-rounded, exactly as eager stores them */
+                if (ck == 0) {
+                    bf16* kd = kv.k + head * kv.s_head + (size_t)pos * kv.s_pos;
+                    bf16* vd = kv.v + head * kv.s_head + (size_t)pos * kv.s_pos;
+                    for (int d = tid; d < HD; d += NTHREADS) {
+                        kd[d] = __float2bfloat16(s_qk[2 * HD + d]);
+                        vd[d] = __float2bfloat16(s_qk[3 * HD + d]);
+                    }
+                }
+
+                float q0[4], q1[4];
+                #pragma unroll
+                for (int t = 0; t < 4; ++t) {
+                    q0[t] = s_qk[lane * 4 + t] * QSCALE;
+                    q1[t] = s_qk[HD + lane * 4 + t] * QSCALE;
+                }
+                const float M0 = s_M[0], M1 = s_M[1];
+
+                float acc0[4] = {0.f, 0.f, 0.f, 0.f};
+                float acc1[4] = {0.f, 0.f, 0.f, 0.f};
+                float den0 = 0.f, den1 = 0.f;
+
+                /* split the *already cached* positions [0,pos) across blocks, then warps */
+                int per = (pos + nck - 1) / nck;
+                int lo  = min(ck * per, pos);
+                int hi  = min(lo + per, pos);
+                int len = hi - lo;
+                int wp  = (len + NW - 1) / NW;
+                int wlo = min(lo + warp * wp, hi);
+                int whi = min(wlo + wp, hi);
+
+                /* These are `.nc` (read-only-cache) loads from a cache this same kernel
+                   writes, which is only sound because a position is written exactly once
+                   and never read before that: step t writes position t and reads only
+                   [0,t). head_dim*2B = 256B is a whole number of 128B lines and the cache
+                   base is 512B-aligned, so reading position t-1 cannot pull in position
+                   t's lines early. No stale `.nc` hit is reachable. */
+                const bf16* kb = kv.k + head * kv.s_head;
+                const bf16* vb = kv.v + head * kv.s_head;
+                /* unrolled so several 256B K/V fetches are in flight per warp; at long ctx
+                   this loop IS the kernel and it must stay DRAM-latency-bound, not
+                   dependency-bound on the warp_sum after each single fetch. */
+                #pragma unroll 4
+                for (int p = wlo; p < whi; ++p) {
+                    uint2 kk = ldg64_pol(kb + (size_t)p * kv.s_pos + lane * 4, POL_KV);
+                    uint2 vv = ldg64_pol(vb + (size_t)p * kv.s_pos + lane * 4, POL_KV);
+                    const __nv_bfloat162* kb2 = reinterpret_cast<const __nv_bfloat162*>(&kk);
+                    const __nv_bfloat162* vb2 = reinterpret_cast<const __nv_bfloat162*>(&vv);
+                    float2 ka = __bfloat1622float2(kb2[0]), kc = __bfloat1622float2(kb2[1]);
+                    float2 va = __bfloat1622float2(vb2[0]), vc = __bfloat1622float2(vb2[1]);
+                    float kf[4] = {ka.x, ka.y, kc.x, kc.y};
+                    float vf[4] = {va.x, va.y, vc.x, vc.y};
+                    float s0 = 0.f, s1 = 0.f;
+                    #pragma unroll
+                    for (int t = 0; t < 4; ++t) { s0 = fmaf(q0[t], kf[t], s0); s1 = fmaf(q1[t], kf[t], s1); }
+                    s0 = warp_sum(s0); s1 = warp_sum(s1);
+                    float e0 = fast_exp2(s0 - M0), e1 = fast_exp2(s1 - M1);
+                    #pragma unroll
+                    for (int t = 0; t < 4; ++t) {
+                        acc0[t] = fmaf(e0, vf[t], acc0[t]);
+                        acc1[t] = fmaf(e1, vf[t], acc1[t]);
+                    }
+                    den0 += e0; den1 += e1;
+                }
+
+                /* position `pos` itself: use the freshly computed k/v, bf16-rounded */
+                if (ck == 0 && warp == 0) {
+                    float kf[4], vf[4];
+                    #pragma unroll
+                    for (int t = 0; t < 4; ++t) {
+                        kf[t] = __bfloat162float(__float2bfloat16(s_qk[2 * HD + lane * 4 + t]));
+                        vf[t] = __bfloat162float(__float2bfloat16(s_qk[3 * HD + lane * 4 + t]));
+                    }
+                    float s0 = 0.f, s1 = 0.f;
+                    #pragma unroll
+                    for (int t = 0; t < 4; ++t) { s0 = fmaf(q0[t], kf[t], s0); s1 = fmaf(q1[t], kf[t], s1); }
+                    s0 = warp_sum(s0); s1 = warp_sum(s1);
+                    float e0 = fast_exp2(s0 - M0), e1 = fast_exp2(s1 - M1);
+                    #pragma unroll
+                    for (int t = 0; t < 4; ++t) {
+                        acc0[t] = fmaf(e0, vf[t], acc0[t]);
+                        acc1[t] = fmaf(e1, vf[t], acc1[t]);
+                    }
+                    den0 += e0; den1 += e1;
+                }
+
+                __syncthreads();   /* s_qk dead; s_part may now alias it */
+                float* pw = s_part + warp * 256;
+                #pragma unroll
+                for (int t = 0; t < 4; ++t) {
+                    pw[lane * 4 + t]      = acc0[t];
+                    pw[HD + lane * 4 + t] = acc1[t];
+                }
+                if (lane == 0) { s_red[warp] = den0; }
+                __syncthreads();
+
+                for (int j = tid; j < 2 * HD; j += NTHREADS) {
+                    float s = 0.f;
+                    for (int ww = 0; ww < NW; ++ww) s += s_part[ww * 256 + j];
+                    atomicAdd(&g_num[(2 * head + (j >> 7)) * HD + (j & (HD - 1))], s);
+                }
+                if (tid == 0) {
+                    float s = 0.f;
+                    for (int ww = 0; ww < NW; ++ww) s += s_red[ww];
+                    atomicAdd(&g_den[2 * head], s);
+                }
+                __syncthreads();
+                if (lane == 0) s_red[warp] = den1;
+                __syncthreads();
+                if (tid == 0) {
+                    float s = 0.f;
+                    for (int ww = 0; ww < NW; ++ww) s += s_red[ww];
+                    atomicAdd(&g_den[2 * head + 1], s);
+                }
+            }
+            grid.sync();
+
+            /* ---------------- stage 3: O projection (split-K) ---------------- */
+            {
+                float* s_ao = s_u;   /* [2048] */
+                if (tid < NQ) s_rd[tid] = 1.f / g_den[tid];
+                __syncthreads();
+                for (int j = tid; j < NQ * HD; j += NTHREADS) s_ao[j] = g_num[j] * s_rd[j >> 7];
+                if (bid == 0)
+                    for (int j = tid; j < HID; j += NTHREADS) g_dout[j] = 0.f;
+                __syncthreads();
+
+                for (int t = gwarp; t < HID * OSPLIT; t += NWG) {
+                    int m = t & (HID - 1);
+                    int c = t >> 10;
+                    float v = warp_dot<O_KC / 256>(w.o_proj + (size_t)m * (NQ * HD), s_ao, lane, c * O_KC, POL_W);
+                    if (lane == 0) atomicAdd(&g_oout[m], v);
+                }
+            }
+            grid.sync();
+
+            /* ---------------- stage 4: attn residual + post-norm + gate/up ---------------- */
+            {
+                for (int j = tid; j < HID; j += NTHREADS) s_resid2[j] = s_resid[j] + g_oout[j];
+                __syncthreads();
+                float ss = 0.f;
+                for (int j = tid; j < HID; j += NTHREADS) { float v = s_resid2[j]; ss += v * v; }
+                float tot = block_sum(ss, s_red, tid, lane, warp);
+                float sc = rsqrtf(tot / (float)HID + RMS_EPS);
+                for (int j = tid; j < HID; j += NTHREADS)
+                    s_u[j] = s_resid2[j] * sc * __bfloat162float(w.post_ln[j]);
+                __syncthreads();
+
+                for (int t = gwarp; t < 2 * INTER; t += NWG) {
+                    int r = t;
+                    const bf16* wr;
+                    float* dst;
+                    if (t < INTER) { wr = w.gate_proj + (size_t)t * HID;           dst = g_gate + t; }
+                    else           { r = t - INTER; wr = w.up_proj + (size_t)r * HID; dst = g_up + r; }
+                    float v = warp_dot<HID / 256>(wr, s_u, lane, 0, POL_W);
+                    if (lane == 0) *dst = v;
+                }
+            }
+            grid.sync();
+
+            /* ---------------- stage 5: SwiGLU + down projection (split-K) ---------------- */
+            {
+                float* s_act = s_u;   /* [3072] */
+                for (int j = tid; j < INTER; j += NTHREADS) {
+                    float gt = g_gate[j];
+                    s_act[j] = (gt / (1.f + __expf(-gt))) * g_up[j];
+                }
+                __syncthreads();
+                for (int t = gwarp; t < HID * DSPLIT; t += NWG) {
+                    int m = t & (HID - 1);
+                    int c = t >> 10;
+                    float v = warp_dot<D_KC / 256>(w.down_proj + (size_t)m * INTER, s_act, lane, c * D_KC, POL_W);
+                    if (lane == 0) atomicAdd(&g_dout[m], v);
+                }
+            }
+            grid.sync();
+        }
+    }
+
+    /* final hidden = bf16(resid2 + down_out) of the last layer of the last step */
+    if (bid == 0)
+        for (int j = tid; j < HID; j += NTHREADS)
+            g_hidden[j] = __float2bfloat16(s_resid2[j] + g_dout[j]);
+}
+
+static int g_sms = -1;
+static int g_percap = -1;
+
+/* default grid = exactly one block per SM: a cooperative grid must be fully resident,
+   and any block count that is not a multiple of the SM count would leave some SMs with
+   2 blocks and others with 1, so every barrier would wait on the doubled-up SMs. */
+int mq_blocks() {
+    if (g_sms < 0) {
+        int dev = 0;
+        cudaGetDevice(&dev);
+        cudaDeviceProp p;
+        cudaGetDeviceProperties(&p, dev);
+        g_sms = p.multiProcessorCount;
+        cudaOccupancyMaxActiveBlocksPerMultiprocessor(&g_percap, (void*)mq_decode, NTHREADS, 0);
+        if (g_percap < 1) g_percap = 1;
+    }
+    return g_sms;
+}
+
+int mq_max_blocks_per_sm() { mq_blocks(); return g_percap; }
+
+void mq_launch(long long lw, long long kvp, long long nlayers,
+               long long qkv, long long num, long long den, long long oout,
+               long long dout, long long gate, long long up, long long rope,
+               long long ropeinv, long long rnd, long long hidden,
+               long long start_pos, long long n_steps,
+               double l2_keep, double l2_stream, long long nblocks) {
+    int nb = (nblocks > 0) ? (int)nblocks : mq_blocks();
+    const LayerW* a0 = (const LayerW*)lw;
+    const KVRef*  a1 = (const KVRef*)kvp;
+    int a2 = (int)nlayers;
+    float* a3 = (float*)qkv;  float* a4 = (float*)num;  float* a5 = (float*)den;
+    float* a6 = (float*)oout; float* a7 = (float*)dout; float* a8 = (float*)gate;
+    float* a9 = (float*)up;   float* a10 = (float*)rope;
+    const float* a11 = (const float*)ropeinv;
+    const bf16* a12 = (const bf16*)rnd;
+    bf16* a13 = (bf16*)hidden;
+    int a14 = (int)start_pos; int a15 = (int)n_steps;
+    float a16 = (float)l2_keep; float a17 = (float)l2_stream;
+    void* args[] = {&a0,&a1,&a2,&a3,&a4,&a5,&a6,&a7,&a8,&a9,&a10,&a11,&a12,&a13,&a14,&a15,&a16,&a17};
+    cudaError_t st = cudaLaunchCooperativeKernel((void*)mq_decode, dim3(nb), dim3(NTHREADS),
+                                                 args, 0, at::cuda::getCurrentCUDAStream());
+    /* Raise rather than warn: a cooperative launch that does not fit would otherwise
+       leave every output buffer untouched and silently produce garbage numerics. */
+    TORCH_CHECK(st == cudaSuccess, "mq_decode cooperative launch failed: ",
+                cudaGetErrorString(st), " (blocks=", nb, " threads=", NTHREADS,
+                ", max resident blocks/SM=", g_percap, ")");
+}
+"""
+
+_CPP_SRC = r"""
+#include <torch/extension.h>
+#include <c10/cuda/CUDAStream.h>
+int mq_blocks();
+int mq_max_blocks_per_sm();
+void mq_launch(long long, long long, long long, long long, long long, long long, long long,
+               long long, long long, long long, long long, long long, long long, long long,
+               long long, long long, double, double, long long);
+"""
+
+_ext = None
+
+
+def _get_ext():
+    global _ext
+    if _ext is None:
+        _ext = load_inline(
+            name=f"mq_decode_ext_w{BLOCK_WARPS}",
+            cpp_sources=_CPP_SRC,
+            cuda_sources=_CUDA_SRC,
+            functions=["mq_launch", "mq_blocks", "mq_max_blocks_per_sm"],
+            # NOTE: deliberately NOT --use_fast_math. It would rewrite the RoPE sincosf
+            # into __sincosf, whose range reduction breaks down at ctx-scale angles
+            # (pos=131071 rad). See the rope comment in the kernel.
+            extra_cuda_cflags=[
+                "-O3",
+                f"-DNW={BLOCK_WARPS}",
+                "-gencode", "arch=compute_120,code=sm_120",
+                "--expt-relaxed-constexpr",
+            ],
+            verbose=False,
+        )
+    return _ext
+
+
+class Block(nn.Module):
+    """Same parameter set / names / shapes as the eager block."""
+
+    def __init__(self):
+        super().__init__()
+        H, IM, D = HIDDEN, INTERMEDIATE, HEAD_DIM
+        self.input_ln = nn.Parameter(torch.ones(H, dtype=torch.bfloat16))
+        self.q_proj = nn.Parameter(torch.empty(NUM_Q * D, H, dtype=torch.bfloat16))
+        self.k_proj = nn.Parameter(torch.empty(NUM_KV * D, H, dtype=torch.bfloat16))
+        self.v_proj = nn.Parameter(torch.empty(NUM_KV * D, H, dtype=torch.bfloat16))
+        self.q_norm = nn.Parameter(torch.ones(D, dtype=torch.bfloat16))
+        self.k_norm = nn.Parameter(torch.ones(D, dtype=torch.bfloat16))
+        self.o_proj = nn.Parameter(torch.empty(H, NUM_Q * D, dtype=torch.bfloat16))
+        self.post_ln = nn.Parameter(torch.ones(H, dtype=torch.bfloat16))
+        self.gate_proj = nn.Parameter(torch.empty(IM, H, dtype=torch.bfloat16))
+        self.up_proj = nn.Parameter(torch.empty(IM, H, dtype=torch.bfloat16))
+        self.down_proj = nn.Parameter(torch.empty(H, IM, dtype=torch.bfloat16))
+        for p in self.parameters():
+            if p.dim() >= 2:
+                nn.init.normal_(p, std=0.02)
+
+
+class Model(nn.Module):
+    def __init__(self, num_layers: int = NUM_LAYERS, max_seq: int = 131072):
+        super().__init__()
+        self.num_layers = num_layers
+        self.max_seq = max_seq
+        self.blocks = nn.ModuleList([Block() for _ in range(num_layers)])
+        # plain attributes -> not part of state_dict, so load_state_dict(strict=True) matches
+        self._wtab = None
+        self._scratch = None
+        self._kvkey = None
+        self._kvtab = None
+
+
+def _build_wtab(model: Model) -> torch.Tensor:
+    """Pack the LayerW struct array: 11 pointers + a float, padded to 96B per layer.
+
+    Layout must mirror the CUDA `struct LayerW` exactly. The weights are consumed
+    straight out of the state_dict -- row-major [out, in] is already the right layout
+    for a warp-per-row GEMV (each row is 2048/4096/6144 B, so every row start is at
+    least 32B-aligned), so there is no repacked second copy to keep coherent.
+    """
+    dev = model.blocks[0].q_proj.device
+    rows = []
+    for b in model.blocks:
+        ptrs = [
+            b.input_ln.data_ptr(), b.q_proj.data_ptr(), b.k_proj.data_ptr(),
+            b.v_proj.data_ptr(), b.q_norm.data_ptr(), b.k_norm.data_ptr(),
+            b.o_proj.data_ptr(), b.post_ln.data_ptr(), b.gate_proj.data_ptr(),
+            b.up_proj.data_ptr(), b.down_proj.data_ptr(),
+        ]
+        knorm_absmax = b.k_norm.float().abs().max().item()
+        qnorm_absmax = b.q_norm.float().abs().max().item()
+        # exp(s-M) with |s| <= M must not underflow: needs 2*M < ~87 (fp32 exp range).
+        bound = math.sqrt(HEAD_DIM) * qnorm_absmax * knorm_absmax
+        if not (bound < 40.0):
+            raise ValueError(
+                f"score bound sqrt(D)*max|q_norm|*max|k_norm| = {bound:.3f} is too large for "
+                "the fixed-offset softmax; this geometry expects ~11.3"
+            )
+        blob = torch.tensor(ptrs, dtype=torch.int64).view(torch.uint8).clone()
+        tail = torch.zeros(8, dtype=torch.uint8)
+        tail[:4] = torch.tensor([knorm_absmax], dtype=torch.float32).view(torch.uint8)
+        rows.append(torch.cat([blob, tail]))
+    return torch.cat(rows).to(dev)
+
+
+def _build_kvtab(model: Model, k_caches, v_caches) -> torch.Tensor:
+    dev = k_caches[0].device
+    rows = []
+    for kc, vc in zip(k_caches, v_caches, strict=True):
+        assert kc.shape[0] == NUM_KV and kc.shape[2] == HEAD_DIM, kc.shape
+        assert kc.stride(2) == 1 and vc.stride(2) == 1, "kv head_dim must be contiguous"
+        rows.append(torch.tensor(
+            [kc.data_ptr(), vc.data_ptr(), kc.stride(0), kc.stride(1)], dtype=torch.int64
+        ))
+    return torch.cat(rows).view(torch.uint8).to(dev)
+
+
+def _rope_inv(device) -> torch.Tensor:
+    half = HEAD_DIM // 2
+    inv = 1.0 / (10000 ** (torch.arange(0, half, dtype=torch.float32) / half))
+    return inv.to(device)
+
+
+def _prepare(model: Model):
+    if model._wtab is None:
+        model._wtab = _build_wtab(model)
+        dev = model.blocks[0].q_proj.device
+        model._scratch = {
+            "qkv": torch.zeros(4096, dtype=torch.float32, device=dev),
+            "num": torch.zeros(NUM_Q * HEAD_DIM, dtype=torch.float32, device=dev),
+            "den": torch.zeros(NUM_Q, dtype=torch.float32, device=dev),
+            "oout": torch.zeros(HIDDEN, dtype=torch.float32, device=dev),
+            "dout": torch.zeros(HIDDEN, dtype=torch.float32, device=dev),
+            "gate": torch.zeros(INTERMEDIATE, dtype=torch.float32, device=dev),
+            "up": torch.zeros(INTERMEDIATE, dtype=torch.float32, device=dev),
+            "rope": torch.zeros(HEAD_DIM, dtype=torch.float32, device=dev),
+            "ropeinv": _rope_inv(dev),
+        }
+    return model._wtab, model._scratch
+
+
+def empty_caches(num_layers: int, max_seq: int, device, dtype=torch.bfloat16):
+    k = [torch.zeros(NUM_KV, max_seq, HEAD_DIM, device=device, dtype=dtype) for _ in range(num_layers)]
+    v = [torch.zeros(NUM_KV, max_seq, HEAD_DIM, device=device, dtype=dtype) for _ in range(num_layers)]
+    return k, v
+
+
+def _seeded_hidden(seed: int, device) -> torch.Tensor:
+    g = torch.Generator(device="cpu")
+    g.manual_seed(seed)
+    return torch.randn(HIDDEN, generator=g, dtype=torch.bfloat16).to(device)
+
+
+_STEP_CHUNK = 4096
+
+
+@torch.no_grad()
+def _run_steps(model: Model, hidden, k_caches, v_caches, start_pos, n_steps, rng_seed):
+    """Shared engine for prefill and decode: identical recurrence, identical kernel."""
+    ext = _get_ext()
+    wtab, sc = _prepare(model)
+    dev = hidden.device
+
+    key = (k_caches[0].data_ptr(), v_caches[0].data_ptr(), k_caches[0].stride(0))
+    if model._kvkey != key:
+        model._kvtab = _build_kvtab(model, k_caches, v_caches)
+        model._kvkey = key
+    kvtab = model._kvtab
+
+    h = hidden.detach().contiguous().clone()   # kernel writes the final hidden in place
+    g = torch.Generator(device="cpu")
+    g.manual_seed(rng_seed)
+
+    done = 0
+    while done < n_steps:
+        n = min(_STEP_CHUNK, n_steps - done)
+        rnd = torch.randn(n, HIDDEN, generator=g, dtype=torch.bfloat16).to(dev, non_blocking=True)
+        ext.mq_launch(
+            wtab.data_ptr(), kvtab.data_ptr(), model.num_layers,
+            sc["qkv"].data_ptr(), sc["num"].data_ptr(), sc["den"].data_ptr(),
+            sc["oout"].data_ptr(), sc["dout"].data_ptr(), sc["gate"].data_ptr(),
+            sc["up"].data_ptr(), sc["rope"].data_ptr(), sc["ropeinv"].data_ptr(),
+            rnd.data_ptr(), h.data_ptr(), start_pos + done, n,
+            L2_KEEP, L2_STREAM, GRID_BLOCKS,
+        )
+        done += n
+    return h, k_caches, v_caches
+
+
+@torch.no_grad()
+def prefill(model: Model, ctx_len: int, seed: int, device=None):
+    """Build a real KV cache of length ctx_len. Untimed, but uses the same kernel."""
+    device = device or next(model.parameters()).device
+    model = model.to(device).eval()
+    assert ctx_len <= model.max_seq
+    h = _seeded_hidden(seed, device)
+    k_caches, v_caches = empty_caches(model.num_layers, model.max_seq, device)
+    if ctx_len > 0:
+        h, k_caches, v_caches = _run_steps(model, h, k_caches, v_caches, 0, ctx_len, seed + 1)
+    return h, k_caches, v_caches
+
+
+@torch.no_grad()
+def decode_steps(model: Model, hidden, k_caches, v_caches, start_pos: int, n_steps: int, seed: int):
+    """Run n_steps decode steps starting at start_pos. This is the timed path."""
+    return _run_steps(model, hidden, k_caches, v_caches, start_pos, n_steps, seed + 2)
+
+
+def run(ctx_len: int, n_decode: int, seed: int, model: Model | None = None, max_seq: int | None = None) -> dict:
+    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    max_seq = max_seq or max(ctx_len + n_decode, 512)
+    if model is None:
+        model = Model(NUM_LAYERS, max_seq)
+    elif getattr(model, "max_seq", 0) < ctx_len + n_decode:
+        raise ValueError(
+            f"model.max_seq={getattr(model, 'max_seq', None)} too small for "
+            f"ctx_len={ctx_len}+n_decode={n_decode}"
+        )
+    model = model.to(device).eval()
+    h, k_caches, v_caches = prefill(model, ctx_len, seed, device=device)
+    h, k_caches, v_caches = decode_steps(
+        model, h, k_caches, v_caches, start_pos=ctx_len, n_steps=n_decode, seed=seed
+    )
+    return {"last_hidden": h.detach(), "ctx_len": ctx_len, "decode_steps": n_decode}
+
+
+def get_init_inputs():
+    return [NUM_LAYERS, 131072]
+
+
+def get_inputs():
+    return []

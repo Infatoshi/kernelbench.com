@@ -91,8 +91,16 @@ for rj in glob.glob(str(RUNS_DIR/"2026*/result.json")):
     if not h or not m: continue
     run_dir = os.path.dirname(rj)
     if _contaminated(run_dir, rid):
-        print(f"  EXCLUDED (contaminated, read other archive): {rid}", file=sys.stderr)
-        continue
+        # The regex tripwire over-fires on parallel sweeps: sibling run ids leak
+        # into transcripts passively via the shared gpu.lock owner file and ps
+        # output. A manual audit (results/annotations/, which includes a
+        # contamination read of the transcript) marked `clean` overrides it;
+        # anything unaudited or non-clean stays excluded.
+        if ann.get(rid, (None, None))[0] == "clean":
+            print(f"  tripwire overridden (manual audit clean): {rid}", file=sys.stderr)
+        else:
+            print(f"  EXCLUDED (contaminated, read other archive): {rid}", file=sys.stderr)
+            continue
     has_sol_file = os.path.exists(os.path.join(run_dir, "solution.py"))
     has_check = os.path.exists(os.path.join(run_dir, "check.log"))
     cells[(h,m,e)].setdefault(prob, []).append({
