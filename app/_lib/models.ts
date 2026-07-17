@@ -123,11 +123,12 @@ export const SITE_HIDDEN_GPUS = new Set(["rtx3090"])
  */
 export const DEFAULT_GPU = "b200"
 
-/** Homepage / deck GPU tabs: B200 first, then RTX PRO 6000, then H100. */
+/** Homepage / deck GPU tabs: H100 → RTX PRO 6000 → B200. Default selection
+ *  remains DEFAULT_GPU (B200). */
 export const HOME_GPU_TABS: { key: string; label: string }[] = [
-  { key: "b200", label: "B200" },
-  { key: "rtxpro6000", label: "RTX PRO 6000" },
   { key: "h100", label: "H100" },
+  { key: "rtxpro6000", label: "RTX PRO 6000" },
+  { key: "b200", label: "B200" },
 ]
 
 /** Homepage ranking chart order (Mega → CUDA → Hard). */

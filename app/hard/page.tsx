@@ -20,13 +20,12 @@ export default async function HardPage({
     bars: barsForBench(idx, "hard", gpu),
   })
 
-  // B200 first: default entry view (see DEFAULT_GPU). Other boards remain
-  // one click away; ?gpu= still deep-links any board.
+  // Tab order H100 → RTX PRO 6000 → B200; default selection is DEFAULT_GPU.
   const views: GpuView[] = [
     {
-      key: "b200",
-      label: gpuLabels.b200 ?? "B200",
-      ...mk("b200"),
+      key: "h100",
+      label: gpuLabels.h100 ?? "H100 PCIe",
+      ...mk("h100"),
     },
     {
       key: "rtxpro6000",
@@ -36,9 +35,9 @@ export default async function HardPage({
       ...mk(),
     },
     {
-      key: "h100",
-      label: gpuLabels.h100 ?? "H100 PCIe",
-      ...mk("h100"),
+      key: "b200",
+      label: gpuLabels.b200 ?? "B200",
+      ...mk("b200"),
     },
   ]
 

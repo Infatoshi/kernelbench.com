@@ -26,15 +26,15 @@ export default async function MegaPage({
     bars: barsForBench(idx, "mega", gpu),
   })
 
-  // B200 first: default entry view (see DEFAULT_GPU).
+  // Tab order H100 → RTX PRO 6000 → B200; default selection is DEFAULT_GPU.
   const views: GpuView[] = [
-    { key: "b200", label: gpuLabels.b200 ?? "B200", ...mk("b200") },
+    { key: "h100", label: gpuLabels.h100 ?? "H100", ...mk("h100") },
     {
       key: "rtxpro6000",
       label: gpuLabels.rtxpro6000 ?? "RTX PRO 6000 Blackwell",
       ...mk(),
     },
-    { key: "h100", label: gpuLabels.h100 ?? "H100", ...mk("h100") },
+    { key: "b200", label: gpuLabels.b200 ?? "B200", ...mk("b200") },
   ]
 
   return (

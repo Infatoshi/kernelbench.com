@@ -76,9 +76,9 @@ const benchmarks = [
     title: "Mega",
     tagline: "Whole-block fused megakernels, graded on decode speedup over optimized PyTorch.",
     gpus: [
-      { label: "B200", href: "/mega?gpu=b200" },
-      { label: "RTX PRO 6000", href: "/mega?gpu=rtxpro6000" },
       { label: "H100", href: "/mega?gpu=h100" },
+      { label: "RTX PRO 6000", href: "/mega?gpu=rtxpro6000" },
+      { label: "B200", href: "/mega?gpu=b200" },
     ],
     hfHref: "https://huggingface.co/datasets/Infatoshi/kernelbench-mega-traces",
     ghHref:
@@ -100,9 +100,9 @@ const benchmarks = [
     title: "Hard",
     tagline: "Six-op CUDA/Triton deck, roofline-graded, one unlimited agent session per cell.",
     gpus: [
-      { label: "B200", href: "/hard?gpu=b200" },
-      { label: "RTX PRO 6000", href: "/hard?gpu=rtxpro6000" },
       { label: "H100", href: "/hard?gpu=h100" },
+      { label: "RTX PRO 6000", href: "/hard?gpu=rtxpro6000" },
+      { label: "B200", href: "/hard?gpu=b200" },
     ],
     hfHref: "https://huggingface.co/datasets/Infatoshi/kernelbench-hard-traces",
     ghHref:
