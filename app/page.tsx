@@ -1,7 +1,7 @@
 import Link from "next/link"
 import { EfficiencyChart } from "./efficiency-chart"
 import { loadEfficiency } from "@/app/_lib/charts"
-import { columnOrder, columnsForBench, columnsForCorrectness } from "@/app/_lib/models"
+import { SITE_HIDDEN_GPUS, columnOrder, columnsForBench, columnsForCorrectness } from "@/app/_lib/models"
 import { loadModelIndex } from "@/app/_lib/models.server"
 import { ModelScoreboards } from "@/app/_components/model-columns"
 
@@ -89,7 +89,6 @@ const benchmarks = [
       { label: "RTX PRO 6000", href: "/hard" },
       { label: "H100", href: "/hard?gpu=h100" },
       { label: "B200", href: "/hard?gpu=b200" },
-      { label: "RTX 3090", href: "/hard?gpu=rtx3090" },
     ],
     hfHref: "https://huggingface.co/datasets/Infatoshi/kernelbench-hard-traces",
     ghHref:
@@ -186,7 +185,7 @@ export default async function HomePage() {
   const correctnessChart = columnsForCorrectness(modelIdx, ordered)
   const boards = (["mega", "hard", "cuda"] as const).reduce((n, b) => {
     const g = modelIdx.benches[b]?.gpu_labels
-    return n + (g ? Object.keys(g).length : 1)
+    return n + (g ? Object.keys(g).filter((k) => !SITE_HIDDEN_GPUS.has(k)).length : 1)
   }, 0)
   return (
     <div className="space-y-12">

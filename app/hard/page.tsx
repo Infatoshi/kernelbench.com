@@ -38,11 +38,6 @@ export default async function HardPage({
       label: gpuLabels.b200 ?? "B200",
       ...mk("b200"),
     },
-    {
-      key: "rtx3090",
-      label: gpuLabels.rtx3090 ?? "RTX 3090",
-      ...mk("rtx3090"),
-    },
   ]
 
   return (
@@ -89,19 +84,6 @@ export default async function HardPage({
               and roofline grading; peak fraction is measured against B200
               dense peaks (fp8 4500, bf16 2250 TFLOPS), so the same kernel
               reads as a smaller fraction of a much higher ceiling.
-            </p>
-            <p>
-              <strong>RTX 3090.</strong> The first consumer/Ampere part in the
-              set: a single RTX 3090 (SM86, GDDR6X, 936 GB/s). Ampere has no
-              FP8 tensor cores, so the FP8 GEMM problem is dropped entirely —
-              five problems, not six. The memory-bound cells (paged attention,
-              top-k, W4A16) port cleanly and lead the board, with
-              paged-attention decode reaching ~66% of the 936 GB/s ceiling; the
-              bf16 compute cells (KDA, sonic-MoE) run against Ampere&apos;s
-              much lower bf16 peak. GLM-5.2 is a clean 5/5 and its
-              paged-attention kernel holds the board&apos;s top bandwidth
-              fraction (~66%). Only MiniMax-M3 is partial — its sweep was cut
-              short by provider rate limits.
             </p>
           </>
         }

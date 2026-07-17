@@ -6,8 +6,9 @@ import { usePathname } from "next/navigation"
 // Sticky site header: wordmark + primary nav + source links. Active route is
 // derived client-side so every page gets the same server-rendered shell.
 
+// Wordmark is the home/dashboard link; Models is the roster of every ranked
+// model. No separate "Charts" entry — the homepage IS the charts.
 const NAV = [
-  { href: "/", label: "Charts" },
   { href: "/models", label: "Models" },
   { href: "/hard", label: "Hard" },
   { href: "/mega", label: "Mega" },

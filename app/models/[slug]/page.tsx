@@ -3,6 +3,7 @@ import { notFound } from "next/navigation"
 import {
   BENCH_LABELS,
   FLAG_VERDICTS,
+  SITE_HIDDEN_GPUS,
   auditChipClass,
   benchValue,
   brandFor,
@@ -175,7 +176,9 @@ function BenchPanel({
   const block = model.benches[bench]!
   const meta = idx.benches[bench]
   const canonicalLabel = meta?.gpu_labels?.["rtxpro6000"] ?? "RTX PRO 6000"
-  const gpuKeys = (meta?.gpus ?? []).filter((g) => g !== "rtxpro6000" && block.gpus?.[g])
+  const gpuKeys = (meta?.gpus ?? []).filter(
+    (g) => g !== "rtxpro6000" && !SITE_HIDDEN_GPUS.has(g) && block.gpus?.[g],
+  )
   const full = block.total_problems > 0 && block.passed >= block.total_problems
   const harness = [block.harness, block.effort].filter(Boolean).join(" · ")
   return (

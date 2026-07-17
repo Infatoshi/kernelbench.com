@@ -5,7 +5,7 @@ import type { BarView } from "../_lib/models"
 import { ModelBars } from "./model-bars"
 
 // Client wrapper for benches with multiple per-GPU boards (hard: RTX PRO 6000,
-// H100, B200, RTX 3090; mega: 3 boards). Data is precomputed server-side per
+// H100, B200; mega: 3 boards). Data is precomputed server-side per
 // GPU; this just switches between the bar-chart views.
 
 export interface GpuView {

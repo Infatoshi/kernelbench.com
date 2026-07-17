@@ -104,6 +104,13 @@ export const FLAG_VERDICTS = new Set([
 ])
 
 /**
+ * Boards hidden site-wide (2026-07-17): RTX 3090 results stay in the data
+ * files (and the v3 archive), but the current site presents only the three
+ * live boards. Filter any per-GPU UI through this before rendering.
+ */
+export const SITE_HIDDEN_GPUS = new Set(["rtx3090"])
+
+/**
  * Lab brand presentation for charts (AA-style: bar color + logo keyed by lab).
  * Logos are white-fill SVGs vendored from simple-icons into public/logos/labs.
  * Labs without a vendored mark render a letter chip instead.

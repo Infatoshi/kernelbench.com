@@ -124,19 +124,18 @@ export type EffData = {
 export type EffByGpu = Record<string, EffData>
 
 // Candidate GPUs in display order; only those with clean token telemetry for a
-// benchmark actually appear (the loader drops empty ones).
-export const EFF_GPU_ORDER = ["RTX PRO 6000", "H100", "B200", "RTX 3090"]
+// benchmark actually appear (the loader drops empty ones). RTX 3090 is hidden
+// site-wide (2026-07-17) — its entries below are dropped with it.
+export const EFF_GPU_ORDER = ["RTX PRO 6000", "H100", "B200"]
 const MEGA_GPU_MAP: Record<string, string> = {
   "RTX PRO 6000 Blackwell": "RTX PRO 6000",
   H100: "H100",
   B200: "B200",
-  "RTX 3090": "RTX 3090",
 }
 const HARD_SRC: Record<string, { lb: string; runs: string }> = {
   "RTX PRO 6000": { lb: "benchmarks/hard/results/leaderboard.json", runs: "benchmarks/hard/outputs/runs" },
   H100: { lb: "benchmarks/hard/results/leaderboard.h100.json", runs: "benchmarks/hard/outputs/runs-h100" },
   B200: { lb: "benchmarks/hard/results/leaderboard.b200.json", runs: "benchmarks/hard/outputs/runs-b200" },
-  "RTX 3090": { lb: "benchmarks/hard/results/leaderboard.rtx3090.json", runs: "benchmarks/hard/outputs/runs-rtx3090" },
 }
 
 function markFrontier(points: EffPoint[]): EffPoint[] {
