@@ -415,11 +415,13 @@ PERF_EXCLUDE: dict[str, set[str]] = {"mega": {"01_rl_grid_ppo"}}
 
 
 def compute_perf(models: Models) -> None:
-    """perf = mean(cell score / board-best score) over valid cells.
+    """perf = mean(cell score / board-best score) over the FULL problem deck.
 
-    Bests are recomputed from the CURRENT board rows post-flag — never from
-    v2 per_problem bests, which can be stale relative to editorial board drops
-    or flag a hacked run as the normalizing constant (mega).
+    Failed / invalid / missing cells score 0. Denominator is every problem that
+    appears on this board (minus PERF_EXCLUDE), not only the cells a model
+    passed — otherwise a 3/6 model can outrank a 6/6 model on mean alone.
+
+    Bests are recomputed from CURRENT board rows post-flag (valid cells only).
     """
     for bench in ("hard", "mega", "cuda"):
         blocks = [e["benches"][bench] for e in models.by_slug.values() if bench in e["benches"]]
@@ -427,23 +429,44 @@ def compute_perf(models: Models) -> None:
         gpu_keys = sorted({k for b in blocks for k in b.get("gpus", {})})
         for g in gpu_keys:
             groups.append([b["gpus"][g] for b in blocks if g in b.get("gpus", {})])
+        exclude = PERF_EXCLUDE.get(bench, set())
         for group in groups:
+            if not group:
+                continue
+            # Deck = union of problems any model on this board has a cell for.
+            deck = sorted(
+                {
+                    prob
+                    for b in group
+                    for prob in b.get("cells", {})
+                    if prob not in exclude
+                }
+            )
+            if not deck:
+                for b in group:
+                    b["perf"] = None
+                continue
             best: dict[str, float] = {}
             for b in group:
                 for prob, cell in b.get("cells", {}).items():
+                    if prob in exclude:
+                        continue
                     s = cell.get("score")
                     if cell.get("valid") and s and s > best.get(prob, 0.0):
                         best[prob] = s
             for b in group:
-                rs, n = 0.0, 0
-                for prob, cell in b.get("cells", {}).items():
-                    if prob in PERF_EXCLUDE.get(bench, ()):
-                        continue
+                # No cells at all → not on this board.
+                if not b.get("cells"):
+                    b["perf"] = None
+                    continue
+                rs = 0.0
+                for prob in deck:
+                    cell = b.get("cells", {}).get(prob) or {}
                     s = cell.get("score")
                     if cell.get("valid") and s and best.get(prob, 0.0) > 0:
                         rs += s / best[prob]
-                        n += 1
-                b["perf"] = norm_perf(rs, n)
+                    # else: 0 contribution (fail / invalid / missing)
+                b["perf"] = norm_perf(rs, len(deck))
 
 
 GPU_LABELS = {
@@ -495,7 +518,8 @@ def finalize(models: Models) -> dict:
         "benches": bench_meta,
         "methodology": (
             "Rank per bench: valid passes (audited-clean correct cells / problems) desc, "
-            "then mean normalized performance (cell score / board best per problem) desc. "
+            "then mean normalized performance over the FULL problem deck (cell score / "
+            "board best per problem; fail/invalid/missing cells count as 0) desc. "
             "Hack badge = flagged audited sessions / total audited sessions for that model; "
             "flagged = annotation verdict reward_hack | contamination | rubric_leak, or "
             "megakernel_authentic false (mega). Verdicts come from per-run audit YAMLs, not "

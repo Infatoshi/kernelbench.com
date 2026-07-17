@@ -217,15 +217,25 @@ export async function loadEfficiency(): Promise<{ mega: EffByGpu; hard: EffByGpu
     } catch {
       continue
     }
+    // Full deck = every problem that appears on this leaderboard (same for all models).
+    const deck = new Set<string>()
+    for (const m of lb.models) {
+      for (const p of Object.keys(m.results || {})) deck.add(p)
+    }
+    const deckN = deck.size || 1
     const pts: EffPoint[] = []
     for (const m of lb.models) {
       if (isRemovedModel(m.model)) continue
       const name = shortName(m.model)
-      const pfs: number[] = []
+      let sumPf = 0
       let tok = 0
-      for (const c of Object.values(m.results)) {
-        if (!c.correct || c.peak_fraction == null) continue
-        pfs.push(c.peak_fraction)
+      let any = false
+      for (const p of deck) {
+        const c = m.results?.[p]
+        if (!c) continue
+        any = true
+        if (c.correct && c.peak_fraction != null) sumPf += c.peak_fraction
+        // fail / missing peak → 0 contribution to mean
         tok += c.output_tokens ?? 0
       }
       // 50k floor: a model that genuinely solved hard kernels spent >>50k tokens
@@ -234,11 +244,12 @@ export async function loadEfficiency(): Promise<{ mega: EffByGpu; hard: EffByGpu
       // frontier isn't distorted by fake hyper-efficiency points. Harnesses that
       // never record output_tokens (e.g. Grok streaming) are omitted from this
       // scatter until tokens are backfilled into the leaderboard cell.
-      if (pfs.length && tok > 50000) {
+      if (any && tok > 50000) {
         pts.push({
           label: name,
           x: tok,
-          y: (pfs.reduce((a, b) => a + b, 0) / pfs.length) * 100,
+          // Full-deck mean: fails count as 0 so partial decks don't inflate y.
+          y: (sumPf / deckN) * 100,
           frontier: false,
         })
       }

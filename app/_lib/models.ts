@@ -354,8 +354,8 @@ export interface BarRow {
   subtitle: string
   passed: number
   total: number
-  /** bench-native display metric: mean peak fraction (hard/cuda) or best
-   *  speedup over baseline (mega) across valid cells */
+  /** bench-native display metric: full-deck mean peak fraction (hard/cuda;
+   *  fails = 0) or best speedup over baseline (mega) */
   value: number
   display: string
   flagged: number
@@ -370,35 +370,71 @@ export interface BarView {
   maxValue: number
 }
 
+/** Problem ids that enter the mean/max for a bench board. Fails/missing count
+ *  as 0 in hard/cuda means — only PERF-style exclusions drop a problem. */
+function deckProblems(view: GpuBlock, bench: Bench): string[] {
+  return Object.keys(view.cells).filter(
+    (prob) => !(bench === "mega" && MEGA_RANK_EXCLUDE.has(prob)),
+  )
+}
+
+/** Hard/CUDA: mean peak fraction over the full deck (invalid/missing = 0).
+ *  Mega: best valid speedup (unchanged — one primary head-to-head cell). */
+function boardScore(view: GpuBlock, bench: Bench): number | null {
+  const probs = deckProblems(view, bench)
+  if (probs.length === 0) return null
+  if (bench === "mega") {
+    const vals = probs
+      .map((p) => view.cells[p])
+      .filter((c) => c?.valid && c.score != null)
+      .map((c) => c.score!)
+    return vals.length ? Math.max(...vals) : null
+  }
+  // Full-deck mean: each problem contributes its score or 0.
+  let sum = 0
+  for (const p of probs) {
+    const c = view.cells[p]
+    if (c?.valid && c.score != null) sum += c.score
+  }
+  return sum / probs.length
+}
+
 /** AA-style horizontal bar chart data for one bench (optionally one GPU
  *  board): one bar per model, ordered by the same rank rule as the lists
- *  (valid passes desc, then normalized perf desc). */
+ *  (valid passes desc, then full-deck perf desc). */
 export function barsForBench(
   index: ModelIndex,
   bench: Bench,
   gpu?: string,
 ): BarView {
   const { board } = rowsForBench(index, bench, gpu)
+  // Deck = union of problems any ranked model has a cell for on this board.
+  const deckSet = new Set<string>()
+  for (const row of board) {
+    const model = index.models.find((m) => m.slug === row.slug)
+    if (!model?.benches[bench]) continue
+    const view: GpuBlock = gpu ? model.benches[bench]!.gpus[gpu]! : model.benches[bench]!
+    if (!view) continue
+    for (const p of deckProblems(view, bench)) deckSet.add(p)
+  }
+  const deck = [...deckSet].sort()
+
   const rows: BarRow[] = []
   for (const row of board) {
     const model = index.models.find((m) => m.slug === row.slug)!
     const block = model.benches[bench]!
     const view: GpuBlock = gpu ? block.gpus[gpu]! : block
-    const vals = Object.entries(view.cells)
-      .filter(
-        ([prob, c]) =>
-          c.valid &&
-          c.score != null &&
-          !(bench === "mega" && MEGA_RANK_EXCLUDE.has(prob)),
-      )
-      .map(([, c]) => c)
     let value = 0
-    if (vals.length > 0) {
-      if (bench === "mega") {
-        value = Math.max(...vals.map((c) => c.score!))
-      } else {
-        value = vals.reduce((s, c) => s + c.score!, 0) / vals.length
+    if (bench === "mega") {
+      value = boardScore(view, bench) ?? 0
+    } else if (deck.length > 0) {
+      // Mean over the shared board deck so a 3/6 model can't inflate vs 6/6.
+      let sum = 0
+      for (const p of deck) {
+        const c = view.cells[p]
+        if (c?.valid && c.score != null) sum += c.score
       }
+      value = sum / deck.length
     }
     rows.push({
       slug: row.slug,
@@ -418,7 +454,7 @@ export function barsForBench(
   const axis =
     bench === "mega"
       ? "best decode speedup vs optimized-PyTorch baseline (valid cells)"
-      : "mean peak fraction of roofline (valid cells)"
+      : "mean peak fraction of roofline over full deck (fails = 0)"
   return { bench, axis, rows, maxValue }
 }
 
@@ -429,15 +465,12 @@ export function barsForBench(
 // should be able to recompute any chart value by hand):
 //
 // 1) HARD / CUDA performance chart, one column per model:
-//      score_m = mean(peak_fraction) over the model's VALID cells on the
-//                bench's canonical board (valid = correct AND audited-clean;
-//                problems with no valid cell are EXCLUDED from the mean).
-//    Worked example (real data): glm-5.2 has 6/6 valid hard cells whose mean
-//    peak fraction is 0.2614 -> bar renders 26.1% of roofline.
-//    Why no per-problem weighting: a raw mean under-weights launch-bound
-//    problems, it can never be swayed by them — topk's ~0.02 ceiling adds at
-//    most 0.02/6 = 0.3 points to a 6-problem mean, while fp8/KDA (~0.3-0.5)
-//    dominate. That is the same convention the published leaderboard uses.
+//      score_m = mean(peak_fraction) over the FULL problem deck on that board.
+//                valid cell → its peak_fraction; fail / invalid / missing → 0.
+//                Denominator is always |deck|, never "only the problems passed".
+//    Worked example: a model at 3/6 with mean 0.23 among correct cells scores
+//    (sum of 3 peaks) / 6 ≈ 0.115 → bar ~11.5%, not 23%. A 6/6 model at mean
+//    0.21 stays ~21%. Partial decks cannot outrank full decks on average alone.
 //
 // 2) MEGA performance chart:
 //      score_m = max(speedup) over the model's valid cells on the canonical
@@ -614,25 +647,33 @@ export function columnsForBench(
   gpu?: string,
 ): ColChart {
   const models = ordered ?? columnOrder(index)
+  // Shared deck across models on this GPU so everyone uses the same denominator.
+  const deckSet = new Set<string>()
+  for (const m of models) {
+    const view = cellsForBenchGpu(m.benches[bench], bench, gpu)
+    if (!view) continue
+    for (const p of deckProblems(view, bench)) deckSet.add(p)
+  }
+  const deck = [...deckSet].sort()
+
   const columns: ColPoint[] = []
   let maxValue = 0
   for (const m of models) {
     let value: number | null = null
     const view = cellsForBenchGpu(m.benches[bench], bench, gpu)
-    if (view) {
-      const vals = Object.entries(view.cells)
-        .filter(
-          ([prob, c]) =>
-            c.valid &&
-            c.score != null &&
-            !(bench === "mega" && MEGA_RANK_EXCLUDE.has(prob)),
-        )
-        .map(([, c]) => c)
-      if (vals.length > 0) {
-        value =
-          bench === "mega"
-            ? Math.max(...vals.map((c) => c.score!))
-            : vals.reduce((s, c) => s + c.score!, 0) / vals.length
+    if (view && deck.length > 0) {
+      if (bench === "mega") {
+        value = boardScore(view, bench)
+      } else {
+        // Full-deck mean; never attempted / failed / invalid → 0.
+        let sum = 0
+        let any = false
+        for (const p of deck) {
+          const c = view.cells[p]
+          if (c) any = true
+          if (c?.valid && c.score != null) sum += c.score
+        }
+        value = any ? sum / deck.length : null
       }
     }
     if (value != null && value > maxValue) maxValue = value
@@ -664,8 +705,8 @@ export function columnsForBench(
       bench === "mega"
         ? `best decode speedup vs optimized-PyTorch baseline over valid (correct + audited-clean) cells · ${displayGpu}`
         : bench === "cuda"
-          ? `mean peak fraction of roofline over valid cells · ${displayGpu} (CUDA-only deck)`
-          : `mean peak fraction of roofline over valid (correct + audited-clean) cells · ${displayGpu}`,
+          ? `mean peak fraction of roofline over full deck (fails = 0) · ${displayGpu} (CUDA-only deck)`
+          : `mean peak fraction of roofline over full deck (fails = 0) · ${displayGpu}`,
     unit: bench === "mega" ? "x" : "%",
     columns: ranked,
     maxValue: niceCeil(maxValue || 0.01),
