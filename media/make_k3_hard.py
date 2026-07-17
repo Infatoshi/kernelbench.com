@@ -22,8 +22,8 @@ PANELS = {
         "tag": "RTX PRO 6000 Blackwell",
         "models": {
             #               fp8     kda     paged   topk    sonic   w4a16
-            "Kimi K3":     [0.3196, 0.0315, 0.4855, 0.0640, 0.0885, 0.3733],
-            "Kimi K3 [1M]": [0.3529, 0.0493, 0.5811, 0.0895, 0.0329, 0.027],
+            "Kimi K3 (256k)":     [0.3196, 0.0315, 0.4855, 0.0640, 0.0885, 0.3733],
+            "Kimi K3 (1M)": [0.3529, 0.0493, 0.5811, 0.0895, 0.0329, 0.027],
             "Fable 5":     [0.3480, 0.0358, 0.6299, 0.0494, 0.1075, 0.3477],
             "Opus 4.8":    [0.3855, 0.0552, 0.6706, 0.0335, 0.0864, 0.2355],
             "GLM 5.2":     [0.4059, 0.0323, 0.6771, 0.0341, 0.0980, 0.3207],
@@ -35,8 +35,8 @@ PANELS = {
     "h100": {
         "tag": "H100 SXM5",
         "models": {
-            "Kimi K3":     [0.2819, 0.0255, 0.4958, 0.0494, 0.0784, 0.1233],
-            "Kimi K3 [1M]": [0.2290, 0.0157, None,  "FAIL", None,   None],
+            "Kimi K3 (256k)":     [0.2819, 0.0255, 0.5143, 0.0494, 0.0793, 0.3063],
+            "Kimi K3 (1M)": [0.2290, 0.0157, 0.4178, "FAIL", 0.0203, 0.2098],
             "Fable 5":     [0.3033, 0.0152, 0.4605, 0.0470, None,   0.3681],
         },
         "xlim": 0.58,
@@ -44,7 +44,7 @@ PANELS = {
     "b200": {
         "tag": "B200",
         "models": {
-            "Kimi K3":     [0.2222, 0.0057, 0.2117, 0.0101, 0.0760, 0.0425],
+            "Kimi K3 (256k)":     [0.2222, 0.0057, 0.2117, 0.0101, 0.0760, 0.0425],
             "Fable 5":     [0.2535, "FAIL", 0.1696, None,   0.0762, 0.0434],
         },
         "xlim": 0.32,
@@ -57,7 +57,7 @@ MODELS = list(panel["models"])
 DATA = panel["models"]
 # Model->color mapping shared across all article charts (SERIES wraps at 6,
 # and positional coloring would recolor models between per-GPU panels).
-MODEL_COLORS = {"Kimi K3": SERIES[0], "Kimi K3 [1M]": SERIES[1],
+MODEL_COLORS = {"Kimi K3 (256k)": SERIES[0], "Kimi K3 (1M)": SERIES[1],
                 "Fable 5": SERIES[2], "Opus 4.8": SERIES[3],
                 "GLM 5.2": SERIES[4], "GPT-5.6 Sol": SERIES[5],
                 "Grok 4.5": C["warn"]}

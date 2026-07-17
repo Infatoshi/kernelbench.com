@@ -59,7 +59,8 @@ MODEL_NAMES = {
     "minimax-m3": "MiniMax-M3",
     "kimi-k2.7-code": "Kimi K2.7-Code",
     "kimi-k2.6": "Kimi K2.6",
-    "kinetic-0715": "Kimi K3",
+    "kinetic-0715": "Kimi K3 (256k)",
+    "kinetic-0715-1m": "Kimi K3 (1M)",
     "composer-2.5-fast": "Composer 2.5 Fast",
     "composer-2.5": "Composer 2.5",
     "gemini-3.5-flash": "Gemini 3.5 Flash",
@@ -102,9 +103,15 @@ KNOWN_PROBLEMS: set[str] = set()
 
 
 def slugify(model_field: str) -> str:
-    """Canonical model slug: lowercase, provider-path and label-tag stripped."""
+    """Canonical model slug: lowercase, provider-path stripped, label-tag folded.
+
+    A bracket tag is part of the identity (kinetic-0715[1m] is a distinct
+    model entry from kinetic-0715), so fold it into the slug: "x[1m]" -> "x-1m".
+    Run-id-derived fields carry the same tag as "x_1m_"; normalize identically.
+    """
     s = (model_field or "").strip().lower()
-    s = _TAG_TAIL.sub("", s)
+    s = _TAG_TAIL.sub(lambda m: "-" + re.sub(r"[^a-z0-9]", "", m.group(0)), s)
+    s = re.sub(r"_1m_?$", "-1m", s)
     if "/" in s:
         s = s.rsplit("/", 1)[-1]
     return s
@@ -401,6 +408,12 @@ def join_annotations(models: Models, bench: str, ann_dir: Path) -> tuple[list[st
     return sorted(annotation_only), len(files)
 
 
+# Problems excluded from the perf aggregate (cells still display on boards).
+# mega/01_rl_grid_ppo: too few models have attempted it — counting it lets a
+# model's score ride on a problem most of the roster never ran.
+PERF_EXCLUDE: dict[str, set[str]] = {"mega": {"01_rl_grid_ppo"}}
+
+
 def compute_perf(models: Models) -> None:
     """perf = mean(cell score / board-best score) over valid cells.
 
@@ -424,6 +437,8 @@ def compute_perf(models: Models) -> None:
             for b in group:
                 rs, n = 0.0, 0
                 for prob, cell in b.get("cells", {}).items():
+                    if prob in PERF_EXCLUDE.get(bench, ()):
+                        continue
                     s = cell.get("score")
                     if cell.get("valid") and s and best.get(prob, 0.0) > 0:
                         rs += s / best[prob]

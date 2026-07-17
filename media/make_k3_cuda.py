@@ -17,14 +17,14 @@ PROBLEMS = ["glm52_fused_moe", "deepseek_nsa", "megaqwen_decode", "grid_mingru"]
 # 2026-07-17, official benchmark.py protocol; scheduling-sensitive kernels
 # need an idle box for stable timing).
 DATA = {
-    "Kimi K3":      [0.0595, 0.4246, 0.0470, 0.174],
-    "Kimi K3 [1M]": [0.0810, 0.0584, None,   0.224],
+    "Kimi K3 (256k)":      [0.0595, 0.4246, 0.0470, 0.174],
+    "Kimi K3 (1M)": [0.0810, 0.0584, None,   0.224],
     "Opus 4.8":     [0.0653, 0.1784, 0.0097, 0.327],
     "Grok 4.5":     [0.0844, 0.0177, 0.0345, 0.0020],
 }
 MODELS = list(DATA)
 # Model->color mapping shared across all article charts (matches make_k3_hard).
-MODEL_COLORS = {"Kimi K3": SERIES[0], "Kimi K3 [1M]": SERIES[1],
+MODEL_COLORS = {"Kimi K3 (256k)": SERIES[0], "Kimi K3 (1M)": SERIES[1],
                 "Opus 4.8": SERIES[3], "Grok 4.5": C["warn"]}
 
 fig, ax = tight_square(size=10.0)

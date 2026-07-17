@@ -12,17 +12,17 @@ from kbh_theme import C, SERIES, apply, tight_square
 
 apply()
 
-MODELS = ["Kimi K3", "Fable 5", "Opus 4.8", "GLM 5.2", "GPT-5.6 Sol"]
+MODELS = ["Kimi K3 (256k)", "Fable 5", "Opus 4.8", "GLM 5.2", "GPT-5.6 Sol"]
 GPUS = ["RTX PRO 6000", "H100", "B200"]
 DATA = {
-    "Kimi K3":     [18.09, 14.82, None],
+    "Kimi K3 (256k)":     [18.09, 14.82, None],
     "Fable 5":     [18.72, None,  None],
     "Opus 4.8":    [14.40, 15.50, 19.35],
     "GLM 5.2":     [11.14, None,  7.30],
     "GPT-5.6 Sol": [2.64,  None,  None],
 }
 # Model->color mapping shared across all article charts (matches make_k3_hard).
-MODEL_COLORS = {"Kimi K3": SERIES[0], "Fable 5": SERIES[2], "Opus 4.8": SERIES[3],
+MODEL_COLORS = {"Kimi K3 (256k)": SERIES[0], "Fable 5": SERIES[2], "Opus 4.8": SERIES[3],
                 "GLM 5.2": SERIES[4], "GPT-5.6 Sol": SERIES[5]}
 
 fig, ax = tight_square(size=10.0)
