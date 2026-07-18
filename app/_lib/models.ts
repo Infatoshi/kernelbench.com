@@ -792,12 +792,13 @@ function correctnessOf(index: ModelIndex, m: ModelEntry): {
  * untouched. New slugs auto-appear (e.g. the kinetic model lands on publish
  * with no edit here).
  *
- * Curated roster (2026-07-16, per product decision — "one model per lab"):
- *   Anthropic  fable-5, opus-4-8, sonnet-5      OpenAI   5.6-sol, 5.5
+ * Curated roster (2026-07-18):
+ *   Anthropic  fable-5, opus-4-8, sonnet-5      OpenAI   5.6-sol (5.5 removed)
  *   xAI        grok-4.5                          Z.ai     glm-5.2 (5.1 dropped)
  *   DeepSeek   v4-pro (flash dropped)            MiniMax  m3 (m2.7 dropped)
  *   Cursor     composer-2.5-fast                 Meituan  longcat-2.0
- *   Moonshot   kinetic model when it lands (k2.6/k2.7 dropped)
+ *   Moonshot   kinetic-0715 / 1m (k2.6/k2.7 dropped)
+ *   Tencent    hy3 (hy3-preview removed)
  *   Google     none — both gemini models removed site-wide (see
  *              REMOVED_MODEL_SLUGS in models.server.ts)
  */
@@ -819,7 +820,9 @@ export const CHART_HIDDEN_SLUGS = new Set([
   "fugu-ultra",
   "nemotron-3-ultra-550b-a55b",
   "mimo-v2.5-pro",
-  // Preview / non-canonical ids — not what labs want cited
+  // Also in REMOVED_MODEL_SLUGS — kept here as belt-and-suspenders for charts
+  // that don't go through loadModelIndex.
+  "gpt-5.5",
   "hy3-preview",
   "tencent-hy3-preview",
   "tencent/hy3-preview",

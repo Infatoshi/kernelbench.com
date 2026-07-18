@@ -8,7 +8,16 @@ import type { ModelIndex } from "./models"
 /** Models pulled from the site entirely (every chart, /models, model pages).
  *  Filtered at load so `kb publish` regenerating models.json can't
  *  resurrect them. */
-const REMOVED_MODEL_SLUGS = new Set(["gemini-3.1-pro-preview", "gemini-3.5-flash"])
+const REMOVED_MODEL_SLUGS = new Set([
+  "gemini-3.1-pro-preview",
+  "gemini-3.5-flash",
+  // Superseded by gpt-5.6-sol
+  "gpt-5.5",
+  // Retired preview ids — canonical is `hy3` only
+  "hy3-preview",
+  "tencent-hy3-preview",
+  "tencent/hy3-preview",
+])
 
 // No module-level cache: Next dev (and prod workers) keep one module graph per
 // route segment, so a `cached ??=` here pins each page to whatever models.json

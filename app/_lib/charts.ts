@@ -39,9 +39,11 @@ function displayName(modelId: string): string {
 
 /** Models pulled from the site entirely — keep in sync with
  *  REMOVED_MODEL_SLUGS in models.server.ts. Matches raw leaderboard/CSV ids
- *  like "gemini/gemini-3.5-flash". */
+ *  like "gemini/gemini-3.5-flash" or "codex/gpt-5.5". */
 export function isRemovedModel(modelId: string): boolean {
-  return /gemini-3\.1-pro|gemini-3\.5-flash/.test(modelId)
+  return /gemini-3\.1-pro|gemini-3\.5-flash|(^|\/)gpt-5\.5($|[^0-9])|hy3-preview|tencent\/hy3-preview|tencent-hy3-preview/.test(
+    modelId,
+  )
 }
 
 // GPU series colors — match the published charts (B200 is the NVIDIA accent).
