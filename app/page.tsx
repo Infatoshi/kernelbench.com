@@ -1,17 +1,10 @@
-import Link from "next/link"
-import { EfficiencyChart } from "./efficiency-chart"
-import { loadEfficiency } from "@/app/_lib/charts"
 import {
-  HOME_BENCH_ORDER,
+  DEFAULT_GPU,
   HOME_GPU_TABS,
-  columnOrder,
-  columnsForBench,
+  reportCardForBench,
 } from "@/app/_lib/models"
 import { loadModelIndex } from "@/app/_lib/models.server"
-import { HomeRankings } from "@/app/_components/home-rankings"
-
-const HUGGING_FACE_LOGO =
-  "https://huggingface.co/front/assets/huggingface_logo-noborder.svg"
+import { HomeDecks, type HomeDeck } from "@/app/_components/home-decks"
 
 const citationGraph = {
   "@context": "https://schema.org",
@@ -28,326 +21,94 @@ const citationGraph = {
       },
       description:
         "Open agentic GPU kernel benchmark results, run transcripts, source repositories, and datasets.",
-      citation: [
-        "https://github.com/Infatoshi/kernelbench.com",
-        "https://github.com/Infatoshi/kernelbench.com/tree/master/benchmarks/mega",
-        "https://github.com/Infatoshi/kernelbench.com/tree/master/benchmarks/hard",
-        "https://github.com/Infatoshi/kernelbench.com/tree/master/benchmarks/cuda",
-        "https://huggingface.co/datasets/Infatoshi/kernelbench-mega-traces",
-        "https://huggingface.co/datasets/Infatoshi/kernelbench-hard-traces",
-      ],
-    },
-    {
-      "@type": "Dataset",
-      "@id": "https://huggingface.co/datasets/Infatoshi/kernelbench-mega-traces",
-      name: "KernelBench-Mega agent traces",
-      url: "https://huggingface.co/datasets/Infatoshi/kernelbench-mega-traces",
-      creator: { "@type": "Person", name: "Elliot Arledge" },
-    },
-    {
-      "@type": "Dataset",
-      "@id": "https://huggingface.co/datasets/Infatoshi/kernelbench-hard-traces",
-      name: "KernelBench-Hard agent traces",
-      url: "https://huggingface.co/datasets/Infatoshi/kernelbench-hard-traces",
-      creator: { "@type": "Person", name: "Elliot Arledge" },
-    },
-    {
-      "@type": "SoftwareSourceCode",
-      "@id": "https://github.com/Infatoshi/kernelbench.com/tree/master/benchmarks/mega",
-      name: "Mega result suite repository",
-      codeRepository: "https://github.com/Infatoshi/kernelbench.com/tree/master/benchmarks/mega",
-      author: { "@type": "Person", name: "Elliot Arledge" },
-    },
-    {
-      "@type": "SoftwareSourceCode",
-      "@id": "https://github.com/Infatoshi/kernelbench.com/tree/master/benchmarks/hard",
-      name: "Hard result suite repository",
-      codeRepository: "https://github.com/Infatoshi/kernelbench.com/tree/master/benchmarks/hard",
-      author: { "@type": "Person", name: "Elliot Arledge" },
     },
   ],
 }
 
-// Compact bench tiles: rankings above carry the numbers; each tile is a
-// deep-link into the board plus artifacts (GitHub source, HF traces).
-const benchmarks = [
-  {
-    href: "/mega",
-    title: "Mega",
-    tagline: "Whole-block fused megakernels, graded on decode speedup over optimized PyTorch.",
-    gpus: [
-      { label: "H100", href: "/mega?gpu=h100" },
-      { label: "RTX PRO 6000", href: "/mega?gpu=rtxpro6000" },
-      { label: "B200", href: "/mega?gpu=b200" },
-    ],
-    hfHref: "https://huggingface.co/datasets/Infatoshi/kernelbench-mega-traces",
-    ghHref:
-      "https://github.com/Infatoshi/kernelbench.com/tree/master/benchmarks/mega",
-    comingSoon: false,
-  },
-  {
-    href: "/cuda",
-    title: "CUDA",
-    tagline: "CUDA-only writing deck — Triton and kernel DSLs fail the language gate.",
-    gpus: [{ label: "RTX PRO 6000", href: "/cuda" }],
-    hfHref: "https://huggingface.co/datasets/Infatoshi/kernelbench-cuda-traces",
-    ghHref:
-      "https://github.com/Infatoshi/kernelbench.com/tree/master/benchmarks/cuda",
-    comingSoon: false,
-  },
-  {
-    href: "/hard",
-    title: "Hard",
-    tagline: "Six-op CUDA/Triton deck, roofline-graded, one unlimited agent session per cell.",
-    gpus: [
-      { label: "H100", href: "/hard?gpu=h100" },
-      { label: "RTX PRO 6000", href: "/hard?gpu=rtxpro6000" },
-      { label: "B200", href: "/hard?gpu=b200" },
-    ],
-    hfHref: "https://huggingface.co/datasets/Infatoshi/kernelbench-hard-traces",
-    ghHref:
-      "https://github.com/Infatoshi/kernelbench.com/tree/master/benchmarks/hard",
-    comingSoon: false,
-  },
-  {
-    href: "/multi",
-    title: "Multi",
-    tagline: "NVLink collectives rewritten as kernels on 8×H100 SXM, graded on busbw.",
-    gpus: [{ label: "8×H100 SXM", href: "/multi" }],
-    hfHref: null,
-    ghHref:
-      "https://github.com/Infatoshi/kernelbench.com/tree/master/benchmarks/multi",
-    comingSoon: true,
-  },
-]
-
 export default async function HomePage() {
-  const [efficiency, modelIdx] = await Promise.all([
-    loadEfficiency(),
-    loadModelIndex(),
-  ])
-  const ordered = columnOrder(modelIdx)
-  // Precompute Mega → CUDA → Hard for every GPU tab. CUDA is a single-GPU
-  // deck (always RTX PRO 6000 numbers); mega/hard switch with the tab.
-  const chartsByGpu: Record<string, ReturnType<typeof columnsForBench>[]> = {}
+  const modelIdx = await loadModelIndex()
+
+  const megaByGpu: NonNullable<HomeDeck["byGpu"]> = {}
+  const hardByGpu: NonNullable<HomeDeck["byGpu"]> = {}
   for (const g of HOME_GPU_TABS) {
-    chartsByGpu[g.key] = HOME_BENCH_ORDER.map((b) =>
-      columnsForBench(modelIdx, b, ordered, g.key),
+    megaByGpu[g.key] = reportCardForBench(
+      modelIdx,
+      "mega",
+      g.key === "rtxpro6000" ? undefined : g.key,
+    )
+    hardByGpu[g.key] = reportCardForBench(
+      modelIdx,
+      "hard",
+      g.key === "rtxpro6000" ? undefined : g.key,
     )
   }
+  const cudaReport = reportCardForBench(modelIdx, "cuda")
+
+  const decks: HomeDeck[] = [
+    {
+      key: "mega",
+      title: "Mega",
+      accent: "#76b900",
+      byGpu: megaByGpu,
+      gpus: HOME_GPU_TABS,
+      defaultGpu: DEFAULT_GPU,
+    },
+    {
+      key: "cuda",
+      title: "CUDA",
+      accent: "#38bdf8",
+      byGpu: { rtxpro6000: cudaReport },
+      gpus: [{ key: "rtxpro6000", label: "RTX PRO 6000" }],
+      defaultGpu: "rtxpro6000",
+    },
+    {
+      key: "hard",
+      title: "Hard",
+      accent: "#a78bfa",
+      byGpu: hardByGpu,
+      gpus: HOME_GPU_TABS,
+      defaultGpu: DEFAULT_GPU,
+    },
+    {
+      key: "multi",
+      title: "Multi",
+      accent: "#fbbf24",
+      byGpu: null,
+      gpus: [],
+      defaultGpu: "",
+    },
+  ]
 
   return (
-    <div className="space-y-12">
+    <div className="space-y-8">
       <script
         type="application/ld+json"
         dangerouslySetInnerHTML={{ __html: JSON.stringify(citationGraph) }}
       />
-
-      <HomeRankings gpus={HOME_GPU_TABS} chartsByGpu={chartsByGpu} />
-
-      <section aria-label="Benchmarks">
-        <div className="section-head">
-          <h2 className="section-title">The decks</h2>
-          <span className="section-note">
-            pick a GPU board — frozen decks, public harnesses, traces on
-            Hugging&nbsp;Face
-          </span>
-        </div>
-        <div className="bench-grid">
-          {benchmarks.map((benchmark) => (
-            <article
-              key={benchmark.href}
-              className={`bench-tile${benchmark.comingSoon ? " bench-tile-ghost" : ""}`}
-            >
-              <div className="bench-tile-head">
-                <Link
-                  href={benchmark.href}
-                  className="bench-tile-title no-underline"
-                  aria-label={`Open ${benchmark.title} benchmark`}
-                >
-                  {benchmark.title}
-                  <svg
-                    viewBox="0 0 24 24"
-                    fill="none"
-                    stroke="currentColor"
-                    strokeLinecap="round"
-                    strokeLinejoin="round"
-                    strokeWidth="2"
-                    aria-hidden="true"
-                  >
-                    <path d="M7 17 17 7" />
-                    <path d="M9 7h8v8" />
-                  </svg>
-                </Link>
-                {benchmark.comingSoon && (
-                  <span className="bench-tile-soon">coming soon</span>
-                )}
-              </div>
-              <p className="bench-tile-tag">{benchmark.tagline}</p>
-              <div className="bench-tile-gpus" aria-label={`${benchmark.title} GPU boards`}>
-                {benchmark.gpus.map((g) => (
-                  <Link key={g.label} href={g.href} className="bench-gpu-chip no-underline">
-                    {g.label}
-                  </Link>
-                ))}
-              </div>
-              <div className="bench-tile-links">
-                <a
-                  href={benchmark.ghHref}
-                  target="_blank"
-                  rel="noreferrer"
-                  className="hf-link no-underline"
-                  aria-label={`Open ${benchmark.title} benchmark source on GitHub`}
-                >
-                  <svg
-                    viewBox="0 0 24 24"
-                    aria-hidden="true"
-                    width="16"
-                    height="16"
-                    fill="currentColor"
-                  >
-                    <path d="M12 2C6.48 2 2 6.58 2 12.26c0 4.53 2.87 8.37 6.84 9.73.5.1.68-.22.68-.49 0-.24-.01-1.04-.01-1.89-2.78.62-3.37-1.22-3.37-1.22-.45-1.19-1.11-1.5-1.11-1.5-.91-.64.07-.63.07-.63 1 .07 1.53 1.06 1.53 1.06.9 1.57 2.35 1.12 2.92.86.09-.67.35-1.12.63-1.38-2.22-.26-4.55-1.14-4.55-5.07 0-1.12.39-2.03 1.03-2.75-.1-.26-.45-1.3.1-2.71 0 0 .84-.28 2.75 1.05A9.29 9.29 0 0 1 12 6.98c.85 0 1.71.12 2.51.34 1.91-1.33 2.75-1.05 2.75-1.05.55 1.41.2 2.45.1 2.71.64.72 1.03 1.63 1.03 2.75 0 3.94-2.34 4.81-4.57 5.06.36.32.68.94.68 1.9 0 1.38-.01 2.49-.01 2.83 0 .27.18.59.69.49A10.05 10.05 0 0 0 22 12.26C22 6.58 17.52 2 12 2Z" />
-                  </svg>
-                  <span>GitHub</span>
-                </a>
-                {benchmark.hfHref && (
-                  <a
-                    href={benchmark.hfHref}
-                    target="_blank"
-                    rel="noreferrer"
-                    className="hf-link no-underline"
-                    aria-label={`Open ${benchmark.title} benchmark runs on Hugging Face`}
-                  >
-                    <img
-                      src={HUGGING_FACE_LOGO}
-                      alt=""
-                      width="16"
-                      height="16"
-                      loading="lazy"
-                    />
-                    <span>Traces</span>
-                  </a>
-                )}
-              </div>
-            </article>
-          ))}
-        </div>
-      </section>
-
-      <section aria-label="Performance vs compute" className="box p-6">
-        <EfficiencyChart mega={efficiency.mega} hard={efficiency.hard} />
-      </section>
-
-      <section aria-label="Method">
-        <div className="section-head">
-          <h2 className="section-title">Method</h2>
-        </div>
-        <div className="method-grid">
-          <div className="method-card">
-            <span className="method-num">01</span>
-            <h3>Roofline, not speedup</h3>
-            <p>Scores ground in hardware ceilings; baseline quirks can&apos;t move them.</p>
-          </div>
-          <div className="method-card">
-            <span className="method-num">02</span>
-            <h3>Real agent harnesses</h3>
-            <p>Claude Code, Codex, Cursor, Kimi, OpenCode, Grok — the tools labs actually ship.</p>
-          </div>
-          <div className="method-card">
-            <span className="method-num">03</span>
-            <h3>Public transcripts</h3>
-            <p>
-              Every run — tools, reasoning, diffs — on{" "}
-              <Link href="/runs">the run index</Link> and Hugging Face.
-            </p>
-          </div>
-          <div className="method-card">
-            <span className="method-num">04</span>
-            <h3>Judge-assisted audit</h3>
-            <p>Reward hacks and rubric leaks get flagged, published, and linked per cell.</p>
-          </div>
-        </div>
-      </section>
-
-      <details className="cite-details scroll-mt-24" id="cite">
-        <summary>Cite this benchmark suite</summary>
-        <div className="cite-body">
-          <div className="citation-links" style={{ marginTop: 0 }}>
-            <ArtifactLink href="https://kernelbench.com" label="Website" />
-            <ArtifactLink
-              href="https://github.com/Infatoshi/kernelbench.com"
-              label="Website repository"
-            />
-            <ArtifactLink
-              href="https://github.com/Infatoshi/kernelbench.com/tree/master/benchmarks/mega"
-              label="Mega repository"
-            />
-            <ArtifactLink
-              href="https://github.com/Infatoshi/kernelbench.com/tree/master/benchmarks/hard"
-              label="Hard repository"
-            />
-            <ArtifactLink
-              href="https://huggingface.co/datasets/Infatoshi/kernelbench-mega-traces"
-              label="Mega HF traces"
-            />
-            <ArtifactLink
-              href="https://huggingface.co/datasets/Infatoshi/kernelbench-hard-traces"
-              label="Hard HF traces"
-            />
-          </div>
-          <pre className="bibtex-block">
-{`@misc{arledge2026kernelbenchcom,
-  title        = {kernelbench.com: Agentic GPU Kernel Benchmark Results and Run Artifacts},
-  author       = {Arledge, Elliot},
-  year         = {2026},
-  howpublished = {\\url{https://kernelbench.com}},
-  note         = {Website, benchmark results, transcript viewers, and citation index}
-}
-
-@misc{arledge2026hard,
-  title        = {Hard: Agentic CUDA Kernel Result Suite},
-  author       = {Arledge, Elliot},
-  year         = {2026},
-  howpublished = {\\url{https://github.com/Infatoshi/kernelbench.com/tree/master/benchmarks/hard}},
-  note         = {CUDA benchmark suite, harness, results, and annotations}
-}
-
-@misc{arledge2026mega,
-  title        = {Mega: Agentic GPU Megakernel Result Suite},
-  author       = {Arledge, Elliot},
-  year         = {2026},
-  howpublished = {\\url{https://github.com/Infatoshi/kernelbench.com/tree/master/benchmarks/mega}},
-  note         = {Megakernel benchmark suite, sandboxed harness, and result artifacts}
-}
-
-@misc{arledge2026hardtraces,
-  title        = {KernelBench-Hard Agent Traces},
-  author       = {Arledge, Elliot},
-  year         = {2026},
-  publisher    = {Hugging Face},
-  howpublished = {\\url{https://huggingface.co/datasets/Infatoshi/kernelbench-hard-traces}},
-  note         = {Per-run agent transcripts: messages, tool calls, reasoning}
-}
-
-@misc{arledge2026megatraces,
-  title        = {KernelBench-Mega Agent Traces},
-  author       = {Arledge, Elliot},
-  year         = {2026},
-  publisher    = {Hugging Face},
-  howpublished = {\\url{https://huggingface.co/datasets/Infatoshi/kernelbench-mega-traces}},
-  note         = {Per-run agent transcripts for the megakernel suite}
-}`}
-          </pre>
-        </div>
-      </details>
+      <HomeDecks decks={decks} />
+      <p className="hd-legend" aria-label="Outcome legend">
+        <span>
+          <b>pass</b> bar = share of best · click a cell for solution / trace
+        </span>
+        <span>
+          <b className="hd-leg-blank">blank</b> no run yet
+        </span>
+        <span>
+          <b className="hd-leg-wrong">wrong</b> answers don&apos;t match
+        </span>
+        <span>
+          <b className="hd-leg-build">build</b> can&apos;t compile/import
+        </span>
+        <span>
+          <b className="hd-leg-slow">slow</b> timed out
+        </span>
+        <span>
+          <b className="hd-leg-cut">cut</b> stopped early
+        </span>
+        <span>
+          <b className="hd-leg-flag">flag</b> audit reject
+        </span>
+      </p>
     </div>
-  )
-}
-
-function ArtifactLink({ href, label }: { href: string; label: string }) {
-  return (
-    <a href={href} target="_blank" rel="noreferrer" className="artifact-link">
-      {label}
-    </a>
   )
 }

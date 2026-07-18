@@ -6,6 +6,12 @@ const nextConfig = {
   images: {
     unoptimized: true,
   },
+  // IMPORTANT: do NOT set allowedDevOrigins unless the list is complete for
+  // every host the Mac might use (LAN / Tailscale / ZeroTier / short name).
+  // When the key is present Next switches from warn → block and 403s /_next/*
+  // for any unlisted Origin ("Unauthorized"), which looks like a blank page
+  // or a Next.js error overlay from the Mac. Leaving it unset keeps remote
+  // preview working on any network path to anvil:3000.
   experimental: {
     // Persist the Turbopack module graph across runs — warm `next dev` skips
     // recompiling unchanged subtrees. (ForBuild exists but is canary-gated in

@@ -35,11 +35,12 @@ OUT = REPO / "public" / "data" / "models.json"
 
 FLAG_VERDICTS = {"reward_hack", "contamination", "rubric_leak"}
 
-# HF trace datasets per bench; None = traces not pushed yet (site omits link).
+# HF trace datasets per bench; omit a key (or set None) only when that
+# dataset is not published yet — site then drops the trace link.
 TRACE_DATASETS = {
     "hard": "kernelbench-hard-traces",
     "mega": "kernelbench-mega-traces",
-    "cuda": None,
+    "cuda": "kernelbench-cuda-traces",
 }
 
 # Pretty names keyed by canonical slug. Keep in sync with MODEL_NAMES in
@@ -414,6 +415,46 @@ def join_annotations(models: Models, bench: str, ann_dir: Path) -> tuple[list[st
 PERF_EXCLUDE: dict[str, set[str]] = {"mega": {"01_rl_grid_ppo"}}
 
 
+def join_catalog(models: Models) -> None:
+    """Attach outcome codes/labels from public/data/catalog.json by run_id.
+
+    Catalog is the universal sweep table (scripts/build_catalog.py). Missing
+    catalog is a soft no-op so model-index builds still work offline.
+    """
+    path = REPO / "public" / "data" / "catalog.json"
+    if not path.exists():
+        print("WARN: no catalog.json — outcomes not joined (run scripts/build_catalog.py)")
+        return
+    cat = json.loads(path.read_text())
+    legend = {x["code"]: x["label"] for x in cat.get("legend", [])}
+    by_run = {c["run_id"]: c for c in cat.get("cells", []) if c.get("run_id")}
+    n = 0
+    for e in models.by_slug.values():
+        for bench, block in e.get("benches", {}).items():
+            blocks = [block, *block.get("gpus", {}).values()]
+            for b in blocks:
+                for prob, cell in b.get("cells", {}).items():
+                    rid = cell.get("run_id")
+                    src = by_run.get(rid) if rid else None
+                    if not src:
+                        # synthesize pass/fail without archive detail
+                        if cell.get("valid"):
+                            cell["outcome"] = "pass"
+                            cell["outcome_label"] = legend.get("pass", "pass")
+                        else:
+                            cell["outcome"] = "other"
+                            cell["outcome_label"] = legend.get("other", "fail")
+                        continue
+                    cell["outcome"] = src.get("outcome") or "other"
+                    cell["outcome_label"] = legend.get(
+                        cell["outcome"], src.get("outcome") or "fail"
+                    )
+                    if src.get("failure_reason") is not None:
+                        cell["failure_reason"] = src["failure_reason"]
+                    n += 1
+    print(f"joined catalog outcomes into {n} cells")
+
+
 def compute_perf(models: Models) -> None:
     """perf = mean(cell score / board-best score) over the FULL problem deck.
 
@@ -562,6 +603,8 @@ def main() -> None:
         for block in [mb, *mb.get("gpus", {}).values()]:
             if block.get("cells"):
                 block["passed"] = sum(1 for c in block["cells"].values() if c.get("valid"))
+
+    join_catalog(models)
 
     out = finalize(models)
     OUT.write_text(json.dumps(out, indent=2) + "\n")

@@ -1,18 +1,19 @@
 "use client"
 
 import { useState } from "react"
-import type { BarView } from "../_lib/models"
+import type { BarView, ReportView } from "../_lib/models"
 import { ModelBars } from "./model-bars"
+import { ModelReportCard } from "./model-report-card"
 
-// Client wrapper for benches with multiple per-GPU boards (hard: RTX PRO 6000,
-// H100, B200; mega: 3 boards). Data is precomputed server-side per
-// GPU; this just switches between the bar-chart views.
+// Client wrapper for multi-GPU boards. Hard uses per-problem report cards;
+// mega keeps the single-metric bar chart.
 
 export interface GpuView {
   key: string
   label: string
   blurb?: string
-  bars: BarView
+  bars?: BarView
+  report?: ReportView
 }
 
 export function ModelGpuBoard({
@@ -24,7 +25,9 @@ export function ModelGpuBoard({
    *  first non-empty view when absent or unknown */
   initialGpu?: string
 }) {
-  const nonEmpty = views.filter((v) => v.bars.rows.length > 0)
+  const nonEmpty = views.filter(
+    (v) => (v.report?.rows.length ?? 0) > 0 || (v.bars?.rows.length ?? 0) > 0,
+  )
   const [sel, setSel] = useState(
     (nonEmpty.find((v) => v.key === initialGpu) ?? nonEmpty[0] ?? views[0])?.key ?? "",
   )
@@ -37,6 +40,7 @@ export function ModelGpuBoard({
           {views.map((v) => (
             <button
               key={v.key}
+              type="button"
               className={`gpu-toggle-btn${v.key === view.key ? " active" : ""}`}
               onClick={() => setSel(v.key)}
               role="tab"
@@ -52,7 +56,11 @@ export function ModelGpuBoard({
           {view.blurb}
         </p>
       )}
-      <ModelBars view={view.bars} />
+      {view.report ? (
+        <ModelReportCard view={view.report} />
+      ) : view.bars ? (
+        <ModelBars view={view.bars} />
+      ) : null}
     </div>
   )
 }

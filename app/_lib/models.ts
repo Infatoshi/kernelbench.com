@@ -9,9 +9,15 @@ export type Bench = "hard" | "mega" | "cuda"
 export interface ModelCell {
   run_id: string | null
   correct: boolean
+  /** false when the agent never wrote a solution (or harness recorded none) */
+  has_solution?: boolean
   score: number | null
   verdict: string
   valid: boolean
+  /** short outcome from public/data/catalog.json (pass|wrong|build|slow|…) */
+  outcome?: string
+  outcome_label?: string
+  failure_reason?: string | null
   elapsed_seconds?: number | null
   tok_s?: number | null
   ctx?: Record<string, number>
@@ -96,12 +102,12 @@ export const PROBLEM_LABELS: Record<string, string> = {
   "02_online_softmax": "Online Softmax",
 }
 
-/** Mega problems held out of the ranking value (the chart's best-cell max)
- *  because the flagship roster hasn't gone head-to-head on them yet — a model
- *  can't outrank another on a problem the other never attempted. Cells stay
- *  visible in boards and per-model detail. Mirrors PERF_EXCLUDE in
- *  scripts/build_model_index.py. */
-const MEGA_RANK_EXCLUDE = new Set(["01_rl_grid_ppo"])
+/** Mega problems hidden from public UI (homepage, /mega, model pages) and
+ *  held out of ranking. Flagship roster hasn't gone head-to-head on these —
+ *  showing them next to `02_kimi_linear_decode` made pass counts and columns
+ *  inconsistent. Data stays in catalog/index; only presentation filters.
+ *  Mirrors PERF_EXCLUDE in scripts/build_model_index.py. */
+export const MEGA_HIDDEN_PROBLEMS = new Set(["01_rl_grid_ppo"])
 
 export const FLAG_VERDICTS = new Set([
   "reward_hack",
@@ -264,7 +270,8 @@ export function rowsForBench(
   return { board, sink }
 }
 
-export function compareRows(a: ModelRow, b: ModelRow): number {  const ar = a.total > 0 ? a.passed / a.total : 0
+export function compareRows(a: ModelRow, b: ModelRow): number {
+  const ar = a.total > 0 ? a.passed / a.total : 0
   const br = b.total > 0 ? b.passed / b.total : 0
   if (br !== ar) return br - ar
   if (b.passed !== a.passed) return b.passed - a.passed
@@ -272,6 +279,232 @@ export function compareRows(a: ModelRow, b: ModelRow): number {  const ar = a.to
   const bp = b.perf ?? -1
   if (bp !== ap) return bp - ap
   return a.slug.localeCompare(b.slug)
+}
+
+/** Hard/CUDA report-card rank: passes only, then name. No mean-perf tie-break
+ *  (means over partial decks misread as "how good at kernels"). */
+export function compareRowsByPasses(a: ModelRow, b: ModelRow): number {
+  if (b.passed !== a.passed) return b.passed - a.passed
+  if (b.total !== a.total) return b.total - a.total
+  return a.slug.localeCompare(b.slug)
+}
+
+// ---- Per-problem report card (Hard / CUDA) ---------------------------------
+
+const PROBLEM_SHORT: Record<string, string> = {
+  "01_fp8_gemm": "fp8",
+  "02_kda_cutlass": "kda",
+  "03_paged_attention": "paged",
+  "05_topk_bitonic": "topk",
+  "06_sonic_moe_swiglu": "sonic",
+  "07_w4a16_gemm": "w4a16",
+  "01_glm52_fused_moe": "moe",
+  "02_deepseek_nsa": "nsa",
+  "03_megaqwen_decode": "qwen",
+  "04_grid_mingru_sps": "sps",
+}
+
+export type ChipKind = "pass" | "numerics" | "no_kernel" | "hack" | "fail"
+
+export interface ProblemChip {
+  problem: string
+  short: string
+  kind: ChipKind
+  /** on-chip text: "30%" | "check" | "empty" | "hack" */
+  label: string
+  title: string
+  score: number | null
+  solution_url: string | null
+  trace_url: string | null
+  run_id: string | null
+}
+
+export interface ReportRow {
+  slug: string
+  name: string
+  lab: string
+  subtitle: string
+  passed: number
+  total: number
+  flagged: number
+  audited: number
+  brand: Brand
+  chips: ProblemChip[]
+  /** mean peak fraction among valid passes only — display footnote, never rank */
+  meanWhenCorrect: number | null
+}
+
+export interface ReportView {
+  bench: Bench
+  axis: string
+  problems: { id: string; short: string }[]
+  rows: ReportRow[]
+}
+
+function shortProblem(id: string): string {
+  if (PROBLEM_SHORT[id]) return PROBLEM_SHORT[id]
+  // "01_foo_bar" → "foo"
+  const bare = id.replace(/^\d+_/, "")
+  const first = bare.split("_")[0] || bare
+  return first.slice(0, 6)
+}
+
+/** Map catalog outcome → chip kind (styling). */
+function kindFromOutcome(outcome: string | undefined, c: ModelCell): ProblemChip["kind"] {
+  if (c.valid && c.score != null) return "pass"
+  if (FLAG_VERDICTS.has(c.verdict) || outcome === "flagged") return "hack"
+  if (outcome === "empty" || c.has_solution === false) return "no_kernel"
+  if (outcome === "wrong" || outcome === "build" || outcome === "timeout" || outcome === "memory")
+    return "numerics"
+  if (outcome === "cut" || outcome === "infra" || outcome === "other") return "fail"
+  if (!c.correct) return "numerics"
+  return "fail"
+}
+
+const OUTCOME_TITLE: Record<string, string> = {
+  pass: "correct on the tests",
+  wrong: "ran, but answers don't match",
+  build: "couldn't compile or import",
+  timeout: "ran too long / timed out",
+  memory: "ran out of GPU memory",
+  empty: "never wrote a kernel",
+  cut: "session stopped early",
+  infra: "provider / harness glitch",
+  flagged: "audit rejected the run",
+  other: "didn't pass",
+}
+
+function chipFromCell(prob: string, c: ModelCell | undefined): ProblemChip {
+  const short = shortProblem(prob)
+  const links = {
+    solution_url: c?.solution_url ?? null,
+    trace_url: c?.trace_url ?? null,
+    run_id: c?.run_id ?? null,
+  }
+  if (!c) {
+    return {
+      problem: prob,
+      short,
+      kind: "no_kernel",
+      label: "empty",
+      title: OUTCOME_TITLE.empty,
+      score: null,
+      ...links,
+    }
+  }
+  const outcome = c.outcome
+  const kind = kindFromOutcome(outcome, c)
+  if (kind === "pass" && c.score != null) {
+    const isSpeedup = c.score > 1.5
+    const label = isSpeedup
+      ? c.score >= 10
+        ? c.score.toFixed(0)
+        : c.score.toFixed(1)
+      : (c.score * 100).toFixed(c.score >= 0.1 ? 0 : 1)
+    return {
+      problem: prob,
+      short,
+      kind,
+      label,
+      title: isSpeedup
+        ? `${c.score.toFixed(2)}× vs baseline`
+        : `${(c.score * 100).toFixed(2)}% of roofline`,
+      score: c.score,
+      ...links,
+    }
+  }
+  // Fail chips: short catalog label (wrong / build / slow / empty / …)
+  const label = (c.outcome_label || outcome || "fail").slice(0, 8)
+  const title =
+    OUTCOME_TITLE[outcome || ""] ||
+    c.failure_reason ||
+    OUTCOME_TITLE.other
+  return {
+    problem: prob,
+    short,
+    kind,
+    label,
+    title,
+    score: null,
+    ...links,
+  }
+}
+
+/** Per-problem report card: rank by passes only. Homepage hides
+ *  CHART_HIDDEN_SLUGS. Problem headers use full readable names.
+ *  Mega drops MEGA_HIDDEN_PROBLEMS so the grid matches the head-to-head deck. */
+export function reportCardForBench(
+  index: ModelIndex,
+  bench: Bench,
+  gpu?: string,
+): ReportView {
+  const { board } = rowsForBench(index, bench, gpu)
+  const ordered = [...board]
+    .filter((r) => !CHART_HIDDEN_SLUGS.has(r.slug))
+    .sort(compareRowsByPasses)
+
+  const deckSet = new Set<string>()
+  for (const row of ordered) {
+    const model = index.models.find((m) => m.slug === row.slug)
+    if (!model?.benches[bench]) continue
+    const view: GpuBlock = gpu
+      ? model.benches[bench]!.gpus[gpu]!
+      : model.benches[bench]!
+    if (!view) continue
+    for (const p of deckProblems(view, bench)) deckSet.add(p)
+  }
+  const deck = [...deckSet].sort()
+
+  const rows: ReportRow[] = []
+  for (const row of ordered) {
+    const model = index.models.find((m) => m.slug === row.slug)!
+    const block = model.benches[bench]!
+    const view: GpuBlock = gpu ? block.gpus[gpu]! : block
+    const chips = deck.map((p) => chipFromCell(p, view.cells[p]))
+    // Pass counts from the visible deck only (mega: exclude hold-outs).
+    const passed = chips.filter((c) => c.kind === "pass").length
+    const total = deck.length
+    const okScores = chips
+      .filter((c) => c.kind === "pass" && c.score != null)
+      .map((c) => c.score!)
+    const meanWhenCorrect =
+      okScores.length > 0
+        ? okScores.reduce((a, b) => a + b, 0) / okScores.length
+        : null
+    rows.push({
+      slug: row.slug,
+      name: model.name,
+      lab: row.lab,
+      subtitle: row.subtitle,
+      passed,
+      total,
+      flagged: row.flagged,
+      audited: row.audited,
+      brand: brandFor(row.lab, row.slug),
+      chips,
+      meanWhenCorrect,
+    })
+  }
+
+  // Re-rank after visible-deck pass recount (mega hold-outs no longer inflate).
+  rows.sort((a, b) => {
+    if (b.passed !== a.passed) return b.passed - a.passed
+    const am = a.meanWhenCorrect ?? -1
+    const bm = b.meanWhenCorrect ?? -1
+    if (bm !== am) return bm - am
+    return a.slug.localeCompare(b.slug)
+  })
+
+  return {
+    bench,
+    axis: "per-problem · rank by passes · bar = share of best on that problem",
+    // Full readable names for column headers (short kept for narrow layouts).
+    problems: deck.map((id) => ({
+      id,
+      short: problemLabel(id),
+    })),
+    rows,
+  }
 }
 
 /** Homepage index view: rank by benches fully passed, then mean normalized
@@ -374,8 +607,14 @@ export interface BarView {
  *  as 0 in hard/cuda means — only PERF-style exclusions drop a problem. */
 function deckProblems(view: GpuBlock, bench: Bench): string[] {
   return Object.keys(view.cells).filter(
-    (prob) => !(bench === "mega" && MEGA_RANK_EXCLUDE.has(prob)),
+    (prob) => !(bench === "mega" && MEGA_HIDDEN_PROBLEMS.has(prob)),
   )
+}
+
+/** Public problem list for a bench (drops mega hold-outs). */
+export function visibleProblems(bench: Bench, problems: string[]): string[] {
+  if (bench !== "mega") return problems
+  return problems.filter((p) => !MEGA_HIDDEN_PROBLEMS.has(p))
 }
 
 /** Hard/CUDA: mean peak fraction over the full deck (invalid/missing = 0).
@@ -474,7 +713,7 @@ export function barsForBench(
 //
 // 2) MEGA performance chart:
 //      score_m = max(speedup) over the model's valid cells on the canonical
-//                board, EXCLUDING problems in MEGA_RANK_EXCLUDE (currently
+//                board, EXCLUDING problems in MEGA_HIDDEN_PROBLEMS (currently
 //                01_rl_grid_ppo — not head-to-head yet: flagships haven't all
 //                attempted it, so its cells can't set a rank). Each cell's
 //                score is already the run's geomean decode speedup vs the
@@ -580,6 +819,10 @@ export const CHART_HIDDEN_SLUGS = new Set([
   "fugu-ultra",
   "nemotron-3-ultra-550b-a55b",
   "mimo-v2.5-pro",
+  // Preview / non-canonical ids — not what labs want cited
+  "hy3-preview",
+  "tencent-hy3-preview",
+  "tencent/hy3-preview",
 ])
 
 /**

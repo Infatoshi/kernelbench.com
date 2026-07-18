@@ -1,6 +1,6 @@
 import type { Metadata } from "next"
 import { JetBrains_Mono } from "next/font/google"
-import { SiteNav } from "@/app/_components/site-nav"
+import { SiteBrand } from "@/app/_components/site-brand"
 import "./globals.css"
 
 const mono = JetBrains_Mono({
@@ -50,10 +50,13 @@ export default function RootLayout({
   children: React.ReactNode
 }) {
   return (
-    <html lang="en" className={mono.variable} data-theme="dark">
-      <body className="min-h-screen">
-        <SiteNav />
-        <main className="container mx-auto px-4 sm:px-6 max-w-7xl pt-8 pb-12">
+    // suppressHydrationWarning: browser extensions (Dark Reader, etc.) inject
+    // attributes on <html>/<body> before React hydrates; without this the
+    // Mac preview shows a noisy hydration overlay that is not app state.
+    <html lang="en" className={mono.variable} data-theme="dark" suppressHydrationWarning>
+      <body className="min-h-screen" suppressHydrationWarning>
+        <SiteBrand />
+        <main className="container mx-auto px-4 sm:px-6 max-w-7xl pt-6 pb-12">
           {children}
         </main>
         <Footer />

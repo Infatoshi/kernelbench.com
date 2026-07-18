@@ -8,6 +8,7 @@ import {
   benchValue,
   brandFor,
   problemLabel,
+  visibleProblems,
   type Bench,
   type GpuBlock,
   type ModelCell,
@@ -211,12 +212,20 @@ function BenchPanel({
         {canonicalLabel}
         <span className="board-kicker-dim">· canonical board</span>
       </p>
-      <CellGrid bench={bench} problems={meta?.problems ?? []} block={block} />
+      <CellGrid
+        bench={bench}
+        problems={visibleProblems(bench, meta?.problems ?? [])}
+        block={block}
+      />
 
       {gpuKeys.map((g) => (
         <div key={g} className="board-extra">
           <p className="board-kicker">{meta?.gpu_labels?.[g] ?? g}</p>
-          <CellGrid bench={bench} problems={meta?.problems ?? []} block={block.gpus[g]!} />
+          <CellGrid
+            bench={bench}
+            problems={visibleProblems(bench, meta?.problems ?? [])}
+            block={block.gpus[g]!}
+          />
         </div>
       ))}
 

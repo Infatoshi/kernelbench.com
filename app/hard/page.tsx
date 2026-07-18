@@ -1,11 +1,11 @@
 import Link from "next/link"
-import { DEFAULT_GPU, barsForBench } from "@/app/_lib/models"
+import { DEFAULT_GPU, reportCardForBench } from "@/app/_lib/models"
 import { loadModelIndex } from "@/app/_lib/models.server"
 import { ModelGpuBoard, type GpuView } from "@/app/_components/model-board"
 import { PageHead } from "@/app/_components/page-head"
 
-// KernelBench-Hard: per-op kernel deck. AA-style model bar chart per GPU
-// board; run-level forensics live on /runs and the per-model pages.
+// KernelBench-Hard: per-problem report card per GPU board.
+// Rank by passes only; each cell is score or fail reason (not a blended mean).
 
 export default async function HardPage({
   searchParams,
@@ -16,8 +16,8 @@ export default async function HardPage({
   const idx = await loadModelIndex()
   const gpuLabels = idx.benches.hard?.gpu_labels ?? {}
 
-  const mk = (gpu?: string): Pick<GpuView, "bars"> => ({
-    bars: barsForBench(idx, "hard", gpu),
+  const mk = (gpu?: string): Pick<GpuView, "report"> => ({
+    report: reportCardForBench(idx, "hard", gpu),
   })
 
   // Tab order H100 → RTX PRO 6000 → B200; default selection is DEFAULT_GPU.
@@ -30,8 +30,6 @@ export default async function HardPage({
     {
       key: "rtxpro6000",
       label: gpuLabels.rtxpro6000 ?? "RTX PRO 6000",
-      blurb:
-        "Unlimited time per problem. The frozen lab board — every published cell is contamination-checked and reward-hack audited.",
       ...mk(),
     },
     {
@@ -48,43 +46,21 @@ export default async function HardPage({
         title="The per-op kernel deck"
         sub={
           <>
-            Six CUDA/Triton problems, one unlimited agent session per cell,
-            graded against each GPU&apos;s own roofline — comparable within a
-            GPU, not across GPUs. Correctness groups the board; flagged audits
-            never reorder it.
+            Six problems × one unlimited agent session. Ranked by how many
+            problems passed; each problem shows peak fraction or why it failed
+            — fails are not averaged into a fake speed score.
           </>
         }
         notes={
           <>
             <p>
-              <strong>Ordering.</strong> Models group by valid passes
-              (audited-clean correct cells), then order by mean peak fraction.
-              The flagged count lists audited sessions that failed the
-              reward-hack review; it never changes the order. Click a model for
-              its per-problem cells, audit chips, and integrity record. Browse
-              the <Link href="/runs">run index</Link> for transcripts, submitted
-              solutions, checks, timing, and costs.
-            </p>
-            <p>
-              <strong>RTX PRO 6000.</strong> Frontier coding agents on one
-              unlimited autonomous session per problem: Opus 4.8, Fable 5, Grok
-              4.5, GPT-5.6 Sol, GLM-5.2, MiniMax-M3, DeepSeek V4 Pro, LongCat
-              2.0, and more. Roofline-graded; every published cell is
-              contamination-checked and reward-hack audited.
-            </p>
-            <p>
-              <strong>H100 PCIe.</strong> Opus 4.8, Fable 5, GLM-5.2,
-              MiniMax-M3, DeepSeek V4 Pro, and LongCat 2.0 on a single H100
-              PCIe with the same containerized harness and roofline grading as
-              the Blackwell deck; peak fraction is measured against H100 dense
-              peaks.
-            </p>
-            <p>
-              <strong>B200.</strong> The same models on a single NVIDIA B200
-              (SM100 Blackwell, HBM3e) with the identical containerized harness
-              and roofline grading; peak fraction is measured against B200
-              dense peaks (fp8 4500, bf16 2250 TFLOPS), so the same kernel
-              reads as a smaller fraction of a much higher ceiling.
+              <strong>Reading the board.</strong> Order is pass count only.
+              Green chips are peak fraction of that GPU&apos;s roofline.{" "}
+              <code>check</code> = solution failed correctness;{" "}
+              <code>empty</code> = no kernel written; <code>hack</code> = audit
+              flag. &quot;when ok&quot; is mean peak fraction among passes only
+              (footnote, not a rank key). Click a model for audits and traces.{" "}
+              <Link href="/runs">Run index</Link>.
             </p>
           </>
         }

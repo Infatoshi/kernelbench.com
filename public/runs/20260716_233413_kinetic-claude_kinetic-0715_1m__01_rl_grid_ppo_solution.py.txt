@@ -1,0 +1,647 @@
+"""Grid-foraging PPO training megakernel (solution).
+
+The ENTIRE training run -- all PPO iterations, each containing the full
+32-step x 4096-env rollout and the full 4-epoch x 4-minibatch PPO update --
+runs inside ONE persistent cooperative kernel launch (plus a tiny one-off
+init kernel for weight initialization and a single final curve readback).
+Kernel launches therefore do not scale with env-steps, horizon, or
+minibatches: there are two launches per *run*, not per iteration.
+
+Inside the launch, per PPO iteration:
+
+  * Rollout phase (fused): every 16-lane half-warp owns one env and advances
+    it through all 32 horizon steps: policy forward (the 645 parameters sit
+    in shared memory; the 64 hidden units are split 4-per-lane and the
+    logits/value are formed by a 16-lane butterfly reduction), categorical
+    sampling from counter-based Philox RNG, env transition + food respawn,
+    then an in-register backward GAE scan (no bootstrap past the horizon,
+    matching the reference). Packed {state, logp, adv, ret} records (16B per
+    sample) are written to a global buffer; advantage mean/var statistics
+    and the episodic-return curve are accumulated via atomics.
+
+  * Update phase (fused): 4 epochs x 4 minibatches. Sample--minibatch
+    assignment is an exact balanced bijection: each warp sweeps consecutive
+    positions of a Feistel permutation of all 2^17 samples (no randperm
+    materialization, near-perfectly balanced warps; statistically equivalent
+    to the reference's randperm-chunk partitioning). For every sample, the
+    fused forward+backward pass computes the exact PPO gradient terms (clip
+    with the reference's tie semantics, entropy, and value terms), kept in
+    per-lane register accumulators. Per-warp partials are staged in shared
+    memory and block-reduced, one cooperative grid.sync() per minibatch,
+    then every block redundantly applies the identical grad-norm clip +
+    Adam step to its own shared-memory parameter copy (identical math =>
+    identical copies, so no broadcast barrier is needed). Parameters and
+    Adam moments live in shared memory for the whole run.
+
+Advantage normalization uses the same global (unbiased) mean/std statistic
+as the reference. Custom CUDA via load_inline. No CUDA graphs, no
+torch.compile, no RL library.
+"""
+from __future__ import annotations
+
+import os
+
+import torch
+from torch.utils.cpp_extension import load_inline
+
+os.environ.setdefault("TORCH_CUDA_ARCH_LIST", "12.0")
+
+_CPP_SRC = "at::Tensor train_impl(int64_t total_env_steps, int64_t seed);"
+
+_CUDA_SRC = r"""
+#include <ATen/ATen.h>
+#include <c10/cuda/CUDAStream.h>
+#include <cooperative_groups.h>
+#include <cuda_runtime.h>
+#include <math.h>
+#include <stdint.h>
+
+namespace cg = cooperative_groups;
+
+#define N_ENVS 4096
+#define TT 32
+#define N_SAMP 131072          // N_ENVS * TT == 2^17
+#define NMB_SAMP 32768         // N_SAMP / 4 == 2^15
+#define NPARAM 645             // 64*4 + 64 + 4*64 + 4 + 64 + 1
+#define INV_NMB (1.0f / 32768.0f)
+#define TPB 384                // threads per block in the megakernel
+#define NWARP_B (TPB / 32)     // warps per block
+
+// parameter vector layout
+//   W1 [0,256)    j*4+i   (hidden j, input i)
+//   b1 [256,320)  j
+//   W2 [320,576)  c*64+j  (action c, hidden j)
+//   b2 [576,580)  c
+//   w3 [580,644)  j
+//   b3 644
+
+__device__ __forceinline__ float tanh_ap(float x) {
+    float y;
+    asm("tanh.approx.f32 %0, %1;" : "=f"(y) : "f"(x));
+    return y;
+}
+
+__device__ __forceinline__ uint4 philox4x32_10(uint4 c, uint2 k) {
+#pragma unroll
+    for (int i = 0; i < 10; ++i) {
+        unsigned long long p0 = (unsigned long long)c.x * 0xD2511F53ull;
+        unsigned long long p1 = (unsigned long long)c.z * 0xCD9E8D57ull;
+        uint4 n;
+        n.x = (unsigned)(p1 >> 32) ^ c.y ^ k.x;
+        n.y = (unsigned)p1;
+        n.z = (unsigned)(p0 >> 32) ^ c.w ^ k.y;
+        n.w = (unsigned)p0;
+        c = n;
+        k.x += 0x9E3779B9u;
+        k.y += 0xBB67AE85u;
+    }
+    return c;
+}
+
+
+__device__ __forceinline__ uint32_t feistel17(int pos, uint32_t multA, uint32_t addB) {
+    uint32_t x = (uint32_t)pos & 0x1FFFFu;
+    x ^= x >> 7;
+    x = (x * multA) & 0x1FFFFu;
+    x ^= x >> 5;
+    x = (x + addB) & 0x1FFFFu;
+    x ^= x >> 8;
+    return x;
+}
+
+__device__ __forceinline__ float uni01(uint32_t r) {
+    return (float)r * 0x1.0p-32f;  // [0,1)
+}
+
+// ---------------------------------------------------------------------------
+// Weight initialization: uniform(-1/sqrt(fan_in), 1/sqrt(fan_in)), biases zero.
+// Separate one-off launch (does not scale with iterations).
+// ---------------------------------------------------------------------------
+__global__ void init_kernel(float* __restrict__ params, uint32_t k0, uint32_t k1) {
+    uint2 key = make_uint2(k0 ^ 0xF00DF00Du, k1 ^ 0x12345678u);
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i * 4 >= NPARAM) return;
+    uint4 r = philox4x32_10(make_uint4(i, 0xABCDu, 0, 0), key);
+#pragma unroll
+    for (int q = 0; q < 4; ++q) {
+        int idx = i * 4 + q;
+        if (idx >= NPARAM) break;
+        float u = uni01((&r.x)[q]);
+        float w;
+        if (idx < 256) w = (u * 2.f - 1.f) * 0.5f;          // W1  bound 1/sqrt(4)
+        else if (idx < 320) w = 0.f;                        // b1
+        else if (idx < 576) w = (u * 2.f - 1.f) * 0.125f;   // W2  bound 1/sqrt(64)
+        else if (idx < 580) w = 0.f;                        // b2
+        else if (idx < 644) w = (u * 2.f - 1.f) * 0.125f;   // w3
+        else w = 0.f;                                       // b3
+        params[idx] = w;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Persistent shared state of the megakernel.
+// ---------------------------------------------------------------------------
+struct MegaShared {
+    float p[NPARAM];             // parameters
+    float m[NPARAM];             // Adam m
+    float v[NPARAM];             // Adam v
+    float red[32];               // reduction scratch
+    double bc[2];                // beta^t accumulators (fp64, incremental)
+    float bcf[2];                // lr/(1-b1^t), 1/(1-b2^t) for this step
+    float slice[NWARP_B][NPARAM]; // per-warp gradient partials (lane-disjoint slots)
+    float vsh[2 * NWARP_B][TT + 1];     // per-half-warp rollout values
+};
+
+// ---------------------------------------------------------------------------
+// THE megakernel: an entire PPO training run in one cooperative launch.
+// ---------------------------------------------------------------------------
+__global__ void __launch_bounds__(TPB, 1) ppo_megakernel(const float* __restrict__ init_params,
+                               uint4* __restrict__ traj,       // [N_SAMP] packed {sa,logp,adv,ret}
+                               double* __restrict__ cum_stats, // [0,1] cum adv sum/sumsq, [2,3] prev
+                               float* __restrict__ gradG,      // [16*NPARAM]
+                               float* __restrict__ curve,      // [iters] reward sums
+                               int iters, uint32_t k0, uint32_t k1) {
+    cg::grid_group grid = cg::this_grid();
+    extern __shared__ char smem_raw[];
+    MegaShared& S = *reinterpret_cast<MegaShared*>(smem_raw);
+    const int tid = threadIdx.x;
+    const int lane = tid & 31;
+    const int wid = tid >> 5;
+    const int warp_g = blockIdx.x * NWARP_B + wid;
+    const int nwarp = gridDim.x * NWARP_B;
+    uint2 key = make_uint2(k0, k1);
+
+    // load initial parameters; Adam moments start at zero (host pre-zeroed)
+    for (int i = tid; i < NPARAM; i += TPB) {
+        S.p[i] = init_params[i];
+        S.m[i] = 0.f;
+        S.v[i] = 0.f;
+    }
+    if (tid == 0) { S.bc[0] = 1.0; S.bc[1] = 1.0; }
+    __syncthreads();
+
+    for (int iter = 0; iter < iters; ++iter) {
+        // ------------------------------------------------------------------
+        // ROLLOUT PHASE: half-warp (16 lanes) per env, full HORIZON inside
+        // the launch. Hidden-unit quads per lane; logits/value by butterfly.
+        // ------------------------------------------------------------------
+        for (int i = blockIdx.x * TPB + tid; i < 16 * NPARAM; i += gridDim.x * TPB)
+            gradG[i] = 0.f;  // cheap: spread across all threads while rolling out
+
+        const int half_r = lane >> 4;
+        const int lh_r = lane & 15;
+        // register-cache this lane's weights for the whole rollout phase
+        const float w2_00 = S.p[320 + lh_r], w2_01 = S.p[320 + lh_r + 16], w2_02 = S.p[320 + lh_r + 32], w2_03 = S.p[320 + lh_r + 48];
+        const float w2_10 = S.p[384 + lh_r], w2_11 = S.p[384 + lh_r + 16], w2_12 = S.p[384 + lh_r + 32], w2_13 = S.p[384 + lh_r + 48];
+        const float w2_20 = S.p[448 + lh_r], w2_21 = S.p[448 + lh_r + 16], w2_22 = S.p[448 + lh_r + 32], w2_23 = S.p[448 + lh_r + 48];
+        const float w2_30 = S.p[512 + lh_r], w2_31 = S.p[512 + lh_r + 16], w2_32 = S.p[512 + lh_r + 32], w2_33 = S.p[512 + lh_r + 48];
+        const float w3_0 = S.p[580 + lh_r], w3_1 = S.p[580 + lh_r + 16], w3_2 = S.p[580 + lh_r + 32], w3_3 = S.p[580 + lh_r + 48];
+        const float w1_00 = S.p[lh_r * 4 + 0], w1_01 = S.p[lh_r * 4 + 1], w1_02 = S.p[lh_r * 4 + 2], w1_03 = S.p[lh_r * 4 + 3];
+        const float w1_10 = S.p[(lh_r + 16) * 4 + 0], w1_11 = S.p[(lh_r + 16) * 4 + 1], w1_12 = S.p[(lh_r + 16) * 4 + 2], w1_13 = S.p[(lh_r + 16) * 4 + 3];
+        const float w1_20 = S.p[(lh_r + 32) * 4 + 0], w1_21 = S.p[(lh_r + 32) * 4 + 1], w1_22 = S.p[(lh_r + 32) * 4 + 2], w1_23 = S.p[(lh_r + 32) * 4 + 3];
+        const float w1_30 = S.p[(lh_r + 48) * 4 + 0], w1_31 = S.p[(lh_r + 48) * 4 + 1], w1_32 = S.p[(lh_r + 48) * 4 + 2], w1_33 = S.p[(lh_r + 48) * 4 + 3];
+        const float b1_0 = S.p[256 + lh_r], b1_1 = S.p[256 + lh_r + 16], b1_2 = S.p[256 + lh_r + 32], b1_3 = S.p[256 + lh_r + 48];
+        const float b2_0 = S.p[576 + 0], b2_1 = S.p[576 + 1], b2_2 = S.p[576 + 2], b2_3 = S.p[576 + 3];
+        const float b3c = S.p[644];
+        float ws_ret = 0.f, ws_asum = 0.f, ws_asq = 0.f;
+        for (int e = warp_g * 2 + half_r; e < N_ENVS; e += nwarp * 2) {
+            // episode reset (board re-randomizes every HORIZON; rollout aligns)
+            uint4 rr = philox4x32_10(make_uint4(e, (uint32_t)iter, 0x5151u, 0u), key);
+            int ax = rr.x % 11, ay = rr.y % 11, fx = rr.z % 11, fy = rr.w % 11;
+            uint32_t rewmask = 0;
+            float retsum = 0.f;
+#pragma unroll
+            for (int t = 0; t < TT; ++t) {
+                float X0 = (float)(fx - ax) * (1.0f / 11.0f);
+                float X1 = (float)(fy - ay) * (1.0f / 11.0f);
+                float X2 = (float)ax * 0.1f;
+                float X3 = (float)ay * 0.1f;
+                float h0 = tanh_ap(w1_00 * X0 + w1_01 * X1 + w1_02 * X2 + w1_03 * X3 + b1_0);
+                float h1 = tanh_ap(w1_10 * X0 + w1_11 * X1 + w1_12 * X2 + w1_13 * X3 + b1_1);
+                float h2 = tanh_ap(w1_20 * X0 + w1_21 * X1 + w1_22 * X2 + w1_23 * X3 + b1_2);
+                float h3 = tanh_ap(w1_30 * X0 + w1_31 * X1 + w1_32 * X2 + w1_33 * X3 + b1_3);
+                float z0 = w2_00 * h0 + w2_01 * h1 + w2_02 * h2 + w2_03 * h3;
+                float z1 = w2_10 * h0 + w2_11 * h1 + w2_12 * h2 + w2_13 * h3;
+                float z2 = w2_20 * h0 + w2_21 * h1 + w2_22 * h2 + w2_23 * h3;
+                float z3 = w2_30 * h0 + w2_31 * h1 + w2_32 * h2 + w2_33 * h3;
+                float vv = w3_0 * h0 + w3_1 * h1 + w3_2 * h2 + w3_3 * h3;
+#pragma unroll
+                for (int off = 8; off; off >>= 1) {
+                    z0 += __shfl_xor_sync(0xffffffffu, z0, off);
+                    z1 += __shfl_xor_sync(0xffffffffu, z1, off);
+                    z2 += __shfl_xor_sync(0xffffffffu, z2, off);
+                    z3 += __shfl_xor_sync(0xffffffffu, z3, off);
+                    vv += __shfl_xor_sync(0xffffffffu, vv, off);
+                }
+                z0 += b2_0; z1 += b2_1; z2 += b2_2; z3 += b2_3;
+                vv += b3c;
+                float mx = fmaxf(fmaxf(z0, z1), fmaxf(z2, z3));
+                float e0 = __expf(z0 - mx), e1 = __expf(z1 - mx), e2 = __expf(z2 - mx), e3 = __expf(z3 - mx);
+                float Sm = e0 + e1 + e2 + e3;
+                uint4 rn = philox4x32_10(make_uint4(e, (uint32_t)iter, (uint32_t)t, 0x717u), key);
+                float u = uni01(rn.x);
+                float rS = __frcp_rn(Sm);
+                float c0 = e0 * rS;
+                float c1 = c0 + e1 * rS;
+                float c2 = c1 + e2 * rS;
+                int a = (u < c0) ? 0 : ((u < c1) ? 1 : ((u < c2) ? 2 : 3));
+                float lse = mx + __logf(Sm);
+                float za = (a == 0) ? z0 : ((a == 1) ? z1 : ((a == 2) ? z2 : z3));
+                if (lh_r == 0) {
+                    int s = t * N_ENVS + e;
+                    uint32_t word = (uint32_t)ax | ((uint32_t)ay << 4) | ((uint32_t)fx << 8) |
+                                    ((uint32_t)fy << 12) | ((uint32_t)a << 16);
+                    *reinterpret_cast<uint2*>(&traj[s]) = make_uint2(word, __float_as_uint(za - lse));
+                }
+                S.vsh[(wid * 2 + half_r)][t] = vv;
+                // env transition (replicated across the half-warp)
+                int dx = (a == 2) ? -1 : ((a == 3) ? 1 : 0);
+                int dy = (a == 0) ? -1 : ((a == 1) ? 1 : 0);
+                ax += dx; ax = ax < 0 ? 0 : (ax > 10 ? 10 : ax);
+                ay += dy; ay = ay < 0 ? 0 : (ay > 10 ? 10 : ay);
+                bool hit = (ax == fx) && (ay == fy);
+                if (hit) { fx = (int)(rn.y % 11u); fy = (int)(rn.z % 11u); }
+                rewmask |= (uint32_t)hit << t;
+                retsum += hit ? 1.f : 0.f;
+            }
+            // backward GAE (episode terminates at T: no bootstrap)
+            __syncwarp(0xffffu << (half_r * 16));  // half-warp visibility of vsh
+            float gae = 0.f, advsum = 0.f, advsq = 0.f;
+            float nextv = 0.f, nt = 0.f;
+#pragma unroll
+            for (int t = TT - 1; t >= 0; --t) {
+                float vv = S.vsh[(wid * 2 + half_r)][t];
+                float r = (float)((rewmask >> t) & 1u);
+                float delta = r + 0.99f * nextv * nt - vv;
+                gae = delta + (0.99f * 0.95f) * nt * gae;
+                nextv = vv;
+                nt = 1.f;
+                if (lh_r == 0) *reinterpret_cast<float2*>(&traj[t * N_ENVS + e].z) = make_float2(gae, gae + vv);
+                advsum += gae;
+                advsq += gae * gae;
+            }
+            if (lh_r == 0) {
+                ws_ret += retsum;
+                ws_asum += advsum;
+                ws_asq += advsq;
+            }
+        }
+        __syncwarp();
+        if (lh_r == 0) {
+            atomicAdd(&curve[iter], ws_ret);
+            atomicAdd(&cum_stats[0], (double)ws_asum);
+            atomicAdd(&cum_stats[1], (double)ws_asq);
+        }
+
+        grid.sync();  // rollout complete; gradG zeroed by everyone
+
+        // per-iteration advantage normalization stats (cumulative counters)
+        double d0 = cum_stats[0] - cum_stats[2];
+        double d1 = cum_stats[1] - cum_stats[3];
+        double dn = (double)N_SAMP;
+        float mu = (float)(d0 / dn);
+        float var = (float)((d1 - d0 * d0 / dn) / (dn - 1.0));
+        float inv_sig = 1.0f / (sqrtf(var) + 1e-8f);
+
+        // ------------------------------------------------------------------
+        // UPDATE PHASE: 4 epochs x 4 minibatches, one grid.sync per minibatch.
+        // ------------------------------------------------------------------
+        for (int mb = 0; mb < 16; ++mb) {
+            const int epoch = mb >> 2;
+            const int mbi = mb & 3;
+            const uint32_t salt = (uint32_t)(iter * 4 + epoch) * 0x9E3779B9u ^ k0;
+            const uint32_t multA = ((salt ^ (salt >> 11)) | 0x1u) & 0x1FFFFu;
+            const uint32_t addB = (salt * 0x85EBCA6Bu) & 0x1FFFFu;
+
+            float aW1[4][4], aW2[4][4], aV3[4], aB1[4], aB2[4], aB3;
+#pragma unroll
+            for (int a = 0; a < 4; ++a) {
+#pragma unroll
+                for (int b = 0; b < 4; ++b) { aW1[a][b] = 0.f; aW2[a][b] = 0.f; aB2[b] = 0.f; }
+                aV3[a] = 0.f; aB1[a] = 0.f;
+            }
+            aB3 = 0.f;
+
+            uint4 u4pre = make_uint4(0u, 0u, 0u, 0u);
+            // pull-based exact minibatch enumeration: each warp sweeps
+            // consecutive permutation positions through a forward Feistel
+            // bijection -> near-perfectly balanced samples per warp, no
+            // compaction pass and no shared hit buffer at all.
+            const int half = lane >> 4;
+            const int lh = lane & 15;
+            // register-cache this lane's W2/w3 weights for the whole minibatch
+            // (they change only at Adam; ~300 fewer shared loads per lane)
+            const float w2_00 = S.p[320 + lh], w2_01 = S.p[320 + lh + 16], w2_02 = S.p[320 + lh + 32], w2_03 = S.p[320 + lh + 48];
+            const float w2_10 = S.p[384 + lh], w2_11 = S.p[384 + lh + 16], w2_12 = S.p[384 + lh + 32], w2_13 = S.p[384 + lh + 48];
+            const float w2_20 = S.p[448 + lh], w2_21 = S.p[448 + lh + 16], w2_22 = S.p[448 + lh + 32], w2_23 = S.p[448 + lh + 48];
+            const float w2_30 = S.p[512 + lh], w2_31 = S.p[512 + lh + 16], w2_32 = S.p[512 + lh + 32], w2_33 = S.p[512 + lh + 48];
+            const float w3_0 = S.p[580 + lh], w3_1 = S.p[580 + lh + 16], w3_2 = S.p[580 + lh + 32], w3_3 = S.p[580 + lh + 48];
+            const float w1_00 = S.p[lh * 4 + 0], w1_01 = S.p[lh * 4 + 1], w1_02 = S.p[lh * 4 + 2], w1_03 = S.p[lh * 4 + 3];
+            const float w1_10 = S.p[(lh + 16) * 4 + 0], w1_11 = S.p[(lh + 16) * 4 + 1], w1_12 = S.p[(lh + 16) * 4 + 2], w1_13 = S.p[(lh + 16) * 4 + 3];
+            const float w1_20 = S.p[(lh + 32) * 4 + 0], w1_21 = S.p[(lh + 32) * 4 + 1], w1_22 = S.p[(lh + 32) * 4 + 2], w1_23 = S.p[(lh + 32) * 4 + 3];
+            const float w1_30 = S.p[(lh + 48) * 4 + 0], w1_31 = S.p[(lh + 48) * 4 + 1], w1_32 = S.p[(lh + 48) * 4 + 2], w1_33 = S.p[(lh + 48) * 4 + 3];
+            const float b1_0 = S.p[256 + lh], b1_1 = S.p[256 + lh + 16], b1_2 = S.p[256 + lh + 32], b1_3 = S.p[256 + lh + 48];
+            const float b2_0 = S.p[576 + 0], b2_1 = S.p[576 + 1], b2_2 = S.p[576 + 2], b2_3 = S.p[576 + 3];
+            const float b3c = S.p[644];
+            const int mbBeg = mbi * 32768;
+            const int mbEnd = mbBeg + 32768;
+            const int pStep = nwarp * 2;
+            // rolling prefetch of packed sample data (warm from cross-barrier
+            // prefetch for mb > 0)
+            uint4 u4c = (mb > 0) ? u4pre : make_uint4(0u, 0u, 0u, 0u);
+            if (mb == 0 && mbBeg + warp_g * 2 + half < mbEnd) {
+                int s0 = feistel17(mbBeg + warp_g * 2 + half, multA, addB);
+                u4c = traj[s0];
+            }
+#pragma unroll 2
+            for (int pbase = mbBeg + warp_g * 2; pbase < mbEnd; pbase += pStep) {
+                int pos = pbase + half;
+                uint4 u4 = u4c;
+                uint2 u2 = make_uint2(u4.x, u4.y);
+                float2 f2 = make_float2(__uint_as_float(u4.z), __uint_as_float(u4.w));
+                int posn = pos + pStep;
+                if (posn < mbEnd) {
+                    int sn = feistel17(posn, multA, addB);
+                    u4c = traj[sn];
+                }
+                bool acth = (pos < mbEnd);
+                uint32_t sa = u2.x;
+                float oldlogp = __uint_as_float(u2.y);
+                int ax = sa & 15, ay = (sa >> 4) & 15, fx = (sa >> 8) & 15, fy = (sa >> 12) & 15;
+                int act = (sa >> 16) & 3;
+                float X0 = (float)(fx - ax) * (1.0f / 11.0f);
+                float X1 = (float)(fy - ay) * (1.0f / 11.0f);
+                float X2 = (float)ax * 0.1f;
+                float X3 = (float)ay * 0.1f;
+                float adv = (f2.x - mu) * inv_sig;
+                float rt = f2.y;
+
+                // 16 lanes x 4 hidden units
+                float h0 = tanh_ap(w1_00 * X0 + w1_01 * X1 + w1_02 * X2 + w1_03 * X3 + b1_0);
+                float h1 = tanh_ap(w1_10 * X0 + w1_11 * X1 + w1_12 * X2 + w1_13 * X3 + b1_1);
+                float h2 = tanh_ap(w1_20 * X0 + w1_21 * X1 + w1_22 * X2 + w1_23 * X3 + b1_2);
+                float h3 = tanh_ap(w1_30 * X0 + w1_31 * X1 + w1_32 * X2 + w1_33 * X3 + b1_3);
+                float z0 = w2_00 * h0 + w2_01 * h1 + w2_02 * h2 + w2_03 * h3;
+                float z1 = w2_10 * h0 + w2_11 * h1 + w2_12 * h2 + w2_13 * h3;
+                float z2 = w2_20 * h0 + w2_21 * h1 + w2_22 * h2 + w2_23 * h3;
+                float z3 = w2_30 * h0 + w2_31 * h1 + w2_32 * h2 + w2_33 * h3;
+                float vv = w3_0 * h0 + w3_1 * h1 + w3_2 * h2 + w3_3 * h3;
+#pragma unroll
+                for (int off = 8; off; off >>= 1) {
+                    z0 += __shfl_xor_sync(0xffffffffu, z0, off);
+                    z1 += __shfl_xor_sync(0xffffffffu, z1, off);
+                    z2 += __shfl_xor_sync(0xffffffffu, z2, off);
+                    z3 += __shfl_xor_sync(0xffffffffu, z3, off);
+                    vv += __shfl_xor_sync(0xffffffffu, vv, off);
+                }
+                z0 += b2_0; z1 += b2_1; z2 += b2_2; z3 += b2_3;
+                float v = vv + b3c;
+
+                float mx = fmaxf(fmaxf(z0, z1), fmaxf(z2, z3));
+                float e0 = __expf(z0 - mx), e1 = __expf(z1 - mx), e2 = __expf(z2 - mx), e3 = __expf(z3 - mx);
+                float Sm = e0 + e1 + e2 + e3;
+                float rS = __frcp_rn(Sm);
+                float p0 = e0 * rS, p1 = e1 * rS, p2 = e2 * rS, p3 = e3 * rS;
+                float lse = mx + __logf(Sm);
+                float lp0 = z0 - lse, lp1 = z1 - lse, lp2 = z2 - lse, lp3 = z3 - lse;
+                float HH = -(p0 * lp0 + p1 * lp1 + p2 * lp2 + p3 * lp3);
+                float newlp = act == 0 ? lp0 : (act == 1 ? lp1 : (act == 2 ? lp2 : lp3));
+                float ratio = __expf(newlp - oldlogp);
+                float s1 = ratio * adv;
+                float rc = fminf(fmaxf(ratio, 0.8f), 1.2f);
+                float s2 = rc * adv;
+                float pgfac = (s1 <= s2) ? (-ratio * adv * INV_NMB) : 0.f;
+                float entfac = 0.01f * INV_NMB;
+                float gz0 = pgfac * ((act == 0 ? 1.f : 0.f) - p0) + entfac * p0 * (lp0 + HH);
+                float gz1 = pgfac * ((act == 1 ? 1.f : 0.f) - p1) + entfac * p1 * (lp1 + HH);
+                float gz2 = pgfac * ((act == 2 ? 1.f : 0.f) - p2) + entfac * p2 * (lp2 + HH);
+                float gz3 = pgfac * ((act == 3 ? 1.f : 0.f) - p3) + entfac * p3 * (lp3 + HH);
+                float GV = (v - rt) * INV_NMB;
+
+                float dw0 = gz0 * w2_00 + gz1 * w2_10 + gz2 * w2_20 + gz3 * w2_30 + GV * w3_0;
+                float dw1 = gz0 * w2_01 + gz1 * w2_11 + gz2 * w2_21 + gz3 * w2_31 + GV * w3_1;
+                float dw2 = gz0 * w2_02 + gz1 * w2_12 + gz2 * w2_22 + gz3 * w2_32 + GV * w3_2;
+                float dw3 = gz0 * w2_03 + gz1 * w2_13 + gz2 * w2_23 + gz3 * w2_33 + GV * w3_3;
+                float dh0 = dw0 * (1.f - h0 * h0);
+                float dh1 = dw1 * (1.f - h1 * h1);
+                float dh2 = dw2 * (1.f - h2 * h2);
+                float dh3 = dw3 * (1.f - h3 * h3);
+                if (!acth) {
+                    gz0 = 0.f; gz1 = 0.f; gz2 = 0.f; gz3 = 0.f; GV = 0.f;
+                    dh0 = 0.f; dh1 = 0.f; dh2 = 0.f; dh3 = 0.f;
+                    h0 = 0.f; h1 = 0.f; h2 = 0.f; h3 = 0.f;
+                }
+                aW2[0][0] += gz0 * h0; aW2[0][1] += gz1 * h0; aW2[0][2] += gz2 * h0; aW2[0][3] += gz3 * h0;
+                aW2[1][0] += gz0 * h1; aW2[1][1] += gz1 * h1; aW2[1][2] += gz2 * h1; aW2[1][3] += gz3 * h1;
+                aW2[2][0] += gz0 * h2; aW2[2][1] += gz1 * h2; aW2[2][2] += gz2 * h2; aW2[2][3] += gz3 * h2;
+                aW2[3][0] += gz0 * h3; aW2[3][1] += gz1 * h3; aW2[3][2] += gz2 * h3; aW2[3][3] += gz3 * h3;
+                aW1[0][0] += dh0 * X0; aW1[0][1] += dh0 * X1; aW1[0][2] += dh0 * X2; aW1[0][3] += dh0 * X3;
+                aW1[1][0] += dh1 * X0; aW1[1][1] += dh1 * X1; aW1[1][2] += dh1 * X2; aW1[1][3] += dh1 * X3;
+                aW1[2][0] += dh2 * X0; aW1[2][1] += dh2 * X1; aW1[2][2] += dh2 * X2; aW1[2][3] += dh2 * X3;
+                aW1[3][0] += dh3 * X0; aW1[3][1] += dh3 * X1; aW1[3][2] += dh3 * X2; aW1[3][3] += dh3 * X3;
+                aV3[0] += GV * h0; aV3[1] += GV * h1; aV3[2] += GV * h2; aV3[3] += GV * h3;
+                aB1[0] += dh0; aB1[1] += dh1; aB1[2] += dh2; aB1[3] += dh3;
+                if (lh == 0) {
+                    aB2[0] += gz0; aB2[1] += gz1; aB2[2] += gz2; aB2[3] += gz3; aB3 += GV;
+                }
+            }
+            float* G = gradG + mb * NPARAM;
+            // halves hold disjoint samples but identical j-slot sets: reduce
+            // accumulator pairs (lane lh <-> lh+16) via shuffles, then only
+            // lanes 0..15 stage per-warp partials in shared.
+#pragma unroll
+            for (int k = 0; k < 4; ++k) {
+#pragma unroll
+                for (int q = 0; q < 4; ++q) {
+                    aW1[k][q] += __shfl_xor_sync(0xffffffffu, aW1[k][q], 16);
+                    aW2[k][q] += __shfl_xor_sync(0xffffffffu, aW2[k][q], 16);
+                }
+                aV3[k] += __shfl_xor_sync(0xffffffffu, aV3[k], 16);
+                aB1[k] += __shfl_xor_sync(0xffffffffu, aB1[k], 16);
+                aB2[k] += __shfl_xor_sync(0xffffffffu, aB2[k], 16);
+            }
+            aB3 += __shfl_xor_sync(0xffffffffu, aB3, 16);
+            if (lane < 16) {
+                float* SL = &S.slice[wid][0];
+#pragma unroll
+                for (int k = 0; k < 4; ++k) {
+                    int j = lane + 16 * k;
+                    SL[j * 4 + 0] = aW1[k][0]; SL[j * 4 + 1] = aW1[k][1];
+                    SL[j * 4 + 2] = aW1[k][2]; SL[j * 4 + 3] = aW1[k][3];
+                    SL[256 + j] = aB1[k];
+                    SL[320 + j] = aW2[k][0]; SL[384 + j] = aW2[k][1];
+                    SL[448 + j] = aW2[k][2]; SL[512 + j] = aW2[k][3];
+                    SL[580 + j] = aV3[k];
+                }
+                if (lane == 0) {
+                    SL[576 + 0] = aB2[0]; SL[576 + 1] = aB2[1];
+                    SL[576 + 2] = aB2[2]; SL[576 + 3] = aB2[3];
+                    SL[644] = aB3;
+                }
+            }
+            __syncthreads();
+            // block-level reduction: sum the warp slices, one atomic per slot
+            for (int i = tid; i < NPARAM; i += TPB) {
+                float r = S.slice[0][i];
+                for (int w = 1; w < NWARP_B; ++w) r += S.slice[w][i];
+                atomicAdd(G + i, r);
+            }
+
+            // cross-barrier prefetch: next minibatch's first sample record is
+            // param-independent; start the gather before the grid sync.
+            u4pre = make_uint4(0u, 0u, 0u, 0u);
+            if (mb < 15) {
+                const int epn = (mb + 1) >> 2;
+                const int mbn = (mb + 1) & 3;
+                const uint32_t saltN = (uint32_t)(iter * 4 + epn) * 0x9E3779B9u ^ k0;
+                const uint32_t mAN = ((saltN ^ (saltN >> 11)) | 0x1u) & 0x1FFFFu;
+                const uint32_t aBN = (saltN * 0x85EBCA6Bu) & 0x1FFFFu;
+                int posn = mbn * 32768 + warp_g * 2 + half;
+                if (posn < mbn * 32768 + 32768) {
+                    u4pre = traj[feistel17(posn, mAN, aBN)];
+                }
+            }
+            grid.sync();  // minibatch gradient complete (drains the few atomics)
+
+            // identical clip + Adam in every block
+            float g_loc[2];
+            float ssum = 0.f;
+#pragma unroll
+            for (int q = 0; q < 2; ++q) {
+                int i = tid + q * TPB;
+                g_loc[q] = (i < NPARAM) ? G[i] : 0.f;
+                ssum += g_loc[q] * g_loc[q];
+            }
+#pragma unroll
+            for (int off = 16; off; off >>= 1) ssum += __shfl_down_sync(0xffffffffu, ssum, off);
+            if (lane == 0) S.red[wid] = ssum;
+            if (tid == 0) {
+                S.bc[0] *= 0.9;
+                S.bc[1] *= 0.999;
+                S.bcf[0] = (float)(0.003 / (1.0 - S.bc[0]));
+                S.bcf[1] = (float)(1.0 / (1.0 - S.bc[1]));
+            }
+            __syncthreads();
+            if (tid == 0) {
+                float tot = 0.f;
+                for (int w = 0; w < NWARP_B; ++w) tot += S.red[w];
+                S.red[0] = sqrtf(tot);
+            }
+            __syncthreads();
+            float total = S.red[0];
+            float clipf = fminf(0.5f / (total + 1e-6f), 1.0f);
+            float bcA = S.bcf[0];   // lr / (1 - beta1^t)
+            float bc2i = S.bcf[1];  // 1 / (1 - beta2^t)
+#pragma unroll
+            for (int q = 0; q < 2; ++q) {
+                int i = tid + q * TPB;
+                if (i < NPARAM) {
+                    float g = g_loc[q] * clipf;
+                    float m = 0.9f * S.m[i] + 0.1f * g;
+                    float v2 = 0.999f * S.v[i] + 0.001f * g * g;
+                    S.m[i] = m;
+                    S.v[i] = v2;
+                    S.p[i] -= (bcA * m) / (sqrtf(v2 * bc2i) + 1e-8f);
+                }
+            }
+            __syncthreads();
+        }
+        if (blockIdx.x == 0 && tid == 0) {
+            cum_stats[2] = cum_stats[0];
+            cum_stats[3] = cum_stats[1];
+        }
+        // next iteration reuses the shared-resident parameters directly
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Host orchestration: init launch + ONE megakernel launch + curve readback.
+// ---------------------------------------------------------------------------
+at::Tensor train_impl(int64_t total_env_steps, int64_t seed) {
+    const int64_t iters = std::max<int64_t>(1, total_env_steps / (TT * N_ENVS));
+    auto optsF = at::TensorOptions().dtype(at::kFloat).device(at::kCUDA, 0);
+    auto optsI = at::TensorOptions().dtype(at::kInt).device(at::kCUDA, 0);
+    auto optsD = at::TensorOptions().dtype(at::kDouble).device(at::kCUDA, 0);
+
+    at::Tensor params = at::zeros({NPARAM}, optsF);
+    at::Tensor traj = at::empty({N_SAMP, 4}, optsI);
+    at::Tensor gradG = at::empty({16 * NPARAM}, optsF);
+    at::Tensor cum_stats = at::zeros({4}, optsD);
+    at::Tensor curve = at::zeros({iters}, optsF);
+
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream(0).stream();
+    const uint32_t k0 = (uint32_t)(seed & 0xffffffffu);
+    const uint32_t k1 = (uint32_t)(((uint64_t)seed >> 32) | 0x5A5A5A5Au);
+
+    float* p_params = params.data_ptr<float>();
+    uint4* p_traj = (uint4*)traj.data_ptr<int>();
+    float* p_gradG = gradG.data_ptr<float>();
+    double* p_stats = cum_stats.data_ptr<double>();
+    float* p_curve = curve.data_ptr<float>();
+
+    init_kernel<<<1, 256, 0, stream>>>(p_params, k0, k1);
+
+    static int mg_grid = -1;
+    if (mg_grid < 0) {
+        int dev = 0;
+        cudaGetDevice(&dev);
+        int sms = 0;
+        cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev);
+        cudaFuncSetAttribute(ppo_megakernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                             (int)sizeof(MegaShared));
+        int nb = 0;
+        cudaOccupancyMaxActiveBlocksPerMultiprocessor(&nb, ppo_megakernel, TPB, (int)sizeof(MegaShared));
+        TORCH_CHECK(nb >= 1, "megakernel does not fit on this GPU");
+        mg_grid = sms;
+    }
+
+    int iters_i = (int)iters;
+    void* args[] = {&p_params, &p_traj, &p_stats, &p_gradG,
+                    &p_curve, &iters_i, (void*)&k0, (void*)&k1};
+    cudaError_t err = cudaLaunchCooperativeKernel(
+        (void*)ppo_megakernel, dim3(mg_grid), dim3(TPB), args, (size_t)sizeof(MegaShared), stream);
+    TORCH_CHECK(err == cudaSuccess, "cooperative launch failed: ",
+                cudaGetErrorString(err));
+    cudaError_t last = cudaGetLastError();
+    TORCH_CHECK(last == cudaSuccess, "kernel launch error: ", cudaGetErrorString(last));
+    at::Tensor cpu = curve.to(at::kCPU);
+    return cpu;
+}
+"""
+
+_ext = None
+
+
+def _build():
+    global _ext
+    if _ext is None:
+        _ext = load_inline(
+            name="grid_ppo_megakernel_v2",
+            cpp_sources=[_CPP_SRC],
+            cuda_sources=[_CUDA_SRC],
+            functions=["train_impl"],
+            extra_cuda_cflags=["-O3"],
+            verbose=False,
+        )
+    return _ext
+
+
+def train(total_env_steps: int, seed: int) -> list[float]:
+    ext = _build()
+    cpu = ext.train_impl(int(total_env_steps), int(seed))
+    n = cpu.numel()
+    # curve tensor holds per-iteration reward sums; reference reports the mean
+    # over envs, so divide by NUM_ENVS.
+    return [cpu[i].item() / 4096.0 for i in range(n)]
+
+
+if __name__ == "__main__":
+    import time
+
+    t0 = time.perf_counter()
+    c = train(32 * 4096 * 40, seed=0)
+    torch.cuda.synchronize()
+    dt = time.perf_counter() - t0
+    steps = 32 * 4096 * len(c)
+    print(f"iters={len(c)} return_first={c[0]:.3f} return_last={c[-1]:.3f}")
+    print(f"elapsed={dt:.2f}s sps={steps / dt:,.0f}")
