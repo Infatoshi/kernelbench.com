@@ -103,10 +103,11 @@ export const PROBLEM_LABELS: Record<string, string> = {
 }
 
 /** Mega problems hidden from public UI (homepage, /mega, model pages) and
- *  held out of ranking. Flagship roster hasn't gone head-to-head on these —
- *  showing them next to `02_kimi_linear_decode` made pass counts and columns
- *  inconsistent. Data stays in catalog/index; only presentation filters.
- *  Mirrors PERF_EXCLUDE in scripts/build_model_index.py. */
+ *  held out of ranking. `01_rl_grid_ppo` is still run, archived, and kept in
+ *  catalog/models.json (runs, traces, solutions intact) but not shown — the
+ *  same fused-megakernel skill surface is graded on KernelBench-CUDA, so Mega
+ *  presents the head-to-head Kimi-Linear cell only. Presentation filter only;
+ *  mirrors PERF_EXCLUDE in scripts/build_model_index.py. */
 export const MEGA_HIDDEN_PROBLEMS = new Set(["01_rl_grid_ppo"])
 
 export const FLAG_VERDICTS = new Set([
@@ -714,7 +715,7 @@ export function barsForBench(
 // 2) MEGA performance chart:
 //      score_m = max(speedup) over the model's valid cells on the canonical
 //                board, EXCLUDING problems in MEGA_HIDDEN_PROBLEMS (currently
-//                01_rl_grid_ppo — not head-to-head yet: flagships haven't all
+//                01_rl_grid_ppo — hidden on site; skill covered on CUDA; flagships
 //                attempted it, so its cells can't set a rank). Each cell's
 //                score is already the run's geomean decode speedup vs the
 //                optimized-PyTorch baseline across contexts; the model's best

@@ -409,9 +409,10 @@ def join_annotations(models: Models, bench: str, ann_dir: Path) -> tuple[list[st
     return sorted(annotation_only), len(files)
 
 
-# Problems excluded from the perf aggregate (cells still display on boards).
-# mega/01_rl_grid_ppo: too few models have attempted it — counting it lets a
-# model's score ride on a problem most of the roster never ran.
+# Problems excluded from the perf aggregate. Cells remain in models.json /
+# archives (runs, traces, solutions). Site UI also hides these via
+# MEGA_HIDDEN_PROBLEMS in app/_lib/models.ts — Mega public board is
+# Kimi-Linear only; RL Grid PPO skill is graded on KernelBench-CUDA.
 PERF_EXCLUDE: dict[str, set[str]] = {"mega": {"01_rl_grid_ppo"}}
 
 

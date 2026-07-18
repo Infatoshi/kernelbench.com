@@ -180,7 +180,17 @@ function BenchPanel({
   const gpuKeys = (meta?.gpus ?? []).filter(
     (g) => g !== "rtxpro6000" && !SITE_HIDDEN_GPUS.has(g) && block.gpus?.[g],
   )
-  const full = block.total_problems > 0 && block.passed >= block.total_problems
+  // Visible deck only (e.g. mega drops 01_rl_grid_ppo from the public board).
+  const problems = visibleProblems(
+    bench,
+    meta?.problems?.length ? meta.problems : Object.keys(block.cells),
+  )
+  const passedVisible = problems.filter((p) => {
+    const c = block.cells[p]
+    return Boolean(c?.valid && c.score != null)
+  }).length
+  const totalVisible = problems.length
+  const full = totalVisible > 0 && passedVisible >= totalVisible
   const harness = [block.harness, block.effort].filter(Boolean).join(" · ")
   return (
     <section className="chart-panel board-panel">
@@ -191,7 +201,7 @@ function BenchPanel({
         </div>
         <div className="board-head-chips">
           <span className={`status-pill ${full ? "status-pill-good" : "status-pill-muted"}`}>
-            {block.passed}/{block.total_problems} pass
+            {passedVisible}/{totalVisible} pass
           </span>
           {block.flagged > 0 ? (
             <span
@@ -212,20 +222,12 @@ function BenchPanel({
         {canonicalLabel}
         <span className="board-kicker-dim">· canonical board</span>
       </p>
-      <CellGrid
-        bench={bench}
-        problems={visibleProblems(bench, meta?.problems ?? [])}
-        block={block}
-      />
+      <CellGrid bench={bench} problems={problems} block={block} />
 
       {gpuKeys.map((g) => (
         <div key={g} className="board-extra">
           <p className="board-kicker">{meta?.gpu_labels?.[g] ?? g}</p>
-          <CellGrid
-            bench={bench}
-            problems={visibleProblems(bench, meta?.problems ?? [])}
-            block={block.gpus[g]!}
-          />
+          <CellGrid bench={bench} problems={problems} block={block.gpus[g]!} />
         </div>
       ))}
 
