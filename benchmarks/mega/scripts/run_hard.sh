@@ -571,6 +571,47 @@ case "$HARNESS" in
             > "$LOG_FILE" 2> "$STDERR_FILE" || HARNESS_EXIT=$?
         ;;
 
+    or-fable|openrouter-fable)
+        # Claude Code → OpenRouter Anthropic-compatible API for Claude Fable 5.
+        # Requires OPENROUTER_API_KEY. See hard/scripts/run_hard.sh for notes.
+        if [ -z "${OPENROUTER_API_KEY:-}" ]; then
+            echo "OPENROUTER_API_KEY is required for or-fable" >&2
+            exit 1
+        fi
+        case "$MODEL" in
+            fable|fable-5|claude-fable|claude-fable-5|anthropic/claude-fable-5)
+                OR_FABLE_MODEL="anthropic/claude-fable-5"
+                ;;
+            *)
+                OR_FABLE_MODEL="$MODEL"
+                ;;
+        esac
+        OR_FABLE_BASE_URL="${OR_FABLE_BASE_URL:-https://openrouter.ai/api}"
+        ( cd "$PROBLEM_DIR" && \
+            export ANTHROPIC_AUTH_TOKEN="$OPENROUTER_API_KEY" && \
+            unset ANTHROPIC_API_KEY CLAUDE_CODE_OAUTH_TOKEN && \
+            export ANTHROPIC_API_KEY= && \
+            export ANTHROPIC_BASE_URL="$OR_FABLE_BASE_URL" && \
+            export API_TIMEOUT_MS="${API_TIMEOUT_MS:-3000000}" && \
+            export CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS="${CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS:-1}" && \
+            export CLAUDE_CODE_MAX_RETRIES="${CLAUDE_CODE_MAX_RETRIES:-1000000}" && \
+            export CLAUDE_CODE_MAX_OUTPUT_TOKENS="${CLAUDE_CODE_MAX_OUTPUT_TOKENS:-128000}" && \
+            export ANTHROPIC_MODEL="$OR_FABLE_MODEL" && \
+            export ANTHROPIC_DEFAULT_HAIKU_MODEL="$OR_FABLE_MODEL" && \
+            export ANTHROPIC_DEFAULT_SONNET_MODEL="$OR_FABLE_MODEL" && \
+            export ANTHROPIC_DEFAULT_OPUS_MODEL="$OR_FABLE_MODEL" && \
+            "${KBH_SBX[@]}" timeout "$BUDGET_SECONDS" claude \
+                --dangerously-skip-permissions \
+                --print --verbose \
+                --output-format stream-json \
+                --settings "$CLAUDE_KBH_SETTINGS" \
+                --model "$OR_FABLE_MODEL" \
+                --disallowedTools ExitPlanMode EnterPlanMode AskUserQuestion \
+                --add-dir "$PROBLEM_DIR" \
+                -p "$PROMPT" ) \
+            > "$LOG_FILE" 2> "$STDERR_FILE" || HARNESS_EXIT=$?
+        ;;
+
     longcat-claude)
         # Claude Code routed to Meituan LongCat's Anthropic-compatible endpoint.
         # Requires LONGCAT_API_KEY. Pass MODEL=LongCat-2.0.
@@ -660,10 +701,9 @@ JSON
             </dev/null > "$LOG_FILE" 2> "$STDERR_FILE" ) || HARNESS_EXIT=$?
         ;;
 
-    tinker|inkling)
+    tinker)
         # Thinking Machines Inkling: OpenCode -> Tinker OpenAI-compat (beta).
-        # Same route as the hard bench; key THINKING_MACHINES_API_KEY
-        # (TINKER_API_KEY honored). 64K context tier, output <= 32000.
+        # Key THINKING_MACHINES_API_KEY (TINKER_API_KEY honored). 64K context tier.
         TINKER_KEY_VAL="${THINKING_MACHINES_API_KEY:-${TINKER_API_KEY:-}}"
         if [ -z "$TINKER_KEY_VAL" ]; then
             echo "STOP: tinker needs \$THINKING_MACHINES_API_KEY (Tinker / Thinking Machines)" >&2
@@ -738,6 +778,104 @@ JSON
             printf '%s tinker auto-continue %s/%s (growth=%s)\n' \
                 "$(date -Is)" "$TINKER_I" "$TINKER_CONTINUES" "$TINKER_GROWTH" \
                 >> "$RUN_DIR/tinker_continues.log"
+        done
+        ;;
+
+    inkling|opencode-inkling)
+        # Thinking Machines Inkling via OpenRouter + OpenCode (official agent
+        # harness). Prefers high reasoning effort for kernel work.
+        # Usage: inkling thinkingmachines/inkling problems/02_kimi_linear_decode high
+        if [ -z "${OPENROUTER_API_KEY:-}" ]; then
+            echo "STOP: inkling needs \$OPENROUTER_API_KEY (OpenRouter)" >&2
+            exit 1
+        fi
+        case "$MODEL" in
+            ""|inkling|Inkling|thinkingmachines/inkling|thinkingmachines/Inkling|openrouter/thinkingmachines/inkling)
+                MODEL="thinkingmachines/inkling"
+                ;;
+            *)
+                echo "STOP: inkling harness only serves thinkingmachines/inkling (got '$MODEL')" >&2
+                exit 1
+                ;;
+        esac
+        # Map 4th-arg effort -> OpenRouter reasoning.effort (high for kernels).
+        INK_RE="${INKLING_REASONING_EFFORT:-}"
+        if [ -z "$INK_RE" ]; then
+            case "${REASONING_EFFORT:-high}" in
+                no_think|none|minimal|off) INK_RE=none ;;
+                low|minimal|fast) INK_RE=low ;;
+                medium|med|default) INK_RE=medium ;;
+                high|xhigh|max|*) INK_RE=high ;;
+            esac
+        fi
+        INK_OC_HOME="$RUN_DIR/opencode_openrouter_inkling_config"
+        mkdir -p "$INK_OC_HOME/opencode"
+        cat > "$INK_OC_HOME/opencode/opencode.json" <<JSON
+{
+  "\$schema": "https://opencode.ai/config.json",
+  "permission": { "external_directory": "deny" },
+  "provider": {
+    "openrouter-thinkingmachines": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "OpenRouter -> Thinking Machines (Inkling)",
+      "options": {
+        "baseURL": "https://openrouter.ai/api/v1",
+        "apiKey": "${OPENROUTER_API_KEY}",
+        "headers": {
+          "HTTP-Referer": "https://kernelbench.com",
+          "X-Title": "KernelBench-Mega"
+        },
+        "extraBody": {
+          "reasoning": { "effort": "${INK_RE}" }
+        }
+      },
+      "models": {
+        "thinkingmachines/inkling": {
+          "name": "Inkling (OpenRouter)",
+          "limit": { "context": ${INKLING_CONTEXT_LIMIT:-1048576}, "output": ${INKLING_OUTPUT_LIMIT:-65536} },
+          "tools": true
+        }
+      }
+    }
+  }
+}
+JSON
+        INK_MODEL="openrouter-thinkingmachines/thinkingmachines/inkling"
+        # Same auto-continue as tinker (Inkling likes to ask "should I proceed?").
+        INK_CONTINUES="${KBH_INKLING_CONTINUES:-${KBH_TINKER_CONTINUES:-30}}"
+        INK_NUDGE="Proceed autonomously; never ask questions or wait for confirmation. If check.py has not printed PASS, keep fixing solution.py until it does. Once it passes, keep optimizing and re-measuring with benchmark.py. Only stop when you are confident the kernel is as fast as you can make it."
+        INK_SID=""
+        INK_I=0
+        HARNESS_EXIT=0
+        while :; do
+            INK_LOG_BEFORE=0
+            [ -f "$LOG_FILE" ] && INK_LOG_BEFORE="$(wc -l < "$LOG_FILE")"
+            HARNESS_EXIT=0
+            if [ "$INK_I" -eq 0 ]; then
+                ( cd "$PROBLEM_DIR" && "${KBH_SBX[@]}" timeout "$BUDGET_SECONDS" \
+                    env XDG_CONFIG_HOME="$INK_OC_HOME" OPENROUTER_API_KEY="$OPENROUTER_API_KEY" \
+                    opencode run --pure --format json -m "$INK_MODEL" "$PROMPT" \
+                    </dev/null >> "$LOG_FILE" 2>> "$STDERR_FILE" ) || HARNESS_EXIT=$?
+            else
+                ( cd "$PROBLEM_DIR" && "${KBH_SBX[@]}" timeout "$BUDGET_SECONDS" \
+                    env XDG_CONFIG_HOME="$INK_OC_HOME" OPENROUTER_API_KEY="$OPENROUTER_API_KEY" \
+                    opencode run --pure --format json -m "$INK_MODEL" \
+                        -s "$INK_SID" "$INK_NUDGE" \
+                    </dev/null >> "$LOG_FILE" 2>> "$STDERR_FILE" ) || HARNESS_EXIT=$?
+            fi
+            INK_LOG_AFTER=0
+            [ -f "$LOG_FILE" ] && INK_LOG_AFTER="$(wc -l < "$LOG_FILE")"
+            INK_GROWTH=$(( INK_LOG_AFTER - INK_LOG_BEFORE ))
+            INK_SID="$(grep -ao '"sessionID":"[^"]*"' "$LOG_FILE" | tail -1 | cut -d'"' -f4)"
+            [ -z "$INK_SID" ] && break
+            if [ "$INK_I" -gt 0 ] && [ "$INK_GROWTH" -lt 12 ] && [ -f "$PROBLEM_DIR/solution.py" ]; then
+                break
+            fi
+            INK_I=$(( INK_I + 1 ))
+            [ "$INK_I" -gt "$INK_CONTINUES" ] && break
+            printf '%s inkling auto-continue %s/%s (growth=%s effort=%s)\n' \
+                "$(date -Is)" "$INK_I" "$INK_CONTINUES" "$INK_GROWTH" "$INK_RE" \
+                >> "$RUN_DIR/inkling_continues.log"
         done
         ;;
 
@@ -884,7 +1022,7 @@ JSON
 
     *)
         echo "Unknown harness: $HARNESS" >&2
-        echo "Supported: claude, zai-claude, minimax-claude, kimi-claude, kinetic-claude, longcat-claude, hy3, deepseek-claude, ccr-claude, codex, kimi, droid, gemini, cursor, grok, opencode" >&2
+        echo "Supported: claude, zai-claude, minimax-claude, kimi-claude, kinetic-claude, or-fable, longcat-claude, hy3, deepseek-claude, ccr-claude, codex, kimi, droid, gemini, cursor, grok, opencode, tinker, inkling, opencode-inkling" >&2
         exit 1
         ;;
 esac
@@ -915,7 +1053,7 @@ fi
 
 SESSION_COMPLETE=true
 case "$HARNESS" in
-    claude|zai-claude|minimax-claude|kimi-claude|kinetic-claude|longcat-claude|deepseek-claude|ccr-claude|cursor|gemini)
+    claude|zai-claude|minimax-claude|kimi-claude|kinetic-claude|or-fable|openrouter-fable|longcat-claude|deepseek-claude|ccr-claude|cursor|gemini)
         if ! grep -q '"type":"result"' "$CHECK_FILE" 2>/dev/null; then
             SESSION_COMPLETE=false
         fi
@@ -930,7 +1068,7 @@ case "$HARNESS" in
             SESSION_COMPLETE=false
         fi
         ;;
-    droid|kimi|opencode|hy3|hy3-claude)
+    droid|kimi|opencode|hy3|hy3-claude|tinker|inkling|opencode-inkling)
         # No reliable terminal marker; trust the exit code.
         if [ "$HARNESS_EXIT" -ne 0 ]; then
             SESSION_COMPLETE=false

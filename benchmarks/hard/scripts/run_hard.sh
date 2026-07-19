@@ -1639,6 +1639,81 @@ case "$HARNESS" in
         fi
         ;;
 
+    or-fable|openrouter-fable)
+        # Claude Code → OpenRouter Anthropic-compatible API for Claude Fable 5.
+        # Requires OPENROUTER_API_KEY. Smoke-tested 2026-07-19:
+        #   ANTHROPIC_BASE_URL=https://openrouter.ai/api
+        #   ANTHROPIC_AUTH_TOKEN=$OPENROUTER_API_KEY
+        #   unset ANTHROPIC_API_KEY / CLAUDE_CODE_OAUTH_TOKEN
+        #   --model anthropic/claude-fable-5
+        #   CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS=1
+        if [ -z "${OPENROUTER_API_KEY:-}" ]; then
+            echo "OPENROUTER_API_KEY is required for or-fable" >&2
+            exit 1
+        fi
+        # Default model id if caller passes a bare alias.
+        case "$MODEL" in
+            fable|fable-5|claude-fable|claude-fable-5|anthropic/claude-fable-5)
+                OR_FABLE_MODEL="anthropic/claude-fable-5"
+                ;;
+            *)
+                OR_FABLE_MODEL="$MODEL"
+                ;;
+        esac
+        OR_FABLE_BASE_URL="${OR_FABLE_BASE_URL:-https://openrouter.ai/api}"
+        if [ "$KBH_AGENT_CONTAINER" = "1" ]; then
+            CLAUDE_CONTAINER_ENV_NAMES=(
+                ANTHROPIC_BASE_URL API_TIMEOUT_MS
+                CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS
+                CLAUDE_CODE_MAX_RETRIES CLAUDE_CODE_MAX_OUTPUT_TOKENS
+                ANTHROPIC_MODEL
+                ANTHROPIC_DEFAULT_HAIKU_MODEL ANTHROPIC_DEFAULT_SONNET_MODEL
+                ANTHROPIC_DEFAULT_OPUS_MODEL
+            )
+            CLAUDE_CONTAINER_EXTRA_CLAUDE_ARGS=(--disallowedTools ExitPlanMode EnterPlanMode AskUserQuestion)
+            ( export ANTHROPIC_AUTH_TOKEN="$OPENROUTER_API_KEY" && \
+                unset ANTHROPIC_API_KEY CLAUDE_CODE_OAUTH_TOKEN && \
+                export ANTHROPIC_API_KEY= && \
+                export ANTHROPIC_BASE_URL="$OR_FABLE_BASE_URL" && \
+                export API_TIMEOUT_MS="${API_TIMEOUT_MS:-3000000}" && \
+                export CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS="${CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS:-1}" && \
+                export CLAUDE_CODE_MAX_RETRIES="${CLAUDE_CODE_MAX_RETRIES:-1000000}" && \
+                export CLAUDE_CODE_MAX_OUTPUT_TOKENS="${CLAUDE_CODE_MAX_OUTPUT_TOKENS:-128000}" && \
+                export ANTHROPIC_MODEL="$OR_FABLE_MODEL" && \
+                export ANTHROPIC_DEFAULT_HAIKU_MODEL="$OR_FABLE_MODEL" && \
+                export ANTHROPIC_DEFAULT_SONNET_MODEL="$OR_FABLE_MODEL" && \
+                export ANTHROPIC_DEFAULT_OPUS_MODEL="$OR_FABLE_MODEL" && \
+                run_claude_container "" "$OR_FABLE_MODEL" 0 ) \
+                > "$LOG_FILE" 2> "$STDERR_FILE" || HARNESS_EXIT=$?
+            CLAUDE_CONTAINER_ENV_NAMES=()
+            CLAUDE_CONTAINER_EXTRA_CLAUDE_ARGS=()
+        else
+        ( cd "$PROBLEM_DIR" && \
+            export ANTHROPIC_AUTH_TOKEN="$OPENROUTER_API_KEY" && \
+            unset ANTHROPIC_API_KEY CLAUDE_CODE_OAUTH_TOKEN && \
+            export ANTHROPIC_API_KEY= && \
+            export ANTHROPIC_BASE_URL="$OR_FABLE_BASE_URL" && \
+            export API_TIMEOUT_MS="${API_TIMEOUT_MS:-3000000}" && \
+            export CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS="${CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS:-1}" && \
+            export CLAUDE_CODE_MAX_RETRIES="${CLAUDE_CODE_MAX_RETRIES:-1000000}" && \
+            export CLAUDE_CODE_MAX_OUTPUT_TOKENS="${CLAUDE_CODE_MAX_OUTPUT_TOKENS:-128000}" && \
+            export ANTHROPIC_MODEL="$OR_FABLE_MODEL" && \
+            export ANTHROPIC_DEFAULT_HAIKU_MODEL="$OR_FABLE_MODEL" && \
+            export ANTHROPIC_DEFAULT_SONNET_MODEL="$OR_FABLE_MODEL" && \
+            export ANTHROPIC_DEFAULT_OPUS_MODEL="$OR_FABLE_MODEL" && \
+            timeout "$BUDGET_SECONDS" claude \
+                --dangerously-skip-permissions \
+                --print --verbose \
+                --output-format stream-json \
+                --settings "$CLAUDE_KBH_SETTINGS" \
+                --model "$OR_FABLE_MODEL" \
+                --disallowedTools ExitPlanMode EnterPlanMode AskUserQuestion \
+                --add-dir "$PROBLEM_DIR" \
+                -p "$PROMPT" ) \
+            > "$LOG_FILE" 2> "$STDERR_FILE" || HARNESS_EXIT=$?
+        fi
+        ;;
+
     longcat-claude)
         # Claude Code routed to Meituan's Anthropic-compatible endpoint for
         # LongCat-2.0. Requires LONGCAT_API_KEY in the environment or
@@ -2165,7 +2240,7 @@ case "$HARNESS" in
 
     *)
         echo "Unknown harness: $HARNESS" >&2
-        echo "Supported: claude, zai-claude, minimax-claude, kimi-claude, kinetic-claude, longcat-claude, hy3, deepseek-claude, qwen-claude, ccr-claude, codex, kimi, droid, gemini, cursor, grok, opencode, opencode-nemotron, nvcf-nemotron" >&2
+        echo "Supported: claude, zai-claude, minimax-claude, kimi-claude, kinetic-claude, or-fable, longcat-claude, hy3, deepseek-claude, qwen-claude, ccr-claude, codex, kimi, droid, gemini, cursor, grok, opencode, opencode-nemotron, nvcf-nemotron" >&2
         exit 1
         ;;
 esac
@@ -2196,7 +2271,7 @@ fi
 
 SESSION_COMPLETE=true
 case "$HARNESS" in
-    claude|zai-claude|minimax-claude|kimi-claude|kinetic-claude|longcat-claude|deepseek-claude|qwen-claude|ccr-claude|cursor|gemini)
+    claude|zai-claude|minimax-claude|kimi-claude|kinetic-claude|or-fable|openrouter-fable|longcat-claude|deepseek-claude|qwen-claude|ccr-claude|cursor|gemini)
         if ! grep -q '"type":"result"' "$CHECK_FILE" 2>/dev/null; then
             SESSION_COMPLETE=false
         fi

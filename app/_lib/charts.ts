@@ -16,6 +16,7 @@ const REPO_ROOT = process.cwd()
 export const MODEL_NAMES: Record<string, string> = {
   "claude-opus-4-8": "Claude Opus 4.8",
   "claude-fable-5": "Claude Fable 5",
+  "anthropic/claude-fable-5": "Claude Fable 5 (OpenRouter)",
   "claude-sonnet-5": "Claude Sonnet 5",
   "glm-5.2": "GLM-5.2",
   "gpt-5.5": "GPT-5.5",
@@ -157,6 +158,7 @@ function markFrontier(points: EffPoint[]): EffPoint[] {
 const SHORT_NAMES: Record<string, string> = {
   "claude-opus-4-8": "Opus 4.8",
   "claude-fable-5": "Fable 5",
+  "anthropic/claude-fable-5": "Fable 5 (OR)",
   "claude-sonnet-5": "Sonnet 5",
   "glm-5.2": "GLM-5.2",
   "gpt-5.5": "GPT-5.5",

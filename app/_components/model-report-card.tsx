@@ -1,5 +1,9 @@
+"use client"
+
 import Link from "next/link"
+import { useState } from "react"
 import type { ProblemChip, ReportRow, ReportView } from "../_lib/models"
+import { RunDetailOverlay } from "./run-detail"
 
 // Per-problem report card: one row per model, six (or N) chips — pass shows
 // peak fraction, fail shows a short reason. Rank is by pass count only; we
@@ -50,7 +54,13 @@ function FlagMark({ row }: { row: ReportRow }) {
   )
 }
 
-function Chip({ chip }: { chip: ProblemChip }) {
+function Chip({
+  chip,
+  onOpen,
+}: {
+  chip: ProblemChip
+  onOpen?: (chip: ProblemChip) => void
+}) {
   const cls =
     chip.kind === "pass"
       ? "rcell rcell-pass"
@@ -61,8 +71,34 @@ function Chip({ chip }: { chip: ProblemChip }) {
           : chip.kind === "no_kernel"
             ? "rcell rcell-empty"
             : "rcell rcell-fail"
+  const openable = Boolean(chip.run_id && onOpen)
   return (
-    <span className={cls} title={`${chip.problem}: ${chip.title}`}>
+    <span
+      className={`${cls}${openable ? " rcell-openable" : ""}`}
+      title={`${chip.problem}: ${chip.title}${openable ? " — click for shapes, kernel, trace" : ""}`}
+      role={openable ? "button" : undefined}
+      tabIndex={openable ? 0 : undefined}
+      onClick={
+        openable
+          ? (e) => {
+              e.preventDefault()
+              e.stopPropagation()
+              onOpen!(chip)
+            }
+          : undefined
+      }
+      onKeyDown={
+        openable
+          ? (e) => {
+              if (e.key === "Enter" || e.key === " ") {
+                e.preventDefault()
+                e.stopPropagation()
+                onOpen!(chip)
+              }
+            }
+          : undefined
+      }
+    >
       <span className="rcell-prob">{chip.short}</span>
       <span className="rcell-val tabular">{chip.label}</span>
     </span>
@@ -71,6 +107,10 @@ function Chip({ chip }: { chip: ProblemChip }) {
 
 export function ModelReportCard({ view }: { view: ReportView }) {
   let lastTier: string | null = null
+  const [openRun, setOpenRun] = useState<{
+    chip: ProblemChip
+    modelName: string
+  } | null>(null)
   return (
     <div className="rcard" role="figure" aria-label={view.axis}>
       <div className="rcard-head" aria-hidden="true">
@@ -119,7 +159,11 @@ export function ModelReportCard({ view }: { view: ReportView }) {
               </span>
               <span className="rcard-chips">
                 {row.chips.map((c) => (
-                  <Chip key={c.problem} chip={c} />
+                  <Chip
+                    key={c.problem}
+                    chip={c}
+                    onOpen={(chip) => setOpenRun({ chip, modelName: row.name })}
+                  />
                 ))}
               </span>
               <span className="mbar-right">
@@ -152,6 +196,13 @@ export function ModelReportCard({ view }: { view: ReportView }) {
         </span>
         audit flag
       </p>
+      {openRun && (
+        <RunDetailOverlay
+          chip={openRun.chip}
+          modelName={openRun.modelName}
+          onClose={() => setOpenRun(null)}
+        />
+      )}
     </div>
   )
 }

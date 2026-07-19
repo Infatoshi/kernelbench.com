@@ -286,9 +286,15 @@ TMP="$RUN_DIR/tmp"
 The harness prepends `$RUN_DIR/bin` to `PATH` and wraps `uv`, `python`,
 `python3`, `nvidia-smi`, `ncu`, `nsys`, and `nvcc`. These wrappers acquire the
 shared `outputs/gpu.lock`, log timing to `$RUN_DIR/gpu_lock.log`, and then run
-the real binary. The lock wrapper is intentionally reentrant:
-`KBH_GPU_LOCK_HELD=1` lets child tools such as `nvcc` run under the parent
-`uv run python benchmark.py` lock instead of deadlocking.
+the real binary. **Caveat (2026-07-19):** the default lock is **per-bench**
+(`benchmarks/{hard,cuda,mega}/outputs/gpu_lock/gpu.lock`), not machine-wide —
+so hard + cuda + mega agents can still hold the GPU at the same time. Agent
+ad-hoc `python`/`nvcc` via absolute paths can also bypass the wrapper. Parallel
+agent sessions are fine for development flywheels; **do not treat mid-session
+or contention-era `result.json` peak numbers as publish-grade** (see
+sequential re-benchmark rule below). The lock wrapper is intentionally
+reentrant: `KBH_GPU_LOCK_HELD=1` lets child tools such as `nvcc` run under the
+parent `uv run python benchmark.py` lock instead of deadlocking.
 Run metadata includes agent wall time, total/check/benchmark wall time,
 check/benchmark exit codes, parsed token/cache/reasoning usage, and GPU lock
 wait/active totals via `scripts/summarize_runs.py`.
@@ -355,7 +361,7 @@ uv run kbh run opencode openrouter-google-ai-studio/google/gemini-3.5-flash prob
 uv run kbh run opencode-nemotron nvidia/nemotron-3-ultra-550b-a55b problems-rtxpro6000/01_fp8_gemm
 uv run kbh run cursor composer-2.5 problems-rtxpro6000/01_fp8_gemm
 uv run kbh run cursor composer-2.5-fast problems-rtxpro6000/01_fp8_gemm
-uv run kbh run grok grok-build problems-rtxpro6000/01_fp8_gemm max
+uv run kbh run grok grok-4.5 problems-rtxpro6000/01_fp8_gemm high
 ```
 
 Other serious rows to keep in the matrix if their auth/config is healthy:
@@ -383,8 +389,10 @@ Current smoke notes:
 - Cursor CLI on Anvil is `/home/infatoshi/.local/bin/agent`, not `cursor`.
   Available Cursor model slugs include `composer-2.5` and `composer-2.5-fast`.
 - Grok CLI is installed on Anvil as `/home/infatoshi/.local/bin/grok`, not on
-  the Mac control plane. `grok models` currently exposes `grok-build` as the
-  default model. The working headless route is top-level `grok --cwd
+  the Mac control plane. The `grok-build` model id was retired by xAI on
+  2026-07-15 (returns "unknown model id"); `grok models` now exposes
+  `grok-4.5` as the default (plus `glm-5.2`) — use `grok grok-4.5 <problem>
+  high` for the matrix row. The working headless route is top-level `grok --cwd
   <workspace> --output-format streaming-json -p <prompt>`; `grok agent` does
   not accept the same cwd/output flags.
 
@@ -457,6 +465,21 @@ historical cells never re-grade); the site renders a best..worst linear span
 across published models as presentation only (never persisted to
 leaderboard.json; a new best shifts the span on render, it does not re-grade
 cells). Full design: `benchmarks/cuda/DEVLOG.md` + `SPEC.md`.
+
+**MANDATORY sequential isolated re-benchmark (standing, 2026-07-19).** When a
+wave ran with many agents concurrent (multi-model / multi-bench on one GPU),
+the in-run and end-of-session harness timings can be **time-contaminated**
+even with path-wrapper locks (per-bench locks, bypasses, overlapping
+compile/check). **Before publish / leaderboard / any public number from that
+wave:** take each cell’s final `solution.py` (and its archive workspace
+deps/caches as needed) and re-run the same graded path the harness uses —
+`check.py` then `benchmark.py` — **sequentially, one GPU owner at a time**,
+no other CUDA jobs on the box. Prefer a quiet single-GPU machine (or a
+machine-wide `KBH_GPU_LOCK_DIR`). Persist the clean metrics into the cell’s
+`result.json` / publish pipeline the same way a normal harness finish would.
+Agent flywheel times during the parallel phase stay in the archive for
+trace/debug only; **published peak_fraction / ms / speedup must come from
+the isolated sequential re-grade.**
 
 Run `uv run python scripts/roofline_plot.py outputs/runs/<ts>_...` to (re)generate the plot.
 
