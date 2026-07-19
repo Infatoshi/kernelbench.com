@@ -1,0 +1,803 @@
+"""Fused CUDA decode path for Qwen3-0.6B geometry on RTX PRO 6000 (SM120).
+
+Design
+------
+The whole decode step (4 layers) runs as a fixed sequence of 6 CUDA kernels
+per layer, driven by a device-side position counter, so a CUDA graph of 64
+unrolled steps can be captured once and replayed for both prefill and decode
+with near-zero launch overhead:
+
+  1. qkv_kernel     : RMSNorm(x) fused into a bf16 GEMV over the packed
+                      [Wq;Wk;Wv] matrix (4096x1024). Layer 0 also produces the
+                      step input x_t = bf16(0.5*randn + 0.5*h) from a
+                      pre-uploaded random stream.
+  2. attn_kernel    : per (kv-head, split) block: Q/K RMSNorm + RoPE computed
+                      in-block, fresh K/V written to the cache (bf16-rounded,
+                      exactly like the reference), then an online-softmax
+                      flash-decode pass over its chunk of cached positions,
+                      writing one (acc, m, l) partial per (q-head, split).
+                      KV loads use streaming (evict-first) hints so the
+                      ~123MB of weights stay resident in the 128MB L2.
+  3. combine_kernel : merges the split-K partials per q head (log-sum-exp
+                      style) into the attention output.
+  4. oproj_kernel   : O-projection GEMV + residual add.
+  5. gateup_kernel  : RMSNorm fused into gate/up GEMV + SwiGLU.
+  6. down_kernel    : down GEMV + residual, bf16 round-trip between layers
+                      (matches reference y.to(bf16)); last layer bumps the
+                      device position counter.
+
+All arithmetic is fp32 internally with bf16 storage at exactly the points the
+reference rounds (KV cache entries, inter-layer hidden), so numerics track the
+eager reference well inside the 0.08 tolerance.
+"""
+from __future__ import annotations
+
+import os
+
+import torch
+import torch.nn as nn
+
+os.environ.setdefault("TORCH_CUDA_ARCH_LIST", "12.0")
+
+
+def _ensure_cuda_home() -> None:
+    """Point CUDA_HOME at a CUDA-13 toolkit with a working nvcc.
+
+    torch is a cu13 wheel; the system toolkit on this box is 12.8 (major
+    mismatch, rejected by torch's extension builder). The venv carries the
+    pip CUDA-13 compiler (nvidia-cuda-nvcc) under site-packages/nvidia/cu13.
+    """
+    cur = os.environ.get("CUDA_HOME")
+    if cur and os.path.exists(os.path.join(cur, "bin", "nvcc")):
+        return
+    candidates = []
+    try:
+        import nvidia  # type: ignore
+
+        for p in nvidia.__path__:
+            candidates.append(os.path.join(p, "cu13"))
+    except Exception:
+        pass
+    candidates += ["/usr/local/cuda-13", "/usr/local/cuda"]
+    for cand in candidates:
+        nvcc = os.path.join(cand, "bin", "nvcc")
+        if os.path.exists(nvcc):
+            os.environ["CUDA_HOME"] = cand
+            os.environ["PATH"] = (
+                os.path.join(cand, "bin") + os.pathsep + os.environ.get("PATH", "")
+            )
+            # The pip toolkit ships libcudart.so.13 without the dev symlink
+            # the -lcudart link line needs; create it if we can.
+            libdir = os.path.join(cand, "lib")
+            so = os.path.join(libdir, "libcudart.so")
+            if os.path.isdir(libdir) and not os.path.exists(so):
+                for v in ("libcudart.so.13", "libcudart.so.12"):
+                    tgt = os.path.join(libdir, v)
+                    if os.path.exists(tgt):
+                        try:
+                            os.symlink(v, so)
+                        except OSError:
+                            pass
+                        break
+            return
+
+
+_ensure_cuda_home()
+
+from torch.utils.cpp_extension import load_inline  # noqa: E402
+
+HIDDEN = 1024
+INTERMEDIATE = 3072
+NUM_Q = 16
+NUM_KV = 8
+HEAD_DIM = 128
+NUM_LAYERS = 4
+EPS = 1e-6
+
+# Packed per-layer weight layout (elements, bf16):
+#   [Wq(2048x1024); Wk(1024x1024); Wv(1024x1024)]  -> one 4096x1024 QKV matrix
+#   Wo(1024x2048), Wgate(3072x1024), Wup(3072x1024), Wdown(1024x3072)
+#   input_ln(1024), post_ln(1024), q_norm(128), k_norm(128)
+_LAYER_ELEMS = (
+    4096 * 1024 + 1024 * 2048 + 3 * 3072 * 1024 + 1024 + 1024 + 128 + 128
+)
+
+_CUDA_SRC = r"""
+#include <torch/extension.h>
+#include <ATen/cuda/CUDAContext.h>
+#include <cuda_bf16.h>
+#include <vector>
+
+using bf16 = __nv_bfloat16;
+
+#define HID   1024
+#define IMED  3072
+#define NQH   16
+#define NKVH  8
+#define HD    128
+#define HHALF 64
+#define RMS_EPS 1e-6f
+#define ATT_SCALE 0.08838834764831845f
+
+#define OFF_QKV 0L
+#define OFF_O   4194304L
+#define OFF_G   6291456L
+#define OFF_U   9437184L
+#define OFF_D   12582912L
+#define OFF_ILN 15728640L
+#define OFF_PLN 15729664L
+#define OFF_QN  15730688L
+#define OFF_KN  15730816L
+#define LSTRIDE 15730944L
+
+
+__device__ __forceinline__ float bf2f(bf16 v) { return __bfloat162float(v); }
+
+__device__ __forceinline__ float warp_sum(float v) {
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
+    return v;
+}
+
+// dot of 8 packed bf16 weights against 8 fp32 activations
+__device__ __forceinline__ float dot8(const uint4 pk, const float* __restrict__ h) {
+    const __nv_bfloat162* w2 = reinterpret_cast<const __nv_bfloat162*>(&pk);
+    float acc = 0.f;
+#pragma unroll
+    for (int j = 0; j < 4; j++) {
+        const float2 f = __bfloat1622float2(w2[j]);
+        acc = fmaf(f.x, h[2 * j], acc);
+        acc = fmaf(f.y, h[2 * j + 1], acc);
+    }
+    return acc;
+}
+
+// ---------------------------------------------------------------------------
+// Kernel 1: (optional input mix) + RMSNorm + QKV GEMV.
+// grid 512 x 256; warp per output row (4096 rows).
+// ---------------------------------------------------------------------------
+__global__ void qkv_kernel(const bf16* __restrict__ W,
+                           bf16* __restrict__ xbf,
+                           const bf16* __restrict__ hbf,
+                           const bf16* __restrict__ Xbuf,
+                           const int* __restrict__ posctr,
+                           int mix,
+                           float* __restrict__ qkv) {
+    __shared__ float hn[HID];
+    __shared__ float red[8];
+    const bf16* ln = W + OFF_ILN;
+    const int tid = threadIdx.x;
+
+    float xv[4];
+    float ss = 0.f;
+    if (mix) {
+        const long idx = (long)(posctr[0] - posctr[1]);
+        const bf16* Xr = Xbuf + idx * HID;
+#pragma unroll
+        for (int i = 0; i < 4; i++) {
+            const int e = tid + i * 256;
+            const float m = 0.5f * bf2f(Xr[e]) + 0.5f * bf2f(hbf[e]);
+            const bf16 mb = __float2bfloat16(m);
+            if (blockIdx.x == 0) xbf[e] = mb;
+            xv[i] = bf2f(mb);
+            ss += xv[i] * xv[i];
+        }
+    } else {
+#pragma unroll
+        for (int i = 0; i < 4; i++) {
+            const int e = tid + i * 256;
+            xv[i] = bf2f(xbf[e]);
+            ss += xv[i] * xv[i];
+        }
+    }
+    ss = warp_sum(ss);
+    if ((tid & 31) == 0) red[tid >> 5] = ss;
+    __syncthreads();
+    const float tot = red[0] + red[1] + red[2] + red[3] +
+                      red[4] + red[5] + red[6] + red[7];
+    const float rs = rsqrtf(tot / (float)HID + RMS_EPS);
+#pragma unroll
+    for (int i = 0; i < 4; i++) {
+        const int e = tid + i * 256;
+        hn[e] = xv[i] * rs * bf2f(ln[e]);
+    }
+    __syncthreads();
+
+    const int warp = tid >> 5;
+    const int lane = tid & 31;
+    const int r = blockIdx.x * 8 + warp;  // < 4096
+    const bf16* wr = W + OFF_QKV + (long)r * HID;
+    float acc = 0.f;
+#pragma unroll
+    for (int it = 0; it < 4; it++) {
+        const int k = (lane + it * 32) * 8;
+        const uint4 pk = *reinterpret_cast<const uint4*>(wr + k);
+        acc += dot8(pk, hn + k);
+    }
+    acc = warp_sum(acc);
+    if (lane == 0) qkv[r] = acc;
+}
+
+// ---------------------------------------------------------------------------
+// Kernel 2: attention. grid (NKVH * S) x 256.
+// Each block: Q norm + RoPE for its 2 q heads; owner split (S-1) also norms/
+// ropes fresh K, writes K/V cache (bf16), and folds the fresh token into its
+// partial. Online softmax over chunk of old positions, half-warp per position.
+// Partials: part[qh][split][0..127]=acc, [128]=m, [129]=l.
+// ---------------------------------------------------------------------------
+__global__ void attn_kernel(const bf16* __restrict__ W,
+                            const float* __restrict__ qkv,
+                            bf16* __restrict__ kcache,
+                            bf16* __restrict__ vcache,
+                            const int* __restrict__ posctr,
+                            int S, long max_seq,
+                            float* __restrict__ part) {
+    const int kh = blockIdx.x / S;
+    const int split = blockIdx.x % S;
+    const bool owner = (split == S - 1);
+    const int pos = posctr[0];
+    const int Lc = (pos + S - 1) / S;  // 0 when pos == 0
+    const int tid = threadIdx.x;
+
+    __shared__ float qs[2][HD];
+    __shared__ float kf[HD], vf[HD];
+    __shared__ float sred[8];
+    __shared__ float sacc[2][16][HD];
+    __shared__ float sml[2][16][2];
+    __shared__ float sfresh[2];
+
+    // --- Q rmsnorm + rope, both q heads (threads 0..127 head0, 128..255 head1)
+    {
+        const int hh = tid >> 7;
+        const int d = tid & 127;
+        const int qh = kh * 2 + hh;
+        const float qraw = qkv[qh * HD + d];
+        float w = warp_sum(qraw * qraw);
+        if ((tid & 31) == 0) sred[tid >> 5] = w;
+        __syncthreads();
+        const float ss = (hh == 0) ? (sred[0] + sred[1] + sred[2] + sred[3])
+                                   : (sred[4] + sred[5] + sred[6] + sred[7]);
+        const float rs = rsqrtf(ss / (float)HD + RMS_EPS);
+        const float qn = qraw * rs * bf2f(W[OFF_QN + d]);
+        __syncthreads();
+        qs[hh][d] = qn;
+        __syncthreads();
+        const int j = d & (HHALF - 1);
+        const float theta =
+            (float)pos * (1.0f / powf(10000.0f, (float)j / (float)HHALF));
+        float sn, cs;
+        sincosf(theta, &sn, &cs);
+        const float x1 = qs[hh][j];
+        const float x2 = qs[hh][j + HHALF];
+        const float out = (d < HHALF) ? (x1 * cs - x2 * sn)
+                                      : (x1 * sn + x2 * cs);
+        __syncthreads();
+        qs[hh][d] = out * ATT_SCALE;
+        __syncthreads();
+    }
+
+    // --- fresh K/V (owner block only; uniform branch)
+    if (owner) {
+        const float kraw = (tid < HD) ? qkv[2048 + kh * HD + tid] : 0.f;
+        float w = warp_sum(kraw * kraw);
+        if ((tid & 31) == 0) sred[tid >> 5] = w;
+        __syncthreads();
+        const float ss = sred[0] + sred[1] + sred[2] + sred[3];
+        const float rs = rsqrtf(ss / (float)HD + RMS_EPS);
+        if (tid < HD) kf[tid] = kraw * rs * bf2f(W[OFF_KN + tid]);
+        __syncthreads();
+        float outk = 0.f;
+        if (tid < HD) {
+            const int j = tid & (HHALF - 1);
+            const float theta =
+                (float)pos * (1.0f / powf(10000.0f, (float)j / (float)HHALF));
+            float sn, cs;
+            sincosf(theta, &sn, &cs);
+            const float x1 = kf[j];
+            const float x2 = kf[j + HHALF];
+            outk = (tid < HHALF) ? (x1 * cs - x2 * sn) : (x1 * sn + x2 * cs);
+        }
+        __syncthreads();
+        if (tid < HD) {
+            const bf16 kb = __float2bfloat16(outk);
+            kcache[((long)kh * max_seq + pos) * HD + tid] = kb;
+            kf[tid] = bf2f(kb);  // attention sees the bf16-rounded value
+            const float vv = qkv[3072 + kh * HD + tid];
+            const bf16 vb = __float2bfloat16(vv);
+            vcache[((long)kh * max_seq + pos) * HD + tid] = vb;
+            vf[tid] = bf2f(vb);
+        }
+        __syncthreads();
+        {
+            const int hh = tid >> 7;
+            const int d = tid & 127;
+            float p = qs[hh][d] * kf[d];
+            float w2 = warp_sum(p);
+            if ((tid & 31) == 0) sred[tid >> 5] = w2;
+            __syncthreads();
+            if (tid == 0) sfresh[0] = sred[0] + sred[1] + sred[2] + sred[3];
+            if (tid == 128) sfresh[1] = sred[4] + sred[5] + sred[6] + sred[7];
+        }
+    }
+    __syncthreads();
+
+    // --- chunk of old positions [start, end) with online softmax
+    const int start = split * Lc;
+    const int end = min(start + Lc, pos);
+    const int warp = tid >> 5;
+    const int hw = (tid & 31) >> 4;
+    const int lane16 = tid & 15;
+    const int slot = warp * 2 + hw;
+
+    float m0 = -INFINITY, m1 = -INFINITY, l0 = 0.f, l1 = 0.f;
+    float a0[8], a1[8];
+#pragma unroll
+    for (int j = 0; j < 8; j++) { a0[j] = 0.f; a1[j] = 0.f; }
+
+    const bf16* kbase = kcache + (long)kh * max_seq * HD;
+    const bf16* vbase = vcache + (long)kh * max_seq * HD;
+
+    for (int base = start + warp * 2; base < end; base += 16) {
+        const int p = base + hw;
+        const bool valid = p < end;
+        const int pl = valid ? p : (end - 1);
+        const uint4 kk = __ldcs(
+            reinterpret_cast<const uint4*>(kbase + (long)pl * HD + lane16 * 8));
+        const bf16* kvv = reinterpret_cast<const bf16*>(&kk);
+        float s0 = 0.f, s1 = 0.f;
+#pragma unroll
+        for (int j = 0; j < 8; j++) {
+            const float kx = bf2f(kvv[j]);
+            s0 += qs[0][lane16 * 8 + j] * kx;
+            s1 += qs[1][lane16 * 8 + j] * kx;
+        }
+#pragma unroll
+        for (int o = 8; o > 0; o >>= 1) {
+            s0 += __shfl_xor_sync(0xffffffffu, s0, o);
+            s1 += __shfl_xor_sync(0xffffffffu, s1, o);
+        }
+        const uint4 vk = __ldcs(
+            reinterpret_cast<const uint4*>(vbase + (long)pl * HD + lane16 * 8));
+        const bf16* vvv = reinterpret_cast<const bf16*>(&vk);
+        if (valid) {
+            {
+                const float mn = fmaxf(m0, s0);
+                const float c = __expf(m0 - mn);
+                const float pw = __expf(s0 - mn);
+                l0 = l0 * c + pw;
+#pragma unroll
+                for (int j = 0; j < 8; j++)
+                    a0[j] = a0[j] * c + pw * bf2f(vvv[j]);
+                m0 = mn;
+            }
+            {
+                const float mn = fmaxf(m1, s1);
+                const float c = __expf(m1 - mn);
+                const float pw = __expf(s1 - mn);
+                l1 = l1 * c + pw;
+#pragma unroll
+                for (int j = 0; j < 8; j++)
+                    a1[j] = a1[j] * c + pw * bf2f(vvv[j]);
+                m1 = mn;
+            }
+        }
+    }
+
+    sml[0][slot][0] = m0;
+    sml[0][slot][1] = l0;
+    sml[1][slot][0] = m1;
+    sml[1][slot][1] = l1;
+#pragma unroll
+    for (int j = 0; j < 8; j++) {
+        sacc[0][slot][lane16 * 8 + j] = a0[j];
+        sacc[1][slot][lane16 * 8 + j] = a1[j];
+    }
+    __syncthreads();
+
+    // --- block-level merge of 16 half-warp partials (+ fresh token if owner)
+    {
+        const int hh = tid >> 7;
+        const int d = tid & 127;
+        float m = -INFINITY;
+#pragma unroll
+        for (int w2 = 0; w2 < 16; w2++) m = fmaxf(m, sml[hh][w2][0]);
+        if (owner) m = fmaxf(m, sfresh[hh]);
+        float l = 0.f, acc = 0.f;
+        if (m > -INFINITY) {
+#pragma unroll
+            for (int w2 = 0; w2 < 16; w2++) {
+                const float e = __expf(sml[hh][w2][0] - m);
+                l += e * sml[hh][w2][1];
+                acc += e * sacc[hh][w2][d];
+            }
+            if (owner) {
+                const float e = __expf(sfresh[hh] - m);
+                l += e;
+                acc += e * vf[d];
+            }
+        }
+        const long pi = ((long)(kh * 2 + hh) * S + split) * 130;
+        part[pi + d] = acc;
+        if (d == 0) {
+            part[pi + 128] = m;
+            part[pi + 129] = l;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Kernel 3: combine split partials. grid NQH x 128.
+// ---------------------------------------------------------------------------
+__global__ void combine_kernel(const float* __restrict__ part, int S,
+                               float* __restrict__ attn) {
+    const int qh = blockIdx.x;
+    const int d = threadIdx.x;
+    float m = -INFINITY;
+    for (int s = 0; s < S; s++)
+        m = fmaxf(m, part[((long)qh * S + s) * 130 + 128]);
+    float den = 0.f, num = 0.f;
+    for (int s = 0; s < S; s++) {
+        const long pi = ((long)qh * S + s) * 130;
+        const float e = __expf(part[pi + 128] - m);
+        den += e * part[pi + 129];
+        num += e * part[pi + d];
+    }
+    attn[qh * HD + d] = num / den;
+}
+
+// ---------------------------------------------------------------------------
+// Kernel 4: O projection + residual. grid 128 x 256; warp per row.
+// ---------------------------------------------------------------------------
+__global__ void oproj_kernel(const bf16* __restrict__ W,
+                             const float* __restrict__ attn,
+                             const bf16* __restrict__ xbf,
+                             float* __restrict__ r2) {
+    __shared__ float a[NQH * HD];
+    const int tid = threadIdx.x;
+#pragma unroll
+    for (int i = 0; i < 8; i++) a[tid + i * 256] = attn[tid + i * 256];
+    __syncthreads();
+    const int warp = tid >> 5;
+    const int lane = tid & 31;
+    const int r = blockIdx.x * 8 + warp;
+    const bf16* wr = W + OFF_O + (long)r * 2048;
+    float acc = 0.f;
+#pragma unroll
+    for (int it = 0; it < 8; it++) {
+        const int k = (lane + it * 32) * 8;
+        const uint4 pk = *reinterpret_cast<const uint4*>(wr + k);
+        acc += dot8(pk, a + k);
+    }
+    acc = warp_sum(acc);
+    if (lane == 0) r2[r] = bf2f(xbf[r]) + acc;
+}
+
+// ---------------------------------------------------------------------------
+// Kernel 5: RMSNorm + gate/up GEMV + SwiGLU. grid 384 x 256; warp per row j
+// computes both gate[j] and up[j].
+// ---------------------------------------------------------------------------
+__global__ void gateup_kernel(const bf16* __restrict__ W,
+                              const float* __restrict__ r2,
+                              float* __restrict__ mlp) {
+    __shared__ float hn[HID];
+    __shared__ float red[8];
+    const int tid = threadIdx.x;
+    float xv[4];
+    float ss = 0.f;
+#pragma unroll
+    for (int i = 0; i < 4; i++) {
+        const int e = tid + i * 256;
+        xv[i] = r2[e];
+        ss += xv[i] * xv[i];
+    }
+    ss = warp_sum(ss);
+    if ((tid & 31) == 0) red[tid >> 5] = ss;
+    __syncthreads();
+    const float tot = red[0] + red[1] + red[2] + red[3] +
+                      red[4] + red[5] + red[6] + red[7];
+    const float rs = rsqrtf(tot / (float)HID + RMS_EPS);
+    const bf16* pln = W + OFF_PLN;
+#pragma unroll
+    for (int i = 0; i < 4; i++) {
+        const int e = tid + i * 256;
+        hn[e] = xv[i] * rs * bf2f(pln[e]);
+    }
+    __syncthreads();
+
+    const int warp = tid >> 5;
+    const int lane = tid & 31;
+    const int j0 = blockIdx.x * 8 + warp;  // < 3072
+    const bf16* wg = W + OFF_G + (long)j0 * HID;
+    const bf16* wu = W + OFF_U + (long)j0 * HID;
+    float g = 0.f, u = 0.f;
+#pragma unroll
+    for (int it = 0; it < 4; it++) {
+        const int k = (lane + it * 32) * 8;
+        const uint4 pg = *reinterpret_cast<const uint4*>(wg + k);
+        const uint4 pu = *reinterpret_cast<const uint4*>(wu + k);
+        g += dot8(pg, hn + k);
+        u += dot8(pu, hn + k);
+    }
+    g = warp_sum(g);
+    u = warp_sum(u);
+    if (lane == 0) mlp[j0] = (g / (1.f + expf(-g))) * u;
+}
+
+// ---------------------------------------------------------------------------
+// Kernel 6: down GEMV + residual, output bf16. Last layer bumps pos.
+// grid 128 x 256; warp per row.
+// ---------------------------------------------------------------------------
+__global__ void down_kernel(const bf16* __restrict__ W,
+                            const float* __restrict__ mlp,
+                            const float* __restrict__ r2,
+                            bf16* __restrict__ out,
+                            int last, int* __restrict__ posctr) {
+    __shared__ float m[IMED];
+    const int tid = threadIdx.x;
+#pragma unroll
+    for (int i = 0; i < 12; i++) m[tid + i * 256] = mlp[tid + i * 256];
+    __syncthreads();
+    const int warp = tid >> 5;
+    const int lane = tid & 31;
+    const int r = blockIdx.x * 8 + warp;
+    const bf16* wr = W + OFF_D + (long)r * IMED;
+    float acc = 0.f;
+#pragma unroll
+    for (int it = 0; it < 12; it++) {
+        const int k = (lane + it * 32) * 8;
+        const uint4 pk = *reinterpret_cast<const uint4*>(wr + k);
+        acc += dot8(pk, m + k);
+    }
+    acc = warp_sum(acc);
+    if (lane == 0) out[r] = __float2bfloat16(r2[r] + acc);
+    if (last && blockIdx.x == 0 && tid == 0) posctr[0] = posctr[0] + 1;
+}
+
+// ---------------------------------------------------------------------------
+// Host: launch nsteps full decode steps on the current stream.
+// ---------------------------------------------------------------------------
+void step_batch(torch::Tensor W, torch::Tensor xbf, torch::Tensor hbf,
+                torch::Tensor Xbuf, torch::Tensor posctr,
+                std::vector<torch::Tensor> kc, std::vector<torch::Tensor> vc,
+                torch::Tensor qkv, torch::Tensor part, torch::Tensor attn,
+                torch::Tensor r2, torch::Tensor mlp,
+                int64_t nsteps, int64_t S, int64_t max_seq) {
+    auto stream = at::cuda::getCurrentCUDAStream();
+    const bf16* Wp = reinterpret_cast<const bf16*>(W.data_ptr());
+    bf16* xbfp = reinterpret_cast<bf16*>(xbf.data_ptr());
+    bf16* hbfp = reinterpret_cast<bf16*>(hbf.data_ptr());
+    const bf16* Xp = reinterpret_cast<const bf16*>(Xbuf.data_ptr());
+    int* posp = posctr.data_ptr<int>();
+    float* qkvp = qkv.data_ptr<float>();
+    float* partp = part.data_ptr<float>();
+    float* attnp = attn.data_ptr<float>();
+    float* r2p = r2.data_ptr<float>();
+    float* mlpp = mlp.data_ptr<float>();
+    const int nl = (int)kc.size();
+    for (int64_t step = 0; step < nsteps; ++step) {
+        for (int l = 0; l < nl; ++l) {
+            const bf16* Wl = Wp + (long)l * LSTRIDE;
+            bf16* kcp = reinterpret_cast<bf16*>(kc[l].data_ptr());
+            bf16* vcp = reinterpret_cast<bf16*>(vc[l].data_ptr());
+            const int last = (l == nl - 1) ? 1 : 0;
+            bf16* outp = last ? hbfp : xbfp;
+            qkv_kernel<<<512, 256, 0, stream>>>(Wl, xbfp, hbfp, Xp, posp,
+                                                l == 0 ? 1 : 0, qkvp);
+            attn_kernel<<<NKVH * (int)S, 256, 0, stream>>>(
+                Wl, qkvp, kcp, vcp, posp, (int)S, (long)max_seq, partp);
+            combine_kernel<<<NQH, 128, 0, stream>>>(partp, (int)S, attnp);
+            oproj_kernel<<<128, 256, 0, stream>>>(Wl, attnp, xbfp, r2p);
+            gateup_kernel<<<384, 256, 0, stream>>>(Wl, r2p, mlpp);
+            down_kernel<<<128, 256, 0, stream>>>(Wl, mlpp, r2p, outp, last,
+                                                 posp);
+        }
+    }
+}
+"""
+
+_CPP_SRC = """
+#include <torch/extension.h>
+#include <vector>
+void step_batch(torch::Tensor W, torch::Tensor xbf, torch::Tensor hbf,
+                torch::Tensor Xbuf, torch::Tensor posctr,
+                std::vector<torch::Tensor> kc, std::vector<torch::Tensor> vc,
+                torch::Tensor qkv, torch::Tensor part, torch::Tensor attn,
+                torch::Tensor r2, torch::Tensor mlp,
+                int64_t nsteps, int64_t S, int64_t max_seq);
+"""
+
+_mod = load_inline(
+    name="megaqwen_decode_sm120",
+    cpp_sources=_CPP_SRC,
+    cuda_sources=_CUDA_SRC,
+    functions=["step_batch"],
+    extra_cuda_cflags=["-O3"],
+    verbose=False,
+)
+
+
+class Block(nn.Module):
+    def __init__(self):
+        super().__init__()
+        H, I, D = HIDDEN, INTERMEDIATE, HEAD_DIM
+        self.input_ln = nn.Parameter(torch.ones(H, dtype=torch.bfloat16))
+        self.q_proj = nn.Parameter(torch.empty(NUM_Q * D, H, dtype=torch.bfloat16))
+        self.k_proj = nn.Parameter(torch.empty(NUM_KV * D, H, dtype=torch.bfloat16))
+        self.v_proj = nn.Parameter(torch.empty(NUM_KV * D, H, dtype=torch.bfloat16))
+        self.q_norm = nn.Parameter(torch.ones(D, dtype=torch.bfloat16))
+        self.k_norm = nn.Parameter(torch.ones(D, dtype=torch.bfloat16))
+        self.o_proj = nn.Parameter(torch.empty(H, NUM_Q * D, dtype=torch.bfloat16))
+        self.post_ln = nn.Parameter(torch.ones(H, dtype=torch.bfloat16))
+        self.gate_proj = nn.Parameter(torch.empty(I, H, dtype=torch.bfloat16))
+        self.up_proj = nn.Parameter(torch.empty(I, H, dtype=torch.bfloat16))
+        self.down_proj = nn.Parameter(torch.empty(H, I, dtype=torch.bfloat16))
+        for name, p in self.named_parameters():
+            if p.dim() >= 2:
+                nn.init.normal_(p, std=0.02)
+
+
+class Model(nn.Module):
+    def __init__(self, num_layers: int = NUM_LAYERS, max_seq: int = 131072):
+        super().__init__()
+        self.num_layers = num_layers
+        self.max_seq = max_seq
+        self.blocks = nn.ModuleList([Block() for _ in range(num_layers)])
+        self._ws = None
+
+    # -- workspace ---------------------------------------------------------
+    def _workspace(self):
+        dev = next(self.parameters()).device
+        assert dev.type == "cuda", "solution requires a CUDA device"
+        if self._ws is not None and self._ws["dev"] == dev:
+            return self._ws
+        L = self.num_layers
+        S = int(min(64, max(4, self.max_seq // 64)))
+        ws = {
+            "dev": dev,
+            "S": S,
+            "W": torch.empty(L * _LAYER_ELEMS, dtype=torch.bfloat16, device=dev),
+            "xbf": torch.empty(HIDDEN, dtype=torch.bfloat16, device=dev),
+            "hbf": torch.empty(HIDDEN, dtype=torch.bfloat16, device=dev),
+            "X": torch.empty(self.max_seq, HIDDEN, dtype=torch.bfloat16, device=dev),
+            "pos": torch.zeros(2, dtype=torch.int32, device=dev),
+            "kc": [
+                torch.zeros(NUM_KV, self.max_seq, HEAD_DIM,
+                            dtype=torch.bfloat16, device=dev)
+                for _ in range(L)
+            ],
+            "vc": [
+                torch.zeros(NUM_KV, self.max_seq, HEAD_DIM,
+                            dtype=torch.bfloat16, device=dev)
+                for _ in range(L)
+            ],
+            "qkv": torch.empty(4096, dtype=torch.float32, device=dev),
+            "part": torch.zeros(NUM_Q * S * 130, dtype=torch.float32, device=dev),
+            "attn": torch.empty(NUM_Q * HEAD_DIM, dtype=torch.float32, device=dev),
+            "r2": torch.empty(HIDDEN, dtype=torch.float32, device=dev),
+            "mlp": torch.empty(INTERMEDIATE, dtype=torch.float32, device=dev),
+            "graphs": {},
+            "warm": False,
+        }
+        self._ws = ws
+        return ws
+
+    def _pack(self):
+        ws = self._workspace()
+        W = ws["W"].view(self.num_layers, _LAYER_ELEMS)
+        with torch.no_grad():
+            for i, b in enumerate(self.blocks):
+                row = W[i]
+                o = 0
+                for t in (b.q_proj, b.k_proj, b.v_proj, b.o_proj, b.gate_proj,
+                          b.up_proj, b.down_proj, b.input_ln, b.post_ln,
+                          b.q_norm, b.k_norm):
+                    n = t.numel()
+                    row[o:o + n].copy_(t.detach().reshape(-1))
+                    o += n
+
+    def _launch(self, nsteps: int):
+        ws = self._ws
+        _mod.step_batch(ws["W"], ws["xbf"], ws["hbf"], ws["X"], ws["pos"],
+                        ws["kc"], ws["vc"], ws["qkv"], ws["part"],
+                        ws["attn"], ws["r2"], ws["mlp"], nsteps, ws["S"],
+                        self.max_seq)
+
+    def _graph(self, nsteps: int):
+        ws = self._workspace()
+        if nsteps in ws["graphs"]:
+            return ws["graphs"][nsteps]
+        if not ws["warm"]:
+            # One eager warmup pass; corrupts device state, so callers must
+            # (re)initialize state after graph creation, which prefill and
+            # decode_steps both do.
+            ws["pos"].zero_()
+            self._launch(1)
+            torch.cuda.synchronize()
+            ws["warm"] = True
+        g = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g):
+            self._launch(nsteps)
+        ws["graphs"][nsteps] = g
+        return g
+
+    def _run_steps(self, n: int):
+        ws = self._ws
+        n64, rem = divmod(n, 64)
+        if n64:
+            g64 = ws["graphs"][64]
+            for _ in range(n64):
+                g64.replay()
+        if rem:
+            g1 = ws["graphs"][1]
+            for _ in range(rem):
+                g1.replay()
+
+    def forward(self, *args, **kwargs):  # not used by the harness
+        raise NotImplementedError
+
+
+def _seeded_hidden(seed: int) -> torch.Tensor:
+    g = torch.Generator(device="cpu")
+    g.manual_seed(seed)
+    return torch.randn(HIDDEN, generator=g, dtype=torch.bfloat16)
+
+
+@torch.no_grad()
+def prefill(model: Model, ctx_len: int, seed: int, device=None):
+    """Build KV of length ctx_len (sequential steps, exact reference numerics)."""
+    assert ctx_len <= model.max_seq
+    ws = model._workspace()
+    model._pack()
+    model._graph(64)
+    model._graph(1)
+    # Deterministic input stream (matches per-step randn draws bit-exactly).
+    g = torch.Generator(device="cpu")
+    g.manual_seed(seed + 1)
+    X = torch.randn((ctx_len, HIDDEN), generator=g, dtype=torch.bfloat16)
+    ws["X"][:ctx_len].copy_(X)
+    ws["hbf"].copy_(_seeded_hidden(seed))
+    ws["pos"][0] = 0
+    ws["pos"][1] = 0
+    model._run_steps(ctx_len)
+    torch.cuda.synchronize()
+    return ws["hbf"].clone(), ws["kc"], ws["vc"]
+
+
+@torch.no_grad()
+def decode_steps(model: Model, hidden: torch.Tensor, k_caches, v_caches,
+                 start_pos: int, n_steps: int, seed: int):
+    """Run n_steps decode steps starting at start_pos (timed section)."""
+    ws = model._workspace()
+    if not ws["graphs"]:
+        model._pack()
+        model._graph(64)
+        model._graph(1)
+    # If the caller passed foreign caches, adopt their contents.
+    if k_caches and k_caches[0].data_ptr() != ws["kc"][0].data_ptr():
+        for i in range(model.num_layers):
+            ws["kc"][i][:, :start_pos].copy_(k_caches[i][:, :start_pos])
+            ws["vc"][i][:, :start_pos].copy_(v_caches[i][:, :start_pos])
+    ws["hbf"].copy_(hidden.reshape(-1).to(torch.bfloat16))
+    g = torch.Generator(device="cpu")
+    g.manual_seed(seed + 2)
+    X = torch.randn((n_steps, HIDDEN), generator=g, dtype=torch.bfloat16)
+    ws["X"][:n_steps].copy_(X)
+    ws["pos"][0] = start_pos
+    ws["pos"][1] = start_pos
+    model._run_steps(n_steps)
+    torch.cuda.synchronize()
+    return ws["hbf"].clone(), ws["kc"], ws["vc"]
+
+
+def run(ctx_len: int, n_decode: int, seed: int, model: Model | None = None) -> dict:
+    device = torch.device("cuda:0")
+    if model is None:
+        model = Model(NUM_LAYERS, max(ctx_len + n_decode, 512))
+    model = model.to(device).eval()
+    h, kc, vc = prefill(model, ctx_len, seed)
+    h, kc, vc = decode_steps(model, h, kc, vc, ctx_len, n_decode, seed)
+    return {
+        "last_hidden": h.detach(),
+        "ctx_len": ctx_len,
+        "decode_steps": n_decode,
+    }
