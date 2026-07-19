@@ -2013,11 +2013,16 @@ case "$HARNESS" in
         ;;
 
     qwen-claude)
-        # Claude Code routed to Alibaba DashScope (Model Studio, Intl/Singapore)
-        # Anthropic-compatible endpoint. Requires DASHSCOPE_API_KEY (Model Studio
-        # key). Pass MODEL=qwen3-max.
-        if [ -z "${DASHSCOPE_API_KEY:-}" ]; then
-            echo "DASHSCOPE_API_KEY is required for qwen-claude" >&2
+        # Claude Code routed to Alibaba's Anthropic-compatible endpoint.
+        # Default is the token-plan (ap-southeast-1 MaaS) route with
+        # QWEN_API_KEY (qwen3.8-max-preview lives here; verified 2026-07-19).
+        # DASHSCOPE_API_KEY + QWEN_ANTHROPIC_BASE_URL=https://dashscope-intl.aliyuncs.com/apps/anthropic
+        # still works for Model Studio (qwen3-max). Kinetic-style settings:
+        # tool search off, effort max, subagent model pinned (reasoning model
+        # returns thinking blocks; keep max output tokens high).
+        QWEN_CLAUDE_KEY="${QWEN_API_KEY:-${DASHSCOPE_API_KEY:-}}"
+        if [ -z "$QWEN_CLAUDE_KEY" ]; then
+            echo "QWEN_API_KEY (or DASHSCOPE_API_KEY) is required for qwen-claude" >&2
             exit 1
         fi
         QWEN_CLAUDE_ALIAS="${QWEN_CLAUDE_ALIAS:-opus}"
@@ -2026,38 +2031,49 @@ case "$HARNESS" in
             CLAUDE_CONTAINER_ENV_NAMES=(
                 ANTHROPIC_BASE_URL API_TIMEOUT_MS
                 CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC
+                CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS
+                ENABLE_TOOL_SEARCH CLAUDE_CODE_SUBAGENT_MODEL
+                CLAUDE_CODE_EFFORT_LEVEL
                 CLAUDE_CODE_MAX_RETRIES CLAUDE_CODE_MAX_OUTPUT_TOKENS
                 ANTHROPIC_MODEL
                 ANTHROPIC_DEFAULT_HAIKU_MODEL ANTHROPIC_DEFAULT_SONNET_MODEL
                 ANTHROPIC_DEFAULT_OPUS_MODEL
             )
             CLAUDE_CONTAINER_EXTRA_CLAUDE_ARGS=(--disallowedTools ExitPlanMode EnterPlanMode AskUserQuestion)
-            ( export ANTHROPIC_AUTH_TOKEN="$DASHSCOPE_API_KEY" && \
-                export ANTHROPIC_BASE_URL="${QWEN_ANTHROPIC_BASE_URL:-https://dashscope-intl.aliyuncs.com/apps/anthropic}" && \
+            ( export ANTHROPIC_AUTH_TOKEN="$QWEN_CLAUDE_KEY" && \
+                export ANTHROPIC_BASE_URL="${QWEN_ANTHROPIC_BASE_URL:-https://token-plan.ap-southeast-1.maas.aliyuncs.com/apps/anthropic}" && \
                 export API_TIMEOUT_MS="${API_TIMEOUT_MS:-3000000}" && \
                 export CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC="${CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC:-1}" && \
+                export CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS="${CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS:-1}" && \
                 export CLAUDE_CODE_MAX_RETRIES="${CLAUDE_CODE_MAX_RETRIES:-1000000}" && \
                 export CLAUDE_CODE_MAX_OUTPUT_TOKENS="${CLAUDE_CODE_MAX_OUTPUT_TOKENS:-128000}" && \
                 export ANTHROPIC_MODEL="$MODEL" && \
                 export ANTHROPIC_DEFAULT_HAIKU_MODEL="$QWEN_CLAUDE_HAIKU_MODEL" && \
                 export ANTHROPIC_DEFAULT_SONNET_MODEL="$MODEL" && \
                 export ANTHROPIC_DEFAULT_OPUS_MODEL="$MODEL" && \
+                export ENABLE_TOOL_SEARCH="${ENABLE_TOOL_SEARCH:-false}" && \
+                export CLAUDE_CODE_EFFORT_LEVEL="${CLAUDE_CODE_EFFORT_LEVEL:-max}" && \
+                export CLAUDE_CODE_SUBAGENT_MODEL="$MODEL" && \
                 run_claude_container "" "$QWEN_CLAUDE_ALIAS" 0 ) \
                 > "$LOG_FILE" 2> "$STDERR_FILE" || HARNESS_EXIT=$?
             CLAUDE_CONTAINER_ENV_NAMES=()
             CLAUDE_CONTAINER_EXTRA_CLAUDE_ARGS=()
         else
         ( cd "$PROBLEM_DIR" && \
-            export ANTHROPIC_AUTH_TOKEN="$DASHSCOPE_API_KEY" && \
-            export ANTHROPIC_BASE_URL="${QWEN_ANTHROPIC_BASE_URL:-https://dashscope-intl.aliyuncs.com/apps/anthropic}" && \
+            export ANTHROPIC_AUTH_TOKEN="$QWEN_CLAUDE_KEY" && \
+            export ANTHROPIC_BASE_URL="${QWEN_ANTHROPIC_BASE_URL:-https://token-plan.ap-southeast-1.maas.aliyuncs.com/apps/anthropic}" && \
             export API_TIMEOUT_MS="${API_TIMEOUT_MS:-3000000}" && \
             export CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC="${CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC:-1}" && \
+            export CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS="${CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS:-1}" && \
             export CLAUDE_CODE_MAX_RETRIES="${CLAUDE_CODE_MAX_RETRIES:-1000000}" && \
             export CLAUDE_CODE_MAX_OUTPUT_TOKENS="${CLAUDE_CODE_MAX_OUTPUT_TOKENS:-128000}" && \
             export ANTHROPIC_MODEL="$MODEL" && \
             export ANTHROPIC_DEFAULT_HAIKU_MODEL="$QWEN_CLAUDE_HAIKU_MODEL" && \
             export ANTHROPIC_DEFAULT_SONNET_MODEL="$MODEL" && \
             export ANTHROPIC_DEFAULT_OPUS_MODEL="$MODEL" && \
+            export ENABLE_TOOL_SEARCH="${ENABLE_TOOL_SEARCH:-false}" && \
+            export CLAUDE_CODE_EFFORT_LEVEL="${CLAUDE_CODE_EFFORT_LEVEL:-max}" && \
+            export CLAUDE_CODE_SUBAGENT_MODEL="$MODEL" && \
             timeout "$BUDGET_SECONDS" claude \
                 --dangerously-skip-permissions \
                 --print --verbose \
