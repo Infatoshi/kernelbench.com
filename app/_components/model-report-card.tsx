@@ -3,7 +3,7 @@
 import Link from "next/link"
 import { useState } from "react"
 import type { ProblemChip, ReportRow, ReportView } from "../_lib/models"
-import { RunDetailOverlay } from "./run-detail"
+import { RunDetailPanel } from "./run-detail"
 
 // Per-problem report card: one row per model, six (or N) chips — pass shows
 // peak fraction, fail shows a short reason. Rank is by pass count only; we
@@ -108,9 +108,16 @@ function Chip({
 export function ModelReportCard({ view }: { view: ReportView }) {
   let lastTier: string | null = null
   const [openRun, setOpenRun] = useState<{
+    slug: string
     chip: ProblemChip
     modelName: string
   } | null>(null)
+  const toggleRun = (slug: string, chip: ProblemChip, modelName: string) =>
+    setOpenRun((cur) =>
+      cur && cur.slug === slug && cur.chip.run_id === chip.run_id
+        ? null
+        : { slug, chip, modelName },
+    )
   return (
     <div className="rcard" role="figure" aria-label={view.axis}>
       <div className="rcard-head" aria-hidden="true">
@@ -134,6 +141,13 @@ export function ModelReportCard({ view }: { view: ReportView }) {
               <p className="mbar-tier">
                 {row.passed >= row.total ? `full pass · ${tier}` : `${tier} passed`}
               </p>
+            )}
+            {openRun && openRun.slug === row.slug && (
+              <RunDetailPanel
+                chip={openRun.chip}
+                modelName={openRun.modelName}
+                onClose={() => setOpenRun(null)}
+              />
             )}
             <Link href={`/models/${row.slug}`} className="rcard-row no-underline">
               <span className="mbar-label">
@@ -162,7 +176,7 @@ export function ModelReportCard({ view }: { view: ReportView }) {
                   <Chip
                     key={c.problem}
                     chip={c}
-                    onOpen={(chip) => setOpenRun({ chip, modelName: row.name })}
+                    onOpen={(chip) => toggleRun(row.slug, chip, row.name)}
                   />
                 ))}
               </span>
@@ -196,13 +210,6 @@ export function ModelReportCard({ view }: { view: ReportView }) {
         </span>
         audit flag
       </p>
-      {openRun && (
-        <RunDetailOverlay
-          chip={openRun.chip}
-          modelName={openRun.modelName}
-          onClose={() => setOpenRun(null)}
-        />
-      )}
     </div>
   )
 }
