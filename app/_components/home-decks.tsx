@@ -13,6 +13,9 @@ import { problemLabel } from "../_lib/models"
 
 // Homepage: stacked KernelBench sections. Each score is a mini bar vs the
 // best result on that problem (100% = winner).
+// Desktop: model × problem matrix.
+// Mobile multi-problem: per-problem leaderboards (best → worst).
+// Mobile single-problem: model cards.
 // No-run cells are blank (not red). Judged fails keep a short color label.
 // Artifact links: click-to-pin popover, one open cell per deck (no hover stack).
 
@@ -73,6 +76,16 @@ function failTone(chip: ProblemChip): "blank" | "miss" | "warn" | "hack" {
   return "warn"
 }
 
+/** Rank bucket for per-problem mobile boards (lower = higher on the list). */
+function rankBucket(chip: ProblemChip): number {
+  if (chip.kind === "pass" && chip.score != null) return 0
+  const tone = failTone(chip)
+  if (tone === "hack") return 1
+  if (tone === "miss") return 2
+  if (tone === "warn") return 3
+  return 4 // blank / empty
+}
+
 function pinKey(rowSlug: string, problem: string): string {
   return `${rowSlug}::${problem}`
 }
@@ -101,6 +114,8 @@ function Chip({
   open,
   onToggle,
   animDelayMs = 0,
+  /** Side label left of the bar (mobile cards). null = no side label. */
+  sideLabel = null,
 }: {
   chip: ProblemChip
   best: number | undefined
@@ -108,6 +123,7 @@ function Chip({
   onToggle: () => void
   /** Stagger entrance slightly down the grid */
   animDelayMs?: number
+  sideLabel?: string | null
 }) {
   const pass = chip.kind === "pass" && chip.score != null && best != null && best > 0
   const pct = pass ? Math.min(100, (chip.score! / best) * 100) : 0
@@ -197,10 +213,12 @@ function Chip({
   } as CSSProperties
 
   return (
-    <span className="hd-cell">
-      <span className="hd-cell-label" title={chip.problem}>
-        {chip.short}
-      </span>
+    <span className={`hd-cell${sideLabel == null ? " hd-cell-bare" : ""}`}>
+      {sideLabel != null && (
+        <span className="hd-cell-label" title={chip.problem}>
+          {sideLabel}
+        </span>
+      )}
       <span
         className={`hd-bar ${tone}${hasLinks ? " hd-bar-hot" : ""}${open ? " hd-bar-open" : ""}`}
         onClick={onBarClick}
@@ -292,6 +310,33 @@ function gpuTabLabel(key: string, full: string) {
   return full
 }
 
+type RankEntry = { row: ReportRow; chip: ProblemChip }
+
+function rankEntriesForProblem(
+  view: ReportView,
+  problemId: string,
+): RankEntry[] {
+  const entries: RankEntry[] = []
+  for (const row of view.rows) {
+    const chip = row.chips.find((c) => c.problem === problemId)
+    if (!chip) continue
+    entries.push({ row, chip })
+  }
+  entries.sort((a, b) => {
+    const ba = rankBucket(a.chip)
+    const bb = rankBucket(b.chip)
+    if (ba !== bb) return ba - bb
+    if (ba === 0) {
+      // Higher score first among passes.
+      const sa = a.chip.score ?? 0
+      const sb = b.chip.score ?? 0
+      if (sb !== sa) return sb - sa
+    }
+    return a.row.name.localeCompare(b.row.name)
+  })
+  return entries
+}
+
 function DeckPanel({ deck }: { deck: HomeDeck }) {
   const [gpu, setGpu] = useState(deck.defaultGpu)
   const [pinned, setPinned] = useState<string | null>(null)
@@ -335,6 +380,7 @@ function DeckPanel({ deck }: { deck: HomeDeck }) {
   }
   if (!view) return null
   const nCols = Math.max(view.problems.length, 1)
+  const multiProblem = nCols > 1
   let lastTier: string | null = null
 
   const selectGpu = (key: string) => {
@@ -342,9 +388,13 @@ function DeckPanel({ deck }: { deck: HomeDeck }) {
     setPinned(null)
   }
 
+  const togglePin = (key: string) => {
+    setPinned((cur) => (cur === key ? null : key))
+  }
+
   return (
     <section
-      className="hd-deck"
+      className={`hd-deck${multiProblem ? " hd-deck-multi" : " hd-deck-single"}`}
       id={deck.key}
       style={
         {
@@ -376,55 +426,100 @@ function DeckPanel({ deck }: { deck: HomeDeck }) {
         )}
       </div>
 
-      <div className="hd-grid-head">
-        <span className="hd-head-gutter" aria-hidden />
-        <div className="hd-cells">
-          {view.problems.map((p) => (
-            <span key={p.id} className="hd-col-label" title={p.id}>
-              {p.short}
-            </span>
-          ))}
+      {/* Desktop matrix (and mobile single-problem model cards) */}
+      <div className="hd-matrix">
+        <div className="hd-grid-head">
+          <span className="hd-head-gutter" aria-hidden />
+          <div className="hd-cells">
+            {view.problems.map((p) => (
+              <span key={p.id} className="hd-col-label" title={p.id}>
+                {p.short}
+              </span>
+            ))}
+          </div>
+          <span className="hd-head-score" aria-hidden />
         </div>
-        <span className="hd-head-score" aria-hidden />
+
+        {view.rows.map((row, rowIdx) => {
+          const tier = `${row.passed}/${row.total}`
+          const showTier = tier !== lastTier
+          lastTier = tier
+          return (
+            <div key={row.slug} className="hd-row-block">
+              {showTier && <div className="hd-tier">{tier}</div>}
+              <div className="hd-row">
+                <span className="hd-model">
+                  <LabMark row={row} />
+                  <span className="hd-model-name">{row.name}</span>
+                </span>
+                <div className="hd-cells">
+                  {row.chips.map((c, i) => {
+                    const key = pinKey(row.slug, c.problem)
+                    const animDelayMs = Math.min(i * 40 + rowIdx * 28, 420)
+                    return (
+                      <Chip
+                        key={c.problem}
+                        chip={c}
+                        best={best.get(c.problem)}
+                        open={pinned === key}
+                        onToggle={() => togglePin(key)}
+                        animDelayMs={animDelayMs}
+                        sideLabel={c.short}
+                      />
+                    )
+                  })}
+                </div>
+                <span className="hd-pass tabular">
+                  {row.passed}
+                  <span className="hd-pass-den">/{row.total}</span>
+                </span>
+              </div>
+            </div>
+          )
+        })}
       </div>
 
-      {view.rows.map((row, rowIdx) => {
-        const tier = `${row.passed}/${row.total}`
-        const showTier = tier !== lastTier
-        lastTier = tier
-        return (
-          <div key={row.slug} className="hd-row-block">
-            {showTier && <div className="hd-tier">{tier}</div>}
-            <div className="hd-row">
-              <span className="hd-model">
-                <LabMark row={row} />
-                <span className="hd-model-name">{row.name}</span>
-              </span>
-              <div className="hd-cells">
-                {row.chips.map((c, i) => {
-                  const key = pinKey(row.slug, c.problem)
-                  // Light stagger so the board doesn't fill in lockstep.
-                  const animDelayMs = Math.min(i * 40 + rowIdx * 28, 420)
-                  return (
-                    <Chip
-                      key={c.problem}
-                      chip={c}
-                      best={best.get(c.problem)}
-                      open={pinned === key}
-                      onToggle={() => setPinned((cur) => (cur === key ? null : key))}
-                      animDelayMs={animDelayMs}
-                    />
-                  )
-                })}
+      {/* Mobile multi-problem: per-problem leaderboards, best → worst */}
+      {multiProblem && (
+        <div className="hd-by-problem">
+          {view.problems.map((p, pIdx) => {
+            const ranked = rankEntriesForProblem(view, p.id)
+            const problemBest = best.get(p.id)
+            return (
+              <div key={p.id} className="hd-problem-board">
+                <div className="hd-problem-head">
+                  <span className="hd-problem-name" title={p.id}>
+                    {p.short}
+                  </span>
+                  <span className="hd-problem-meta">best → worst</span>
+                </div>
+                <div className="hd-rank-list">
+                  {ranked.map(({ row, chip }, i) => {
+                    const key = pinKey(row.slug, chip.problem)
+                    const animDelayMs = Math.min(pIdx * 80 + i * 28, 520)
+                    return (
+                      <div key={key} className="hd-rank-row">
+                        <span className="hd-rank-model">
+                          <LabMark row={row} />
+                          <span className="hd-model-name">{row.name}</span>
+                        </span>
+                        <Chip
+                          chip={chip}
+                          best={problemBest}
+                          open={pinned === key}
+                          onToggle={() => togglePin(key)}
+                          animDelayMs={animDelayMs}
+                          sideLabel={null}
+                        />
+                      </div>
+                    )
+                  })}
+                </div>
               </div>
-              <span className="hd-pass tabular">
-                {row.passed}
-                <span className="hd-pass-den">/{row.total}</span>
-              </span>
-            </div>
-          </div>
-        )
-      })}
+            )
+          })}
+        </div>
+      )}
     </section>
   )
 }
