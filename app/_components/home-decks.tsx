@@ -77,22 +77,98 @@ function pinKey(rowSlug: string, problem: string): string {
   return `${rowSlug}::${problem}`
 }
 
+const BAR_GROW_MS = 1000
+
+/** Format a count-up value to match the chip's published label shape. */
+function formatCountUp(t: number, finalLabel: string, score: number): string {
+  if (t >= 1) return finalLabel
+  const v = score * t
+  // Speedup-style labels: "23", "5.1" (score usually > 1.5)
+  if (score > 1.5) {
+    if (score >= 10) return Math.round(v).toString()
+    // one decimal like the static label
+    return (Math.round(v * 10) / 10).toFixed(1)
+  }
+  // Peak-fraction labels as percent points of score (label is e.g. "30" for 0.30)
+  const pctPts = score * 100 * t
+  if (score >= 0.1) return Math.round(pctPts).toString()
+  return (Math.round(pctPts * 10) / 10).toFixed(1)
+}
+
 function Chip({
   chip,
   best,
   open,
   onToggle,
+  animDelayMs = 0,
 }: {
   chip: ProblemChip
   best: number | undefined
   open: boolean
   onToggle: () => void
+  /** Stagger entrance slightly down the grid */
+  animDelayMs?: number
 }) {
   const pass = chip.kind === "pass" && chip.score != null && best != null && best > 0
   const pct = pass ? Math.min(100, (chip.score! / best) * 100) : 0
+  const fillW = pass ? Math.max(pct, 4) : 0
   const win = pass && chip.score! >= best! - 1e-12
   const hasLinks = Boolean(chip.solution_url || chip.trace_url)
   const blank = !pass && failTone(chip) === "blank"
+
+  // pre → grow (line + count-up) → static
+  const [phase, setPhase] = useState<"pre" | "grow" | "static">("pre")
+  const [numLabel, setNumLabel] = useState(pass ? "0" : chip.label)
+
+  useEffect(() => {
+    if (!pass || chip.score == null) {
+      setPhase("static")
+      setNumLabel(chip.label)
+      return
+    }
+    const reduced =
+      typeof window !== "undefined" &&
+      window.matchMedia("(prefers-reduced-motion: reduce)").matches
+    if (reduced) {
+      setPhase("static")
+      setNumLabel(chip.label)
+      return
+    }
+
+    setPhase("pre")
+    setNumLabel("0")
+    let raf = 0
+    let growTimer = 0
+    let staticTimer = 0
+    let growStarted = 0
+    const score = chip.score
+    const label = chip.label
+
+    const tick = (now: number) => {
+      const t = Math.min(1, (now - growStarted) / BAR_GROW_MS)
+      const e = 1 - (1 - t) ** 3 // ease-out cubic
+      setNumLabel(formatCountUp(e, label, score))
+      if (t < 1) raf = requestAnimationFrame(tick)
+      else setNumLabel(label)
+    }
+
+    growTimer = window.setTimeout(() => {
+      setPhase("grow")
+      growStarted = performance.now()
+      raf = requestAnimationFrame(tick)
+    }, animDelayMs)
+
+    staticTimer = window.setTimeout(() => {
+      setPhase("static")
+      setNumLabel(label)
+    }, animDelayMs + BAR_GROW_MS)
+
+    return () => {
+      cancelAnimationFrame(raf)
+      clearTimeout(growTimer)
+      clearTimeout(staticTimer)
+    }
+  }, [pass, chip.score, chip.label, chip.problem, best, animDelayMs])
 
   const tone = pass
     ? win
@@ -115,6 +191,10 @@ function Chip({
       onToggle()
     }
   }
+
+  const fillStyle = {
+    ["--hd-w" as string]: `${fillW.toFixed(1)}%`,
+  } as CSSProperties
 
   return (
     <span
@@ -145,12 +225,15 @@ function Chip({
       {pass ? (
         <>
           <span
-            className="hd-bar-fill"
-            style={{ width: `${Math.max(pct, 4).toFixed(1)}%` } as CSSProperties}
+            className={`hd-bar-fill${phase === "pre" ? "" : " hd-bar-fill-on"}`}
+            style={fillStyle}
           />
-          <span className="hd-bar-num tabular">{chip.label}</span>
-          {win && (
-            <span className="hd-bar-star" aria-label="best">
+          <span className="hd-bar-num tabular">{phase === "static" ? chip.label : numLabel}</span>
+          {win && phase !== "pre" && (
+            <span
+              className={`hd-bar-star${phase === "static" ? " hd-bar-star-in" : ""}`}
+              aria-label="best"
+            >
               ★
             </span>
           )}
@@ -282,7 +365,7 @@ function DeckPanel({ deck }: { deck: HomeDeck }) {
         <span />
       </div>
 
-      {view.rows.map((row) => {
+      {view.rows.map((row, rowIdx) => {
         const tier = `${row.passed}/${row.total}`
         const showTier = tier !== lastTier
         lastTier = tier
@@ -297,8 +380,10 @@ function DeckPanel({ deck }: { deck: HomeDeck }) {
                 <LabMark row={row} />
                 <span className="hd-model-name">{row.name}</span>
               </span>
-              {row.chips.map((c) => {
+              {row.chips.map((c, i) => {
                 const key = pinKey(row.slug, c.problem)
+                // Light stagger so the board doesn't fill in lockstep.
+                const animDelayMs = Math.min(i * 40 + rowIdx * 28, 420)
                 return (
                   <Chip
                     key={c.problem}
@@ -306,6 +391,7 @@ function DeckPanel({ deck }: { deck: HomeDeck }) {
                     best={best.get(c.problem)}
                     open={pinned === key}
                     onToggle={() => setPinned((cur) => (cur === key ? null : key))}
+                    animDelayMs={animDelayMs}
                   />
                 )
               })}
