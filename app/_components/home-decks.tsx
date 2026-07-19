@@ -197,80 +197,99 @@ function Chip({
   } as CSSProperties
 
   return (
-    <span
-      className={`hd-bar ${tone}${hasLinks ? " hd-bar-hot" : ""}${open ? " hd-bar-open" : ""}`}
-      onClick={onBarClick}
-      onKeyDown={onBarKey}
-      role={hasLinks ? "button" : undefined}
-      tabIndex={hasLinks ? 0 : undefined}
-      aria-expanded={hasLinks ? open : undefined}
-      aria-haspopup={hasLinks ? "dialog" : undefined}
-      title={
-        blank
-          ? chip.title || "no run"
-          : hasLinks
-            ? open
-              ? "Click to close"
-              : "Click for solution / trace"
-            : chip.title || undefined
-      }
-      aria-label={
-        blank
-          ? chip.title || "no run"
-          : hasLinks
-            ? `${problemLabel(chip.problem)}: ${chip.title || chip.label}. ${open ? "Close details" : "Open solution and trace"}`
-            : chip.title || chip.label || undefined
-      }
-    >
-      {pass ? (
-        <>
-          <span
-            className={`hd-bar-fill${phase === "pre" ? "" : " hd-bar-fill-on"}`}
-            style={fillStyle}
-          />
-          <span className="hd-bar-num tabular">{phase === "static" ? chip.label : numLabel}</span>
-          {win && phase !== "pre" && (
+    <span className="hd-cell">
+      <span className="hd-cell-label" title={chip.problem}>
+        {chip.short}
+      </span>
+      <span
+        className={`hd-bar ${tone}${hasLinks ? " hd-bar-hot" : ""}${open ? " hd-bar-open" : ""}`}
+        onClick={onBarClick}
+        onKeyDown={onBarKey}
+        role={hasLinks ? "button" : undefined}
+        tabIndex={hasLinks ? 0 : undefined}
+        aria-expanded={hasLinks ? open : undefined}
+        aria-haspopup={hasLinks ? "dialog" : undefined}
+        title={
+          blank
+            ? chip.title || "no run"
+            : hasLinks
+              ? open
+                ? "Click to close"
+                : "Click for solution / trace"
+              : chip.title || undefined
+        }
+        aria-label={
+          blank
+            ? chip.title || "no run"
+            : hasLinks
+              ? `${problemLabel(chip.problem)}: ${chip.title || chip.label}. ${open ? "Close details" : "Open solution and trace"}`
+              : chip.title || chip.label || undefined
+        }
+      >
+        {pass ? (
+          <>
             <span
-              className={`hd-bar-star${phase === "static" ? " hd-bar-star-in" : ""}`}
-              aria-label="best"
-            >
-              ★
+              className={`hd-bar-fill${phase === "pre" ? "" : " hd-bar-fill-on"}`}
+              style={fillStyle}
+            />
+            <span className="hd-bar-num tabular">
+              {phase === "static" ? chip.label : numLabel}
             </span>
-          )}
-        </>
-      ) : blank ? null : (
-        <span className="hd-bar-fail-label" aria-label={chip.title || chip.label || "fail"}>
-          {chip.label || "fail"}
-        </span>
-      )}
-      {hasLinks && open && (
-        <span
-          className="hd-pop"
-          role="dialog"
-          aria-label={`${problemLabel(chip.problem)} artifacts`}
-          onClick={(e) => e.stopPropagation()}
-        >
-          <span className="hd-pop-name">
-            {problemLabel(chip.problem)}
-            {win ? " · best" : ""}
-          </span>
-          <span className="hd-pop-meta">{chip.title}</span>
-          <span className="hd-pop-links">
-            {chip.solution_url && (
-              <a href={chip.solution_url} target="_blank" rel="noreferrer" className="hd-pop-a">
-                solution
-              </a>
+            {win && phase !== "pre" && (
+              <span
+                className={`hd-bar-star${phase === "static" ? " hd-bar-star-in" : ""}`}
+                aria-label="best"
+              >
+                ★
+              </span>
             )}
-            {chip.trace_url && (
-              <a href={chip.trace_url} target="_blank" rel="noreferrer" className="hd-pop-a">
-                trace
-              </a>
-            )}
+          </>
+        ) : blank ? null : (
+          <span className="hd-bar-fail-label" aria-label={chip.title || chip.label || "fail"}>
+            {chip.label || "fail"}
           </span>
-        </span>
-      )}
+        )}
+        {hasLinks && open && (
+          <span
+            className="hd-pop"
+            role="dialog"
+            aria-label={`${problemLabel(chip.problem)} artifacts`}
+            onClick={(e) => e.stopPropagation()}
+          >
+            <span className="hd-pop-name">
+              {problemLabel(chip.problem)}
+              {win ? " · best" : ""}
+            </span>
+            <span className="hd-pop-meta">{chip.title}</span>
+            <span className="hd-pop-links">
+              {chip.solution_url && (
+                <a href={chip.solution_url} target="_blank" rel="noreferrer" className="hd-pop-a">
+                  solution
+                </a>
+              )}
+              {chip.trace_url && (
+                <a href={chip.trace_url} target="_blank" rel="noreferrer" className="hd-pop-a">
+                  trace
+                </a>
+              )}
+            </span>
+          </span>
+        )}
+      </span>
     </span>
   )
+}
+
+function gpuTabLabel(key: string, full: string) {
+  if (key === "rtxpro6000") {
+    return (
+      <>
+        <span className="gpu-label-full">{full}</span>
+        <span className="gpu-label-short">PRO 6000</span>
+      </>
+    )
+  }
+  return full
 }
 
 function DeckPanel({ deck }: { deck: HomeDeck }) {
@@ -327,7 +346,12 @@ function DeckPanel({ deck }: { deck: HomeDeck }) {
     <section
       className="hd-deck"
       id={deck.key}
-      style={{ ["--deck-accent" as string]: deck.accent }}
+      style={
+        {
+          ["--deck-accent" as string]: deck.accent,
+          ["--hd-cols" as string]: String(nCols),
+        } as CSSProperties
+      }
     >
       <div className="hd-section-label">
         <div className="hd-section-title">
@@ -335,7 +359,7 @@ function DeckPanel({ deck }: { deck: HomeDeck }) {
           <span className="hd-name">{deck.title}</span>
         </div>
         {deck.gpus.length > 1 && (
-          <div className="gpu-toggle" role="tablist" aria-label={`${deck.title} GPU`}>
+          <div className="gpu-toggle hd-gpu-toggle" role="tablist" aria-label={`${deck.title} GPU`}>
             {deck.gpus.map((g) => (
               <button
                 key={g.key}
@@ -345,24 +369,23 @@ function DeckPanel({ deck }: { deck: HomeDeck }) {
                 role="tab"
                 aria-selected={g.key === active}
               >
-                {g.label}
+                {gpuTabLabel(g.key, g.label)}
               </button>
             ))}
           </div>
         )}
       </div>
 
-      <div
-        className="hd-grid-head"
-        style={{ gridTemplateColumns: `11rem repeat(${nCols}, minmax(0, 1fr)) 2.4rem` }}
-      >
-        <span />
-        {view.problems.map((p) => (
-          <span key={p.id} className="hd-col-label" title={p.id}>
-            {p.short}
-          </span>
-        ))}
-        <span />
+      <div className="hd-grid-head">
+        <span className="hd-head-gutter" aria-hidden />
+        <div className="hd-cells">
+          {view.problems.map((p) => (
+            <span key={p.id} className="hd-col-label" title={p.id}>
+              {p.short}
+            </span>
+          ))}
+        </div>
+        <span className="hd-head-score" aria-hidden />
       </div>
 
       {view.rows.map((row, rowIdx) => {
@@ -370,31 +393,30 @@ function DeckPanel({ deck }: { deck: HomeDeck }) {
         const showTier = tier !== lastTier
         lastTier = tier
         return (
-          <div key={row.slug}>
+          <div key={row.slug} className="hd-row-block">
             {showTier && <div className="hd-tier">{tier}</div>}
-            <div
-              className="hd-row"
-              style={{ gridTemplateColumns: `11rem repeat(${nCols}, minmax(0, 1fr)) 2.4rem` }}
-            >
+            <div className="hd-row">
               <span className="hd-model">
                 <LabMark row={row} />
                 <span className="hd-model-name">{row.name}</span>
               </span>
-              {row.chips.map((c, i) => {
-                const key = pinKey(row.slug, c.problem)
-                // Light stagger so the board doesn't fill in lockstep.
-                const animDelayMs = Math.min(i * 40 + rowIdx * 28, 420)
-                return (
-                  <Chip
-                    key={c.problem}
-                    chip={c}
-                    best={best.get(c.problem)}
-                    open={pinned === key}
-                    onToggle={() => setPinned((cur) => (cur === key ? null : key))}
-                    animDelayMs={animDelayMs}
-                  />
-                )
-              })}
+              <div className="hd-cells">
+                {row.chips.map((c, i) => {
+                  const key = pinKey(row.slug, c.problem)
+                  // Light stagger so the board doesn't fill in lockstep.
+                  const animDelayMs = Math.min(i * 40 + rowIdx * 28, 420)
+                  return (
+                    <Chip
+                      key={c.problem}
+                      chip={c}
+                      best={best.get(c.problem)}
+                      open={pinned === key}
+                      onToggle={() => setPinned((cur) => (cur === key ? null : key))}
+                      animDelayMs={animDelayMs}
+                    />
+                  )
+                })}
+              </div>
               <span className="hd-pass tabular">
                 {row.passed}
                 <span className="hd-pass-den">/{row.total}</span>
