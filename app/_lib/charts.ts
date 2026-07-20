@@ -32,6 +32,7 @@ export const MODEL_NAMES: Record<string, string> = {
   "LongCat-2.0": "LongCat 2.0",
   hy3: "Tencent Hy3",
   "tencent/hy3-preview": "Tencent Hy3",
+  "qwen3.8-max-preview": "Qwen 3.8 Max (preview)",
 }
 
 function displayName(modelId: string): string {
@@ -174,6 +175,7 @@ const SHORT_NAMES: Record<string, string> = {
   "LongCat-2.0": "LongCat",
   hy3: "Hy3",
   "tencent/hy3-preview": "Hy3",
+  "qwen3.8-max-preview": "Qwen 3.8",
 }
 
 function shortName(modelId: string): string {

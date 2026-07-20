@@ -24,13 +24,19 @@ PROBLEMS = ["01_fp8_gemm","02_kda_cutlass","03_paged_attention",
 
 # run_id -> (verdict, summary)
 ann = {}
+# run_ids whose manual audit explicitly cleared contamination (annotation
+# `contamination: clean`) even though the overall verdict is not `clean`
+# (e.g. a reward_hack cell published flagged). Overrides the regex tripwire.
+ann_contam_clean: set[str] = set()
 for f in glob.glob(str(ROOT/"results/annotations/*.yaml")):
     txt = open(f).read()
     rid = re.search(r"run_id:\s*(\S+)", txt)
-    ver = re.search(r"verdict:\s*(\S+)", txt)
+    ver = re.search(r"^verdict:\s*(\S+)", txt, re.M)
     summ = re.search(r'summary:\s*"(.*)"', txt, re.S)
     if rid and ver:
         ann[rid.group(1)] = (ver.group(1), (summ.group(1) if summ else "")[:400])
+        if re.search(r"^contamination:\s*clean\b", txt, re.M):
+            ann_contam_clean.add(rid.group(1))
 
 # collect v2 runs: every run dated 2026-06-10 or later (v2 containerized era).
 # Date-gated instead of an enumerated list so new sweep dates are picked up
@@ -96,7 +102,7 @@ for rj in glob.glob(str(RUNS_DIR/"2026*/result.json")):
         # output. A manual audit (results/annotations/, which includes a
         # contamination read of the transcript) marked `clean` overrides it;
         # anything unaudited or non-clean stays excluded.
-        if ann.get(rid, (None, None))[0] == "clean":
+        if ann.get(rid, (None, None))[0] == "clean" or rid in ann_contam_clean:
             print(f"  tripwire overridden (manual audit clean): {rid}", file=sys.stderr)
         else:
             print(f"  EXCLUDED (contaminated, read other archive): {rid}", file=sys.stderr)
