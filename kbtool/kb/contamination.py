@@ -92,6 +92,10 @@ def _sibling_score_refs(run_dir: Path, text: str, self_ts: str) -> set[str]:
         m = re.match(r"(\d{8}_\d{6})", sib.name)
         if not m or m.group(1) == self_ts:
             continue
+        # Temporal gate: a sibling that started after this run cannot be a
+        # contamination source (its score didn't exist yet).
+        if self_ts and m.group(1) > self_ts:
+            continue
         if _run_problem(sib) != problem:
             continue
         try:

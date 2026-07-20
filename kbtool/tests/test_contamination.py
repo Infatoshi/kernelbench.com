@@ -108,3 +108,20 @@ def test_non_grok_transcript_behavior_unchanged(tmp_path):
         "message": "see outputs/runs/20260721_000000_claude_claude-opus-4-8_01_glm52_fused_moe",
     }) + "\n")
     assert other_archives(own_only) == set()
+
+
+def test_sibling_score_after_run_finished_does_not_fire(tmp_path):
+    """Temporal gate: a sibling that STARTED LATER cannot contaminate.
+
+    Real false positive (20260708_143924 grok topk): the flagged sibling ran
+    8 days after this run; the matching number was the run's own intermediate
+    geomean.
+    """
+    run = _mk_run(tmp_path, "20260708_143924_grok_grok-4.5_05_topk_bitonic",
+                  "05_topk_bitonic", 0.0293)
+    _write_tokens(run / "transcript.jsonl", [
+        "Slightly worse than the peak 0.", "0296", " so revert",
+    ])
+    _mk_run(tmp_path, "20260716_091251_kinetic-claude_kinetic-0715_05_topk_bitonic",
+            "05_topk_bitonic", 0.0296)
+    assert other_archives(run) == set()
