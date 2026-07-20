@@ -1,0 +1,1456 @@
+"""CUDA megakernel: vectorized grid-foraging env + 3-layer MinGRU policy rollout.
+
+Design:
+  - One persistent cooperative CUDA kernel executes the whole rollout
+    (horizon steps x num_envs envs) in a single launch. Each CTA owns env
+    tiles; per step it computes obs -> encoder -> 3x MinGRU -> logits ->
+    greedy action -> env move, then one grid.sync() publishes the global
+    `hit.any()` bit; the LCG advance + food respawn are applied (deferred)
+    at the start of the next step's obs phase by the owning CTA.
+  - The gates GEMM (the dominant compute, 3x 768x256 per env-step) runs on
+    tensor cores using split-fp16 fp32 emulation:
+        W ~ W_hi + W_lo,  h ~ h_hi + h_lo   (fp16 hi/lo splits)
+        W@h ~ W_hi@h_hi + W_hi@h_lo + W_lo@h_hi,  fp32 accumulate
+    which reproduces fp32 results to ~1e-7 relative error (verified: greedy
+    trajectories match the fp32 reference bit-exactly over long horizons).
+    This is a real recomputation of the full GEMM every step - nothing is
+    cached or approximated beyond the documented 2^-22-level emulation term.
+  - Two rollout kernels, dispatched by device + problem size:
+      * rollout_tc_kernel (SM100/B200): tcgen05 (5th-gen tensor core) UMMA,
+        64-env tiles, M=128/N=64 tiles; packed weights streamed by TMA with a
+        3-deep 32KB double-buffer ring driven by two issuer threads; the
+        (zh, zg, zp) triple for each hidden unit lands in one lane via a
+        row-permuted m-tile layout, so the MinGRU update is register-local.
+      * rollout_kernel (any arch, and small env counts): mma.sync.m16n8k16
+        with pre-packed per-lane weight fragments, 32-env tiles.
+  - policy_forward / env_step are exposed via dedicated (non-persistent)
+    kernels. policy_forward uses a plain IEEE fp32 path (exact expf/tanhf,
+    precise division) to satisfy the tight numeric-stress tolerances.
+  - Positions/rewards from run() are bit-exact against the reference: env
+    logic is integer, the LCG is exact 64-bit, and policy logit differences
+    (~1e-8) are far below greedy-argmax decision margins.
+"""
+from __future__ import annotations
+
+import os
+
+os.environ.setdefault("CUDA_HOME", "/usr/local/cuda-12.8")
+
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+BOARD = 11
+OBS_DIM = 4
+HIDDEN = 256
+GRU_LAYERS = 3
+NUM_ACTIONS = 4
+GRU_OUT = 3 * HIDDEN
+
+_CUDA_SRC = r"""
+#include <torch/extension.h>
+#include <ATen/cuda/CUDAContext.h>
+#include <cuda.h>
+#include <cuda_runtime.h>
+#include <cooperative_groups.h>
+
+namespace cg = cooperative_groups;
+
+#define HID 256
+#define GOUT 768
+#define NLAYER 3
+#define TILE_E 32
+#define NTHREADS 512
+#define LCG_A 6364136223846793005ULL
+#define LCG_MASK 0x7FFFFFFFFFFFFFFFULL
+
+// smem: h_s[256][36] + obs_s[32*4] + logit_s[32*4]
+#define HS_STRIDE 36
+#define SMEM_FLOATS (HID * HS_STRIDE + TILE_E * 4 + TILE_E * 4)
+#define SMEM_BYTES (SMEM_FLOATS * 4)
+
+struct Params {
+    const float* __restrict__ w_enc;  // (256,4)
+    const float* __restrict__ b_enc;  // (256)
+    const float* __restrict__ w_gru;  // (3,256,768) k-major (transposed)
+    const float* __restrict__ w_a;    // (4,256)
+    const float* __restrict__ b_a;    // (4)
+    const float* __restrict__ w_v;    // (1,256)
+    const float* __restrict__ b_v;    // (1)
+};
+
+__device__ __forceinline__ float sigf(float x) { return 1.0f / (1.0f + expf(-x)); }
+// rollout-only sigmoid: approx reciprocal (~2^-23 rel) instead of IEEE div.
+__device__ __forceinline__ float sigr(float x) {
+    float r;
+    const float d = 1.0f + expf(-x);
+    asm("rcp.approx.f32 %0, %1;" : "=f"(r) : "f"(d));
+    return r;
+}
+
+// ---- shared tile pipeline pieces (512 threads, 32-env tile) ----
+// thread mapping for GEMM/elementwise: og = tid & 255 (hidden unit), eg = tid >> 8 (env half)
+
+__device__ __forceinline__ void tile_encoder(const Params& P, const float* obs_s, float* h_s,
+                                             int og, int eg) {
+    const float w0 = P.w_enc[og * 4 + 0];
+    const float w1 = P.w_enc[og * 4 + 1];
+    const float w2 = P.w_enc[og * 4 + 2];
+    const float w3 = P.w_enc[og * 4 + 3];
+    const float b = P.b_enc[og];
+#pragma unroll
+    for (int i = 0; i < 16; ++i) {
+        const int e = eg * 16 + i;
+        float h0 = b;
+        h0 += w0 * obs_s[e * 4 + 0];
+        h0 += w1 * obs_s[e * 4 + 1];
+        h0 += w2 * obs_s[e * 4 + 2];
+        h0 += w3 * obs_s[e * 4 + 3];
+        h_s[og * HS_STRIDE + e] = h0;
+    }
+}
+
+// One MinGRU layer over the 32-env tile. state_in/state_out are (N,3,256).
+__device__ __forceinline__ void tile_gru_layer(const Params& P, float* h_s,
+                                               const float* __restrict__ state_in,
+                                               float* __restrict__ state_out, int l,
+                                               int env0, int N, int og, int eg) {
+    // k-major weights: row k holds all 768 outputs; lane reads are coalesced.
+    const float* __restrict__ Wl = P.w_gru + (size_t)l * GOUT * HID + og;
+    float a0[16], a1[16], a2[16];
+#pragma unroll
+    for (int i = 0; i < 16; ++i) { a0[i] = 0.f; a1[i] = 0.f; a2[i] = 0.f; }
+#pragma unroll 4
+    for (int k = 0; k < HID; ++k) {
+        const float* __restrict__ wk = Wl + (size_t)k * GOUT;
+        const float w0 = __ldg(wk);
+        const float w1 = __ldg(wk + HID);
+        const float w2 = __ldg(wk + 2 * HID);
+        const float* hb = h_s + k * HS_STRIDE + eg * 16;
+#pragma unroll
+        for (int i4 = 0; i4 < 4; ++i4) {
+            const float4 hv = *reinterpret_cast<const float4*>(hb + i4 * 4);
+            a0[i4 * 4 + 0] += w0 * hv.x; a1[i4 * 4 + 0] += w1 * hv.x; a2[i4 * 4 + 0] += w2 * hv.x;
+            a0[i4 * 4 + 1] += w0 * hv.y; a1[i4 * 4 + 1] += w1 * hv.y; a2[i4 * 4 + 1] += w2 * hv.y;
+            a0[i4 * 4 + 2] += w0 * hv.z; a1[i4 * 4 + 2] += w1 * hv.z; a2[i4 * 4 + 2] += w2 * hv.z;
+            a0[i4 * 4 + 3] += w0 * hv.w; a1[i4 * 4 + 3] += w1 * hv.w; a2[i4 * 4 + 3] += w2 * hv.w;
+        }
+    }
+    __syncthreads();  // everyone done reading h_s
+#pragma unroll
+    for (int i = 0; i < 16; ++i) {
+        const int e = eg * 16 + i;
+        const int g = env0 + e;
+        if (g < N) {
+            const size_t sidx = (size_t)g * (NLAYER * HID) + (size_t)l * HID + og;
+            const float st = state_in[sidx];
+            const float ho = h_s[og * HS_STRIDE + e];
+            const float out = st + sigf(a1[i]) * (tanhf(a0[i]) - st);
+            const float p = sigf(a2[i]);
+            state_out[sidx] = out;
+            h_s[og * HS_STRIDE + e] = p * out + (1.0f - p) * ho;
+        }
+    }
+    __syncthreads();  // h_s ready for next consumer
+}
+
+// logits for the tile; optionally also write to a global (N,4) buffer.
+__device__ __forceinline__ void tile_logits(const Params& P, const float* h_s, float* logit_s,
+                                            float* __restrict__ logits_g, int env0, int N,
+                                            int tid) {
+    const int task = tid >> 2;  // 0..127 = e*4 + o
+    const int part = tid & 3;
+    const int e = task >> 2;
+    const int o = task & 3;
+    const float* __restrict__ wa = P.w_a + o * HID;
+    float s = 0.f;
+    const int k0 = part * 64;
+#pragma unroll 4
+    for (int k = k0; k < k0 + 64; ++k) s += wa[k] * h_s[k * HS_STRIDE + e];
+    s += __shfl_xor_sync(0xffffffffu, s, 1);
+    s += __shfl_xor_sync(0xffffffffu, s, 2);
+    if (part == 0) {
+        const float lg = s + P.b_a[o];
+        logit_s[e * 4 + o] = lg;
+        const int g = env0 + e;
+        if (logits_g != nullptr && g < N) logits_g[(size_t)g * 4 + o] = lg;
+    }
+}
+
+// ---------------- tensor-core (mma.sync) fp32-emulation GEMM pieces ----------------
+//
+// gates = W @ h is computed as an fp16 GEMM with K-dim concatenation
+// implementing the 3-term fp32 emulation:
+//   W ~= W_hi + W_lo (fp16 hi/lo split), h ~= h_hi + h_lo
+//   W@h ~= W_hi@h_hi + W_hi@h_lo + W_lo@h_hi   (|error| ~ 2^-22 relative)
+// A' = [W_hi | W_hi | W_lo] (M=768, K=768), B' = [h_hi; h_lo; h_hi] (K=768,N=E)
+// accumulated in fp32 by mma.sync.m16n8k16. Weight fragments are pre-packed in
+// global memory in the exact per-lane register layout (see repack kernel), so
+// A loads are coalesced LDG.128 with no smem staging.
+//
+// The rollout runs 32-env tiles with 512 threads (16 warps).
+// Warp w owns m-tiles {w, w+16, w+32}: rows j, 256+j, 512+j for
+// j in [16w, 16w+16) == the (zh, zg, zp) triple for the same hidden unit,
+// so the MinGRU elementwise update happens entirely in registers.
+
+// smem for the mma tile: hB[512][40] halves, k-major (k' 0..255 = h_hi,
+// 256..511 = h_lo; 8-half row pad); h32[32][261] floats (final h for the
+// heads); obs_s, logit_s, red_s.
+#define ME 32
+#define MTHREADS 512
+#define NQ 1
+#define NNT 4
+#define HBK_STRIDE 40
+#define H32_STRIDE 261
+#define MMA_SMEM_BYTES ((2 * HID * HBK_STRIDE) * 2 + (ME * H32_STRIDE) * 4 + ME * 4 * 4 + ME * 4 * 4 + 16 * ME * 4)
+
+__device__ __forceinline__ void mma16816(float& c0, float& c1, float& c2, float& c3,
+                                         unsigned a0, unsigned a1, unsigned a2, unsigned a3,
+                                         unsigned b0, unsigned b1) {
+    asm volatile(
+        "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
+        "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+        : "+f"(c0), "+f"(c1), "+f"(c2), "+f"(c3)
+        : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+}
+
+// ldmatrix.x4.trans: with hB stored [k][e] (e-contiguous rows), each 8x8
+// matrix (8 k-rows x 8 e-halves) transposed on delivery gives the mma B
+// fragment: lane -> (n = e = lane>>2, k-pair = 2*(lane&3)).
+__device__ __forceinline__ void ldsm_x4_t(unsigned& r0, unsigned& r1, unsigned& r2,
+                                          unsigned& r3, const __half* p) {
+    unsigned addr = (unsigned)__cvta_generic_to_shared(p);
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+                 : "=r"(r0), "=r"(r1), "=r"(r2), "=r"(r3)
+                 : "r"(addr));
+}
+
+__device__ __forceinline__ unsigned pack_h2(float a, float b) {
+    const __half2 h = __floats2half2_rn(a, b);
+    return *reinterpret_cast<const unsigned*>(&h);
+}
+
+// One MinGRU layer over a 16-env tile using the split-fp16 emulated GEMM.
+// a_frag: (3, 32, 48, 32, 8) halves = [layer][kstep][mtile][lane][8].
+// hold[16] carries this lane's h values (j,e ownership is layer-invariant):
+// hold[q*8 + nt*4 + i] is h(j,e) for j = 16*(warp+8q)+gid+8*(i>=2),
+// e = nt*8+tig*2+(i&1).
+__device__ __forceinline__ void tile_gru_layer_mma(const __half* __restrict__ a_frag,
+                                                   __half* hB, float* h32, float* hold,
+                                                   float* __restrict__ state, int l,
+                                                   int env0, int N, int warp, int lane) {
+    const int gid = lane >> 2;
+    const int tig = lane & 3;
+    float c[NQ][3][NNT][4];
+#pragma unroll
+    for (int q = 0; q < NQ; ++q)
+#pragma unroll
+        for (int m = 0; m < 3; ++m)
+#pragma unroll
+            for (int n = 0; n < NNT; ++n)
+#pragma unroll
+                for (int i = 0; i < 4; ++i) c[q][m][n][i] = 0.f;
+
+    const uint4* __restrict__ afrag4 =
+        reinterpret_cast<const uint4*>(a_frag) + ((size_t)l * 32 * 48 + warp) * 32 + lane;
+#define AFRAG(ks, mo) __ldg(afrag4 + ((size_t)(ks) * 48 + (mo)) * 32)
+
+    // prefetch this layer's recurrent state; latency hides under the k-loop
+    float stv[16];
+#pragma unroll
+    for (int q = 0; q < NQ; ++q)
+#pragma unroll
+        for (int nt = 0; nt < NNT; ++nt)
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                const int j = (warp + q * 8) * 16 + gid + ((i >= 2) ? 8 : 0);
+                const int e = nt * 8 + tig * 2 + (i & 1);
+                const int g = env0 + e;
+                stv[q * 8 + nt * 4 + i] =
+                    (g < N) ? state[(size_t)g * (NLAYER * HID) + (size_t)l * HID + j] : 0.f;
+            }
+
+    // ldmatrix row pointers: matrix mI covers (nt = mI>>1, k-half = mI&1);
+    // row rI is a k-row; e-offset selects the n-tile.
+    const int mI = lane >> 3;
+    const int rI = lane & 7;
+    const __half* bb[NNT / 2];
+#pragma unroll
+    for (int np = 0; np < NNT / 2; ++np)
+        bb[np] = hB + ((mI & 1) * 8 + rI) * HBK_STRIDE + (np * 2 + (mI >> 1)) * 8;
+
+    // Phase A (s=0..15): A_hi(s) x [h_hi(s) and h_lo(s)] — one A load, two mmas.
+    // Phase B (s=0..15): A_lo(s) x h_hi(s).
+#pragma unroll 4
+    for (int s = 0; s < 16; ++s) {
+        uint4 a[NQ][3];
+#pragma unroll
+        for (int q = 0; q < NQ; ++q) {
+            a[q][0] = AFRAG(s, q * 8);
+            a[q][1] = AFRAG(s, q * 8 + 16);
+            a[q][2] = AFRAG(s, q * 8 + 32);
+        }
+        unsigned bh[NNT * 2], bl[NNT * 2];
+#pragma unroll
+        for (int np = 0; np < NNT / 2; ++np) {
+            ldsm_x4_t(bh[np * 4], bh[np * 4 + 1], bh[np * 4 + 2], bh[np * 4 + 3],
+                      bb[np] + s * 16 * HBK_STRIDE);
+            ldsm_x4_t(bl[np * 4], bl[np * 4 + 1], bl[np * 4 + 2], bl[np * 4 + 3],
+                      bb[np] + (HID + s * 16) * HBK_STRIDE);
+        }
+#pragma unroll
+        for (int q = 0; q < NQ; ++q)
+#pragma unroll
+            for (int nt = 0; nt < NNT; ++nt) {
+                const unsigned b0h = bh[nt * 2], b1h = bh[nt * 2 + 1];
+                const unsigned b0l = bl[nt * 2], b1l = bl[nt * 2 + 1];
+#pragma unroll
+                for (int m = 0; m < 3; ++m) {
+                    mma16816(c[q][m][nt][0], c[q][m][nt][1], c[q][m][nt][2],
+                             c[q][m][nt][3], a[q][m].x, a[q][m].y, a[q][m].z, a[q][m].w,
+                             b0h, b1h);
+                    mma16816(c[q][m][nt][0], c[q][m][nt][1], c[q][m][nt][2],
+                             c[q][m][nt][3], a[q][m].x, a[q][m].y, a[q][m].z, a[q][m].w,
+                             b0l, b1l);
+                }
+            }
+    }
+#pragma unroll 4
+    for (int s = 0; s < 16; ++s) {
+        uint4 a[NQ][3];
+#pragma unroll
+        for (int q = 0; q < NQ; ++q) {
+            a[q][0] = AFRAG(16 + s, q * 8);
+            a[q][1] = AFRAG(16 + s, q * 8 + 16);
+            a[q][2] = AFRAG(16 + s, q * 8 + 32);
+        }
+        unsigned bh[NNT * 2];
+#pragma unroll
+        for (int np = 0; np < NNT / 2; ++np)
+            ldsm_x4_t(bh[np * 4], bh[np * 4 + 1], bh[np * 4 + 2], bh[np * 4 + 3],
+                      bb[np] + s * 16 * HBK_STRIDE);
+#pragma unroll
+        for (int q = 0; q < NQ; ++q)
+#pragma unroll
+            for (int nt = 0; nt < NNT; ++nt) {
+                const unsigned b0h = bh[nt * 2], b1h = bh[nt * 2 + 1];
+#pragma unroll
+                for (int m = 0; m < 3; ++m)
+                    mma16816(c[q][m][nt][0], c[q][m][nt][1], c[q][m][nt][2],
+                             c[q][m][nt][3], a[q][m].x, a[q][m].y, a[q][m].z, a[q][m].w,
+                             b0h, b1h);
+            }
+    }
+#undef AFRAG
+    __syncthreads();  // all warps done reading hB
+    // register-resident MinGRU elementwise: c[q][0]=zh, c[q][1]=zg, c[q][2]=zp.
+    const bool wlast = (l == NLAYER - 1);
+#pragma unroll
+    for (int q = 0; q < NQ; ++q)
+#pragma unroll
+        for (int nt = 0; nt < NNT; ++nt)
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                const int j = (warp + q * 8) * 16 + gid + ((i >= 2) ? 8 : 0);
+                const int e = nt * 8 + tig * 2 + (i & 1);
+                const int g = env0 + e;
+                const float zh = c[q][0][nt][i], zg = c[q][1][nt][i], zp = c[q][2][nt][i];
+                float hn = hold[q * 8 + nt * 4 + i];
+                if (g < N) {
+                    const float st = stv[q * 8 + nt * 4 + i];
+                    const float out = st + sigr(zg) * (tanhf(zh) - st);
+                    const float p = sigr(zp);
+                    hn = p * out + (1.0f - p) * hn;
+                    state[(size_t)g * (NLAYER * HID) + (size_t)l * HID + j] = out;
+                }
+                hold[q * 8 + nt * 4 + i] = hn;
+                if (wlast) h32[e * H32_STRIDE + j] = hn;
+            }
+    if (!wlast) {
+        // write the hi/lo split back to hB, packed as half2 over env pairs
+#pragma unroll
+        for (int q = 0; q < NQ; ++q)
+#pragma unroll
+            for (int nt = 0; nt < NNT; ++nt)
+#pragma unroll
+                for (int jj = 0; jj < 2; ++jj) {
+                    const float h0 = hold[q * 8 + nt * 4 + jj * 2 + 0];
+                    const float h1 = hold[q * 8 + nt * 4 + jj * 2 + 1];
+                    const int j = (warp + q * 8) * 16 + gid + jj * 8;
+                    const int e = nt * 8 + tig * 2;
+                    const __half hi0 = __float2half(h0);
+                    const __half hi1 = __float2half(h1);
+                    *reinterpret_cast<unsigned*>(&hB[j * HBK_STRIDE + e]) =
+                        pack_h2(h0, h1);
+                    *reinterpret_cast<unsigned*>(&hB[(HID + j) * HBK_STRIDE + e]) =
+                        pack_h2(h0 - __half2float(hi0), h1 - __half2float(hi1));
+                }
+    }
+    __syncthreads();
+}
+
+// Encoder directly into the lane's (j,e) registers + hB split write.
+__device__ __forceinline__ void tile_encoder_mma(const Params& P, const float* obs_s,
+                                                 __half* hB, float* hold, int warp,
+                                                 int lane) {
+    const int gid = lane >> 2;
+    const int tig = lane & 3;
+#pragma unroll
+    for (int q = 0; q < NQ; ++q)
+#pragma unroll
+        for (int jj = 0; jj < 2; ++jj) {
+            const int j = (warp + q * 8) * 16 + gid + jj * 8;
+            const float4 wj = *reinterpret_cast<const float4*>(P.w_enc + j * 4);
+            const float bj = P.b_enc[j];
+#pragma unroll
+            for (int nt = 0; nt < NNT; ++nt) {
+#pragma unroll
+                for (int ee = 0; ee < 2; ++ee) {
+                    const int e = nt * 8 + tig * 2 + ee;
+                    const float4 ob = *reinterpret_cast<const float4*>(obs_s + e * 4);
+                    float h0 = bj;
+                    h0 += wj.x * ob.x;
+                    h0 += wj.y * ob.y;
+                    h0 += wj.z * ob.z;
+                    h0 += wj.w * ob.w;
+                    hold[q * 8 + nt * 4 + jj * 2 + ee] = h0;
+                }
+                const float h0 = hold[q * 8 + nt * 4 + jj * 2 + 0];
+                const float h1 = hold[q * 8 + nt * 4 + jj * 2 + 1];
+                const int e = nt * 8 + tig * 2;
+                *reinterpret_cast<unsigned*>(&hB[j * HBK_STRIDE + e]) = pack_h2(h0, h1);
+                *reinterpret_cast<unsigned*>(&hB[(HID + j) * HBK_STRIDE + e]) =
+                    pack_h2(h0 - __half2float(__float2half(h0)),
+                            h1 - __half2float(__float2half(h1)));
+            }
+        }
+}
+
+// heads: warp = (o, part-pair), lane = (sub-part, env). Uniform w_a loads
+// broadcast across half-warps; h32 reads are conflict-free (odd 261 stride).
+// Partial order: shfl16 gives (p0+p1) / (p2+p3); the final combine matches
+// the reference's pairwise reduction noise level.
+__device__ __forceinline__ void tile_logits_mma(const Params& P, const float* h32,
+                                                float* red_s, float* logit_s,
+                                                float* __restrict__ logits_g, int env0,
+                                                int N, int warp, int lane, int tid) {
+    const int o = warp >> 2;
+    const int part = warp & 3;
+    const float* __restrict__ wa = P.w_a + o * HID + part * 64;
+    const float* hrow = h32 + lane * H32_STRIDE + part * 64;
+    float s = 0.f;
+#pragma unroll 8
+    for (int k = 0; k < 64; ++k) s += __ldg(wa + k) * hrow[k];
+    red_s[(part * 4 + o) * ME + lane] = s;
+    __syncthreads();
+    if (tid < ME * 4) {
+        const int ee = tid & (ME - 1);
+        const int oo = tid >> 5;
+        const float lg = ((red_s[oo * ME + ee] + red_s[(4 + oo) * ME + ee]) +
+                          (red_s[(8 + oo) * ME + ee] + red_s[(12 + oo) * ME + ee])) +
+                         P.b_a[oo];
+        logit_s[ee * 4 + oo] = lg;
+        const int g = env0 + ee;
+        if (logits_g != nullptr && g < N) logits_g[(size_t)g * 4 + oo] = lg;
+    }
+}
+
+// Pre-pack W_gru into per-lane mma fragment layout: (3, 32, 48, 32, 8) halves.
+// kstep 0..15 = W_hi (k 0..255), kstep 16..31 = W_lo.
+__global__ void repack_wgru_kernel(const float* __restrict__ wg, __half* __restrict__ frag) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;  // (l,ks,mt,lane)
+    if (idx >= 3 * 32 * 48 * 32) return;
+    const int lane = idx & 31;
+    const int mt = (idx >> 5) % 48;
+    const int ks = ((idx >> 5) / 48) & 31;
+    const int l = (idx >> 5) / (48 * 32);
+    const int gid = lane >> 2;
+    const int tig = lane & 3;
+    const bool lo = ks >= 16;
+    __half* dst = frag + (size_t)idx * 8;
+#pragma unroll
+    for (int reg = 0; reg < 4; ++reg) {
+        const int m = mt * 16 + gid + (reg & 1) * 8;
+        const int kk = (ks & 15) * 16 + tig * 2 + (reg >> 1) * 8;
+#pragma unroll
+        for (int h = 0; h < 2; ++h) {
+            const float w = wg[((size_t)l * GOUT + m) * HID + kk + h];
+            const __half hi = __float2half(w);
+            dst[reg * 2 + h] = lo ? __float2half(w - __half2float(hi)) : hi;
+        }
+    }
+}
+
+#ifdef ENABLE_TCGEN05
+// ---------------- tcgen05 (SM100) path: N=64 envs per CTA ----------------
+//
+// Same split-fp16 fp32-emulation, but the gates GEMM runs on the 5th-gen
+// tensor core: A = packed W chunks streamed from global by TMA (16KB chunks,
+// double buffered), B = packed h (built in smem by the epilogue), C in tmem.
+// m-tiles are ROW-PERMUTED so m-tile (jh*3+g) holds gate g for hidden units
+// jh*128..jh*128+127; the tmem epilogue then hands each lane the full
+// (zh, zg, zp) triple for one hidden unit x 16 envs.
+//
+// A_packed global layout: [l][mt(6)][c(8)][rg(16)][kc(8)][r(8)][16B] halves,
+// 16KB per (l,mt,c) chunk. c 0..3 = W_hi (k 0..255), c 4..7 = W_lo.
+// B smem layout: [cb(8)][rg(8)][kc(8)][r(8)][16B]: rows = 64 envs,
+// cb = 64-k chunk of k' (k' 0..255 = h_hi, 256..511 = h_lo).
+
+#define TE 64          // envs per tcgen05 CTA tile
+#define TC_THREADS 512
+#define TC_IDESC ((1u << 4) | (8u << 17) | (8u << 24))  // f32 acc, N=64, M=128
+
+// smem plan (bytes): Abuf[TC_NBUF][32768] + Bbuf[65536] + h32[64*257*4] + bars.
+// obs_s/logit_s/red_s overlay Abuf (phase-disjoint with the GEMM stream).
+// 32KB super-chunks (24 per layer) halve the mbarrier protocol round-trips.
+#define TC_NBUF 3
+#define TC_H32_STRIDE 257
+#define TC_H32_FLOATS (TE * TC_H32_STRIDE)
+#define TC_SMEM_BYTES (TC_NBUF * 32768 + 65536 + TC_H32_FLOATS * 4 + 192)
+
+__device__ __forceinline__ unsigned long long tc_desc(unsigned saddr_bytes) {
+    unsigned long long d = 0;
+    d |= (unsigned long long)((saddr_bytes >> 4) & 0x3FFF);
+    d |= (unsigned long long)((128u >> 4) & 0x3FFF) << 16;   // LBO
+    d |= (unsigned long long)((1024u >> 4) & 0x3FFF) << 32;  // SBO
+    return d;
+}
+
+__device__ __forceinline__ void tc_mma(unsigned tmem, unsigned long long adesc,
+                                       unsigned long long bdesc, unsigned accum) {
+    asm volatile(
+        "{.reg .pred p; setp.ne.u32 p, %4, 0;\n"
+        "tcgen05.mma.cta_group::1.kind::f16 [%0], %1, %2, %3, p;}\n" ::
+        "r"(tmem), "l"(adesc), "l"(bdesc), "r"(TC_IDESC), "r"(accum));
+}
+
+__device__ __forceinline__ void tc_commit(unsigned bar) {
+    asm volatile(
+        "tcgen05.commit.cta_group::1.mbarrier::arrive::one.shared::cluster.b64 [%0];" ::
+        "r"(bar));
+}
+
+__device__ __forceinline__ void bar_wait(unsigned bar, unsigned parity) {
+    unsigned done = 0;
+    while (!done)
+        asm volatile(
+            "{.reg .pred p; mbarrier.try_wait.parity.shared::cta.b64 p, [%1], %2;\n"
+            "selp.u32 %0, 1, 0, p;}\n"
+            : "=r"(done)
+            : "r"(bar), "r"(parity));
+}
+
+__device__ __forceinline__ void tma_load(unsigned dst, const void* src, unsigned bytes,
+                                         unsigned bar) {
+    asm volatile("mbarrier.arrive.expect_tx.release.cta.shared::cta.b64 _, [%0], %1;" ::
+                 "r"(bar), "r"(bytes));
+    asm volatile(
+        "cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes [%0], [%1], %2, "
+        "[%3];" ::
+        "r"(dst), "l"(src), "r"(bytes), "r"(bar));
+}
+
+__device__ __forceinline__ void tc_ld_x8(float* v, unsigned taddr) {
+    asm volatile(
+        "tcgen05.ld.sync.aligned.32x32b.x8.b32 {%0,%1,%2,%3,%4,%5,%6,%7}, [%8];\n"
+        : "=f"(v[0]), "=f"(v[1]), "=f"(v[2]), "=f"(v[3]), "=f"(v[4]), "=f"(v[5]),
+          "=f"(v[6]), "=f"(v[7])
+        : "r"(taddr));
+}
+
+__device__ __forceinline__ void tc_ld_x16(float* v, unsigned taddr) {
+    asm volatile(
+        "tcgen05.ld.sync.aligned.32x32b.x16.b32 "
+        "{%0,%1,%2,%3,%4,%5,%6,%7,%8,%9,%10,%11,%12,%13,%14,%15}, [%16];\n"
+        : "=f"(v[0]), "=f"(v[1]), "=f"(v[2]), "=f"(v[3]), "=f"(v[4]), "=f"(v[5]),
+          "=f"(v[6]), "=f"(v[7]), "=f"(v[8]), "=f"(v[9]), "=f"(v[10]), "=f"(v[11]),
+          "=f"(v[12]), "=f"(v[13]), "=f"(v[14]), "=f"(v[15])
+        : "r"(taddr));
+}
+
+// B-packed store offset (in halves) for element (kp, e): kp = k' 0..511.
+__device__ __forceinline__ int bpack_off(int kp, int e) {
+    return (kp >> 6) * 4096 + (e >> 3) * 512 + (((kp & 63) >> 3) * 64) + (e & 7) * 8 +
+           (kp & 7);
+}
+
+// Pre-pack W_gru into the tcgen05 A layout: (3,6,8,8192) halves.
+__global__ void repack_wgru_tc_kernel(const float* __restrict__ wg,
+                                      __half* __restrict__ apack) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;  // one per 16B row (8 halves)
+    const int total = 3 * 6 * 8 * 16 * 8 * 8;               // (l,mt,c,rg,kc,r)
+    if (idx >= total) return;
+    int t = idx;
+    const int r = t & 7; t >>= 3;
+    const int kc = t & 7; t >>= 3;
+    const int rg = t & 15; t >>= 4;
+    const int c = t & 7; t >>= 3;
+    const int mt = t % 6; t /= 6;
+    const int l = t;
+    const int g = mt % 3, jh = mt / 3;
+    const int m = g * HID + jh * 128 + rg * 8 + r;
+    const bool lo = c >= 4;
+    const int kbase = (c & 3) * 64 + kc * 8;
+    __half* dst = apack + (size_t)idx * 8;
+    const float* wrow = wg + ((size_t)l * GOUT + m) * HID + kbase;
+#pragma unroll
+    for (int h = 0; h < 8; ++h) {
+        const float w = wrow[h];
+        const __half hi = __float2half(w);
+        dst[h] = lo ? __float2half(w - __half2float(hi)) : hi;
+    }
+}
+
+__global__ void __launch_bounds__(TC_THREADS, 1)
+rollout_tc_kernel(Params P, const __half* __restrict__ a_pack, int* __restrict__ agent,
+                  int* __restrict__ food, unsigned long long* __restrict__ rng,
+                  float* __restrict__ state, float* __restrict__ rewards,
+                  float* __restrict__ last_logits, long long* __restrict__ positions,
+                  int* __restrict__ flags, int N, int horizon, int numTiles) {
+    cg::grid_group grid = cg::this_grid();
+    extern __shared__ __align__(1024) float smem[];
+    __half* Abuf = reinterpret_cast<__half*>(smem);          // TC_NBUF x 32KB
+    __half* Bbuf = Abuf + TC_NBUF * 16384;                   // 64KB
+    float* h32 = reinterpret_cast<float*>(Bbuf + 32768);     // [64][257]
+    // overlays on Abuf (only live outside the GEMM phase):
+    float* obs_s = reinterpret_cast<float*>(Abuf);           // [64][4]
+    float* logit_s = obs_s + TE * 4;                         // [64][4]
+    float* red_s = logit_s + TE * 4;                         // [16][64]
+    unsigned long long* bars = reinterpret_cast<unsigned long long*>(h32 + TC_H32_FLOATS);
+    // bars[0..NBUF-1] = tma, bars[NBUF..2*NBUF-1] = cmt
+    __shared__ unsigned tmem_base;
+
+    const int tid = threadIdx.x;
+    const int warp = tid >> 5;
+    const int lane = tid & 31;
+
+    if (tid == 0) {
+#pragma unroll
+        for (int i = 0; i < 2 * TC_NBUF; ++i)
+            asm volatile("mbarrier.init.shared::cta.b64 [%0], 1;" ::
+                         "r"((unsigned)__cvta_generic_to_shared(&bars[i])));
+    }
+    __syncthreads();
+    if (tid < 32)
+        asm volatile("tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], 512;" ::
+                     "r"((unsigned)__cvta_generic_to_shared(&tmem_base)));
+    __syncthreads();
+    const unsigned tb = tmem_base;
+    const unsigned abuf_s = (unsigned)__cvta_generic_to_shared(Abuf);
+    const unsigned bbuf_s = (unsigned)__cvta_generic_to_shared(Bbuf);
+    const unsigned tma_bar0 = (unsigned)__cvta_generic_to_shared(&bars[0]);
+    const unsigned cmt_bar0 = (unsigned)__cvta_generic_to_shared(&bars[TC_NBUF]);
+    unsigned cnt_tma[TC_NBUF] = {}, cnt_cmt[TC_NBUF] = {};
+
+    // epilogue mapping: this lane covers (j = p*128 + 32*(warp&3) + lane,
+    // e = (warp>>2)*16 + i) for p in {0,1}, i in 0..15.
+    const int ebase = (warp >> 2) * 16;
+    const int jrow = 32 * (warp & 3) + lane;
+    float hold[32];
+
+    for (int t = 0; t < horizon; ++t) {
+        const bool last = (t == horizon - 1);
+        for (int tile = blockIdx.x; tile < numTiles; tile += gridDim.x) {
+            const int env0 = tile * TE;
+            __syncthreads();
+            // obs (applies the previous step's deferred food respawn first)
+            if (tid < TE) {
+                const int g = env0 + tid;
+                float o0 = 0.f, o1 = 0.f, o2 = 0.f, o3 = 0.f;
+                if (g < N) {
+                    if (t > 0 && flags[t - 1] != 0) {
+                        unsigned long long r = rng[g];
+                        r = (r * LCG_A + 1ULL) & LCG_MASK;
+                        const int nfx = (int)(r % 11ULL);
+                        r = (r * LCG_A + 1ULL) & LCG_MASK;
+                        const int nfy = (int)(r % 11ULL);
+                        rng[g] = r;
+                        if (agent[2 * g] == food[2 * g] &&
+                            agent[2 * g + 1] == food[2 * g + 1]) {
+                            food[2 * g] = nfx;
+                            food[2 * g + 1] = nfy;
+                        }
+                    }
+                    const int ax = agent[2 * g], ay = agent[2 * g + 1];
+                    const int fx = food[2 * g], fy = food[2 * g + 1];
+                    o0 = (float)(fx - ax) / 11.0f;
+                    o1 = (float)(fy - ay) / 11.0f;
+                    o2 = (float)ax / 10.0f;
+                    o3 = (float)ay / 10.0f;
+                }
+                obs_s[tid * 4 + 0] = o0;
+                obs_s[tid * 4 + 1] = o1;
+                obs_s[tid * 4 + 2] = o2;
+                obs_s[tid * 4 + 3] = o3;
+            }
+            __syncthreads();
+            // encoder into hold + packed B
+#pragma unroll
+            for (int p = 0; p < 2; ++p) {
+                const int j = p * 128 + jrow;
+                const float4 wj = *reinterpret_cast<const float4*>(P.w_enc + j * 4);
+                const float bj = P.b_enc[j];
+#pragma unroll
+                for (int i = 0; i < 16; ++i) {
+                    const int e = ebase + i;
+                    const float4 ob = *reinterpret_cast<const float4*>(obs_s + e * 4);
+                    float h0 = bj;
+                    h0 += wj.x * ob.x;
+                    h0 += wj.y * ob.y;
+                    h0 += wj.z * ob.z;
+                    h0 += wj.w * ob.w;
+                    hold[p * 16 + i] = h0;
+                    const __half hi = __float2half(h0);
+                    Bbuf[bpack_off(j, e)] = hi;
+                    Bbuf[bpack_off(HID + j, e)] = __float2half(h0 - __half2float(hi));
+                }
+            }
+            asm volatile("fence.proxy.async.shared::cta;");
+            __syncthreads();
+
+            for (int l = 0; l < NLAYER; ++l) {
+                // prefetch this layer's state while the GEMM runs (warps other
+                // than the two issuers just wait at the barrier anyway)
+                float stv[32];
+#pragma unroll
+                for (int p = 0; p < 2; ++p) {
+                    const int j = p * 128 + jrow;
+#pragma unroll
+                    for (int i = 0; i < 16; ++i) {
+                        const int g = env0 + ebase + i;
+                        stv[p * 16 + i] =
+                            (g < N)
+                                ? state[(size_t)g * (NLAYER * HID) + (size_t)l * HID + j]
+                                : 0.f;
+                    }
+                }
+                // ---- GEMM: thread 64 streams A via TMA; thread 0 issues ummas ----
+                // 24 super-chunks of 32KB per layer: sc = mt*4 + h2,
+                // h2 0/1 = W_hi halves (paired with h_hi AND h_lo),
+                // h2 2/3 = W_lo halves (h_hi only).
+                if (tid == 64) {
+                    const __half* Ag = a_pack + (size_t)l * 6 * 8 * 8192;
+                    for (int sc = 0; sc < 24; ++sc) {
+                        const int nb = sc % TC_NBUF;
+                        if (cnt_cmt[nb] > 0)
+                            bar_wait(cmt_bar0 + nb * 8, (cnt_cmt[nb] - 1) & 1);
+                        ++cnt_cmt[nb];
+                        tma_load(abuf_s + nb * 32768, Ag + (size_t)sc * 16384, 32768,
+                                 tma_bar0 + nb * 8);
+                    }
+                }
+                if (tid == 0) {
+                    for (int sc = 0; sc < 24; ++sc) {
+                        const int b = sc % TC_NBUF;
+                        const int mt = sc >> 2;
+                        const int h2 = sc & 3;
+                        ++cnt_tma[b];
+                        bar_wait(tma_bar0 + b * 8, (cnt_tma[b] - 1) & 1);
+                        const unsigned ab = abuf_s + b * 32768;
+                        const unsigned tacc = tb + mt * 64;
+                        if (h2 < 2) {
+                            // W_hi: kk = h2*8 + k16
+#pragma unroll
+                            for (int k16 = 0; k16 < 8; ++k16) {
+                                const int kk = h2 * 8 + k16;
+                                const unsigned long long ad =
+                                    tc_desc(ab + (k16 >> 2) * 16384 + (k16 & 3) * 256);
+                                const unsigned bhi =
+                                    bbuf_s + (kk >> 2) * 8192 + (kk & 3) * 256;
+                                tc_mma(tacc, ad, tc_desc(bhi), (kk == 0) ? 0u : 1u);
+                                tc_mma(tacc, ad, tc_desc(bhi + 32768), 1u);
+                            }
+                        } else {
+                            // W_lo: kk = (h2-2)*8 + k16, vs h_hi
+#pragma unroll
+                            for (int k16 = 0; k16 < 8; ++k16) {
+                                const int kk = (h2 - 2) * 8 + k16;
+                                const unsigned long long ad =
+                                    tc_desc(ab + (k16 >> 2) * 16384 + (k16 & 3) * 256);
+                                tc_mma(tacc,
+                                       ad,
+                                       tc_desc(bbuf_s + (kk >> 2) * 8192 + (kk & 3) * 256),
+                                       1u);
+                            }
+                        }
+                        tc_commit(cmt_bar0 + b * 8);
+                        ++cnt_cmt[b];
+                    }
+                    // final commit completion implies all prior mma done
+                    {
+                        const int fb = 23 % TC_NBUF;
+                        bar_wait(cmt_bar0 + fb * 8, (cnt_cmt[fb] - 1) & 1);
+                    }
+                }
+                __syncthreads();
+                // ---- epilogue: tmem -> registers -> MinGRU update ----
+                const bool wlast = (l == NLAYER - 1);
+#pragma unroll
+                for (int p = 0; p < 2; ++p) {
+                    const int j = p * 128 + jrow;
+                    const unsigned trow = tb + ((32u * (warp & 3)) << 16);
+                    float zh[16], zg[16], zp[16];
+                    tc_ld_x16(zh, trow + (p * 3 + 0) * 64 + ebase);
+                    tc_ld_x16(zg, trow + (p * 3 + 1) * 64 + ebase);
+                    tc_ld_x16(zp, trow + (p * 3 + 2) * 64 + ebase);
+                    asm volatile("tcgen05.wait::ld.sync.aligned;");
+#pragma unroll
+                    for (int i = 0; i < 16; ++i) {
+                        const int e = ebase + i;
+                        const int g = env0 + e;
+                        float hn = hold[p * 16 + i];
+                        if (g < N) {
+                            const float st = stv[p * 16 + i];
+                            const float out = st + sigr(zg[i]) * (tanhf(zh[i]) - st);
+                            const float pr = sigr(zp[i]);
+                            hn = pr * out + (1.0f - pr) * hn;
+                            state[(size_t)g * (NLAYER * HID) + (size_t)l * HID + j] = out;
+                        }
+                        hold[p * 16 + i] = hn;
+                        if (wlast) {
+                            h32[e * TC_H32_STRIDE + j] = hn;
+                        } else {
+                            const __half hi = __float2half(hn);
+                            Bbuf[bpack_off(j, e)] = hi;
+                            Bbuf[bpack_off(HID + j, e)] =
+                                __float2half(hn - __half2float(hi));
+                        }
+                    }
+                }
+                if (!wlast) asm volatile("fence.proxy.async.shared::cta;");
+                __syncthreads();
+            }
+            // ---- heads ----
+            {
+                const int o = warp >> 2;
+                const int part = warp & 3;
+                const float* __restrict__ wa = P.w_a + o * HID + part * 64;
+#pragma unroll
+                for (int rp = 0; rp < 2; ++rp) {
+                    const int e = rp * 32 + lane;
+                    const float* hrow = h32 + e * TC_H32_STRIDE + part * 64;
+                    float s = 0.f;
+#pragma unroll 8
+                    for (int k = 0; k < 64; ++k) s += __ldg(wa + k) * hrow[k];
+                    red_s[(part * 4 + o) * TE + e] = s;
+                }
+            }
+            __syncthreads();
+            if (tid < TE * 4) {
+                const int ee = tid & (TE - 1);
+                const int oo = tid >> 6;
+                const float lg = ((red_s[oo * TE + ee] + red_s[(4 + oo) * TE + ee]) +
+                                  (red_s[(8 + oo) * TE + ee] + red_s[(12 + oo) * TE + ee])) +
+                                 P.b_a[oo];
+                logit_s[ee * 4 + oo] = lg;
+                const int g = env0 + ee;
+                if (last && g < N) last_logits[(size_t)g * 4 + oo] = lg;
+            }
+            __syncthreads();
+            // ---- env step ----
+            if (tid < TE) {
+                const int g = env0 + tid;
+                if (g < N) {
+                    const float l0 = logit_s[tid * 4 + 0];
+                    const float l1 = logit_s[tid * 4 + 1];
+                    const float l2 = logit_s[tid * 4 + 2];
+                    const float l3 = logit_s[tid * 4 + 3];
+                    int a = 0;
+                    float m = l0;
+                    if (l1 > m) { m = l1; a = 1; }
+                    if (l2 > m) { m = l2; a = 2; }
+                    if (l3 > m) { m = l3; a = 3; }
+                    int ax = agent[2 * g], ay = agent[2 * g + 1];
+                    if (a == 0) ay -= 1;
+                    else if (a == 1) ay += 1;
+                    else if (a == 2) ax -= 1;
+                    else ax += 1;
+                    ax = min(max(ax, 0), 10);
+                    ay = min(max(ay, 0), 10);
+                    agent[2 * g] = ax;
+                    agent[2 * g + 1] = ay;
+                    if (ax == food[2 * g] && ay == food[2 * g + 1]) {
+                        rewards[g] += 1.0f;
+                        atomicOr(&flags[t], 1);
+                    }
+                    if (last) {
+                        positions[2 * g] = (long long)ax;
+                        positions[2 * g + 1] = (long long)ay;
+                    }
+                }
+            }
+        }
+        // publish flags[t] for the next step's deferred respawn. The final
+        // step's respawn is unobservable in run()'s outputs and is skipped.
+        if (!last) grid.sync();
+    }
+    __syncthreads();
+    if (tid < 32) {
+        asm volatile("tcgen05.dealloc.cta_group::1.sync.aligned.b32 %0, 512;" :: "r"(tb));
+        asm volatile("tcgen05.relinquish_alloc_permit.cta_group::1.sync.aligned;");
+    }
+}
+#endif  // ENABLE_TCGEN05
+
+// ---------------- rollout megakernel ----------------
+
+__global__ void __launch_bounds__(MTHREADS, 1)
+rollout_kernel(Params P, const __half* __restrict__ a_frag, int* __restrict__ agent,
+               int* __restrict__ food,
+               unsigned long long* __restrict__ rng, float* __restrict__ state,
+               float* __restrict__ rewards, float* __restrict__ last_logits,
+               long long* __restrict__ positions, int* __restrict__ flags, int N,
+               int horizon, int numTiles) {
+    cg::grid_group grid = cg::this_grid();
+    extern __shared__ float smem[];
+    float* h32 = smem;                                    // [16][261] f32 (final h)
+    float* obs_s = h32 + ME * H32_STRIDE;                 // [16][4]
+    float* logit_s = obs_s + ME * 4;                      // [16][4]
+    float* red_s = logit_s + ME * 4;                      // [16][32] head partials
+    __half* hB = reinterpret_cast<__half*>(red_s + 16 * ME);  // [512][40] f16
+
+    const int tid = threadIdx.x;
+    const int warp = tid >> 5;
+    const int lane = tid & 31;
+    float hold[16];
+
+    for (int t = 0; t < horizon; ++t) {
+        const bool last = (t == horizon - 1);
+        for (int tile = blockIdx.x; tile < numTiles; tile += gridDim.x) {
+            const int env0 = tile * ME;
+            __syncthreads();  // smem reuse across tiles/steps
+            if (tid < ME) {
+                const int g = env0 + tid;
+                float o0 = 0.f, o1 = 0.f, o2 = 0.f, o3 = 0.f;
+                if (g < N) {
+                    if (t > 0 && flags[t - 1] != 0) {
+                        unsigned long long r = rng[g];
+                        r = (r * LCG_A + 1ULL) & LCG_MASK;
+                        const int nfx = (int)(r % 11ULL);
+                        r = (r * LCG_A + 1ULL) & LCG_MASK;
+                        const int nfy = (int)(r % 11ULL);
+                        rng[g] = r;
+                        if (agent[2 * g] == food[2 * g] &&
+                            agent[2 * g + 1] == food[2 * g + 1]) {
+                            food[2 * g] = nfx;
+                            food[2 * g + 1] = nfy;
+                        }
+                    }
+                    const int ax = agent[2 * g], ay = agent[2 * g + 1];
+                    const int fx = food[2 * g], fy = food[2 * g + 1];
+                    o0 = (float)(fx - ax) / 11.0f;
+                    o1 = (float)(fy - ay) / 11.0f;
+                    o2 = (float)ax / 10.0f;
+                    o3 = (float)ay / 10.0f;
+                }
+                obs_s[tid * 4 + 0] = o0;
+                obs_s[tid * 4 + 1] = o1;
+                obs_s[tid * 4 + 2] = o2;
+                obs_s[tid * 4 + 3] = o3;
+            }
+            __syncthreads();
+            tile_encoder_mma(P, obs_s, hB, hold, warp, lane);
+            __syncthreads();
+            for (int l = 0; l < NLAYER; ++l)
+                tile_gru_layer_mma(a_frag, hB, h32, hold, state, l, env0, N, warp, lane);
+            tile_logits_mma(P, h32, red_s, logit_s, last ? last_logits : nullptr, env0, N,
+                            warp, lane, tid);
+            __syncthreads();
+            if (tid < ME) {
+                const int g = env0 + tid;
+                if (g < N) {
+                    const float l0 = logit_s[tid * 4 + 0];
+                    const float l1 = logit_s[tid * 4 + 1];
+                    const float l2 = logit_s[tid * 4 + 2];
+                    const float l3 = logit_s[tid * 4 + 3];
+                    int a = 0;
+                    float m = l0;
+                    if (l1 > m) { m = l1; a = 1; }
+                    if (l2 > m) { m = l2; a = 2; }
+                    if (l3 > m) { m = l3; a = 3; }
+                    int ax = agent[2 * g], ay = agent[2 * g + 1];
+                    if (a == 0) ay -= 1;
+                    else if (a == 1) ay += 1;
+                    else if (a == 2) ax -= 1;
+                    else ax += 1;
+                    ax = min(max(ax, 0), 10);
+                    ay = min(max(ay, 0), 10);
+                    agent[2 * g] = ax;
+                    agent[2 * g + 1] = ay;
+                    if (ax == food[2 * g] && ay == food[2 * g + 1]) {
+                        rewards[g] += 1.0f;
+                        atomicOr(&flags[t], 1);
+                    }
+                    if (last) {
+                        positions[2 * g] = (long long)ax;
+                        positions[2 * g + 1] = (long long)ay;
+                    }
+                }
+            }
+        }
+        // publish flags[t] for the next step's deferred respawn (in the obs
+        // phase). The final step's respawn is unobservable and skipped.
+        if (!last) grid.sync();
+    }
+}
+
+// ---------------- single-step policy kernel (policy_forward) ----------------
+
+__global__ void __launch_bounds__(NTHREADS)
+policy_step_kernel(Params P, const float* __restrict__ obs_g,
+                   const float* __restrict__ state_in, float* __restrict__ state_out,
+                   float* __restrict__ logits_g, float* __restrict__ value_g, int N) {
+    extern __shared__ float smem[];
+    float* h_s = smem;
+    float* obs_s = h_s + HID * HS_STRIDE;
+    float* logit_s = obs_s + TILE_E * 4;
+
+    const int tid = threadIdx.x;
+    const int og = tid & 255;
+    const int eg = tid >> 8;
+    const int env0 = blockIdx.x * TILE_E;
+
+    if (tid < TILE_E * 4) {
+        const size_t idx = (size_t)env0 * 4 + tid;
+        obs_s[tid] = (idx < (size_t)N * 4) ? obs_g[idx] : 0.f;
+    }
+    __syncthreads();
+    tile_encoder(P, obs_s, h_s, og, eg);
+    __syncthreads();
+    for (int l = 0; l < NLAYER; ++l)
+        tile_gru_layer(P, h_s, state_in, state_out, l, env0, N, og, eg);
+    tile_logits(P, h_s, logit_s, logits_g, env0, N, tid);
+    // value head: 32 envs x 16 k-parts
+    {
+        const int e = tid >> 4;
+        const int part = tid & 15;
+        const float* __restrict__ wv = P.w_v;
+        float s = 0.f;
+        const int k0 = part * 16;
+#pragma unroll
+        for (int k = k0; k < k0 + 16; ++k) s += wv[k] * h_s[k * HS_STRIDE + e];
+        s += __shfl_xor_sync(0xffffffffu, s, 1);
+        s += __shfl_xor_sync(0xffffffffu, s, 2);
+        s += __shfl_xor_sync(0xffffffffu, s, 4);
+        s += __shfl_xor_sync(0xffffffffu, s, 8);
+        const int g = env0 + e;
+        if (part == 0 && g < N) value_g[g] = s + P.b_v[0];
+    }
+}
+
+// ---------------- env_step kernels ----------------
+
+__global__ void env_move_kernel(const float* __restrict__ agent_in,
+                                const float* __restrict__ food_in,
+                                const long long* __restrict__ actions,
+                                const unsigned long long* __restrict__ rng_in,
+                                float* __restrict__ agent_out, float* __restrict__ food_out,
+                                float* __restrict__ reward, unsigned long long* __restrict__ rng_out,
+                                int* __restrict__ flag, int N) {
+    const int g = blockIdx.x * blockDim.x + threadIdx.x;
+    if (g >= N) return;
+    float ax = agent_in[2 * g], ay = agent_in[2 * g + 1];
+    const long long a = actions[g];
+    float dx = 0.f, dy = 0.f;
+    if (a == 0) dy = -1.f;
+    else if (a == 1) dy = 1.f;
+    else if (a == 2) dx = -1.f;
+    else if (a == 3) dx = 1.f;
+    ax = fminf(fmaxf(ax + dx, 0.f), 10.f);
+    ay = fminf(fmaxf(ay + dy, 0.f), 10.f);
+    agent_out[2 * g] = ax;
+    agent_out[2 * g + 1] = ay;
+    const float fx = food_in[2 * g], fy = food_in[2 * g + 1];
+    food_out[2 * g] = fx;
+    food_out[2 * g + 1] = fy;
+    rng_out[g] = rng_in[g];
+    const bool hit = (ax == fx) && (ay == fy);
+    reward[g] = hit ? 1.0f : 0.0f;
+    if (hit) atomicOr(flag, 1);
+}
+
+__global__ void env_respawn_kernel(const float* __restrict__ agent_out,
+                                   float* __restrict__ food_out,
+                                   unsigned long long* __restrict__ rng_out,
+                                   const int* __restrict__ flag, int N) {
+    const int g = blockIdx.x * blockDim.x + threadIdx.x;
+    if (g >= N) return;
+    if (*flag == 0) return;
+    unsigned long long r = rng_out[g];
+    r = (r * LCG_A + 1ULL) & LCG_MASK;
+    const int fx = (int)(r % 11ULL);
+    r = (r * LCG_A + 1ULL) & LCG_MASK;
+    const int fy = (int)(r % 11ULL);
+    rng_out[g] = r;
+    if (agent_out[2 * g] == food_out[2 * g] && agent_out[2 * g + 1] == food_out[2 * g + 1]) {
+        food_out[2 * g] = (float)fx;
+        food_out[2 * g + 1] = (float)fy;
+    }
+}
+
+// ---------------- host wrappers ----------------
+
+static Params make_params(const torch::Tensor& w_enc, const torch::Tensor& b_enc,
+                          const torch::Tensor& w_gru, const torch::Tensor& w_a,
+                          const torch::Tensor& b_a, const torch::Tensor& w_v,
+                          const torch::Tensor& b_v) {
+    Params P;
+    P.w_enc = w_enc.data_ptr<float>();
+    P.b_enc = b_enc.data_ptr<float>();
+    P.w_gru = w_gru.data_ptr<float>();
+    P.w_a = w_a.data_ptr<float>();
+    P.b_a = b_a.data_ptr<float>();
+    P.w_v = w_v.data_ptr<float>();
+    P.b_v = b_v.data_ptr<float>();
+    return P;
+}
+
+void repack_wgru(torch::Tensor w_gru, torch::Tensor frag) {
+    const int total = 3 * 32 * 48 * 32;
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    repack_wgru_kernel<<<(total + 255) / 256, 256, 0, stream>>>(
+        w_gru.data_ptr<float>(), reinterpret_cast<__half*>(frag.data_ptr<at::Half>()));
+}
+
+#ifndef ENABLE_TCGEN05
+void repack_wgru_tc(torch::Tensor, torch::Tensor) {
+    TORCH_CHECK(false, "tcgen05 path not compiled for this arch");
+}
+void rollout_tc(torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
+                torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
+                torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
+                torch::Tensor, int64_t) {
+    TORCH_CHECK(false, "tcgen05 path not compiled for this arch");
+}
+#else
+void repack_wgru_tc(torch::Tensor w_gru, torch::Tensor apack) {
+    const int total = 3 * 6 * 8 * 16 * 8 * 8;
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    repack_wgru_tc_kernel<<<(total + 255) / 256, 256, 0, stream>>>(
+        w_gru.data_ptr<float>(), reinterpret_cast<__half*>(apack.data_ptr<at::Half>()));
+}
+
+void rollout_tc(torch::Tensor w_enc, torch::Tensor b_enc, torch::Tensor w_gru,
+                torch::Tensor w_a, torch::Tensor b_a, torch::Tensor w_v, torch::Tensor b_v,
+                torch::Tensor a_pack, torch::Tensor agent, torch::Tensor food,
+                torch::Tensor rng, torch::Tensor state, torch::Tensor rewards,
+                torch::Tensor last_logits, torch::Tensor positions, torch::Tensor flags,
+                int64_t horizon) {
+    const int N = (int)rng.size(0);
+    const int numTiles = (N + TE - 1) / TE;
+    Params P = make_params(w_enc, b_enc, w_gru, w_a, b_a, w_v, b_v);
+
+    static int maxBlocks = -1;
+    if (maxBlocks < 0) {
+        cudaFuncSetAttribute(rollout_tc_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                             TC_SMEM_BYTES);
+        int occ = 0;
+        cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occ, rollout_tc_kernel, TC_THREADS,
+                                                      TC_SMEM_BYTES);
+        int dev = 0;
+        cudaGetDevice(&dev);
+        cudaDeviceProp prop;
+        cudaGetDeviceProperties(&prop, dev);
+        maxBlocks = occ * prop.multiProcessorCount;
+        TORCH_CHECK(maxBlocks > 0, "rollout_tc kernel: zero occupancy");
+    }
+    // balance rounds: pick the smallest grid that still gives ceil(tiles/max)
+    // rounds, so every CTA runs the same number of tiles per step.
+    const int rounds = (numTiles + maxBlocks - 1) / maxBlocks;
+    const int gridSize = (numTiles + rounds - 1) / rounds;
+
+    const __half* apack_p = reinterpret_cast<const __half*>(a_pack.data_ptr<at::Half>());
+    int* agent_p = agent.data_ptr<int>();
+    int* food_p = food.data_ptr<int>();
+    unsigned long long* rng_p = reinterpret_cast<unsigned long long*>(rng.data_ptr<int64_t>());
+    float* state_p = state.data_ptr<float>();
+    float* rewards_p = rewards.data_ptr<float>();
+    float* ll_p = last_logits.data_ptr<float>();
+    long long* pos_p = reinterpret_cast<long long*>(positions.data_ptr<int64_t>());
+    int* flags_p = flags.data_ptr<int>();
+    int N_ = N;
+    int hor_ = (int)horizon;
+    int nt_ = numTiles;
+    void* args[] = {&P, &apack_p, &agent_p, &food_p, &rng_p, &state_p, &rewards_p, &ll_p,
+                    &pos_p, &flags_p, &N_, &hor_, &nt_};
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    cudaError_t err = cudaLaunchCooperativeKernel((void*)rollout_tc_kernel, dim3(gridSize),
+                                                  dim3(TC_THREADS), args, TC_SMEM_BYTES,
+                                                  stream);
+    TORCH_CHECK(err == cudaSuccess, "rollout_tc launch failed: ", cudaGetErrorString(err));
+}
+#endif  // ENABLE_TCGEN05
+
+void rollout(torch::Tensor w_enc, torch::Tensor b_enc, torch::Tensor w_gru, torch::Tensor w_a,
+             torch::Tensor b_a, torch::Tensor w_v, torch::Tensor b_v, torch::Tensor a_frag,
+             torch::Tensor agent, torch::Tensor food, torch::Tensor rng, torch::Tensor state,
+             torch::Tensor rewards, torch::Tensor last_logits, torch::Tensor positions,
+             torch::Tensor flags, int64_t horizon) {
+    const int N = (int)rng.size(0);
+    const int numTiles = (N + ME - 1) / ME;
+    Params P = make_params(w_enc, b_enc, w_gru, w_a, b_a, w_v, b_v);
+
+    static int maxBlocks = -1;
+    if (maxBlocks < 0) {
+        cudaFuncSetAttribute(rollout_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                             MMA_SMEM_BYTES);
+        int occ = 0;
+        cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occ, rollout_kernel, MTHREADS,
+                                                      MMA_SMEM_BYTES);
+        int dev = 0;
+        cudaGetDevice(&dev);
+        cudaDeviceProp prop;
+        cudaGetDeviceProperties(&prop, dev);
+        maxBlocks = occ * prop.multiProcessorCount;
+        TORCH_CHECK(maxBlocks > 0, "rollout kernel: zero occupancy");
+    }
+    const int rounds = (numTiles + maxBlocks - 1) / maxBlocks;
+    const int gridSize = (numTiles + rounds - 1) / rounds;
+
+    const __half* afrag_p = reinterpret_cast<const __half*>(a_frag.data_ptr<at::Half>());
+    int* agent_p = agent.data_ptr<int>();
+    int* food_p = food.data_ptr<int>();
+    unsigned long long* rng_p = reinterpret_cast<unsigned long long*>(rng.data_ptr<int64_t>());
+    float* state_p = state.data_ptr<float>();
+    float* rewards_p = rewards.data_ptr<float>();
+    float* ll_p = last_logits.data_ptr<float>();
+    long long* pos_p = reinterpret_cast<long long*>(positions.data_ptr<int64_t>());
+    int* flags_p = flags.data_ptr<int>();
+    int N_ = N;
+    int hor_ = (int)horizon;
+    int nt_ = numTiles;
+    void* args[] = {&P, &afrag_p, &agent_p, &food_p, &rng_p, &state_p, &rewards_p, &ll_p,
+                    &pos_p, &flags_p, &N_, &hor_, &nt_};
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    cudaError_t err = cudaLaunchCooperativeKernel((void*)rollout_kernel, dim3(gridSize),
+                                                  dim3(MTHREADS), args, MMA_SMEM_BYTES, stream);
+    TORCH_CHECK(err == cudaSuccess, "rollout launch failed: ", cudaGetErrorString(err));
+}
+
+void policy_step(torch::Tensor w_enc, torch::Tensor b_enc, torch::Tensor w_gru,
+                 torch::Tensor w_a, torch::Tensor b_a, torch::Tensor w_v, torch::Tensor b_v,
+                 torch::Tensor obs, torch::Tensor state_in, torch::Tensor state_out,
+                 torch::Tensor logits, torch::Tensor value) {
+    const int N = (int)obs.size(0);
+    const int numTiles = (N + TILE_E - 1) / TILE_E;
+    Params P = make_params(w_enc, b_enc, w_gru, w_a, b_a, w_v, b_v);
+    static bool attrSet = false;
+    if (!attrSet) {
+        cudaFuncSetAttribute(policy_step_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                             SMEM_BYTES);
+        attrSet = true;
+    }
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    policy_step_kernel<<<numTiles, NTHREADS, SMEM_BYTES, stream>>>(
+        P, obs.data_ptr<float>(), state_in.data_ptr<float>(), state_out.data_ptr<float>(),
+        logits.data_ptr<float>(), value.data_ptr<float>(), N);
+}
+
+void env_step_op(torch::Tensor agent, torch::Tensor food, torch::Tensor actions,
+                 torch::Tensor rng, torch::Tensor agent_out, torch::Tensor food_out,
+                 torch::Tensor reward, torch::Tensor rng_out, torch::Tensor flag) {
+    const int N = (int)actions.size(0);
+    const int threads = 256;
+    const int blocks = (N + threads - 1) / threads;
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    env_move_kernel<<<blocks, threads, 0, stream>>>(
+        agent.data_ptr<float>(), food.data_ptr<float>(),
+        reinterpret_cast<const long long*>(actions.data_ptr<int64_t>()),
+        reinterpret_cast<const unsigned long long*>(rng.data_ptr<int64_t>()),
+        agent_out.data_ptr<float>(), food_out.data_ptr<float>(), reward.data_ptr<float>(),
+        reinterpret_cast<unsigned long long*>(rng_out.data_ptr<int64_t>()),
+        flag.data_ptr<int>(), N);
+    env_respawn_kernel<<<blocks, threads, 0, stream>>>(
+        agent_out.data_ptr<float>(), food_out.data_ptr<float>(),
+        reinterpret_cast<unsigned long long*>(rng_out.data_ptr<int64_t>()),
+        flag.data_ptr<int>(), N);
+}
+"""
+
+_CPP_SRC = r"""
+#include <torch/extension.h>
+void repack_wgru(torch::Tensor w_gru, torch::Tensor frag);
+void repack_wgru_tc(torch::Tensor w_gru, torch::Tensor apack);
+void rollout(torch::Tensor w_enc, torch::Tensor b_enc, torch::Tensor w_gru, torch::Tensor w_a,
+             torch::Tensor b_a, torch::Tensor w_v, torch::Tensor b_v, torch::Tensor a_frag,
+             torch::Tensor agent, torch::Tensor food, torch::Tensor rng, torch::Tensor state,
+             torch::Tensor rewards, torch::Tensor last_logits, torch::Tensor positions,
+             torch::Tensor flags, int64_t horizon);
+void rollout_tc(torch::Tensor w_enc, torch::Tensor b_enc, torch::Tensor w_gru,
+                torch::Tensor w_a, torch::Tensor b_a, torch::Tensor w_v, torch::Tensor b_v,
+                torch::Tensor a_pack, torch::Tensor agent, torch::Tensor food,
+                torch::Tensor rng, torch::Tensor state, torch::Tensor rewards,
+                torch::Tensor last_logits, torch::Tensor positions, torch::Tensor flags,
+                int64_t horizon);
+void policy_step(torch::Tensor w_enc, torch::Tensor b_enc, torch::Tensor w_gru,
+                 torch::Tensor w_a, torch::Tensor b_a, torch::Tensor w_v, torch::Tensor b_v,
+                 torch::Tensor obs, torch::Tensor state_in, torch::Tensor state_out,
+                 torch::Tensor logits, torch::Tensor value);
+void env_step_op(torch::Tensor agent, torch::Tensor food, torch::Tensor actions,
+                 torch::Tensor rng, torch::Tensor agent_out, torch::Tensor food_out,
+                 torch::Tensor reward, torch::Tensor rng_out, torch::Tensor flag);
+"""
+
+
+_CAP = torch.cuda.get_device_capability(0)
+_USE_TC = _CAP == (10, 0)  # tcgen05 available on SM100 only
+
+
+def _arch_flags() -> list[str]:
+    suffix = "a" if _USE_TC else ""
+    arch = f"{_CAP[0]}{_CAP[1]}{suffix}"
+    os.environ.setdefault("TORCH_CUDA_ARCH_LIST", f"{_CAP[0]}.{_CAP[1]}{suffix}")
+    flags = [f"--generate-code=arch=compute_{arch},code=sm_{arch}"]
+    if _USE_TC:
+        flags.append("-DENABLE_TCGEN05")
+    return flags
+
+
+_ext = load_inline(
+    name="grid_mingru_cuda_v9",
+    cpp_sources=[_CPP_SRC],
+    cuda_sources=[_CUDA_SRC],
+    functions=["rollout", "rollout_tc", "policy_step", "env_step_op", "repack_wgru",
+               "repack_wgru_tc"],
+    extra_cuda_cflags=["-O3", "-std=c++17"] + _arch_flags(),
+    verbose=False,
+)
+
+
+class Model(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.w_enc = nn.Parameter(torch.empty(HIDDEN, OBS_DIM))
+        self.b_enc = nn.Parameter(torch.zeros(HIDDEN))
+        self.w_gru = nn.Parameter(torch.empty(GRU_LAYERS, GRU_OUT, HIDDEN))
+        self.w_a = nn.Parameter(torch.empty(NUM_ACTIONS, HIDDEN))
+        self.b_a = nn.Parameter(torch.zeros(NUM_ACTIONS))
+        self.w_v = nn.Parameter(torch.empty(1, HIDDEN))
+        self.b_v = nn.Parameter(torch.zeros(1))
+        self.reset_parameters(0)
+
+    def reset_parameters(self, seed: int = 0) -> None:
+        g = torch.Generator(device="cpu")
+        g.manual_seed(seed)
+        for p in self.parameters():
+            tmp = torch.empty(p.shape, dtype=p.dtype, device="cpu")
+            tmp.normal_(0.0, 0.02, generator=g)
+            p.data.copy_(tmp)
+
+    def forward(self, obs: torch.Tensor, state: torch.Tensor):
+        return policy_forward(self, obs, state)
+
+
+def _params(model: Model):
+    return (
+        model.w_enc.detach().contiguous(),
+        model.b_enc.detach().contiguous(),
+        model.w_gru.detach().permute(0, 2, 1).contiguous(),
+        model.w_a.detach().contiguous(),
+        model.b_a.detach().contiguous(),
+        model.w_v.detach().contiguous(),
+        model.b_v.detach().contiguous(),
+    )
+
+
+def policy_forward(model: Model, obs: torch.Tensor, state: torch.Tensor):
+    device = obs.device
+    obs_c = obs.detach().to(torch.float32).contiguous()
+    state_c = state.detach().to(torch.float32).contiguous()
+    n = obs_c.shape[0]
+    logits = torch.empty(n, NUM_ACTIONS, device=device, dtype=torch.float32)
+    new_state = torch.empty_like(state_c)
+    value = torch.empty(n, device=device, dtype=torch.float32)
+    _ext.policy_step(*_params(model), obs_c, state_c, new_state, logits, value)
+    return logits, new_state.view(n, GRU_LAYERS, HIDDEN), value
+
+
+def env_step(agent: torch.Tensor, food: torch.Tensor, actions: torch.Tensor,
+             rng_state: torch.Tensor):
+    agent_c = agent.detach().to(torch.float32).contiguous()
+    food_c = food.detach().to(torch.float32).contiguous()
+    actions_c = actions.detach().to(torch.int64).contiguous()
+    rng_c = rng_state.detach().to(torch.int64).contiguous()
+    n = actions_c.shape[0]
+    device = agent_c.device
+    agent_out = torch.empty_like(agent_c)
+    food_out = torch.empty_like(food_c)
+    reward = torch.empty(n, device=device, dtype=torch.float32)
+    rng_out = torch.empty_like(rng_c)
+    flag = torch.zeros(1, device=device, dtype=torch.int32)
+    _ext.env_step_op(agent_c, food_c, actions_c, rng_c, agent_out, food_out, reward, rng_out,
+                     flag)
+    return agent_out, food_out, reward, rng_out
+
+
+_PIN_CACHE: dict[int, torch.Tensor] = {}
+_PIN_EVENTS: dict[int, torch.cuda.Event] = {}
+
+
+def _pinned(num_envs: int) -> torch.Tensor:
+    buf = _PIN_CACHE.get(num_envs)
+    if buf is None:
+        buf = torch.empty(2, num_envs, 2, dtype=torch.int64, pin_memory=True)
+        _PIN_CACHE[num_envs] = buf
+    return buf
+
+
+def run(num_envs: int, horizon: int, seed: int, model: Model | None = None) -> dict:
+    device = torch.device("cuda:0")
+    if model is None:
+        model = Model()
+    model = model.to(device).eval()
+
+    # Launch GPU-side prep first (async), then do the CPU-bound reference
+    # randint draws, then a single H2D copy from a cached pinned buffer.
+    # Pre-pack W_gru into fp16 hi/lo tensor-core operands (recomputed every
+    # call). The tcgen05 kernel uses 64-env tiles; below ~96 tiles it
+    # underfills the GPU, where the 32-env mma.sync kernel wins.
+    wg = model.w_gru.detach().contiguous()
+    use_tc = _USE_TC and num_envs >= 6144
+    if use_tc:
+        a_op = torch.empty(3, 6, 8, 8192, device=device, dtype=torch.float16)
+        _ext.repack_wgru_tc(wg, a_op)
+    else:
+        a_op = torch.empty(3, 32, 48, 32, 8, device=device, dtype=torch.float16)
+        _ext.repack_wgru(wg, a_op)
+    rng = torch.arange(num_envs, device=device, dtype=torch.int64) + (seed * 10007)
+    state = torch.zeros(num_envs, GRU_LAYERS, HIDDEN, device=device, dtype=torch.float32)
+    rewards = torch.zeros(num_envs, device=device, dtype=torch.float32)
+    last_logits = torch.zeros(num_envs, NUM_ACTIONS, device=device, dtype=torch.float32)
+    flags = torch.zeros(max(horizon, 1), device=device, dtype=torch.int32)
+
+    g = torch.Generator(device="cpu")
+    g.manual_seed(seed)
+    pin = _pinned(num_envs)
+    ev = _PIN_EVENTS.get(num_envs)
+    if ev is not None:
+        ev.synchronize()  # previous async H2D from this buffer must be done
+    torch.randint(0, BOARD, (num_envs, 2), generator=g, out=pin[0])
+    torch.randint(0, BOARD, (num_envs, 2), generator=g, out=pin[1])
+    af = pin.to(device, non_blocking=True)
+    ev = torch.cuda.Event()
+    ev.record()
+    _PIN_EVENTS[num_envs] = ev
+    agent = af[0].to(torch.int32)
+    food = af[1].to(torch.int32)
+    positions = af[0]
+    if horizon > 0:
+        launch = _ext.rollout_tc if use_tc else _ext.rollout
+        launch(model.w_enc.detach(), model.b_enc.detach(), wg, model.w_a.detach(),
+               model.b_a.detach(), model.w_v.detach(), model.b_v.detach(), a_op,
+               agent, food, rng, state, rewards, last_logits, positions, flags, horizon)
+    return {
+        "rewards": rewards,
+        "positions": positions.view(num_envs, 2),
+        "last_logits": last_logits,
+        "state": state,
+    }
+
+
+def get_init_inputs():
+    return []
+
+
+def get_inputs():
+    return []

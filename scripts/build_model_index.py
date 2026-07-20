@@ -634,6 +634,10 @@ def main() -> None:
     cuda_board = REPO / "benchmarks/cuda/results/leaderboard.json"
     if cuda_board.exists():
         load_site_board(models, "cuda", cuda_board, None)
+    for gpu_key in ("h100", "b200", "rtx3090"):
+        p = REPO / f"benchmarks/cuda/results/leaderboard.{gpu_key}.json"
+        if p.exists():
+            load_site_board(models, "cuda", p, gpu_key)
     load_mega(models, REPO / "public/data/mega/results.csv")
     load_legacy_v1(models, REPO / "benchmarks/hard/results/leaderboard_v1.json")
 

@@ -1,0 +1,425 @@
+"""GLM-5.2-class fused MoE, custom CUDA (cp.async WMMA grouped GEMM) for B200/SM100.
+
+Pipeline (all custom kernels, no library GEMM):
+  1. route: histogram expert_ids -> per-expert counts, prefix-sum offsets,
+     scatter (token,weight) into expert-sorted order, build an M-tile schedule.
+     The shared expert(s) are appended as extra "groups" (all T tokens, w=1).
+  2. gemm1: grouped GEMM  x @ w1[e].T  producing gate|up, fused SiLU*up -> h.
+  3. gemm2: grouped GEMM  h @ w2[e].T  -> y, scaled by the routing weight and
+     scatter-added (atomic, fp32) into the output accumulator.
+  4. finalize: fp32 accumulator -> bf16.
+
+Weights match the reference layout exactly (state_dict-compatible):
+  w1_routed (E,2I,H)  w2_routed (E,H,I)  w1_shared (n_shared,2I,H)  w2_shared (n_shared,H,I)
+"""
+from __future__ import annotations
+
+import os
+
+os.environ.setdefault("CUDA_HOME", "/usr/local/cuda-12.8")
+os.environ["PATH"] = "/usr/local/cuda-12.8/bin:" + os.environ.get("PATH", "")
+
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+_CUDA = r"""
+#include <torch/extension.h>
+#include <ATen/cuda/CUDAContext.h>
+#include <cuda_bf16.h>
+#include <cuda_pipeline.h>
+#include <mma.h>
+
+using namespace nvcuda;
+typedef __nv_bfloat16 bf16;
+
+#define BM 64
+#define BN 64
+#define BK 32
+#define PAD 8
+#define LDK (BK+PAD)
+#define NTHREADS 256
+#define MINBLK 4
+
+__device__ __forceinline__ float siluf(float x){ return x / (1.0f + __expf(-x)); }
+
+// ---------------- routing ----------------
+__global__ void hist_kernel(const long* __restrict__ eid, int n, int* __restrict__ counts){
+    int a = blockIdx.x*blockDim.x + threadIdx.x;
+    if(a < n){ atomicAdd(&counts[(int)eid[a]], 1); }
+}
+
+__global__ void prefix_schedule_kernel(
+        int* __restrict__ counts, int* __restrict__ offsets,
+        int* __restrict__ mtile_expert, int* __restrict__ mtile_row0, int* __restrict__ mtile_nrows,
+        int* __restrict__ num_mtiles, int E, int n_shared, int T, int G){
+    if(threadIdx.x==0){
+        for(int s=0;s<n_shared;s++) counts[E+s]=T;
+        int acc=0;
+        for(int g=0; g<G; g++){ offsets[g]=acc; acc+=counts[g]; }
+        offsets[G]=acc;
+        int nt=0;
+        for(int g=0; g<G; g++){
+            int c=counts[g];
+            int ntiles=(c+BM-1)/BM;
+            for(int j=0;j<ntiles;j++){
+                mtile_expert[nt]=g;
+                mtile_row0[nt]=offsets[g]+j*BM;
+                int nr=c-j*BM; if(nr>BM) nr=BM;
+                mtile_nrows[nt]=nr;
+                nt++;
+            }
+        }
+        num_mtiles[0]=nt;
+    }
+}
+
+__global__ void scatter_routed_kernel(
+        const long* __restrict__ eid, const bf16* __restrict__ ew, int n, int top_k,
+        const int* __restrict__ offsets, int* __restrict__ fillc,
+        int* __restrict__ sorted_token, float* __restrict__ sorted_weight,
+        int* __restrict__ row_expert){
+    int a = blockIdx.x*blockDim.x + threadIdx.x;
+    if(a < n){
+        int e=(int)eid[a];
+        int pos = offsets[e] + atomicAdd(&fillc[e], 1);
+        sorted_token[pos] = a / top_k;
+        sorted_weight[pos] = __bfloat162float(ew[a]);
+        row_expert[pos] = e;
+    }
+}
+
+__global__ void scatter_shared_kernel(
+        int E, int n_shared, int T, const int* __restrict__ offsets,
+        int* __restrict__ sorted_token, float* __restrict__ sorted_weight,
+        int* __restrict__ row_expert){
+    int idx = blockIdx.x*blockDim.x + threadIdx.x;
+    if(idx < n_shared*T){
+        int s=idx/T, t=idx%T;
+        int pos = offsets[E+s] + t;
+        sorted_token[pos]=t;
+        sorted_weight[pos]=1.0f;
+        row_expert[pos]=E+s;
+    }
+}
+
+// ---------------- decode (small T): warp per output, GEMV-style, high parallelism ----------------
+__global__ void decode_gemm1_kernel(
+        const bf16* __restrict__ x, const bf16* __restrict__ w1r, const bf16* __restrict__ w1s,
+        const int* __restrict__ sorted_token, const int* __restrict__ row_expert,
+        bf16* __restrict__ h_buf, int R, int E, int H, int I){
+    int gw = blockIdx.x*(NTHREADS/32) + (threadIdx.x>>5);
+    if(gw >= R*I) return;
+    int r=gw/I, i=gw%I, lane=threadIdx.x&31;
+    int e=row_expert[r];
+    const bf16* w1 = (e<E) ? (w1r + (size_t)e*(2*(size_t)I)*H) : (w1s + (size_t)(e-E)*(2*(size_t)I)*H);
+    const bf16* xr = x + (size_t)sorted_token[r]*H;
+    const bf16* wg = w1 + (size_t)i*H;
+    const bf16* wu = w1 + (size_t)(I+i)*H;
+    float gate=0.f, up=0.f;
+    for(int k=lane;k<H;k+=32){ float xv=__bfloat162float(xr[k]);
+        gate+=xv*__bfloat162float(wg[k]); up+=xv*__bfloat162float(wu[k]); }
+    for(int o=16;o>0;o>>=1){ gate+=__shfl_down_sync(0xffffffff,gate,o); up+=__shfl_down_sync(0xffffffff,up,o); }
+    if(lane==0) h_buf[(size_t)r*I + i]=__float2bfloat16(siluf(gate)*up);
+}
+
+__global__ void decode_gemm2_kernel(
+        const bf16* __restrict__ h_buf, const bf16* __restrict__ w2r, const bf16* __restrict__ w2s,
+        const int* __restrict__ sorted_token, const float* __restrict__ sorted_weight,
+        const int* __restrict__ row_expert, float* __restrict__ out, int R, int E, int H, int I){
+    int gw = blockIdx.x*(NTHREADS/32) + (threadIdx.x>>5);
+    if(gw >= R*H) return;
+    int r=gw/H, hh=gw%H, lane=threadIdx.x&31;
+    int e=row_expert[r];
+    const bf16* w2 = (e<E) ? (w2r + (size_t)e*(size_t)H*I) : (w2s + (size_t)(e-E)*(size_t)H*I);
+    const bf16* hr = h_buf + (size_t)r*I;
+    const bf16* wr = w2 + (size_t)hh*I;
+    float y=0.f;
+    for(int k=lane;k<I;k+=32) y+=__bfloat162float(hr[k])*__bfloat162float(wr[k]);
+    for(int o=16;o>0;o>>=1) y+=__shfl_down_sync(0xffffffff,y,o);
+    if(lane==0){ atomicAdd(&out[(size_t)sorted_token[r]*H + hh], sorted_weight[r]*y); }
+}
+
+// ---------------- gemm1: x @ w1.T -> gate|up -> silu*up -> h ----------------
+// 8 warps: wm=warp/2 (0..3, 16 rows), wn=warp%2 (0..1, 32 cols=2 col-subtiles).
+__global__ void __launch_bounds__(NTHREADS, MINBLK) gemm1_kernel(
+        const bf16* __restrict__ x, const bf16* __restrict__ w1r, const bf16* __restrict__ w1s,
+        const int* __restrict__ sorted_token,
+        const int* __restrict__ mtile_expert, const int* __restrict__ mtile_row0,
+        const int* __restrict__ mtile_nrows, const int* __restrict__ num_mtiles,
+        bf16* __restrict__ h_buf, int E, int H, int I){
+    int mt = blockIdx.x;
+    if(mt >= num_mtiles[0]) return;
+    int nt = blockIdx.y;
+    int expert = mtile_expert[mt];
+    int row0 = mtile_row0[mt];
+    int nrows = mtile_nrows[mt];
+    int ncol0 = nt*BN;
+    const bf16* w1 = (expert < E) ? (w1r + (size_t)expert*(2*(size_t)I)*H)
+                                  : (w1s + (size_t)(expert-E)*(2*(size_t)I)*H);
+    __shared__ bf16 As[2][BM][LDK];
+    __shared__ bf16 Bg[2][BN][LDK];
+    __shared__ bf16 Bu[2][BN][LDK];
+    __shared__ float Os[BM][BN];
+    int tid=threadIdx.x, warp=tid>>5, wm=warp>>1, wn=warp&1;
+    int active = (wm*16) < nrows;   // skip mma for fully-padding row bands
+
+    wmma::fragment<wmma::accumulator,16,16,16,float> gacc[2], uacc[2];
+    for(int c=0;c<2;c++){ wmma::fill_fragment(gacc[c],0.0f); wmma::fill_fragment(uacc[c],0.0f); }
+
+    int nk=H/BK;
+    #define G1_LOAD(step, buf) do{ \
+        int _k0=(step)*BK; \
+        for(int c=tid;c<BM*(BK/8);c+=NTHREADS){ int r=c/(BK/8),ko=(c%(BK/8))*8; \
+            int tok=(r<nrows)?sorted_token[row0+r]:0; \
+            __pipeline_memcpy_async(&As[buf][r][ko], x+(size_t)tok*H+_k0+ko, 16);} \
+        for(int c=tid;c<BN*(BK/8);c+=NTHREADS){ int r=c/(BK/8),ko=(c%(BK/8))*8; \
+            __pipeline_memcpy_async(&Bg[buf][r][ko], w1+(size_t)(ncol0+r)*H+_k0+ko, 16); \
+            __pipeline_memcpy_async(&Bu[buf][r][ko], w1+(size_t)(I+ncol0+r)*H+_k0+ko, 16);} \
+    }while(0)
+
+    G1_LOAD(0,0); __pipeline_commit();
+    for(int s=0;s<nk;s++){
+        int cur=s&1;
+        if(s+1<nk){ G1_LOAD(s+1,(s+1)&1); __pipeline_commit(); __pipeline_wait_prior(1); }
+        else __pipeline_wait_prior(0);
+        __syncthreads();
+        if(active){
+            wmma::fragment<wmma::matrix_a,16,16,16,bf16,wmma::row_major> af;
+            wmma::fragment<wmma::matrix_b,16,16,16,bf16,wmma::col_major> bf;
+            for(int ks=0;ks<BK;ks+=16){
+                wmma::load_matrix_sync(af, &As[cur][wm*16][ks], LDK);
+                for(int c=0;c<2;c++){
+                    wmma::load_matrix_sync(bf, &Bg[cur][wn*32+c*16][ks], LDK);
+                    wmma::mma_sync(gacc[c], af, bf, gacc[c]);
+                    wmma::load_matrix_sync(bf, &Bu[cur][wn*32+c*16][ks], LDK);
+                    wmma::mma_sync(uacc[c], af, bf, uacc[c]);
+                }
+            }
+        }
+        __syncthreads();
+    }
+    #undef G1_LOAD
+    if(active){
+        for(int c=0;c<2;c++){
+            wmma::fragment<wmma::accumulator,16,16,16,float> hf;
+            for(int t=0;t<gacc[c].num_elements;t++){ float g=gacc[c].x[t]; hf.x[t]=siluf(g)*uacc[c].x[t]; }
+            wmma::store_matrix_sync(&Os[wm*16][wn*32+c*16], hf, BN, wmma::mem_row_major);
+        }
+    }
+    __syncthreads();
+    for(int idx=tid; idx<BM*BN; idx+=NTHREADS){
+        int i=idx/BN, n=idx%BN;
+        if(i<nrows) h_buf[(size_t)(row0+i)*I + ncol0+n]=__float2bfloat16(Os[i][n]);
+    }
+}
+
+// ---------------- gemm2: h @ w2.T -> y, scale by weight, atomic scatter-add ----------------
+__global__ void __launch_bounds__(NTHREADS, MINBLK) gemm2_kernel(
+        const bf16* __restrict__ h_buf, const bf16* __restrict__ w2r, const bf16* __restrict__ w2s,
+        const int* __restrict__ sorted_token, const float* __restrict__ sorted_weight,
+        const int* __restrict__ mtile_expert, const int* __restrict__ mtile_row0,
+        const int* __restrict__ mtile_nrows, const int* __restrict__ num_mtiles,
+        float* __restrict__ out, int E, int H, int I){
+    int mt = blockIdx.x;
+    if(mt >= num_mtiles[0]) return;
+    int nt = blockIdx.y;
+    int expert = mtile_expert[mt];
+    int row0 = mtile_row0[mt];
+    int nrows = mtile_nrows[mt];
+    int ncol0 = nt*BN;                 // over H
+    const bf16* w2 = (expert < E) ? (w2r + (size_t)expert*(size_t)H*I)
+                                  : (w2s + (size_t)(expert-E)*(size_t)H*I);
+    __shared__ bf16 As[2][BM][LDK];
+    __shared__ bf16 Bs[2][BN][LDK];
+    __shared__ float Os[BM][BN];
+    int tid=threadIdx.x, warp=tid>>5, wm=warp>>1, wn=warp&1;
+    int active = (wm*16) < nrows;
+
+    wmma::fragment<wmma::accumulator,16,16,16,float> yacc[2];
+    for(int c=0;c<2;c++) wmma::fill_fragment(yacc[c],0.0f);
+
+    int nk=I/BK;
+    #define G2_LOAD(step, buf) do{ \
+        int _k0=(step)*BK; \
+        for(int c=tid;c<BM*(BK/8);c+=NTHREADS){ int r=c/(BK/8),ko=(c%(BK/8))*8; \
+            int rr=(r<nrows)?r:0; \
+            __pipeline_memcpy_async(&As[buf][r][ko], h_buf+(size_t)(row0+rr)*I+_k0+ko, 16);} \
+        for(int c=tid;c<BN*(BK/8);c+=NTHREADS){ int r=c/(BK/8),ko=(c%(BK/8))*8; \
+            __pipeline_memcpy_async(&Bs[buf][r][ko], w2+(size_t)(ncol0+r)*I+_k0+ko, 16);} \
+    }while(0)
+
+    G2_LOAD(0,0); __pipeline_commit();
+    for(int s=0;s<nk;s++){
+        int cur=s&1;
+        if(s+1<nk){ G2_LOAD(s+1,(s+1)&1); __pipeline_commit(); __pipeline_wait_prior(1); }
+        else __pipeline_wait_prior(0);
+        __syncthreads();
+        if(active){
+            wmma::fragment<wmma::matrix_a,16,16,16,bf16,wmma::row_major> af;
+            wmma::fragment<wmma::matrix_b,16,16,16,bf16,wmma::col_major> bf;
+            for(int ks=0;ks<BK;ks+=16){
+                wmma::load_matrix_sync(af, &As[cur][wm*16][ks], LDK);
+                for(int c=0;c<2;c++){
+                    wmma::load_matrix_sync(bf, &Bs[cur][wn*32+c*16][ks], LDK);
+                    wmma::mma_sync(yacc[c], af, bf, yacc[c]);
+                }
+            }
+        }
+        __syncthreads();
+    }
+    #undef G2_LOAD
+    if(active){
+        for(int c=0;c<2;c++)
+            wmma::store_matrix_sync(&Os[wm*16][wn*32+c*16], yacc[c], BN, wmma::mem_row_major);
+    }
+    __syncthreads();
+    for(int idx=tid; idx<BM*BN; idx+=NTHREADS){
+        int i=idx/BN, n=idx%BN;
+        if(i<nrows){
+            int tok=sorted_token[row0+i];
+            float w=sorted_weight[row0+i];
+            atomicAdd(&out[(size_t)tok*H + ncol0+n], w*Os[i][n]);
+        }
+    }
+}
+
+__global__ void finalize_kernel(const float* __restrict__ o32, bf16* __restrict__ o16, int n){
+    int i=blockIdx.x*blockDim.x+threadIdx.x;
+    if(i<n) o16[i]=__float2bfloat16(o32[i]);
+}
+
+torch::Tensor fused_moe(torch::Tensor x, torch::Tensor eid, torch::Tensor ew,
+                        torch::Tensor w1r, torch::Tensor w2r,
+                        torch::Tensor w1s, torch::Tensor w2s){
+    int T=x.size(0), H=x.size(1);
+    int top_k=eid.size(1);
+    int E=w1r.size(0), I=w1r.size(1)/2;
+    int n_shared=w1s.size(0);
+    int G=E+n_shared;
+    int expanded=T*top_k;
+    int R=expanded + n_shared*T;
+
+    auto oi=torch::TensorOptions().dtype(torch::kInt32).device(x.device());
+    auto of=torch::TensorOptions().dtype(torch::kFloat32).device(x.device());
+    auto ob=torch::TensorOptions().dtype(torch::kBFloat16).device(x.device());
+
+    auto counts=torch::zeros({G}, oi);
+    auto offsets=torch::empty({G+1}, oi);
+    auto fillc=torch::zeros({G}, oi);
+    auto sorted_token=torch::empty({R}, oi);
+    auto sorted_weight=torch::empty({R}, of);
+    auto row_expert=torch::empty({R}, oi);
+    auto num_mtiles=torch::zeros({1}, oi);
+    int MAX_MTILES=G + (R+BM-1)/BM + 8;
+    auto mtile_expert=torch::empty({MAX_MTILES}, oi);
+    auto mtile_row0=torch::empty({MAX_MTILES}, oi);
+    auto mtile_nrows=torch::empty({MAX_MTILES}, oi);
+    auto h_buf=torch::empty({R, I}, ob);
+    auto out32=torch::zeros({T, H}, of);
+    auto out=torch::empty({T, H}, ob);
+
+    const long* eidp=eid.data_ptr<long>();
+    const bf16* ewp=(const bf16*)ew.data_ptr();
+    cudaStream_t st = at::cuda::getCurrentCUDAStream();
+
+    hist_kernel<<<(expanded+255)/256,256,0,st>>>(eidp, expanded, counts.data_ptr<int>());
+    prefix_schedule_kernel<<<1,32,0,st>>>(counts.data_ptr<int>(), offsets.data_ptr<int>(),
+        mtile_expert.data_ptr<int>(), mtile_row0.data_ptr<int>(), mtile_nrows.data_ptr<int>(),
+        num_mtiles.data_ptr<int>(), E, n_shared, T, G);
+    scatter_routed_kernel<<<(expanded+255)/256,256,0,st>>>(eidp, ewp, expanded, top_k,
+        offsets.data_ptr<int>(), fillc.data_ptr<int>(),
+        sorted_token.data_ptr<int>(), sorted_weight.data_ptr<float>(), row_expert.data_ptr<int>());
+    scatter_shared_kernel<<<(n_shared*T+255)/256,256,0,st>>>(E, n_shared, T, offsets.data_ptr<int>(),
+        sorted_token.data_ptr<int>(), sorted_weight.data_ptr<float>(), row_expert.data_ptr<int>());
+
+    const int DECODE_T=8;
+    if(T<=DECODE_T){
+        // decode: warp-per-output GEMV, high parallelism for the tiny-batch (low-tile) regime.
+        int nw=NTHREADS/32;
+        decode_gemm1_kernel<<<(R*I+nw-1)/nw, NTHREADS, 0, st>>>((const bf16*)x.data_ptr(),
+            (const bf16*)w1r.data_ptr(), (const bf16*)w1s.data_ptr(),
+            sorted_token.data_ptr<int>(), row_expert.data_ptr<int>(), (bf16*)h_buf.data_ptr(), R, E, H, I);
+        decode_gemm2_kernel<<<(R*H+nw-1)/nw, NTHREADS, 0, st>>>((const bf16*)h_buf.data_ptr(),
+            (const bf16*)w2r.data_ptr(), (const bf16*)w2s.data_ptr(),
+            sorted_token.data_ptr<int>(), sorted_weight.data_ptr<float>(), row_expert.data_ptr<int>(),
+            out32.data_ptr<float>(), R, E, H, I);
+    } else {
+        dim3 g1(MAX_MTILES, I/BN); dim3 g2(MAX_MTILES, H/BN);
+        gemm1_kernel<<<g1,NTHREADS,0,st>>>((const bf16*)x.data_ptr(), (const bf16*)w1r.data_ptr(),
+            (const bf16*)w1s.data_ptr(), sorted_token.data_ptr<int>(),
+            mtile_expert.data_ptr<int>(), mtile_row0.data_ptr<int>(), mtile_nrows.data_ptr<int>(),
+            num_mtiles.data_ptr<int>(), (bf16*)h_buf.data_ptr(), E, H, I);
+        gemm2_kernel<<<g2,NTHREADS,0,st>>>((const bf16*)h_buf.data_ptr(), (const bf16*)w2r.data_ptr(),
+            (const bf16*)w2s.data_ptr(), sorted_token.data_ptr<int>(), sorted_weight.data_ptr<float>(),
+            mtile_expert.data_ptr<int>(), mtile_row0.data_ptr<int>(), mtile_nrows.data_ptr<int>(),
+            num_mtiles.data_ptr<int>(), out32.data_ptr<float>(), E, H, I);
+    }
+
+    int nout=T*H;
+    finalize_kernel<<<(nout+255)/256,256,0,st>>>(out32.data_ptr<float>(), (bf16*)out.data_ptr(), nout);
+    return out;
+}
+"""
+
+_CPP = "torch::Tensor fused_moe(torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor);"
+
+_ext = load_inline(
+    name="glm52_moe_v11",
+    cpp_sources=_CPP,
+    cuda_sources=_CUDA,
+    functions=["fused_moe"],
+    extra_cuda_cflags=["-arch=sm_100", "-O3"],
+    verbose=False,
+)
+
+
+class Model(nn.Module):
+    def __init__(self, T: int, E: int, top_k: int, n_shared: int, H: int, I: int):
+        super().__init__()
+        self.T, self.E, self.top_k = T, E, top_k
+        self.n_shared, self.H, self.I = n_shared, H, I
+        self.w1_routed = nn.Parameter(torch.empty(E, 2 * I, H, dtype=torch.bfloat16))
+        self.w2_routed = nn.Parameter(torch.empty(E, H, I, dtype=torch.bfloat16))
+        self.w1_shared = nn.Parameter(torch.empty(n_shared, 2 * I, H, dtype=torch.bfloat16))
+        self.w2_shared = nn.Parameter(torch.empty(n_shared, H, I, dtype=torch.bfloat16))
+        for p in self.parameters():
+            nn.init.normal_(p, std=0.02)
+        self._graphs: dict = {}
+
+    def _raw(self, x, ids, w):
+        return _ext.fused_moe(x, ids, w, self.w1_routed, self.w2_routed,
+                              self.w1_shared, self.w2_shared)
+
+    def _get_graph(self, x, ids, w):
+        key = (x.shape[0], x.shape[1], ids.shape[1])
+        g = self._graphs.get(key)
+        if g is not None:
+            return g
+        sx = torch.empty_like(x); sids = torch.empty_like(ids); sw = torch.empty_like(w)
+        sx.copy_(x); sids.copy_(ids); sw.copy_(w)
+        s = torch.cuda.Stream()
+        s.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(s):
+            for _ in range(3):
+                self._raw(sx, sids, sw)
+        torch.cuda.current_stream().wait_stream(s)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            sout = self._raw(sx, sids, sw)
+        g = (sx, sids, sw, sout, graph)
+        self._graphs[key] = g
+        return g
+
+    def forward(self, x: torch.Tensor, expert_ids: torch.Tensor,
+                expert_weights: torch.Tensor) -> torch.Tensor:
+        x = x.contiguous()
+        expert_ids = expert_ids.contiguous()
+        expert_weights = expert_weights.contiguous()
+        try:
+            sx, sids, sw, sout, graph = self._get_graph(x, expert_ids, expert_weights)
+            sx.copy_(x); sids.copy_(expert_ids); sw.copy_(expert_weights)
+            graph.replay()
+            return sout.clone()
+        except Exception:
+            return self._raw(x, expert_ids, expert_weights)

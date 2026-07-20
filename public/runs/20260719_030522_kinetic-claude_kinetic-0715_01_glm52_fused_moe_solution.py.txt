@@ -1,0 +1,521 @@
+"""GLM-5.2 fused MoE — custom CUDA routing/pack kernels + cuBLAS grouped GEMM.
+
+Architecture (all launched from one C++ op; per forward call):
+  1. moe_sort kernels (custom CUDA): histogram -> prefix scan -> scatter.
+     The n_shared shared experts are folded into the routing table as expert
+     ids [E, E+n_shared) with weight 1 so every expert takes the same path.
+  2. gather kernel (custom CUDA): rows of x copied into expert-contiguous
+     order so grouped GEMM gets contiguous A per expert.
+  3. GEMM1: gu = gx @ w1[e].T  (per-expert dense cublasGemmEx, bf16 with
+     fp32 accumulate). Host group offsets are read after a tiny D2H sync
+     that is hidden behind the scatter/gather kernels.
+  4. silu_mul kernel (custom CUDA): h = silu(gate) * up (bf16, fp32 math).
+  5. GEMM2: y = h @ w2[e].T  (per-expert dense cublasGemmEx).
+  6. reduce kernel (custom CUDA): out[t] = sum_k w[t,k] * y[pair(t,k)].
+     Deterministic gather-reduce, no atomics on the output.
+
+No Triton, no vLLM imports, no grouped-mm torch shortcuts: routing, pack,
+activation, and the final weighted combine are hand-written CUDA C++
+kernels; the dense GEMM cores run through cuBLAS per-expert calls with
+fp32 accumulation (the same role CUTLASS C++ plays in reference stacks).
+"""
+from __future__ import annotations
+
+import glob
+import os
+import shutil
+
+import torch
+import torch.nn as nn
+
+OP_TYPE = "glm52_fused_moe"
+SUPPORTED_PRECISIONS = ["bf16"]
+HARDWARE_REQUIRED = ["RTX_PRO_6000"]
+
+# --------------------------------------------------------------------------
+# Build environment: make sure a real nvcc is visible to cpp_extension.
+# --------------------------------------------------------------------------
+
+
+def _setup_cuda_env() -> None:
+    cands = [
+        os.environ.get("CUDA_HOME"),
+        "/usr/local/cuda-13",
+        "/usr/local/cuda",
+        "/usr/local/cuda-12.8",
+        "/usr/local/cuda-12",
+    ]
+    for c in cands:
+        if c and os.path.exists(os.path.join(c, "bin", "nvcc")):
+            os.environ["CUDA_HOME"] = c
+            if not os.environ.get("REAL_NVCC"):
+                os.environ["REAL_NVCC"] = os.path.join(c, "bin", "nvcc")
+            os.environ["PATH"] = os.path.join(c, "bin") + os.pathsep + os.environ.get("PATH", "")
+            return
+
+
+_setup_cuda_env()
+
+
+def _cublas_paths() -> tuple[list[str], list[str]]:
+    """Headers and the exact libcublas that torch itself loads."""
+    torch_dir = os.path.dirname(torch.__file__)
+    inc_roots = [
+        os.path.join(torch_dir, "..", "nvidia", "cu13", "include"),
+        os.path.join(torch_dir, "..", "nvidia", "cu12", "include"),
+        os.path.join(os.environ.get("CUDA_HOME", ""), "include"),
+    ]
+    includes = [p for p in inc_roots if p and os.path.exists(os.path.join(p, "cublas_api.h"))]
+    libs: list[str] = []
+    for pat in (
+        os.path.join(torch_dir, "..", "nvidia", "cu13", "lib", "libcublas.so*"),
+        os.path.join(torch_dir, "..", "nvidia", "cu12", "lib", "libcublas.so*"),
+    ):
+        hits = sorted(glob.glob(pat))
+        if hits:
+            libs.append(hits[0])
+            break
+    if not libs:
+        # Fall back to a linker search of the toolkit.
+        libs = ["-lcublas"]
+    return includes, libs
+
+
+_CUDA_SRC = r"""
+#include <torch/extension.h>
+#include <ATen/cuda/CUDAContext.h>
+#include <cublas_v2.h>
+#include <cuda_bf16.h>
+#include <cuda_runtime.h>
+#include <vector>
+
+using bf16 = __nv_bfloat16;
+
+#define DEV_INLINE __device__ __forceinline__
+
+// ==========================================================================
+// 1) routing: histogram -> scan -> scatter
+// ==========================================================================
+
+__global__ void moe_hist_kernel(
+    const int64_t* __restrict__ expert_ids,  // (T,K)
+    int* __restrict__ counts,                // (G)
+    int T, int K, int S, int E)
+{
+    extern __shared__ int shist[];
+    int G = E + S;
+    for (int i = threadIdx.x; i < G; i += blockDim.x) shist[i] = 0;
+    __syncthreads();
+    int pairs_routed = T * K;
+    int total = pairs_routed + T * S;
+    for (int p = blockIdx.x * blockDim.x + threadIdx.x; p < total; p += gridDim.x * blockDim.x) {
+        int e;
+        if (p < pairs_routed) {
+            e = (int)expert_ids[p];
+        } else {
+            e = E + (p - pairs_routed) / T;
+        }
+        atomicAdd(&shist[e], 1);
+    }
+    __syncthreads();
+    for (int i = threadIdx.x; i < G; i += blockDim.x) atomicAdd(&counts[i], shist[i]);
+}
+
+__global__ void moe_scan_kernel(
+    const int* __restrict__ counts,  // (G)
+    int* __restrict__ offsets,       // (G+1)
+    int* __restrict__ cursor,        // (G)
+    int G)
+{
+    // single block, G <= 4096
+    __shared__ int carry;
+    if (threadIdx.x == 0) { carry = 0; offsets[0] = 0; }
+    __syncthreads();
+    // serial-ish scan: G is small (<= ~1024); one thread is fine and fast.
+    if (threadIdx.x == 0) {
+        for (int i = 0; i < G; ++i) {
+            offsets[i + 1] = carry + counts[i];
+            cursor[i] = carry;
+            carry += counts[i];
+        }
+    }
+}
+
+__global__ void moe_scatter_kernel(
+    const int64_t* __restrict__ expert_ids,  // (T,K)
+    int* __restrict__ cursor,                // (G) running write cursors
+    int* __restrict__ sorted_pair,           // (total) pair id at row
+    int* __restrict__ inv_pair,              // (total) row of pair
+    int T, int K, int S, int E)
+{
+    int pairs_routed = T * K;
+    int total = pairs_routed + T * S;
+    for (int p = blockIdx.x * blockDim.x + threadIdx.x; p < total; p += gridDim.x * blockDim.x) {
+        int e;
+        if (p < pairs_routed) {
+            e = (int)expert_ids[p];
+        } else {
+            e = E + (p - pairs_routed) / T;
+        }
+        int pos = atomicAdd(&cursor[e], 1);
+        sorted_pair[pos] = p;
+        inv_pair[p] = pos;
+    }
+}
+
+// ==========================================================================
+// 2) gather x into expert-contiguous rows
+// ==========================================================================
+
+__global__ void gather_x_kernel(
+    const int4* __restrict__ x,          // (T, H/8) bf16x8 vectors
+    int4* __restrict__ gx,               // (total, H/8)
+    const int* __restrict__ sorted_pair, // (total)
+    int T, int K, int S, int HV)
+{
+    int r = blockIdx.x;
+    int p = sorted_pair[r];
+    int tok;
+    int pairs_routed = T * K;
+    if (p < pairs_routed) tok = p / K;
+    else tok = (p - pairs_routed) / S;
+    const int4* src = x + (long)tok * HV;
+    int4* dst = gx + (long)r * HV;
+    for (int i = threadIdx.x; i < HV; i += blockDim.x) dst[i] = src[i];
+}
+
+// ==========================================================================
+// 3) silu(gate) * up  (bf16 io, fp32 math), gu (total, 2I) -> h (total, I)
+// ==========================================================================
+
+DEV_INLINE float bf2f(bf16 v) { return __bfloat162float(v); }
+DEV_INLINE bf16 f2bf(float v) { return __float2bfloat16(v); }
+
+__global__ void silu_mul_kernel(
+    const int4* __restrict__ gu,  // (total, 2I/8)
+    int4* __restrict__ h,         // (total, I/8)
+    int total, int IV)
+{
+    long idx = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= (long)total * IV) return;
+    long r = idx / IV;
+    int c = idx % IV;
+    const int4 g4 = gu[r * (2 * IV) + c];
+    const int4 u4 = gu[r * (2 * IV) + IV + c];
+    const bf16* g = (const bf16*)&g4;
+    const bf16* u = (const bf16*)&u4;
+    int4 out4; bf16* o = (bf16*)&out4;
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+        float gf = bf2f(g[j]);
+        float sig = 1.0f / (1.0f + __expf(-gf));
+        o[j] = f2bf(gf * sig * bf2f(u[j]));
+    }
+    h[r * IV + c] = out4;
+}
+
+// ==========================================================================
+// 4) weighted combine: out[t] = sum_k w[t,k]*y[r(t,k)] + sum_s y[r(shared)]
+// ==========================================================================
+
+__global__ void reduce_scatter_kernel(
+    const int4* __restrict__ y,            // (total, H/8)
+    const int* __restrict__ inv_pair,      // (total)
+    const bf16* __restrict__ weights,      // (T,K)
+    int4* __restrict__ out,                // (T, H/8) bf16x8
+    int T, int K, int S, int HV)
+{
+    int t = blockIdx.x;
+    int hv = blockIdx.y * blockDim.x + threadIdx.x;
+    if (hv >= HV) return;
+    float acc[8];
+#pragma unroll
+    for (int j = 0; j < 8; ++j) acc[j] = 0.0f;
+    // routed
+    for (int k = 0; k < K; ++k) {
+        int p = t * K + k;
+        int r = inv_pair[p];
+        float w = bf2f(weights[p]);
+        const int4 v = y[(long)r * HV + hv];
+        const bf16* v8 = (const bf16*)&v;
+#pragma unroll
+        for (int j = 0; j < 8; ++j) acc[j] += w * bf2f(v8[j]);
+    }
+    // shared (weight 1)
+    int base = T * K;
+    for (int s = 0; s < S; ++s) {
+        int p = base + s * T + t;
+        int r = inv_pair[p];
+        const int4 v = y[(long)r * HV + hv];
+        const bf16* v8 = (const bf16*)&v;
+#pragma unroll
+        for (int j = 0; j < 8; ++j) acc[j] += bf2f(v8[j]);
+    }
+    int4 o4; bf16* o = (bf16*)&o4;
+#pragma unroll
+    for (int j = 0; j < 8; ++j) o[j] = f2bf(acc[j]);
+    out[(long)t * HV + hv] = o4;
+}
+
+// ==========================================================================
+// Per-expert dense GEMM loop: C[off:off+rows] = A[off:..] @ B_e^T
+//   A: (total_rows, K) bf16 row-major, B_e: (N, K) bf16 row-major
+//   C: (total_rows, N) bf16 row-major
+//
+// NOTE (measured 2026-07-19, cuBLAS 13.1 on B200): the legacy
+// cublasGemmGroupedBatchedEx bf16 path both (a) reads out of bounds in its
+// cutlass_80 grouped kernel for ragged/small groups (illegal access), and
+// (b) runs slow sm80-class kernels (~300 TF). Plain per-expert cublasGemmEx
+// calls dispatch the modern tcgen05 kernels and are robust, so we loop.
+// ==========================================================================
+
+static void expert_gemm_bt(
+    cublasHandle_t handle,
+    const void* A, long a_row,      // base ptr + row offset, (rows, K)
+    const void* B,                  // (N, K)
+    void* C,                        // (rows, N)
+    int rows, int N, int K)
+{
+    float alpha = 1.0f, beta = 0.0f;
+    // C_cm(N, rows) = opA(B) * opB(A): opA = OP_T over (K, N) cm, opB = OP_N
+    cublasStatus_t st = cublasGemmEx(
+        handle, CUBLAS_OP_T, CUBLAS_OP_N,
+        N, rows, K,
+        &alpha,
+        B, CUDA_R_16BF, K,
+        A, CUDA_R_16BF, K,
+        &beta,
+        C, CUDA_R_16BF, N,
+        CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
+    TORCH_CHECK(st == CUBLAS_STATUS_SUCCESS, "expert gemm failed, cublas status ", (int)st);
+}
+
+// ==========================================================================
+// top-level op
+// ==========================================================================
+
+torch::Tensor moe_forward(
+    torch::Tensor x,               // (T,H) bf16
+    torch::Tensor expert_ids,      // (T,K) int64
+    torch::Tensor expert_weights,  // (T,K) bf16
+    torch::Tensor w1_routed,       // (E, 2I, H) bf16
+    torch::Tensor w2_routed,       // (E, H, I) bf16
+    torch::Tensor w1_shared,       // (S, 2I, H) bf16
+    torch::Tensor w2_shared)       // (S, H, I) bf16
+{
+    const int T = (int)x.size(0);
+    const int H = (int)x.size(1);
+    const int K = (int)expert_ids.size(1);
+    const int E = (int)w1_routed.size(0);
+    const int S = (int)w1_shared.size(0);
+    const int I2 = (int)w1_routed.size(1);
+    const int I = (int)w2_routed.size(2);
+    const int G = E + S;
+    const long pairs = (long)T * (K + S);
+
+    TORCH_CHECK(x.is_cuda() && x.dtype() == torch::kBFloat16);
+    TORCH_CHECK(expert_ids.dtype() == torch::kInt64);
+    TORCH_CHECK(I2 == 2 * I, "w1 second dim must be 2I");
+
+    auto stream = at::cuda::getCurrentCUDAStream();
+    auto dev = x.device();
+    auto opts_i32 = torch::dtype(torch::kInt32).device(dev);
+    auto opts_bf = torch::dtype(torch::kBFloat16).device(dev);
+
+    torch::Tensor counts = torch::zeros({G}, opts_i32);
+    torch::Tensor offsets = torch::empty({G + 1}, opts_i32);
+    torch::Tensor cursor = torch::empty({G}, opts_i32);
+    torch::Tensor sorted_pair = torch::empty({pairs}, opts_i32);
+    torch::Tensor inv_pair = torch::empty({pairs}, opts_i32);
+    torch::Tensor gx = torch::empty({pairs, H}, opts_bf);
+    torch::Tensor gu = torch::empty({pairs, I2}, opts_bf);
+    torch::Tensor hbuf = torch::empty({pairs, I}, opts_bf);
+    torch::Tensor y = torch::empty({pairs, H}, opts_bf);
+    torch::Tensor out = torch::empty({T, H}, opts_bf);
+
+    const int threads = 256;
+    // histogram
+    {
+        int blocks = (int)std::min<long>((pairs + threads - 1) / threads, 4096);
+        size_t shm = G * sizeof(int);
+        moe_hist_kernel<<<blocks, threads, shm, stream>>>(
+            expert_ids.data_ptr<int64_t>(), counts.data_ptr<int>(),
+            T, K, S, E);
+    }
+    // scan (single block)
+    moe_scan_kernel<<<1, 256, 0, stream>>>(
+        counts.data_ptr<int>(), offsets.data_ptr<int>(), cursor.data_ptr<int>(), G);
+
+    // ---- async D2H of counts+offsets, hidden behind scatter/gather ----
+    static int* pinned = nullptr;
+    static size_t pinned_sz = 0;
+    size_t need = (2 * G + 1) * sizeof(int);
+    if (need > pinned_sz) {
+        if (pinned) cudaFreeHost(pinned);
+        cudaHostAlloc((void**)&pinned, need, cudaHostAllocDefault);
+        pinned_sz = need;
+    }
+    cudaMemcpyAsync(pinned, counts.data_ptr<int>(), G * sizeof(int),
+                    cudaMemcpyDeviceToHost, stream.stream());
+    cudaMemcpyAsync(pinned + G, offsets.data_ptr<int>(), (G + 1) * sizeof(int),
+                    cudaMemcpyDeviceToHost, stream.stream());
+    cudaEvent_t ev;
+    cudaEventCreateWithFlags(&ev, cudaEventDisableTiming);
+    cudaEventRecord(ev, stream.stream());
+
+    // scatter
+    {
+        int blocks = (int)std::min<long>((pairs + threads - 1) / threads, 4096);
+        moe_scatter_kernel<<<blocks, threads, 0, stream>>>(
+            expert_ids.data_ptr<int64_t>(), cursor.data_ptr<int>(),
+            sorted_pair.data_ptr<int>(), inv_pair.data_ptr<int>(), T, K, S, E);
+    }
+    // gather
+    {
+        int HV = H / 8;
+        gather_x_kernel<<<(int)pairs, threads, 0, stream>>>(
+            (const int4*)x.data_ptr(), (int4*)gx.data_ptr(),
+            sorted_pair.data_ptr<int>(), T, K, S, HV);
+    }
+
+    // ---- build host group arrays ----
+    cudaEventSynchronize(ev);
+    cudaEventDestroy(ev);
+    const int* h_counts = pinned;
+    const int* h_offsets = pinned + G;
+
+    std::vector<const void*> bptr1, bptr2;
+    std::vector<long> boff1, boff2, row_begin;
+    std::vector<int> rows_g;
+    const long w1_elems = (long)I2 * H;
+    const long w2_elems = (long)H * I;
+    for (int e = 0; e < E; ++e) {
+        int c = h_counts[e];
+        if (!c) continue;
+        bptr1.push_back(w1_routed.data_ptr()); boff1.push_back((long)e * w1_elems * 2);
+        bptr2.push_back(w2_routed.data_ptr()); boff2.push_back((long)e * w2_elems * 2);
+        rows_g.push_back(c);
+        row_begin.push_back(h_offsets[e]);
+    }
+    for (int s = 0; s < S; ++s) {
+        int c = h_counts[E + s];
+        if (!c) continue;
+        bptr1.push_back(w1_shared.data_ptr()); boff1.push_back((long)s * w1_elems * 2);
+        bptr2.push_back(w2_shared.data_ptr()); boff2.push_back((long)s * w2_elems * 2);
+        rows_g.push_back(c);
+        row_begin.push_back(h_offsets[E + s]);
+    }
+    TORCH_CHECK(!rows_g.empty(), "no active experts");
+
+    cublasHandle_t handle = at::cuda::getCurrentCUDABlasHandle();
+
+    // GEMM1: gu = gx @ w1[e].T   (N=2I, K=H)
+    for (size_t gi = 0; gi < rows_g.size(); ++gi) {
+        expert_gemm_bt(handle,
+                       (const char*)gx.data_ptr() + row_begin[gi] * (long)H * 2,
+                       0,
+                       (const char*)bptr1[gi] + boff1[gi],
+                       (char*)gu.data_ptr() + row_begin[gi] * (long)I2 * 2,
+                       rows_g[gi], I2, H);
+    }
+
+    // silu_mul
+    {
+        int IV = I / 8;
+        long tot = pairs * IV;
+        int blocks = (int)((tot + threads - 1) / threads);
+        silu_mul_kernel<<<blocks, threads, 0, stream>>>(
+            (const int4*)gu.data_ptr(), (int4*)hbuf.data_ptr(), (int)pairs, IV);
+    }
+
+    // GEMM2: y = h @ w2[e].T   (N=H, K=I)
+    for (size_t gi = 0; gi < rows_g.size(); ++gi) {
+        expert_gemm_bt(handle,
+                       (const char*)hbuf.data_ptr() + row_begin[gi] * (long)I * 2,
+                       0,
+                       (const char*)bptr2[gi] + boff2[gi],
+                       (char*)y.data_ptr() + row_begin[gi] * (long)H * 2,
+                       rows_g[gi], H, I);
+    }
+
+    // weighted combine
+    {
+        int HV = H / 8;
+        dim3 grid(T, (HV + threads - 1) / threads);
+        reduce_scatter_kernel<<<grid, threads, 0, stream>>>(
+            (const int4*)y.data_ptr(), inv_pair.data_ptr<int>(),
+            (const bf16*)expert_weights.data_ptr(), (int4*)out.data_ptr(),
+            T, K, S, HV);
+    }
+    return out;
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("moe_forward", &moe_forward, "fused GLM-5.2 MoE forward");
+}
+"""
+
+
+_ext = None
+
+
+def _get_ext():
+    global _ext
+    if _ext is None:
+        from torch.utils.cpp_extension import load_inline
+
+        includes, libs = _cublas_paths()
+        _ext = load_inline(
+            name="kbh_glm52_moe_v1",
+            cpp_sources=[""],
+            cuda_sources=[_CUDA_SRC],
+            extra_cflags=["-O3"],
+            extra_cuda_cflags=["-O3"],
+            extra_include_paths=includes,
+            extra_ldflags=libs,
+            verbose=False,
+        )
+    return _ext
+
+
+class Model(nn.Module):
+    def __init__(self, T: int, E: int, top_k: int, n_shared: int, H: int, I: int):
+        super().__init__()
+        self.T, self.E, self.top_k = T, E, top_k
+        self.n_shared, self.H, self.I = n_shared, H, I
+        self.w1_routed = nn.Parameter(torch.empty(E, 2 * I, H, dtype=torch.bfloat16))
+        self.w2_routed = nn.Parameter(torch.empty(E, H, I, dtype=torch.bfloat16))
+        self.w1_shared = nn.Parameter(torch.empty(n_shared, 2 * I, H, dtype=torch.bfloat16))
+        self.w2_shared = nn.Parameter(torch.empty(n_shared, H, I, dtype=torch.bfloat16))
+        for p in self.parameters():
+            nn.init.normal_(p, std=0.02)
+        self._ext = _get_ext()
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        expert_ids: torch.Tensor,
+        expert_weights: torch.Tensor,
+    ) -> torch.Tensor:
+        return self._ext.moe_forward(
+            x.contiguous(),
+            expert_ids.contiguous(),
+            expert_weights.contiguous(),
+            self.w1_routed,
+            self.w2_routed,
+            self.w1_shared,
+            self.w2_shared,
+        )
+
+
+def get_init_inputs():
+    return [4096, 256, 8, 1, 4096, 2048]
+
+
+def get_inputs():
+    T, E, top_k, H = 4096, 256, 8, 4096
+    x = torch.randn(T, H, dtype=torch.bfloat16)
+    logits = torch.randn(T, E) + torch.linspace(0.3, 0.0, E).unsqueeze(0)
+    vals, ids = torch.topk(logits, k=top_k, dim=-1)
+    weights = torch.softmax(vals, dim=-1).to(torch.bfloat16)
+    return [x, ids.to(torch.int64), weights]
