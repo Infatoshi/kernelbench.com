@@ -1,0 +1,1136 @@
+"""Fused CUDA rollout: vectorized grid foraging + 3-layer MinGRU policy.
+
+Design (RTX PRO 6000 / SM120, fp32):
+  - One persistent cooperative kernel runs the WHOLE horizon in a single
+    launch. Blocks synchronize with a software grid barrier (all blocks are
+    resident; grid size chosen from the occupancy API).
+  - Per step: [respawn+obs+encoder] -> 3x [tiled GEMM (N,256)x(256,768) with
+    the MinGRU gate/highway epilogue fused in] -> [action head + argmax +
+    env move + reward + hit-any flag].
+  - The reference advances the LCG only when ANY env hits food that step
+    (a global reduction). The flag is published via atomicOr and consumed
+    after the grid barrier at the start of the next step.
+  - Everything is fp32 CUDA-core FFMA (no TF32/fp16): positions/rewards must
+    match the PyTorch reference EXACTLY, which requires argmax-stable logits.
+  - Weights are repacked once per model version: w_gru (3,768,256) ->
+    PW[l][k][3*i+g] so gate triplets for one hidden unit are adjacent and
+    GEMM loads are coalesced.
+"""
+from __future__ import annotations
+
+import os
+
+import torch
+import torch.nn as nn
+
+from torch.utils.cpp_extension import load_inline
+
+OP_TYPE = "grid_mingru_sps"
+SUPPORTED_PRECISIONS = ["fp32"]
+HARDWARE_REQUIRED = ["RTX_PRO_6000"]
+
+BOARD = 11
+OBS_DIM = 4
+HIDDEN = 256
+GRU_LAYERS = 3
+NUM_ACTIONS = 4
+GRU_OUT = 3 * HIDDEN
+
+_CUDA_SRC = r"""
+#include <torch/extension.h>
+#include <ATen/cuda/CUDAContext.h>
+#include <cuda_runtime.h>
+
+#define HID 256
+#define BM 64        // envs per GEMM tile
+#define THREADS 512  // 16 warps/SM (1 resident block per SM)
+#define APITHREADS 256
+
+__device__ __forceinline__ float sigf(float x) { return 1.0f / (1.0f + expf(-x)); }
+
+// cp.async 16B copy: global -> shared without a register round trip.
+__device__ __forceinline__ void cp_async16(void* smem_dst, const void* gsrc) {
+    unsigned a = (unsigned)__cvta_generic_to_shared(smem_dst);
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" :: "r"(a), "l"(gsrc));
+}
+__device__ __forceinline__ void cp_async_commit() {
+    asm volatile("cp.async.commit_group;\n");
+}
+__device__ __forceinline__ void cp_async_wait0() {
+    asm volatile("cp.async.wait_group 0;\n");
+}
+
+__device__ __forceinline__ unsigned long long lcg(unsigned long long r) {
+    return (r * 6364136223846793005ULL + 1ULL) & 0x7FFFFFFFFFFFFFFFULL;
+}
+
+// ---------------------------------------------------------------------------
+// Software grid barrier (all blocks resident by construction).
+// ---------------------------------------------------------------------------
+__device__ __forceinline__ void grid_barrier(int* bar, int nblocks, int* lsense) {
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        int s = *lsense ^ 1;
+        *lsense = s;
+        __threadfence();
+        if (atomicAdd(&bar[0], 1) == nblocks - 1) {
+            bar[0] = 0;
+            __threadfence();
+            atomicExch(&bar[1], s);
+        } else {
+            volatile int* vs = (volatile int*)&bar[1];
+            while (*vs != s) { __nanosleep(64); }
+        }
+        __threadfence();
+    }
+    __syncthreads();
+}
+
+// ---------------------------------------------------------------------------
+// Persistent rollout megakernel.
+//   PWT   : packed gate weights TRANSPOSED [3][768][256]; row j = 3*i + g,
+//           contiguous over k so shared-memory weight tiles load as float4.
+//   wenc  : [256][4] (float4 rows), benc [256]
+//   wa    : [4][256], ba [4]
+//   Ha/Hb : hidden ping-pong buffers [256][N] (k-major)
+//   state : [3][256][N]
+// Template variants (all use BM=64 envs, TM=4 envs/thread):
+//   TN=6: BN=192 cols/chunk, NCHUNK=4, BK=16, HK=256 (1 block/SM, 16 warps)
+//   TN=3: BN=96  cols/chunk, NCHUNK=8, BK=32, HK=256 (1 block/SM, 16 warps)
+//   TN=3 HK=128: h staged in two k-halves so smem fits 2 blocks/SM (32 warps)
+// Accumulation order over k is strictly sequential (k=0..255) per output so
+// logits are reproducible across variants and match the validated path.
+// ---------------------------------------------------------------------------
+template <int BN, int NCHUNK, int TN, int BK, int HK, int MINB>
+__global__ void __launch_bounds__(THREADS, MINB)
+rollout_kernel(int N, int horizon, int nblocks, int ntiles,
+               const float* __restrict__ PWT,
+               const float* __restrict__ wenc,
+               const float* __restrict__ benc,
+               const float* __restrict__ wa,
+               const float* __restrict__ ba,
+               int2* __restrict__ agent,
+               int2* __restrict__ food,
+               unsigned long long* __restrict__ rng,
+               float* __restrict__ Ha,
+               float* __restrict__ Hb,
+               float* __restrict__ state,
+               float* __restrict__ rewards,
+               float* __restrict__ lastlog,
+               int* __restrict__ flags,
+               int* __restrict__ bar) {
+    extern __shared__ float smem[];
+    float* h_sh = smem;                 // [HK][BM] staged k-slice of Hin
+    float* w2 = smem + HK * BM;         // 2x [BN][BK] transposed weight tiles
+
+    __shared__ int lsense;
+    if (threadIdx.x == 0) lsense = 0;
+    __syncthreads();
+
+    const int tid = threadIdx.x;
+    const int bid = blockIdx.x;
+    const int tx = tid & 15;   // env group (TM=4)
+    const int ty = tid >> 4;   // col group (TN cols each)
+    const int stride = nblocks * THREADS;
+    const bool vec4 = (N % 4) == 0;
+    constexpr int WTILE = BN * BK;          // floats per weight buffer
+    constexpr int NSTG = (WTILE / 4 + THREADS - 1) / THREADS;  // float4 per thread
+
+    const long long items = (long long)ntiles * NCHUNK;
+    const int it_s = (int)(items * bid / nblocks);
+    const int it_e = (int)(items * (bid + 1) / nblocks);
+
+    // Env range whose tiles this block's items touch (for the fused phase E).
+    // Straddled tiles are recomputed by both neighbor blocks; respawn/obs/
+    // encoder are deterministic, so duplicate writes are identical (benign).
+    const int eg0 = (it_s < it_e) ? (it_s / NCHUNK) * BM : 0;
+    const int eg1 = (it_s < it_e) ? min(N, ((it_e - 1) / NCHUNK + 1) * BM) : 0;
+
+    for (int t = 0; t < horizon; ++t) {
+        // ---------------- Phase L: 3 MinGRU layers (E fused into L0) -------
+        for (int l = 0; l < 3; ++l) {
+            if (l == 0) {
+                // Phase E: respawn + obs + encoder for this block's env range
+                const int do_respawn = (t > 0) ? flags[t - 1] : 0;
+                for (int ge = eg0 + tid; ge < eg1; ge += THREADS) {
+                    int2 a = agent[ge];
+                    int2 f = food[ge];
+                    if (do_respawn) {
+                        // read-only rng use: duplicate blocks compute identical
+                        // values; the rng writeback happens in phase H (which
+                        // has exclusive env ownership), keyed on the same flag.
+                        unsigned long long r = rng[ge];
+                        r = lcg(r);
+                        int nfx = (int)(r % 11ULL);
+                        r = lcg(r);
+                        int nfy = (int)(r % 11ULL);
+                        if (a.x == f.x && a.y == f.y) {
+                            f.x = nfx; f.y = nfy;
+                            food[ge] = f;
+                        }
+                    }
+                    float o0 = (float)(f.x - a.x) / 11.0f;
+                    float o1 = (float)(f.y - a.y) / 11.0f;
+                    float o2 = (float)a.x / 10.0f;
+                    float o3 = (float)a.y / 10.0f;
+                    const float4* w4 = (const float4*)wenc;
+                    #pragma unroll 4
+                    for (int i = 0; i < HID; ++i) {
+                        float4 w = __ldg(&w4[i]);
+                        float h = fmaf(w.x, o0, fmaf(w.y, o1, fmaf(w.z, o2, fmaf(w.w, o3, __ldg(&benc[i])))));
+                        Ha[(size_t)i * N + ge] = h;
+                    }
+                }
+                // no grid barrier: each block wrote every Ha column it reads;
+                // the h-stage __syncthreads orders writes before reads.
+            }
+            const float* __restrict__ Hin  = (l & 1) ? Hb : Ha;
+            float* __restrict__ Hout       = (l & 1) ? Ha : Hb;
+            float* __restrict__ state_l    = state + (size_t)l * 256 * N;
+
+            int prev_key = -1;  // staged h_sh identity: tile * (256/HK) + k-half
+            for (int item = it_s; item < it_e; ++item) {
+                const int tile = item / NCHUNK;
+                const int chunk = item % NCHUNK;
+                const int e0 = tile * BM;
+                // PWT rows for this chunk: [BN][256], contiguous over k
+                const float* __restrict__ PWc =
+                    PWT + ((size_t)l * 768 + (size_t)chunk * BN) * 256;
+
+                float acc[4][TN];
+                #pragma unroll
+                for (int m = 0; m < 4; ++m)
+                    #pragma unroll
+                    for (int n = 0; n < TN; ++n) acc[m][n] = 0.0f;
+
+                for (int k0 = 0; k0 < 256; k0 += BK) {
+                    if ((k0 & (HK - 1)) == 0) {
+                        const int key = tile * (256 / HK) + k0 / HK;
+                        const bool need_h = (key != prev_key);
+                        if (need_h) {
+                            __syncthreads();  // protect h_sh from lagging readers
+                            if (vec4 && e0 + BM <= N) {
+                                for (int idx = tid; idx < HK * (BM / 4); idx += THREADS) {
+                                    int k = idx >> 4;          // BM/4 == 16
+                                    int j = (idx & 15) << 2;
+                                    cp_async16(&h_sh[k * BM + j],
+                                               &Hin[(size_t)(k0 + k) * N + e0 + j]);
+                                }
+                            } else {
+                                for (int idx = tid; idx < HK * (BM / 4); idx += THREADS) {
+                                    int k = idx >> 4;
+                                    int j = (idx & 15) << 2;
+                                    int ge = e0 + j;
+                                    float4 v;
+                                    v.x = (ge + 0 < N) ? Hin[(size_t)(k0 + k) * N + ge + 0] : 0.0f;
+                                    v.y = (ge + 1 < N) ? Hin[(size_t)(k0 + k) * N + ge + 1] : 0.0f;
+                                    v.z = (ge + 2 < N) ? Hin[(size_t)(k0 + k) * N + ge + 2] : 0.0f;
+                                    v.w = (ge + 3 < N) ? Hin[(size_t)(k0 + k) * N + ge + 3] : 0.0f;
+                                    *(float4*)&h_sh[k * BM + j] = v;
+                                }
+                            }
+                            prev_key = key;
+                        }
+                        if (k0 == 0) {
+                            // stage first weight tile into buffer 0 ([BN][BK])
+                            #pragma unroll
+                            for (int s = 0; s < NSTG; ++s) {
+                                int idx = tid + s * THREADS;
+                                if (idx < WTILE / 4) {
+                                    int c = idx / (BK / 4);
+                                    int kq = (idx % (BK / 4)) << 2;
+                                    cp_async16(&w2[c * BK + kq], &PWc[(size_t)c * 256 + kq]);
+                                }
+                            }
+                        }
+                        if (need_h || k0 == 0) {
+                            cp_async_commit();
+                            cp_async_wait0();
+                            __syncthreads();
+                        }
+                    }
+                    const float* wcur = w2 + ((k0 / BK) & 1) * WTILE;
+                    float* wnxt = w2 + (((k0 / BK) & 1) ^ 1) * WTILE;
+                    // async-copy next weight tile straight to shared
+                    const bool has_next = (k0 + BK) < 256;
+                    if (has_next) {
+                        #pragma unroll
+                        for (int s = 0; s < NSTG; ++s) {
+                            int idx = tid + s * THREADS;
+                            if (idx < WTILE / 4) {
+                                int c = idx / (BK / 4);
+                                int kq = (idx % (BK / 4)) << 2;
+                                cp_async16(&wnxt[c * BK + kq],
+                                           &PWc[(size_t)c * 256 + k0 + BK + kq]);
+                            }
+                        }
+                        cp_async_commit();
+                    }
+                    #pragma unroll
+                    for (int kk = 0; kk < BK; kk += 4) {
+                        float4 hk[4];
+                        #pragma unroll
+                        for (int q = 0; q < 4; ++q)
+                            hk[q] = *(const float4*)&h_sh[((k0 & (HK - 1)) + kk + q) * BM + tx * 4];
+                        float4 wn[TN];
+                        #pragma unroll
+                        for (int n = 0; n < TN; ++n)
+                            wn[n] = *(const float4*)&wcur[(ty * TN + n) * BK + kk];
+                        // k-sequential accumulation per acc element
+                        #pragma unroll
+                        for (int q = 0; q < 4; ++q) {
+                            const float hv[4] = {hk[q].x, hk[q].y, hk[q].z, hk[q].w};
+                            #pragma unroll
+                            for (int n = 0; n < TN; ++n) {
+                                const float w = (&wn[n].x)[q];
+                                #pragma unroll
+                                for (int m = 0; m < 4; ++m)
+                                    acc[m][n] = fmaf(hv[m], w, acc[m][n]);
+                            }
+                        }
+                    }
+                    if (has_next) cp_async_wait0();
+                    __syncthreads();
+                }
+
+                // epilogue: MinGRU gate + highway, write state and Hout
+                const int ebase = e0 + tx * 4;
+                if (vec4 && e0 + BM <= N) {
+                    #pragma unroll
+                    for (int u = 0; u < TN / 3; ++u) {
+                        const int i = chunk * (BN / 3) + ty * (TN / 3) + u;
+                        const size_t base = (size_t)i * N + ebase;
+                        float4 st4 = *(const float4*)&state_l[base];
+                        float4 h4;
+                        if (HK == 256) {
+                            h4 = *(const float4*)&h_sh[i * BM + tx * 4];
+                        } else {
+                            h4 = *(const float4*)&Hin[(size_t)i * N + ebase];
+                        }
+                        float4 o4, n4;
+                        #pragma unroll
+                        for (int m = 0; m < 4; ++m) {
+                            float zh = acc[m][u * 3 + 0];
+                            float zg = acc[m][u * 3 + 1];
+                            float zp = acc[m][u * 3 + 2];
+                            float st = (&st4.x)[m];
+                            float outv = st + sigf(zg) * (tanhf(zh) - st);
+                            float p = sigf(zp);
+                            float hnew = p * outv + (1.0f - p) * (&h4.x)[m];
+                            (&o4.x)[m] = outv;
+                            (&n4.x)[m] = hnew;
+                        }
+                        *(float4*)&state_l[base] = o4;
+                        *(float4*)&Hout[base] = n4;
+                    }
+                } else {
+                    #pragma unroll
+                    for (int m = 0; m < 4; ++m) {
+                        const int ge = ebase + m;
+                        if (ge >= N) continue;
+                        #pragma unroll
+                        for (int u = 0; u < TN / 3; ++u) {
+                            const int i = chunk * (BN / 3) + ty * (TN / 3) + u;
+                            float zh = acc[m][u * 3 + 0];
+                            float zg = acc[m][u * 3 + 1];
+                            float zp = acc[m][u * 3 + 2];
+                            size_t si = (size_t)i * N + ge;
+                            float st = state_l[si];
+                            float outv = st + sigf(zg) * (tanhf(zh) - st);
+                            float p = sigf(zp);
+                            float hold = (HK == 256) ? h_sh[i * BM + tx * 4 + m]
+                                                     : Hin[(size_t)i * N + ge];
+                            float hnew = p * outv + (1.0f - p) * hold;
+                            state_l[si] = outv;
+                            Hout[(size_t)i * N + ge] = hnew;
+                        }
+                    }
+                }
+            }
+            grid_barrier(bar, nblocks, &lsense);
+        }
+
+        // ---------------- Phase H: action head + argmax + env step ---------
+        {
+            float* wa_sm = w2;  // 4*256 floats
+            for (int idx = tid; idx < 4 * 256; idx += THREADS) wa_sm[idx] = wa[idx];
+            __syncthreads();
+            const float* __restrict__ Hf = Hb;  // layer-2 output
+            const float b0 = __ldg(&ba[0]), b1 = __ldg(&ba[1]);
+            const float b2 = __ldg(&ba[2]), b3 = __ldg(&ba[3]);
+            const int do_respawn = (t > 0) ? flags[t - 1] : 0;
+            for (int ge = bid * THREADS + tid; ge < N; ge += stride) {
+                // deferred rng writeback for this step's phase-E respawn
+                // (exclusive env ownership here, so no cross-block RMW race)
+                if (do_respawn) rng[ge] = lcg(lcg(rng[ge]));
+                float a0 = b0, a1 = b1, a2 = b2, a3 = b3;
+                #pragma unroll 8
+                for (int k = 0; k < HID; ++k) {
+                    float h = Hf[(size_t)k * N + ge];
+                    a0 = fmaf(h, wa_sm[0 * 256 + k], a0);
+                    a1 = fmaf(h, wa_sm[1 * 256 + k], a1);
+                    a2 = fmaf(h, wa_sm[2 * 256 + k], a2);
+                    a3 = fmaf(h, wa_sm[3 * 256 + k], a3);
+                }
+                int act = 0;
+                float best = a0;
+                if (a1 > best) { best = a1; act = 1; }
+                if (a2 > best) { best = a2; act = 2; }
+                if (a3 > best) { best = a3; act = 3; }
+
+                int2 a = agent[ge];
+                int2 f = food[ge];
+                int dx = (act == 2) ? -1 : (act == 3) ? 1 : 0;
+                int dy = (act == 0) ? -1 : (act == 1) ? 1 : 0;
+                a.x = min(10, max(0, a.x + dx));
+                a.y = min(10, max(0, a.y + dy));
+                agent[ge] = a;
+                bool hit = (a.x == f.x) && (a.y == f.y);
+                if (hit) rewards[ge] += 1.0f;
+                unsigned mask = __activemask();
+                unsigned b = __ballot_sync(mask, hit);
+                if (hit && ((threadIdx.x & 31) == (unsigned)(__ffs(b) - 1)))
+                    atomicOr(&flags[t], 1);
+                if (t == horizon - 1) {
+                    lastlog[(size_t)ge * 4 + 0] = a0;
+                    lastlog[(size_t)ge * 4 + 1] = a1;
+                    lastlog[(size_t)ge * 4 + 2] = a2;
+                    lastlog[(size_t)ge * 4 + 3] = a3;
+                }
+            }
+        }
+        if (t + 1 < horizon) grid_barrier(bar, nblocks, &lsense);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tile-owner rollout kernel: each block owns whole 32-env tiles end-to-end
+// (encoder, all 768 GEMM columns of all 3 layers, logits, env step). The full
+// per-step pipeline stays in shared memory (h never round-trips global), and
+// the ONLY cross-block coupling is the hit-any flag -> ONE grid barrier per
+// step instead of four.
+//   Geometry: TBM=32 envs/tile, 512 threads, TM=4 (tx=tid&7), TN=6
+//   (ty=tid>>3, 64 groups), sub-GEMMs of TBN=384 cols x2 per layer.
+//   smem: h_sh[256][32] (32KB) + w2 2x[384][16] (48KB) = 80KB dynamic.
+//   h_new is held in registers across both sub-GEMMs so h_sh stays intact
+//   until every thread finished reading the old h, then swapped in place.
+// Numerics: identical FMA orders to the multi-phase kernel (k-sequential
+// per output for GEMM, encoder, and logits), so logits match bit-for-bit.
+// ---------------------------------------------------------------------------
+#define TBM 32
+#define TBN 384
+#define TBK 16
+
+__global__ void __launch_bounds__(THREADS, 1)
+rollout_tile_kernel(int N, int horizon, int nblocks, int ntiles,
+                    const float* __restrict__ PWT,
+                    const float* __restrict__ wenc,
+                    const float* __restrict__ benc,
+                    const float* __restrict__ wa,
+                    const float* __restrict__ ba,
+                    int2* __restrict__ agent,
+                    int2* __restrict__ food,
+                    unsigned long long* __restrict__ rng,
+                    float* __restrict__ state,
+                    float* __restrict__ rewards,
+                    float* __restrict__ lastlog,
+                    int* __restrict__ flags,
+                    int* __restrict__ bar) {
+    extern __shared__ float smem[];
+    float* h_sh = smem;                  // [256][TBM] k-major
+    float* w2 = smem + 256 * TBM;        // 2x [TBN][TBK] weight tiles
+
+    __shared__ int lsense;
+    __shared__ __align__(16) float obs_sh[TBM * 4];
+    __shared__ float logit_sh[4 * TBM];
+    if (threadIdx.x == 0) lsense = 0;
+
+    const int tid = threadIdx.x;
+    const int bid = blockIdx.x;
+    const int tx = tid & 7;    // env group (TM=4 -> envs tx*4..tx*4+3)
+    const int ty = tid >> 3;   // col group (TN=6 cols each)
+    constexpr int WTILE = TBN * TBK;                      // 6144 floats
+    constexpr int NSTG = (WTILE / 4 + THREADS - 1) / THREADS;  // 3
+
+    const int tl_s = (int)((long long)ntiles * bid / nblocks);
+    const int tl_e = (int)((long long)ntiles * (bid + 1) / nblocks);
+
+    __syncthreads();
+
+    for (int t = 0; t < horizon; ++t) {
+        const int do_respawn = (t > 0) ? flags[t - 1] : 0;
+        for (int tile = tl_s; tile < tl_e; ++tile) {
+            const int e0 = tile * TBM;
+            const bool full = (e0 + TBM <= N);
+            const bool vec4 = full && (N % 4) == 0;
+
+            // ---- E: respawn + obs (exclusive env ownership: rng writeback
+            //      here is race-free), then encoder straight into h_sh ------
+            if (tid < TBM) {
+                const int ge = e0 + tid;
+                float4 o = make_float4(0.f, 0.f, 0.f, 0.f);
+                if (ge < N) {
+                    int2 a = agent[ge];
+                    int2 f = food[ge];
+                    if (do_respawn) {
+                        unsigned long long r = rng[ge];
+                        r = lcg(r);
+                        int nfx = (int)(r % 11ULL);
+                        r = lcg(r);
+                        int nfy = (int)(r % 11ULL);
+                        rng[ge] = r;
+                        if (a.x == f.x && a.y == f.y) {
+                            f.x = nfx; f.y = nfy;
+                            food[ge] = f;
+                        }
+                    }
+                    o.x = (float)(f.x - a.x) / 11.0f;
+                    o.y = (float)(f.y - a.y) / 11.0f;
+                    o.z = (float)a.x / 10.0f;
+                    o.w = (float)a.y / 10.0f;
+                }
+                *(float4*)&obs_sh[tid * 4] = o;
+            }
+            __syncthreads();
+            {
+                const float4* w4 = (const float4*)wenc;
+                #pragma unroll
+                for (int s = 0; s < (HID * TBM) / THREADS; ++s) {
+                    const int idx = tid + s * THREADS;
+                    const int i = idx >> 5;   // TBM == 32
+                    const int e = idx & 31;
+                    float4 w = __ldg(&w4[i]);
+                    const float* o = &obs_sh[e * 4];
+                    h_sh[idx] = fmaf(w.x, o[0],
+                                fmaf(w.y, o[1],
+                                fmaf(w.z, o[2],
+                                fmaf(w.w, o[3], __ldg(&benc[i])))));
+                }
+            }
+            __syncthreads();
+
+            // ---- 3 MinGRU layers, fully block-local ----------------------
+            for (int l = 0; l < 3; ++l) {
+                float* __restrict__ state_l = state + (size_t)l * 256 * N;
+                float4 hn[2][2];   // deferred h_new (sub, u) for this thread
+                #pragma unroll
+                for (int sub = 0; sub < 2; ++sub) {
+                    const float* __restrict__ PWc =
+                        PWT + ((size_t)l * 768 + (size_t)sub * TBN) * 256;
+                    float acc[4][6];
+                    #pragma unroll
+                    for (int m = 0; m < 4; ++m)
+                        #pragma unroll
+                        for (int n = 0; n < 6; ++n) acc[m][n] = 0.0f;
+
+                    for (int k0 = 0; k0 < 256; k0 += TBK) {
+                        if (k0 == 0) {
+                            #pragma unroll
+                            for (int s = 0; s < NSTG; ++s) {
+                                int idx = tid + s * THREADS;
+                                if (idx < WTILE / 4) {
+                                    int c = idx / (TBK / 4);
+                                    int kq = (idx % (TBK / 4)) << 2;
+                                    cp_async16(&w2[c * TBK + kq],
+                                               &PWc[(size_t)c * 256 + kq]);
+                                }
+                            }
+                            cp_async_commit();
+                            cp_async_wait0();
+                            __syncthreads();
+                        }
+                        const float* wcur = w2 + ((k0 / TBK) & 1) * WTILE;
+                        float* wnxt = w2 + (((k0 / TBK) & 1) ^ 1) * WTILE;
+                        const bool has_next = (k0 + TBK) < 256;
+                        if (has_next) {
+                            #pragma unroll
+                            for (int s = 0; s < NSTG; ++s) {
+                                int idx = tid + s * THREADS;
+                                if (idx < WTILE / 4) {
+                                    int c = idx / (TBK / 4);
+                                    int kq = (idx % (TBK / 4)) << 2;
+                                    cp_async16(&wnxt[c * TBK + kq],
+                                               &PWc[(size_t)c * 256 + k0 + TBK + kq]);
+                                }
+                            }
+                            cp_async_commit();
+                        }
+                        #pragma unroll
+                        for (int kk = 0; kk < TBK; kk += 4) {
+                            float4 hk[4];
+                            #pragma unroll
+                            for (int q = 0; q < 4; ++q)
+                                hk[q] = *(const float4*)&h_sh[(k0 + kk + q) * TBM + tx * 4];
+                            float4 wn[6];
+                            #pragma unroll
+                            for (int n = 0; n < 6; ++n)
+                                wn[n] = *(const float4*)&wcur[(ty * 6 + n) * TBK + kk];
+                            #pragma unroll
+                            for (int q = 0; q < 4; ++q) {
+                                const float hv[4] = {hk[q].x, hk[q].y, hk[q].z, hk[q].w};
+                                #pragma unroll
+                                for (int n = 0; n < 6; ++n) {
+                                    const float w = (&wn[n].x)[q];
+                                    #pragma unroll
+                                    for (int m = 0; m < 4; ++m)
+                                        acc[m][n] = fmaf(hv[m], w, acc[m][n]);
+                                }
+                            }
+                        }
+                        if (has_next) cp_async_wait0();
+                        __syncthreads();
+                    }
+
+                    // epilogue: state out to global now; h_new parked in regs
+                    const int ebase = e0 + tx * 4;
+                    #pragma unroll
+                    for (int u = 0; u < 2; ++u) {
+                        const int i = sub * 128 + ty * 2 + u;
+                        const size_t base = (size_t)i * N + ebase;
+                        float4 st4;
+                        if (vec4) {
+                            st4 = *(const float4*)&state_l[base];
+                        } else {
+                            #pragma unroll
+                            for (int m = 0; m < 4; ++m)
+                                (&st4.x)[m] = (ebase + m < N) ? state_l[base + m] : 0.0f;
+                        }
+                        float4 h4 = *(const float4*)&h_sh[i * TBM + tx * 4];
+                        float4 o4, n4;
+                        #pragma unroll
+                        for (int m = 0; m < 4; ++m) {
+                            float zh = acc[m][u * 3 + 0];
+                            float zg = acc[m][u * 3 + 1];
+                            float zp = acc[m][u * 3 + 2];
+                            float st = (&st4.x)[m];
+                            float outv = st + sigf(zg) * (tanhf(zh) - st);
+                            float p = sigf(zp);
+                            (&o4.x)[m] = outv;
+                            (&n4.x)[m] = p * outv + (1.0f - p) * (&h4.x)[m];
+                        }
+                        if (vec4) {
+                            *(float4*)&state_l[base] = o4;
+                        } else {
+                            #pragma unroll
+                            for (int m = 0; m < 4; ++m)
+                                if (ebase + m < N) state_l[base + m] = (&o4.x)[m];
+                        }
+                        hn[sub][u] = n4;
+                    }
+                }
+                __syncthreads();   // everyone is done reading the old h_sh
+                #pragma unroll
+                for (int sub = 0; sub < 2; ++sub)
+                    #pragma unroll
+                    for (int u = 0; u < 2; ++u) {
+                        const int i = sub * 128 + ty * 2 + u;
+                        *(float4*)&h_sh[i * TBM + tx * 4] = hn[sub][u];
+                    }
+                __syncthreads();
+            }
+
+            // ---- logits from h_sh (k-sequential per output, same order as
+            //      the validated phase-H path), then the env step -----------
+            if (tid < 4 * TBM) {
+                const int e = tid & 31;
+                const int a = tid >> 5;
+                float accv = __ldg(&ba[a]);
+                const float* war = &wa[a * 256];
+                #pragma unroll 8
+                for (int k = 0; k < HID; ++k)
+                    accv = fmaf(h_sh[k * TBM + e], __ldg(&war[k]), accv);
+                logit_sh[a * TBM + e] = accv;
+            }
+            __syncthreads();
+            if (tid < TBM) {
+                const int ge = e0 + tid;
+                bool hit = false;
+                if (ge < N) {
+                    float a0 = logit_sh[0 * TBM + tid];
+                    float a1 = logit_sh[1 * TBM + tid];
+                    float a2 = logit_sh[2 * TBM + tid];
+                    float a3 = logit_sh[3 * TBM + tid];
+                    int act = 0;
+                    float best = a0;
+                    if (a1 > best) { best = a1; act = 1; }
+                    if (a2 > best) { best = a2; act = 2; }
+                    if (a3 > best) { best = a3; act = 3; }
+                    int2 a = agent[ge];
+                    int2 f = food[ge];
+                    int dx = (act == 2) ? -1 : (act == 3) ? 1 : 0;
+                    int dy = (act == 0) ? -1 : (act == 1) ? 1 : 0;
+                    a.x = min(10, max(0, a.x + dx));
+                    a.y = min(10, max(0, a.y + dy));
+                    agent[ge] = a;
+                    hit = (a.x == f.x) && (a.y == f.y);
+                    if (hit) rewards[ge] += 1.0f;
+                    if (t == horizon - 1) {
+                        lastlog[(size_t)ge * 4 + 0] = a0;
+                        lastlog[(size_t)ge * 4 + 1] = a1;
+                        lastlog[(size_t)ge * 4 + 2] = a2;
+                        lastlog[(size_t)ge * 4 + 3] = a3;
+                    }
+                }
+                unsigned b = __ballot_sync(0xffffffffu, hit);
+                if (b && tid == 0) atomicOr(&flags[t], 1);
+            }
+            __syncthreads();   // logit_sh/obs_sh reuse + h_sh done
+        }
+        if (t + 1 < horizon) grid_barrier(bar, nblocks, &lsense);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Simple API kernels (used by check.py's policy_forward / env_step probes).
+// h layout here: [N][256] row-major, state [N][3][256].
+// ---------------------------------------------------------------------------
+extern "C" __global__ void api_enc_kernel(int N,
+                                          const float* __restrict__ obs,
+                                          const float* __restrict__ wenc,
+                                          const float* __restrict__ benc,
+                                          float* __restrict__ h) {
+    int gid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (gid >= N * HID) return;
+    int e = gid / HID;
+    int i = gid - e * HID;
+    float4 w = __ldg(&((const float4*)wenc)[i]);
+    const float* o = &obs[e * 4];
+    h[gid] = fmaf(w.x, o[0], fmaf(w.y, o[1], fmaf(w.z, o[2], fmaf(w.w, o[3], benc[i]))));
+}
+
+extern "C" __global__ void api_gru_kernel(int N, int l,
+                                          const float* __restrict__ PW,
+                                          const float* __restrict__ state_in,
+                                          float* __restrict__ state_out,
+                                          float* __restrict__ h) {
+    const int e = blockIdx.x;
+    const int i = threadIdx.x;
+    __shared__ float hsh[HID];
+    hsh[i] = h[(size_t)e * HID + i];
+    __syncthreads();
+    const float* PWl = PW + (size_t)l * 256 * 768;
+    float zh = 0.0f, zg = 0.0f, zp = 0.0f;
+    #pragma unroll 8
+    for (int k = 0; k < HID; ++k) {
+        float hk = hsh[k];
+        const float* r = &PWl[(size_t)k * 768 + 3 * i];
+        zh = fmaf(hk, r[0], zh);
+        zg = fmaf(hk, r[1], zg);
+        zp = fmaf(hk, r[2], zp);
+    }
+    size_t si = (size_t)e * (3 * HID) + (size_t)l * HID + i;
+    float st = state_in[si];
+    float outv = st + sigf(zg) * (tanhf(zh) - st);
+    float p = sigf(zp);
+    float hnew = p * outv + (1.0f - p) * hsh[i];
+    state_out[si] = outv;
+    __syncthreads();
+    h[(size_t)e * HID + i] = hnew;
+}
+
+extern "C" __global__ void api_heads_kernel(int N,
+                                            const float* __restrict__ h,
+                                            const float* __restrict__ wa,
+                                            const float* __restrict__ ba,
+                                            const float* __restrict__ wv,
+                                            const float* __restrict__ bv,
+                                            float* __restrict__ logits,
+                                            float* __restrict__ value) {
+    const int e = blockIdx.x;
+    const int tidx = threadIdx.x;
+    __shared__ float hsh[HID];
+    __shared__ float red[HID];
+    hsh[tidx] = h[(size_t)e * HID + tidx];
+    __syncthreads();
+    for (int j = 0; j < 5; ++j) {
+        const float* w = (j < 4) ? &wa[j * HID] : wv;
+        red[tidx] = hsh[tidx] * w[tidx];
+        __syncthreads();
+        for (int s = HID / 2; s > 0; s >>= 1) {
+            if (tidx < s) red[tidx] += red[tidx + s];
+            __syncthreads();
+        }
+        if (tidx == 0) {
+            if (j < 4) logits[(size_t)e * 4 + j] = red[0] + ba[j];
+            else value[e] = red[0] + bv[0];
+        }
+        __syncthreads();
+    }
+}
+
+extern "C" __global__ void env_move_kernel(int N,
+                                           const float* __restrict__ agent_in,
+                                           const float* __restrict__ food,
+                                           const long long* __restrict__ actions,
+                                           float* __restrict__ agent_out,
+                                           float* __restrict__ reward,
+                                           int* __restrict__ flag) {
+    int e = blockIdx.x * blockDim.x + threadIdx.x;
+    if (e >= N) return;
+    long long act = actions[e];
+    float ax = agent_in[e * 2 + 0];
+    float ay = agent_in[e * 2 + 1];
+    float dx = (act == 2) ? -1.0f : (act == 3) ? 1.0f : 0.0f;
+    float dy = (act == 0) ? -1.0f : (act == 1) ? 1.0f : 0.0f;
+    ax = fminf(10.0f, fmaxf(0.0f, ax + dx));
+    ay = fminf(10.0f, fmaxf(0.0f, ay + dy));
+    agent_out[e * 2 + 0] = ax;
+    agent_out[e * 2 + 1] = ay;
+    bool hit = (ax == food[e * 2 + 0]) && (ay == food[e * 2 + 1]);
+    reward[e] = hit ? 1.0f : 0.0f;
+    if (hit) atomicOr(flag, 1);
+}
+
+extern "C" __global__ void env_respawn_kernel(int N,
+                                              const float* __restrict__ agent_out,
+                                              const float* __restrict__ food_in,
+                                              const long long* __restrict__ rng_in,
+                                              float* __restrict__ food_out,
+                                              long long* __restrict__ rng_out,
+                                              const int* __restrict__ flag) {
+    int e = blockIdx.x * blockDim.x + threadIdx.x;
+    if (e >= N) return;
+    float fx = food_in[e * 2 + 0];
+    float fy = food_in[e * 2 + 1];
+    if (*flag) {
+        unsigned long long r = (unsigned long long)rng_in[e];
+        r = lcg(r);
+        float nfx = (float)(r % 11ULL);
+        r = lcg(r);
+        float nfy = (float)(r % 11ULL);
+        rng_out[e] = (long long)r;
+        if (agent_out[e * 2 + 0] == fx && agent_out[e * 2 + 1] == fy) {
+            fx = nfx; fy = nfy;
+        }
+    } else {
+        rng_out[e] = rng_in[e];
+    }
+    food_out[e * 2 + 0] = fx;
+    food_out[e * 2 + 1] = fy;
+}
+
+// ---------------------------------------------------------------------------
+// Host wrappers
+// ---------------------------------------------------------------------------
+template <int BN, int NCHUNK, int TN, int BK, int HK, int MINB>
+static int rollout_grid_cap_t() {
+    static int cap = -1;
+    if (cap < 0) {
+        int smem_bytes = (HK * BM + 2 * BN * BK) * 4;
+        cudaFuncSetAttribute(rollout_kernel<BN, NCHUNK, TN, BK, HK, MINB>,
+                             cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes);
+        int nb = 0;
+        cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+            &nb, rollout_kernel<BN, NCHUNK, TN, BK, HK, MINB>, THREADS, smem_bytes);
+        int sms = 0;
+        cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, 0);
+        cap = nb * sms;
+        if (cap < 1) cap = 1;
+    }
+    return cap;
+}
+
+template <int BN, int NCHUNK, int TN, int BK, int HK, int MINB>
+static void rollout_launch(torch::Tensor& agent, torch::Tensor& food, torch::Tensor& rng,
+                           torch::Tensor& PWT, torch::Tensor& wenc, torch::Tensor& benc,
+                           torch::Tensor& wa, torch::Tensor& ba,
+                           torch::Tensor& state, torch::Tensor& Ha, torch::Tensor& Hb,
+                           torch::Tensor& rewards, torch::Tensor& lastlog,
+                           torch::Tensor& flags, torch::Tensor& bar,
+                           int N, int horizon) {
+    int smem_bytes = (HK * BM + 2 * BN * BK) * 4;
+    int ntiles = (N + BM - 1) / BM;
+    long long items = (long long)ntiles * NCHUNK;
+    int grid = rollout_grid_cap_t<BN, NCHUNK, TN, BK, HK, MINB>();
+    if (items < grid) grid = (int)items;
+    if (grid < 1) grid = 1;
+    auto stream = at::cuda::getCurrentCUDAStream();
+    rollout_kernel<BN, NCHUNK, TN, BK, HK, MINB><<<grid, THREADS, smem_bytes, stream>>>(
+        N, horizon, grid, ntiles,
+        PWT.data_ptr<float>(), wenc.data_ptr<float>(), benc.data_ptr<float>(),
+        wa.data_ptr<float>(), ba.data_ptr<float>(),
+        (int2*)agent.data_ptr<int>(), (int2*)food.data_ptr<int>(),
+        (unsigned long long*)rng.data_ptr<int64_t>(),
+        Ha.data_ptr<float>(), Hb.data_ptr<float>(), state.data_ptr<float>(),
+        rewards.data_ptr<float>(), lastlog.data_ptr<float>(),
+        flags.data_ptr<int>(), bar.data_ptr<int>());
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+static int tile_grid_cap() {
+    static int cap = -1;
+    if (cap < 0) {
+        int smem_bytes = (256 * TBM + 2 * TBN * TBK) * 4;
+        cudaFuncSetAttribute(rollout_tile_kernel,
+                             cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes);
+        int nb = 0;
+        cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+            &nb, rollout_tile_kernel, THREADS, smem_bytes);
+        int sms = 0;
+        cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, 0);
+        cap = nb * sms;
+        if (cap < 1) cap = 1;
+    }
+    return cap;
+}
+
+static void rollout_tile_launch(torch::Tensor& agent, torch::Tensor& food,
+                                torch::Tensor& rng, torch::Tensor& PWT,
+                                torch::Tensor& wenc, torch::Tensor& benc,
+                                torch::Tensor& wa, torch::Tensor& ba,
+                                torch::Tensor& state, torch::Tensor& rewards,
+                                torch::Tensor& lastlog, torch::Tensor& flags,
+                                torch::Tensor& bar, int N, int horizon) {
+    int smem_bytes = (256 * TBM + 2 * TBN * TBK) * 4;
+    int ntiles = (N + TBM - 1) / TBM;
+    int grid = tile_grid_cap();
+    if (ntiles < grid) grid = ntiles;
+    auto stream = at::cuda::getCurrentCUDAStream();
+    rollout_tile_kernel<<<grid, THREADS, smem_bytes, stream>>>(
+        N, horizon, grid, ntiles,
+        PWT.data_ptr<float>(), wenc.data_ptr<float>(), benc.data_ptr<float>(),
+        wa.data_ptr<float>(), ba.data_ptr<float>(),
+        (int2*)agent.data_ptr<int>(), (int2*)food.data_ptr<int>(),
+        (unsigned long long*)rng.data_ptr<int64_t>(),
+        state.data_ptr<float>(),
+        rewards.data_ptr<float>(), lastlog.data_ptr<float>(),
+        flags.data_ptr<int>(), bar.data_ptr<int>());
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+void rollout(torch::Tensor agent, torch::Tensor food, torch::Tensor rng,
+             torch::Tensor PWT, torch::Tensor wenc, torch::Tensor benc,
+             torch::Tensor wa, torch::Tensor ba,
+             torch::Tensor state, torch::Tensor Ha, torch::Tensor Hb,
+             torch::Tensor rewards, torch::Tensor lastlog, torch::Tensor flags,
+             torch::Tensor bar, int64_t N, int64_t horizon, int64_t variant) {
+    if (horizon <= 0) return;
+    int pick;  // 9 = tile-owner, 6/3/23 = legacy multi-phase
+    if (variant == 6 || variant == 3 || variant == 23 || variant == 9) {
+        pick = (int)variant;
+    } else if (N <= 4096) {
+        // tile-owner: block-local h, 1 barrier/step — wins at small N where
+        // the multi-phase kernels are barrier/launch-balance bound.
+        pick = 9;
+    } else {
+        // multi-phase auto: TN=6 has 4 items/tile; use it only when there are
+        // enough items for good wave balance, else the 8-chunk variant.
+        int ntiles = (int)((N + BM - 1) / BM);
+        int cap6 = rollout_grid_cap_t<192, 4, 6, 16, 256, 1>();
+        pick = ((long long)ntiles * 4 >= 2LL * cap6) ? 6 : 3;
+    }
+    if (pick == 9) {
+        rollout_tile_launch(agent, food, rng, PWT, wenc, benc, wa, ba,
+                            state, rewards, lastlog, flags, bar,
+                            (int)N, (int)horizon);
+        return;
+    }
+    if (pick == 6) {
+        rollout_launch<192, 4, 6, 16, 256, 1>(agent, food, rng, PWT, wenc, benc, wa, ba,
+                                              state, Ha, Hb, rewards, lastlog, flags, bar,
+                                              (int)N, (int)horizon);
+    } else if (pick == 23) {
+        rollout_launch<96, 8, 3, 16, 128, 2>(agent, food, rng, PWT, wenc, benc, wa, ba,
+                                             state, Ha, Hb, rewards, lastlog, flags, bar,
+                                             (int)N, (int)horizon);
+    } else {
+        rollout_launch<96, 8, 3, 32, 256, 1>(agent, food, rng, PWT, wenc, benc, wa, ba,
+                                             state, Ha, Hb, rewards, lastlog, flags, bar,
+                                             (int)N, (int)horizon);
+    }
+}
+
+std::vector<torch::Tensor> policy_fwd(torch::Tensor obs, torch::Tensor state,
+                                      torch::Tensor PW, torch::Tensor wenc,
+                                      torch::Tensor benc, torch::Tensor wa,
+                                      torch::Tensor ba, torch::Tensor wv,
+                                      torch::Tensor bv) {
+    const int N = (int)obs.size(0);
+    auto opts = obs.options();
+    auto h = torch::empty({N, HID}, opts);
+    auto new_state = torch::empty({N, 3, HID}, opts);
+    auto logits = torch::empty({N, 4}, opts);
+    auto value = torch::empty({N}, opts);
+    auto stream = at::cuda::getCurrentCUDAStream();
+    int blocks = (N * HID + THREADS - 1) / THREADS;
+    api_enc_kernel<<<blocks, THREADS, 0, stream>>>(
+        N, obs.data_ptr<float>(), wenc.data_ptr<float>(), benc.data_ptr<float>(),
+        h.data_ptr<float>());
+    for (int l = 0; l < 3; ++l) {
+        api_gru_kernel<<<N, HID, 0, stream>>>(
+            N, l, PW.data_ptr<float>(), state.data_ptr<float>(),
+            new_state.data_ptr<float>(), h.data_ptr<float>());
+    }
+    api_heads_kernel<<<N, HID, 0, stream>>>(
+        N, h.data_ptr<float>(), wa.data_ptr<float>(), ba.data_ptr<float>(),
+        wv.data_ptr<float>(), bv.data_ptr<float>(),
+        logits.data_ptr<float>(), value.data_ptr<float>());
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return {logits, new_state, value};
+}
+
+std::vector<torch::Tensor> env_step_cuda(torch::Tensor agent, torch::Tensor food,
+                                         torch::Tensor actions, torch::Tensor rng) {
+    const int N = (int)agent.size(0);
+    auto agent_out = torch::empty_like(agent);
+    auto food_out = torch::empty_like(food);
+    auto reward = torch::empty({N}, agent.options());
+    auto rng_out = torch::empty_like(rng);
+    auto flag = torch::zeros({1}, agent.options().dtype(torch::kInt32));
+    auto stream = at::cuda::getCurrentCUDAStream();
+    int blocks = (N + THREADS - 1) / THREADS;
+    env_move_kernel<<<blocks, THREADS, 0, stream>>>(
+        N, agent.data_ptr<float>(), food.data_ptr<float>(),
+        (const long long*)actions.data_ptr<int64_t>(),
+        agent_out.data_ptr<float>(), reward.data_ptr<float>(),
+        flag.data_ptr<int>());
+    env_respawn_kernel<<<blocks, THREADS, 0, stream>>>(
+        N, agent_out.data_ptr<float>(), food.data_ptr<float>(),
+        (const long long*)rng.data_ptr<int64_t>(),
+        food_out.data_ptr<float>(), (long long*)rng_out.data_ptr<int64_t>(),
+        flag.data_ptr<int>());
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return {agent_out, food_out, reward, rng_out};
+}
+"""
+
+_CPP_DECLS = r"""
+#include <torch/extension.h>
+#include <vector>
+void rollout(torch::Tensor agent, torch::Tensor food, torch::Tensor rng,
+             torch::Tensor PWT, torch::Tensor wenc, torch::Tensor benc,
+             torch::Tensor wa, torch::Tensor ba,
+             torch::Tensor state, torch::Tensor Ha, torch::Tensor Hb,
+             torch::Tensor rewards, torch::Tensor lastlog, torch::Tensor flags,
+             torch::Tensor bar, int64_t N, int64_t horizon, int64_t variant);
+std::vector<torch::Tensor> policy_fwd(torch::Tensor obs, torch::Tensor state,
+                                      torch::Tensor PW, torch::Tensor wenc,
+                                      torch::Tensor benc, torch::Tensor wa,
+                                      torch::Tensor ba, torch::Tensor wv,
+                                      torch::Tensor bv);
+std::vector<torch::Tensor> env_step_cuda(torch::Tensor agent, torch::Tensor food,
+                                         torch::Tensor actions, torch::Tensor rng);
+"""
+
+_ext = load_inline(
+    name="grid_mingru_sps_cuda",
+    cpp_sources=_CPP_DECLS,
+    cuda_sources=_CUDA_SRC,
+    functions=["rollout", "policy_fwd", "env_step_cuda"],
+    extra_cuda_cflags=["-O3", "--restrict"],
+    verbose=False,
+)
+
+
+class Model(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.w_enc = nn.Parameter(torch.empty(HIDDEN, OBS_DIM))
+        self.b_enc = nn.Parameter(torch.zeros(HIDDEN))
+        self.w_gru = nn.Parameter(torch.empty(GRU_LAYERS, GRU_OUT, HIDDEN))
+        self.w_a = nn.Parameter(torch.empty(NUM_ACTIONS, HIDDEN))
+        self.b_a = nn.Parameter(torch.zeros(NUM_ACTIONS))
+        self.w_v = nn.Parameter(torch.empty(1, HIDDEN))
+        self.b_v = nn.Parameter(torch.zeros(1))
+        self.reset_parameters(0)
+
+    def reset_parameters(self, seed: int = 0) -> None:
+        g = torch.Generator(device="cpu")
+        g.manual_seed(seed)
+        for p in self.parameters():
+            tmp = torch.empty(p.shape, dtype=p.dtype, device="cpu")
+            tmp.normal_(0.0, 0.02, generator=g)
+            p.data.copy_(tmp)
+
+    def forward(self, obs: torch.Tensor, state: torch.Tensor):
+        return policy_forward(self, obs, state)
+
+
+def _packed(model: Model, device: torch.device):
+    """Pack weights for the kernels; cached per parameter version."""
+    params = [model.w_enc, model.b_enc, model.w_gru, model.w_a, model.b_a,
+              model.w_v, model.b_v]
+    key = tuple(p._version for p in params) + tuple(p.data_ptr() for p in params)
+    cached = getattr(model, "_kb_packed", None)
+    if cached is not None and cached[0] == key:
+        return cached[1]
+    with torch.no_grad():
+        wg = model.w_gru.detach().to(device=device, dtype=torch.float32)
+        # PW[l][k][3*i+g] = w_gru[l][g*256+i][k]
+        pw = wg.view(3, 3, HIDDEN, HIDDEN).permute(0, 3, 2, 1).reshape(3, HIDDEN, GRU_OUT).contiguous()
+        pack = {
+            "PW": pw,
+            # transposed copy for the rollout kernel: [3][768][256], row j=3i+g
+            "PWT": pw.permute(0, 2, 1).contiguous(),
+            "wenc": model.w_enc.detach().to(device=device, dtype=torch.float32).contiguous(),
+            "benc": model.b_enc.detach().to(device=device, dtype=torch.float32).contiguous(),
+            "wa": model.w_a.detach().to(device=device, dtype=torch.float32).contiguous(),
+            "ba": model.b_a.detach().to(device=device, dtype=torch.float32).contiguous(),
+            "wv": model.w_v.detach().to(device=device, dtype=torch.float32).reshape(HIDDEN).contiguous(),
+            "bv": model.b_v.detach().to(device=device, dtype=torch.float32).contiguous(),
+        }
+    model._kb_packed = (key, pack)
+    return pack
+
+
+def policy_forward(model: Model, obs: torch.Tensor, state: torch.Tensor):
+    """obs (N,4), state (N,L,H) -> logits (N,4), new_state (N,L,H), value (N,)."""
+    device = obs.device
+    p = _packed(model, device)
+    obs_c = obs.detach().to(dtype=torch.float32).contiguous()
+    state_c = state.detach().to(dtype=torch.float32).contiguous()
+    logits, new_state, value = _ext.policy_fwd(
+        obs_c, state_c, p["PW"], p["wenc"], p["benc"], p["wa"], p["ba"],
+        p["wv"], p["bv"])
+    return logits, new_state, value
+
+
+def env_step(agent, food, actions, rng_state):
+    agent_c = agent.detach().to(dtype=torch.float32).contiguous()
+    food_c = food.detach().to(dtype=torch.float32).contiguous()
+    act_c = actions.detach().to(dtype=torch.int64).contiguous()
+    rng_c = rng_state.detach().contiguous()
+    a, f, r, rs = _ext.env_step_cuda(agent_c, food_c, act_c, rng_c)
+    return a, f, r, rs
+
+
+def run(num_envs: int, horizon: int, seed: int, model: Model | None = None) -> dict:
+    device = torch.device("cuda:0")
+    if model is None:
+        model = Model()
+    model = model.to(device).eval()
+    p = _packed(model, device)
+
+    g = torch.Generator(device="cpu")
+    g.manual_seed(seed)
+    agent = torch.randint(0, BOARD, (num_envs, 2), generator=g).to(torch.int32).to(device).contiguous()
+    food = torch.randint(0, BOARD, (num_envs, 2), generator=g).to(torch.int32).to(device).contiguous()
+    rng_state = torch.arange(num_envs, device=device, dtype=torch.int64) + (seed * 10007)
+
+    state = torch.zeros(3, HIDDEN, num_envs, device=device)
+    Ha = torch.empty(HIDDEN, num_envs, device=device)
+    Hb = torch.empty(HIDDEN, num_envs, device=device)
+    rewards = torch.zeros(num_envs, device=device)
+    last_logits = torch.zeros(num_envs, NUM_ACTIONS, device=device)
+    flags = torch.zeros(max(horizon, 1), device=device, dtype=torch.int32)
+    bar = torch.zeros(2, device=device, dtype=torch.int32)
+
+    variant = int(os.environ.get("KB_TN", "0"))
+    _ext.rollout(agent, food, rng_state, p["PWT"], p["wenc"], p["benc"],
+                 p["wa"], p["ba"], state, Ha, Hb, rewards, last_logits,
+                 flags, bar, num_envs, horizon, variant)
+
+    return {
+        "rewards": rewards,
+        "positions": agent.to(torch.int64),
+        "last_logits": last_logits,
+        "state": state.permute(2, 0, 1),
+    }
+
+
+if __name__ == "__main__":
+    out = run(4096, 32, 0)
+    torch.cuda.synchronize()
+    print("rewards mean:", out["rewards"].mean().item())
+    print("positions[:4]:", out["positions"][:4].tolist())
+    print("last_logits[0]:", out["last_logits"][0].tolist())

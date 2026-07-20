@@ -1,0 +1,338 @@
+"""Grouped GEMM + fused SwiGLU for the MoE up-projection (Triton, SM120).
+
+Design:
+  - One Triton kernel computes BOTH the gate and up GEMMs for a (BM x BN)
+    output tile, sharing the activation tile load (halves activation traffic
+    vs two separate GEMMs) and fusing the SwiGLU epilogue
+    silu(gate) * up directly into the store (no intermediate tensors).
+  - Two variants: a TMA one (cp.async.bulk.tensor descriptors, available on
+    SM120) and a pointer/cp.async one. The best variant + tile config per
+    canonical shape was measured end-to-end and recorded in _CONFIGS.
+  - Variable-length groups: rows [offsets[e], offsets[e+1]) belong to expert e.
+    A tiny prologue kernel computes the per-expert m-tile prefix sum on device
+    (single launch, no host sync); each GEMM program binary-searches it to
+    find its expert. The grid is an upper bound (cdiv(T_perm, BM) + E);
+    surplus programs exit early.
+  - The output is stored with a masked regular store so expert boundaries that
+    are not tile-aligned stay exact.
+  - fp32 accumulation, bf16 in/out.
+"""
+from __future__ import annotations
+
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+from triton.tools.tensor_descriptor import TensorDescriptor
+
+# (kind, BLOCK_M, BLOCK_N, BLOCK_K, GROUP_M, num_stages, num_warps)
+_DEFAULT_CONFIG = ("tma", 128, 64, 32, 8, 3, 4)
+# Keyed on (H, I, E); measured end-to-end per canonical shape.
+_CONFIGS: dict[tuple[int, int, int], tuple] = {
+    (4096, 1536, 128): ("ptr", 128, 64, 32, 8, 3, 4),
+    (2048, 1024, 64): ("ptr", 128, 64, 32, 8, 4, 8),
+    (2048, 4096, 64): ("ptr", 128, 64, 32, 4, 3, 4),
+}
+_FORCE_CONFIG: tuple | None = None  # tuning hook
+
+
+def set_config(cfg):
+    global _FORCE_CONFIG
+    _FORCE_CONFIG = cfg
+
+
+def candidate_configs():
+    return [
+        ("tma", 128, 64, 32, 8, 3, 4),
+        ("tma", 128, 64, 32, 8, 4, 4),
+        ("tma", 128, 64, 32, 8, 5, 8),
+        ("tma", 128, 64, 32, 4, 3, 4),
+        ("tma", 128, 64, 32, 16, 3, 4),
+        ("tma", 128, 128, 32, 8, 3, 8),
+        ("tma", 64, 64, 32, 8, 4, 4),
+        ("ptr", 128, 64, 32, 8, 3, 4),
+        ("ptr", 128, 64, 32, 8, 4, 8),
+        ("ptr", 128, 64, 32, 8, 5, 8),
+        ("ptr", 128, 128, 32, 8, 3, 8),
+        ("ptr", 64, 64, 32, 8, 4, 4),
+        ("ptr", 64, 64, 64, 8, 4, 4),
+    ]
+
+
+@triton.jit
+def _tile_cum_kernel(offs_ptr, tile_cum_ptr, E: tl.constexpr, BM: tl.constexpr,
+                     BLOCK_E: tl.constexpr):
+    """tile_cum[i] = sum_{e<i} ceil((offs[e+1]-offs[e]) / BM), single program."""
+    idx = tl.arange(0, BLOCK_E)
+    lo = tl.load(offs_ptr + idx, mask=idx < E, other=0)
+    hi = tl.load(offs_ptr + idx + 1, mask=idx < E, other=0)
+    mt = tl.where(idx < E, (hi - lo + BM - 1) // BM, 0)
+    cum = tl.cumsum(mt, 0)
+    tl.store(tile_cum_ptr, 0)
+    tl.store(tile_cum_ptr + 1 + idx, cum, mask=idx < E)
+
+
+@triton.jit
+def _grouped_swiglu_tma_kernel(
+    x_desc, wg_desc, wu_desc,
+    out_ptr,
+    offs_ptr, tile_cum_ptr,
+    H, I, E,
+    stride_om, stride_on,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    GROUP_M: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    num_pid_n = tl.cdiv(I, BLOCK_N)
+    total_m_tiles = tl.load(tile_cum_ptr + E)
+    if pid >= total_m_tiles * num_pid_n:
+        return
+
+    # Grouped swizzle over the (total_m_tiles, num_pid_n) tile space (L2 reuse).
+    num_pid_in_group = GROUP_M * num_pid_n
+    group_id = pid // num_pid_in_group
+    first_pid_m = group_id * GROUP_M
+    group_size_m = tl.minimum(total_m_tiles - first_pid_m, GROUP_M)
+    pid_m = first_pid_m + ((pid % num_pid_in_group) % group_size_m)
+    pid_n = (pid % num_pid_in_group) // group_size_m
+
+    # Binary search: expert e with tile_cum[e] <= pid_m < tile_cum[e+1].
+    lo = 0
+    hi = E
+    while lo + 1 < hi:
+        mid = (lo + hi) // 2
+        c = tl.load(tile_cum_ptr + mid)
+        if pid_m >= c:
+            lo = mid
+        else:
+            hi = mid
+    e = lo
+    tile_base = tl.load(tile_cum_ptr + e)
+    row_start = tl.load(offs_ptr + e)
+    row_end = tl.load(offs_ptr + e + 1)
+
+    m0 = row_start + (pid_m - tile_base) * BLOCK_M
+    n0 = pid_n * BLOCK_N
+
+    acc_g = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    acc_u = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    for k in range(0, tl.cdiv(H, BLOCK_K)):
+        a = x_desc.load([m0, k * BLOCK_K])
+        bg = wg_desc.load([e, k * BLOCK_K, n0]).reshape(BLOCK_K, BLOCK_N)
+        bu = wu_desc.load([e, k * BLOCK_K, n0]).reshape(BLOCK_K, BLOCK_N)
+        acc_g = tl.dot(a, bg, acc_g)
+        acc_u = tl.dot(a, bu, acc_u)
+
+    # SwiGLU epilogue in fp32, stored bf16. Masked store keeps arbitrary
+    # (non-tile-aligned) expert boundaries exact.
+    h = acc_g * tl.sigmoid(acc_g) * acc_u
+    rm = m0 + tl.arange(0, BLOCK_M)
+    rn = n0 + tl.arange(0, BLOCK_N)
+    out_ptrs = out_ptr + rm[:, None] * stride_om + rn[None, :] * stride_on
+    o_mask = (rm[:, None] < row_end) & (rn[None, :] < I)
+    tl.store(out_ptrs, h.to(tl.bfloat16), mask=o_mask)
+
+
+@triton.jit
+def _grouped_swiglu_ptr_kernel(
+    x_ptr, wg_ptr, wu_ptr,
+    out_ptr,
+    offs_ptr, tile_cum_ptr,
+    H, I, E,
+    stride_xm, stride_xk,
+    stride_we, stride_wk, stride_wn,
+    stride_om, stride_on,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    GROUP_M: tl.constexpr,
+    EVEN_K: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    num_pid_n = tl.cdiv(I, BLOCK_N)
+    total_m_tiles = tl.load(tile_cum_ptr + E)
+    if pid >= total_m_tiles * num_pid_n:
+        return
+
+    num_pid_in_group = GROUP_M * num_pid_n
+    group_id = pid // num_pid_in_group
+    first_pid_m = group_id * GROUP_M
+    group_size_m = tl.minimum(total_m_tiles - first_pid_m, GROUP_M)
+    pid_m = first_pid_m + ((pid % num_pid_in_group) % group_size_m)
+    pid_n = (pid % num_pid_in_group) // group_size_m
+
+    lo = 0
+    hi = E
+    while lo + 1 < hi:
+        mid = (lo + hi) // 2
+        c = tl.load(tile_cum_ptr + mid)
+        if pid_m >= c:
+            lo = mid
+        else:
+            hi = mid
+    e = lo
+    tile_base = tl.load(tile_cum_ptr + e)
+    row_start = tl.load(offs_ptr + e)
+    row_end = tl.load(offs_ptr + e + 1)
+
+    m0 = row_start + (pid_m - tile_base) * BLOCK_M
+    n0 = pid_n * BLOCK_N
+
+    rm = m0 + tl.arange(0, BLOCK_M)
+    rn = n0 + tl.arange(0, BLOCK_N)
+    rk = tl.arange(0, BLOCK_K)
+    a_mask = rm[:, None] < row_end
+    n_mask = rn[None, :] < I
+
+    a_ptrs = x_ptr + rm[:, None] * stride_xm + rk[None, :] * stride_xk
+    wg_ptrs = wg_ptr + e * stride_we + rk[:, None] * stride_wk + rn[None, :] * stride_wn
+    wu_ptrs = wu_ptr + e * stride_we + rk[:, None] * stride_wk + rn[None, :] * stride_wn
+
+    acc_g = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    acc_u = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    for k in range(0, tl.cdiv(H, BLOCK_K)):
+        if EVEN_K:
+            a = tl.load(a_ptrs, mask=a_mask, other=0.0)
+            bg = tl.load(wg_ptrs, mask=n_mask, other=0.0)
+            bu = tl.load(wu_ptrs, mask=n_mask, other=0.0)
+        else:
+            k_mask = rk < H - k * BLOCK_K
+            a = tl.load(a_ptrs, mask=a_mask & k_mask[None, :], other=0.0)
+            bg = tl.load(wg_ptrs, mask=k_mask[:, None] & n_mask, other=0.0)
+            bu = tl.load(wu_ptrs, mask=k_mask[:, None] & n_mask, other=0.0)
+        acc_g = tl.dot(a, bg, acc_g)
+        acc_u = tl.dot(a, bu, acc_u)
+        a_ptrs += BLOCK_K * stride_xk
+        wg_ptrs += BLOCK_K * stride_wk
+        wu_ptrs += BLOCK_K * stride_wk
+
+    h = acc_g * tl.sigmoid(acc_g) * acc_u
+    out_ptrs = out_ptr + rm[:, None] * stride_om + rn[None, :] * stride_on
+    o_mask = (rm[:, None] < row_end) & n_mask
+    tl.store(out_ptrs, h.to(tl.bfloat16), mask=o_mask)
+
+
+def _triton_alloc(size: int, align: int, stream):
+    return torch.empty(size, dtype=torch.int8, device="cuda")
+
+
+triton.set_allocator(_triton_alloc)
+
+
+class Model(nn.Module):
+    """Drop-in replacement for reference.Model (same params / interface)."""
+
+    def __init__(self, T_total: int, H: int, I: int, E: int, K: int):  # noqa: E741
+        super().__init__()
+        self.T_total = T_total
+        self.H = H
+        self.I = I
+        self.E = E
+        self.K = K
+        self.W_gate = nn.Parameter(torch.empty(E, H, I, dtype=torch.bfloat16))
+        self.W_up = nn.Parameter(torch.empty(E, H, I, dtype=torch.bfloat16))
+        nn.init.normal_(self.W_gate, std=0.02)
+        nn.init.normal_(self.W_up, std=0.02)
+        self._tile_cum: torch.Tensor | None = None
+        self._w_descs: tuple | None = None
+        self._x_desc: tuple | None = None
+
+    def _weight_descriptors(self, BK: int, BN: int):
+        # Descriptors depend only on the parameter storage + block shape;
+        # rebuild if the params were replaced/moved (load_state_dict / .to()).
+        key = (self.W_gate.data_ptr(), self.W_up.data_ptr(), BK, BN)
+        if self._w_descs is None or self._w_descs[0] != key:
+            wg_d = TensorDescriptor.from_tensor(self.W_gate.data, [1, BK, BN])
+            wu_d = TensorDescriptor.from_tensor(self.W_up.data, [1, BK, BN])
+            self._w_descs = (key, wg_d, wu_d)
+        return self._w_descs[1], self._w_descs[2]
+
+    def _x_descriptor(self, x: torch.Tensor, BM: int, BK: int):
+        # A descriptor is fully determined by (ptr, shape, strides, block), so
+        # caching on that key is exact; steady-state calls skip the ~20us
+        # host-side descriptor build.
+        key = (x.data_ptr(), x.shape, x.stride(), BM, BK)
+        if self._x_desc is None or self._x_desc[0] != key:
+            self._x_desc = (key, TensorDescriptor.from_tensor(x, [BM, BK]))
+        return self._x_desc[1]
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,   # (T_perm, H) bf16
+        expert_offsets: torch.Tensor,  # (E+1,) int32
+    ) -> torch.Tensor:
+        T_perm, H = hidden_states.shape
+        I, E = self.I, self.E  # noqa: E741
+        device = hidden_states.device
+        out = torch.empty(T_perm, I, dtype=torch.bfloat16, device=device)
+
+        cfg = _FORCE_CONFIG or _CONFIGS.get((H, I, E), _DEFAULT_CONFIG)
+        kind, BM, BN, BK, GM, ns, nw = cfg
+
+        offs = expert_offsets.to(device=device, dtype=torch.int32)
+        if self._tile_cum is None or self._tile_cum.device != device:
+            self._tile_cum = torch.empty(E + 1, dtype=torch.int32, device=device)
+        tile_cum = self._tile_cum
+        _tile_cum_kernel[(1,)](
+            offs, tile_cum, E=E, BM=BM,
+            BLOCK_E=triton.next_power_of_2(E),
+        )
+
+        max_m_tiles = triton.cdiv(T_perm, BM) + E
+        grid = (max_m_tiles * triton.cdiv(I, BN),)
+        if kind == "tma":
+            x_desc = self._x_descriptor(hidden_states, BM, BK)
+            wg_desc, wu_desc = self._weight_descriptors(BK, BN)
+            _grouped_swiglu_tma_kernel[grid](
+                x_desc, wg_desc, wu_desc, out, offs, tile_cum,
+                H, I, E,
+                out.stride(0), out.stride(1),
+                BLOCK_M=BM, BLOCK_N=BN, BLOCK_K=BK, GROUP_M=GM,
+                num_stages=ns, num_warps=nw,
+            )
+        else:
+            _grouped_swiglu_ptr_kernel[grid](
+                hidden_states, self.W_gate, self.W_up, out, offs, tile_cum,
+                H, I, E,
+                hidden_states.stride(0), hidden_states.stride(1),
+                self.W_gate.stride(0), self.W_gate.stride(1), self.W_gate.stride(2),
+                out.stride(0), out.stride(1),
+                BLOCK_M=BM, BLOCK_N=BN, BLOCK_K=BK, GROUP_M=GM,
+                EVEN_K=(H % BK == 0),
+                num_stages=ns, num_warps=nw,
+            )
+        return out
+
+
+# --- module-level shims mirrored from reference.py -------------------------
+T_total = 32768
+H = 4096
+I = 1536  # noqa: E741
+E = 128
+K = 8
+
+
+def _build_routing(T_total: int, E: int, K: int, device: str = "cpu") -> torch.Tensor:
+    T_perm = T_total * K
+    base = T_perm // E
+    rem = T_perm - base * E
+    counts = torch.full((E,), base, dtype=torch.int32, device=device)
+    counts[:rem] += 1
+    offsets = torch.zeros(E + 1, dtype=torch.int32, device=device)
+    offsets[1:] = torch.cumsum(counts, dim=0)
+    return offsets
+
+
+def get_inputs():
+    T_perm = T_total * K
+    hidden_states = torch.randn(T_perm, H, dtype=torch.bfloat16) * 0.1
+    expert_offsets = _build_routing(T_total, E, K)
+    return [hidden_states, expert_offsets]
+
+
+def get_init_inputs():
+    return [T_total, H, I, E, K]

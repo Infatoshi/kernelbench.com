@@ -1,0 +1,505 @@
+"""Custom paged-attention decode kernel for RTX PRO 6000 (SM120 Blackwell).
+
+Design (vLLM/FlashDecoding-style, GQA-aware):
+  * One CTA per (batch, kv_head, seq_split). All G = H/Hkv query heads that
+    share a kv head are processed by the same CTA, so the KV cache is streamed
+    from DRAM exactly once (decode is bandwidth-bound; this is the whole game).
+  * The sequence is processed in 16-token tiles. Each tile's packed [K|V] rows
+    (contiguous 2*D bf16 per token for our kv head) are staged into shared
+    memory with cp.async, double-buffered so the next tile's loads overlap the
+    current tile's math.
+  * Online softmax in fp32 (running max / running sum per head), scores and
+    the P*V accumulation in fp32, output cast to bf16.
+  * Split-K over the sequence gives enough CTAs to fill 188 SMs when
+    batch*num_kv_heads is small; a tiny reduce kernel merges the per-split
+    partial (m, l, acc) triples. When splits == 1 the main kernel writes the
+    final output directly and the reduce kernel is skipped.
+  * When the KV stream is bigger than the 96 MB L2, cp.async carries an
+    evict-first L2 policy (inline PTX createpolicy/cache_hint) so the one-shot
+    KV lines don't thrash the cache (+15% on the largest shape).
+  * Launch overhead (two kernels + pybind arg parsing) is a real fraction of
+    the 35-50 us shapes, so forward() replays a captured CUDA graph keyed on
+    the input data pointers; replay re-reads live buffers, so in-place input
+    updates are honored, and any pointer/config change falls back to an eager
+    launch.
+"""
+
+import math
+import os
+
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+OP_TYPE = "attention"
+SUPPORTED_PRECISIONS = ["bf16"]
+HARDWARE_REQUIRED = ["RTX_PRO_6000", "H100", "B200"]
+
+os.environ.setdefault("TORCH_CUDA_ARCH_LIST", "12.0")
+
+_CUDA_SRC = r"""
+#include <torch/extension.h>
+#include <ATen/cuda/CUDAContext.h>
+#include <cuda_bf16.h>
+#include <cuda_pipeline.h>
+#include <math_constants.h>
+
+using bf16 = __nv_bfloat16;
+
+// ---------------------------------------------------------------------------
+// Main kernel: one CTA per (split, kv_head, batch).
+// Template on head_dim D and GQA group size G. NT = max(D, 16*G) threads.
+//   * threads [0, 16*G): score role, thread = (g, t) = (tid/16, tid%16)
+//   * threads [0, D):    value-accum role, thread owns output dim d = tid
+// Shared memory carve:
+//   kv tiles  : 2 buffers x 16 tokens x (2*D + 8) bf16 (row-padded, 16B align)
+//   qs        : G*D fp32 (query pre-scaled by 1/sqrt(D))
+//   probs     : G*16 fp32
+//   salpha    : G fp32 (per-page softmax rescale factor)
+//   sml       : G*2 fp32 (final running max / sum handoff)
+// ---------------------------------------------------------------------------
+
+template <int D, int G, int STAGES, bool EF>
+__global__ void paged_decode_kernel(
+    const bf16* __restrict__ q,          // (B, H, D)
+    const bf16* __restrict__ kv,         // (nblocks, P, Hkv, 2*D)
+    const int*  __restrict__ block_table, // (B, W)
+    const int*  __restrict__ seq_lens,   // (B,)
+    bf16* __restrict__ out,              // (B, H, D)
+    float* __restrict__ pacc,            // (B, H, S, D)
+    float* __restrict__ pml,             // (B, H, S, 2)
+    int W, int Hkv, int P, int S, float scale)
+{
+    constexpr int NTR = (D > 16 * G) ? D : 16 * G;   // role threads
+    constexpr int NT = NTR < 128 ? 128 : NTR;        // CTA size (>=128 for loads)
+    constexpr int KSTRIDE = 2 * D + 8;      // bf16 elems per shared kv row
+    constexpr int CPT = (2 * D) / 8;        // 16B chunks per token row
+
+    const int split = blockIdx.x;
+    const int h     = blockIdx.y;           // kv head
+    const int b     = blockIdx.z;
+    const int tid   = threadIdx.x;
+    const int H     = Hkv * G;
+
+    extern __shared__ char smem_raw[];
+    bf16*  kvs    = reinterpret_cast<bf16*>(smem_raw);              // STAGES*16*KSTRIDE
+    float* qs     = reinterpret_cast<float*>(smem_raw + STAGES * 16 * KSTRIDE * sizeof(bf16));
+    float* probs  = qs + G * D;
+    float* salpha = probs + G * 16;
+    float* sml    = salpha + G;
+
+    const int L = seq_lens[b];
+    const int ntiles = (L + 15) >> 4;
+    const int tps = (ntiles + S - 1) / S;
+    const int tile_lo = split * tps;
+    const int tile_hi = min(tile_lo + tps, ntiles);
+
+    if (tile_lo >= tile_hi) {
+        // Empty split: publish sentinel so the reduce kernel skips it.
+        if (S > 1) {
+            if (tid < G) {
+                long base = (((long)b * H + h * G + tid) * S + split) * 2;
+                pml[base + 0] = -CUDART_INF_F;
+                pml[base + 1] = 0.f;
+            }
+        } else if (tid < D) {
+            for (int g = 0; g < G; ++g)
+                out[((long)b * H + h * G + g) * D + tid] = __float2bfloat16(0.f);
+        }
+        return;
+    }
+
+    // Load Q for the group, pre-scaled, fp32.
+    for (int i = tid; i < G * D; i += NT) {
+        int g = i / D, d = i % D;
+        qs[i] = __bfloat162float(q[((long)b * H + h * G + g) * D + d]) * scale;
+    }
+    __syncthreads();
+
+    const long rowW = (long)Hkv * 2 * D;     // kv row stride in elems (per token slot)
+    const long hoff = (long)h * 2 * D;
+
+    auto issue_tile = [&](int tile, int buf) {
+        const int tstart = tile << 4;
+        bf16* dstbase = kvs + buf * 16 * KSTRIDE;
+        for (int c = tid; c < 16 * CPT; c += NT) {
+            int t = c / CPT, off = c % CPT;
+            int tok = tstart + t;
+            int tok_c = min(tok, L - 1);          // clamp masked tail to a valid token
+            int pidx = min(tok_c / P, W - 1);
+            int page = __ldg(&block_table[(long)b * W + pidx]);
+            int slot = tok_c % P;
+            const bf16* src = kv + ((long)page * P + slot) * rowW + hoff + off * 8;
+            if (EF) {
+                // Streaming KV: mark evict-first in L2 so one-shot lines don't
+                // force extra writebacks of the (dirty) resident working set.
+                unsigned ds = (unsigned)__cvta_generic_to_shared(
+                    dstbase + t * KSTRIDE + off * 8);
+                asm volatile(
+                    "{\n"
+                    "  .reg .b64 pol;\n"
+                    "  createpolicy.fractional.L2::evict_first.b64 pol, 1.0;\n"
+                    "  cp.async.cg.shared.global.L2::cache_hint [%0], [%1], 16, pol;\n"
+                    "}\n" :: "r"(ds), "l"(src));
+            } else {
+                __pipeline_memcpy_async(dstbase + t * KSTRIDE + off * 8, src, 16);
+            }
+        }
+        __pipeline_commit();
+    };
+
+#pragma unroll
+    for (int i = 0; i < STAGES - 1; ++i)
+        if (tile_lo + i < tile_hi) issue_tile(tile_lo + i, i);
+
+    float m = -CUDART_INF_F;
+    float l = 0.f;
+    float acc[G];
+#pragma unroll
+    for (int g = 0; g < G; ++g) acc[g] = 0.f;
+
+    const int g_s = tid >> 4;   // score-role head
+    const int t_s = tid & 15;   // score-role token lane
+
+    for (int tile = tile_lo; tile < tile_hi; ++tile) {
+        const int buf = (tile - tile_lo) % STAGES;
+        if (tile + STAGES - 1 < tile_hi)
+            issue_tile(tile + STAGES - 1, (tile - tile_lo + STAGES - 1) % STAGES);
+        const int outstanding = min(tile_hi - tile - 1, STAGES - 1);
+        __pipeline_wait_prior(outstanding);
+        __syncthreads();
+
+        if (tid < 16 * G) {
+            const int tok = (tile << 4) + t_s;
+            float s = -CUDART_INF_F;
+            if (tok < L) {
+                const bf16* krow = kvs + buf * 16 * KSTRIDE + t_s * KSTRIDE;
+                const float* qrow = qs + g_s * D;
+                float dot = 0.f;
+#pragma unroll
+                for (int d = 0; d < D; d += 2) {
+                    float2 kf = __bfloat1622float2(
+                        *reinterpret_cast<const __nv_bfloat162*>(krow + d));
+                    dot += qrow[d] * kf.x + qrow[d + 1] * kf.y;
+                }
+                s = dot;
+            }
+            float tmax = s;
+#pragma unroll
+            for (int o = 8; o > 0; o >>= 1)
+                tmax = fmaxf(tmax, __shfl_xor_sync(0xffffffffu, tmax, o, 16));
+            const float mnew = fmaxf(m, tmax);
+            const float p = (tok < L) ? __expf(s - mnew) : 0.f;
+            float psum = p;
+#pragma unroll
+            for (int o = 8; o > 0; o >>= 1)
+                psum += __shfl_xor_sync(0xffffffffu, psum, o, 16);
+            const float alpha = __expf(m - mnew);
+            l = l * alpha + psum;
+            m = mnew;
+            probs[g_s * 16 + t_s] = p;
+            if (t_s == 0) salpha[g_s] = alpha;
+        }
+        __syncthreads();
+
+        if (tid < D) {
+            const bf16* vbase = kvs + buf * 16 * KSTRIDE + D + tid;
+#pragma unroll
+            for (int g = 0; g < G; ++g) {
+                float sum = 0.f;
+#pragma unroll
+                for (int t = 0; t < 16; ++t)
+                    sum += probs[g * 16 + t] * __bfloat162float(vbase[t * KSTRIDE]);
+                acc[g] = acc[g] * salpha[g] + sum;
+            }
+        }
+        __syncthreads();
+    }
+
+    if (tid < 16 * G && t_s == 0) {
+        sml[g_s * 2 + 0] = m;
+        sml[g_s * 2 + 1] = l;
+    }
+    __syncthreads();
+
+    if (S == 1) {
+        if (tid < D) {
+#pragma unroll
+            for (int g = 0; g < G; ++g) {
+                const float lg = sml[g * 2 + 1];
+                const float o = lg > 0.f ? acc[g] / lg : 0.f;
+                out[((long)b * H + h * G + g) * D + tid] = __float2bfloat16(o);
+            }
+        }
+    } else {
+        if (tid < D) {
+#pragma unroll
+            for (int g = 0; g < G; ++g)
+                pacc[(((long)b * H + h * G + g) * S + split) * D + tid] = acc[g];
+        }
+        if (tid < G) {
+            long base = (((long)b * H + h * G + tid) * S + split) * 2;
+            pml[base + 0] = sml[tid * 2 + 0];
+            pml[base + 1] = sml[tid * 2 + 1];
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Split-K reduce: one CTA per (batch*head), D threads.
+// ---------------------------------------------------------------------------
+__global__ void paged_reduce_kernel(
+    const float* __restrict__ pacc,   // (BH, S, D)
+    const float* __restrict__ pml,    // (BH, S, 2)
+    bf16* __restrict__ out,           // (BH, D)
+    int S, int D)
+{
+    const long bh = blockIdx.x;
+    const int d = threadIdx.x;
+
+    float M = -CUDART_INF_F;
+    for (int s = 0; s < S; ++s)
+        M = fmaxf(M, pml[(bh * S + s) * 2]);
+    if (M == -CUDART_INF_F) {
+        out[bh * D + d] = __float2bfloat16(0.f);
+        return;
+    }
+    float Lsum = 0.f;
+    for (int s = 0; s < S; ++s) {
+        const float ms = pml[(bh * S + s) * 2];
+        if (ms == -CUDART_INF_F) continue;
+        Lsum += pml[(bh * S + s) * 2 + 1] * __expf(ms - M);
+    }
+    float o = 0.f;
+    for (int s = 0; s < S; ++s) {
+        const float ms = pml[(bh * S + s) * 2];
+        if (ms == -CUDART_INF_F) continue;
+        o += pacc[(bh * S + s) * D + d] * __expf(ms - M);
+    }
+    out[bh * D + d] = __float2bfloat16(Lsum > 0.f ? o / Lsum : 0.f);
+}
+
+// ---------------------------------------------------------------------------
+
+template <int D, int G>
+void launch_typed(
+    const bf16* q, const bf16* kv, const int* bt, const int* sl,
+    bf16* out, float* pacc, float* pml,
+    int B, int Hkv, int W, int P, int S, float scale, int stages, bool ef,
+    cudaStream_t stream)
+{
+    constexpr int NTR = (D > 16 * G) ? D : 16 * G;
+    constexpr int NT = NTR < 128 ? 128 : NTR;
+    constexpr int KSTRIDE = 2 * D + 8;
+    dim3 grid(S, Hkv, B);
+#define LAUNCH(ST, EFV)                                                       \
+    {                                                                         \
+        const int smem = ST * 16 * KSTRIDE * sizeof(bf16)                     \
+                       + (G * D + G * 16 + G + G * 2) * sizeof(float);        \
+        paged_decode_kernel<D, G, ST, EFV><<<grid, NT, smem, stream>>>(       \
+            q, kv, bt, sl, out, pacc, pml, W, Hkv, P, S, scale);              \
+    }
+    if (stages == 3) { if (ef) LAUNCH(3, true) else LAUNCH(3, false) }
+    else             { if (ef) LAUNCH(2, true) else LAUNCH(2, false) }
+#undef LAUNCH
+    if (S > 1) {
+        paged_reduce_kernel<<<B * Hkv * G, D, 0, stream>>>(pacc, pml, out, S, D);
+    }
+}
+
+void paged_attention_forward(
+    torch::Tensor query, torch::Tensor kv_cache, torch::Tensor block_table,
+    torch::Tensor seq_lens, torch::Tensor out, torch::Tensor pacc,
+    torch::Tensor pml, int64_t num_kv_heads, int64_t page_size,
+    int64_t num_splits, double scale, int64_t stages, bool ef)
+{
+    TORCH_CHECK(query.is_cuda() && query.dtype() == torch::kBFloat16);
+    TORCH_CHECK(kv_cache.is_cuda() && kv_cache.dtype() == torch::kBFloat16);
+    TORCH_CHECK(block_table.dtype() == torch::kInt32);
+    TORCH_CHECK(seq_lens.dtype() == torch::kInt32);
+    TORCH_CHECK(query.is_contiguous() && kv_cache.is_contiguous());
+    TORCH_CHECK(block_table.is_contiguous() && seq_lens.is_contiguous());
+
+    const int B = query.size(0);
+    const int H = query.size(1);
+    const int D = query.size(2);
+    const int Hkv = (int)num_kv_heads;
+    const int G = H / Hkv;
+    const int W = block_table.size(1);
+    const int P = (int)page_size;
+    const int S = (int)num_splits;
+
+    auto stream = at::cuda::getCurrentCUDAStream();
+    const bf16* qp = reinterpret_cast<const bf16*>(query.data_ptr());
+    const bf16* kvp = reinterpret_cast<const bf16*>(kv_cache.data_ptr());
+    const int* btp = block_table.data_ptr<int>();
+    const int* slp = seq_lens.data_ptr<int>();
+    bf16* outp = reinterpret_cast<bf16*>(out.data_ptr());
+    float* paccp = pacc.data_ptr<float>();
+    float* pmlp = pml.data_ptr<float>();
+
+#define DISPATCH_G(DD)                                                        \
+    switch (G) {                                                              \
+        case 1:  launch_typed<DD, 1>(qp, kvp, btp, slp, outp, paccp, pmlp, B, Hkv, W, P, S, (float)scale, (int)stages, ef, stream); break; \
+        case 2:  launch_typed<DD, 2>(qp, kvp, btp, slp, outp, paccp, pmlp, B, Hkv, W, P, S, (float)scale, (int)stages, ef, stream); break; \
+        case 4:  launch_typed<DD, 4>(qp, kvp, btp, slp, outp, paccp, pmlp, B, Hkv, W, P, S, (float)scale, (int)stages, ef, stream); break; \
+        case 8:  launch_typed<DD, 8>(qp, kvp, btp, slp, outp, paccp, pmlp, B, Hkv, W, P, S, (float)scale, (int)stages, ef, stream); break; \
+        case 16: launch_typed<DD, 16>(qp, kvp, btp, slp, outp, paccp, pmlp, B, Hkv, W, P, S, (float)scale, (int)stages, ef, stream); break; \
+        default: TORCH_CHECK(false, "unsupported GQA group size ", G);        \
+    }
+
+    if (D == 128) { DISPATCH_G(128) }
+    else if (D == 64) { DISPATCH_G(64) }
+    else { TORCH_CHECK(false, "unsupported head_dim ", D); }
+#undef DISPATCH_G
+}
+"""
+
+_CPP_SRC = """
+#include <torch/extension.h>
+void paged_attention_forward(
+    torch::Tensor query, torch::Tensor kv_cache, torch::Tensor block_table,
+    torch::Tensor seq_lens, torch::Tensor out, torch::Tensor pacc,
+    torch::Tensor pml, int64_t num_kv_heads, int64_t page_size,
+    int64_t num_splits, double scale, int64_t stages, bool ef);
+"""
+
+_ext = load_inline(
+    name="paged_attn_sm120_v5",
+    cpp_sources=_CPP_SRC,
+    cuda_sources=_CUDA_SRC,
+    functions=["paged_attention_forward"],
+    extra_cuda_cflags=["-O3", "--extra-device-vectorization"],
+    extra_cflags=["-O3"],
+    verbose=False,
+)
+
+
+class Model(nn.Module):
+    """Single-query paged attention decode (custom CUDA kernel)."""
+
+    def __init__(
+        self,
+        batch: int,
+        num_heads: int,
+        num_kv_heads: int,
+        head_dim: int,
+        seq_len: int,
+        page_size: int,
+    ):
+        super().__init__()
+        assert num_heads % num_kv_heads == 0
+        self.batch = batch
+        self.num_heads = num_heads
+        self.num_kv_heads = num_kv_heads
+        self.head_dim = head_dim
+        self.seq_len = seq_len
+        self.page_size = page_size
+        self.group_size = num_heads // num_kv_heads
+        self.scale = 1.0 / math.sqrt(head_dim)
+
+        # Split-K factor: enough CTAs (batch * kv_heads * splits) to cover the
+        # 188 SMs a few times, bounded by the number of 16-token tiles.
+        # Targets tuned by sweep on RTX PRO 6000 (D=64 CTAs are smaller, so a
+        # denser grid wins; very wide batches still profit from a few splits).
+        tiles = max(1, (seq_len + 15) // 16)
+        bh = batch * num_kv_heads
+        s = max(1, -(-512 // bh))
+        if bh >= 256 and tiles >= 64:
+            s = max(s, 7)
+        self.num_splits = int(min(s, tiles))
+        self.stages = 2
+        # Evict-first L2 policy pays off when the KV stream exceeds L2 (96 MB):
+        # +15% on the large-KV shapes, neutral/slightly negative when KV fits.
+        kv_bytes = 2 * batch * seq_len * num_kv_heads * head_dim * 2
+        self.evict_first = kv_bytes > 96 * 1024 * 1024
+
+        self._pacc = None
+        self._pml = None
+        self._out = None
+        # CUDA-graph replay cache: keyed on input data pointers. Replay
+        # re-reads the live input buffers, so in-place updates to query /
+        # kv_cache between calls are always honored; any pointer or config
+        # change falls back to a fresh eager launch (and possible recapture).
+        self._graphs = {}
+        self._warmed = set()
+
+        self.register_buffer("_dummy", torch.zeros(1, dtype=torch.bfloat16), persistent=False)
+
+    def _workspace(self, device):
+        if (
+            self._pacc is None
+            or self._pacc.device != device
+            or self._pacc.numel()
+            != self.batch * self.num_heads * self.num_splits * self.head_dim
+        ):
+            B, H, D, S = self.batch, self.num_heads, self.head_dim, self.num_splits
+            self._pacc = torch.empty(B * H * S * D, dtype=torch.float32, device=device)
+            self._pml = torch.empty(B * H * S * 2, dtype=torch.float32, device=device)
+            self._out = torch.empty(B, H, D, dtype=torch.bfloat16, device=device)
+        return self._pacc, self._pml, self._out
+
+    def forward(
+        self,
+        query: torch.Tensor,
+        kv_cache: torch.Tensor,
+        block_table: torch.Tensor,
+        seq_lens: torch.Tensor,
+    ) -> torch.Tensor:
+        pacc, pml, out = self._workspace(query.device)
+        if out.shape != query.shape or out.device != query.device:
+            out = torch.empty_like(query)
+            _ext.paged_attention_forward(
+                query, kv_cache, block_table, seq_lens, out, pacc, pml,
+                self.num_kv_heads, self.page_size, self.num_splits, self.scale,
+                self.stages, self.evict_first,
+            )
+            return out
+
+        key = (
+            query.data_ptr(), kv_cache.data_ptr(), block_table.data_ptr(),
+            seq_lens.data_ptr(), tuple(kv_cache.shape), tuple(block_table.shape),
+            self.num_splits, self.stages, self.evict_first, pacc.data_ptr(),
+        )
+        graph = self._graphs.get(key)
+        if graph is not None:
+            graph.replay()
+            return out
+        if key in self._warmed and len(self._graphs) < 8:
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                _ext.paged_attention_forward(
+                    query, kv_cache, block_table, seq_lens, out, pacc, pml,
+                    self.num_kv_heads, self.page_size, self.num_splits,
+                    self.scale, self.stages, self.evict_first,
+                )
+            self._graphs[key] = graph
+            graph.replay()
+            return out
+        if len(self._warmed) < 64:
+            self._warmed.add(key)
+        _ext.paged_attention_forward(
+            query, kv_cache, block_table, seq_lens, out, pacc, pml,
+            self.num_kv_heads, self.page_size, self.num_splits, self.scale,
+            self.stages, self.evict_first,
+        )
+        return out
+
+
+# Module-level shape knobs mirroring reference.py (check/benchmark override these).
+BATCH = 8
+NUM_HEADS = 32
+NUM_KV_HEADS = 8
+HEAD_DIM = 128
+SEQ_LEN = 1024
+PAGE_SIZE = 16
+
+
+def get_inputs():
+    import reference
+
+    return reference.get_inputs()
+
+
+def get_init_inputs():
+    return [BATCH, NUM_HEADS, NUM_KV_HEADS, HEAD_DIM, SEQ_LEN, PAGE_SIZE]

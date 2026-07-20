@@ -1,0 +1,254 @@
+"""Custom Triton paged-attention decode kernel (memory-bound, single-query).
+
+Design
+------
+Decode is bandwidth-bound: the KV cache must be streamed end-to-end once.  We
+launch ONE program per (batch element, KV head) and walk the pages of sequence
+b via block_table, reading each KV token exactly once and running a FlashAttention
+style *online softmax* so K and V are consumed in a single streaming pass.  A
+single (b, hkv) program owns the group of G = num_heads / num_kv_heads query
+heads that share that KV head, so KV is fetched exactly once regardless of the
+GQA ratio (matching problem.yaml's minimal bytes_formula).
+
+To hide memory latency when the batch is small, each sequence is optionally
+split across several programs (FlashDecoding): kernel 1 produces, per (b, hkv,
+split), a *partial* (running max, normalizer, weighted sum) over its page range;
+kernel 2 combines the partials with the online-softmax combine rule.  This keeps
+the GPU's SMs saturated even for batch=4 / long context.
+
+KV cache layout: (num_blocks, page_size, num_kv_heads, 2 * head_dim) with the
+last dim packing [K | V], so a single gather pulls both halves.
+
+Triton notes (learned the hard way on this build):
+  * A tl.dot whose contraction dimension is not stride-1 contiguous in memory
+    HANGS on Hopper.  The token dimension is strided (stride 2048) in this KV
+    layout, so the V aggregation is done as a broadcast-multiply + sum over
+    tokens (reads V contiguously per token) instead of a tl.dot.
+  * A combined (row & col) store mask HANGS on this build; a row-only mask is
+    used (BLOCK_D == D always, so no column masking is needed).
+  * The MMA requires the leading (query-head) dimension to be a multiple of 16,
+    so BLOCK_G is rounded up to 16 and padding rows are reset every step.
+"""
+import math
+
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def _decode_split_kernel(
+    Q, KV, BLOCK_TABLE, M_PART, L_PART, A_PART, SEQ_LENS,
+    # kv strides
+    stride_kv_b, stride_kv_p, stride_kv_h, stride_kv_d,
+    # q strides
+    stride_q_b, stride_q_h, stride_q_d,
+    # partial strides: (B, Hkv, num_splits, ...)
+    stride_m_b, stride_m_h, stride_m_s, stride_m_g,
+    stride_l_b, stride_l_h, stride_l_s, stride_l_g,
+    stride_a_b, stride_a_h, stride_a_s, stride_a_g, stride_a_d,
+    stride_bt_b, stride_bt_p,
+    scale,
+    B, HKV, G, P, D, num_splits, pages_per_split, num_pages,
+    BLOCK_D: tl.constexpr,
+    BLOCK_G: tl.constexpr,
+    GROUP: tl.constexpr,
+    PAGE: tl.constexpr,
+    NEG_INF: tl.constexpr,
+):
+    pid_b = tl.program_id(0)
+    pid_hkv = tl.program_id(1)
+    pid_split = tl.program_id(2)
+
+    seqlen = tl.load(SEQ_LENS + pid_b).to(tl.int32)
+    num_pages = num_pages  # python int passed in
+
+    start = pid_split * pages_per_split
+    end = start + pages_per_split
+    if end > num_pages:
+        end = num_pages
+
+    offs_g = tl.arange(0, BLOCK_G)
+    offs_d = tl.arange(0, BLOCK_D)
+    keep = offs_g < GROUP
+
+    # Load Q for the G query heads mapped to this KV head.
+    q_ptr = Q + pid_b * stride_q_b + pid_hkv * GROUP * stride_q_h
+    Qg = tl.load(q_ptr + offs_g[:, None] * stride_q_h + offs_d[None, :] * stride_q_d,
+                 mask=(offs_g[:, None] < GROUP), other=0.0).to(tl.float32)
+
+    m = tl.full((BLOCK_G,), NEG_INF, dtype=tl.float32)
+    lsum = tl.zeros((BLOCK_G,), dtype=tl.float32)
+    acc = tl.zeros((BLOCK_G, BLOCK_D), dtype=tl.float32)
+
+    offs_p = tl.arange(0, PAGE)
+
+    for page in range(start, end):
+        blk = tl.load(BLOCK_TABLE + pid_b * stride_bt_b + page * stride_bt_p).to(tl.int32)
+        kv_base = KV + blk * stride_kv_b + pid_hkv * stride_kv_h
+        k_ptrs = kv_base + offs_p[None, :] * stride_kv_p + offs_d[:, None] * stride_kv_d
+        KT = tl.load(k_ptrs).to(tl.float32)                 # (D, PAGE)
+        scores = tl.dot(Qg, KT) * scale                    # (BLOCK_G, PAGE)
+        tok = page * PAGE + offs_p
+        valid = tok < seqlen
+        scores = tl.where(valid[None, :], scores, NEG_INF)
+
+        m_new = tl.maximum(m, tl.max(scores, axis=1))      # (BLOCK_G,)
+        p = tl.exp(scores - m_new[:, None])                # (BLOCK_G, PAGE)
+        corr = tl.exp(m - m_new)                           # (BLOCK_G,)
+
+        v_ptrs = kv_base + D * stride_kv_d + offs_p[:, None] * stride_kv_p + offs_d[None, :] * stride_kv_d
+        Vp = tl.load(v_ptrs).to(tl.float32)                # (PAGE, D)
+        p = tl.where(tok[None, :] < seqlen, p, 0.0)        # (BLOCK_G, PAGE)
+        acc_corr = acc * corr[:, None] + tl.sum(p[:, :, None] * Vp[None, :, :], axis=1)
+        acc = acc_corr
+        lsum = corr * lsum + tl.sum(p, axis=1)
+        m = m_new
+        # Reset padding rows every step so they never leak into shared vectors.
+        acc = tl.where(keep[:, None], acc, 0.0)
+        lsum = tl.where(keep, lsum, 0.0)
+        m = tl.where(keep, m, NEG_INF)
+
+    # Write partials at [b, hkv, split, g].
+    m_ptr = M_PART + pid_b * stride_m_b + pid_hkv * stride_m_h + pid_split * stride_m_s
+    l_ptr = L_PART + pid_b * stride_l_b + pid_hkv * stride_l_h + pid_split * stride_l_s
+    a_ptr = A_PART + pid_b * stride_a_b + pid_hkv * stride_a_h + pid_split * stride_a_s
+    tl.store(m_ptr + offs_g * stride_m_g, m.to(tl.float32))
+    tl.store(l_ptr + offs_g * stride_l_g, lsum.to(tl.float32))
+    tl.store(a_ptr + offs_g[:, None] * stride_a_g + offs_d[None, :] * stride_a_d,
+             acc.to(tl.float32))
+
+
+@triton.jit
+def _combine_kernel(
+    M_PART, L_PART, A_PART, OUT,
+    stride_m_b, stride_m_h, stride_m_s, stride_m_g,
+    stride_l_b, stride_l_h, stride_l_s, stride_l_g,
+    stride_a_b, stride_a_h, stride_a_s, stride_a_g, stride_a_d,
+    stride_o_b, stride_o_h, stride_o_d,
+    B, HKV, G, D, num_splits,
+    BLOCK_D: tl.constexpr,
+    BLOCK_G: tl.constexpr,
+    GROUP: tl.constexpr,
+    NEG_INF: tl.constexpr,
+):
+    pid_b = tl.program_id(0)
+    pid_hkv = tl.program_id(1)
+    offs_g = tl.arange(0, BLOCK_G)
+    offs_d = tl.arange(0, BLOCK_D)
+    keep = offs_g < GROUP
+
+    m = tl.full((BLOCK_G,), NEG_INF, dtype=tl.float32)
+    lsum = tl.zeros((BLOCK_G,), dtype=tl.float32)
+    acc = tl.zeros((BLOCK_G, BLOCK_D), dtype=tl.float32)
+
+    for s in range(0, num_splits):
+        m_s = tl.load(M_PART + pid_b * stride_m_b + pid_hkv * stride_m_h + s * stride_m_s
+                      + offs_g * stride_m_g).to(tl.float32)
+        l_s = tl.load(L_PART + pid_b * stride_l_b + pid_hkv * stride_l_h + s * stride_l_s
+                      + offs_g * stride_l_g).to(tl.float32)
+        a_s = tl.load(A_PART + pid_b * stride_a_b + pid_hkv * stride_a_h + s * stride_a_s
+                      + offs_g[:, None] * stride_a_g + offs_d[None, :] * stride_a_d).to(tl.float32)
+        # Treat empty partials (l_s == 0, i.e. m_s at sentinel) as no-op.
+        m_s = tl.where(l_s > 0, m_s, m)
+        m_new = tl.maximum(m, m_s)
+        w_g = tl.exp(m - m_new)
+        w_s = tl.exp(m_s - m_new)
+        acc = acc * w_g[:, None] + a_s * w_s[:, None]
+        lsum = lsum * w_g + l_s * w_s
+        m = m_new
+
+    out = acc / lsum[:, None]
+    o_ptr = OUT + pid_b * stride_o_b + pid_hkv * GROUP * stride_o_h
+    tl.store(o_ptr + offs_g[:, None] * stride_o_h + offs_d[None, :] * stride_o_d,
+             out.to(tl.bfloat16), mask=(offs_g[:, None] < GROUP))
+
+
+class Model(nn.Module):
+    def __init__(self, batch, num_heads, num_kv_heads, head_dim, seq_len, page_size):
+        super().__init__()
+        assert num_heads % num_kv_heads == 0
+        self.batch = batch
+        self.num_heads = num_heads
+        self.num_kv_heads = num_kv_heads
+        self.head_dim = head_dim
+        self.seq_len = seq_len
+        self.page_size = page_size
+        self.group_size = num_heads // num_kv_heads
+        self.scale = 1.0 / math.sqrt(head_dim)
+        self.register_buffer("_dummy", torch.zeros(1, dtype=torch.bfloat16), persistent=False)
+
+    def forward(self, query, kv_cache, block_table, seq_lens):
+        B, H, D = query.shape
+        Hkv = self.num_kv_heads
+        G = self.group_size
+        P = self.page_size
+        BLOCK_G = ((G + 15) // 16) * 16
+
+        out = torch.empty(B, H, D, dtype=query.dtype, device=query.device)
+
+        num_pages = int(((seq_lens.max() + P - 1) // P).item())
+        # FlashDecoding: aim for ~512 concurrent programs to hide memory latency.
+        target = 512
+        num_splits = max(1, min((target + B * Hkv - 1) // (B * Hkv), num_pages))
+        pages_per_split = (num_pages + num_splits - 1) // num_splits
+
+        # Partial buffers (B, Hkv, num_splits, BLOCK_G, [D]).
+        m_part = torch.empty(B, Hkv, num_splits, BLOCK_G, dtype=torch.float32, device=query.device)
+        l_part = torch.empty(B, Hkv, num_splits, BLOCK_G, dtype=torch.float32, device=query.device)
+        a_part = torch.empty(B, Hkv, num_splits, BLOCK_G, D, dtype=torch.float32, device=query.device)
+
+        _decode_split_kernel[(B, Hkv, num_splits)](
+            query, kv_cache, block_table, m_part, l_part, a_part, seq_lens,
+            kv_cache.stride(0), kv_cache.stride(1), kv_cache.stride(2), kv_cache.stride(3),
+            query.stride(0), query.stride(1), query.stride(2),
+            m_part.stride(0), m_part.stride(1), m_part.stride(2), m_part.stride(3),
+            l_part.stride(0), l_part.stride(1), l_part.stride(2), l_part.stride(3),
+            a_part.stride(0), a_part.stride(1), a_part.stride(2), a_part.stride(3), a_part.stride(4),
+            block_table.stride(0), block_table.stride(1),
+            self.scale,
+            B, Hkv, G, P, D, num_splits, pages_per_split, num_pages,
+            BLOCK_D=D, BLOCK_G=BLOCK_G, GROUP=G, PAGE=P, NEG_INF=-3.0e4,
+        )
+
+        _combine_kernel[(B, Hkv)](
+            m_part, l_part, a_part, out,
+            m_part.stride(0), m_part.stride(1), m_part.stride(2), m_part.stride(3),
+            l_part.stride(0), l_part.stride(1), l_part.stride(2), l_part.stride(3),
+            a_part.stride(0), a_part.stride(1), a_part.stride(2), a_part.stride(3), a_part.stride(4),
+            out.stride(0), out.stride(1), out.stride(2),
+            B, Hkv, G, D, num_splits,
+            BLOCK_D=D, BLOCK_G=BLOCK_G, GROUP=G, NEG_INF=-3.0e4,
+        )
+        return out
+
+
+def get_inputs():
+    B = BATCH
+    H = NUM_HEADS
+    Hkv = NUM_KV_HEADS
+    D = HEAD_DIM
+    L = SEQ_LEN
+    P = PAGE_SIZE
+    pages_per_seq = (L + P - 1) // P
+    total_pages = max(B * pages_per_seq + 8, 64)
+    query = torch.randn(B, H, D, dtype=torch.bfloat16) * 0.1
+    kv_cache = torch.randn(total_pages, P, Hkv, 2 * D, dtype=torch.bfloat16) * 0.1
+    perm = torch.randperm(total_pages)[: B * pages_per_seq].reshape(B, pages_per_seq).int()
+    block_table = perm.contiguous()
+    seq_lens = torch.full((B,), L, dtype=torch.int32)
+    return [query, kv_cache, block_table, seq_lens]
+
+
+def get_init_inputs():
+    return [BATCH, NUM_HEADS, NUM_KV_HEADS, HEAD_DIM, SEQ_LEN, PAGE_SIZE]
+
+
+# --- Shape knobs (overridden by check.py / benchmark.py from shapes.py) ----
+BATCH = 8
+NUM_HEADS = 32
+NUM_KV_HEADS = 8
+HEAD_DIM = 128
+SEQ_LEN = 1024
+PAGE_SIZE = 16

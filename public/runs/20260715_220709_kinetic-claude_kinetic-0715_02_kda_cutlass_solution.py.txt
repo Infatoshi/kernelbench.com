@@ -1,0 +1,870 @@
+"""Kimi Delta Attention forward (chunk form) — custom Triton kernels for SM100/B200.
+
+Structure (exact chunk-parallel form of the delta-rule recurrence; the state
+feedback v_new = u - w @ S makes the inter-chunk part inherently sequential):
+
+  K_A "intra" (grid: NT x B*H) — per 64-token chunk:
+      gc = in-chunk cumsum(g)
+      L[c,j] = beta_c * <k_c e^{gc_c-gc_j}, k_j>  (j<c, via factorized-exp dots,
+               mid-block pivots for diagonal blocks)
+      (I+L)^-1 by exact nilpotent Neumann product on 32x32 blocks + Schur merge
+      w = M (beta e^{gc} k);  u = M (beta v);  kg = k e^{g_last-gc}  [fp32 out]
+      qg = scale q e^{gc};  Aqk[c,j] = scale <q_c e^{gc_c-gc_j}, k_j> [bf16 out]
+  K_B "scan" (grid: B*H x VS) — exact sequential recurrence per (b, h):
+      h fp32 in registers;  v_new = u - w@h;  o = qg@h + Aqk@v_new;
+      h = h * e^{g_last} + kg^T @ v_new.  Single bf16 rounding of o.
+"""
+from __future__ import annotations
+
+import os
+import sys
+
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+LOG2E = tl.constexpr(1.4426950408889634)
+
+_CUDA_MOD = None
+CUDA_SRC = r"""
+#include <torch/extension.h>
+#include <cuda.h>
+#include <cuda_runtime.h>
+#include <cuda_fp16.h>
+#include <cuda_bf16.h>
+
+using fp16 = __half;
+using bf16 = __nv_bfloat16;
+#define DEVI __device__ __forceinline__
+
+DEVI void mma16816f(float& d0, float& d1, float& d2, float& d3,
+                    uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3,
+                    uint32_t b0, uint32_t b1,
+                    float c0, float c1, float c2, float c3) {
+  asm volatile(
+      "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%10,%11,%12,%13};\n"
+      : "=f"(d0), "=f"(d1), "=f"(d2), "=f"(d3)
+      : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1),
+        "f"(c0), "f"(c1), "f"(c2), "f"(c3));
+}
+DEVI uint32_t packh(fp16 x, fp16 y) {
+  __half2 h2 = __halves2half2(x, y);
+  return *reinterpret_cast<uint32_t*>(&h2);
+}
+DEVI void ldsm_x2_trans(uint32_t& r0, uint32_t& r1, const void* addr) {
+  uint32_t s = static_cast<uint32_t>(__cvta_generic_to_shared(addr));
+  asm volatile("ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%0,%1}, [%2];\n"
+               : "=r"(r0), "=r"(r1) : "r"(s));
+}
+
+DEVI __nv_bfloat162 ldpair(const bf16* p) { return *reinterpret_cast<const __nv_bfloat162*>(p); }
+
+constexpr int K  = 128;
+constexpr int HS = 32;
+constexpr int BROW = K + 8;    // 136 halves = 272B brick row stride
+constexpr int FROW = K + 2;    // 130 fp32
+constexpr int BT = 64;
+
+// (32,32)@(32,128) dot: X fp16 brick (A-side, pitch xpr), Y fp16 brick (pitch ypr).
+DEVI void dot32x(const fp16* X, int xpr, const fp16* Y, int ypr, float acc[4][4], int warp, int lane) {
+  int rbw = (warp >> 2) * 16;
+  int g8 = lane >> 2, g2 = lane & 3;
+#pragma unroll
+  for (int ks = 0; ks < 2; ks++) {
+    uint32_t a[4];
+    a[0] = *reinterpret_cast<const uint32_t*>(&X[(rbw + g8) * xpr + ks * 16 + 2 * g2]);
+    a[1] = *reinterpret_cast<const uint32_t*>(&X[(rbw + 8 + g8) * xpr + ks * 16 + 2 * g2]);
+    a[2] = *reinterpret_cast<const uint32_t*>(&X[(rbw + g8) * xpr + ks * 16 + 2 * g2 + 8]);
+    a[3] = *reinterpret_cast<const uint32_t*>(&X[(rbw + 8 + g8) * xpr + ks * 16 + 2 * g2 + 8]);
+#pragma unroll
+    for (int tc = 0; tc < 4; tc++) {
+      int col = (warp & 3) * 32 + tc * 8;
+      uint32_t b[2];
+      ldsm_x2_trans(b[0], b[1], Y + (ks * 16 + (lane & 15)) * ypr + col);
+      mma16816f(acc[tc][0], acc[tc][1], acc[tc][2], acc[tc][3],
+                a[0], a[1], a[2], a[3], b[0], b[1], acc[tc][0], acc[tc][1], acc[tc][2], acc[tc][3]);
+    }
+  }
+}
+
+#ifndef STAGES
+#define STAGES 127
+#endif
+extern "C" __global__ void kda_fused_v4(
+    const bf16* __restrict__ q, const bf16* __restrict__ k, const bf16* __restrict__ v,
+    const bf16* __restrict__ beta, const float* __restrict__ g,
+    float scale,
+    float* __restrict__ Dgl,
+    bf16* __restrict__ Amat, bf16* __restrict__ bvec,
+    bf16* __restrict__ Cbuf, bf16* __restrict__ dbuf,
+    int T, int NT, int H)
+{
+  const int i_t = blockIdx.x;
+  const int i_bh = blockIdx.y;
+  const int i_b = i_bh / H;
+  const int i_h = i_bh % H;
+  const int tid = threadIdx.x;
+  const int warp = tid >> 5;
+  const int lane = tid & 31;
+  const int g8 = lane >> 2;
+  const int g2 = lane & 3;
+
+  extern __shared__ char smem_raw[];
+  fp16* sGC = reinterpret_cast<fp16*>(smem_raw);
+  fp16* P0 = sGC + 64 * FROW;
+  float* sAcc = reinterpret_cast<float*>(P0 + 192 * BROW);
+  float* sBeta = sAcc + 10 * HS * HS;
+  float* sGL = sBeta + 64;
+
+  const long base = ((long)(i_b * T + i_t * BT) * H + i_h);
+  const long baseg = ((long)(i_b * NT + i_t) * H + i_h);
+
+  // ---------------- S0: gc, beta, cumsum ----------------
+  if (!(STAGES & 1)) goto l_s1;
+  for (int i = tid; i < BT * K; i += blockDim.x)
+    sGC[(i / K) * FROW + (i % K)] = __float2half(g[base * K + (i / K) * (long)H * K + (i % K)]);
+  for (int i = tid; i < BT; i += blockDim.x)
+    sBeta[i] = __bfloat162float(beta[base + i * (long)H]);
+  __syncthreads();
+  for (int d = tid; d < K; d += blockDim.x) {
+    float acc = 0.f;
+    for (int r = 0; r < BT; r++) { acc += __half2float(sGC[r * FROW + d]); sGC[r * FROW + d] = __float2half(acc * 1.4426950408889634f); }
+  }
+  __syncthreads();
+  for (int d = tid; d < K; d += blockDim.x) {
+    sGL[d] = exp2f(__half2float(sGC[63 * FROW + d]));
+    Dgl[baseg * K + d] = sGL[d];
+  }
+  __syncthreads();
+
+l_s1: ;
+  const int rb = (warp >> 2) * 16;
+  const int cb = (warp & 3) * 8;
+
+  // ---------------- S1: Akk/Aqk ----------------
+  if (!(STAGES & 2)) goto l_s2;
+  for (int blk = 0; blk < 3; blk++) {
+    int r_l = (blk == 0) ? 0 : HS;
+    int r_piv = (blk == 0) ? 16 : (blk == 1 ? 48 : 32);
+    int r_rhs = (blk == 2) ? 0 : r_l;
+    for (int i = tid; i < HS * K; i += blockDim.x) {
+      int r = i / K, d = i % K;
+      float piv = __half2float(sGC[r_piv * FROW + d]);
+      float f = exp2f(__half2float(sGC[(r_l + r) * FROW + d]) - piv);
+      bf16 kx = k[base * K + (r_l + r) * (long)H * K + d];
+      bf16 qx = q[base * K + (r_l + r) * (long)H * K + d];
+      P0[(r)*BROW + d] = __float2half(__bfloat162float(kx) * f);
+      P0[(32 + r)*BROW + d] = __float2half(__bfloat162float(qx) * f * scale);
+      bf16 kx2 = k[base * K + (r_rhs + r) * (long)H * K + d];
+      P0[(128 + r) * BROW + d] = __float2half(__bfloat162float(kx2) * exp2f(piv - __half2float(sGC[(r_rhs + r) * FROW + d])));
+    }
+    __syncthreads();
+
+    float ak[4] = {0.f,0.f,0.f,0.f}, aq[4] = {0.f,0.f,0.f,0.f};
+#pragma unroll 2
+    for (int ks = 0; ks < K / 16; ks++) {
+      uint32_t a[4], b[2];
+      a[0] = *reinterpret_cast<const uint32_t*>(&P0[(rb + g8) * BROW + ks * 16 + 2 * g2]);
+      a[1] = *reinterpret_cast<const uint32_t*>(&P0[(rb + 8 + g8) * BROW + ks * 16 + 2 * g2]);
+      a[2] = *reinterpret_cast<const uint32_t*>(&P0[(rb + g8) * BROW + ks * 16 + 2 * g2 + 8]);
+      a[3] = *reinterpret_cast<const uint32_t*>(&P0[(rb + 8 + g8) * BROW + ks * 16 + 2 * g2 + 8]);
+      b[0] = *reinterpret_cast<const uint32_t*>(&P0[(128 + cb + g8) * BROW + ks * 16 + 2 * g2]);
+      b[1] = *reinterpret_cast<const uint32_t*>(&P0[(128 + cb + g8) * BROW + ks * 16 + 2 * g2 + 8]);
+      mma16816f(ak[0], ak[1], ak[2], ak[3], a[0], a[1], a[2], a[3], b[0], b[1], ak[0], ak[1], ak[2], ak[3]);
+      a[0] = *reinterpret_cast<const uint32_t*>(&P0[(32 + rb + g8) * BROW + ks * 16 + 2 * g2]);
+      a[1] = *reinterpret_cast<const uint32_t*>(&P0[(32 + rb + 8 + g8) * BROW + ks * 16 + 2 * g2]);
+      a[2] = *reinterpret_cast<const uint32_t*>(&P0[(32 + rb + g8) * BROW + ks * 16 + 2 * g2 + 8]);
+      a[3] = *reinterpret_cast<const uint32_t*>(&P0[(32 + rb + 8 + g8) * BROW + ks * 16 + 2 * g2 + 8]);
+      mma16816f(aq[0], aq[1], aq[2], aq[3], a[0], a[1], a[2], a[3], b[0], b[1], aq[0], aq[1], aq[2], aq[3]);
+    }
+    float* sL = sAcc + blk * HS * HS;
+    float* sA = sAcc + (3 + blk) * HS * HS;
+    int r0 = rb + g8, cc = cb + 2 * g2;
+    *reinterpret_cast<float2*>(&sL[r0 * HS + cc]) = make_float2(ak[0], ak[1]);
+    *reinterpret_cast<float2*>(&sL[(r0 + 8) * HS + cc]) = make_float2(ak[2], ak[3]);
+    *reinterpret_cast<float2*>(&sA[r0 * HS + cc]) = make_float2(aq[0], aq[1]);
+    *reinterpret_cast<float2*>(&sA[(r0 + 8) * HS + cc]) = make_float2(aq[2], aq[3]);
+    __syncthreads();
+  }
+
+  // ---------------- S2: mask + beta ----------------
+l_s2: ;
+  if (!(STAGES & 4)) goto l_s3;
+  for (int i = tid; i < 3 * HS * HS; i += blockDim.x) {
+    int blk = i / (HS * HS);
+    int r = (i % (HS * HS)) / HS, cc = i % HS;
+    float bval = sBeta[(blk == 0 ? 0 : HS) + r];
+    float L = sAcc[blk * HS * HS + r * HS + cc];
+    bool low = r > cc, lowi = r >= cc;
+    sAcc[blk * HS * HS + r * HS + cc] = (blk == 2 ? L : (low ? L : 0.f)) * bval;
+    float A = sAcc[(3 + blk) * HS * HS + r * HS + cc];
+    sAcc[(3 + blk) * HS * HS + r * HS + cc] = blk == 2 ? A : (lowi ? A : 0.f);
+  }
+  __syncthreads();
+
+  // ---------------- S3: solves M00@6, M11@7 ----------------
+  if (warp < 2) {
+    float* L = sAcc + warp * HS * HS;
+    float* M = sAcc + (6 + warp) * HS * HS;    // slots 6(M00), 7(M11)
+    for (int i = 0; i < HS; i++) {
+      float acc = 0.f;
+      if (lane < i) {
+        acc = -L[i * HS + lane];
+        for (int kk = 0; kk < i; kk++) acc -= L[i * HS + kk] * M[kk * HS + lane];
+      }
+      M[i * HS + lane] = acc; __syncwarp();
+    }
+    M[lane * HS + lane] = 1.f;
+  }
+  __syncthreads();
+
+  // ---------------- S4: M10 = -M11 @ L10 @ M00 ----------------
+  {
+    float* T1 = sAcc + 9 * HS * HS;
+    float* M00 = sAcc + 6 * HS * HS;
+    float* M11 = sAcc + 7 * HS * HS;
+    float* L10 = sAcc + 2 * HS * HS;
+    float* M10s = sAcc + 8 * HS * HS;
+    for (int idx = tid; idx < HS * HS; idx += blockDim.x) {
+      int r = idx / HS, cc = idx % HS;
+      float acc = 0.f;
+      for (int j = 0; j < HS; j++) acc += L10[r * HS + j] * M00[j * HS + cc];
+      T1[idx] = acc;
+    }
+    __syncthreads();
+    for (int idx = tid; idx < HS * HS; idx += blockDim.x) {
+      int r = idx / HS, cc = idx % HS;
+      float acc = 0.f;
+      for (int j = 0; j < HS; j++) acc += M11[r * HS + j] * T1[j * HS + cc];
+      M10s[idx] = -acc;
+    }
+  }
+  __syncthreads();
+
+  // ---------------- S5: kbg/vb bricks + w/u dots ----------------
+l_s3: ;
+  if (!(STAGES & 8)) goto l_s4;
+  for (int i = tid; i < BT * K; i += blockDim.x) {
+    int r = i / K, d = i % K;
+    bf16 kx = k[base * K + r * (long)H * K + d];
+    P0[r * BROW + d] = __float2half(__bfloat162float(kx) * (sBeta[r] * exp2f(__half2float(sGC[r * FROW + d]))));
+    bf16 vx = v[base * K + r * (long)H * K + d];
+    P0[(64 + r) * BROW + d] = __float2half(__bfloat162float(vx) * sBeta[r]);
+  }
+  __syncthreads();
+
+  float wf0[4][4], uf0[4][4], wf1[4][4], uf1[4][4];
+#pragma unroll
+  for (int t = 0; t < 4; t++) for (int e = 0; e < 4; e++) {
+    wf0[t][e] = uf0[t][e] = wf1[t][e] = uf1[t][e] = 0.f;
+  }
+  {
+    auto convM = [&](int slot) {
+      for (int i = tid; i < HS * HS; i += blockDim.x)
+        reinterpret_cast<fp16*>(sAcc + 0 * HS * HS)[(i / HS) * BROW + (i % HS)] = __float2half(sAcc[slot * HS * HS + i]);
+    };
+    convM(6);    // M00
+    __syncthreads();
+    dot32x(reinterpret_cast<fp16*>(sAcc + 0 * HS * HS), BROW, P0, BROW, wf0, warp, lane);
+    dot32x(reinterpret_cast<fp16*>(sAcc + 0 * HS * HS), BROW, P0 + 64 * BROW, BROW, uf0, warp, lane);
+    __syncthreads();
+    convM(8);   // M10
+    __syncthreads();
+    dot32x(reinterpret_cast<fp16*>(sAcc + 0 * HS * HS), BROW, P0, BROW, wf1, warp, lane);
+    dot32x(reinterpret_cast<fp16*>(sAcc + 0 * HS * HS), BROW, P0 + 64 * BROW, BROW, uf1, warp, lane);
+    __syncthreads();
+    convM(7);   // M11
+    __syncthreads();
+    dot32x(reinterpret_cast<fp16*>(sAcc + 0 * HS * HS), BROW, P0 + 32 * BROW, BROW, wf1, warp, lane);
+    dot32x(reinterpret_cast<fp16*>(sAcc + 0 * HS * HS), BROW, P0 + 64 * BROW + 32 * BROW, BROW, uf1, warp, lane);
+  }
+  __syncthreads();
+
+  // ---------------- S6: move frags to bricks + kg brick ----------------
+l_s4: ;
+  if (!(STAGES & 16)) goto l_s5;
+  // kgT at flat [0:9216) chan-pitch 72; w at [68:132), u at [132:196)
+  for (int i = tid; i < BT * K; i += blockDim.x) {
+    int r = i / K, d = i % K;
+    bf16 kx = k[base * K + r * (long)H * K + d];
+    P0[r * BROW + d] = __float2half(__bfloat162float(kx) * exp2f(__half2float(sGC[63 * FROW + d]) - __half2float(sGC[r * FROW + d])));
+  }
+  for (int tc = 0; tc < 4; tc++) {
+    int rw = rb + g8;
+    int cc = (warp & 3) * 32 + tc * 8 + 2 * g2;
+    *reinterpret_cast<__half2*>(&P0[(64 + rw) * BROW + cc]) = __halves2half2(__float2half(wf0[tc][0]), __float2half(wf0[tc][1]));
+    *reinterpret_cast<__half2*>(&P0[(64 + rw + 8) * BROW + cc]) = __halves2half2(__float2half(wf0[tc][2]), __float2half(wf0[tc][3]));
+    *reinterpret_cast<__half2*>(&P0[(128 + rw) * BROW + cc]) = __halves2half2(__float2half(uf0[tc][0]), __float2half(uf0[tc][1]));
+    *reinterpret_cast<__half2*>(&P0[(128 + rw + 8) * BROW + cc]) = __halves2half2(__float2half(uf0[tc][2]), __float2half(uf0[tc][3]));
+    *reinterpret_cast<__half2*>(&P0[(96 + rw) * BROW + cc]) = __halves2half2(__float2half(wf1[tc][0]), __float2half(wf1[tc][1]));
+    *reinterpret_cast<__half2*>(&P0[(96 + rw + 8) * BROW + cc]) = __halves2half2(__float2half(wf1[tc][2]), __float2half(wf1[tc][3]));
+    *reinterpret_cast<__half2*>(&P0[(160 + rw) * BROW + cc]) = __halves2half2(__float2half(uf1[tc][0]), __float2half(uf1[tc][1]));
+    *reinterpret_cast<__half2*>(&P0[(160 + rw + 8) * BROW + cc]) = __halves2half2(__float2half(uf1[tc][2]), __float2half(uf1[tc][3]));
+  }
+  __syncthreads();
+
+  // ---------------- S7: Amat = -kgT @ w, bvec = kgT @ u ----------------
+l_s5: ;
+  if (!(STAGES & 32)) goto l_s6;
+  {
+    const fp16* kgB = P0;
+    const fp16* wbr = P0 + 64 * BROW;
+    const fp16* ubr = P0 + 128 * BROW;
+    const int mrow = warp * 16;
+    float aacc[16][4], bacc_[16][4];
+#pragma unroll
+    for (int t = 0; t < 16; t++) for (int e = 0; e < 4; e++) { aacc[t][e] = 0.f; bacc_[t][e] = 0.f; }
+#pragma unroll 2
+    for (int ks = 0; ks < BT / 16; ks++) {
+      uint32_t a[4];
+      ldsm_x2_trans(a[0], a[2], kgB + (ks * 16 + (lane & 15)) * BROW + mrow);
+      ldsm_x2_trans(a[1], a[3], kgB + (ks * 16 + (lane & 15)) * BROW + mrow + 8);
+#pragma unroll
+      for (int tc = 0; tc < 16; tc++) {
+        int col = tc * 8;
+        uint32_t b[2];
+        ldsm_x2_trans(b[0], b[1], wbr + (ks * 16 + (lane & 15)) * BROW + col);
+        mma16816f(aacc[tc][0], aacc[tc][1], aacc[tc][2], aacc[tc][3],
+                  a[0], a[1], a[2], a[3], b[0], b[1], aacc[tc][0], aacc[tc][1], aacc[tc][2], aacc[tc][3]);
+        ldsm_x2_trans(b[0], b[1], ubr + (ks * 16 + (lane & 15)) * BROW + col);
+        mma16816f(bacc_[tc][0], bacc_[tc][1], bacc_[tc][2], bacc_[tc][3],
+                  a[0], a[1], a[2], a[3], b[0], b[1], bacc_[tc][0], bacc_[tc][1], bacc_[tc][2], bacc_[tc][3]);
+      }
+    }
+#pragma unroll
+    for (int tc = 0; tc < 16; tc++) {
+      int arow = mrow + g8;
+      int acol = tc * 8 + 2 * g2;
+      *reinterpret_cast<__nv_bfloat162*>(&Amat[baseg * K * K + arow * K + acol]) =
+          __halves2bfloat162(__float2bfloat16(-aacc[tc][0]), __float2bfloat16(-aacc[tc][1]));
+      *reinterpret_cast<__nv_bfloat162*>(&Amat[baseg * K * K + (arow + 8) * K + acol]) =
+          __halves2bfloat162(__float2bfloat16(-aacc[tc][2]), __float2bfloat16(-aacc[tc][3]));
+      *reinterpret_cast<__nv_bfloat162*>(&bvec[baseg * K * 128 + arow * 128 + acol]) =
+          __halves2bfloat162(__float2bfloat16(bacc_[tc][0]), __float2bfloat16(bacc_[tc][1]));
+      *reinterpret_cast<__nv_bfloat162*>(&bvec[baseg * K * 128 + (arow + 8) * 128 + acol]) =
+          __halves2bfloat162(__float2bfloat16(bacc_[tc][2]), __float2bfloat16(bacc_[tc][3]));
+    }
+  }
+  __syncthreads();
+
+  // ---------------- S8: C/d ----------------
+l_s6: ;
+  if (!(STAGES & 64)) goto l_s7;
+  // Aqk blocks at sAcc[3](A00), 4(A11), 5(A10); A-brick converts at P0[0:32).
+  {
+    auto convA = [&](int slot) {
+      for (int i = tid; i < HS * HS; i += blockDim.x)
+        reinterpret_cast<fp16*>(sAcc + 0 * HS * HS)[(i / HS) * BROW + (i % HS)] = __float2half(sAcc[slot * HS * HS + i]);
+    };
+    const fp16* wbr = P0 + 64 * BROW;
+    const fp16* ubr = P0 + 128 * BROW;
+    float cacc[4][4], dacc[4][4], cacc1[4][4], dacc1[4][4];
+#pragma unroll
+    for (int t = 0; t < 4; t++) for (int e = 0; e < 4; e++) {
+      cacc[t][e] = dacc[t][e] = cacc1[t][e] = dacc1[t][e] = 0.f;
+    }
+    convA(3);
+    __syncthreads();
+    dot32x(reinterpret_cast<fp16*>(sAcc + 0 * HS * HS), BROW, wbr, BROW, cacc, warp, lane);
+    dot32x(reinterpret_cast<fp16*>(sAcc + 0 * HS * HS), BROW, ubr, BROW, dacc, warp, lane);
+    __syncthreads();
+    convA(5);
+    __syncthreads();
+    dot32x(reinterpret_cast<fp16*>(sAcc + 0 * HS * HS), BROW, wbr, BROW, cacc1, warp, lane);
+    dot32x(reinterpret_cast<fp16*>(sAcc + 0 * HS * HS), BROW, ubr, BROW, dacc1, warp, lane);
+    __syncthreads();
+    convA(4);
+    __syncthreads();
+    dot32x(reinterpret_cast<fp16*>(sAcc + 0 * HS * HS), BROW, wbr + 32 * BROW, BROW, cacc1, warp, lane);
+    dot32x(reinterpret_cast<fp16*>(sAcc + 0 * HS * HS), BROW, ubr + 32 * BROW, BROW, dacc1, warp, lane);
+
+#pragma unroll
+    for (int tc = 0; tc < 4; tc++) {
+      int rg = rb + g8;
+      int cg = (warp & 3) * 32 + tc * 8 + 2 * g2;
+      const long HK = (long)H * K;
+      bf16 qx0 = q[base * K + rg * (long)H * K + cg];
+      bf16 qx1 = q[base * K + rg * (long)H * K + cg + 1];
+      bf16 qx2 = q[base * K + (rg + 8) * (long)H * K + cg];
+      bf16 qx3 = q[base * K + (rg + 8) * (long)H * K + cg + 1];
+      float ge0 = exp2f(__half2float(sGC[rg * FROW + cg]));
+      float ge1 = exp2f(__half2float(sGC[rg * FROW + cg + 1]));
+      float ge2 = exp2f(__half2float(sGC[(rg + 8) * FROW + cg]));
+      float ge3 = exp2f(__half2float(sGC[(rg + 8) * FROW + cg + 1]));
+      float qg0 = __bfloat162float(qx0) * (scale * ge0);
+      float qg1 = __bfloat162float(qx1) * (scale * ge1);
+      float qg2 = __bfloat162float(qx2) * (scale * ge2);
+      float qg3 = __bfloat162float(qx3) * (scale * ge3);
+      bf16* cp = Cbuf + base * K + rg * HK + cg;
+      *reinterpret_cast<__nv_bfloat162*>(cp) = __halves2bfloat162(__float2bfloat16(qg0 - cacc[tc][0]), __float2bfloat16(qg1 - cacc[tc][1]));
+      *reinterpret_cast<__nv_bfloat162*>(cp + 8 * HK) = __halves2bfloat162(__float2bfloat16(qg2 - cacc[tc][2]), __float2bfloat16(qg3 - cacc[tc][3]));
+      bf16* dp = dbuf + base * K + rg * HK + cg;
+      *reinterpret_cast<__nv_bfloat162*>(dp) = __halves2bfloat162(__float2bfloat16(dacc[tc][0]), __float2bfloat16(dacc[tc][1]));
+      *reinterpret_cast<__nv_bfloat162*>(dp + 8 * HK) = __halves2bfloat162(__float2bfloat16(dacc[tc][2]), __float2bfloat16(dacc[tc][3]));
+    }
+#pragma unroll
+    for (int tc = 0; tc < 4; tc++) {
+      int rg = 32 + rb + g8;
+      int cg = (warp & 3) * 32 + tc * 8 + 2 * g2;
+      const long HK = (long)H * K;
+      bf16 qx0 = q[base * K + rg * (long)H * K + cg];
+      bf16 qx1 = q[base * K + rg * (long)H * K + cg + 1];
+      bf16 qx2 = q[base * K + (rg + 8) * (long)H * K + cg];
+      bf16 qx3 = q[base * K + (rg + 8) * (long)H * K + cg + 1];
+      float ge0 = exp2f(__half2float(sGC[rg * FROW + cg]));
+      float ge1 = exp2f(__half2float(sGC[rg * FROW + cg + 1]));
+      float ge2 = exp2f(__half2float(sGC[(rg + 8) * FROW + cg]));
+      float ge3 = exp2f(__half2float(sGC[(rg + 8) * FROW + cg + 1]));
+      float qg0 = __bfloat162float(qx0) * (scale * ge0);
+      float qg1 = __bfloat162float(qx1) * (scale * ge1);
+      float qg2 = __bfloat162float(qx2) * (scale * ge2);
+      float qg3 = __bfloat162float(qx3) * (scale * ge3);
+      bf16* cp = Cbuf + base * K + rg * HK + cg;
+      *reinterpret_cast<__nv_bfloat162*>(cp) = __halves2bfloat162(__float2bfloat16(qg0 - cacc1[tc][0]), __float2bfloat16(qg1 - cacc1[tc][1]));
+      *reinterpret_cast<__nv_bfloat162*>(cp + 8 * HK) = __halves2bfloat162(__float2bfloat16(qg2 - cacc1[tc][2]), __float2bfloat16(qg3 - cacc1[tc][3]));
+      bf16* dp = dbuf + base * K + rg * HK + cg;
+      *reinterpret_cast<__nv_bfloat162*>(dp) = __halves2bfloat162(__float2bfloat16(dacc1[tc][0]), __float2bfloat16(dacc1[tc][1]));
+      *reinterpret_cast<__nv_bfloat162*>(dp + 8 * HK) = __halves2bfloat162(__float2bfloat16(dacc1[tc][2]), __float2bfloat16(dacc1[tc][3]));
+    }
+  }
+l_s7: ;
+  __syncthreads();
+}
+
+void kda_fused_launch(torch::Tensor q, torch::Tensor k, torch::Tensor v, torch::Tensor beta,
+                      torch::Tensor g, torch::Tensor Dgl,
+                      torch::Tensor Amat, torch::Tensor bvec,
+                      torch::Tensor Cbuf, torch::Tensor dbuf,
+                      double scale, int64_t T, int64_t NT, int64_t H, int64_t BH) {
+  dim3 grid((unsigned)NT, (unsigned)BH);
+  size_t smem = 64 * FROW * 2 + 192 * BROW * 2 + 10 * HS * HS * 4 + 64 * 4 + 128 * 4 + 64;
+  static bool attr = false;
+  if (!attr) { cudaFuncSetAttribute(kda_fused_v4, cudaFuncAttributeMaxDynamicSharedMemorySize, 200000); attr = true; }
+  kda_fused_v4<<<grid, 256, smem>>>(
+      (const bf16*)q.data_ptr(), (const bf16*)k.data_ptr(), (const bf16*)v.data_ptr(),
+      (const bf16*)beta.data_ptr(), g.data_ptr<float>(), (float)scale,
+      Dgl.data_ptr<float>(),
+      (bf16*)Amat.data_ptr(), (bf16*)bvec.data_ptr(),
+      (bf16*)Cbuf.data_ptr(), (bf16*)dbuf.data_ptr(), (int)T, (int)NT, (int)H);
+  cudaError_t e = cudaGetLastError();
+  TORCH_CHECK(e == cudaSuccess, cudaGetErrorString(e));
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) { m.def("fused", &kda_fused_launch); }
+"""
+
+
+def _get_cuda_mod():
+    global _CUDA_MOD
+    if _CUDA_MOD is None:
+        from torch.utils.cpp_extension import load_inline
+        _CUDA_MOD = load_inline(
+            name="kbh_kda_fused_v4",
+            cpp_sources="",
+            cuda_sources=CUDA_SRC,
+            extra_cuda_cflags=["-O3", "-gencode=arch=compute_100a,code=sm_100a", "-maxrregcount=128"],
+            verbose=False,
+        )
+    return _CUDA_MOD
+
+
+# ---------------------------------------------------------------------------
+# K_A: intra-chunk (parallel over chunks and heads)
+# ---------------------------------------------------------------------------
+
+@triton.jit
+def _kda_intra_kernel(
+    q, k, v, g, beta,
+    w, u, kg, qg, Dgl, Cbuf, dbuf,
+    scale,
+    T, NT,
+    H: tl.constexpr, K: tl.constexpr, V: tl.constexpr,
+    BT: tl.constexpr, SEG: tl.constexpr,
+):
+    i_t, i_bh = tl.program_id(0), tl.program_id(1)
+    i_b, i_h = i_bh // H, i_bh % H
+    base = (i_b * T + i_t * BT) * H + i_h
+    HS: tl.constexpr = BT // 2
+    NSEG: tl.constexpr = K // SEG
+    o_r = tl.arange(0, HS)
+    o_2 = tl.arange(0, 2)
+    m0 = (o_2 == 0)[:, None, None]
+    o_s = tl.arange(0, SEG)
+
+    m_low32 = o_r[:, None] > o_r[None, :]
+    m_lowi32 = o_r[:, None] >= o_r[None, :]
+    qm16 = (o_r == BT // 4)
+
+    b_b0 = tl.load(beta + base + o_r * H).to(tl.float32)
+    b_b1 = tl.load(beta + base + HS * H + o_r * H).to(tl.float32)
+    bta0 = tl.where(m0, b_b0[None, :, None], 1.0)
+    bta1 = tl.where(m0, b_b1[None, :, None], 1.0)
+    scl2 = tl.where(m0, 1.0, scale)
+
+    # accumulators: (2,HS,HS) batches [Lxx, Axx]
+    acc00 = tl.zeros([2, HS, HS], dtype=tl.float32)
+    acc11 = tl.zeros([2, HS, HS], dtype=tl.float32)
+    acc10 = tl.zeros([2, HS, HS], dtype=tl.float32)
+
+    psel_k = o_r[None, :, None] * (H * K) + o_s[None, None, :]
+    for s in tl.static_range(NSEG):
+        # ---- segment s loads ----
+        p_kq = tl.where(m0, k + base * K + s * SEG + psel_k, q + base * K + s * SEG + psel_k)
+        kq0 = tl.load(p_kq).to(tl.float32)
+        kq1 = tl.load(p_kq + HS * (H * K))
+        b_g0 = tl.load(g + base * K + s * SEG + o_r[:, None] * (H * K) + o_s[None, :])
+        b_g1 = tl.load(g + base * K + s * SEG + HS * (H * K) + o_r[:, None] * (H * K) + o_s[None, :])
+
+        cs0 = tl.cumsum(b_g0, 0) * LOG2E
+        P1 = tl.sum(b_g0, 0) * LOG2E
+        cs1 = tl.cumsum(b_g1, 0) * LOG2E
+        ST1 = tl.sum(b_g1, 0) * LOG2E
+        GL = P1 + ST1
+
+        egc0 = tl.math.exp2(cs0)
+        engc0 = tl.math.exp2(-cs0)
+        ecs1 = tl.math.exp2(cs1)
+        encs1 = tl.math.exp2(-cs1)
+        eGL = tl.math.exp2(GL)
+        eST1 = tl.math.exp2(ST1)
+
+        P16 = tl.sum(tl.where(qm16[:, None], cs0, 0.0), 0)
+        S1M = tl.sum(tl.where(qm16[:, None], cs1, 0.0), 0)
+        eP16 = tl.math.exp2(P16)
+        eS1M = tl.math.exp2(S1M)
+        eP1 = tl.math.exp2(P1)
+
+        kqp0 = tl.permute(kq0, (1, 2, 0))
+        b_k0, b_q0 = tl.split(kqp0)
+        kqp1 = tl.permute(kq1, (1, 2, 0))
+        b_k1, b_q1 = tl.split(kqp1)
+
+        # elementwise stores possible here: qg, kg
+        tl.store(qg + base * K + s * SEG + o_r[:, None] * (H * K) + o_s[None, :],
+                 (b_q0 * (scale * egc0)).to(tl.bfloat16))
+        tl.store(qg + base * K + s * SEG + HS * (H * K) + o_r[:, None] * (H * K) + o_s[None, :],
+                 (b_q1 * (scale * eP1[None, :] * ecs1)).to(tl.bfloat16))
+        tl.store(kg + base * K + s * SEG + o_r[:, None] * (H * K) + o_s[None, :],
+                 (b_k0 * (eGL[None, :] * engc0)).to(tl.bfloat16))
+        tl.store(kg + base * K + s * SEG + HS * (H * K) + o_r[:, None] * (H * K) + o_s[None, :],
+                 (b_k1 * (eST1[None, :] * encs1)).to(tl.bfloat16))
+        baseg = (i_b * NT + i_t) * H + i_h
+        tl.store(Dgl + baseg * K + s * SEG + o_s, eGL)
+
+        # ---- batched Akk/Aqk dots, accumulate ----
+        lhs00 = (kq0 * (egc0 / eP16[None, :])[None, :, :] * scl2).to(tl.bfloat16)
+        rhs00 = (b_k0 * (engc0 * eP16[None, :])).to(tl.bfloat16)
+        acc00 += tl.dot(lhs00, tl.broadcast_to(tl.trans(rhs00)[None, :, :], (2, SEG, HS)))
+        lhs11 = (kq1 * (ecs1 / eS1M[None, :])[None, :, :] * scl2).to(tl.bfloat16)
+        rhs11 = (b_k1 * (encs1 * eS1M[None, :])).to(tl.bfloat16)
+        acc11 += tl.dot(lhs11, tl.broadcast_to(tl.trans(rhs11)[None, :, :], (2, SEG, HS)))
+        lhs10 = (kq1 * ecs1[None, :, :] * scl2).to(tl.bfloat16)
+        rhs10 = (b_k0 * tl.math.exp2(P1 - cs0)).to(tl.bfloat16)
+        acc10 += tl.dot(lhs10, tl.broadcast_to(tl.trans(rhs10)[None, :, :], (2, SEG, HS)))
+
+    # mask + beta
+    L00A00 = tl.where(m0, tl.where(m_low32[None, :, :], acc00, 0.0) * bta0,
+                      tl.where(m_lowi32[None, :, :], acc00, 0.0))
+    L11A11 = tl.where(m0, tl.where(m_low32[None, :, :], acc11, 0.0) * bta1,
+                      tl.where(m_lowi32[None, :, :], acc11, 0.0))
+    L10A10 = tl.where(m0, acc10 * bta1, acc10)
+
+    LAp0 = tl.permute(L00A00, (1, 2, 0)); L00, A00 = tl.split(LAp0)
+    LAp1 = tl.permute(L11A11, (1, 2, 0)); L11, A11 = tl.split(LAp1)
+    LAp2 = tl.permute(L10A10, (1, 2, 0)); L10, A10 = tl.split(LAp2)
+
+    # ---- batched Neumann ----
+    N = tl.permute(tl.join(L00, L11), (2, 0, 1))
+    eye = tl.where(o_r[:, None] == o_r[None, :], 1.0, 0.0)
+    N2 = tl.dot(N, N); N4 = tl.dot(N2, N2); N8 = tl.dot(N4, N4); N16 = tl.dot(N8, N8)
+    P = -N
+    P = P + N2 + tl.dot(P, N2)
+    P = P + N4 + tl.dot(P, N4)
+    P = P + N8 + tl.dot(P, N8)
+    Md = P + N16 + tl.dot(P, N16) + eye[None, :, :]
+    Mpp = tl.permute(Md, (1, 2, 0))
+    M00, M11 = tl.split(Mpp)
+    M10 = -tl.dot(tl.dot(M11, L10), M00)
+
+    # ---- seg loop 2: w/u per segment ----
+    for s in tl.static_range(NSEG):
+        b_g0 = tl.load(g + base * K + s * SEG + o_r[:, None] * (H * K) + o_s[None, :])
+        b_g1 = tl.load(g + base * K + s * SEG + HS * (H * K) + o_r[:, None] * (H * K) + o_s[None, :])
+        cs0 = tl.cumsum(b_g0, 0) * LOG2E
+        P1 = tl.sum(b_g0, 0) * LOG2E
+        cs1 = tl.cumsum(b_g1, 0) * LOG2E
+        egc0 = tl.math.exp2(cs0)
+        ecs1 = tl.math.exp2(cs1)
+        eP1 = tl.math.exp2(P1)
+
+        b_k0 = tl.load(k + base * K + s * SEG + o_r[:, None] * (H * K) + o_s[None, :]).to(tl.float32)
+        b_k1 = tl.load(k + base * K + s * SEG + HS * (H * K) + o_r[:, None] * (H * K) + o_s[None, :]).to(tl.float32)
+        b_v0 = tl.load(v + base * V + s * SEG + o_r[:, None] * (H * V) + o_s[None, :]).to(tl.float32)
+        b_v1 = tl.load(v + base * V + s * SEG + HS * (H * V) + o_r[:, None] * (H * V) + o_s[None, :]).to(tl.float32)
+
+        kbg0 = b_k0 * (b_b0[:, None] * egc0)
+        kbg1 = b_k1 * (b_b1[:, None] * eP1[None, :] * ecs1)
+        vb0 = b_v0 * b_b0[:, None]
+        vb1 = b_v1 * b_b1[:, None]
+
+        b_w0s = tl.dot(M00, kbg0)
+        b_w1s = tl.dot(M10, kbg0) + tl.dot(M11, kbg1)
+        b_u0s = tl.dot(M00, vb0)
+        b_u1s = tl.dot(M10, vb0) + tl.dot(M11, vb1)
+        tl.store(w + base * K + s * SEG + o_r[:, None] * (H * K) + o_s[None, :], b_w0s.to(tl.bfloat16))
+        tl.store(w + base * K + s * SEG + HS * (H * K) + o_r[:, None] * (H * K) + o_s[None, :], b_w1s.to(tl.bfloat16))
+        tl.store(u + base * V + s * SEG + o_r[:, None] * (H * V) + o_s[None, :], b_u0s.to(tl.bfloat16))
+        tl.store(u + base * V + s * SEG + HS * (H * V) + o_r[:, None] * (H * V) + o_s[None, :], b_u1s.to(tl.bfloat16))
+
+    # ---- phase 2b: output-side C = qg - Aqk @ w, d = Aqk @ u ----
+    o_kf = tl.arange(0, K)
+    b_C0 = tl.load(qg + base * K + o_r[:, None] * (H * K) + o_kf[None, :]).to(tl.float32)
+    b_C1 = tl.load(qg + base * K + HS * (H * K) + o_r[:, None] * (H * K) + o_kf[None, :]).to(tl.float32)
+    b_w0f = tl.load(w + base * K + o_r[:, None] * (H * K) + o_kf[None, :]).to(tl.float32)
+    b_w1f = tl.load(w + base * K + HS * (H * K) + o_r[:, None] * (H * K) + o_kf[None, :]).to(tl.float32)
+    b_u0f = tl.load(u + base * V + o_r[:, None] * (H * V) + o_kf[None, :]).to(tl.float32)
+    b_u1f = tl.load(u + base * V + HS * (H * V) + o_r[:, None] * (H * V) + o_kf[None, :]).to(tl.float32)
+    b_C0 -= tl.dot(A00, b_w0f, input_precision="tf32")
+    b_C1 -= tl.dot(A10, b_w0f, input_precision="tf32") + tl.dot(A11, b_w1f, input_precision="tf32")
+    b_d0 = tl.dot(A00, b_u0f, input_precision="tf32")
+    b_d1 = tl.dot(A10, b_u0f, input_precision="tf32") + tl.dot(A11, b_u1f, input_precision="tf32")
+    tl.store(Cbuf + base * K + o_r[:, None] * (H * K) + o_kf[None, :], b_C0.to(tl.bfloat16))
+    tl.store(Cbuf + base * K + HS * (H * K) + o_r[:, None] * (H * K) + o_kf[None, :], b_C1.to(tl.bfloat16))
+    tl.store(dbuf + base * V + o_r[:, None] * (H * V) + o_kf[None, :], b_d0.to(tl.bfloat16))
+    tl.store(dbuf + base * V + HS * (H * V) + o_r[:, None] * (H * V) + o_kf[None, :], b_d1.to(tl.bfloat16))
+
+
+# ---------------------------------------------------------------------------
+# K_A2: factored state-recurrence operands: Amat = -(kg^T w), bvec = kg^T u
+# ---------------------------------------------------------------------------
+
+@triton.jit
+def _kda_ab_kernel(
+    kg, w, u, Amat, bvec,
+    T, NT,
+    H: tl.constexpr, K: tl.constexpr, V: tl.constexpr,
+    BT: tl.constexpr,
+):
+    i_t, i_bh = tl.program_id(0), tl.program_id(1)
+    i_b, i_h = i_bh // H, i_bh % H
+    base = (i_b * T + i_t * BT) * H + i_h
+    baseh = (i_b * NT + i_t) * H + i_h
+
+    o_t64 = tl.arange(0, BT)
+    o_kf = tl.arange(0, K)
+    o_vf = tl.arange(0, V)
+
+    b_wf = tl.load(w + base * K + o_t64[:, None] * (H * K) + o_kf[None, :])
+    b_uf = tl.load(u + base * V + o_t64[:, None] * (H * V) + o_vf[None, :])
+    b_kgt = tl.trans(tl.load(kg + base * K + o_t64[:, None] * (H * K) + o_kf[None, :]))
+
+    b_Ab = tl.dot(b_kgt, b_wf)                           # (K, K) = -Amat
+    tl.store(Amat + baseh * K * K + o_kf[:, None] * K + o_kf[None, :], (-b_Ab).to(tl.bfloat16))
+    b_bv = tl.dot(b_kgt, b_uf)
+    tl.store(bvec + baseh * K * V + o_kf[:, None] * V + o_vf[None, :], b_bv.to(tl.bfloat16))
+
+
+
+
+# ---------------------------------------------------------------------------
+# K_B: state materialization scan — one chained dot per link
+#       h' = GL * h - (kg^T w) @ h + kg^T u = GL*h + Amat @ h + bvec
+# ---------------------------------------------------------------------------
+
+@triton.jit
+def _kda_state_out_kernel(
+    Amat, bvec, Dgl, Cbuf, dbuf, o,
+    T, NT,
+    H: tl.constexpr, K: tl.constexpr, V: tl.constexpr,
+    BT: tl.constexpr, BV: tl.constexpr, VS: tl.constexpr,
+):
+    i_bhv = tl.program_id(0)
+    i_v = i_bhv % VS
+    i_bh = i_bhv // VS
+    i_b, i_h = i_bh // H, i_bh % H
+
+    o_k = tl.arange(0, K)
+    o_v = i_v * BV + tl.arange(0, BV)
+    o_t = tl.arange(0, BT)
+
+    b_h = tl.zeros([K, BV], dtype=tl.float32)
+
+    for c in range(0, NT):
+        baseg = (i_b * NT + c) * H + i_h
+        base = (i_b * T + c * BT) * H + i_h
+        b_gl = tl.load(Dgl + baseg * K + o_k)
+        b_Am = tl.load(Amat + baseg * K * K + o_k[:, None] * K + o_k[None, :])
+        b_bv = tl.load(bvec + baseg * K * V + o_k[:, None] * V + o_v[None, :]).to(tl.float32)
+        b_C = tl.load(Cbuf + base * K + o_t[:, None] * (H * K) + o_k[None, :])
+        b_d = tl.load(dbuf + base * V + o_t[:, None] * (H * V) + o_v[None, :]).to(tl.float32)
+
+        b_o = tl.dot(b_C, b_h.to(tl.bfloat16)) + b_d
+        tl.store(o + base * V + o_t[:, None] * (H * V) + o_v[None, :], b_o.to(tl.bfloat16))
+        b_h = b_h * b_gl[:, None] + tl.dot(b_Am.to(tl.float32), b_h, input_precision="tf32") + b_bv
+
+
+# ---------------------------------------------------------------------------
+# K_C: fully parallel output: o = C_t @ h_t + d_t
+# ---------------------------------------------------------------------------
+
+@triton.jit
+def _kda_out_kernel(
+    Cbuf, dbuf, hb, o,
+    T, NT,
+    H: tl.constexpr, K: tl.constexpr, V: tl.constexpr,
+    BT: tl.constexpr, BV: tl.constexpr, VS: tl.constexpr,
+):
+    i_t, i_bhv = tl.program_id(0), tl.program_id(1)
+    i_v = i_bhv % VS
+    i_bh = i_bhv // VS
+    i_b, i_h = i_bh // H, i_bh % H
+
+    o_k = tl.arange(0, K)
+    o_v = i_v * BV + tl.arange(0, BV)
+    o_t = tl.arange(0, BT)
+
+    base = (i_b * T + i_t * BT) * H + i_h
+    baseh = (i_b * NT + i_t) * H + i_h
+
+    b_C = tl.load(Cbuf + base * K + o_t[:, None] * (H * K) + o_k[None, :])
+    b_d = tl.load(dbuf + base * V + o_t[:, None] * (H * V) + o_v[None, :]).to(tl.float32)
+    b_h = tl.load(hb + baseh * K * V + o_k[:, None] * V + o_v[None, :])
+
+    b_o = tl.dot(b_C, b_h) + b_d
+    tl.store(o + base * V + o_t[:, None] * (H * V) + o_v[None, :], b_o.to(tl.bfloat16))
+
+
+# ---------------------------------------------------------------------------
+# Host side
+# ---------------------------------------------------------------------------
+
+def _pick_vs(NT: int, BH: int, V: int) -> int:
+    return 8 if V % 8 == 0 else 1
+
+
+class _Workspace:
+    def __init__(self):
+        self.buf = None
+        self.views = {}
+
+    def get(self, dev, key, total):
+        rebuild = False
+        if self.buf is None or self.buf.numel() < total:
+            self.buf = torch.empty(total, dtype=torch.uint8, device=dev)
+            rebuild = True
+        if key not in self.views or rebuild:
+            self.views.pop(key, None)
+        return self.buf
+
+
+_WS = _Workspace()
+
+# byte offsets into the workspace (bf16 units / fp32 units depending)
+def _plan_offsets(B, T, H, K, V, NT, dev):
+    # sizes in bytes
+    sz = {}
+    pad = lambda x: (x + 255) & ~255
+    off = 0
+    def add(name, nb):
+        nonlocal off
+        sz[name] = off
+        off += pad(nb)
+        return sz[name]
+    BTHK = B * T * H * K
+    BTHV = B * T * H * V
+    BNTHK = B * NT * H * K
+    add("Dgl", BNTHK * 4)
+    add("Amat", B * NT * H * K * K * 2)
+    add("bvec", B * NT * H * K * V * 2)
+    add("Cbuf", BTHK * 2)
+    add("dbuf", BTHV * 2)
+    return sz, off
+
+
+def _build_views(buf, offs, B, T, H, K, V, NT):
+    def view(name, shape, dtype):
+        o = offs[name]
+        n = 1
+        for s in shape:
+            n *= s
+        return buf[o:o + n * dtype.itemsize].view(dtype).view(shape)
+    return {
+        "Dgl": view("Dgl", (B, NT, H, K), torch.float32),
+        "Amat": view("Amat", (B, NT, H, K, K), torch.bfloat16),
+        "bvec": view("bvec", (B, NT, H, K, V), torch.bfloat16),
+        "Cbuf": view("Cbuf", (B, T, H, K), torch.bfloat16),
+        "dbuf": view("dbuf", (B, T, H, V), torch.bfloat16),
+
+    }
+
+
+def kda_chunk_forward(q, k, v, g, beta, scale, chunk_size=64, plan=None, nw=(8, 4, 4), ns=1, SEG=64):
+    B, T, H, K = q.shape
+    V = v.shape[-1]
+    assert T % chunk_size == 0
+    BT = chunk_size
+    NT = T // BT
+    BH = B * H
+    dev = q.device
+
+    VS = plan if plan is not None else _pick_vs(NT, BH, V)
+    BV = V // VS
+
+    offs, total = _plan_offsets(B, T, H, K, V, NT, dev)
+    key = (B, T, H, K, V, NT, dev.index)
+    buf = _WS.get(dev, key, total)
+    if key not in _WS.views:
+        _WS.views[key] = _build_views(buf, offs, B, T, H, K, V, NT)
+    vw = _WS.views[key]
+
+    Dgl = vw["Dgl"]
+    Amat = vw["Amat"]; bvec = vw["bvec"]; Cbuf = vw["Cbuf"]; dbuf = vw["dbuf"]
+    o = torch.empty(B, T, H, V, dtype=torch.bfloat16, device=dev)
+
+
+    mod = _get_cuda_mod()
+    mod.fused(q, k, v, beta, g, Dgl, Amat, bvec, Cbuf, dbuf, scale, T, NT, H, BH)
+    _kda_state_out_kernel[(BH * VS,)](
+        Amat, bvec, Dgl, Cbuf, dbuf, o, T, NT,
+        H=H, K=K, V=V, BT=BT, BV=BV, VS=VS,
+        num_warps=nw[1], num_stages=ns,
+    )
+    return o
+
+
+class Model(nn.Module):
+    """KDA forward (chunk form). No learned parameters; all inputs are activations."""
+
+    def __init__(self, B: int, T: int, H: int, K: int, V: int, chunk_size: int = 64):
+        super().__init__()
+        self.B, self.T, self.H, self.K, self.V = B, T, H, K, V
+        self.chunk_size = chunk_size
+        self.scale = float(K) ** -0.5
+        self.register_buffer("_dummy", torch.zeros(1), persistent=False)
+
+    def forward(self, q, k, v, g, beta):
+        return kda_chunk_forward(q, k, v, g, beta, scale=self.scale, chunk_size=self.chunk_size)
+
+
+# Module-level shape shims (overridden by check.py / benchmark.py per shape).
+B = 2
+T = 1024
+H = 8
+K = 128
+V = 128
+CHUNK_SIZE = 64
+
+
+def get_inputs():
+    torch.manual_seed(0)
+    q = torch.randn(B, T, H, K, dtype=torch.bfloat16) * 0.1
+    k = torch.randn(B, T, H, K, dtype=torch.bfloat16) * 0.1
+    v = torch.randn(B, T, H, V, dtype=torch.bfloat16) * 0.1
+    g = (torch.randn(B, T, H, K, dtype=torch.float32) * 0.1 - 0.05)
+    beta = torch.sigmoid(torch.randn(B, T, H, dtype=torch.bfloat16))
+    return [q, k, v, g, beta]
+
+
+def get_init_inputs():
+    return [B, T, H, K, V, CHUNK_SIZE]

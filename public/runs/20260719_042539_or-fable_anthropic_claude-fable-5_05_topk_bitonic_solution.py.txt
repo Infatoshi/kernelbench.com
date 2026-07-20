@@ -1,0 +1,449 @@
+"""Custom CUDA top-k kernel (values + int64 indices, sorted descending).
+
+Strategy
+--------
+One CUDA kernel launch per forward. Each block owns one row segment and runs a
+threshold-filtered selection:
+
+  * fp32 values are mapped to order-preserving u32 keys (sign-flip trick), and
+    packed with the column index into a u64 (key in high bits). Sorting the
+    packed u64 descending sorts values descending with deterministic tie-breaks;
+    the original float is recovered bit-exactly from the key, so the returned
+    values match the reference bit-for-bit (ties resolve to the same value
+    multiset, and the lenient index check gathers to the same values).
+  * Threads stream their segment in tiles. Elements whose key exceeds the
+    current k-th-best key are appended to a shared-memory candidate buffer via
+    atomicAdd. When the buffer risks overflow (or the segment ends), the block
+    bitonic-sorts (buffer ∪ current top-k) descending in shared memory, keeps
+    the top K2 = next_pow2(k), and raises the threshold to the new k-th key.
+    After the first compaction the threshold makes further appends rare, so the
+    scan is ~1 compare per element — the kernel is limited by the input read.
+  * For tiny batch (the batch=1, n=131072 decoder shape) the row is split
+    across `segments` blocks. Each block writes its top-K2 packed candidates to
+    a scratch buffer; the last block to finish (atomic ticket per row) merges
+    all segments' candidates with one more shared-memory bitonic sort and
+    writes the final output. Still a single kernel launch.
+
+k=1 (argmax) and non-power-of-two n fall out of the same code path: the tile
+loop handles ragged segment ends, and padding slots use key 0 (below every
+real fp32 key, including -inf).
+"""
+
+import os
+
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+OP_TYPE = "topk"
+SUPPORTED_PRECISIONS = ["fp32"]
+HARDWARE_REQUIRED = ["RTX_PRO_6000", "H100", "B200"]
+
+_CUDA_SRC = r"""
+#include <torch/extension.h>
+#include <ATen/cuda/CUDAContext.h>
+#include <cuda_runtime.h>
+
+#define THREADS 512
+#define BUFSZ   4096   // shared candidate buffer (u64) = 32 KB
+#define TILE    2048   // elements appended per tile <= TILE
+#define MAXK2   128
+
+// Order-preserving fp32 -> u32 key: larger float <=> larger key.
+__device__ __forceinline__ unsigned int fkey(float v) {
+    unsigned int b = __float_as_uint(v);
+    return (b & 0x80000000u) ? ~b : (b | 0x80000000u);
+}
+
+// Exact inverse of fkey.
+__device__ __forceinline__ float kval(unsigned int key) {
+    unsigned int b = (key & 0x80000000u) ? (key & 0x7fffffffu) : ~key;
+    return __uint_as_float(b);
+}
+
+// Block-wide bitonic sort, descending, over sdata[0..M) with M a power of 2.
+// Assumes a __syncthreads() has been issued after the last write to sdata.
+__device__ void bitonic_sort_desc(unsigned long long* sdata, int M) {
+    for (int kk = 2; kk <= M; kk <<= 1) {
+        for (int jj = kk >> 1; jj > 0; jj >>= 1) {
+            for (int i = threadIdx.x; i < M; i += THREADS) {
+                int ixj = i ^ jj;
+                if (ixj > i) {
+                    unsigned long long a = sdata[i];
+                    unsigned long long b = sdata[ixj];
+                    bool desc = ((i & kk) == 0);
+                    if (desc ? (a < b) : (a > b)) {
+                        sdata[i] = b;
+                        sdata[ixj] = a;
+                    }
+                }
+            }
+            __syncthreads();
+        }
+    }
+}
+
+// Register bitonic sort, descending, over exactly THREADS elements (one per
+// thread). Intra-warp stages use shuffles; cross-warp stages bounce through
+// `sh` (>= THREADS u64 slots). Returns the element of rank threadIdx.x.
+__device__ __forceinline__ unsigned long long sort_block_desc(
+        unsigned long long v, unsigned long long* sh) {
+    const int tid = threadIdx.x;
+    #pragma unroll
+    for (int kk = 2; kk <= THREADS; kk <<= 1) {
+        const bool desc = (tid & kk) == 0;
+        #pragma unroll
+        for (int jj = kk >> 1; jj > 0; jj >>= 1) {
+            unsigned long long other;
+            if (jj >= 32) {
+                __syncthreads();
+                sh[tid] = v;
+                __syncthreads();
+                other = sh[tid ^ jj];
+            } else {
+                other = __shfl_xor_sync(0xffffffffu, v, jj, 32);
+            }
+            const bool keep_max = (desc == ((tid & jj) == 0));
+            if (keep_max ? (other > v) : (other < v)) v = other;
+        }
+    }
+    return v;
+}
+
+__global__ void topk_kernel(const float* __restrict__ x,
+                            int n, int k, int K2, int segments, int seg_len,
+                            unsigned long long* __restrict__ scratch,
+                            int* __restrict__ counters,
+                            float* __restrict__ out_vals,
+                            long* __restrict__ out_idx) {
+    __shared__ unsigned long long sbuf[BUFSZ];
+    __shared__ unsigned long long stopk[MAXK2];
+    __shared__ unsigned int sthresh;
+    __shared__ unsigned long long sth64;
+    __shared__ int scount;
+    __shared__ int slast;
+
+    const int row = blockIdx.y;
+    const int seg = blockIdx.x;
+    const int tid = threadIdx.x;
+    const float* xr = x + (long)row * n;
+
+    if (tid < MAXK2) stopk[tid] = 0ull;
+    if (tid == 0) { sthresh = 0u; scount = 0; }
+    __syncthreads();
+
+    const int begin = seg * seg_len;
+    const int end = min(begin + seg_len, n);
+
+    // Warm-up: bootstrap the threshold from the first W elements so the main
+    // scan filters almost everything (avoids a full-buffer sort at threshold 0).
+    const int W = min(THREADS, end - begin);
+    unsigned long long wv = 0ull;
+    if (tid < W) {
+        unsigned int key = fkey(xr[begin + tid]);
+        wv = ((unsigned long long)key << 32) | (unsigned int)(begin + tid);
+    }
+
+    // vec4 path: TILE == 4*THREADS, so each thread owns exactly one float4 per
+    // tile. The next tile's load is issued before this tile's barrier/compact
+    // so DRAM latency overlaps the selection work (software pipeline). The
+    // first prefetch is issued before the warm-up sort to hide under it.
+    const bool vec4 = (((begin + W) | end) & 3) == 0;
+    const float4* xr4 = reinterpret_cast<const float4*>(xr);
+    float4 f = make_float4(0.f, 0.f, 0.f, 0.f);
+    int i0 = ((begin + W) >> 2) + tid;
+    bool valid = vec4 && ((i0 << 2) < end);
+    if (valid) f = xr4[i0];
+
+    {
+        unsigned long long v = sort_block_desc(wv, sbuf);
+        if (tid < K2) stopk[tid] = v;
+        if (tid == k - 1) sthresh = (unsigned int)(v >> 32);
+        __syncthreads();
+    }
+
+    for (int tile = begin + W; tile < end; tile += TILE) {
+        const int tend = min(tile + TILE, end);
+        const unsigned int th = sthresh;  // stable within a tile
+        if (vec4) {
+            const int inext = ((tile + TILE) >> 2) + tid;
+            const bool vnext = (tend < end) && ((inext << 2) < end);
+            float4 fn = make_float4(0.f, 0.f, 0.f, 0.f);
+            if (vnext) fn = xr4[inext];
+            if (valid) {
+                const int i = i0 << 2;
+                unsigned int k0 = fkey(f.x), k1 = fkey(f.y);
+                unsigned int k2 = fkey(f.z), k3 = fkey(f.w);
+                if (k0 > th) { int p = atomicAdd(&scount, 1);
+                    sbuf[p] = ((unsigned long long)k0 << 32) | (unsigned int)(i); }
+                if (k1 > th) { int p = atomicAdd(&scount, 1);
+                    sbuf[p] = ((unsigned long long)k1 << 32) | (unsigned int)(i + 1); }
+                if (k2 > th) { int p = atomicAdd(&scount, 1);
+                    sbuf[p] = ((unsigned long long)k2 << 32) | (unsigned int)(i + 2); }
+                if (k3 > th) { int p = atomicAdd(&scount, 1);
+                    sbuf[p] = ((unsigned long long)k3 << 32) | (unsigned int)(i + 3); }
+            }
+            i0 = inext; f = fn; valid = vnext;
+        } else {
+            for (int i = tile + tid; i < tend; i += THREADS) {
+                unsigned int key = fkey(xr[i]);
+                if (key > th) {
+                    int p = atomicAdd(&scount, 1);
+                    sbuf[p] = ((unsigned long long)key << 32) | (unsigned int)i;
+                }
+            }
+        }
+        __syncthreads();
+
+        // Compact eagerly: a fresh threshold collapses the qualifying rate
+        // from ~k/W of the stream to ~k/seen, and small sorts are cheap.
+        const bool final_tile = (tend >= end);
+        if (final_tile || scount >= 128 || scount + TILE + K2 > BUFSZ) {
+            // Compact: top-K2 of (sbuf[0..scount) U stopk[0..K2)).
+            const int cnt = scount;               // uniform after barrier
+            if (cnt + K2 <= THREADS) {
+                // Fast path: fits one register sort.
+                unsigned long long v = 0ull;
+                if (tid < cnt) v = sbuf[tid];
+                else if (tid - cnt < K2) v = stopk[tid - cnt];
+                v = sort_block_desc(v, sbuf);
+                if (tid < K2) stopk[tid] = v;
+                if (tid == k - 1) sthresh = (unsigned int)(v >> 32);
+                if (tid == 0) scount = 0;
+                __syncthreads();
+            } else {
+                // Rare (adversarial input order): shared-memory array sort.
+                if (tid < K2) sbuf[cnt + tid] = stopk[tid];
+                const int total = cnt + K2;       // <= BUFSZ by invariant
+                int M = 1;
+                while (M < total) M <<= 1;
+                for (int i = total + tid; i < M; i += THREADS) sbuf[i] = 0ull;
+                __syncthreads();
+                bitonic_sort_desc(sbuf, M);
+                if (tid < K2) stopk[tid] = sbuf[tid];
+                __syncthreads();
+                if (tid == 0) {
+                    sthresh = (unsigned int)(stopk[k - 1] >> 32);
+                    scount = 0;
+                }
+                __syncthreads();
+            }
+        }
+    }
+
+    if (segments == 1) {
+        if (tid < k) {
+            unsigned long long p = stopk[tid];
+            out_vals[(long)row * k + tid] = kval((unsigned int)(p >> 32));
+            out_idx[(long)row * k + tid] = (long)(unsigned int)(p & 0xffffffffu);
+        }
+        return;
+    }
+
+    // Multi-segment: publish this segment's candidates; last block merges.
+    if (tid < K2) scratch[((long)row * segments + seg) * K2 + tid] = stopk[tid];
+    __threadfence();
+    __syncthreads();
+    if (tid == 0) {
+        int ticket = atomicAdd(&counters[row], 1);
+        slast = (ticket == segments - 1) ? 1 : 0;
+    }
+    __syncthreads();
+    if (!slast) return;
+    __threadfence();
+
+    const int C = segments * K2;  // <= 4 * THREADS (enforced host-side)
+    const unsigned long long* cand = scratch + (long)row * C;
+    if (C <= THREADS) {
+        unsigned long long p = (tid < C) ? cand[tid] : 0ull;
+        p = sort_block_desc(p, sbuf);
+        if (tid < k) {
+            out_vals[(long)row * k + tid] = kval((unsigned int)(p >> 32));
+            out_idx[(long)row * k + tid] = (long)(unsigned int)(p & 0xffffffffu);
+        }
+        if (tid == 0) counters[row] = 0;  // ready for the next launch
+        return;
+    }
+
+    // C > THREADS: bootstrap a threshold from the first THREADS candidates
+    // (one register sort), then filter the remainder — same trick as the main
+    // scan. Compare full u64s; indices are unique so no equal keys.
+    if (tid < MAXK2) stopk[tid] = 0ull;
+    if (tid == 0) scount = 0;
+    {
+        unsigned long long v = (tid < C) ? cand[tid] : 0ull;
+        v = sort_block_desc(v, sbuf);   // internal barriers cover the inits
+        if (tid < K2) stopk[tid] = v;
+        if (tid == k - 1) sth64 = v;
+        __syncthreads();
+    }
+    const unsigned long long th = sth64;
+    for (int i = THREADS + tid; i < C; i += THREADS) {
+        unsigned long long c = cand[i];
+        if (c > th) { int p = atomicAdd(&scount, 1); sbuf[p] = c; }
+    }
+    __syncthreads();
+    const int cnt = scount;             // <= C - THREADS + few; C <= BUFSZ/2
+    if (cnt + K2 <= THREADS) {
+        unsigned long long p = 0ull;
+        if (tid < cnt) p = sbuf[tid];
+        else if (tid - cnt < K2) p = stopk[tid - cnt];
+        p = sort_block_desc(p, sbuf);
+        if (tid < k) {
+            out_vals[(long)row * k + tid] = kval((unsigned int)(p >> 32));
+            out_idx[(long)row * k + tid] = (long)(unsigned int)(p & 0xffffffffu);
+        }
+    } else {
+        if (tid < K2) sbuf[cnt + tid] = stopk[tid];
+        const int total = cnt + K2;
+        int M = 1;
+        while (M < total) M <<= 1;
+        for (int i = total + tid; i < M; i += THREADS) sbuf[i] = 0ull;
+        __syncthreads();
+        bitonic_sort_desc(sbuf, M);
+        if (tid < k) {
+            unsigned long long p = sbuf[tid];
+            out_vals[(long)row * k + tid] = kval((unsigned int)(p >> 32));
+            out_idx[(long)row * k + tid] = (long)(unsigned int)(p & 0xffffffffu);
+        }
+    }
+    if (tid == 0) counters[row] = 0;  // ready for the next launch
+}
+
+void topk_forward(torch::Tensor x, long k, long segments,
+                  torch::Tensor scratch, torch::Tensor counters,
+                  torch::Tensor out_vals, torch::Tensor out_idx) {
+    TORCH_CHECK(x.is_cuda(), "x must be CUDA");
+    TORCH_CHECK(x.dim() == 2, "x must be 2D");
+    TORCH_CHECK(x.scalar_type() == at::kFloat, "x must be fp32");
+    TORCH_CHECK(x.is_contiguous(), "x must be contiguous");
+    const long batch = x.size(0);
+    const long n = x.size(1);
+    TORCH_CHECK(k >= 1 && k <= n && k <= MAXK2, "k out of supported range");
+
+    long K2 = 1;
+    while (K2 < k) K2 <<= 1;
+    TORCH_CHECK(segments >= 1 && segments <= 32 &&
+                segments * K2 <= 4 * THREADS, "too many segments");
+    const long seg_len = (((n + segments - 1) / segments) + 3) & ~3L;  // 4-aligned for float4
+
+    dim3 grid((unsigned)segments, (unsigned)batch);
+    auto stream = at::cuda::getCurrentCUDAStream();
+    topk_kernel<<<grid, THREADS, 0, stream>>>(
+        x.data_ptr<float>(), (int)n, (int)k, (int)K2, (int)segments,
+        (int)seg_len,
+        reinterpret_cast<unsigned long long*>(scratch.data_ptr<int64_t>()),
+        counters.data_ptr<int>(),
+        out_vals.data_ptr<float>(), out_idx.data_ptr<long>());
+}
+"""
+
+_CPP_SRC = (
+    "void topk_forward(torch::Tensor x, long k, long segments, "
+    "torch::Tensor scratch, torch::Tensor counters, "
+    "torch::Tensor out_vals, torch::Tensor out_idx);"
+)
+
+os.environ.setdefault("TORCH_CUDA_ARCH_LIST", "12.0")
+
+_ext = load_inline(
+    name="topk_bitonic_ext",
+    cpp_sources=[_CPP_SRC],
+    cuda_sources=[_CUDA_SRC],
+    functions=["topk_forward"],
+    extra_cuda_cflags=["-O3", "--use_fast_math"],
+    verbose=False,
+)
+
+
+class Model(nn.Module):
+    """Top-k over the last dim of a 2D fp32 tensor via a custom CUDA kernel."""
+
+    def __init__(self, batch: int, n: int, k: int):
+        super().__init__()
+        self.batch, self.n, self.k = batch, n, k
+        self.register_buffer("_dummy", torch.zeros(1))
+
+        # Split rows across segments until batch*segments roughly fills the
+        # GPU (188 SMs on RTX PRO 6000): fewer sequential tiles per block, at
+        # the cost of one merge per row. The merge block handles up to
+        # segments * K2 = 2048 packed candidates via the same filter loop.
+        k2 = 1
+        while k2 < k:
+            k2 *= 2
+        spread = 188 // batch  # blocks we can add per row before oversubscribing
+        if spread >= 4 and n >= 2048:
+            segments = max(1, min(32, 2048 // k2, spread, n // 1024))
+        else:
+            segments = 1
+        self.segments = segments
+        # Non-persistent so state_dict stays identical to reference's.
+        self.register_buffer(
+            "_scratch",
+            torch.zeros(batch * segments * k2, dtype=torch.int64),
+            persistent=False,
+        )
+        self.register_buffer(
+            "_counters", torch.zeros(batch, dtype=torch.int32), persistent=False
+        )
+        # Preallocated outputs: the kernel fully rewrites every slot each call
+        # (out[i] is written unconditionally for i < k), so reusing the buffers
+        # is safe and saves two allocator round-trips per forward.
+        self.register_buffer(
+            "_out_vals", torch.empty(batch, k, dtype=torch.float32), persistent=False
+        )
+        self.register_buffer(
+            "_out_idx", torch.empty(batch, k, dtype=torch.int64), persistent=False
+        )
+        self._fn = _ext.topk_forward
+        # CUDA-graph replay for repeated calls on the same input buffer: the
+        # launch itself dominates for these tiny kernels. Replay re-reads the
+        # live input memory every call (it stores the pointer, not the data),
+        # so results always reflect the current buffer contents; any new
+        # pointer/shape takes the plain-launch path below.
+        self._graph = None
+        self._graph_ptr = None
+        self._last_ptr = None
+        self._graph_ok = True
+
+    def _launch(self, x: torch.Tensor):
+        self._fn(x, self.k, self.segments, self._scratch, self._counters,
+                 self._out_vals, self._out_idx)
+
+    def forward(self, x: torch.Tensor):
+        if not x.is_contiguous():
+            x = x.contiguous()
+        ptr = x.data_ptr()
+        if self._graph is not None and ptr == self._graph_ptr:
+            self._graph.replay()
+            return self._out_vals, self._out_idx
+        if self._graph_ok and ptr == self._last_ptr:
+            # Second consecutive call on the same buffer: capture once.
+            try:
+                g = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(g):
+                    self._launch(x)
+                self._graph = g
+                self._graph_ptr = ptr
+                g.replay()  # capture records without executing; run it now
+                return self._out_vals, self._out_idx
+            except Exception:
+                self._graph_ok = False
+                self._graph = None
+        self._last_ptr = ptr
+        self._launch(x)
+        return self._out_vals, self._out_idx
+
+
+batch = 64
+n = 8192
+k = 8
+
+
+def get_inputs():
+    x = torch.randn(batch, n, dtype=torch.float32)
+    return [x]
+
+
+def get_init_inputs():
+    return [batch, n, k]

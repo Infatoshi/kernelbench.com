@@ -1,0 +1,889 @@
+"""Paged attention decode kernel for B200 (SM100).
+
+Custom CUDA kernel (flash-decoding style):
+  - One warp per (batch, kv_head, chunk) task; cp.async 3-stage smem pipeline.
+  - Scores via mma.sync.m16n8k16 bf16 with tokens in the M dimension
+    (S^T = K * Q^T), online softmax in fp32 (redux.sync.max), P^T via
+    movmatrix, O^T += V^T * P^T accumulation.
+  - Cross-chunk merge in-kernel via self-zeroing counters (last task per
+    (batch, kv_head) merges the chunk partials; single launch per call).
+  - Lean per-call path: one pybind call, at::empty + launch inside C++.
+A generic PyTorch fallback covers shapes the kernel doesn't specialize.
+"""
+import math
+import os
+
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+OP_TYPE = "attention"
+SUPPORTED_PRECISIONS = ["bf16"]
+HARDWARE_REQUIRED = ["RTX_PRO_6000", "H100", "B200"]
+
+# --- Shape knobs (overridden by check.py / benchmark.py from shapes.py) ----
+BATCH = 8
+NUM_HEADS = 32
+NUM_KV_HEADS = 8
+HEAD_DIM = 128
+SEQ_LEN = 1024
+PAGE_SIZE = 16
+
+_CUDA_SRC = r"""
+// Final paged attention decode kernel for B200 (SM100).
+// Template <D, W, TPG, RED, STG>: head dim, warps/block, 16-token slabs/stage,
+// reducer style (0 = fp32 pooled, 1 = bf16 sliced), pipeline stages.
+#include <cuda_runtime.h>
+#include <cuda_bf16.h>
+#include <cstdint>
+
+#define DEVINL __device__ __forceinline__
+
+DEVINL void cp_async16(uint32_t dst, const void* src, int src_bytes) {
+  asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" ::"r"(dst),
+               "l"(src), "r"(src_bytes));
+}
+DEVINL void cp_commit() { asm volatile("cp.async.commit_group;\n"); }
+template <int N>
+DEVINL void cp_wait() { asm volatile("cp.async.wait_group %0;\n" ::"n"(N)); }
+
+DEVINL void ldsm_x4(uint32_t& r0, uint32_t& r1, uint32_t& r2, uint32_t& r3,
+                    uint32_t addr) {
+  asm volatile(
+      "ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+      : "=r"(r0), "=r"(r1), "=r"(r2), "=r"(r3)
+      : "r"(addr));
+}
+DEVINL void ldsm_x4_t(uint32_t& r0, uint32_t& r1, uint32_t& r2, uint32_t& r3,
+                      uint32_t addr) {
+  asm volatile(
+      "ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+      : "=r"(r0), "=r"(r1), "=r"(r2), "=r"(r3)
+      : "r"(addr));
+}
+DEVINL uint32_t movmatrix_t(uint32_t a) {
+  uint32_t d;
+  asm volatile("movmatrix.sync.aligned.m8n8.trans.b16 %0, %1;\n"
+               : "=r"(d)
+               : "r"(a));
+  return d;
+}
+DEVINL void mma_bf16(float c[4], const uint32_t a[4], uint32_t b0, uint32_t b1) {
+  asm volatile(
+      "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
+      "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+      : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
+      : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+}
+DEVINL uint32_t pack_bf16(float x, float y) {
+  uint32_t r;
+  asm volatile("cvt.rn.bf16x2.f32 %0, %1, %2;\n" : "=r"(r) : "f"(y), "f"(x));
+  return r;
+}
+DEVINL void pack_hilo_bf16(float x, float y, uint32_t& hi, uint32_t& lo) {
+  hi = pack_bf16(x, y);
+  __nv_bfloat162 h2;
+  *(uint32_t*)&h2 = hi;
+  float2 hf = __bfloat1622float2(h2);
+  lo = pack_bf16(x - hf.x, y - hf.y);
+}
+
+template <int D, int W, int TPG, int RED, int STG>
+__global__ void __launch_bounds__(W * 32) attn9_kernel(
+    const __nv_bfloat16* __restrict__ qp,
+    const __nv_bfloat16* __restrict__ kv,
+    const int* __restrict__ block_table,
+    const int* __restrict__ seq_lens,
+    __nv_bfloat16* __restrict__ outp,
+    void* __restrict__ ws_O,  // RED==0: fp32 (tasks,8,D); RED==1: bf16
+    float* __restrict__ ws_ml,         // (tasks, 8, 2)
+    unsigned int* __restrict__ counters,
+    int B, int H, int Hkv, int G, int kv_page_stride, int kv_tok_stride,
+    int bt_stride, int chunk_pages, int chunks) {
+  constexpr int TOKS = 16;
+  constexpr int ROWB = 4 * D;
+  constexpr int CPR = ROWB / 16;
+  constexpr int STAGE_BYTES = TPG * TOKS * ROWB;
+  constexpr int STAGES = STG;
+  constexpr int KSTEPS = D / 16;
+  constexpr int VTILE_OFF = (ROWB / 2) / 16;
+  constexpr int MLF = 16;
+
+  extern __shared__ char smem[];
+  const int warp = threadIdx.x >> 5;
+  const int lane = threadIdx.x & 31;
+  const int task = blockIdx.x * W + warp;
+  const int total_tasks = B * Hkv * chunks;
+  char* wsmem = smem + (size_t)warp * (STAGES * STAGE_BYTES + 64);
+  if (task >= total_tasks) return;
+
+  const int c = task % chunks;
+  const int bj = task / chunks;
+  const int b = bj / Hkv;
+  const int j = bj - b * Hkv;
+  const int L = seq_lens[b];
+  const int pages_b = (L + TOKS - 1) / TOKS;
+  const int start_page = c * chunk_pages;
+  const int npages = min(chunk_pages, pages_b - start_page);
+  const int nstages = (npages + TPG - 1) / TPG;
+  const float K2 = rsqrtf((float)D) * 1.4426950408889634f;
+
+  auto issue = [&](int s) {
+    const bool pv = s < nstages;
+    const uint32_t dst_base =
+        (uint32_t)__cvta_generic_to_shared(wsmem + (s % STAGES) * STAGE_BYTES);
+#pragma unroll
+    for (int pg = 0; pg < TPG; ++pg) {
+      const bool pvpg = pv && (s * TPG + pg < npages);
+      const int page =
+          pvpg ? block_table[b * bt_stride + start_page + s * TPG + pg] : 0;
+      const __nv_bfloat16* srcp =
+          kv + (int64_t)page * kv_page_stride + (int64_t)j * (2 * D);
+      const uint32_t dst_pg = dst_base + pg * TOKS * ROWB;
+#pragma unroll
+      for (int i = 0; i < TOKS * CPR / 32; ++i) {
+        const int idx = lane + i * 32;
+        const int t = idx / CPR;
+        const int ch = idx - t * CPR;
+        const uint32_t dst = dst_pg + t * ROWB + ((ch ^ (t & 7)) << 4);
+        cp_async16(dst, srcp + t * kv_tok_stride + (ch << 3), pvpg ? 16 : 0);
+      }
+    }
+    cp_commit();
+  };
+  for (int i = 0; i < STG - 1; ++i) issue(i);
+
+  const int hloc = lane >> 2;
+  const bool hv = hloc < G;
+  const __nv_bfloat16* qbase =
+      qp + ((int64_t)b * H + j * G + hloc) * (int64_t)D;
+  uint32_t qf[KSTEPS][2];
+#pragma unroll
+  for (int ks = 0; ks < KSTEPS; ++ks) {
+    qf[ks][0] = hv ? *(const uint32_t*)(qbase + 16 * ks + 2 * (lane & 3)) : 0u;
+    qf[ks][1] =
+        hv ? *(const uint32_t*)(qbase + 16 * ks + 2 * (lane & 3) + 8) : 0u;
+  }
+
+  float acc[KSTEPS][4];
+#pragma unroll
+  for (int t = 0; t < KSTEPS; ++t) acc[t][0]=acc[t][1]=acc[t][2]=acc[t][3]=0.f;
+  float m0 = -1e30f, m1 = -1e30f, l0 = 0.f, l1 = 0.f;
+  const int lane_r = lane >> 2;
+  const unsigned rmask = 0x11111111u << (lane & 3);
+
+  auto compute_round = [&](const uint32_t st_base, const int valid_t) {
+    float sca[4] = {0.f, 0.f, 0.f, 0.f};
+    float scb[4] = {0.f, 0.f, 0.f, 0.f};
+    {
+      const int mat = lane >> 3;
+      const int ta = ((mat & 1) << 3) + (lane & 7);
+      const int rowb = ta * ROWB;
+      const int coff = mat >> 1;
+      uint32_t a[4];
+#pragma unroll
+      for (int kd = 0; kd < KSTEPS; ++kd) {
+        const int ch = 2 * kd + coff;
+        ldsm_x4(a[0], a[1], a[2], a[3],
+                st_base + rowb + ((ch ^ (ta & 7)) << 4));
+        if (kd & 1) mma_bf16(scb, a, qf[kd][0], qf[kd][1]);
+        else mma_bf16(sca, a, qf[kd][0], qf[kd][1]);
+      }
+    }
+    float sc[4] = {sca[0]+scb[0], sca[1]+scb[1], sca[2]+scb[2], sca[3]+scb[3]};
+    if (lane_r >= valid_t) { sc[0] = -1e30f; sc[1] = -1e30f; }
+    if (lane_r + 8 >= valid_t) { sc[2] = -1e30f; sc[3] = -1e30f; }
+
+    float cm0 = fmaxf(sc[0], sc[2]);
+    float cm1 = fmaxf(sc[1], sc[3]);
+    asm volatile("redux.sync.max.f32 %0, %1, %2;\n"
+                 : "=f"(cm0)
+                 : "f"(cm0), "r"(rmask));
+    asm volatile("redux.sync.max.f32 %0, %1, %2;\n"
+                 : "=f"(cm1)
+                 : "f"(cm1), "r"(rmask));
+    const float mn0 = fmaxf(m0, cm0);
+    const float mn1 = fmaxf(m1, cm1);
+    const float r0 = exp2f((m0 - mn0) * K2);
+    const float r1 = exp2f((m1 - mn1) * K2);
+    sc[0] = exp2f((sc[0] - mn0) * K2);
+    sc[1] = exp2f((sc[1] - mn1) * K2);
+    sc[2] = exp2f((sc[2] - mn0) * K2);
+    sc[3] = exp2f((sc[3] - mn1) * K2);
+    float s0, s1;
+    uint32_t ph0_, ph1_, pl0_, pl1_;
+    pack_hilo_bf16(sc[0], sc[1], ph0_, pl0_);
+    pack_hilo_bf16(sc[2], sc[3], ph1_, pl1_);
+    const uint32_t pbh0 = movmatrix_t(ph0_);
+    const uint32_t pbh1 = movmatrix_t(ph1_);
+    const uint32_t pbl0 = movmatrix_t(pl0_);
+    const uint32_t pbl1 = movmatrix_t(pl1_);
+    {
+      const uint32_t onesA[4] = {0x3f803f80u, 0x3f803f80u, 0x3f803f80u, 0x3f803f80u};
+      float lacc[4] = {0.f, 0.f, 0.f, 0.f};
+      mma_bf16(lacc, onesA, pbh0, pbh1);
+      s0 = lacc[0];
+      s1 = lacc[1];
+    }
+    l0 = l0 * r0 + s0;
+    l1 = l1 * r1 + s1;
+    m0 = mn0;
+    m1 = mn1;
+#pragma unroll
+    for (int t = 0; t < KSTEPS; ++t) {
+      acc[t][0] *= r0; acc[t][1] *= r1; acc[t][2] *= r0; acc[t][3] *= r1;
+    }
+    {
+      const int mat = lane >> 3;
+      const int tt2 = ((mat >> 1) << 3) + (lane & 7);
+      const int rowb2 = tt2 * ROWB;
+#pragma unroll
+      for (int dt = 0; dt < KSTEPS; ++dt) {
+        const int chv = VTILE_OFF + 2 * dt + (mat & 1);
+        uint32_t a[4];
+        ldsm_x4_t(a[0], a[1], a[2], a[3],
+                  st_base + rowb2 + ((chv ^ (tt2 & 7)) << 4));
+        mma_bf16(acc[dt], a, pbh0, pbh1);
+        mma_bf16(acc[dt], a, pbl0, pbl1);
+      }
+    }
+  };
+
+  for (int s = 0; s < nstages; ++s) {
+    issue(s + STG - 1);
+    cp_wait<STG - 1>();
+    __syncwarp();
+    const uint32_t st_base =
+        (uint32_t)__cvta_generic_to_shared(wsmem + (s % STAGES) * STAGE_BYTES);
+#pragma unroll
+    for (int pg = 0; pg < TPG; ++pg) {
+      const int tok0 = (start_page + s * TPG + pg) * TOKS;
+      const int valid_t = min(TOKS, L - tok0);
+      compute_round(st_base + pg * TOKS * ROWB, valid_t);
+    }
+    __syncwarp();
+  }
+
+  // ---- partials + counters ----
+  const bool has = npages > 0;
+  if (lane < 4) {
+    float* mlp = ws_ml + ((int64_t)task * 8 + 2 * lane) * 2;
+    mlp[0] = (2 * lane < G && has) ? m0 : -1e30f;
+    mlp[1] = (2 * lane < G && has) ? l0 : 0.f;
+    mlp[2] = (2 * lane + 1 < G && has) ? m1 : -1e30f;
+    mlp[3] = (2 * lane + 1 < G && has) ? l1 : 0.f;
+  }
+  if (RED == 0) {
+    if (has) {
+      float* op = (float*)ws_O + ((int64_t)task * 8) * D;
+      const int h8 = lane >> 2;
+      const int hA = 2 * (lane & 3);
+#pragma unroll
+      for (int dt = 0; dt < KSTEPS; ++dt) {
+        const int d0 = 16 * dt + h8;
+        if (hA < G) {
+          op[hA * D + d0] = acc[dt][0];
+          op[hA * D + d0 + 8] = acc[dt][2];
+        }
+        if (hA + 1 < G) {
+          op[(hA + 1) * D + d0] = acc[dt][1];
+          op[(hA + 1) * D + d0 + 8] = acc[dt][3];
+        }
+      }
+    }
+  } else {
+    if (has) {
+      __nv_bfloat16* op = (__nv_bfloat16*)ws_O + ((int64_t)task * 8) * D;
+      const int h8 = lane >> 2;
+      const int dp = 2 * (lane & 3);
+#pragma unroll
+      for (int dt = 0; dt < KSTEPS; ++dt) {
+        uint32_t lo = movmatrix_t(pack_bf16(acc[dt][0], acc[dt][1]));
+        uint32_t hi = movmatrix_t(pack_bf16(acc[dt][2], acc[dt][3]));
+        if (h8 < G) {
+          *(uint32_t*)(op + h8 * D + 16 * dt + dp) = lo;
+          *(uint32_t*)(op + h8 * D + 16 * dt + 8 + dp) = hi;
+        }
+      }
+    }
+  }
+
+  __threadfence();
+  __syncwarp();
+  unsigned int old = 0;
+  if (lane == 0) old = atomicAdd(&counters[bj], 1u);
+  old = __shfl_sync(0xffffffffu, old, 0);
+
+  if (RED == 0) {
+    // fp32 pooled reducer: last task per bj merges all chunk partials.
+    if (old == (unsigned int)chunks - 1u) {
+      __threadfence();
+      cp_wait<0>();
+      __syncwarp();
+      float* wS = (float*)wsmem;
+      float* lSt = wS + chunks * 8;
+      {
+        const int64_t mlb = (int64_t)bj * chunks * MLF;
+        for (int i = lane; i < chunks * 4; i += 32) {
+          const int cc = i >> 2;
+          const float4 ml2 =
+              *(const float4*)(ws_ml + mlb + (int64_t)cc * MLF + (i & 3) * 4);
+          const int hA = 2 * (i & 3);
+          wS[cc * 8 + hA] = ml2.x;
+          lSt[cc * 8 + hA] = ml2.y;
+          wS[cc * 8 + hA + 1] = ml2.z;
+          lSt[cc * 8 + hA + 1] = ml2.w;
+        }
+        __syncwarp();
+      }
+      if (lane < 8) {
+        const int h = lane;
+        float M = -1e30f;
+        for (int cc = 0; cc < chunks; ++cc) M = fmaxf(M, wS[cc * 8 + h]);
+        float LS = 0.f;
+        for (int cc = 0; cc < chunks; ++cc) {
+          const float lk = lSt[cc * 8 + h];
+          const float w = lk > 0.f ? exp2f((wS[cc * 8 + h] - M) * K2) : 0.f;
+          wS[cc * 8 + h] = w;
+          LS += w * lk;
+        }
+        lSt[h] = LS;
+      }
+      __syncwarp();
+      char* opipe = (char*)(lSt + chunks * 8 + 8);
+      const uint32_t opipe_s = (uint32_t)__cvta_generic_to_shared(opipe);
+      constexpr int OBUF_BYTES = 8 * D * 4;
+      constexpr int RED_DEPTH_F = (D == 128) ? 5 : 4;
+      constexpr int CPF = D / 4;
+      constexpr int RED_ITERS_F = 8 * CPF / 32;
+      const int64_t ob = ((int64_t)bj * chunks) * 8 * D * 4;
+      auto red_issue = [&](int cc) {
+        const bool pv = cc < chunks;
+        const float* srcp =
+            (const float*)((const char*)ws_O + ob + (int64_t)(pv ? cc : 0) * 8 * D * 4);
+        const uint32_t dst = opipe_s + (cc % RED_DEPTH_F) * OBUF_BYTES;
+#pragma unroll
+        for (int i = 0; i < OBUF_BYTES / 16 / 32; ++i) {
+          const int chunkid = lane + i * 32;
+          cp_async16(dst + chunkid * 16, (const char*)srcp + chunkid * 16,
+                     pv ? 16 : 0);
+        }
+        cp_commit();
+      };
+      for (int i = 0; i < RED_DEPTH_F - 1 && i < chunks; ++i) red_issue(i);
+      float oacc[RED_ITERS_F][4];
+#pragma unroll
+      for (int i = 0; i < RED_ITERS_F; ++i)
+#pragma unroll
+        for (int v = 0; v < 4; ++v) oacc[i][v] = 0.f;
+      for (int cc = 0; cc < chunks; ++cc) {
+        red_issue(cc + RED_DEPTH_F - 1);
+        cp_wait<RED_DEPTH_F - 1>();
+        __syncwarp();
+        const float* orow =
+            (const float*)(opipe + (cc % RED_DEPTH_F) * OBUF_BYTES);
+#pragma unroll
+        for (int i = 0; i < RED_ITERS_F; ++i) {
+          const int chunkid = i * 32 + lane;
+          const int hh = chunkid / CPF;
+          if (hh < G) {
+            const float4 ov4 = *(const float4*)(orow + chunkid * 4);
+            const float w = wS[cc * 8 + hh];
+            oacc[i][0] += w * ov4.x;
+            oacc[i][1] += w * ov4.y;
+            oacc[i][2] += w * ov4.z;
+            oacc[i][3] += w * ov4.w;
+          }
+        }
+        __syncwarp();
+      }
+#pragma unroll
+      for (int i = 0; i < RED_ITERS_F; ++i) {
+        const int chunkid = i * 32 + lane;
+        const int hh = chunkid / CPF;
+        const int dd = (chunkid % CPF) * 4;
+        if (hh < G) {
+          const float LS = lSt[hh];
+          const float inv = LS > 0.f ? 1.f / LS : 0.f;
+          __nv_bfloat162 rr0 =
+              __floats2bfloat162_rn(oacc[i][0] * inv, oacc[i][1] * inv);
+          __nv_bfloat162 rr1 =
+              __floats2bfloat162_rn(oacc[i][2] * inv, oacc[i][3] * inv);
+          uint2 res;
+          res.x = *(const uint32_t*)&rr0;
+          res.y = *(const uint32_t*)&rr1;
+          *(uint2*)(outp + ((int64_t)b * H + j * G + hh) * D + dd) = res;
+        }
+      }
+      __syncwarp();
+      if (lane == 0) counters[bj] = 0u;
+    }
+  } else {
+    // bf16 sliced reducer: last K=min(chunks,G) arrivals split head slices.
+    const int K = min(chunks, G);
+    if ((int)old >= chunks - K) {
+      const int k = chunks - 1 - (int)old;
+      if (lane == 0) {
+        while (true) {
+          unsigned int v;
+          asm volatile("ld.volatile.global.u32 %0, [%1];\n"
+                       : "=r"(v)
+                       : "l"(&counters[bj]));
+          if (v == (unsigned int)chunks) break;
+        }
+      }
+      __syncwarp();
+      __threadfence();
+      cp_wait<0>();
+      __syncwarp();
+      constexpr int RED_LANES = D / 8;
+      for (int hh = k; hh < G; hh += K) {
+        float mv = -1e30f, lv = 0.f;
+        if (lane < chunks) {
+          const float2 ff = *(const float2*)(ws_ml +
+              ((int64_t)(bj * chunks + lane) * 8 + hh) * 2);
+          mv = ff.x;
+          lv = ff.y;
+        }
+        float M = mv;
+#pragma unroll
+        for (int off = 16; off > 0; off >>= 1)
+          M = fmaxf(M, __shfl_xor_sync(0xffffffffu, M, off, 32));
+        float LS = 0.f;
+        if (lane < chunks && lv > 0.f) {
+          mv = exp2f((mv - M) * K2);
+          LS = mv * lv;
+        } else {
+          mv = 0.f;
+        }
+#pragma unroll
+        for (int off = 16; off > 0; off >>= 1)
+          LS += __shfl_xor_sync(0xffffffffu, LS, off, 32);
+        float oacc[8];
+#pragma unroll
+        for (int v = 0; v < 8; ++v) oacc[v] = 0.f;
+        const __nv_bfloat16* obase =
+            (__nv_bfloat16*)ws_O + ((int64_t)(bj * chunks) * 8 + hh) * D + lane * 8;
+        for (int cc = 0; cc < chunks; ++cc) {
+          const float wc = __shfl_sync(0xffffffffu, mv, cc, 32);
+          if (lane < RED_LANES) {
+            const uint4 ov4 = *(const uint4*)(obase + (int64_t)cc * 8 * D);
+            const __nv_bfloat162* ovp = (const __nv_bfloat162*)&ov4;
+            float2 f0 = __bfloat1622float2(ovp[0]);
+            float2 f1 = __bfloat1622float2(ovp[1]);
+            float2 f2 = __bfloat1622float2(ovp[2]);
+            float2 f3 = __bfloat1622float2(ovp[3]);
+            oacc[0] += wc * f0.x; oacc[1] += wc * f0.y;
+            oacc[2] += wc * f1.x; oacc[3] += wc * f1.y;
+            oacc[4] += wc * f2.x; oacc[5] += wc * f2.y;
+            oacc[6] += wc * f3.x; oacc[7] += wc * f3.y;
+          }
+        }
+        if (lane < RED_LANES) {
+          const float inv = LS > 0.f ? 1.f / LS : 0.f;
+          __nv_bfloat162 rr0 = __floats2bfloat162_rn(oacc[0] * inv, oacc[1] * inv);
+          __nv_bfloat162 rr1 = __floats2bfloat162_rn(oacc[2] * inv, oacc[3] * inv);
+          __nv_bfloat162 rr2 = __floats2bfloat162_rn(oacc[4] * inv, oacc[5] * inv);
+          __nv_bfloat162 rr3 = __floats2bfloat162_rn(oacc[6] * inv, oacc[7] * inv);
+          uint4 res;
+          res.x = *(const uint32_t*)&rr0;
+          res.y = *(const uint32_t*)&rr1;
+          res.z = *(const uint32_t*)&rr2;
+          res.w = *(const uint32_t*)&rr3;
+          *(uint4*)(outp + ((int64_t)b * H + j * G + hh) * D + lane * 8) = res;
+        }
+      }
+      __syncwarp();
+      unsigned int old2 = 0;
+      if (lane == 0) old2 = atomicAdd(&counters[B * Hkv + bj], 1u);
+      old2 = __shfl_sync(0xffffffffu, old2, 0);
+      if (old2 == (unsigned int)(K - 1)) {
+        if (lane == 0) {
+          counters[bj] = 0u;
+          counters[B * Hkv + bj] = 0u;
+        }
+      }
+    }
+  }
+}
+
+extern "C" void attn9_launch(const void* q, const void* kv, const void* bt,
+                             const void* sl, void* outp, void* ws_O,
+                             void* ws_ml, void* counters, int B, int H,
+                             int Hkv, int D, int P, int bt_stride,
+                             int chunk_pages, int chunks, int wpb, int tpg,
+                             int red, int stg, void* stream_v) {
+  cudaStream_t stream = (cudaStream_t)stream_v;
+  const int G = H / Hkv;
+  const int tasks = B * Hkv * chunks;
+  const int kv_page_stride = P * Hkv * 2 * D;
+  const int kv_tok_stride = Hkv * 2 * D;
+#define LAUNCH9(DD, WW, TT, RR, SS)                                            \
+  {                                                                            \
+    const int blocks = (tasks + WW - 1) / WW;                                  \
+    const int smem = WW * (SS * TT * 16 * 4 * DD + 64);                        \
+    static int conf = 0;                                                       \
+    if (!conf) {                                                               \
+      cudaFuncSetAttribute(attn9_kernel<DD, WW, TT, RR, SS>,                   \
+                           cudaFuncAttributeMaxDynamicSharedMemorySize,        \
+                           smem);                                              \
+      conf = 1;                                                                \
+    }                                                                          \
+    attn9_kernel<DD, WW, TT, RR, SS><<<blocks, WW * 32, smem, stream>>>(       \
+        (const __nv_bfloat16*)q, (const __nv_bfloat16*)kv, (const int*)bt,     \
+        (const int*)sl, (__nv_bfloat16*)outp, ws_O,                            \
+        (float*)ws_ml, (unsigned int*)counters, B, H, Hkv, G, kv_page_stride,  \
+        kv_tok_stride, bt_stride, chunk_pages, chunks);                        \
+  }
+  if (red != 0) {
+    // sliced reducer only instantiated @ wpb=4 stg=3 for compatibility
+    if (D == 128) LAUNCH9(128, 4, 1, 1, 3)
+    else LAUNCH9(64, 4, 1, 1, 3)
+  } else if (D == 128) {
+    if (wpb == 8) LAUNCH9(128, 8, 1, 0, 3)
+    else if (wpb == 4) { if (stg == 3) LAUNCH9(128, 4, 1, 0, 3) else LAUNCH9(128, 4, 1, 0, 4) }
+    else { if (stg == 3) LAUNCH9(128, 2, 1, 0, 3) else LAUNCH9(128, 2, 1, 0, 4) }
+  } else {
+    if (wpb == 8) LAUNCH9(64, 8, 1, 0, 3)
+    else if (wpb == 4) { if (stg == 3) LAUNCH9(64, 4, 1, 0, 3) else LAUNCH9(64, 4, 1, 0, 4) }
+    else { if (stg == 3) LAUNCH9(64, 2, 1, 0, 3) else LAUNCH9(64, 2, 1, 0, 4) }
+  }
+
+#undef DISPATCH9
+}
+"""
+
+_CPP_SRC = r"""
+#include <cstdint>
+#include <vector>
+#include <map>
+#include <torch/extension.h>
+#include <ATen/cuda/CUDAContext.h>
+
+extern "C" void attn9_launch(const void* q, const void* kv, const void* bt,
+                             const void* sl, void* outp, void* ws_O,
+                             void* ws_ml, void* counters, int B, int H,
+                             int Hkv, int D, int P, int bt_stride,
+                             int chunk_pages, int chunks, int wpb, int tpg,
+                             int red, int stg, void* stream_v);
+
+namespace {
+struct AttnCfg {
+  int B, H, Hkv, D, P, bt_stride, chunk_pages, chunks, wpb, tpg, red, stg;
+  torch::Tensor ws_O, ws_ml, cnt;
+};
+std::vector<AttnCfg*> g_cfgs;
+
+int64_t make_cfg(int64_t B, int64_t H, int64_t Hkv, int64_t D, int64_t P,
+                 int64_t seq_len, int64_t bt_stride, int64_t target_tasks,
+                 int64_t wpb, int64_t tpg, int64_t red, int64_t stg) {
+  AttnCfg* c = new AttnCfg();
+  c->B = B; c->H = H; c->Hkv = Hkv; c->D = D; c->P = P;
+  c->bt_stride = bt_stride; c->wpb = wpb; c->tpg = tpg; c->red = red; c->stg = stg;
+  // Cover the full block_table row capacity; GPU clamps per-b via seq_lens.
+  const int pages = bt_stride;
+  const int bj = B * Hkv;
+  long long chunks_c = (target_tasks + bj - 1) / bj;
+  if (chunks_c < 1) chunks_c = 1;
+  if (chunks_c > pages) chunks_c = pages;
+  if (chunks_c > 32) chunks_c = 32;  // reducer maps one lane per chunk
+
+  const int chunk_pages = (pages + chunks_c - 1) / chunks_c;
+  c->chunks = (pages + chunk_pages - 1) / chunk_pages;
+  c->chunk_pages = chunk_pages;
+  const int tasks = bj * c->chunks;
+  auto opts_f = torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA);
+  auto opts_b = torch::TensorOptions().dtype(torch::kBFloat16).device(torch::kCUDA);
+  auto opts_i = torch::TensorOptions().dtype(torch::kInt32).device(torch::kCUDA);
+  c->ws_O = torch::zeros({(long long)tasks * 8 * D * (red == 0 ? 2 : 1)}, opts_b);
+  c->ws_ml = torch::zeros({(long long)tasks * 8 * 2}, opts_f);
+  c->cnt = torch::zeros({(long long)bj * 2}, opts_i);
+  g_cfgs.push_back(c);
+  return (int64_t)(g_cfgs.size() - 1);
+}
+
+void run_ts(int64_t q, int64_t kv, int64_t bt, int64_t sl, int64_t outp,
+            int64_t handle) {
+  AttnCfg* c = g_cfgs[handle];
+  cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  attn9_launch((const void*)q, (const void*)kv, (const void*)bt, (const void*)sl,
+               (void*)outp, (void*)c->ws_O.data_ptr(), (void*)c->ws_ml.data_ptr(),
+               (void*)c->cnt.data_ptr(), c->B, c->H, c->Hkv, c->D, c->P,
+               c->bt_stride, c->chunk_pages, c->chunks, c->wpb, c->tpg, c->red, c->stg, (void*)stream);
+}
+
+torch::Tensor run_alloc(int64_t q, int64_t kv, int64_t bt, int64_t sl,
+                        int64_t handle) {
+  AttnCfg* c = g_cfgs[handle];
+  auto out = at::empty({c->B, c->H, c->D},
+                       torch::TensorOptions().dtype(torch::kBFloat16).device(torch::kCUDA));
+  cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  attn9_launch((const void*)q, (const void*)kv, (const void*)bt, (const void*)sl,
+               (void*)out.data_ptr(), (void*)c->ws_O.data_ptr(),
+               (void*)c->ws_ml.data_ptr(), (void*)c->cnt.data_ptr(), c->B, c->H,
+               c->Hkv, c->D, c->P, c->bt_stride, c->chunk_pages, c->chunks,
+               c->wpb, c->tpg, c->red, c->stg, (void*)stream);
+  return out;
+}
+
+struct GEnt {
+  cudaGraphExec_t exec;
+  int64_t key[5];
+};
+std::map<int64_t, std::vector<GEnt>> g_graphs;
+
+torch::Tensor run_graph(int64_t q, int64_t kv, int64_t bt, int64_t sl,
+                        int64_t handle) {
+  AttnCfg* c = g_cfgs[handle];
+  auto out = at::empty({c->B, c->H, c->D},
+                       torch::TensorOptions().dtype(torch::kBFloat16).device(torch::kCUDA));
+  cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  auto& gs = g_graphs[handle];
+  const int64_t key[5] = {q, kv, bt, sl, (int64_t)out.data_ptr()};
+  for (auto& g : gs) {
+    if (g.key[0] == key[0] && g.key[1] == key[1] && g.key[2] == key[2] &&
+        g.key[3] == key[3] && g.key[4] == key[4]) {
+      cudaGraphLaunch(g.exec, stream);
+      return out;
+    }
+  }
+  // miss: direct launch now; capture for future replays
+  attn9_launch((const void*)q, (const void*)kv, (const void*)bt, (const void*)sl,
+               (void*)out.data_ptr(), (void*)c->ws_O.data_ptr(),
+               (void*)c->ws_ml.data_ptr(), (void*)c->cnt.data_ptr(), c->B, c->H,
+               c->Hkv, c->D, c->P, c->bt_stride, c->chunk_pages, c->chunks,
+               c->wpb, c->tpg, c->red, c->stg, (void*)stream);
+  cudaStream_t cs;
+  cudaStreamCreateWithFlags(&cs, cudaStreamNonBlocking);
+  cudaStreamBeginCapture(cs, cudaStreamCaptureModeGlobal);
+  attn9_launch((const void*)q, (const void*)kv, (const void*)bt, (const void*)sl,
+               (void*)out.data_ptr(), (void*)c->ws_O.data_ptr(), (void*)c->ws_ml.data_ptr(),
+               (void*)c->cnt.data_ptr(), c->B, c->H, c->Hkv, c->D, c->P,
+               c->bt_stride, c->chunk_pages, c->chunks, c->wpb, c->tpg, c->red,
+               c->stg, (void*)cs);
+  cudaGraph_t graph;
+  cudaStreamEndCapture(cs, &graph);
+  cudaGraphExec_t exec;
+  cudaGraphInstantiate(&exec, graph, nullptr, nullptr, 0);
+  cudaGraphDestroy(graph);
+  cudaStreamDestroy(cs);
+  if (gs.size() > 200) {
+    cudaGraphExecDestroy(gs.front().exec);
+    gs.erase(gs.begin());
+  }
+  GEnt e; e.exec = exec; e.key[0]=key[0]; e.key[1]=key[1]; e.key[2]=key[2]; e.key[3]=key[3]; e.key[4]=key[4];
+  gs.push_back(e);
+  return out;
+}
+
+static PyObject* run_fast_graph(PyObject*, PyObject* args) {
+  long long q, kv, bt, sl, handle;
+  if (!PyArg_ParseTuple(args, "LLLLL", &q, &kv, &bt, &sl, &handle)) return nullptr;
+  AttnCfg* c = g_cfgs[handle];
+  auto out = at::empty({c->B, c->H, c->D},
+                       torch::TensorOptions().dtype(torch::kBFloat16).device(torch::kCUDA));
+  cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  auto& gs = g_graphs[handle];
+  const int64_t key[5] = {q, kv, bt, sl, (int64_t)out.data_ptr()};
+  for (auto& g : gs) {
+    if (g.key[0] == key[0] && g.key[1] == key[1] && g.key[2] == key[2] &&
+        g.key[3] == key[3] && g.key[4] == key[4]) {
+      cudaGraphLaunch(g.exec, stream);
+      return THPVariable_Wrap(out);
+    }
+  }
+  attn9_launch((const void*)q, (const void*)kv, (const void*)bt, (const void*)sl,
+               (void*)out.data_ptr(), (void*)c->ws_O.data_ptr(),
+               (void*)c->ws_ml.data_ptr(), (void*)c->cnt.data_ptr(), c->B, c->H,
+               c->Hkv, c->D, c->P, c->bt_stride, c->chunk_pages, c->chunks,
+               c->wpb, c->tpg, c->red, c->stg, (void*)stream);
+  cudaStream_t cs;
+  cudaStreamCreateWithFlags(&cs, cudaStreamNonBlocking);
+  cudaStreamBeginCapture(cs, cudaStreamCaptureModeGlobal);
+  attn9_launch((const void*)q, (const void*)kv, (const void*)bt, (const void*)sl,
+               (void*)out.data_ptr(), (void*)c->ws_O.data_ptr(),
+               (void*)c->ws_ml.data_ptr(), (void*)c->cnt.data_ptr(), c->B, c->H,
+               c->Hkv, c->D, c->P, c->bt_stride, c->chunk_pages, c->chunks,
+               c->wpb, c->tpg, c->red, c->stg, (void*)cs);
+  cudaGraph_t graph;
+  cudaStreamEndCapture(cs, &graph);
+  cudaGraphExec_t exec;
+  cudaGraphInstantiate(&exec, graph, nullptr, nullptr, 0);
+  cudaGraphDestroy(graph);
+  cudaStreamDestroy(cs);
+  if (gs.size() > 200) {
+    cudaGraphExecDestroy(gs.front().exec);
+    gs.erase(gs.begin());
+  }
+  GEnt e; e.exec = exec;
+  e.key[0]=key[0]; e.key[1]=key[1]; e.key[2]=key[2]; e.key[3]=key[3]; e.key[4]=key[4];
+  gs.push_back(e);
+  return THPVariable_Wrap(out);
+}
+
+static PyObject* run_fast_alloc(PyObject*, PyObject* args) {
+  long long q, kv, bt, sl, handle;
+  if (!PyArg_ParseTuple(args, "LLLLL", &q, &kv, &bt, &sl, &handle)) return nullptr;
+  AttnCfg* c = g_cfgs[handle];
+  auto out = at::empty({c->B, c->H, c->D},
+                       torch::TensorOptions().dtype(torch::kBFloat16).device(torch::kCUDA));
+  cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  attn9_launch((const void*)q, (const void*)kv, (const void*)bt, (const void*)sl,
+               (void*)out.data_ptr(), (void*)c->ws_O.data_ptr(),
+               (void*)c->ws_ml.data_ptr(), (void*)c->cnt.data_ptr(), c->B, c->H,
+               c->Hkv, c->D, c->P, c->bt_stride, c->chunk_pages, c->chunks,
+               c->wpb, c->tpg, c->red, c->stg, (void*)stream);
+  return THPVariable_Wrap(out);
+}
+
+static PyMethodDef _fast_graph_def = {"run_fast_graph", (PyCFunction)run_fast_graph, METH_VARARGS, nullptr};
+static PyMethodDef _fast_alloc_def = {"run_fast_alloc", (PyCFunction)run_fast_alloc, METH_VARARGS, nullptr};
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+  m.def("make_cfg", &make_cfg);
+  m.def("run_alloc", &run_alloc);
+  m.def("run_graph", &run_graph);
+  m.attr("run_fast_graph") = py::reinterpret_steal<py::object>(PyCFunction_New(&_fast_graph_def, nullptr));
+  m.attr("run_fast_alloc") = py::reinterpret_steal<py::object>(PyCFunction_New(&_fast_alloc_def, nullptr));
+}
+
+}  // namespace
+
+
+"""
+
+os.environ.setdefault("TORCH_CUDA_ARCH_LIST", "10.0a")
+_ext = load_inline(
+    name="paged_attn_solution",
+    cpp_sources=[_CPP_SRC],
+    cuda_sources=[_CUDA_SRC],
+    functions=None,
+    verbose=False,
+    extra_cuda_cflags=[
+        "-O3",
+        "--use_fast_math",
+        "-std=c++17",
+        "-gencode", "arch=compute_100a,code=sm_100a",
+    ],
+    extra_cflags=["-O3"],
+)
+_make_cfg = _ext.make_cfg
+_run_alloc = _ext.run_fast_graph
+
+
+class Model(nn.Module):
+    """Single-query paged attention decode (see reference.Model for I/O spec)."""
+
+    # Tuned (target_tasks) per known shape: (B, H, Hkv, D, L, P) -> tt
+    # (B, H, Hkv, D, L, P) -> (target_tasks, reducer_style)
+    _TT_TABLE = {
+        (8, 32, 8, 128, 1024, 16): (592, 0, 4),
+        (32, 32, 8, 128, 2048, 16): (592, 0, 8),
+        (4, 64, 8, 128, 4096, 16): (592, 0, 4),
+        (16, 32, 8, 128, 1535, 16): (888, 0, 4),
+        (8, 16, 4, 64, 2000, 16): (592, 0, 4),
+    }
+
+    def __init__(self, batch, num_heads, num_kv_heads, head_dim, seq_len, page_size):
+        super().__init__()
+        assert num_heads % num_kv_heads == 0
+        self.batch = batch
+        self.num_heads = num_heads
+        self.num_kv_heads = num_kv_heads
+        self.head_dim = head_dim
+        self.seq_len = seq_len
+        self.page_size = page_size
+        self.group_size = num_heads // num_kv_heads
+        self.scale = 1.0 / math.sqrt(head_dim)
+        self.register_buffer("_dummy", torch.zeros(1, dtype=torch.bfloat16), persistent=False)
+        self._cfg_key = None
+        self._cfg_handle = None
+        self._dims = None
+        self._d2 = None
+        self._bw = None
+        self._supported = (
+            head_dim in (64, 128)
+            and page_size == 16
+            and self.group_size <= 8
+        )
+
+    def _get_handle(self, B, H, Hkv, D, P, bt_stride):
+        key = (B, H, Hkv, D, P, bt_stride)
+        if self._cfg_key == key:
+            return self._cfg_handle
+        tt, red, wpb = self._TT_TABLE.get((B, H, Hkv, D, self.seq_len, P), (592, 0, 4))
+        h = _make_cfg(B, H, Hkv, D, P, self.seq_len, bt_stride, tt, wpb, 1, red, 3)
+        self._cfg_key = key
+        self._cfg_handle = h
+        return h
+
+    def forward(self, query, kv_cache, block_table, seq_lens):
+        return self._forward_slow(query, kv_cache, block_table, seq_lens)
+
+    def _forward_slow(self, query, kv_cache, block_table, seq_lens):
+        if not self._supported:
+            return self._fallback(query, kv_cache, block_table, seq_lens)
+        B, H, D = query.shape
+        Hkv = kv_cache.shape[2]
+        P = kv_cache.shape[1]
+        h = self._get_handle(B, H, Hkv, D, P, block_table.shape[1])
+        self._dims = query.shape
+        self._d2 = kv_cache.shape[1:3]
+        self._bw = block_table.shape[1]
+        self._cfg_handle = h
+        return _run_alloc(
+            query.data_ptr(), kv_cache.data_ptr(), block_table.data_ptr(),
+            seq_lens.data_ptr(), h,
+        )
+
+    def __call__(self, query, kv_cache, block_table, seq_lens):
+        # Hot path: skip re-validation when the shape signature repeats.
+        if query.shape == self._dims and kv_cache.shape[1:3] == self._d2 and block_table.shape[1] == self._bw:
+            return _run_alloc(query.data_ptr(), kv_cache.data_ptr(),
+                              block_table.data_ptr(), seq_lens.data_ptr(),
+                              self._cfg_handle)
+        return self._forward_slow(query, kv_cache, block_table, seq_lens)
+
+    def _fallback(self, query, kv_cache, block_table, seq_lens):
+        """Generic PyTorch path for shapes the CUDA kernel doesn't specialize."""
+        B, H, D = query.shape
+        Hkv = kv_cache.shape[2]
+        P = kv_cache.shape[1]
+        G = H // Hkv
+        mb = block_table.shape[1]
+        kvsel = kv_cache.index_select(0, block_table.reshape(-1).long())
+        kvsel = kvsel.view(B, mb * P, Hkv, 2 * D).float()
+        tokmask = torch.arange(mb * P, device=query.device)[None, :] < seq_lens.to(query.device)[:, None]
+        k = kvsel[..., :D].repeat_interleave(G, dim=2)
+        v = kvsel[..., D:].repeat_interleave(G, dim=2)
+        qf = query.float()
+        scores = torch.einsum("bhd,blhd->bhl", qf, k) * self.scale
+        scores = scores.masked_fill(~tokmask[:, None, :], float("-inf"))
+        probs = torch.softmax(scores, dim=-1)
+        o = torch.einsum("bhl,blhd->bhd", probs, v)
+        return o.to(query.dtype)
+
+
+def get_inputs():
+    B = BATCH
+    H = NUM_HEADS
+    Hkv = NUM_KV_HEADS
+    D = HEAD_DIM
+    L = SEQ_LEN
+    P = PAGE_SIZE
+
+    pages_per_seq = (L + P - 1) // P
+    total_pages = max(B * pages_per_seq + 8, 64)
+
+    query = torch.randn(B, H, D, dtype=torch.bfloat16) * 0.1
+    kv_cache = torch.randn(total_pages, P, Hkv, 2 * D, dtype=torch.bfloat16) * 0.1
+
+    perm = torch.randperm(total_pages)[: B * pages_per_seq].reshape(B, pages_per_seq).int()
+    block_table = perm.contiguous()
+    seq_lens = torch.full((B,), L, dtype=torch.int32)
+
+    return [query, kv_cache, block_table, seq_lens]
+
+
+def get_init_inputs():
+    return [BATCH, NUM_HEADS, NUM_KV_HEADS, HEAD_DIM, SEQ_LEN, PAGE_SIZE]

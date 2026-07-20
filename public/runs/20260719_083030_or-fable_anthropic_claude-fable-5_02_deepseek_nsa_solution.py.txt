@@ -1,0 +1,658 @@
+"""DeepSeek NSA-style block-sparse attention — block-centric CUDA (SM120).
+
+Semantics match reference.nsa_attend:
+  per query t: block importance = mean of (q.k * scale) over causal keys in
+  each 64-key block; top-8 blocks (ties -> larger block index, matching the
+  Python tuple sort) unioned with the last-64-token sliding window; softmax
+  attention over the selected indices only.
+
+Selection uses the linear-mean reduction: for blocks entirely below t the
+importance is scale * q . mean(k_block), so a precompute kernel collapses the
+O(S^2 D) scoring pass to O(S * nb * D); only the diagonal block needs the
+partial causal mean.
+
+The attention itself is block-centric split-softmax (flash-decoding style).
+A query-centric gather kernel is bound by L2 random-gather bandwidth
+(~7.3 TB/s measured for this access pattern) because every K/V block is
+re-fetched by each of its ~hundreds of subscriber queries. Inverting the loop
+reads each block from L2 exactly once:
+  1. kmean precompute
+  2. select: per-query importance + top-8 + union(list) with the window;
+     atomic per-(bh,block) subscriber counts
+  3. CSR offsets (device cumsum) + scatter of subscriber entries
+  4. block attention: one CTA per (bh, block); K/V staged to shared memory
+     once; each warp serves one subscriber (masked scores over the block,
+     exp, PV) and emits a partial (m, l, acc) — exact split softmax
+  5. combine: per query, logsumexp-merge its <=10 partials and normalize
+Shared-memory rows are padded to an odd word stride so both the transposed
+score loads and the dim-owner PV loads are bank-conflict-free.
+"""
+from __future__ import annotations
+
+import os
+
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+os.environ.setdefault("TORCH_CUDA_ARCH_LIST", "12.0")
+
+# Selection ordering must match the reference's fp32-precision dots; keep the
+# importance bmm on the full-precision fp32 path, never TF32.
+torch.backends.cuda.matmul.allow_tf32 = False
+
+BLOCK_SIZE = 64
+TOP_N_BLOCKS = 8
+SLIDING_WINDOW = 64
+
+_CUDA_SRC = r"""
+#include <torch/extension.h>
+#include <ATen/cuda/CUDAContext.h>
+#include <cuda_bf16.h>
+#include <cuda_runtime.h>
+#include <math_constants.h>
+
+#define BS 64
+#define TOPN 8
+#define WIN 64
+#define SEL_WARPS 16
+#define MAX_BLOCKS 128   // supports S <= 8192
+#define MAX_UNION 10     // <=8 selected below the window + <=2 window blocks
+
+using bf16 = __nv_bfloat16;
+
+struct F8 { float f[8]; };
+
+__device__ __forceinline__ float oct_sum(float v) {
+#pragma unroll
+    for (int off = 4; off > 0; off >>= 1)
+        v += __shfl_xor_sync(0xffffffffu, v, off);
+    return v;
+}
+
+__device__ __forceinline__ float quad_sum(float v) {
+    v += __shfl_xor_sync(0xffffffffu, v, 1);
+    v += __shfl_xor_sync(0xffffffffu, v, 2);
+    return v;
+}
+
+__device__ __forceinline__ float warp_sum(float v) {
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1)
+        v += __shfl_xor_sync(0xffffffffu, v, off);
+    return v;
+}
+
+__device__ __forceinline__ float warp_max(float v) {
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1)
+        v = fmaxf(v, __shfl_xor_sync(0xffffffffu, v, off));
+    return v;
+}
+
+__device__ __forceinline__ F8 load_bf16x8(const bf16* p) {
+    uint4 raw = *reinterpret_cast<const uint4*>(p);
+    F8 r;
+    const unsigned w[4] = {raw.x, raw.y, raw.z, raw.w};
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        __nv_bfloat162 ab = *reinterpret_cast<const __nv_bfloat162*>(&w[i]);
+        r.f[2 * i] = __bfloat162float(ab.x);
+        r.f[2 * i + 1] = __bfloat162float(ab.y);
+    }
+    return r;
+}
+
+__device__ __forceinline__ float2 unpack_bf2(unsigned w) {
+    __nv_bfloat162 h = *reinterpret_cast<__nv_bfloat162*>(&w);
+    return __bfloat1622float2(h);
+}
+
+// Per-block mean of K in fp32. Only consumed for blocks fully below the
+// diagonal (always 64 keys); the trailing partial block's value is never
+// read, so /64 is safe.
+__global__ void kmean_kernel(const bf16* __restrict__ k, float* __restrict__ km,
+                             int S, int nb, int D) {
+    const int bi = blockIdx.x;
+    const int bh = blockIdx.y;
+    const int d = threadIdx.x;
+    const int s0 = bi * BS;
+    const int cnt = min(BS, S - s0);
+    const bf16* kp = k + ((long)bh * S + s0) * D + d;
+    float sum = 0.f;
+    for (int j = 0; j < cnt; ++j) sum += __bfloat162float(kp[(long)j * D]);
+    km[((long)bh * nb + bi) * D + d] = sum * (1.f / BS);
+}
+
+// One warp per query: top-8 over precomputed sub-diagonal importances (from
+// the fp32 bmm q @ kmean^T) plus the diagonal partial causal mean computed
+// here; ties -> larger index; then the union with the sliding window. Emits
+// the per-query union list (block index | selected-flag<<30) and bumps the
+// per-(bh,block) subscriber count.
+template <int D>
+__global__ void __launch_bounds__(32 * SEL_WARPS) select_kernel(
+        const bf16* __restrict__ q, const bf16* __restrict__ k,
+        const float* __restrict__ imp_in,
+        int* __restrict__ ulist, int* __restrict__ ucnt,
+        int* __restrict__ bcount, int S, int nb) {
+    constexpr int C = D / 64;
+    const int warp = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    const int og = lane >> 2;  // quad id: 8 blocks (or keys) per iteration
+    const int ol = lane & 3;   // quad lane: 16 dims per lane per 64-chunk
+    const int t = blockIdx.x * SEL_WARPS + warp;
+    const int bh = blockIdx.y;
+
+    // Per-CTA histogram of subscriber counts; one global flush at the end
+    // (per-query global atomics on the hot shared counters were ~3x the cost
+    // of the whole rest of this kernel).
+    __shared__ int scount[MAX_BLOCKS];
+    if (threadIdx.x < MAX_BLOCKS) scount[threadIdx.x] = 0;
+    __syncthreads();
+
+    if (t < S) {
+    const float scale = rsqrtf((float)D);
+    const int tb = t >> 6;
+    const int w0 = max(0, t - (WIN - 1));
+    const int w0b = w0 >> 6;
+
+    F8 qv[2 * C];
+    const bf16* qp = q + ((long)bh * S + t) * D;
+#pragma unroll
+    for (int c = 0; c < C; ++c) {
+        qv[2 * c] = load_bf16x8(qp + c * 64 + ol * 16);
+        qv[2 * c + 1] = load_bf16x8(qp + c * 64 + ol * 16 + 8);
+    }
+
+    // Importances live in registers: lane L owns blocks {c*32 + L}. The
+    // sub-diagonal rows come straight from the precomputed fp32 bmm.
+    float impreg[MAX_BLOCKS / 32];
+    const float* irow = imp_in + ((long)bh * S + t) * nb;
+#pragma unroll
+    for (int c = 0; c < MAX_BLOCKS / 32; ++c) {
+        const int bi = c * 32 + lane;
+        impreg[c] = (bi < tb) ? irow[bi] * scale : -CUDART_INF_F;
+    }
+    {   // diagonal block: partial causal mean over [tb*64, t]
+        const int s0 = tb << 6;
+        const int cnt = t - s0 + 1;
+        const bf16* kb = k + ((long)bh * S + s0) * D;
+        float ssum = 0.f;
+        for (int j0 = 0; j0 < cnt; j0 += 8) {
+            const int jj = j0 + og;
+            float part = 0.f;
+            if (jj < cnt) {
+#pragma unroll
+                for (int cc = 0; cc < C; ++cc) {
+                    F8 ka = load_bf16x8(kb + (long)jj * D + cc * 64 + ol * 16);
+                    F8 kc = load_bf16x8(kb + (long)jj * D + cc * 64 + ol * 16 + 8);
+#pragma unroll
+                    for (int i = 0; i < 8; ++i)
+                        part += qv[2 * cc].f[i] * ka.f[i] +
+                                qv[2 * cc + 1].f[i] * kc.f[i];
+                }
+            }
+            ssum += quad_sum(part);
+        }
+        ssum += __shfl_xor_sync(0xffffffffu, ssum, 4);
+        ssum += __shfl_xor_sync(0xffffffffu, ssum, 8);
+        ssum += __shfl_xor_sync(0xffffffffu, ssum, 16);
+        const float dval = ssum * scale / (float)cnt;
+#pragma unroll
+        for (int c = 0; c < MAX_BLOCKS / 32; ++c)
+            if ((tb >> 5) == c && (tb & 31) == lane) impreg[c] = dval;
+    }
+
+    int sel[TOPN];
+#pragma unroll
+    for (int r = 0; r < TOPN; ++r) sel[r] = -1;
+#pragma unroll
+    for (int r = 0; r < TOPN; ++r) {
+        float bv = -CUDART_INF_F;
+        int bbi = -1;
+#pragma unroll
+        for (int c = 0; c < MAX_BLOCKS / 32; ++c) {
+            const int bi = c * 32 + lane;
+            const float vv = impreg[c];
+            if (vv > bv || (vv == bv && bi > bbi)) { bv = vv; bbi = bi; }
+        }
+#pragma unroll
+        for (int off = 16; off > 0; off >>= 1) {
+            float ov = __shfl_xor_sync(0xffffffffu, bv, off);
+            int obi = __shfl_xor_sync(0xffffffffu, bbi, off);
+            if (ov > bv || (ov == bv && obi > bbi)) { bv = ov; bbi = obi; }
+        }
+        if (bbi < 0 || bv == -CUDART_INF_F) break;
+        sel[r] = bbi;
+#pragma unroll
+        for (int c = 0; c < MAX_BLOCKS / 32; ++c)
+            if (bbi == c * 32 + lane) impreg[c] = -CUDART_INF_F;
+    }
+
+    if (lane == 0) {
+        const long gq = (long)bh * S + t;
+        int list[MAX_UNION];
+        int u = 0;
+        for (int bi = w0b; bi <= tb; ++bi) {
+            bool sh = false;
+#pragma unroll
+            for (int r = 0; r < TOPN; ++r) sh |= (sel[r] == bi);
+            list[u++] = bi | (sh ? (1 << 30) : 0);
+        }
+#pragma unroll
+        for (int r = 0; r < TOPN; ++r)
+            if (sel[r] >= 0 && sel[r] < w0b) list[u++] = sel[r] | (1 << 30);
+        ucnt[gq] = u;
+        for (int i = 0; i < u; ++i) {
+            ulist[gq * MAX_UNION + i] = list[i];
+            atomicAdd(&scount[list[i] & 0xffff], 1);
+        }
+    }
+    }  // t < S
+    __syncthreads();
+    if (threadIdx.x < MAX_BLOCKS) {
+        const int c = threadIdx.x;
+        const int v = scount[c];
+        if (v && c < nb) atomicAdd(&bcount[bh * nb + c], v);
+    }
+}
+
+// Thread per query: place its union entries into the per-(bh,block) CSR
+// segments and remember each entry's slot for the combine pass.
+__global__ void scatter_kernel(const int* __restrict__ ulist,
+                               const int* __restrict__ ucnt,
+                               int* __restrict__ cursor,
+                               int* __restrict__ entries,
+                               int* __restrict__ qpos, int S, int nb, long Q) {
+    const long gq = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (gq >= Q) return;
+    const int bh = (int)(gq / S);
+    const int t = (int)(gq % S);
+    const int u = ucnt[gq];
+    for (int i = 0; i < u; ++i) {
+        const int e = ulist[gq * MAX_UNION + i];
+        const int bi = e & 0xffff;
+        const unsigned flag = ((unsigned)e >> 30) & 1u;
+        const int pos = atomicAdd(&cursor[bh * nb + bi], 1);
+        entries[pos] = t | (int)(flag << 31);
+        qpos[gq * MAX_UNION + i] = pos;
+    }
+}
+
+// --- tensor-core plumbing (mma.m16n8k16 bf16 -> fp32, FA2-style layouts) ---
+__device__ __forceinline__ void mma_bf16(float& d0, float& d1, float& d2,
+                                         float& d3, unsigned a0, unsigned a1,
+                                         unsigned a2, unsigned a3, unsigned b0,
+                                         unsigned b1) {
+    asm volatile(
+        "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
+        "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+        : "+f"(d0), "+f"(d1), "+f"(d2), "+f"(d3)
+        : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+}
+
+__device__ __forceinline__ void ldm_x4(unsigned& r0, unsigned& r1, unsigned& r2,
+                                       unsigned& r3, const bf16* p) {
+    const unsigned a = (unsigned)__cvta_generic_to_shared(p);
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+                 : "=r"(r0), "=r"(r1), "=r"(r2), "=r"(r3)
+                 : "r"(a));
+}
+
+__device__ __forceinline__ void ldm_x2(unsigned& r0, unsigned& r1, const bf16* p) {
+    const unsigned a = (unsigned)__cvta_generic_to_shared(p);
+    asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0,%1}, [%2];\n"
+                 : "=r"(r0), "=r"(r1)
+                 : "r"(a));
+}
+
+__device__ __forceinline__ void ldm_x2_t(unsigned& r0, unsigned& r1,
+                                         const bf16* p) {
+    const unsigned a = (unsigned)__cvta_generic_to_shared(p);
+    asm volatile(
+        "ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%0,%1}, [%2];\n"
+        : "=r"(r0), "=r"(r1)
+        : "r"(a));
+}
+
+__device__ __forceinline__ unsigned pack_bf2(float x, float y) {
+    __nv_bfloat162 h = __floats2bfloat162_rn(x, y);
+    return *reinterpret_cast<unsigned*>(&h);
+}
+
+// XOR-swizzled shared tile address: rows of D bf16, 16-byte chunk c of row r
+// lives at chunk (c ^ (r & 7)) so ldmatrix row-vector reads (8 rows, fixed c)
+// hit 8 distinct bank groups. All accesses are 16B-chunk granular.
+template <int CH>
+__device__ __forceinline__ bf16* swz(bf16* base, int r, int c) {
+    return base + (((r * CH) + (c ^ (r & 7))) << 3);
+}
+
+// One CTA per (bh, key-block): stage K/V to shared once; each warp serves 16
+// subscriber queries per round via tensor cores. Score S = Q(16xD) @ K^T,
+// masked/softmaxed in C fragments, P repacked in-register as the A operand of
+// PV = P(16x64) @ V(64xD). Emits exact split-softmax partials per subscriber.
+template <int D>
+__global__ void __launch_bounds__(128) block_attn_kernel(
+        const bf16* __restrict__ q, const bf16* __restrict__ k,
+        const bf16* __restrict__ v,
+        const int* __restrict__ offsets, const int* __restrict__ entries,
+        float2* __restrict__ ml, bf16* __restrict__ oacc, int S, int nb) {
+    constexpr int CH = D / 8;    // 16B chunks per row
+    constexpr int NT = D / 8;    // 8-dim output tiles
+    const int cta = blockIdx.x;
+    const int bh = cta / nb;
+    const int bi = cta - bh * nb;
+    const int s0 = bi * BS;
+    const int i0 = offsets[cta];
+    const int i1 = offsets[cta + 1];
+    // Subscriber lists are skewed (early blocks collect ~3.5x the mean), so
+    // split each list across gridDim.y chunk-CTAs.
+    const int istart = i0 + (int)blockIdx.y * (4 * 16);
+    if (istart >= i1) return;
+    const int istride = (int)gridDim.y * (4 * 16);
+
+    __shared__ bf16 ks[BS * D];
+    __shared__ bf16 vs[BS * D];
+    __shared__ bf16 qt[4][16 * D];
+
+    const int tid = threadIdx.x;
+    const int nrows = min(BS, S - s0);
+    {
+        const bf16* kbase = k + ((long)bh * S + s0) * D;
+        const bf16* vbase = v + ((long)bh * S + s0) * D;
+        for (int i = tid; i < BS * CH; i += 128) {
+            const int r = i / CH;
+            const int c = i - r * CH;
+            uint4 kw = make_uint4(0u, 0u, 0u, 0u), vw = kw;
+            if (r < nrows) {
+                kw = *reinterpret_cast<const uint4*>(kbase + (long)r * D + c * 8);
+                vw = *reinterpret_cast<const uint4*>(vbase + (long)r * D + c * 8);
+            }
+            *reinterpret_cast<uint4*>(swz<CH>(ks, r, c)) = kw;
+            *reinterpret_cast<uint4*>(swz<CH>(vs, r, c)) = vw;
+        }
+    }
+    __syncthreads();
+
+    const int warp = tid >> 5;
+    const int lane = tid & 31;
+    const float scale = rsqrtf((float)D);
+    const int r0 = lane >> 2;          // C-fragment rows r0 and r0+8
+    const int qq = lane & 3;           // in-row quad position
+
+    for (int base = istart + warp * 16; base < i1; base += istride) {
+        const int nsub = min(16, i1 - base);
+        int t_ = 0, lo_ = 1, hi_ = 0;
+        if (lane < nsub) {
+            const unsigned e = (unsigned)entries[base + lane];
+            t_ = (int)(e & 0x7fffffffu);
+            const bool selhit = (e >> 31) != 0u;
+            lo_ = selhit ? 0 : max(0, (t_ - (WIN - 1)) - s0);
+            hi_ = min(BS - 1, t_ - s0);
+        }
+        // stage the 16 q rows (swizzled, zero the tail slots)
+        for (int i = lane; i < 16 * CH; i += 32) {
+            const int ss = i / CH;
+            const int c = i - ss * CH;
+            const int tt = __shfl_sync(0xffffffffu, t_, ss);
+            uint4 w = make_uint4(0u, 0u, 0u, 0u);
+            if (ss < nsub)
+                w = *reinterpret_cast<const uint4*>(
+                    q + ((long)bh * S + tt) * D + c * 8);
+            *reinterpret_cast<uint4*>(swz<CH>(qt[warp], ss, c)) = w;
+        }
+        __syncwarp();
+        const int lo0 = __shfl_sync(0xffffffffu, lo_, r0);
+        const int hi0 = __shfl_sync(0xffffffffu, hi_, r0);
+        const int lo1 = __shfl_sync(0xffffffffu, lo_, r0 + 8);
+        const int hi1 = __shfl_sync(0xffffffffu, hi_, r0 + 8);
+
+        // scores: 8 key-tiles of 16x8, accumulated over D/16 k-steps
+        float sc[8][4];
+#pragma unroll
+        for (int nt = 0; nt < 8; ++nt)
+            sc[nt][0] = sc[nt][1] = sc[nt][2] = sc[nt][3] = 0.f;
+#pragma unroll
+        for (int kk = 0; kk < D / 16; ++kk) {
+            unsigned a0, a1, a2, a3;
+            {   // A tiles: [rows0-7,klo][rows8-15,klo][rows0-7,khi][rows8-15,khi]
+                const int tile = lane >> 3;
+                const int ar = (lane & 7) + (tile & 1) * 8;
+                const int ac = kk * 2 + (tile >> 1);
+                ldm_x4(a0, a1, a2, a3, swz<CH>(qt[warp], ar, ac));
+            }
+            const int bl = lane & 15;
+            const int brc = kk * 2 + (bl >> 3);
+#pragma unroll
+            for (int nt = 0; nt < 8; ++nt) {
+                unsigned b0, b1;
+                ldm_x2(b0, b1, swz<CH>(ks, nt * 8 + (bl & 7), brc));
+                mma_bf16(sc[nt][0], sc[nt][1], sc[nt][2], sc[nt][3],
+                         a0, a1, a2, a3, b0, b1);
+            }
+        }
+
+        // mask + row max
+        float m0 = -CUDART_INF_F, m1 = -CUDART_INF_F;
+#pragma unroll
+        for (int nt = 0; nt < 8; ++nt) {
+            const int j0 = nt * 8 + 2 * qq;
+            const int j1 = j0 + 1;
+            sc[nt][0] = (j0 >= lo0 && j0 <= hi0) ? sc[nt][0] * scale : -CUDART_INF_F;
+            sc[nt][1] = (j1 >= lo0 && j1 <= hi0) ? sc[nt][1] * scale : -CUDART_INF_F;
+            sc[nt][2] = (j0 >= lo1 && j0 <= hi1) ? sc[nt][2] * scale : -CUDART_INF_F;
+            sc[nt][3] = (j1 >= lo1 && j1 <= hi1) ? sc[nt][3] * scale : -CUDART_INF_F;
+            m0 = fmaxf(m0, fmaxf(sc[nt][0], sc[nt][1]));
+            m1 = fmaxf(m1, fmaxf(sc[nt][2], sc[nt][3]));
+        }
+        m0 = fmaxf(m0, __shfl_xor_sync(0xffffffffu, m0, 1));
+        m0 = fmaxf(m0, __shfl_xor_sync(0xffffffffu, m0, 2));
+        m1 = fmaxf(m1, __shfl_xor_sync(0xffffffffu, m1, 1));
+        m1 = fmaxf(m1, __shfl_xor_sync(0xffffffffu, m1, 2));
+        const float mu0 = fmaxf(m0, -1e30f);   // empty rows: exp -> 0, not NaN
+        const float mu1 = fmaxf(m1, -1e30f);
+        float l0 = 0.f, l1 = 0.f;
+#pragma unroll
+        for (int nt = 0; nt < 8; ++nt) {
+            sc[nt][0] = __expf(sc[nt][0] - mu0);
+            sc[nt][1] = __expf(sc[nt][1] - mu0);
+            sc[nt][2] = __expf(sc[nt][2] - mu1);
+            sc[nt][3] = __expf(sc[nt][3] - mu1);
+            l0 += sc[nt][0] + sc[nt][1];
+            l1 += sc[nt][2] + sc[nt][3];
+        }
+        l0 += __shfl_xor_sync(0xffffffffu, l0, 1);
+        l0 += __shfl_xor_sync(0xffffffffu, l0, 2);
+        l1 += __shfl_xor_sync(0xffffffffu, l1, 1);
+        l1 += __shfl_xor_sync(0xffffffffu, l1, 2);
+
+        // PV: A = P (C fragments repacked to bf16), B = V via trans ldmatrix
+        float o[NT][4];
+#pragma unroll
+        for (int nt = 0; nt < NT; ++nt)
+            o[nt][0] = o[nt][1] = o[nt][2] = o[nt][3] = 0.f;
+#pragma unroll
+        for (int kk = 0; kk < 4; ++kk) {
+            const unsigned pa0 = pack_bf2(sc[2 * kk][0], sc[2 * kk][1]);
+            const unsigned pa1 = pack_bf2(sc[2 * kk][2], sc[2 * kk][3]);
+            const unsigned pa2 = pack_bf2(sc[2 * kk + 1][0], sc[2 * kk + 1][1]);
+            const unsigned pa3 = pack_bf2(sc[2 * kk + 1][2], sc[2 * kk + 1][3]);
+            const int vr = kk * 16 + (lane & 15);   // 16 key rows per step
+#pragma unroll
+            for (int nt = 0; nt < NT; ++nt) {
+                unsigned b0, b1;
+                ldm_x2_t(b0, b1, swz<CH>(vs, vr, nt));
+                mma_bf16(o[nt][0], o[nt][1], o[nt][2], o[nt][3],
+                         pa0, pa1, pa2, pa3, b0, b1);
+            }
+        }
+
+        if (qq == 0) {
+            if (r0 < nsub) ml[base + r0] = make_float2(m0, l0);
+            if (r0 + 8 < nsub) ml[base + r0 + 8] = make_float2(m1, l1);
+        }
+        if (r0 < nsub) {
+            bf16* oa = oacc + (long)(base + r0) * D;
+#pragma unroll
+            for (int nt = 0; nt < NT; ++nt)
+                *reinterpret_cast<unsigned*>(oa + nt * 8 + 2 * qq) =
+                    pack_bf2(o[nt][0], o[nt][1]);
+        }
+        if (r0 + 8 < nsub) {
+            bf16* oa = oacc + (long)(base + r0 + 8) * D;
+#pragma unroll
+            for (int nt = 0; nt < NT; ++nt)
+                *reinterpret_cast<unsigned*>(oa + nt * 8 + 2 * qq) =
+                    pack_bf2(o[nt][2], o[nt][3]);
+        }
+        __syncwarp();
+    }
+}
+
+// One warp per query: logsumexp-combine its partials, normalize, store bf16.
+template <int D>
+__global__ void __launch_bounds__(256) combine_kernel(
+        const int* __restrict__ ucnt, const int* __restrict__ qpos,
+        const float2* __restrict__ ml, const bf16* __restrict__ oacc,
+        bf16* __restrict__ o, long Q) {
+    const int warp = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    const long gq = (long)blockIdx.x * 8 + warp;
+    if (gq >= Q) return;
+
+    const int u = ucnt[gq];
+    int pos[MAX_UNION];
+    float2 mls[MAX_UNION];
+    float m = -CUDART_INF_F;
+    for (int i = 0; i < u; ++i) {
+        pos[i] = qpos[gq * MAX_UNION + i];
+        mls[i] = ml[pos[i]];
+        m = fmaxf(m, mls[i].x);
+    }
+    float L = 0.f;
+    float a0 = 0.f, a1 = 0.f, a2 = 0.f, a3 = 0.f;
+    for (int i = 0; i < u; ++i) {
+        const float c = __expf(mls[i].x - m);
+        L += c * mls[i].y;
+        const bf16* oa = oacc + (long)pos[i] * D;
+        float2 f = unpack_bf2(*reinterpret_cast<const unsigned*>(oa + 2 * lane));
+        a0 += c * f.x; a1 += c * f.y;
+        if (D == 128) {
+            f = unpack_bf2(*reinterpret_cast<const unsigned*>(oa + 2 * lane + 64));
+            a2 += c * f.x; a3 += c * f.y;
+        }
+    }
+    const float inv = 1.f / L;
+    bf16* op = o + gq * D;
+    __nv_bfloat162 h0;
+    h0.x = __float2bfloat16(a0 * inv);
+    h0.y = __float2bfloat16(a1 * inv);
+    *reinterpret_cast<__nv_bfloat162*>(op + 2 * lane) = h0;
+    if (D == 128) {
+        __nv_bfloat162 h1;
+        h1.x = __float2bfloat16(a2 * inv);
+        h1.y = __float2bfloat16(a3 * inv);
+        *reinterpret_cast<__nv_bfloat162*>(op + 2 * lane + 64) = h1;
+    }
+}
+
+torch::Tensor nsa_forward(torch::Tensor q, torch::Tensor k, torch::Tensor v) {
+    TORCH_CHECK(q.is_cuda() && k.is_cuda() && v.is_cuda(), "cuda tensors required");
+    TORCH_CHECK(q.scalar_type() == torch::kBFloat16, "bf16 required");
+    TORCH_CHECK(q.dim() == 4, "q must be (B,H,S,D)");
+    auto qc = q.contiguous(), kc = k.contiguous(), vc = v.contiguous();
+    const int B = qc.size(0), H = qc.size(1), S = qc.size(2), D = qc.size(3);
+    TORCH_CHECK(D == 64 || D == 128, "D must be 64 or 128");
+    const int nb = (S + BS - 1) / BS;
+    TORCH_CHECK(nb <= MAX_BLOCKS, "S must be <= 8192");
+    const int BH = B * H;
+    const long Q = (long)BH * S;
+
+    auto fopt = qc.options().dtype(torch::kFloat32);
+    auto iopt = qc.options().dtype(torch::kInt32);
+    auto km = torch::empty({BH, nb, D}, fopt);
+    auto out = torch::empty_like(qc);
+    auto ulist = torch::empty({Q * MAX_UNION}, iopt);
+    auto ucnt = torch::empty({Q}, iopt);
+    auto bcount = torch::zeros({BH * nb}, iopt);
+    auto entries = torch::empty({Q * MAX_UNION}, iopt);
+    auto qpos = torch::empty({Q * MAX_UNION}, iopt);
+    auto ml = torch::empty({Q * MAX_UNION, 2}, fopt);
+    auto oacc = torch::empty({Q * MAX_UNION, D}, qc.options());
+    auto stream = at::cuda::getCurrentCUDAStream();
+
+    const bf16* qp = reinterpret_cast<const bf16*>(qc.data_ptr());
+    const bf16* kp = reinterpret_cast<const bf16*>(kc.data_ptr());
+    const bf16* vp = reinterpret_cast<const bf16*>(vc.data_ptr());
+
+    kmean_kernel<<<dim3(nb, BH), D, 0, stream>>>(kp, km.data_ptr<float>(), S, nb, D);
+
+    // Sub-diagonal importances as one fp32 batched GEMM: (BH,S,D)@(BH,D,nb).
+    // fp32 (not TF32) so selection ordering keeps full dot precision.
+    auto imp = at::bmm(qc.view({BH, S, D}).to(torch::kFloat), km.transpose(1, 2));
+
+    dim3 sgrid((S + SEL_WARPS - 1) / SEL_WARPS, BH);
+    if (D == 64) {
+        select_kernel<64><<<sgrid, 32 * SEL_WARPS, 0, stream>>>(
+            qp, kp, imp.data_ptr<float>(), ulist.data_ptr<int>(),
+            ucnt.data_ptr<int>(), bcount.data_ptr<int>(), S, nb);
+    } else {
+        select_kernel<128><<<sgrid, 32 * SEL_WARPS, 0, stream>>>(
+            qp, kp, imp.data_ptr<float>(), ulist.data_ptr<int>(),
+            ucnt.data_ptr<int>(), bcount.data_ptr<int>(), S, nb);
+    }
+
+    auto offsets = torch::zeros({BH * nb + 1}, iopt);
+    offsets.narrow(0, 1, BH * nb).copy_(torch::cumsum(bcount, 0));
+    auto cursor = offsets.narrow(0, 0, BH * nb).clone();
+
+    const int sthreads = 256;
+    scatter_kernel<<<(unsigned)((Q + sthreads - 1) / sthreads), sthreads, 0, stream>>>(
+        ulist.data_ptr<int>(), ucnt.data_ptr<int>(), cursor.data_ptr<int>(),
+        entries.data_ptr<int>(), qpos.data_ptr<int>(), S, nb, Q);
+
+    const unsigned cgrid = (unsigned)((Q + 7) / 8);
+    if (D == 64) {
+        block_attn_kernel<64><<<dim3(BH * nb, 8), 128, 0, stream>>>(
+            qp, kp, vp, offsets.data_ptr<int>(), entries.data_ptr<int>(),
+            reinterpret_cast<float2*>(ml.data_ptr<float>()),
+            reinterpret_cast<bf16*>(oacc.data_ptr()), S, nb);
+        combine_kernel<64><<<cgrid, 256, 0, stream>>>(
+            ucnt.data_ptr<int>(), qpos.data_ptr<int>(),
+            reinterpret_cast<const float2*>(ml.data_ptr<float>()),
+            reinterpret_cast<bf16*>(oacc.data_ptr()), reinterpret_cast<bf16*>(out.data_ptr()), Q);
+    } else {
+        block_attn_kernel<128><<<dim3(BH * nb, 8), 128, 0, stream>>>(
+            qp, kp, vp, offsets.data_ptr<int>(), entries.data_ptr<int>(),
+            reinterpret_cast<float2*>(ml.data_ptr<float>()),
+            reinterpret_cast<bf16*>(oacc.data_ptr()), S, nb);
+        combine_kernel<128><<<cgrid, 256, 0, stream>>>(
+            ucnt.data_ptr<int>(), qpos.data_ptr<int>(),
+            reinterpret_cast<const float2*>(ml.data_ptr<float>()),
+            reinterpret_cast<bf16*>(oacc.data_ptr()), reinterpret_cast<bf16*>(out.data_ptr()), Q);
+    }
+    return out;
+}
+"""
+
+_CPP_SRC = "torch::Tensor nsa_forward(torch::Tensor q, torch::Tensor k, torch::Tensor v);"
+
+_ext = load_inline(
+    name="nsa_cuda_sm120_v9b",
+    cpp_sources=_CPP_SRC,
+    cuda_sources=_CUDA_SRC,
+    functions=["nsa_forward"],
+    extra_cuda_cflags=["-O3", "--use_fast_math"],
+    verbose=False,
+)
+
+
+class Model(nn.Module):
+    def __init__(self, B: int, H: int, S: int, D: int):
+        super().__init__()
+        self.B, self.H, self.S, self.D = B, H, S, D
+        self.register_buffer("_dummy", torch.zeros(1, dtype=torch.bfloat16))
+
+    def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+        return _ext.nsa_forward(q, k, v)

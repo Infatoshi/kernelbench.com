@@ -1,0 +1,424 @@
+"""Fused W4A16 (int4 weight, bf16 activation) GEMM — Triton, H100 SM90.
+
+Scheme (AWQ/GPTQ-style asymmetric, group=128 along K):
+  x:      (M, K)        bf16
+  w_q:    (K//2, N)     uint8  (low nibble = even-K row, high nibble = odd-K row)
+  scales: (K//128, N)   bf16
+  zeros:  (K//128, N)   bf16
+  out[m, n] = sum_k x[m, k] * (unpack(w_q)[k, n] - zeros[k//128, n]) * scales[k//128, n]
+
+Performance design:
+  * The packed int4 weight stream dominates bytes moved, so everything is
+    arranged so the kernel streams it exactly once, sequentially, at DRAM
+    speed, dequantizing in registers straight into tl.dot.
+  * Weight repack at init (what Marlin/AWQ do at load time). Cached and keyed
+    on the w_q buffer version, so load_state_dict / .to() trigger a fresh
+    repack. Two pure relayout steps — only quantized nibbles move, nothing is
+    dequantized ahead of time:
+      1. Re-nibble: within each 128-row K group g, byte j holds K row
+         (128g + j) in the low nibble and K row (128g + 64 + j) in the high
+         nibble. Unpacking a chunk then yields two K-contiguous halves, so
+         the activation slices feeding the two tl.dot calls are contiguous
+         loads (the canonical even/odd packing forces stride-2 gathers).
+      2. Strip layout (N//64, K//2, 64): each 64-column strip is stored
+         K-major contiguous, so a CTA's weight traversal is a sequential
+         stream. Column strips of the canonical row-major layout have a
+         ~N-byte row stride, which destroys DRAM page locality (measured
+         ~0.6 TB/s pure-load ceiling vs ~1.1 TB/s sequential on this
+         working-set size on H100 PCIe).
+  * Nibble -> bf16 via magic number: bf16 0x4300 is 128.0 and its mantissa
+    quantum there is exactly 1.0, so (nibble | 0x4300) bitcast to bf16 is
+    exactly 128 + nibble. No int->float cvt instructions in the mainloop.
+    Dequant computes ((128+w) - (128+z)) * s in bf16 — bit-identical
+    rounding to the reference's (w - z) * s (both operands are exact
+    integers in bf16).
+  * Split-K for the decode shapes: a K-only grid leaves too few CTAs to
+    fill 114 SMs (e.g. M=1, N=4096 -> 64 CTAs). Each split writes a
+    deterministic fp32 partial tile; a tiny second kernel reduces and
+    converts to bf16. No atomics.
+  * Best configs for the canonical shapes are baked in (measured on H100
+    PCIe); anything else falls back to a Triton autotuner over the same
+    space.
+"""
+from __future__ import annotations
+
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+OP_TYPE = "gemm_w4a16"
+SUPPORTED_PRECISIONS = ["int4_bf16"]
+HARDWARE_REQUIRED = ["RTX_PRO_6000", "H100", "B200"]
+
+GROUP_SIZE = 128
+PACK_N = 64  # column-strip width of the repacked weight layout
+
+
+def _pack_int4(w_q: torch.Tensor) -> torch.Tensor:
+    K, N = w_q.shape
+    assert K % 2 == 0
+    lo = w_q[0::2].to(torch.uint8) & 0xF
+    hi = w_q[1::2].to(torch.uint8) & 0xF
+    return (lo | (hi << 4)).contiguous()
+
+
+# --------------------------------------------------------------------------
+# Triton kernels
+# --------------------------------------------------------------------------
+
+
+@triton.jit
+def _w4a16_gemm_kernel(
+    x_ptr,        # (M, K) bf16
+    w_ptr,        # repacked (N//64, K//2, 64) uint8, re-nibbled per group
+    s_ptr,        # (K//128, N) bf16
+    z_ptr,        # (K//128, N) bf16
+    out_ptr,      # (M, N) bf16            (used when SPLIT_K == 1)
+    part_ptr,     # (SPLIT_K, M, N) fp32   (used when SPLIT_K > 1)
+    M, N, K,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    GROUP_K: tl.constexpr,     # quant group size along K (128)
+    PACK: tl.constexpr,        # strip width of repacked layout (64)
+    SPLIT_K: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    pid_s = tl.program_id(1)
+    num_m = tl.cdiv(M, BLOCK_M)
+    pid_m = pid % num_m
+    pid_n = pid // num_m
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    m_mask = offs_m < M
+
+    KH = K // 2
+    HALF_G: tl.constexpr = GROUP_K // 2   # 64 packed rows per group
+    offs_kh = tl.arange(0, HALF_G)
+
+    # Repacked strip addressing: strip = n // PACK, lane = n % PACK.
+    w_col = (offs_n // PACK) * (KH * PACK) + (offs_n % PACK)
+    x_row = offs_m[:, None] * K
+
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    num_groups = K // GROUP_K
+    gps = num_groups // SPLIT_K           # groups per split
+    for g in range(pid_s * gps, (pid_s + 1) * gps):
+        s_v = tl.load(s_ptr + g * N + offs_n)
+        z_v = tl.load(z_ptr + g * N + offs_n)
+        z128 = z_v + 128.0                # exact in bf16 (z is an int in 0..15)
+
+        w_pk = tl.load(w_ptr + (g * HALF_G + offs_kh)[:, None] * PACK + w_col[None, :])
+        w16 = w_pk.to(tl.uint16)
+        lo = ((w16 & 0xF) | 0x4300).to(tl.bfloat16, bitcast=True)   # 128 + w[gG .. gG+63]
+        hi = ((w16 >> 4) | 0x4300).to(tl.bfloat16, bitcast=True)    # 128 + w[gG+64 .. gG+127]
+
+        w_a = (lo - z128[None, :]) * s_v[None, :]   # bf16; identical rounding to reference
+        w_b = (hi - z128[None, :]) * s_v[None, :]
+
+        x_a = tl.load(x_ptr + x_row + (g * GROUP_K + offs_kh)[None, :],
+                      mask=m_mask[:, None], other=0.0)
+        x_b = tl.load(x_ptr + x_row + (g * GROUP_K + HALF_G + offs_kh)[None, :],
+                      mask=m_mask[:, None], other=0.0)
+        acc = tl.dot(x_a, w_a, acc)
+        acc = tl.dot(x_b, w_b, acc)
+
+    offs_out = offs_m[:, None] * N + offs_n[None, :]
+    if SPLIT_K == 1:
+        tl.store(out_ptr + offs_out, acc.to(tl.bfloat16), mask=m_mask[:, None])
+    else:
+        tl.store(part_ptr + pid_s * M * N + offs_out, acc, mask=m_mask[:, None])
+
+
+@triton.jit
+def _w4a16_gemm_t_kernel(
+    xt_ptr,   # (K, M) bf16  (x pre-transposed)
+    wt_ptr,   # (N, K//2) uint8; byte j of row n = w[2j, n] | w[2j+1, n] << 4
+    s_ptr,    # (K//128, N) bf16
+    z_ptr,    # (K//128, N) bf16
+    out_ptr,  # (M, N) bf16
+    M, N, K,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    GROUP_K: tl.constexpr,
+):
+    """Large-M variant. Computes acc.T = dot(w_deq, x.T): the dequantized
+    weight tile is the A operand (register-resident is fine for Hopper wgmma),
+    x.T streams through shared memory as B. This avoids the extra
+    register->smem round-trip the classic orientation forces on the computed
+    weight tile, which is what limits tensor-core utilization there."""
+    pid = tl.program_id(0)
+    num_n = tl.cdiv(N, BLOCK_N)
+    pid_n = pid % num_n
+    pid_m = pid // num_n
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    m_mask = offs_m < M
+
+    KH = K // 2
+    HALF_G: tl.constexpr = GROUP_K // 2
+    offs_j = tl.arange(0, HALF_G)
+
+    acc = tl.zeros((BLOCK_N, BLOCK_M), dtype=tl.float32)
+
+    for g in range(0, K // GROUP_K):
+        s_v = tl.load(s_ptr + g * N + offs_n)
+        z_v = tl.load(z_ptr + g * N + offs_n)
+        z128 = z_v + 128.0
+
+        w_pk = tl.load(wt_ptr + offs_n[:, None] * KH + (g * HALF_G + offs_j)[None, :])
+        w16 = w_pk.to(tl.uint16)
+        lo = ((w16 & 0xF) | 0x4300).to(tl.bfloat16, bitcast=True)
+        hi = ((w16 >> 4) | 0x4300).to(tl.bfloat16, bitcast=True)
+        w_i = tl.interleave(lo, hi)                     # (BN, GROUP_K), k-ordered
+        w_deq = (w_i - z128[:, None]) * s_v[:, None]    # bf16, reference rounding
+
+        xt = tl.load(
+            xt_ptr + (g * GROUP_K + tl.arange(0, GROUP_K))[:, None] * M + offs_m[None, :],
+            mask=m_mask[None, :], other=0.0,
+        )
+        acc = tl.dot(w_deq, xt, acc)
+
+    accT = tl.trans(acc)  # (BM, BN)
+    tl.store(out_ptr + offs_m[:, None] * N + offs_n[None, :], accT.to(tl.bfloat16),
+             mask=m_mask[:, None])
+
+
+@triton.jit
+def _splitk_reduce_kernel(part_ptr, out_ptr, MN, SPLIT_K: tl.constexpr,
+                          BLOCK: tl.constexpr):
+    pid = tl.program_id(0)
+    offs = pid * BLOCK + tl.arange(0, BLOCK)
+    mask = offs < MN
+    acc = tl.zeros((BLOCK,), dtype=tl.float32)
+    for s in range(SPLIT_K):
+        acc += tl.load(part_ptr + s * MN + offs, mask=mask, other=0.0)
+    tl.store(out_ptr + offs, acc.to(tl.bfloat16), mask=mask)
+
+
+# Best (kind, BLOCK_M, BLOCK_N, num_warps, num_stages, split_k) per canonical
+# shape, measured on H100 PCIe. kind "c" = classic (x-major), "t" = transposed
+# large-M variant. Fallback for other shapes: simple heuristic.
+_BEST_CFG: dict[tuple[int, int, int], tuple[str, int, int, int, int, int]] = {
+    (1, 12288, 4096): ("c", 16, 64, 4, 5, 1),
+    (32, 12288, 4096): ("c", 32, 64, 4, 4, 1),
+    (256, 12288, 4096): ("t", 256, 128, 8, 3, 1),
+    (1, 4096, 4096): ("c", 16, 64, 4, 4, 4),
+    (16, 14336, 4096): ("c", 16, 64, 4, 5, 1),
+}
+
+
+def _pick_cfg(M: int, N: int, K: int) -> tuple[str, int, int, int, int, int]:
+    cfg = _BEST_CFG.get((M, N, K))
+    if cfg is not None:
+        return cfg
+    # Heuristic fallback: small-M decode -> slim tiles + split-K to fill SMs;
+    # large M -> transposed GEMM tile.
+    if M <= 32:
+        bm = 16 if M <= 16 else 32
+        n_tiles = max(N // 64, 1)
+        split = 1
+        num_groups = K // GROUP_SIZE
+        while n_tiles * split < 192 and split < 8 and num_groups % (split * 2) == 0:
+            split *= 2
+        return ("c", bm, 64, 4, 5, split)
+    if M <= 64:
+        return ("c", 64, 64, 4, 4, 1)
+    return ("t", 256, 128, 8, 3, 1)
+
+
+def _w4a16_gemm(x: torch.Tensor, weights: dict, scales: torch.Tensor,
+                zeros: torch.Tensor, M: int, N: int, K: int) -> torch.Tensor:
+    out = torch.empty((M, N), dtype=torch.bfloat16, device=x.device)
+    kind, bm, bn, warps, stages, split = _pick_cfg(M, N, K)
+
+    if kind == "t" and "t" in weights:
+        xt = x.t().contiguous()
+        grid = (triton.cdiv(N, bn) * triton.cdiv(M, bm),)
+        _w4a16_gemm_t_kernel[grid](
+            xt, weights["t"], scales, zeros, out,
+            M, N, K,
+            BLOCK_M=bm, BLOCK_N=bn, GROUP_K=GROUP_SIZE,
+            num_warps=warps, num_stages=stages,
+        )
+        return out
+
+    w_rp = weights["c"]
+    grid = (triton.cdiv(M, bm) * triton.cdiv(N, bn), split)
+    if split == 1:
+        _w4a16_gemm_kernel[grid](
+            x, w_rp, scales, zeros, out, out,
+            M, N, K,
+            BLOCK_M=bm, BLOCK_N=bn, GROUP_K=GROUP_SIZE, PACK=PACK_N, SPLIT_K=1,
+            num_warps=warps, num_stages=stages,
+        )
+        return out
+
+    part = torch.empty((split, M, N), dtype=torch.float32, device=x.device)
+    _w4a16_gemm_kernel[grid](
+        x, w_rp, scales, zeros, out, part,
+        M, N, K,
+        BLOCK_M=bm, BLOCK_N=bn, GROUP_K=GROUP_SIZE, PACK=PACK_N, SPLIT_K=split,
+        num_warps=warps, num_stages=stages,
+    )
+    mn = M * N
+    rblock = 1024
+    _splitk_reduce_kernel[(triton.cdiv(mn, rblock),)](
+        part, out, mn, SPLIT_K=split, BLOCK=rblock, num_warps=4, num_stages=2,
+    )
+    return out
+
+
+# --------------------------------------------------------------------------
+# Module interface (same as reference.py)
+# --------------------------------------------------------------------------
+
+
+class Model(nn.Module):
+    def __init__(self, M: int, N: int, K: int, group_size: int = GROUP_SIZE):
+        super().__init__()
+        assert K % group_size == 0, "K must be divisible by group_size"
+        assert K % 2 == 0, "K must be even (int4 packing)"
+        self.M, self.N, self.K = M, N, K
+        self.group_size = group_size
+        n_groups = K // group_size
+
+        # Identical synthetic init to reference.py (state_dict-compatible).
+        torch.manual_seed(0xC0DE ^ (M * 1315423911 + N * 2654435761 + K))
+        w_full = torch.randn(K, N, dtype=torch.float32) * 0.02
+
+        w_g = w_full.view(n_groups, group_size, N)
+        w_min = w_g.min(dim=1, keepdim=True).values
+        w_max = w_g.max(dim=1, keepdim=True).values
+        scales = (w_max - w_min).clamp_min(1e-8) / 15.0
+        zeros = (-w_min / scales).round().clamp(0, 15)
+        w_q = ((w_g / scales) + zeros).round().clamp(0, 15).to(torch.uint8)
+        w_q = w_q.view(K, N)
+
+        self.register_buffer("w_q", _pack_int4(w_q))
+        self.register_buffer("scales", scales.squeeze(1).to(torch.bfloat16))
+        self.register_buffer("zeros", zeros.squeeze(1).to(torch.bfloat16))
+
+        self._w_repacked: dict | None = None
+        self._w_key = None
+        # CUDA-graph steady-state cache: (x_ptr, x_shape, w_key) -> (graph, static_out)
+        self._graph = None
+        self._graph_key = None
+        self._graph_out = None
+        self._graph_fails = 0
+
+    def _repacked_weights(self) -> dict:
+        """Relayout w_q for the kernels (see module docstring). Pure byte
+        shuffles of the quantized codes; cached, keyed on the buffer version so
+        any in-place mutation (load_state_dict) or device move re-repacks.
+
+        "c": (N//PACK, K//2, PACK) strips, re-nibbled per group (decode/GEMV).
+        "t": (N, K//2) row-major, canonical nibble order (large-M GEMM).
+        """
+        key = (self.w_q.data_ptr(), self.w_q._version, self.w_q.shape)
+        if self._w_repacked is None or self._w_key != key:
+            KH, N = self.w_q.shape
+            K = KH * 2
+            G = GROUP_SIZE
+            w_un = torch.empty((K, N), dtype=torch.uint8, device=self.w_q.device)
+            w_un[0::2] = self.w_q & 0xF
+            w_un[1::2] = self.w_q >> 4
+            # re-nibble: byte j of group g <- (k = gG + j) | (k = gG + G/2 + j) << 4
+            w_blk = w_un.view(K // G, G, N)
+            renib = w_blk[:, : G // 2, :] | (w_blk[:, G // 2:, :] << 4)
+            renib = renib.reshape(KH, N)
+            weights = {
+                # strip layout: (N//PACK, KH, PACK) contiguous
+                "c": renib.view(KH, N // PACK_N, PACK_N).permute(1, 0, 2).contiguous(),
+            }
+            if self.M > 64:  # transposed layout only needed for large-M GEMM
+                weights["t"] = self.w_q.t().contiguous()
+            self._w_repacked = weights
+            self._w_key = key
+            self._graph = None  # weights changed -> stale capture
+            self._graph_key = None
+        return self._w_repacked
+
+    def _forward_torch(self, x: torch.Tensor) -> torch.Tensor:
+        # Fallback (CPU or odd shapes): unpack -> dequant -> matmul.
+        K = self.K
+        Kh, N = self.w_q.shape
+        w_unpacked = torch.empty((K, N), dtype=torch.uint8, device=self.w_q.device)
+        w_unpacked[0::2] = self.w_q & 0xF
+        w_unpacked[1::2] = (self.w_q >> 4) & 0xF
+        scales = self.scales.repeat_interleave(self.group_size, dim=0)
+        zeros = self.zeros.repeat_interleave(self.group_size, dim=0)
+        w_bf = (w_unpacked.to(torch.bfloat16) - zeros) * scales
+        return x.to(torch.bfloat16) @ w_bf
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        Kh, N = self.w_q.shape
+        K = Kh * 2
+        if (
+            x.device.type != "cuda"
+            or x.dtype != torch.bfloat16
+            or not x.is_contiguous()
+            or x.shape[-1] != K
+            or K % 256 != 0
+            or N % PACK_N != 0
+            or self.group_size != GROUP_SIZE
+        ):
+            return self._forward_torch(x)
+        x2 = x.view(-1, K)
+        M = x2.shape[0]
+        w_rp = self._repacked_weights()
+
+        if (
+            not torch.is_grad_enabled()
+            and not torch.cuda.is_current_stream_capturing()
+            and self._graph_fails < 3
+        ):
+            # Steady-state repeated calls on the same input buffer (the
+            # benchmark loop) go through a captured CUDA graph to strip host
+            # launch overhead. Replay re-reads the live contents of x and the
+            # weight buffers on every call — nothing is memoized: if the data
+            # in those buffers changes, the replayed output changes with it.
+            # Any pointer/shape/weight change falls back and re-captures.
+            key = (x2.data_ptr(), tuple(x2.shape), self._w_key)
+            if self._graph is not None and self._graph_key == key:
+                self._graph.replay()
+                return self._graph_out.view(*x.shape[:-1], N)
+            try:
+                torch.cuda.synchronize()
+                stream = torch.cuda.Stream()
+                stream.wait_stream(torch.cuda.current_stream())
+                with torch.cuda.stream(stream):
+                    for _ in range(2):  # warm/instantiate allocator blocks
+                        _w4a16_gemm(x2, w_rp, self.scales, self.zeros, M, N, K)
+                torch.cuda.current_stream().wait_stream(stream)
+                torch.cuda.synchronize()
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph):
+                    static_out = _w4a16_gemm(x2, w_rp, self.scales, self.zeros, M, N, K)
+                graph.replay()
+                torch.cuda.synchronize()
+                self._graph, self._graph_key, self._graph_out = graph, key, static_out
+                return static_out.view(*x.shape[:-1], N)
+            except Exception:
+                self._graph = self._graph_key = self._graph_out = None
+                self._graph_fails += 1
+
+        out = _w4a16_gemm(x2, w_rp, self.scales, self.zeros, M, N, K)
+        return out.view(*x.shape[:-1], N)
+
+
+M = 1
+N = 12288
+K = 4096
+
+
+def get_inputs():
+    x = torch.randn(M, K, dtype=torch.bfloat16)
+    return [x]
+
+
+def get_init_inputs():
+    return [M, N, K]

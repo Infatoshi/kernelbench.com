@@ -1,0 +1,1261 @@
+"""W4A16 weight-only quantized GEMM (AWQ/GPTQ-style asymmetric int4, group=128).
+
+Architecture:
+  - M == 1: custom CUDA GEMV kernel with nibble-repacked weights (fp16 HFMA2
+    group-local accumulation with fp32 spills, per-group scale/zero epilogue,
+    warp-level split-K, cross-block split-K reduction).
+  - M in {16, 32}: custom mma.sync m16n8k16 kernel with weights repacked to
+    mma-fragment nibble order (fp32 accumulators, per-group bias folding).
+  - M > 32: CUTLASS 3.x mixed-input GEMM (fp16 path) with shuffled atom
+    repacking; plan-cached with per-call argument updates.
+  - other: Triton fused dequant + tl.dot fallback.
+Weights are repacked once into kernel-friendly layouts (bijective nibble
+permutations of the same int4 values); repack caches are invalidated on any
+load_state_dict or in-place buffer mutation (tracked via tensor._version).
+"""
+from __future__ import annotations
+
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+OP_TYPE = "gemm_w4a16"
+SUPPORTED_PRECISIONS = ["int4_bf16"]
+HARDWARE_REQUIRED = ["H100"]
+
+GROUP_SIZE = 128
+
+# ---------------------------------------------------------------- CUDA ext --
+_CUDA_SRC = r"""
+#include <torch/extension.h>
+#include <ATen/cuda/CUDAContext.h>
+#include <cuda_bf16.h>
+#include <cstdint>
+#include <unordered_map>
+
+#define DEVINL __device__ __forceinline__
+
+DEVINL uint32_t hsub2_u32(uint32_t a, uint32_t b) {
+  __half2 r = __hsub2(*reinterpret_cast<__half2*>(&a),
+                      *reinterpret_cast<__half2*>(&b));
+  return *reinterpret_cast<uint32_t*>(&r);
+}
+DEVINL uint32_t hfma2_u32(uint32_t a, uint32_t b, uint32_t c) {
+  __half2 r = __hfma2(*reinterpret_cast<__half2*>(&a),
+                      *reinterpret_cast<__half2*>(&b),
+                      *reinterpret_cast<__half2*>(&c));
+  return *reinterpret_cast<uint32_t*>(&r);
+}
+DEVINL float bf16_lo_f(uint32_t p) { return __uint_as_float(p << 16); }
+DEVINL float bf16_hi_f(uint32_t p) { return __uint_as_float(p & 0xFFFF0000u); }
+DEVINL float f16_lo_f(uint32_t p) { return __half2float(*reinterpret_cast<__half*>(&p)); }
+DEVINL float f16_hi_f(uint32_t p) {
+  uint32_t t = p >> 16;
+  return __half2float(*reinterpret_cast<__half*>(&t));
+}
+
+DEVINL uint4 ld_cs_v4(const uint4* p) {
+  uint4 v;
+  asm volatile("ld.global.cs.v4.u32 {%0,%1,%2,%3}, [%4];"
+               : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w)
+               : "l"(p));
+  return v;
+}
+
+DEVINL uint4 lds_v4(const uint32_t* p) {
+  uint4 v;
+  asm volatile("ld.shared.v4.u32 {%0,%1,%2,%3}, [%4];"
+               : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w)
+               : "r"((uint32_t)__cvta_generic_to_shared(p)));
+  return v;
+}
+
+// C cols/thread (4 fixed in layout), WN warps-N (1 for now), WK warps-K.
+template <int WK, int UNROLL>
+__global__ void __launch_bounds__(WK * 32) w4_gemv_kernel(
+    const __nv_bfloat16* __restrict__ x,
+    const uint4* __restrict__ R,      // repacked weights
+    const __nv_bfloat16* __restrict__ sc,
+    const __nv_bfloat16* __restrict__ zr,
+    __nv_bfloat16* __restrict__ out,
+    float* __restrict__ ws,
+    int* __restrict__ counters,
+    int N, int K, int ksplit) {
+  constexpr int COLS_PER_BLOCK = 128;  // 32 lanes * 4 cols
+  const int n_groups = K >> 7;
+  const int lane = threadIdx.x & 31;
+  const int warp_k = threadIdx.x >> 5;  // warps all differ in K slice
+  static_assert(WK >= 1, "");
+
+  const int tile_n = blockIdx.x * COLS_PER_BLOCK;
+  const int n0 = tile_n + lane * 4;
+
+  const int gps = n_groups / ksplit;
+  const int g_begin = blockIdx.y * gps;
+  const int g_end = g_begin + gps;
+  const int ntile = blockIdx.x;
+
+  extern __shared__ uint32_t smem[];  // x pairs slice: gps*64 u32
+  {
+    const uint32_t* x32 = reinterpret_cast<const uint32_t*>(x + g_begin * 128);
+    for (int i = threadIdx.x; i < gps * 64; i += WK * 32) {
+      uint32_t b = x32[i];
+      float lo = __uint_as_float(b << 16);
+      float hi = __uint_as_float(b & 0xFFFF0000u);
+      __half2 h = __floats2half2_rn(lo, hi);
+      smem[i] = *reinterpret_cast<uint32_t*>(&h);
+    }
+  }
+  __syncthreads();
+
+  float acc[4] = {0.f, 0.f, 0.f, 0.f};
+  const uint32_t magic = 0x64006400u;  // fp16x2 (1024, 1024)
+
+  for (int g = g_begin + warp_k; g < g_end; g += WK) {
+    const uint4* rbase = R + ((size_t)ntile * n_groups + g) * 512 + lane;
+    const uint32_t* xs = smem + (g - g_begin) * 64;
+
+    uint32_t acc2[4] = {0u, 0u, 0u, 0u};
+    float accf[4] = {0.f, 0.f, 0.f, 0.f};
+
+#pragma unroll 1
+    for (int ic = 0; ic < 16; ic += UNROLL) {
+      uint4 v[UNROLL];
+#pragma unroll
+      for (int u = 0; u < UNROLL; u++) v[u] = ld_cs_v4(rbase + (ic + u) * 32);
+#pragma unroll
+      for (int u = 0; u < UNROLL; u++) {
+        const uint32_t* q = reinterpret_cast<const uint32_t*>(&v[u]);
+        uint4 xv = lds_v4(xs + (ic + u) * 4);
+        const uint32_t xarr[4] = {xv.x, xv.y, xv.z, xv.w};
+#pragma unroll
+        for (int ii = 0; ii < 4; ii++) {
+          uint32_t w = q[ii];
+          uint32_t x2 = xarr[ii];
+          uint32_t r0 = (w & 0x000F000Fu) | magic;
+          uint32_t r1 = ((w >> 4) & 0x000F000Fu) | magic;
+          uint32_t r2 = ((w >> 8) & 0x000F000Fu) | magic;
+          uint32_t r3 = ((w >> 12) & 0x000F000Fu) | magic;
+          r0 = hsub2_u32(r0, magic);
+          r1 = hsub2_u32(r1, magic);
+          r2 = hsub2_u32(r2, magic);
+          r3 = hsub2_u32(r3, magic);
+          acc2[0] = hfma2_u32(x2, r0, acc2[0]);
+          acc2[1] = hfma2_u32(x2, r1, acc2[1]);
+          acc2[2] = hfma2_u32(x2, r2, acc2[2]);
+          acc2[3] = hfma2_u32(x2, r3, acc2[3]);
+        }
+        // spill fp16x2 partials to fp32 every 16 rows to bound rounding walk
+        if ((ic + u) % 4 == 3) {
+#pragma unroll
+          for (int j = 0; j < 4; j++) {
+            accf[j] += f16_lo_f(acc2[j]) + f16_hi_f(acc2[j]);
+            acc2[j] = 0u;
+          }
+        }
+      }
+    }
+
+    // S_g: warp sums the group's x (64 u32 pairs)
+    float Sg;
+    {
+      uint32_t a = xs[lane];
+      uint32_t b = xs[lane + 32];
+      float s01 = f16_lo_f(a) + f16_hi_f(a) + f16_lo_f(b) + f16_hi_f(b);
+#pragma unroll
+      for (int o = 16; o > 0; o >>= 1) s01 += __shfl_xor_sync(~0u, s01, o);
+      Sg = s01;
+    }
+
+    // scales/zeros for our 4 cols at group g
+    const uint32_t* srow = reinterpret_cast<const uint32_t*>(sc + (size_t)g * N + n0);
+    const uint32_t* zrow = reinterpret_cast<const uint32_t*>(zr + (size_t)g * N + n0);
+    uint32_t s01 = srow[0], s23 = srow[1];
+    uint32_t z01 = zrow[0], z23 = zrow[1];
+    float sf[4] = {bf16_lo_f(s01), bf16_hi_f(s01), bf16_lo_f(s23), bf16_hi_f(s23)};
+    float zf[4] = {bf16_lo_f(z01), bf16_hi_f(z01), bf16_lo_f(z23), bf16_hi_f(z23)};
+#pragma unroll
+    for (int j = 0; j < 4; j++) {
+      acc[j] += sf[j] * (accf[j] - zf[j] * Sg);
+    }
+  }
+
+  // intra-block K reduction across WK warps via smem
+  float* red = reinterpret_cast<float*>(smem);  // reuse x smem: WK*32*4 floats
+  __syncthreads();
+  if (WK > 1) {
+    float* mine = red + warp_k * (32 * 4);
+    mine[lane * 4 + 0] = acc[0];
+    mine[lane * 4 + 1] = acc[1];
+    mine[lane * 4 + 2] = acc[2];
+    mine[lane * 4 + 3] = acc[3];
+    __syncthreads();
+    float a0 = 0, a1 = 0, a2 = 0, a3 = 0;
+#pragma unroll
+    for (int w = 0; w < WK; w++) {
+      const float* p = red + w * 128 + lane * 4;
+      a0 += p[0]; a1 += p[1]; a2 += p[2]; a3 += p[3];
+    }
+    acc[0] = a0; acc[1] = a1; acc[2] = a2; acc[3] = a3;
+    __syncthreads();
+  }
+
+  // cross-split reduction / final store
+  if (ksplit == 1) {
+    if (threadIdx.x < 32) {
+      __nv_bfloat16 o[4] = {__float2bfloat16(acc[0]), __float2bfloat16(acc[1]),
+                            __float2bfloat16(acc[2]), __float2bfloat16(acc[3])};
+      *reinterpret_cast<uint2*>(out + n0) = *reinterpret_cast<uint2*>(o);
+    }
+    return;
+  }
+
+  // write partial
+  float* my_ws = ws + (size_t)blockIdx.y * N;
+  if (threadIdx.x < 32) {
+    my_ws[n0 + 0] = acc[0];
+    my_ws[n0 + 1] = acc[1];
+    my_ws[n0 + 2] = acc[2];
+    my_ws[n0 + 3] = acc[3];
+  }
+  __threadfence();
+  __shared__ int ticket;
+  __syncthreads();
+  if (threadIdx.x == 0) ticket = atomicAdd(&counters[blockIdx.x], 1);
+  __syncthreads();
+  if (ticket != ksplit - 1) return;
+
+  // last split block: reduce all partials
+  if (threadIdx.x < 32) {
+    float a0 = 0, a1 = 0, a2 = 0, a3 = 0;
+    for (int s = 0; s < ksplit; s++) {
+      const float* pws = ws + (size_t)s * N + n0;
+      a0 += __ldcg(pws + 0);
+      a1 += __ldcg(pws + 1);
+      a2 += __ldcg(pws + 2);
+      a3 += __ldcg(pws + 3);
+    }
+    __nv_bfloat16 o[4] = {__float2bfloat16(a0), __float2bfloat16(a1),
+                          __float2bfloat16(a2), __float2bfloat16(a3)};
+    *reinterpret_cast<uint2*>(out + n0) = *reinterpret_cast<uint2*>(o);
+  }
+  __syncthreads();
+  if (threadIdx.x == 0) counters[blockIdx.x] = 0;
+}
+
+// ---- host side ------------------------------------------------------------
+
+static torch::Tensor gemv(torch::Tensor x, torch::Tensor R, torch::Tensor sc,
+                          torch::Tensor zr, torch::Tensor ws,
+                          torch::Tensor counters, int64_t N, int64_t K,
+                          int64_t wk, int64_t ksplit) {
+  auto out = torch::empty({(int64_t)x.size(0), N},
+                          torch::TensorOptions().dtype(torch::kBFloat16).device(x.device()));
+  int n_groups = K / 128;
+  int unr = (int)((ksplit >> 8) & 0xFF);
+  ksplit &= 0xFF;
+  int gps = n_groups / (int)ksplit;
+  dim3 grid(N / 128, (int)ksplit);
+  size_t shmem = (size_t)gps * 256 > (size_t)wk * 512 ? (size_t)gps * 256 : (size_t)wk * 512;
+  auto stream = at::cuda::getCurrentCUDAStream();
+  const uint4* Rp = reinterpret_cast<const uint4*>(R.data_ptr<uint8_t>());
+  const __nv_bfloat16* xp = reinterpret_cast<const __nv_bfloat16*>(x.data_ptr<at::BFloat16>());
+  const __nv_bfloat16* scp = reinterpret_cast<const __nv_bfloat16*>(sc.data_ptr<at::BFloat16>());
+  const __nv_bfloat16* zrp = reinterpret_cast<const __nv_bfloat16*>(zr.data_ptr<at::BFloat16>());
+  __nv_bfloat16* op = reinterpret_cast<__nv_bfloat16*>(out.data_ptr<at::BFloat16>());
+  float* wsp = ws.data_ptr<float>();
+  int* cp = counters.data_ptr<int>();
+
+  int key = (int)wk * 10 + unr;
+  switch (key) {
+#define CASE(WKV, UNR)                                                            \
+  case WKV * 10 + UNR:                                                            \
+    w4_gemv_kernel<WKV, UNR><<<grid, WKV * 32, shmem, stream>>>(                  \
+        xp, Rp, scp, zrp, op, wsp, cp, (int)N, (int)K, (int)ksplit);              \
+    break;
+    CASE(8, 2) CASE(8, 4) CASE(8, 8)
+    CASE(4, 2) CASE(4, 4) CASE(4, 8)
+    CASE(2, 2) CASE(2, 4) CASE(2, 8)
+    CASE(1, 2) CASE(1, 4) CASE(1, 8)
+    CASE(16, 2) CASE(16, 4) CASE(16, 8)
+#undef CASE
+    default:
+      TORCH_CHECK(false, "bad key ", key);
+  }
+  return out;
+}
+
+
+
+DEVINL void ld_cs_v4r(const uint4* p, uint32_t& r0, uint32_t& r1, uint32_t& r2, uint32_t& r3) {
+  asm volatile("ld.global.cs.v4.u32 {%0,%1,%2,%3}, [%4];"
+               : "=r"(r0), "=r"(r1), "=r"(r2), "=r"(r3)
+               : "l"(p));
+}
+
+DEVINL uint32_t lds_u32(const uint32_t* p) {
+  uint32_t v;
+  asm volatile("ld.shared.u32 %0, [%1];"
+               : "=r"(v) : "r"((uint32_t)__cvta_generic_to_shared(p)));
+  return v;
+}
+
+DEVINL uint32_t lop3_ea(uint32_t a, uint32_t b, uint32_t c) {
+  uint32_t r;
+  asm volatile("lop3.b32 %0, %1, %2, %3, 0xEA;" : "=r"(r) : "r"(a), "r"(b), "r"(c));
+  return r;
+}
+
+DEVINL void mma_16816(float4& c, uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3,
+                      uint32_t b0, uint32_t b1) {
+  asm volatile(
+      "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
+      "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+      : "+f"(c.x), "+f"(c.y), "+f"(c.z), "+f"(c.w)
+      : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+}
+
+template <int MT, int WN>
+__global__ void __launch_bounds__(WN * 32) w4_tc_kernel(
+    const __nv_bfloat16* __restrict__ x,
+    const uint4* __restrict__ R,
+    const __nv_bfloat16* __restrict__ sc,
+    const __nv_bfloat16* __restrict__ zr,
+    __nv_bfloat16* __restrict__ out,
+    float* __restrict__ ws,
+    int* __restrict__ counters,
+    int N, int K, int ksplit) {
+  constexpr int COLS_PER_BLOCK = 32 * WN;
+  const int n_groups = K >> 7;
+  const int lane = threadIdx.x & 31;
+  const int warp_n = threadIdx.x >> 5;
+
+  const int tile_n = blockIdx.x * COLS_PER_BLOCK;
+  const int strip = blockIdx.x * WN + warp_n;
+
+  const int gps = n_groups / ksplit;
+  const int g_begin = blockIdx.y * gps;
+  const int g_end = g_begin + gps;
+
+  __shared__ uint32_t smem[MT * 16 * (8 * 64 + 4)];  // rows x (gps<=8 slice + pad)
+  const int kslice_u32 = gps * 64;
+  const int xstride = kslice_u32 + 4;
+  {
+    // stage x slice via cp.async 16B chunks (natural row-major layout)
+    const int rows = MT * 16;
+    const uint4* xsrc = reinterpret_cast<const uint4*>(x + g_begin * 128);
+    const int chunks_per_row = kslice_u32 / 4;
+    for (int i = threadIdx.x; i < rows * chunks_per_row; i += WN * 32) {
+      int r = i / chunks_per_row;
+      int c = (i % chunks_per_row) * 4;
+      const uint4* src = xsrc + r * (K / 8) + (i % chunks_per_row);
+      uint32_t dst = (uint32_t)__cvta_generic_to_shared(smem + r * xstride + c);
+      asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" ::"r"(dst), "l"(src));
+    }
+    asm volatile("cp.async.commit_group;");
+    asm volatile("cp.async.wait_group 0;");
+  }
+  __syncthreads();
+
+  const uint32_t mask = 0x000F000Fu;
+  const uint32_t magic = 0x43004300u;
+
+  float acc[MT][4][4];
+#pragma unroll
+  for (int t = 0; t < MT; t++)
+    for (int o = 0; o < 4; o++)
+      for (int e = 0; e < 4; e++) acc[t][o][e] = 0.f;
+
+  const int l4 = lane % 4;
+  const int lrow = lane / 4;
+
+  // prefetch group g_begin's weights
+  uint32_t V[16];
+  {
+    const uint4* rbase = R + (((size_t)strip * n_groups + g_begin) * 32 + lane) * 4;
+#pragma unroll
+    for (int q = 0; q < 4; q++) ld_cs_v4r(rbase + q, V[q * 4], V[q * 4 + 1], V[q * 4 + 2], V[q * 4 + 3]);
+  }
+  // prefetch s/z for g_begin
+  uint32_t sz_s[4], sz_z[4];
+  {
+    const int col0 = strip * 32 + l4 * 2;
+#pragma unroll
+    for (int o = 0; o < 4; o++) {
+      sz_s[o] = __ldg(reinterpret_cast<const uint32_t*>(sc + (size_t)g_begin * N + col0 + o * 8));
+      sz_z[o] = __ldg(reinterpret_cast<const uint32_t*>(zr + (size_t)g_begin * N + col0 + o * 8));
+    }
+  }
+
+#pragma unroll 1
+  for (int g = g_begin; g < g_end; g++) {
+    // start next group's weight loads early
+    uint32_t Vn[16];
+    if (g + 1 < g_end) {
+      const uint4* rbase = R + (((size_t)strip * n_groups + (g + 1)) * 32 + lane) * 4;
+#pragma unroll
+      for (int q = 0; q < 4; q++) ld_cs_v4r(rbase + q, Vn[q * 4], Vn[q * 4 + 1], Vn[q * 4 + 2], Vn[q * 4 + 3]);
+    }
+
+    float4 gacc[MT][4];
+#pragma unroll
+    for (int t = 0; t < MT; t++)
+      for (int o = 0; o < 4; o++) gacc[t][o] = make_float4(0.f, 0.f, 0.f, 0.f);
+    float sxm[MT][2] = {};
+
+#pragma unroll
+    for (int s = 0; s < 8; s++) {
+      uint32_t a[MT][4];
+      const int grel = g - g_begin;
+#pragma unroll
+      for (int t = 0; t < MT; t++) {
+        const uint32_t* xrow0 = smem + (t * 16 + lrow) * xstride + grel * 64 + s * 8 + l4;
+        const uint32_t* xrow8 = smem + (t * 16 + lrow + 8) * xstride + grel * 64 + s * 8 + l4;
+        {
+        a[t][0] = lds_u32(xrow0);
+        a[t][1] = lds_u32(xrow8);
+        a[t][2] = lds_u32(xrow0 + 4);
+        a[t][3] = lds_u32(xrow8 + 4);
+        }
+        sxm[t][0] += bf16_lo_f(a[t][0]) + bf16_hi_f(a[t][0]) + bf16_lo_f(a[t][2]) + bf16_hi_f(a[t][2]);
+        sxm[t][1] += bf16_lo_f(a[t][1]) + bf16_hi_f(a[t][1]) + bf16_lo_f(a[t][3]) + bf16_hi_f(a[t][3]);
+      }
+#pragma unroll
+      for (int oh = 0; oh < 2; oh++) {
+        uint32_t u = V[s * 2 + oh];
+        uint32_t ba0 = lop3_ea(u, mask, magic);
+        uint32_t ba1 = lop3_ea(u >> 4, mask, magic);
+        uint32_t bb0 = lop3_ea(u >> 8, mask, magic);
+        uint32_t bb1 = lop3_ea(u >> 12, mask, magic);
+#pragma unroll
+        for (int t = 0; t < MT; t++) {
+          mma_16816(gacc[t][oh * 2], a[t][0], a[t][1], a[t][2], a[t][3], ba0, ba1);
+          mma_16816(gacc[t][oh * 2 + 1], a[t][0], a[t][1], a[t][2], a[t][3], bb0, bb1);
+        }
+      }
+    }
+
+    // prefetch next group's s/z
+    uint32_t ns[4], nz[4];
+    if (g + 1 < g_end) {
+      const int col0 = strip * 32 + l4 * 2;
+#pragma unroll
+      for (int o = 0; o < 4; o++) {
+        ns[o] = __ldg(reinterpret_cast<const uint32_t*>(sc + (size_t)(g + 1) * N + col0 + o * 8));
+        nz[o] = __ldg(reinterpret_cast<const uint32_t*>(zr + (size_t)(g + 1) * N + col0 + o * 8));
+      }
+    }
+
+#pragma unroll
+    for (int t = 0; t < MT; t++) {
+      sxm[t][0] += __shfl_xor_sync(~0u, sxm[t][0], 1);
+      sxm[t][0] += __shfl_xor_sync(~0u, sxm[t][0], 2);
+      sxm[t][1] += __shfl_xor_sync(~0u, sxm[t][1], 1);
+      sxm[t][1] += __shfl_xor_sync(~0u, sxm[t][1], 2);
+    }
+
+    // epilogue with current group's prefetched s/z
+#pragma unroll
+    for (int o = 0; o < 4; o++) {
+      float sa = bf16_lo_f(sz_s[o]), sb = bf16_hi_f(sz_s[o]);
+      float za = 128.f + bf16_lo_f(sz_z[o]), zb = 128.f + bf16_hi_f(sz_z[o]);
+#pragma unroll
+      for (int t = 0; t < MT; t++) {
+        acc[t][o][0] += sa * (gacc[t][o].x - za * sxm[t][0]);
+        acc[t][o][1] += sb * (gacc[t][o].y - zb * sxm[t][0]);
+        acc[t][o][2] += sa * (gacc[t][o].z - za * sxm[t][1]);
+        acc[t][o][3] += sb * (gacc[t][o].w - zb * sxm[t][1]);
+      }
+    }
+
+    // rotate buffers
+#pragma unroll
+    for (int i = 0; i < 16; i++) V[i] = Vn[i];
+#pragma unroll
+    for (int o = 0; o < 4; o++) { sz_s[o] = ns[o]; sz_z[o] = nz[o]; }
+  }
+
+  // ---- store --------------------------------------------------------------
+  float* my_ws = ws + (size_t)blockIdx.y * ((size_t)MT * 16 * N);
+  const int ncol_global = tile_n + warp_n * 32;
+
+  if (ksplit == 1) {
+#pragma unroll
+    for (int t = 0; t < MT; t++) {
+#pragma unroll
+      for (int o = 0; o < 4; o++) {
+        int col = ncol_global + l4 * 2 + o * 8;
+        int row0 = t * 16 + lrow;
+        __nv_bfloat16 h01[2] = {__float2bfloat16(acc[t][o][0]), __float2bfloat16(acc[t][o][1])};
+        *reinterpret_cast<uint32_t*>(out + (size_t)row0 * N + col) =
+            *reinterpret_cast<uint32_t*>(h01);
+        __nv_bfloat16 h23[2] = {__float2bfloat16(acc[t][o][2]), __float2bfloat16(acc[t][o][3])};
+        *reinterpret_cast<uint32_t*>(out + (size_t)(row0 + 8) * N + col) =
+            *reinterpret_cast<uint32_t*>(h23);
+      }
+    }
+    return;
+  }
+
+#pragma unroll
+  for (int t = 0; t < MT; t++) {
+#pragma unroll
+    for (int o = 0; o < 4; o++) {
+      int col = ncol_global + l4 * 2 + o * 8;
+      int row0 = t * 16 + lrow;
+      float* p0 = my_ws + (size_t)row0 * N + col;
+      float* p1 = my_ws + (size_t)(row0 + 8) * N + col;
+      p0[0] = acc[t][o][0];
+      p0[1] = acc[t][o][1];
+      p1[0] = acc[t][o][2];
+      p1[1] = acc[t][o][3];
+    }
+  }
+  __threadfence();
+  __shared__ int ticket;
+  __syncthreads();
+  if (threadIdx.x == 0) ticket = atomicAdd(&counters[blockIdx.x], 1);
+  __syncthreads();
+  if (ticket != ksplit - 1) return;
+
+  const int M = MT * 16;
+  for (int i = threadIdx.x; i < M * COLS_PER_BLOCK / 2; i += WN * 32) {
+    int rr = i / (COLS_PER_BLOCK / 2);
+    int cc = (i % (COLS_PER_BLOCK / 2)) * 2;
+    int col = tile_n + cc;
+    float s0 = 0.f, s1 = 0.f;
+    for (int sp = 0; sp < ksplit; sp++) {
+      const float* p = ws + (size_t)sp * ((size_t)M * N) + (size_t)rr * N + col;
+      s0 += __ldcg(p);
+      s1 += __ldcg(p + 1);
+    }
+    __nv_bfloat16 h[2] = {__float2bfloat16(s0), __float2bfloat16(s1)};
+    *reinterpret_cast<uint32_t*>(out + (size_t)rr * N + col) = *reinterpret_cast<uint32_t*>(h);
+  }
+  __syncthreads();
+  if (threadIdx.x == 0) counters[blockIdx.x] = 0;
+}
+
+static torch::Tensor tc(torch::Tensor x, torch::Tensor R, torch::Tensor sc,
+                        torch::Tensor zr, torch::Tensor ws,
+                        torch::Tensor counters, int64_t N, int64_t K,
+                        int64_t mt, int64_t wn, int64_t ksplit) {
+  int M = (int)x.size(0);
+  auto out = torch::empty({(int64_t)M, N},
+                          torch::TensorOptions().dtype(torch::kBFloat16).device(x.device()));
+  int n_groups = K / 128;
+  int gps = n_groups / (int)ksplit;
+  dim3 grid(N / (32 * wn), (int)ksplit);
+  size_t shmem = 0; /* static smem now */
+  auto stream = at::cuda::getCurrentCUDAStream();
+  const uint4* Rp = reinterpret_cast<const uint4*>(R.data_ptr<uint8_t>());
+  const __nv_bfloat16* xp = reinterpret_cast<const __nv_bfloat16*>(x.data_ptr<at::BFloat16>());
+  const __nv_bfloat16* scp = reinterpret_cast<const __nv_bfloat16*>(sc.data_ptr<at::BFloat16>());
+  const __nv_bfloat16* zrp = reinterpret_cast<const __nv_bfloat16*>(zr.data_ptr<at::BFloat16>());
+  __nv_bfloat16* op = reinterpret_cast<__nv_bfloat16*>(out.data_ptr<at::BFloat16>());
+  float* wsp = ws.data_ptr<float>();
+  int* cp = counters.data_ptr<int>();
+  int key = (int)mt * 10 + wn;
+  switch (key) {
+    case 12: w4_tc_kernel<1, 2><<<grid, 2 * 32, shmem, stream>>>(xp, Rp, scp, zrp, op, wsp, cp, (int)N, (int)K, (int)ksplit); break;
+    case 14: w4_tc_kernel<1, 4><<<grid, 4 * 32, shmem, stream>>>(xp, Rp, scp, zrp, op, wsp, cp, (int)N, (int)K, (int)ksplit); break;
+    case 18: w4_tc_kernel<1, 8><<<grid, 8 * 32, shmem, stream>>>(xp, Rp, scp, zrp, op, wsp, cp, (int)N, (int)K, (int)ksplit); break;
+    case 22: w4_tc_kernel<2, 2><<<grid, 2 * 32, shmem, stream>>>(xp, Rp, scp, zrp, op, wsp, cp, (int)N, (int)K, (int)ksplit); break;
+    case 24: w4_tc_kernel<2, 4><<<grid, 4 * 32, shmem, stream>>>(xp, Rp, scp, zrp, op, wsp, cp, (int)N, (int)K, (int)ksplit); break;
+    default:
+      TORCH_CHECK(false, "bad key ", key);
+  }
+  return out;
+}
+
+
+// ---- lean plan-call path -------------------------------------------------
+
+struct Plan {
+  int kind;  // 0 gemv, 1 tc
+  torch::Tensor R, sc, zr, ws, counters;
+  int N, K, wk, ksplit, unr, mt, wn;
+};
+static std::unordered_map<int64_t, Plan> g_plans;
+static int64_t g_next_token = 1;
+
+static int64_t plan_gemv(torch::Tensor R, torch::Tensor sc, torch::Tensor zr,
+                         torch::Tensor ws, torch::Tensor counters, int64_t N,
+                         int64_t K, int64_t wk, int64_t ksplit, int64_t unr) {
+  Plan p;
+  p.kind = 0;
+  p.R = R; p.sc = sc; p.zr = zr; p.ws = ws; p.counters = counters;
+  p.N = (int)N; p.K = (int)K; p.wk = (int)wk; p.ksplit = (int)ksplit; p.unr = (int)unr;
+  int64_t t = g_next_token++;
+  g_plans[t] = p;
+  return t;
+}
+
+static int64_t plan_tc(torch::Tensor R, torch::Tensor sc, torch::Tensor zr,
+                       torch::Tensor ws, torch::Tensor counters, int64_t N,
+                       int64_t K, int64_t mt, int64_t wn, int64_t ksplit) {
+  Plan p;
+  p.kind = 1;
+  p.R = R; p.sc = sc; p.zr = zr; p.ws = ws; p.counters = counters;
+  p.N = (int)N; p.K = (int)K; p.mt = (int)mt; p.wn = (int)wn; p.ksplit = (int)ksplit;
+  int64_t t = g_next_token++;
+  g_plans[t] = p;
+  return t;
+}
+
+static void plan_free(int64_t token) { g_plans.erase(token); }
+
+static torch::Tensor run_plan(torch::Tensor x, int64_t token) {
+  auto it = g_plans.find(token);
+  TORCH_CHECK(it != g_plans.end(), "bad plan token");
+  const Plan& p = it->second;
+  auto stream = at::cuda::getCurrentCUDAStream();
+  auto out = torch::empty({(int64_t)x.size(0), p.N},
+                          torch::TensorOptions().dtype(torch::kBFloat16).device(x.device()));
+  const uint4* Rp = reinterpret_cast<const uint4*>(p.R.data_ptr<uint8_t>());
+  const __nv_bfloat16* xp = reinterpret_cast<const __nv_bfloat16*>(x.data_ptr<at::BFloat16>());
+  const __nv_bfloat16* scp = reinterpret_cast<const __nv_bfloat16*>(p.sc.data_ptr<at::BFloat16>());
+  const __nv_bfloat16* zrp = reinterpret_cast<const __nv_bfloat16*>(p.zr.data_ptr<at::BFloat16>());
+  __nv_bfloat16* op = reinterpret_cast<__nv_bfloat16*>(out.data_ptr<at::BFloat16>());
+  float* wsp = p.ws.data_ptr<float>();
+  int* cp = p.counters.data_ptr<int>();
+  int n_groups = p.K / 128;
+
+  if (p.kind == 0) {
+    int gps = n_groups / p.ksplit;
+    dim3 grid(p.N / 128, p.ksplit);
+    size_t shmem = (size_t)gps * 256 > (size_t)p.wk * 512 ? (size_t)gps * 256 : (size_t)p.wk * 512;
+    int key = p.wk * 10 + p.unr;
+    switch (key) {
+#define CASE(WKV, UNR)                                                            \
+  case WKV * 10 + UNR:                                                            \
+    w4_gemv_kernel<WKV, UNR><<<grid, WKV * 32, shmem, stream>>>(                  \
+        xp, Rp, scp, zrp, op, wsp, cp, p.N, p.K, p.ksplit);                       \
+    break;
+      CASE(8, 2) CASE(8, 4) CASE(8, 8)
+      CASE(4, 2) CASE(4, 4) CASE(4, 8)
+      CASE(2, 2) CASE(2, 4) CASE(2, 8)
+      CASE(1, 2) CASE(1, 4) CASE(1, 8)
+      CASE(16, 2) CASE(16, 4) CASE(16, 8)
+#undef CASE
+      default:
+        TORCH_CHECK(false, "bad key ", key);
+    }
+  } else {
+    int gps = n_groups / p.ksplit;
+    dim3 grid(p.N / (32 * p.wn), p.ksplit);
+    size_t shmem = 0;
+    int key = p.mt * 10 + p.wn;
+    switch (key) {
+#define CASE(MTV, WNV)                                                            \
+  case MTV * 10 + WNV:                                                            \
+    w4_tc_kernel<MTV, WNV><<<grid, WNV * 32, shmem, stream>>>(                    \
+        xp, Rp, scp, zrp, op, wsp, cp, p.N, p.K, p.ksplit);                       \
+    break;
+      CASE(1, 2) CASE(1, 4) CASE(1, 8) CASE(2, 2) CASE(2, 4)
+#undef CASE
+      default:
+        TORCH_CHECK(false, "bad key ", key);
+    }
+  }
+  return out;
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+  m.def("gemv", &gemv, "w4 gemv");
+  m.def("tc", &tc, "w4 tc");
+  m.def("plan_gemv", &plan_gemv, "make gemv plan");
+  m.def("plan_tc", &plan_tc, "make tc plan");
+  m.def("plan_free", &plan_free, "free plan");
+  m.def("run_plan", &run_plan, "run plan");
+}
+"""
+
+# ---------------------------------------------------------------- CUTLASS --
+_CUTLASS_SRC = r"""
+#include <torch/extension.h>
+#include <ATen/cuda/CUDAContext.h>
+
+#include "cutlass/cutlass.h"
+#include "cute/tensor.hpp"
+#include "cutlass/tensor_ref.h"
+#include "cutlass/epilogue/collective/default_epilogue.hpp"
+#include "cutlass/epilogue/thread/linear_combination.h"
+#include "cutlass/gemm/dispatch_policy.hpp"
+#include "cutlass/gemm/collective/collective_builder.hpp"
+#include "cutlass/epilogue/collective/collective_builder.hpp"
+#include "cutlass/gemm/device/gemm_universal_adapter.h"
+#include "cutlass/gemm/kernel/gemm_universal.hpp"
+#include "cutlass/util/packed_stride.hpp"
+#include "cutlass/util/mixed_dtype_utils.hpp"
+
+using namespace cute;
+
+#define CUTLASS_CHECK(expr)                                                   \
+  TORCH_CHECK((expr) == cutlass::Status::kSuccess, "cutlass error: ",         \
+              cutlass::cutlassGetStatusString(expr))
+
+#if defined(CUTLASS_ARCH_MMA_SM90_SUPPORTED)
+
+using MmaType = cutlass::half_t;
+using QuantType = cutlass::uint4b_t;
+constexpr int TileShapeK = 128 * 8 / sizeof_bits<MmaType>::value;
+
+using ElementA = MmaType;
+using LayoutA = cutlass::layout::RowMajor;
+constexpr int AlignmentA = 128 / cutlass::sizeof_bits<ElementA>::value;
+
+using ElementB = QuantType;
+using LayoutB = cutlass::layout::ColumnMajor;
+constexpr int AlignmentB = 128 / cutlass::sizeof_bits<ElementB>::value;
+
+using LayoutA_Transpose = typename cutlass::layout::LayoutTranspose<LayoutA>::type;
+using LayoutB_Transpose = typename cutlass::layout::LayoutTranspose<LayoutB>::type;
+
+using StrideA = cutlass::detail::TagToStrideA_t<LayoutA>;
+using StrideB = cutlass::detail::TagToStrideB_t<LayoutB>;
+
+using ValueShuffle = Layout<Shape<_2, _4>, Stride<_4, _1>>;
+using MmaAtomShape = Layout<Shape<_1, _1>>;
+using LayoutAtomQuant = decltype(cutlass::compute_memory_reordering_atom<MmaType, MmaAtomShape, ValueShuffle>());
+using LayoutB_Reordered = decltype(cute::tile_to_shape(LayoutAtomQuant{}, Layout<Shape<int, int, int>, StrideB>{}));
+
+using ElementScale = cutlass::half_t;
+using ElementZero = ElementScale;
+using LayoutScale = cutlass::layout::RowMajor;
+
+using ElementC = cutlass::bfloat16_t;
+using LayoutC = cutlass::layout::RowMajor;
+constexpr int AlignmentC = 128 / cutlass::sizeof_bits<ElementC>::value;
+using ElementD = ElementC;
+using LayoutD = LayoutC;
+constexpr int AlignmentD = AlignmentC;
+
+using ElementAccumulator = float;
+using ArchTag = cutlass::arch::Sm90;
+using OperatorClass = cutlass::arch::OpClassTensorOp;
+using TileShape = Shape<_128, _128, cute::Int<TileShapeK>>;
+using ClusterShape = Shape<_1, _1, _1>;
+using KernelSchedule = cutlass::gemm::KernelTmaWarpSpecializedCooperative;
+using EpilogueSchedule = cutlass::epilogue::TmaWarpSpecializedCooperative;
+using EpilogueTileType = cutlass::epilogue::collective::EpilogueTileAuto;
+
+using CollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
+    cutlass::arch::Sm90, cutlass::arch::OpClassTensorOp,
+    TileShape, ClusterShape,
+    EpilogueTileType,
+    ElementAccumulator, ElementAccumulator,
+    ElementC, typename cutlass::layout::LayoutTranspose<LayoutC>::type, AlignmentC,
+    ElementD, typename cutlass::layout::LayoutTranspose<LayoutD>::type, AlignmentD,
+    EpilogueSchedule
+  >::CollectiveOp;
+
+using CollectiveMainloop = typename cutlass::gemm::collective::CollectiveBuilder<
+    ArchTag, OperatorClass,
+    cute::tuple<ElementB, ElementScale, ElementZero>, LayoutB_Reordered, AlignmentB,
+    ElementA, LayoutA_Transpose, AlignmentA,
+    ElementAccumulator,
+    TileShape, ClusterShape,
+    cutlass::gemm::collective::StageCountAutoCarveout<
+      static_cast<int>(sizeof(typename CollectiveEpilogue::SharedStorage))
+    >,
+    KernelSchedule
+  >::CollectiveOp;
+
+using GemmKernel = cutlass::gemm::kernel::GemmUniversal<
+    Shape<int, int, int, int>,
+    CollectiveMainloop,
+    CollectiveEpilogue
+>;
+
+using Gemm = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;
+
+torch::Tensor w4_gemm(torch::Tensor x, torch::Tensor wq, torch::Tensor sc,
+                      torch::Tensor zc, torch::Tensor workspace, int64_t M,
+                      int64_t N, int64_t K, int64_t group, double alpha) {
+  auto out = torch::empty({M, N},
+                          torch::TensorOptions().dtype(torch::kBFloat16).device(x.device()));
+  int scale_k = (int)(K / group);
+  int l = 1;
+
+  StrideA stride_A = cutlass::make_cute_packed_stride(StrideA{}, cute::make_shape((int)M, (int)K, l));
+  auto dB = cute::tile_to_shape(LayoutAtomQuant{}, cute::make_shape((int)N, (int)K, l));
+  using StrideC_t = typename GemmKernel::StrideC;
+  using StrideD_t = typename GemmKernel::StrideD;
+  StrideC_t stride_C = cutlass::make_cute_packed_stride(StrideC_t{}, cute::make_shape((int)N, (int)M, l));
+  StrideD_t stride_D = cutlass::make_cute_packed_stride(StrideD_t{}, cute::make_shape((int)N, (int)M, l));
+  using StrideS = typename CollectiveMainloop::StrideScale;
+  StrideS stride_S = cutlass::make_cute_packed_stride(StrideS{}, cute::make_shape((int)N, scale_k, l));
+
+  torch::Tensor xa = x.to(torch::kHalf);
+  typename Gemm::Arguments arguments{
+      cutlass::gemm::GemmUniversalMode::kGemm,
+      {(int)N, (int)M, (int)K, l},
+      {reinterpret_cast<const ElementB*>(wq.data_ptr<uint8_t>()), dB,
+       reinterpret_cast<const ElementA*>(xa.data_ptr<at::Half>()), stride_A,
+       reinterpret_cast<const ElementScale*>(sc.data_ptr<at::Half>()), stride_S,
+       (int)group,
+       reinterpret_cast<const ElementZero*>(zc.data_ptr<at::Half>())},
+      {{(float)alpha, 0.f},
+       reinterpret_cast<const ElementC*>(out.data_ptr<at::BFloat16>()), stride_C,
+       reinterpret_cast<ElementD*>(out.data_ptr<at::BFloat16>()), stride_D}
+  };
+
+  Gemm gemm;
+  size_t ws_needed = Gemm::get_workspace_size(arguments);
+  TORCH_CHECK(ws_needed <= (size_t)workspace.numel(), "workspace too small: need ", ws_needed);
+  CUTLASS_CHECK(gemm.can_implement(arguments));
+  CUTLASS_CHECK(gemm.initialize(arguments, workspace.data_ptr<uint8_t>()));
+  CUTLASS_CHECK(gemm.run(at::cuda::getCurrentCUDAStream()));
+  return out;
+}
+
+// ---- plan-cached variant --------------------------------------------------
+
+static typename Gemm::Arguments make_cl_args(
+    const void* ptrB, int64_t N, int64_t M, int64_t K, int64_t group,
+    const void* ptrA, const void* ptrS, const void* ptrZ,
+    const void* ptrC, void* ptrD, double alpha, int l) {
+  int scale_k = (int)(K / group);
+  StrideA stride_A = cutlass::make_cute_packed_stride(StrideA{}, cute::make_shape((int)M, (int)K, l));
+  auto dB = cute::tile_to_shape(LayoutAtomQuant{}, cute::make_shape((int)N, (int)K, l));
+  using StrideC_t = typename GemmKernel::StrideC;
+  using StrideD_t = typename GemmKernel::StrideD;
+  StrideC_t stride_C = cutlass::make_cute_packed_stride(StrideC_t{}, cute::make_shape((int)N, (int)M, l));
+  StrideD_t stride_D = cutlass::make_cute_packed_stride(StrideD_t{}, cute::make_shape((int)N, (int)M, l));
+  using StrideS = typename CollectiveMainloop::StrideScale;
+  StrideS stride_S = cutlass::make_cute_packed_stride(StrideS{}, cute::make_shape((int)N, scale_k, l));
+  return typename Gemm::Arguments{
+      cutlass::gemm::GemmUniversalMode::kGemm,
+      {(int)N, (int)M, (int)K, l},
+      {reinterpret_cast<const ElementB*>(ptrB), dB,
+       reinterpret_cast<const ElementA*>(ptrA), stride_A,
+       reinterpret_cast<const ElementScale*>(ptrS), stride_S,
+       (int)group,
+       reinterpret_cast<const ElementZero*>(ptrZ)},
+      {{(float)alpha, 0.f},
+       reinterpret_cast<const ElementC*>(ptrC), stride_C,
+       reinterpret_cast<ElementD*>(ptrD), stride_D}
+  };
+}
+
+struct CPlan {
+  Gemm gemm;
+  torch::Tensor wq, sc, zc, workspace;
+  int M, N, K, group;
+  double alpha;
+};
+static std::unordered_map<int64_t, CPlan> g_cplans;
+static int64_t g_next_ctoken = 1;
+
+static int64_t plan_cutlass(torch::Tensor wq, torch::Tensor sc, torch::Tensor zc,
+                            torch::Tensor workspace, int64_t M, int64_t N,
+                            int64_t K, int64_t group, double alpha) {
+  int l = 1;
+  CPlan p;
+  p.M = (int)M; p.N = (int)N; p.K = (int)K; p.group = (int)group;
+  p.alpha = alpha;
+  p.wq = wq; p.sc = sc; p.zc = zc; p.workspace = workspace;
+  // dummy A/D pointers; real ones set per call
+  auto args = make_cl_args(wq.data_ptr<uint8_t>(), N, M, K, group,
+                           zc.data_ptr<at::Half>(), sc.data_ptr<at::Half>(), zc.data_ptr<at::Half>(),
+                           zc.data_ptr<at::Half>(), zc.data_ptr<at::Half>(), alpha, l);
+  CUTLASS_CHECK(p.gemm.can_implement(args));
+  CUTLASS_CHECK(p.gemm.initialize(args, workspace.data_ptr<uint8_t>()));
+  g_cplans[g_next_ctoken] = p;
+  return g_next_ctoken++;
+}
+
+static void plan_cutlass_free(int64_t token) { g_cplans.erase(token); }
+
+__global__ void bf16_to_fp16_kernel(const uint4* __restrict__ in, uint4* __restrict__ outp, int64_t n4) {
+  int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= n4) return;
+  uint4 v = in[i];
+  uint4 o;
+  const uint32_t* vs = reinterpret_cast<const uint32_t*>(&v);
+  uint32_t* os = reinterpret_cast<uint32_t*>(&o);
+#pragma unroll
+  for (int j = 0; j < 4; j++) {
+    float lo = __uint_as_float(vs[j] << 16);
+    float hi = __uint_as_float(vs[j] & 0xFFFF0000u);
+    __half2 h = __floats2half2_rn(lo, hi);
+    os[j] = *reinterpret_cast<uint32_t*>(&h);
+  }
+  outp[i] = o;
+}
+
+static torch::Tensor bf16_to_fp16(torch::Tensor x) {
+  auto out = torch::empty_like(x, torch::TensorOptions().dtype(torch::kHalf));
+  int64_t n = x.numel();
+  int64_t n4 = n / 8;
+  auto stream = at::cuda::getCurrentCUDAStream();
+  if (n4 * 8 == n && reinterpret_cast<uintptr_t>(x.data_ptr()) % 16 == 0) {
+    int threads = 256;
+    int64_t blocks = (n4 + threads - 1) / threads;
+    bf16_to_fp16_kernel<<<(int)blocks, threads, 0, stream>>>(
+        reinterpret_cast<const uint4*>(x.data_ptr<at::BFloat16>()),
+        reinterpret_cast<uint4*>(out.data_ptr<at::Half>()), n4);
+  } else {
+    // fallback: elementwise
+    out = x.to(torch::kHalf);
+  }
+  return out;
+}
+
+static torch::Tensor run_cutlass(torch::Tensor x, int64_t token) {
+  auto it = g_cplans.find(token);
+  TORCH_CHECK(it != g_cplans.end(), "bad cutlass plan token");
+  CPlan& p = it->second;
+  torch::Tensor xa = bf16_to_fp16(x);
+  auto out = torch::empty({p.M, p.N},
+                          torch::TensorOptions().dtype(torch::kBFloat16).device(x.device()));
+  auto args = make_cl_args(p.wq.data_ptr<uint8_t>(), p.N, p.M, p.K, p.group,
+                           xa.data_ptr<at::Half>(), p.sc.data_ptr<at::Half>(), p.zc.data_ptr<at::Half>(),
+                           out.data_ptr<at::BFloat16>(), out.data_ptr<at::BFloat16>(), p.alpha, 1);
+  CUTLASS_CHECK(p.gemm.update(args));
+  CUTLASS_CHECK(p.gemm.run(at::cuda::getCurrentCUDAStream()));
+  return out;
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+  m.def("w4_gemm", &w4_gemm, "cutlass mixed input w4 gemm");
+  m.def("plan_cutlass", &plan_cutlass, "make cutlass plan");
+  m.def("plan_cutlass_free", &plan_cutlass_free, "free cutlass plan");
+  m.def("run_cutlass", &run_cutlass, "run cutlass plan");
+}
+#else
+#error "SM90 required"
+#endif
+"""
+
+_cutlass_ext = None
+
+
+def _get_cutlass_ext():
+    global _cutlass_ext
+    if _cutlass_ext is None:
+        from torch.utils.cpp_extension import load_inline
+        import pathlib
+
+        here = pathlib.Path(__file__).resolve().parent
+        _cutlass_ext = load_inline(
+            name="w4a16_cutlass_ext",
+            cpp_sources="",
+            cuda_sources=_CUTLASS_SRC,
+            extra_cuda_cflags=[
+                "-O3",
+                "--use_fast_math",
+                "-gencode=arch=compute_90a,code=sm_90a",
+                "--expt-relaxed-constexpr",
+                "-std=c++17",
+            ],
+            extra_include_paths=[
+                str(here / "cutlass_src" / "include"),
+                str(here / "cutlass_src" / "tools" / "util" / "include"),
+            ],
+            verbose=False,
+        )
+    return _cutlass_ext
+
+
+def _repack_cutlass(w_q: torch.Tensor) -> torch.Tensor:
+    """Transpose to (N, K), apply the CUTLASS ValueShuffle atom, repack bytes."""
+    Kh, N = w_q.shape
+    K = Kh * 2
+    dev = w_q.device
+    lo = (w_q & 0xF)
+    hi = (w_q >> 4)
+    nib = torch.stack([lo, hi], dim=1).reshape(K, N)
+    nibT = nib.T.contiguous()  # (N, K)
+    nn = torch.arange(N, device=dev).view(N, 1)
+    kk = torch.arange(K, device=dev).view(1, K)
+    i0, i1, j = nn % 8, (nn // 8) % 2, nn // 16
+    k0, k1, k2, m = kk % 2, (kk // 2) % 4, (kk // 8) % 2, kk // 16
+    off = 32 * i0 + i1 + 256 * j + 4 * k0 + 8 * k1 + 2 * k2 + (16 * N) * m
+    flat = nibT.reshape(-1).to(torch.int32)
+    shuf_flat = torch.empty(N * K, dtype=torch.int32, device=dev)
+    shuf_flat[off.reshape(-1)] = flat.reshape(-1)
+    shuf = shuf_flat.view(N, K).to(torch.uint8)
+    return (shuf[:, 0::2] | (shuf[:, 1::2] << 4)).contiguous()
+
+
+def _zero_convert(scales: torch.Tensor, zeros: torch.Tensor) -> torch.Tensor:
+    """CUTLASS zero semantic is w*s + zc: zc = -z * s."""
+    return (-zeros.float() * scales.float()).to(torch.float16).contiguous()
+
+
+_ext = None
+
+
+def _get_ext():
+    global _ext
+    if _ext is None:
+        from torch.utils.cpp_extension import load_inline
+
+        _ext = load_inline(
+            name="w4a16_gemv_ext",
+            cpp_sources="",
+            cuda_sources=_CUDA_SRC,
+            extra_cuda_cflags=[
+                "-O3",
+                "--use_fast_math",
+                "-gencode=arch=compute_90a,code=sm_90a",
+            ],
+            verbose=False,
+        )
+    return _ext
+
+
+def _repack_gemv(w_q: torch.Tensor) -> torch.Tensor:
+    """(K/2, N) uint8 -> nibble-repacked R (uint8 view, int32 content)."""
+    Kh, N = w_q.shape
+    K = Kh * 2
+    G = K // 128
+    NT = N // 128
+    v = w_q.view(G, 16, 4, NT, 32, 4)  # (g, ichunk, ii, ntile, lane, cj)
+    lo = (v & 0xF).to(torch.int32)
+    hi = (v >> 4).to(torch.int32)
+    sh = torch.tensor([0, 4, 8, 12], dtype=torch.int32, device=w_q.device)
+    new = ((lo << sh).sum(-1) + (((hi << sh).sum(-1)) << 16)).to(torch.int32)
+    new = new.permute(3, 0, 1, 4, 2).contiguous()  # (NT, G, ichunk, lane, ii)
+    return new.view(torch.uint8)
+
+
+def _repack_tc(w_q: torch.Tensor) -> torch.Tensor:
+    """(K/2, N) uint8 -> R_T nibble repack for the TC (mma) kernel."""
+    Kh, N = w_q.shape
+    K = Kh * 2
+    G = K // 128
+    S = N // 32
+    dev = w_q.device
+    ar_s = torch.arange(S, device=dev).view(S, 1, 1, 1, 1)
+    ar_g = torch.arange(G, device=dev).view(1, G, 1, 1, 1)
+    ar_l = torch.arange(32, device=dev).view(1, 1, 32, 1, 1)
+    ar_j = torch.arange(16, device=dev).view(1, 1, 1, 16, 1)
+    ar_sl = torch.arange(8, device=dev).view(1, 1, 1, 1, 8)
+    s = ar_j // 2
+    oh = ar_j % 2
+    # slot layout per u32 (matches kernel extractor):
+    #   octA (o = oh*2): slots 0,1,4,5 -> w(k0), w(k0+8), w(k0+1), w(k0+9)
+    #   octB (o = oh*2+1): slots 2,3,6,7 -> same k offsets
+    is_octB = ((ar_sl == 2) | (ar_sl == 3) | (ar_sl == 6) | (ar_sl == 7))
+    o = oh * 2 + is_octB.to(torch.int64)
+    koff = (ar_sl % 2) * 8 + ((ar_sl >> 2) & 1)  # 0, 8, 1, 9
+    r = ar_g * 64 + s * 8 + (ar_l % 4) + koff // 2
+    c = ar_s * 32 + ar_l // 4 + 8 * o
+    hi = ((ar_sl >> 2) & 1).to(torch.int64)
+    idx = (r * N + c).reshape(-1)
+    bytesel = w_q.reshape(-1)[idx].view(S, G, 32, 16, 8)
+    val = (bytesel.to(torch.int32) >> (hi.to(torch.int32) * 4)) & 0xF
+    shifts = (ar_sl * 4).to(torch.int32)
+    u32 = (val << shifts).sum(-1).to(torch.int32)
+    return u32.contiguous().view(torch.uint8)
+
+
+# -------------------------------------------------------------- Triton path --
+
+
+def _cfgs():
+    cfgs = []
+    for bm, bn, bk, w, s in [
+        (16, 64, 128, 4, 4),
+        (16, 128, 128, 4, 4),
+        (16, 256, 128, 8, 4),
+        (16, 64, 64, 4, 4),
+        (16, 128, 64, 4, 5),
+        (32, 128, 128, 4, 4),
+        (32, 256, 128, 8, 4),
+        (64, 128, 128, 4, 4),
+        (64, 256, 128, 8, 4),
+        (128, 128, 128, 8, 3),
+        (128, 256, 64, 8, 4),
+        (256, 128, 64, 8, 4),
+    ]:
+        cfgs.append(triton.Config({"BM": bm, "BN": bn, "BK": bk}, num_warps=w, num_stages=s))
+    return cfgs
+
+
+@triton.autotune(configs=_cfgs(), key=["M", "N", "K"])
+@triton.jit
+def _w4a16_kernel(
+    x_ptr, w_ptr, s_ptr, z_ptr, out_ptr,
+    M, N, K,
+    GROUP: tl.constexpr,
+    BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    num_pid_n = tl.cdiv(N, BN)
+    pid_m = pid // num_pid_n
+    pid_n = pid % num_pid_n
+
+    offs_m = pid_m * BM + tl.arange(0, BM)
+    offs_n = pid_n * BN + tl.arange(0, BN)
+    offs_r = tl.arange(0, BK // 2)
+    mask_m = offs_m < M
+    mask_n = offs_n < N
+
+    x_base = x_ptr + offs_m[:, None] * K
+    w_base = w_ptr + offs_n[None, :]
+
+    acc = tl.zeros((BM, BN), dtype=tl.float32)
+    for k0 in range(0, K, BK):
+        g = k0 // GROUP
+        wp = tl.load(
+            w_base + (k0 // 2 + offs_r)[:, None] * N,
+            mask=mask_n[None, :],
+            other=0,
+        )
+        s = tl.load(s_ptr + g * N + offs_n, mask=mask_n, other=0.0).to(tl.float32)
+        z = tl.load(z_ptr + g * N + offs_n, mask=mask_n, other=0.0).to(tl.float32)
+        lo = (wp & 0xF).to(tl.float32)
+        hi = ((wp >> 4) & 0xF).to(tl.float32)
+        w_lo = ((lo - z[None, :]) * s[None, :]).to(tl.bfloat16)
+        w_hi = ((hi - z[None, :]) * s[None, :]).to(tl.bfloat16)
+        xe = tl.load(x_base + (k0 + 2 * offs_r)[None, :], mask=mask_m[:, None], other=0.0)
+        xo = tl.load(x_base + (k0 + 2 * offs_r + 1)[None, :], mask=mask_m[:, None], other=0.0)
+        acc = tl.dot(xe, w_lo, acc)
+        acc = tl.dot(xo, w_hi, acc)
+
+    tl.store(
+        out_ptr + offs_m[:, None] * N + offs_n[None, :],
+        acc.to(tl.bfloat16),
+        mask=mask_m[:, None] & mask_n[None, :],
+    )
+
+
+def _triton_forward(x, w_q, scales, zeros, M, N, K, group_size):
+    out = torch.empty((M, N), dtype=torch.bfloat16, device=x.device)
+    grid = lambda meta: (  # noqa: E731
+        triton.cdiv(M, meta["BM"]) * triton.cdiv(N, meta["BN"]),
+    )
+    _w4a16_kernel[grid](
+        x, w_q, scales, zeros, out,
+        M, N, K,
+        GROUP=group_size,
+    )
+    return out
+
+
+# ------------------------------------------------------------------- Model --
+
+
+class Model(nn.Module):
+    def __init__(self, M: int, N: int, K: int, group_size: int = GROUP_SIZE):
+        super().__init__()
+        assert K % group_size == 0
+        self.M, self.N, self.K = M, N, K
+        self.group_size = group_size
+        n_groups = K // group_size
+        self.register_buffer("w_q", torch.zeros(K // 2, N, dtype=torch.uint8))
+        self.register_buffer("scales", torch.zeros(n_groups, N, dtype=torch.bfloat16))
+        self.register_buffer("zeros", torch.zeros(n_groups, N, dtype=torch.bfloat16))
+        self._cache_key = None
+        self._R = None
+        self._Z = None
+        self._Sf = None
+        self._ws = None
+        self._counters = None
+        self._plan = None
+        self._cplan = None
+
+    def _invalidate(self):
+        if getattr(self, "_plan", None) is not None:
+            try:
+                _get_ext().plan_free(self._plan)
+            except Exception:
+                pass
+            self._plan = None
+        if getattr(self, "_cplan", None) is not None:
+            try:
+                _get_cutlass_ext().plan_cutlass_free(self._cplan)
+            except Exception:
+                pass
+            self._cplan = None
+        self._cache_key = None
+        self._R = None
+
+    def _load_from_state_dict(self, *args, **kwargs):
+        self._invalidate()
+        return super()._load_from_state_dict(*args, **kwargs)
+
+    def _ensure_cache(self):
+        key = (
+            self.w_q._version,
+            self.scales._version,
+            self.zeros._version,
+            self.w_q.data_ptr(),
+            self.scales.data_ptr(),
+            self.zeros.data_ptr(),
+            self.w_q.device,
+            self.M,
+        )
+        if self._cache_key == key and self._R is not None:
+            return
+        dev = self.w_q.device
+        self._ws = None
+        self._counters = None
+        if self.M == 1:
+            self._R = _repack_gemv(self.w_q.to(dev))
+            self._ws = torch.empty(64, self.N, dtype=torch.float32, device=dev)
+            self._counters = torch.zeros(self.N // 16, dtype=torch.int32, device=dev)
+            if self.N >= 8192:
+                wk, ks, unr = 4, 4, 8
+            else:
+                wk, ks, unr = 4, 8, 8
+            self._plan = _get_ext().plan_gemv(
+                self._R, self.scales, self.zeros, self._ws[:ks], self._counters,
+                self.N, self.K, wk, ks, unr,
+            )
+        elif self.M in (16, 32) and self.N % 128 == 0:
+            self._R = _repack_tc(self.w_q.to(dev))
+            self._ws = torch.empty(32, self.M * self.N, dtype=torch.float32, device=dev)
+            self._counters = torch.zeros(self.N // 16, dtype=torch.int32, device=dev)
+            mt, wn, ks = (1, 8, 4) if self.M == 16 else (2, 4, 8)
+            self._plan = _get_ext().plan_tc(
+                self._R, self.scales, self.zeros, self._ws[:ks], self._counters,
+                self.N, self.K, mt, wn, ks,
+            )
+        elif self.M > 32 and self.N % 128 == 0 and self.K % 256 == 0:
+            self._R = _repack_cutlass(self.w_q.to(dev))
+            self._Z = _zero_convert(self.scales.to(dev), self.zeros.to(dev))
+            self._Sf = self.scales.to(dev).to(torch.float16).contiguous()
+            self._ws = torch.empty(8 * 1024 * 1024, dtype=torch.uint8, device=dev)
+            self._cplan = _get_cutlass_ext().plan_cutlass(
+                self._R, self._Sf, self._Z, self._ws, self.M, self.N, self.K,
+                self.group_size, 1.0,
+            )
+        else:
+            self._R = None
+        self._cache_key = key
+
+    @torch.no_grad()
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        M, K = x.shape
+        N = self.N
+        if x.is_cuda and (not x.is_contiguous() or x.data_ptr() % 32 != 0):
+            x = x.contiguous()
+        if x.is_cuda and self.M == M and K == self.K and (N % 128 == 0) and (K % 4096 == 0):
+            if M == 1 or M in (16, 32):
+                self._ensure_cache()
+                return _get_ext().run_plan(x, self._plan)
+            if M > 32 and (K % 256 == 0):
+                self._ensure_cache()
+                return _get_cutlass_ext().run_cutlass(x, self._cplan)
+        return _triton_forward(x.contiguous(), self.w_q, self.scales, self.zeros,
+                               M, N, K, self.group_size)
+
+
+M = 1
+N = 12288
+K = 4096
+
+
+def get_inputs():
+    x = torch.randn(M, K, dtype=torch.bfloat16)
+    return [x]
+
+
+def get_init_inputs():
+    return [M, N, K]
