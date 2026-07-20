@@ -9,6 +9,17 @@ archive (`outputs/runs/<other_ts>`).
 This is the audit `kb lint` does NOT do (lint only scans a single solution.py
 for in-solution reward-hacks). Run it before publishing; the leaderboard
 builders also exclude contaminated runs automatically.
+
+Grok gap (fixed 2026-07-20): grok `--output-format streaming-json` transcripts
+are per-token delta lines `{"type":"thought"|"text","data":"<token>"}` with NO
+tool-call records, so (a) any archive path is fragmented across JSON lines and
+the raw-text regex can never match, and (b) an archive read often leaves no
+literal path at all -- only the thought stream quoting another run's exact
+published peak fraction (e.g. "a previous solution from grok that achieved
+0.0844 peak fraction"). For token-delta transcripts we therefore reassemble the
+stream and additionally scan the joined text for archive paths, bare run-dir
+ids, and verbatim 4-decimal peak_fraction values of OTHER runs on the same
+problem in the same runs root. Non-grok transcripts keep the raw scan only.
 """
 from __future__ import annotations
 
@@ -18,6 +29,83 @@ import re
 from pathlib import Path
 
 _TS = re.compile(r"outputs/runs/(\d{8}_\d{6})")
+# A run referenced by its directory name, without the outputs/runs/ prefix,
+# e.g. "20260715_212751_grok_grok-4.5_01_glm52_fused_moe".
+_RUN_DIR_ID = re.compile(r"\b(\d{8}_\d{6})_[a-z]")
+_TOKEN_TYPES = ("thought", "text")
+
+
+def _token_stream_text(raw: str) -> str | None:
+    """Reassemble a grok streaming-json token-delta transcript.
+
+    Returns the concatenated thought/text token stream, or None if the file
+    contains no token-delta lines (i.e. it is not a grok-style transcript).
+    """
+    parts: list[str] = []
+    for line in raw.splitlines():
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            obj = json.loads(line)
+        except ValueError:
+            continue
+        if (
+            isinstance(obj, dict)
+            and obj.get("type") in _TOKEN_TYPES
+            and isinstance(obj.get("data"), str)
+        ):
+            parts.append(obj["data"])
+    return "".join(parts) if parts else None
+
+
+def _run_problem(run_dir: Path) -> str:
+    try:
+        r = json.loads((run_dir / "result.json").read_text())
+        return str(r.get("problem") or "")
+    except (OSError, ValueError):
+        return ""
+
+
+def _sibling_score_refs(run_dir: Path, text: str, self_ts: str) -> set[str]:
+    """Foreign run timestamps whose published peak_fraction (same problem, same
+    runs root) is quoted verbatim in a grok token stream.
+
+    Grok transcripts carry no tool-call paths, so an archive read may surface
+    only as the model quoting a sibling run's exact score (4 decimals). An
+    exact standalone match of another run's peak_fraction -- excluding values
+    equal to this run's own score -- is the tripwire signal.
+    """
+    problem = _run_problem(run_dir)
+    if not problem:
+        return set()
+    own = None
+    try:
+        own = json.loads((run_dir / "result.json").read_text()).get("peak_fraction")
+    except (OSError, ValueError):
+        pass
+    own_str = f"{own:.4f}" if isinstance(own, (int, float)) else None
+    seen: set[str] = set()
+    for sib in run_dir.parent.iterdir():
+        if not sib.is_dir() or sib.name == run_dir.name:
+            continue
+        m = re.match(r"(\d{8}_\d{6})", sib.name)
+        if not m or m.group(1) == self_ts:
+            continue
+        if _run_problem(sib) != problem:
+            continue
+        try:
+            pf = json.loads((sib / "result.json").read_text()).get("peak_fraction")
+        except (OSError, ValueError):
+            continue
+        if not isinstance(pf, (int, float)):
+            continue
+        pf_str = f"{pf:.4f}"
+        if pf_str == own_str:
+            continue  # ambiguous with the run's own score
+        if re.search(rf"(?<![\d.]){re.escape(pf_str)}(?!\d)", text):
+            seen.add(m.group(1))
+    return seen
 
 
 def other_archives(run_dir: Path) -> set[str]:
@@ -25,16 +113,27 @@ def other_archives(run_dir: Path) -> set[str]:
 
     Only the agent transcript (transcript.jsonl / codex_session.jsonl) is
     scanned -- NOT stderr.log/scratch, which carry harness orchestration noise.
+    Grok token-delta transcripts are additionally reassembled and scanned for
+    fragmented paths, bare run-dir ids, and quoted sibling scores.
     """
     m = re.match(r"(\d{8}_\d{6})", run_dir.name)
     self_ts = m.group(1) if m else ""
     seen: set[str] = set()
     for fn in ("transcript.jsonl", "codex_session.jsonl"):
         p = run_dir / fn
-        if p.exists():
-            for ts in _TS.findall(p.read_text(errors="ignore")):
-                if ts != self_ts:
-                    seen.add(ts)
+        if not p.exists():
+            continue
+        raw = p.read_text(errors="ignore")
+        for ts in _TS.findall(raw):
+            if ts != self_ts:
+                seen.add(ts)
+        joined = _token_stream_text(raw)
+        if joined is None:
+            continue  # not a grok-style transcript; raw scan is complete
+        for ts in _TS.findall(joined) + _RUN_DIR_ID.findall(joined):
+            if ts != self_ts:
+                seen.add(ts)
+        seen |= _sibling_score_refs(run_dir, joined, self_ts)
     return seen
 
 
