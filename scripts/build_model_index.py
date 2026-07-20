@@ -51,6 +51,9 @@ MODEL_NAMES = {
     "claude-opus-4-6": "Claude Opus 4.6",
     "claude-sonnet-5": "Claude Sonnet 5",
     "claude-fable-5": "Claude Fable 5",
+    # OpenRouter-routed Fable (harness or-fable, model anthropic/claude-fable-5)
+    # is a separate published row from native claude/claude-fable-5.
+    "claude-fable-5-or": "Claude Fable 5 (OpenRouter)",
     "glm-5.2": "GLM-5.2",
     "glm-5.1": "GLM-5.1",
     "gpt-5.5": "GPT-5.5",
@@ -118,6 +121,25 @@ def slugify(model_field: str) -> str:
     return s
 
 
+def board_slug(model_field: str, harness: str | None = None) -> str:
+    """Slug for a published board row.
+
+    Native Claude Fable and OpenRouter Fable (or-fable / anthropic/claude-fable-5)
+    must stay distinct: they share the base model id after path-stripping but are
+    separate published rows. Without this, load order last-writer-wins and one
+    GPU tab silently drops the other harness's cells.
+    """
+    raw = (model_field or "").strip().lower()
+    h = (harness or "").strip().lower()
+    # Annotation harness lines sometimes carry notes after the key.
+    h_key = h.split()[0] if h else ""
+    if h_key == "or-fable" or raw == "anthropic/claude-fable-5" or raw.endswith(
+        "/anthropic/claude-fable-5"
+    ):
+        return "claude-fable-5-or"
+    return slugify(model_field)
+
+
 def display_name(slug: str) -> str:
     return MODEL_NAMES.get(slug, slug)
 
@@ -180,7 +202,7 @@ def load_site_board(models: Models, bench: str, path: Path, gpu_key: str | None)
     total_problems = n_attempted or len(problems)
 
     for m in d.get("models", []):
-        slug = slugify(m.get("model") or m.get("label") or "")
+        slug = board_slug(m.get("model") or m.get("label") or "", m.get("harness"))
         entry = models.get(slug)
         cells = {}
         for prob, c in (m.get("results") or {}).items():
@@ -229,7 +251,7 @@ def load_mega(models: Models, csv_path: Path) -> None:
         # best row per (slug, problem) by score among correct rows
         picked: dict[tuple[str, str], dict] = {}
         for r in rowset:
-            slug = slugify(r.get("model") or "")
+            slug = board_slug(r.get("model") or "", r.get("harness"))
             key = (slug, r["problem"])
             try:
                 s = float(r.get("score") or 0)
@@ -372,7 +394,11 @@ def join_annotations(models: Models, bench: str, ann_dir: Path) -> tuple[list[st
         model_field = (a.get("model") or "").strip() if isinstance(a.get("model"), str) else ""
         if not model_field:
             model_field = model_from_run_id(run_id) or ""
-        slug = slugify(model_field)
+        harness_field = (a.get("harness") or "").strip() if isinstance(a.get("harness"), str) else ""
+        # run_id prefix is a reliable harness signal when YAML harness is missing/noisy
+        if not harness_field and "_or-fable_" in f"_{run_id}_":
+            harness_field = "or-fable"
+        slug = board_slug(model_field, harness_field)
         if not slug or not re.fullmatch(r"[a-z0-9][a-z0-9.\-_]*", slug):
             print(f"  WARN: cannot resolve model for {f.name} (got {slug!r})")
             continue
