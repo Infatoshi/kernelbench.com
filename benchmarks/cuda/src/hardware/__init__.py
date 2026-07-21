@@ -2,7 +2,6 @@
 from src.hardware.b200 import B200
 from src.hardware.h100 import H100
 from src.hardware.m4_max import M4_MAX
-from src.hardware.rtx_3090 import RTX_3090
 from src.hardware.rtx_pro_6000 import RTX_PRO_6000
 
 TARGETS = {
@@ -10,7 +9,6 @@ TARGETS = {
     "M4_MAX": M4_MAX,
     "H100": H100,
     "B200": B200,
-    "RTX_3090": RTX_3090,
 }
 
 

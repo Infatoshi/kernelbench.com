@@ -5,9 +5,13 @@ v2 environment: KBH_AGENT_CONTAINER=1, parallel sessions, per-command GPU lock,
 cells are kept visible but marked invalid and excluded from ceiling ranking;
 rubric_leak/interesting are valid but flagged.
 """
-import json, glob, os, re, sys
-from pathlib import Path
+import glob
+import json
+import os
+import re
+import sys
 from collections import defaultdict
+from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))

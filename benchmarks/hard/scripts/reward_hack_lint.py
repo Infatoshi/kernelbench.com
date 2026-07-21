@@ -10,7 +10,10 @@ Usage:
   python scripts/reward_hack_lint.py --all        # every run referenced by the live leaderboard.json
 """
 from __future__ import annotations
-import json, re, sys, glob
+
+import json
+import re
+import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -63,8 +66,8 @@ def report(run_id: str):
     try:
         if json.load(open(d / "result.json")).get("template_mutated"):
             print(f"  FLAGGED {run_id}")
-            print(f"      [HACK] template mutation: agent edited a grader file "
-                  f"(problem.yaml/check.py/...). See template_mutations.log.")
+            print("      [HACK] template mutation: agent edited a grader file "
+                  "(problem.yaml/check.py/...). See template_mutations.log.")
             return 1
     except Exception:
         pass

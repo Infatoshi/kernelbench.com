@@ -10,9 +10,8 @@ ROWS=(
   "rtx:RTX_PRO_6000:outputs/runs:results/leaderboard.json"
   "h100:H100:outputs/runs-h100:results/leaderboard.h100.json"
   "b200:B200:outputs/runs-b200:results/leaderboard.b200.json"
-  "rtx3090:RTX_3090:outputs/runs-rtx3090:results/leaderboard.rtx3090.json"
 )
-WANT="${*:-rtx h100 b200 rtx3090}"
+WANT="${*:-rtx h100 b200}"
 
 reshape() {  # $1 = out file
   uv run python - "$1" <<'PY'

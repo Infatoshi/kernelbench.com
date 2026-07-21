@@ -7,8 +7,8 @@
 # terminal `result` event (the only source of true output/thinking tokens).
 #
 # Env:
-#   KBH_HARDWARE        roofline target (RTX_PRO_6000 | RTX_3090 | H100 | B200)
-#   KBH_PROBLEMS_ROOT   prompt set dir (problems-rtxpro6000 | problems-h100 | problems-b200 | problems-3090)
+#   KBH_HARDWARE        roofline target (RTX_PRO_6000 | H100 | B200)
+#   KBH_PROBLEMS_ROOT   prompt set dir (problems-rtxpro6000 | problems-h100 | problems-b200)
 #   BUDGET_SECONDS      per-run wall budget (default 6000 = 100min)
 #   RESWEEP_MODELS      optional space-list to override the deck (e.g. "opus glm")
 #   RESWEEP_ONLY_MISSING=1  skip (harness,model,problem) cells already correct in $LEADERBOARD

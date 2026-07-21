@@ -20,15 +20,10 @@ HARD = Path(__file__).resolve().parent.parent
 REPO = HARD.parent.parent
 PUB = REPO / "public" / "runs"
 
-# (bench, gpu key, leaderboard file, runs dirs to try in order). The rtx3090
-# board predates the runs-<gpu> split, so its archives live in plain runs/;
-# the fallback only fires when runs-<gpu>/<rid> is absent, so a colliding rid
-# that exists in both dirs always resolves to the board's own session.
+# (bench, gpu key, leaderboard file, runs dirs to try in order).
 BOARDS = [
     ("hard", "h100", "results/leaderboard.h100.json", ["outputs/runs-h100"]),
     ("hard", "b200", "results/leaderboard.b200.json", ["outputs/runs-b200"]),
-    ("hard", "rtx3090", "results/leaderboard.rtx3090.json",
-     ["outputs/runs-rtx3090", "outputs/runs"]),
     ("cuda", "b200", "results/leaderboard.b200.json", ["outputs/runs-b200"]),
 ]
 

@@ -58,7 +58,6 @@ HARD_RUN_DIRS = [
     REPO / "benchmarks/hard/outputs/runs",
     REPO / "benchmarks/hard/outputs/runs-h100",
     REPO / "benchmarks/hard/outputs/runs-b200",
-    REPO / "benchmarks/hard/outputs/runs-rtx3090",
 ]
 MEGA_RUN_DIRS = [
     REPO / "benchmarks/mega/outputs/runs",
@@ -73,7 +72,6 @@ GPU_MAP = {
     "H100": "h100",
     "H100 PCIe": "h100",
     "B200": "b200",
-    "RTX 3090": "rtx3090",
 }
 
 

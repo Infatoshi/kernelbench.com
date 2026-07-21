@@ -32,7 +32,7 @@ kb — KernelBench operator CLI   (repo: {root})
   kb lint <run_id|--all>                        static reward-hack tripwire (scans solution.py)
   kb contamination <hard|mega|cuda|v3|path> [--published <lb.json>]   cross-run contamination audit
   kb traces-to-hf <out_dir> [run_dirs...]       convert run transcripts to HF agent-trace JSONL
-  kb push-runs <hard|mega|cuda> [--board h100|b200|rtx3090] [--dataset R] [--dry-run]   convert published runs' traces and push to HF (per-GPU hard/cuda boards upload under <board>/)
+  kb push-runs <hard|mega|cuda> [--board h100|b200] [--dataset R] [--dry-run]   convert published runs' traces and push to HF (per-GPU hard/cuda boards upload under <board>/)
   kb brev <up|sync|bootstrap|run|regrade|pull|down> <instance> [...]   Brev GPU worker lifecycle (scripts/brev_worker.sh)
   kb lambda <list|ls|up|sync|bootstrap|run|regrade|pull|down|ssh> [...]  Lambda Cloud worker (scripts/lambda_worker.sh; $10k Zach credits)
   kb help
@@ -260,7 +260,7 @@ def cmd_push_runs(root: Path, args: list[str]) -> int:
         i = args.index("--dataset")
         dataset = args[i + 1]
         del args[i:i + 2]
-    board = None  # non-canonical GPU board key (h100|b200|rtx3090)
+    board = None  # non-canonical GPU board key (h100|b200)
     if "--board" in args:
         i = args.index("--board")
         board = args[i + 1]
@@ -284,15 +284,6 @@ def cmd_push_runs(root: Path, args: list[str]) -> int:
         rids = sorted({c.get("run_id") for m in data.get("models", [])
                        for c in m.get("results", {}).values() if c.get("run_id")})
         src_dir = f"runs-{board}"
-        # Boards that predate the runs-<gpu> split (rtx3090) archive in plain
-        # runs/; fall back when the board dir holds none of this board's rids.
-        out = bench_dir / "outputs"
-        if not any((out / src_dir / r).is_dir() for r in rids) and any(
-            (out / "runs" / r).is_dir() for r in rids
-        ):
-            print(f"kb push-runs: {src_dir} has no archives for this board; "
-                  f"using runs/ (pre-split board)")
-            src_dir = "runs"
     else:
         rids = _leaderboard_run_ids(bench_dir)
         if not rids and bench == "mega":

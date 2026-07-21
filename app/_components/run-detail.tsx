@@ -55,7 +55,6 @@ const GPU_NAMES: Record<string, string> = {
   rtxpro6000: "RTX PRO 6000",
   h100: "H100 PCIe",
   b200: "B200",
-  rtx3090: "RTX 3090",
 }
 
 function fmtDuration(s: number | null | undefined): string {

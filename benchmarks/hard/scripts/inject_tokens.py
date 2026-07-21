@@ -19,7 +19,6 @@ TARGETS = {
     "results/leaderboard.json": "outputs/runs",
     "results/leaderboard.h100.json": "outputs/runs-h100",
     "results/leaderboard.b200.json": "outputs/runs-b200",
-    "results/leaderboard.rtx3090.json": "outputs/runs-rtx3090",
 }
 
 

@@ -62,7 +62,7 @@ benchmarks/hard/           KernelBench-Hard eval — the per-op deck
   results/annotations/*.yaml   per-cell reward-hack / clean verdicts
   outputs/runs/                run archives (gitignored; ~186G)
   scripts/ src/                eval code
-  problems-rtxpro6000/         the deck — per-GPU sets: -rtxpro6000 (default, RTX PRO 6000), -h100, -b200, -3090
+  problems-rtxpro6000/         the deck — per-GPU sets: -rtxpro6000 (default, RTX PRO 6000), -h100, -b200 (RTX 3090 removed from the suite 2026-07-21)
 benchmarks/mega/           KernelBench-Mega eval — megakernel deck (single problems/; reuses hard's machinery)
 benchmarks/cuda/           KernelBench-CUDA eval — CUDA-only deck (Triton/DSL fail); /cuda
 benchmarks/multi/          KernelBench-Multi eval — 8×H100 NVLink (WIP); /multi
@@ -277,7 +277,7 @@ benchmarks/<bench>/
 
 ```bash
 # Hard — single (harness, model, problem). Deck is per-GPU: problems-rtxpro6000
-# (default, RTX PRO 6000), problems-h100, problems-b200, problems-3090.
+# (default, RTX PRO 6000), problems-h100, problems-b200.
 uv run kbh run claude claude-opus-4-7 problems-rtxpro6000/01_fp8_gemm
 
 # Full active matrix on one problem

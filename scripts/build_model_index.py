@@ -255,8 +255,8 @@ def load_site_board(models: Models, bench: str, path: Path, gpu_key: str | None)
     d = json.loads(path.read_text())
     problems = d.get("problems", [])
     KNOWN_PROBLEMS.update(problems)
-    # The 3090 deck drops 01_fp8_gemm but its problems array still lists it;
-    # the attempted-problem union across rows is the true board denominator.
+    # The attempted-problem union across rows is the true board denominator
+    # (a board's deck can drop a problem the problems array still lists).
     n_attempted = max((len(m.get("results") or {}) for m in d.get("models", [])), default=0)
     total_problems = n_attempted or len(problems)
 
@@ -605,7 +605,6 @@ GPU_LABELS = {
     "rtxpro6000": "RTX PRO 6000",
     "h100": "H100 PCIe",
     "b200": "B200",
-    "rtx3090": "RTX 3090",
 }
 
 
@@ -664,14 +663,14 @@ def finalize(models: Models) -> dict:
 def main() -> None:
     models = Models()
     load_site_board(models, "hard", REPO / "benchmarks/hard/results/leaderboard.json", None)
-    for gpu_key in ("h100", "b200", "rtx3090"):
+    for gpu_key in ("h100", "b200"):
         p = REPO / f"benchmarks/hard/results/leaderboard.{gpu_key}.json"
         if p.exists():
             load_site_board(models, "hard", p, gpu_key)
     cuda_board = REPO / "benchmarks/cuda/results/leaderboard.json"
     if cuda_board.exists():
         load_site_board(models, "cuda", cuda_board, None)
-    for gpu_key in ("h100", "b200", "rtx3090"):
+    for gpu_key in ("h100", "b200"):
         p = REPO / f"benchmarks/cuda/results/leaderboard.{gpu_key}.json"
         if p.exists():
             load_site_board(models, "cuda", p, gpu_key)

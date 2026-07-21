@@ -31,7 +31,6 @@ BOARDS = [
     ("hard", "results/leaderboard.json", "rtxpro6000", "problems-rtxpro6000", "runs"),
     ("hard", "results/leaderboard.h100.json", "h100", "problems-h100", "runs-h100"),
     ("hard", "results/leaderboard.b200.json", "b200", "problems-b200", "runs-b200"),
-    ("hard", "results/leaderboard.rtx3090.json", "rtx3090", "problems-3090", "runs-rtx3090"),
     ("cuda", "results/leaderboard.json", "rtxpro6000", "problems-rtxpro6000", "runs"),
     ("cuda", "results/leaderboard.b200.json", "b200", "problems-rtxpro6000", "runs-b200"),
 ]
@@ -42,7 +41,6 @@ HW_FILES = {
     "rtxpro6000": "rtx_pro_6000.py",
     "h100": "h100.py",
     "b200": "b200.py",
-    "rtx3090": "rtx_3090.py",
 }
 
 SHAPE_RE = re.compile(
@@ -164,9 +162,9 @@ def build_cell(
 ) -> dict | None:
     run_dir = ROOT / "benchmarks" / bench / "outputs" / runs / run_id
     if not run_dir.exists() and runs != "runs":
-        # Boards that predate the runs-<gpu> split (rtx3090) archive in plain
-        # runs/. Only fires when the board copy is absent, so a colliding rid
-        # present in both dirs always resolves to the board's own session.
+        # Fall back to the flat runs/ archive when the board copy is absent;
+        # a colliding rid present in both dirs always resolves to the board's
+        # own session.
         run_dir = ROOT / "benchmarks" / bench / "outputs" / "runs" / run_id
     if not run_dir.exists():
         return None
