@@ -22,14 +22,20 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 OUT_DIR = ROOT / "public" / "data" / "rundetail"
 
-# (bench, leaderboard file, gpu key, deck dir)
+# (bench, leaderboard file, gpu key, deck dir, runs dir)
+# Canonical boards (RTX PRO 6000) keep flat rundetail/<rid>.json paths; every
+# other GPU board namespaces as rundetail/<gpu>/<rid>.json — the same run_id
+# can exist on two boards (two different sessions), so bare-rid keys would
+# collide and misattribute one GPU's session to the other board.
 BOARDS = [
-    ("hard", "results/leaderboard.json", "rtxpro6000", "problems-rtxpro6000"),
-    ("hard", "results/leaderboard.h100.json", "h100", "problems-h100"),
-    ("hard", "results/leaderboard.b200.json", "b200", "problems-b200"),
-    ("hard", "results/leaderboard.rtx3090.json", "rtx3090", "problems-3090"),
-    ("cuda", "results/leaderboard.json", "rtxpro6000", "problems-rtxpro6000"),
+    ("hard", "results/leaderboard.json", "rtxpro6000", "problems-rtxpro6000", "runs"),
+    ("hard", "results/leaderboard.h100.json", "h100", "problems-h100", "runs-h100"),
+    ("hard", "results/leaderboard.b200.json", "b200", "problems-b200", "runs-b200"),
+    ("hard", "results/leaderboard.rtx3090.json", "rtx3090", "problems-3090", "runs-rtx3090"),
+    ("cuda", "results/leaderboard.json", "rtxpro6000", "problems-rtxpro6000", "runs"),
 ]
+
+CANONICAL_GPU = "rtxpro6000"
 
 HW_FILES = {
     "rtxpro6000": "rtx_pro_6000.py",
@@ -152,8 +158,10 @@ def dims_label(dims: dict) -> str:
     return "×".join(nums) if nums else str(dims)
 
 
-def build_cell(bench: str, gpu: str, deck: str, run_id: str, cell: dict) -> dict | None:
-    run_dir = ROOT / "benchmarks" / bench / "outputs" / "runs" / run_id
+def build_cell(
+    bench: str, gpu: str, deck: str, runs: str, run_id: str, cell: dict
+) -> dict | None:
+    run_dir = ROOT / "benchmarks" / bench / "outputs" / runs / run_id
     if not run_dir.exists():
         return None
     try:
@@ -210,9 +218,11 @@ def build_cell(bench: str, gpu: str, deck: str, run_id: str, cell: dict) -> dict
         },
         "gpu_lock": parse_lock_log(run_dir / "gpu_lock.log"),
         "shapes": shapes,
-        "has_solution_text": (
-            ROOT / "public" / "runs" / f"{run_id}_solution.py.txt"
-        ).exists(),
+        # Redacted solution text is only emitted for canonical boards; a bare
+        # public/runs/<rid> file may belong to the canonical session, so
+        # non-canonical boards must not claim it.
+        "has_solution_text": gpu == CANONICAL_GPU
+        and (ROOT / "public" / "runs" / f"{run_id}_solution.py.txt").exists(),
     }
     return detail
 
@@ -221,7 +231,7 @@ def main() -> None:
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     written = 0
     skipped = 0
-    for bench, lb_rel, gpu, deck in BOARDS:
+    for bench, lb_rel, gpu, deck, runs in BOARDS:
         lb_path = ROOT / "benchmarks" / bench / lb_rel
         if not lb_path.exists():
             continue
@@ -231,11 +241,13 @@ def main() -> None:
                 run_id = cell.get("run_id")
                 if not run_id:
                     continue
-                detail = build_cell(bench, gpu, deck, run_id, cell)
+                detail = build_cell(bench, gpu, deck, runs, run_id, cell)
                 if detail is None:
                     skipped += 1
                     continue
-                out = OUT_DIR / f"{run_id}.json"
+                out_dir = OUT_DIR if gpu == CANONICAL_GPU else OUT_DIR / gpu
+                out_dir.mkdir(parents=True, exist_ok=True)
+                out = out_dir / f"{run_id}.json"
                 out.write_text(json.dumps(detail, indent=1) + "\n")
                 written += 1
     print(f"rundetail: wrote {written}, skipped (no archive) {skipped}")

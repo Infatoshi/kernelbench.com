@@ -129,18 +129,36 @@ def lab_for(slug: str) -> str:
     return ""
 
 
-def trace_url(bench: str, run_id: str) -> str | None:
+def trace_url(bench: str, run_id: str, gpu_key: str | None = None) -> str | None:
+    """Canonical boards use flat <rid>.jsonl on HF; non-canonical boards use
+    <gpu>/<rid>.jsonl — the same run_id can name two different sessions (one
+    per GPU board), so a bare-rid key would misattribute one to the other."""
     ds = TRACE_DATASETS.get(bench)
     if not ds or not run_id:
         return None
-    return f"https://huggingface.co/datasets/Infatoshi/{ds}/blob/main/{run_id}.jsonl"
+    prefix = f"{gpu_key}/" if gpu_key else ""
+    return f"https://huggingface.co/datasets/Infatoshi/{ds}/blob/main/{prefix}{run_id}.jsonl"
 
 
-def solution_url(run_id: str) -> str | None:
+def solution_url(run_id: str, gpu_key: str | None = None) -> str | None:
     if not run_id:
+        return None
+    # public/runs only carries canonical-board solutions; a bare file with a
+    # colliding rid belongs to the canonical session, never a per-GPU board's.
+    if gpu_key:
         return None
     p = REPO / "public" / "runs" / f"{run_id}_solution.py.txt"
     return f"/runs/{run_id}_solution.py.txt" if p.exists() else None
+
+
+def detail_url(bench: str, run_id: str, gpu_key: str | None = None) -> str | None:
+    """Baked fetch path for the site's run-detail overlay (see
+    scripts/build_run_detail.py for the matching writer)."""
+    if bench not in ("hard", "cuda") or not run_id:
+        return None
+    prefix = f"{gpu_key}/" if gpu_key else ""
+    p = REPO / "public" / "data" / "rundetail" / f"{prefix}{run_id}.json"
+    return f"/data/rundetail/{prefix}{run_id}.json" if p.exists() else None
 
 
 class Models:
@@ -238,8 +256,9 @@ def load_site_board(models: Models, bench: str, path: Path, gpu_key: str | None)
                 "verdict": verdict,
                 "valid": bool(c.get("correct")) and c.get("peak_fraction") is not None and verdict not in FLAG_VERDICTS,
                 "elapsed_seconds": c.get("elapsed_seconds"),
-                "solution_url": solution_url(c.get("run_id") or ""),
-                "trace_url": trace_url(bench, c.get("run_id") or ""),
+                "solution_url": solution_url(c.get("run_id") or "", gpu_key),
+                "trace_url": trace_url(bench, c.get("run_id") or "", gpu_key),
+                "detail_url": detail_url(bench, c.get("run_id") or "", gpu_key),
             }
         block = {
             "label": m.get("label"),

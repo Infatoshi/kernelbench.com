@@ -169,14 +169,14 @@ export function RunDetailPanel({
     setDataMissing(false)
     setSolution(null)
     setShowSolution(false)
-    fetch(`/data/rundetail/${chip.run_id}.json`)
+    fetch(chip.detail_url ?? `/data/rundetail/${chip.run_id}.json`)
       .then((r) => (r.ok ? r.json() : Promise.reject(new Error(`${r.status}`))))
       .then((d) => alive && setData(d))
       .catch(() => alive && setDataMissing(true))
     return () => {
       alive = false
     }
-  }, [chip.run_id])
+  }, [chip.run_id, chip.detail_url])
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => e.key === "Escape" && onClose()

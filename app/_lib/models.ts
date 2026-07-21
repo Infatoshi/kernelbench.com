@@ -24,6 +24,8 @@ export interface ModelCell {
   framework?: string | null
   solution_url: string | null
   trace_url: string | null
+  /** baked rundetail fetch path; gpu-namespaced for non-canonical boards */
+  detail_url?: string | null
 }
 
 export interface FlagEntry {
@@ -318,6 +320,7 @@ export interface ProblemChip {
   solution_url: string | null
   trace_url: string | null
   run_id: string | null
+  detail_url?: string | null
 }
 
 export interface ReportRow {
@@ -381,6 +384,7 @@ function chipFromCell(prob: string, c: ModelCell | undefined): ProblemChip {
     solution_url: c?.solution_url ?? null,
     trace_url: c?.trace_url ?? null,
     run_id: c?.run_id ?? null,
+    detail_url: c?.detail_url ?? null,
   }
   if (!c) {
     return {

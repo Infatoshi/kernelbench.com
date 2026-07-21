@@ -32,7 +32,7 @@ kb — KernelBench operator CLI   (repo: {root})
   kb lint <run_id|--all>                        static reward-hack tripwire (scans solution.py)
   kb contamination <hard|mega|cuda|v3|path> [--published <lb.json>]   cross-run contamination audit
   kb traces-to-hf <out_dir> [run_dirs...]       convert run transcripts to HF agent-trace JSONL
-  kb push-runs <hard|mega|cuda> [--dataset R] [--dry-run]   convert published runs' traces and push to HF
+  kb push-runs <hard|mega|cuda> [--board h100|b200|rtx3090] [--dataset R] [--dry-run]   convert published runs' traces and push to HF (per-GPU boards upload under <board>/)
   kb brev <up|sync|bootstrap|run|regrade|pull|down> <instance> [...]   Brev GPU worker lifecycle (scripts/brev_worker.sh)
   kb help
 
@@ -217,30 +217,27 @@ def _mega_csv_run_ids(root: Path) -> list[str]:
         return sorted({row["run_id"] for row in csv.DictReader(fh) if row.get("run_id")})
 
 
-def _check_rid_collisions(root: Path, bench: str, rids: list[str]) -> None:
-    """A run_id must resolve to exactly one archive dir. The same rid living in
-    two runs dirs (e.g. hard outputs/runs + outputs/runs-b200) with different
-    contents means public/runs and HF traces keyed by rid alone would
-    misattribute one GPU's session to another board. Hard-fail; override with
-    KB_ALLOW_RID_COLLISIONS=1 only if you know which copy wins."""
+def _check_rid_collisions(root: Path, bench: str, rids: list[str], src_dir: str) -> None:
+    """The same rid can live in two runs dirs (two different sessions, one per
+    GPU board). Artifact paths are namespaced per board (flat = canonical from
+    outputs/runs; per-GPU boards upload under <gpu>/), so pushes are
+    deterministic — but each rid must exist in THIS push's source dir, and
+    cross-dir duplicates are still worth flagging."""
     bench_out = root / "benchmarks" / bench / "outputs"
     dirs = sorted(d for d in bench_out.glob("runs*") if d.is_dir())
-    dup: dict[str, list[str]] = {}
+    missing = [r for r in rids if not (bench_out / src_dir / r).is_dir()]
+    if missing:
+        sys.exit(
+            f"kb: {len(missing)} published run_ids missing from {src_dir} "
+            f"(first: {missing[0]}) — wrong --board, or archive not synced?"
+        )
     for rid in rids:
         hits = [str(d.relative_to(root)) for d in dirs if (d / rid).is_dir()]
         if len(hits) > 1:
-            dup[rid] = hits
-    if not dup:
-        return
-    msg = ["kb: run_id collision — same rid archived in multiple runs dirs:"]
-    for rid, hits in dup.items():
-        msg.append(f"  {rid}: {', '.join(hits)}")
-    msg.append("  rid-keyed artifacts (public/runs, HF traces) would misattribute these.")
-    msg.append("  Namespace or rename before pushing, or KB_ALLOW_RID_COLLISIONS=1 to force.")
-    if os.environ.get("KB_ALLOW_RID_COLLISIONS") == "1":
-        sys.stderr.write("\n".join(["WARNING (forced past):"] + msg[1:]) + "\n")
-        return
-    sys.exit("\n".join(msg))
+            sys.stderr.write(
+                f"note: {rid} exists in {len(hits)} runs dirs "
+                f"({', '.join(hits)}); pushing the {src_dir} copy\n"
+            )
 
 
 def cmd_push_runs(root: Path, args: list[str]) -> int:
@@ -251,21 +248,41 @@ def cmd_push_runs(root: Path, args: list[str]) -> int:
         i = args.index("--dataset")
         dataset = args[i + 1]
         del args[i:i + 2]
+    board = None  # non-canonical GPU board key (h100|b200|rtx3090)
+    if "--board" in args:
+        i = args.index("--board")
+        board = args[i + 1]
+        del args[i:i + 2]
     bench = args[0] if args else "hard"
     if bench not in ("hard", "mega", "cuda"):
         sys.exit("kb push-runs: only hard|mega|cuda have trace datasets (v3 is archived)")
+    if board and bench != "hard":
+        sys.exit("kb push-runs: --board only applies to hard (per-GPU boards)")
     bench_dir = _bench_dir(root, bench)
     dataset = dataset or f"Infatoshi/kernelbench-{bench}-traces"
 
-    rids = _leaderboard_run_ids(bench_dir)
-    if not rids and bench == "mega":
-        rids = _mega_csv_run_ids(root)
+    if board:
+        # Per-GPU board: rids from leaderboard.<board>.json, archives from
+        # outputs/runs-<board>, uploaded under <board>/ on HF so they never
+        # clobber the canonical flat namespace.
+        lb = bench_dir / "results" / f"leaderboard.{board}.json"
+        if not lb.exists():
+            sys.exit(f"kb push-runs: no such board file {lb}")
+        data = json.loads(lb.read_text())
+        rids = sorted({c.get("run_id") for m in data.get("models", [])
+                       for c in m.get("results", {}).values() if c.get("run_id")})
+        src_dir = f"runs-{board}"
+    else:
+        rids = _leaderboard_run_ids(bench_dir)
+        if not rids and bench == "mega":
+            rids = _mega_csv_run_ids(root)
+        src_dir = "runs"
     if not rids:
         src = "public/data/mega/results.csv" if bench == "mega" else f"{bench}/results/leaderboard.json"
         sys.exit(f"kb push-runs: no run_ids in {src}")
-    _check_rid_collisions(root, bench, rids)
+    _check_rid_collisions(root, bench, rids, src_dir)
 
-    staging = root / "runs" / bench / "traces"
+    staging = root / "runs" / bench / ("traces" if not board else f"traces-{board}")
     staging.mkdir(parents=True, exist_ok=True)
     listfile = root / "runs" / bench / "_rids.txt"
     listfile.write_text("\n".join(rids) + "\n")
@@ -279,22 +296,25 @@ def cmd_push_runs(root: Path, args: list[str]) -> int:
     bench_env = {k: v for k, v in os.environ.items() if k != "VIRTUAL_ENV"}
     subprocess.run(
         ["uv", "run", "python", str(conv), str(staging),
-         "--from-list", str(listfile), "--search", "outputs/runs"],
+         "--from-list", str(listfile), "--search", f"outputs/{src_dir}"],
         cwd=bench_dir, check=True, env=bench_env,
     )
     produced = sorted(staging.glob("*.jsonl"))
     print(f"  produced {len(produced)} jsonl traces")
 
+    dest = f"{dataset}" + (f" under {board}/" if board else "")
     if dry:
-        print(f"[dry-run] would upload {staging} -> {dataset} (dataset)")
+        print(f"[dry-run] would upload {staging} -> {dest} (dataset)")
         return 0
 
     from huggingface_hub import HfApi
     api = HfApi()
     api.create_repo(dataset, repo_type="dataset", exist_ok=True)
-    print(f"uploading {len(produced)} traces -> {dataset} ...")
+    print(f"uploading {len(produced)} traces -> {dest} ...")
     api.upload_folder(folder_path=str(staging), repo_id=dataset, repo_type="dataset",
-                      commit_message=f"publish {bench} run traces ({len(produced)} runs)")
+                      path_in_repo=(board or ""),
+                      commit_message=f"publish {bench} run traces ({len(produced)} runs)"
+                                     + (f" [{board}]" if board else ""))
     print(f"done: https://huggingface.co/datasets/{dataset}")
     return 0
 
