@@ -38,7 +38,9 @@ fi
 
 run_one() {
   local HARNESS="$1" MODEL="$2" EFFORT="$3"
-  local log="$HOME/mega_run_${HARNESS}_${MODEL}.log"
+  # Model ids can contain slashes (or-fable anthropic/claude-fable-5) —
+  # flatten for the log filename or the redirect fails on a missing dir.
+  local log="$HOME/mega_run_${HARNESS}_${MODEL//\//_}.log"
   echo "[$GPU_LABEL] launch $HARNESS $MODEL $EFFORT ($(date -Is))"
   # </dev/null: keep the agent CLI from eating the caller loop's here-string stdin
   BUDGET_SECONDS="$BUDGET_SECONDS" ./scripts/run_hard.sh "$HARNESS" "$MODEL" "$PROBLEM" "$EFFORT" > "$log" 2>&1 </dev/null || true
