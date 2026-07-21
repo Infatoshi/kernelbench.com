@@ -61,6 +61,7 @@ case "$CMD" in
     rsync -az -e "${S[*]}" \
       --exclude outputs --exclude __pycache__ --exclude '.venv' --exclude '*.pyc' \
       --exclude .git --exclude 'docs/refs' \
+      --exclude 'results/annotations' --exclude 'docs/*case_stud*' \
       "$HARD/" "$NAME:kb-hard/"
     TMPENV="$(mktemp)"
     grep -E "^(export )?($ENV_ALLOWLIST)=" ~/.env_vars > "$TMPENV" || true
