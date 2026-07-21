@@ -3,7 +3,7 @@
 # (Mac or anvil). Wraps: provision -> sync -> bootstrap -> run/regrade -> pull
 # -> verified teardown. `kb brev ...` shells out here.
 #
-#   brev_worker.sh up <name> [gpu]              create instance (default H100) + wait + refresh ssh
+#   brev_worker.sh up <name> [type]             create instance (default hyperstack_H100) + wait + refresh ssh
 #   brev_worker.sh sync <name>                  rsync thin hard bench -> <name>:kb-hard/
 #   brev_worker.sh bootstrap <name> [--agents]  uv + torch (cu128); --agents adds node + agent CLIs + auth
 #   brev_worker.sh run <name> <harness> <model> <problem> [effort]   detached agent session (problems root auto)
@@ -39,9 +39,10 @@ ensure_reachable() {
 
 case "$CMD" in
   up)
-    GPU="${1:-${KB_BREV_GPU:-H100}}"
-    echo "[up] brev create $NAME --gpu $GPU"
-    "$BREV" create "$NAME" --gpu "$GPU"
+    # arg = brev instance type (from `brev search`), e.g. hyperstack_H100
+    TYPE="${1:-${KB_BREV_TYPE:-hyperstack_H100}}"
+    echo "[up] brev create $NAME --type $TYPE"
+    "$BREV" create "$NAME" --type "$TYPE"
     echo "[up] waiting for RUNNING/READY ..."
     for _ in $(seq 1 60); do
       row="$("$BREV" ls 2>/dev/null | awk -v n="$NAME" '$1==n')"
