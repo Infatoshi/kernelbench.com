@@ -11,9 +11,10 @@ the `benchmarks/v3/` archive, which keeps its own).
 This is the **canonical monorepo** for the KernelBench website AND the eval
 benchmarks. **Canonical home is the Mac** at `~/dev/sites/kernelbench.com`
 (edit, site dev, publish/deploy, orchestration, babysit). GPU eval sessions
-launch to NVIDIA Brev (or another remote GPU worker); they do not need Anvil's
-local GPUs. Anvil may still hold a disposable checkout or fat run caches — do
-not treat it as source of truth. Deploys go out from the Mac (`kb deploy`).
+launch to **Lambda Cloud** (Zach / Lambda-sponsored **$10k** credits, 2026-07)
+or NVIDIA Brev (or another remote GPU worker); they do not need Anvil's local
+GPUs. Anvil may still hold a disposable checkout or fat run caches — do not
+treat it as source of truth. Deploys go out from the Mac (`kb deploy`).
 
 ## The active benches — know which one you're writing to
 
@@ -102,19 +103,61 @@ kb deploy "bench kimi k2.7"               # publish + commit + push (Vercel auto
 ```
 Other commands: `kb run <harness> <model> <problem>` (one problem), `kb dev`
 (preview at localhost:3000), `kb build`, `kb audit <run_id>`,
-`kb contamination <hard|mega|v3>`, `kb traces-to-hf`, `kb help`. The CLI is the
-`kbtool/` uv package (`kbtool/kb/cli.py`); `bin/kb` is a thin shim that runs it
-via `uv run` (symlinked to ~/.local/bin/kb). Install standalone with
-`uv tool install ./kbtool`. The GPU-coupled sweep orchestration stays as
-bench-local shell (`benchmarks/<bench>/scripts/*.sh`); the CLI shells out to it.
-The `kb` CLI targets the **hard** bench; for **mega** drive
-`./scripts/run_hard.sh` / `./scripts/sweep.sh` from inside `benchmarks/mega/`
-(or `kb publish mega`).
+`kb contamination <hard|mega|v3>`, `kb traces-to-hf`, `kb brev ...`,
+`kb lambda ...`, `kb help`. The CLI is the `kbtool/` uv package
+(`kbtool/kb/cli.py`); `bin/kb` is a thin shim that runs it via `uv run`
+(symlinked to ~/.local/bin/kb). Install standalone with `uv tool install
+./kbtool`. The GPU-coupled sweep orchestration stays as bench-local shell
+(`benchmarks/<bench>/scripts/*.sh`); the CLI shells out to it. The `kb` CLI
+targets the **hard** bench; for **mega** drive `./scripts/run_hard.sh` /
+`./scripts/sweep.sh` from inside `benchmarks/mega/` (or `kb publish mega`).
+
+### Lambda Cloud workers (sponsored $10k credits, 2026-07)
+
+Zach/Lambda sponsored **$10k** Cloud credits for KernelBench-Hard / Mega /
+CUDA / Multi (Blackwell + Hopper: RTX PRO 6000, H100, B200). Credits live only
+in the console: [Settings → Billing → Credits](https://cloud.lambda.ai/settings/billing)
+(account `elliot@arledge.net`). Mentions: tag Lambda on X when posting runs.
+
+- **Auth:** `LAMBDA_API_KEY` in `~/.env_vars` (mirror `LAMDBA_API_KEY` same
+  value). Mint at https://cloud.lambda.ai/api-keys/cloud-api. Keep Mac and
+  anvil `~/.env_vars` in sync.
+- **SSH keys registered on the account:** `macbook` (Mac
+  `~/.ssh/id_ed25519.pub`) and `anvil` (anvil
+  `~/.ssh/id_ed25519.pub`). `lambda_worker.sh up` attaches **both** so either
+  control plane can log in.
+- **Operator CLI** (curl/API; no brew required on anvil):
+
+```
+kb lambda list                         # capacity by type
+kb lambda ls                           # running instances
+kb lambda up <name> [type] [region]    # default type gpu_1x_h100_sxm5
+kb lambda sync <name>                  # thin hard bench + allowlisted keys
+kb lambda bootstrap <name> [--agents]  # uv + torch; --agents = agent CLIs
+kb lambda run <name> <harness> <model> <problem> [effort]
+kb lambda pull <name>                  # -> benchmarks/hard/outputs/runs-lambda-<name>/
+kb lambda down <name>                  # terminate + poll until gone
+kb lambda ssh <name> [cmd...]
+```
+
+  Or `./scripts/lambda_worker.sh ...` from the repo root. Env overrides:
+  `KB_LAMBDA_TYPE`, `KB_LAMBDA_REGION`, `KB_LAMBDA_SSH_KEYS` (default
+  `macbook,anvil`), `KB_LAMBDA_PROBLEMS_ROOT` (default `problems-h100`).
+- **Always `kb lambda down` when done** — idle nodes bill against the $10k.
+  Confirm with `kb lambda ls` empty for that name.
+- Optional Mac-only community CLI: `brew install strand-ai/tap/lambda-cli`
+  (`lambda list|running|start|stop`); worker scripts use the Cloud API
+  directly so anvil does not need it.
+- Multi-GPU / NVLink work can use either Brev (below) or Lambda
+  `gpu_8x_h100_sxm5` / `gpu_8x_b200_sxm6` when capacity shows in
+  `kb lambda list`.
 
 - API keys live in `~/.env_vars` (KIMI_API_KEY, ZAI_API_KEY, MINIMAX_API_KEY,
   OPENROUTER_API_KEY, OPENAI_API_KEY, GEMINI_API_KEY, CLAUDE_CODE_OAUTH_TOKEN,
-  TENCENT_API_KEY for TokenHub Hy3, LONGCAT_API_KEY, DEEPSEEK_API_KEY).
-  To bench a new model: drop its key in `~/.env_vars`, then `kb sweep`.
+  TENCENT_API_KEY for TokenHub Hy3, LONGCAT_API_KEY, DEEPSEEK_API_KEY,
+  **LAMBDA_API_KEY** for Lambda Cloud workers — also keep legacy typo
+  **LAMDBA_API_KEY** in sync for kimi-sweep). To bench a new model: drop its
+  key in `~/.env_vars`, then `kb sweep`.
 - **If `kb sweep` / `kbh run` prints `STOP: ... needs $X_API_KEY`**, the key is
   missing — ask the human for it, append `export X_API_KEY=...` to
   `~/.env_vars`, rerun. `kb` preflights the key before launching so you get one

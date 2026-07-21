@@ -4,6 +4,22 @@ A running record of decisions, dead ends, and lessons. Newest entries on top. Th
 
 ---
 
+## 2026-07-20 - Lambda Cloud $10k + worker lifecycle
+
+Zach/Lambda sponsored **$10k** Cloud credits for Hard/Mega/CUDA/Multi (H100,
+B200, RTX PRO 6000). Applied to account `elliot@arledge.net` (email
+"Your Cloud Credits Have Been Applied!"). Credits visible only at
+cloud.lambda.ai Settings → Billing → Credits (not via Cloud API).
+
+Repo additions:
+- `scripts/lambda_worker.sh` — list/ls/up/sync/bootstrap/run/regrade/pull/down/ssh
+  via Cloud API (curl+jq). Launch attaches SSH key names **macbook** + **anvil**.
+- `kb lambda ...` thin wrapper in `kbtool/kb/cli.py` (same pattern as `kb brev`).
+- AGENTS.md: Lambda section + LAMBDA_API_KEY note.
+
+Control-plane setup (not in git): `LAMBDA_API_KEY` / `LAMDBA_API_KEY` in
+`~/.env_vars` on Mac and anvil; API keys for SSH already uploaded to Lambda.
+
 ## 2026-07-09 - Agent-side CUDA disabling removed
 
 `KBH_DISABLE_AGENT_CUDA` was removed from the harness, parallel launcher, and
