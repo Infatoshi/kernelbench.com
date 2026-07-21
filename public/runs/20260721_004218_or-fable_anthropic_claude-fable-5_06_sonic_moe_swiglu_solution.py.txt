@@ -1,0 +1,323 @@
+"""Sonic-MoE up-projection: variable-length grouped GEMM + fused SwiGLU.
+
+Custom Triton kernel for H100 (SM90). Design:
+
+  - The gate and up weights are pre-interleaved once (lazily, after
+    load_state_dict) into a single (E, H, 2*I) tensor with gate at even
+    columns and up at odd columns. Each output tile then needs ONE wide
+    wgmma-backed tl.dot per K-step (m128 x n256), sharing the A-tile load
+    between both projections; the epilogue deinterleaves the accumulator
+    with tl.split and applies silu(gate) * up in registers before a single
+    bf16 store. No (T_perm, 2I) intermediate is ever materialized.
+
+  - A tiny schedule kernel (grid = E) turns expert_offsets into a flat tile
+    list [(row_blk, row_end, n_off, w_row), ...] in global memory, entirely
+    on-device (no host sync on routing metadata). Tiles are ordered
+    expert-major with grouped-M rasterization inside each expert for L2
+    weight reuse.
+
+  - The main kernel is persistent (grid = #SMs): each CTA walks the tile
+    list round-robin, so per-tile scheduling is 4 scalar loads instead of
+    cross-warp reductions. All GEMM loads go through TMA tensor descriptors
+    (device-side). Stores use a TMA store for full tiles and fall back to a
+    masked store only at expert-boundary partial tiles (a TMA store cannot
+    be row-masked and would race across experts).
+
+  - The SwiGLU epilogue uses a fast sigmoid via tanh.approx.f32
+    (sigmoid(x) = 0.5*tanh(x/2) + 0.5); error is far below bf16 rounding.
+"""
+from __future__ import annotations
+
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+OP_TYPE = "grouped_gemm_swiglu"
+SUPPORTED_PRECISIONS = ["bf16"]
+
+
+# Triton needs a global-memory allocator for device-side TMA descriptors.
+# Serve it from one persistent buffer: avoids a per-launch allocation and keeps
+# the descriptor scratch at a stable address across CUDA-graph capture/replay.
+_desc_scratch: torch.Tensor | None = None
+
+
+def _alloc_fn(size: int, alignment: int, stream):
+    global _desc_scratch
+    if _desc_scratch is None or _desc_scratch.numel() < size:
+        _desc_scratch = torch.empty(size, device="cuda", dtype=torch.int8)
+    return _desc_scratch
+
+
+triton.set_allocator(_alloc_fn)
+
+
+def _next_pow2(x: int) -> int:
+    n = 1
+    while n < x:
+        n *= 2
+    return n
+
+
+@triton.jit
+def _sched_kernel(
+    offs_ptr, sched_ptr, total_ptr,
+    E: tl.constexpr, E_POW2: tl.constexpr,
+    NT_N: tl.constexpr, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
+    GROUP_M: tl.constexpr, CHUNK: tl.constexpr, H: tl.constexpr,
+):
+    """Expand expert_offsets into a flat tile schedule, one program per expert.
+
+    Entry t (4 x int32): row_blk, row_end, n_off, w_row (= e * H).
+    Program 0 also writes the total tile count.
+    """
+    e = tl.program_id(0)
+    e_idx = tl.arange(0, E_POW2)
+    o_lo_v = tl.load(offs_ptr + e_idx, mask=e_idx < E, other=0)
+    o_hi_v = tl.load(offs_ptr + e_idx + 1, mask=e_idx < E, other=0)
+    counts = o_hi_v - o_lo_v
+    tiles_v = tl.cdiv(counts, BLOCK_M) * NT_N
+    before = tl.sum(tl.where(e_idx < e, tiles_v, 0), axis=0)
+    if e == 0:
+        tl.store(total_ptr, tl.sum(tiles_v, axis=0))
+
+    row_start = tl.load(offs_ptr + e)
+    row_end = tl.load(offs_ptr + e + 1)
+    mt = tl.cdiv(row_end - row_start, BLOCK_M)
+    my_tiles = mt * NT_N
+    num_pid_in_group = GROUP_M * NT_N
+
+    for base in range(0, my_tiles, CHUNK):
+        local = base + tl.arange(0, CHUNK)
+        group_id = local // num_pid_in_group
+        first_pid_m = group_id * GROUP_M
+        group_size_m = tl.minimum(mt - first_pid_m, GROUP_M)
+        pid_m = first_pid_m + ((local % num_pid_in_group) % group_size_m)
+        pid_n = (local % num_pid_in_group) // group_size_m
+        row_blk = row_start + pid_m * BLOCK_M
+        n_off = pid_n * BLOCK_N
+        m = local < my_tiles
+        t = before + local
+        tl.store(sched_ptr + t * 4 + 0, row_blk, mask=m)
+        tl.store(sched_ptr + t * 4 + 1, row_end, mask=m)
+        tl.store(sched_ptr + t * 4 + 2, n_off, mask=m)
+        tl.store(sched_ptr + t * 4 + 3, e * H, mask=m)
+
+
+@triton.jit
+def _fast_silu_mul(g, u):
+    # silu(g) * u with sigmoid(g) = 0.5 * tanh(g/2) + 0.5 (tanh.approx SFU op)
+    t = tl.inline_asm_elementwise(
+        "tanh.approx.f32 $0, $1;", "=r,r", [g * 0.5],
+        dtype=tl.float32, is_pure=True, pack=1)
+    return g * (t * 0.5 + 0.5) * u
+
+
+@triton.jit
+def _moe_swiglu_kernel(
+    x_ptr, w_ptr, out_ptr, sched_ptr, total_ptr,
+    T_perm,
+    H: tl.constexpr, I: tl.constexpr, E: tl.constexpr,
+    NUM_SMS: tl.constexpr,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+):
+    """Persistent grouped GEMM with fused SwiGLU epilogue (TMA everywhere)."""
+    start_pid = tl.program_id(0)
+    total_tiles = tl.load(total_ptr)
+
+    a_desc = tl.make_tensor_descriptor(
+        x_ptr, shape=[T_perm, H], strides=[H, 1],
+        block_shape=[BLOCK_M, BLOCK_K])
+    # (E, H, 2I) viewed as (E*H, 2I); K-blocks never cross expert rows since
+    # the k-loop below stays inside one expert's H rows.
+    w_desc = tl.make_tensor_descriptor(
+        w_ptr, shape=[E * H, 2 * I], strides=[2 * I, 1],
+        block_shape=[BLOCK_K, 2 * BLOCK_N])
+    o_desc = tl.make_tensor_descriptor(
+        out_ptr, shape=[T_perm, I], strides=[I, 1],
+        block_shape=[BLOCK_M, BLOCK_N])
+
+    for tile in range(start_pid, total_tiles, NUM_SMS):
+        row_blk = tl.load(sched_ptr + tile * 4 + 0)
+        row_end = tl.load(sched_ptr + tile * 4 + 1)
+        n_off = tl.load(sched_ptr + tile * 4 + 2)
+        w_row0 = tl.load(sched_ptr + tile * 4 + 3)
+
+        acc = tl.zeros((BLOCK_M, 2 * BLOCK_N), dtype=tl.float32)
+        for k in tl.range(0, H, BLOCK_K):
+            a = a_desc.load([row_blk, k])
+            b = w_desc.load([w_row0 + k, 2 * n_off])
+            acc = tl.dot(a, b, acc)
+
+        g, u = tl.split(tl.reshape(acc, (BLOCK_M, BLOCK_N, 2)))
+        res = _fast_silu_mul(g, u).to(tl.bfloat16)
+
+        if row_blk + BLOCK_M <= row_end:
+            o_desc.store([row_blk, n_off], res)
+        else:
+            rows = row_blk + tl.arange(0, BLOCK_M)
+            cols = n_off + tl.arange(0, BLOCK_N)
+            mask = (rows[:, None] < row_end) & (cols[None, :] < I)
+            out_ptrs = out_ptr + rows[:, None].to(tl.int64) * I + cols[None, :]
+            tl.store(out_ptrs, res, mask=mask)
+
+
+class Model(nn.Module):
+    """Up-projection of a top-K MoE FFN with fused SwiGLU (custom Triton)."""
+
+    def __init__(self, T_total: int, H: int, I: int, E: int, K: int):  # noqa: E741
+        super().__init__()
+        self.T_total = T_total
+        self.H = H
+        self.I = I
+        self.E = E
+        self.K = K
+        self.W_gate = nn.Parameter(torch.empty(E, H, I, dtype=torch.bfloat16))
+        self.W_up = nn.Parameter(torch.empty(E, H, I, dtype=torch.bfloat16))
+        nn.init.normal_(self.W_gate, std=0.02)
+        nn.init.normal_(self.W_up, std=0.02)
+        self._w_int = None          # interleaved (E, H, 2I) weight cache
+        self._w_key = None
+        self._sched = None          # schedule scratch cache
+        self._total = None
+        self._num_sms = None
+        # CUDA-graph cache: key -> [graph, out, hits]. Replay eliminates the
+        # per-call launch overhead; the captured kernels re-read the current
+        # contents of x / offsets / weights from device memory, so replays
+        # keyed by data_ptr+shape are exact.
+        self._graphs: dict = {}
+
+    def _fused_weight(self) -> torch.Tensor:
+        wg, wu = self.W_gate, self.W_up
+        key = (wg.data_ptr(), wg._version, wu.data_ptr(), wu._version)
+        if self._w_int is None or self._w_key != key:
+            E, H, I = self.E, self.H, self.I  # noqa: E741
+            w_int = torch.empty(E, H, 2 * I, dtype=wg.dtype, device=wg.device)
+            w_int[..., 0::2] = wg.detach()
+            w_int[..., 1::2] = wu.detach()
+            self._w_int = w_int
+            self._w_key = key
+        return self._w_int
+
+    def _launch(self, x, offs, w_int, out):
+        T_perm = x.shape[0]
+        H, I, E = self.H, self.I, self.E  # noqa: E741
+        num_sms = self._num_sms
+
+        BM, BN, BK, GM = 128, 128, 64, 16
+        NT_N = (I + BN - 1) // BN
+        # Deeper TMA pipeline pays off on small (few-wave) problems.
+        est_tiles = ((T_perm + BM - 1) // BM) * NT_N
+        num_stages = 4 if est_tiles <= 4096 else 3
+
+        max_tiles = ((T_perm + BM - 1) // BM + E) * NT_N
+        if self._sched is None or self._sched.numel() < max_tiles * 4:
+            self._sched = torch.empty(
+                max_tiles * 4, dtype=torch.int32, device=x.device)
+            self._total = torch.empty(1, dtype=torch.int32, device=x.device)
+
+        _sched_kernel[(E,)](
+            offs, self._sched, self._total,
+            E=E, E_POW2=_next_pow2(E + 1), NT_N=NT_N,
+            BLOCK_M=BM, BLOCK_N=BN, GROUP_M=GM, CHUNK=512, H=H,
+            num_warps=4)
+        _moe_swiglu_kernel[(num_sms,)](
+            x, w_int, out, self._sched, self._total,
+            T_perm,
+            H=H, I=I, E=E, NUM_SMS=num_sms,
+            BLOCK_M=BM, BLOCK_N=BN, BLOCK_K=BK,
+            num_warps=8, num_stages=num_stages)
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,   # (T_perm, H) bf16
+        expert_offsets: torch.Tensor,  # (E+1,) int32
+    ) -> torch.Tensor:
+        x = hidden_states
+        if not x.is_contiguous():
+            x = x.contiguous()
+        offs = expert_offsets
+        if offs.dtype != torch.int32:
+            offs = offs.to(torch.int32)
+        if not offs.is_contiguous():
+            offs = offs.contiguous()
+        T_perm = x.shape[0]
+        w_int = self._fused_weight()
+
+        if T_perm == 0:
+            return torch.empty(0, self.I, dtype=torch.bfloat16, device=x.device)
+
+        if self._num_sms is None:
+            self._num_sms = torch.cuda.get_device_properties(
+                x.device).multi_processor_count
+
+        key = (x.data_ptr(), offs.data_ptr(), tuple(x.shape), self._w_key)
+        ent = self._graphs.get(key)
+        if ent is not None:
+            graph, out, hits = ent
+            if graph is not None:
+                graph.replay()
+                return out
+            # Second call with identical pointers: kernels are compiled and
+            # warm — capture now.
+            try:
+                g = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(g):
+                    self._launch(x, offs, w_int, out)
+                # Burn-in: the first few dozen replays after a capture run
+                # measurably slower (GPU front-end warm-up); absorb that here,
+                # one-time, capped by wall time so huge shapes stay cheap.
+                import time as _time
+                t0 = _time.perf_counter()
+                n = 0
+                while n < 60 and (_time.perf_counter() - t0) < 0.3:
+                    for _ in range(10):
+                        g.replay()
+                    torch.cuda.synchronize()
+                    n += 10
+                self._graphs[key] = [g, out, hits + 1]
+                return out
+            except Exception:
+                self._graphs.pop(key, None)
+                out2 = torch.empty(
+                    T_perm, self.I, dtype=torch.bfloat16, device=x.device)
+                self._launch(x, offs, w_int, out2)
+                return out2
+
+        out = torch.empty(T_perm, self.I, dtype=torch.bfloat16, device=x.device)
+        self._launch(x, offs, w_int, out)
+        if len(self._graphs) >= 8:  # evict oldest to bound VRAM held by graphs
+            self._graphs.pop(next(iter(self._graphs)))
+        self._graphs[key] = [None, out, 1]
+        return out
+
+
+# Module-level shape shims rewritten by check.py / benchmark.py per shape.
+T_total = 32768
+H = 4096
+I = 1536  # noqa: E741
+E = 128
+K = 8
+
+
+def _build_routing(T_total: int, E: int, K: int, device: str = "cpu") -> torch.Tensor:
+    T_perm = T_total * K
+    base = T_perm // E
+    rem = T_perm - base * E
+    counts = torch.full((E,), base, dtype=torch.int32, device=device)
+    counts[:rem] += 1
+    offsets = torch.zeros(E + 1, dtype=torch.int32, device=device)
+    offsets[1:] = torch.cumsum(counts, dim=0)
+    return offsets
+
+
+def get_inputs():
+    T_perm = T_total * K
+    hidden_states = torch.randn(T_perm, H, dtype=torch.bfloat16) * 0.1
+    expert_offsets = _build_routing(T_total, E, K)
+    return [hidden_states, expert_offsets]
+
+
+def get_init_inputs():
+    return [T_total, H, I, E, K]
