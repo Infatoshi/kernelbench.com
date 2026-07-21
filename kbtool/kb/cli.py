@@ -321,12 +321,20 @@ def cmd_deploy(root: Path, args: list[str]) -> int:
     return 0
 
 
+def _js_runner() -> str:
+    """bun where available (repo tracks bun.lock only); npm as fallback."""
+    for cand in ("bun", str(Path.home() / ".bun" / "bin" / "bun")):
+        if shutil.which(cand):
+            return cand
+    return "npm"
+
+
 def cmd_dev(root: Path, args: list[str]) -> int:
-    return _exec(["npm", "run", "dev"], cwd=root)
+    return _exec([_js_runner(), "run", "dev"], cwd=root)
 
 
 def cmd_build(root: Path, args: list[str]) -> int:
-    return _exec(["npm", "run", "build"], cwd=root)
+    return _exec([_js_runner(), "run", "build"], cwd=root)
 
 
 def cmd_audit(root: Path, args: list[str]) -> int:
