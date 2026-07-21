@@ -1,0 +1,285 @@
+"""Triton paged-attention decode kernel for SM90 Hopper (H100 PCIe).
+
+Single-query decode with GQA, memory-bound.  Two kernels, launched as a group:
+
+  phase1  grid = (batch, num_kv_heads, K_SPLIT)
+      Each block owns one kv_head and the GROUP_SIZE = num_heads // num_kv_heads
+      query heads that share it, and processes a *contiguous chunk* of the paged
+      KV sequence.  KV for the kv_head is streamed page-by-page and reused across
+      the whole group, so every KV byte is loaded exactly once.  Online softmax
+      (FlashAttention-style running m/l) folds the softmax into the stream, and a
+      per-token mask handles the predicated tail page.  The partial (m, l, acc)
+      state is written to a workspace.
+
+  phase2  grid = (batch, num_kv_heads)
+      Reduces the K_SPLIT partial states into the final output with the standard
+      online-softmax merge.
+
+Splitting the sequence (instead of launching one block that loops over all pages
+serially) raises the thread-block count from batch*num_kv_heads to
+batch*num_kv_heads*K_SPLIT, which is what saturates the 132 SMs of the H100 for
+the small-batch shapes.  K_SPLIT is chosen per-shape to land the grid in the
+~256-512 block range without making the reduction expensive.
+
+The KV cache packs [K | V] on its last dim; each page loads K and V as separate
+(page_size, head_dim) tiles with a constant offset.
+"""
+import math
+
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+# --- Shape knobs (overridden by check.py / benchmark.py from shapes.py) ----
+BATCH = 8
+NUM_HEADS = 32
+NUM_KV_HEADS = 8
+HEAD_DIM = 128
+SEQ_LEN = 1024
+PAGE_SIZE = 16
+
+
+@triton.jit
+def _phase1_kernel(
+    q_ptr, kv_ptr, block_table_ptr, seq_lens_ptr,
+    wm_ptr, wl_ptr, wa_ptr,                     # workspace: m, l, acc
+    stride_q_b, stride_q_h, stride_q_d,
+    stride_kv_b, stride_kv_p, stride_kv_h, stride_kv_d,
+    stride_bt_b, stride_bt_m,
+    GROUP_SIZE: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    PAGE_SIZE: tl.constexpr,
+    MAX_BLOCKS: tl.constexpr,
+    NUM_KV_HEADS: tl.constexpr,
+    K_SPLIT: tl.constexpr,
+    scale,
+    num_warps: tl.constexpr = 4,
+):
+    pid_b = tl.program_id(0)
+    pid_kv = tl.program_id(1)
+    pid_s = tl.program_id(2)
+
+    seq_len = tl.load(seq_lens_ptr + pid_b)
+    num_pages = (seq_len + PAGE_SIZE - 1) // PAGE_SIZE
+    pages_per_split = (num_pages + K_SPLIT - 1) // K_SPLIT
+    page_start = pid_s * pages_per_split
+    page_end = tl.minimum(page_start + pages_per_split, num_pages)
+
+    q_head_start = pid_kv * GROUP_SIZE
+
+    # Load the group's queries: (G, D), contiguous along the head dim.
+    offs_g = tl.arange(0, GROUP_SIZE)[:, None]   # (G, 1)
+    offs_d = tl.arange(0, HEAD_DIM)[None, :]     # (1, D)
+    q_mask = (q_head_start + offs_g) < (pid_kv * GROUP_SIZE + GROUP_SIZE)
+    q = tl.load(
+        q_ptr + pid_b * stride_q_b + (q_head_start + offs_g) * stride_q_h + offs_d,
+        mask=q_mask,
+        other=0.0,
+    ).to(tl.float32)  # (G, D)
+
+    # Running online-softmax state, per query head in the group.
+    m = tl.full((GROUP_SIZE,), -1e30, dtype=tl.float32)
+    l = tl.zeros((GROUP_SIZE,), dtype=tl.float32)
+    acc = tl.zeros((GROUP_SIZE, HEAD_DIM), dtype=tl.float32)
+
+    offs_p = tl.arange(0, PAGE_SIZE)[:, None]    # (P, 1)
+    offs_dp = tl.arange(0, HEAD_DIM)[None, :]    # (1, D)
+    offs_p1d = tl.arange(0, PAGE_SIZE)           # (P,)
+
+    for page_idx in range(page_start, page_end):
+        valid_page = page_idx < num_pages
+
+        page = tl.load(block_table_ptr + pid_b * stride_bt_b + page_idx * stride_bt_m)
+        page = tl.where(valid_page, page, 0)
+
+        base = page * stride_kv_b + pid_kv * stride_kv_h
+        k = tl.load(
+            kv_ptr + base + offs_p * stride_kv_p + offs_dp,
+            mask=valid_page,
+            other=0.0,
+        ).to(tl.float32)  # (P, D)
+        v = tl.load(
+            kv_ptr + base + offs_p * stride_kv_p + offs_dp + HEAD_DIM,
+            mask=valid_page,
+            other=0.0,
+        ).to(tl.float32)  # (P, D)
+
+        scores = tl.dot(q, k.T) * scale  # (G, P)
+
+        token = page_idx * PAGE_SIZE + offs_p1d  # (P,)
+        mask = token < seq_len
+        scores = tl.where(mask, scores, -1e30)
+
+        new_m = tl.maximum(m, tl.max(scores, axis=1))          # (G,)
+        exp_scores = tl.exp(scores - new_m[:, None])            # (G, P)
+        exp_scores = tl.where(mask, exp_scores, 0.0)
+        new_l = l * tl.exp(m - new_m) + tl.sum(exp_scores, axis=1)  # (G,)
+        acc = acc * tl.exp(m - new_m)[:, None] + tl.dot(exp_scores, v)  # (G, D)
+        m = new_m
+        l = new_l
+
+    # Write partial state to workspace.  Layout: (B, Hkv, K_SPLIT, G) and
+    # (B, Hkv, K_SPLIT, G, D), flattened.
+    split_idx = (pid_b * NUM_KV_HEADS + pid_kv) * K_SPLIT + pid_s
+    base_m = split_idx * GROUP_SIZE
+    offs_g1d = tl.arange(0, GROUP_SIZE)
+    gmask = offs_g1d < GROUP_SIZE
+    tl.store(wm_ptr + base_m + offs_g1d, m, mask=gmask)
+    tl.store(wl_ptr + base_m + offs_g1d, l, mask=gmask)
+    base_a = split_idx * (GROUP_SIZE * HEAD_DIM)
+    offs_gd = tl.arange(0, GROUP_SIZE * HEAD_DIM)
+    tl.store(wa_ptr + base_a + offs_gd, acc.reshape(GROUP_SIZE * HEAD_DIM),
+             mask=offs_gd < GROUP_SIZE * HEAD_DIM)
+
+
+@triton.jit
+def _phase2_kernel(
+    wm_ptr, wl_ptr, wa_ptr, out_ptr,
+    stride_o_b, stride_o_h, stride_o_d,
+    GROUP_SIZE: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    NUM_KV_HEADS: tl.constexpr,
+    K_SPLIT: tl.constexpr,
+    num_warps: tl.constexpr = 4,
+):
+    pid_b = tl.program_id(0)
+    pid_kv = tl.program_id(1)
+
+    q_head_start = pid_kv * GROUP_SIZE
+
+    offs_g = tl.arange(0, GROUP_SIZE)[:, None]   # (G, 1)
+    offs_d = tl.arange(0, HEAD_DIM)[None, :]     # (1, D)
+    q_mask = (q_head_start + offs_g) < (pid_kv * GROUP_SIZE + GROUP_SIZE)
+
+    # Merge the K_SPLIT partial (m, l, acc) states with online-softmax reduction.
+    m = tl.full((GROUP_SIZE,), -1e30, dtype=tl.float32)
+    l = tl.zeros((GROUP_SIZE,), dtype=tl.float32)
+    acc = tl.zeros((GROUP_SIZE, HEAD_DIM), dtype=tl.float32)
+
+    offs_g1d = tl.arange(0, GROUP_SIZE)
+    offs_gd = tl.arange(0, GROUP_SIZE * HEAD_DIM)
+    gmask = offs_g1d < GROUP_SIZE
+    gdmask = offs_gd < GROUP_SIZE * HEAD_DIM
+
+    for s in range(K_SPLIT):
+        split_idx = (pid_b * NUM_KV_HEADS + pid_kv) * K_SPLIT + s
+        base_m = split_idx * GROUP_SIZE
+        ms = tl.load(wm_ptr + base_m + offs_g1d, mask=gmask, other=-1e30)
+        ls = tl.load(wl_ptr + base_m + offs_g1d, mask=gmask, other=0.0)
+        base_a = split_idx * (GROUP_SIZE * HEAD_DIM)
+        accs = tl.load(wa_ptr + base_a + offs_gd, mask=gdmask, other=0.0).reshape(GROUP_SIZE, HEAD_DIM)
+
+        new_m = tl.maximum(m, ms)
+        acc = acc * tl.exp(m - new_m)[:, None] + accs * tl.exp(ms - new_m)[:, None]
+        l = l * tl.exp(m - new_m) + ls * tl.exp(ms - new_m)
+        m = new_m
+
+    out = (acc / l[:, None]).to(tl.bfloat16)
+    tl.store(
+        out_ptr + pid_b * stride_o_b + (q_head_start + offs_g) * stride_o_h + offs_d,
+        out,
+        mask=q_mask,
+    )
+
+
+class Model(nn.Module):
+    """Single-query paged attention decode (Triton split-K kernel)."""
+
+    def __init__(
+        self,
+        batch: int,
+        num_heads: int,
+        num_kv_heads: int,
+        head_dim: int,
+        seq_len: int,
+        page_size: int,
+    ):
+        super().__init__()
+        assert num_heads % num_kv_heads == 0, "num_heads must be a multiple of num_kv_heads (GQA)"
+        self.batch = batch
+        self.num_heads = num_heads
+        self.num_kv_heads = num_kv_heads
+        self.head_dim = head_dim
+        self.seq_len = seq_len
+        self.page_size = page_size
+        self.group_size = num_heads // num_kv_heads
+        self.scale = 1.0 / math.sqrt(head_dim)
+
+        self.register_buffer("_dummy", torch.zeros(1, dtype=torch.bfloat16), persistent=False)
+
+    def forward(
+        self,
+        query: torch.Tensor,
+        kv_cache: torch.Tensor,
+        block_table: torch.Tensor,
+        seq_lens: torch.Tensor,
+    ) -> torch.Tensor:
+        B, H, D = query.shape
+        Hkv = self.num_kv_heads
+        G = self.group_size
+        P = self.page_size
+
+        out = torch.empty(B, H, D, dtype=query.dtype, device=query.device)
+        max_blocks = block_table.shape[1]
+
+        # Choose K_SPLIT to land the phase1 grid in the ~256-512 block range so the
+        # GPU stays full for small batches, without oversplitting large ones.
+        base = B * Hkv
+        num_pages = (int(seq_lens.max().item()) + P - 1) // P
+        # Target a grid large enough to saturate the 132 SMs of the H100.
+        # The optimum scales with how register-heavy each block is (G*D), so a
+        # single desired-count heuristic lands near the per-shape optimum across
+        # the whole sweep; the rest of the shapes sit on a flat plateau.
+        desired = 640
+        k_split = max(1, min(num_pages, (desired + base - 1) // base))
+        # Keep the reduction cheap.
+        k_split = min(k_split, 20)
+
+        wm = torch.empty(B, Hkv, k_split, G, dtype=torch.float32, device=query.device)
+        wl = torch.empty(B, Hkv, k_split, G, dtype=torch.float32, device=query.device)
+        wa = torch.empty(B, Hkv, k_split, G, D, dtype=torch.float32, device=query.device)
+
+        grid1 = (B, Hkv, k_split)
+        _phase1_kernel[grid1](
+            query, kv_cache, block_table, seq_lens,
+            wm, wl, wa,
+            query.stride(0), query.stride(1), query.stride(2),
+            kv_cache.stride(0), kv_cache.stride(1), kv_cache.stride(2), kv_cache.stride(3),
+            block_table.stride(0), block_table.stride(1),
+            GROUP_SIZE=G, HEAD_DIM=D, PAGE_SIZE=P, MAX_BLOCKS=max_blocks,
+            NUM_KV_HEADS=Hkv, K_SPLIT=k_split, scale=self.scale,
+        )
+
+        grid2 = (B, Hkv)
+        _phase2_kernel[grid2](
+            wm, wl, wa, out,
+            out.stride(0), out.stride(1), out.stride(2),
+            GROUP_SIZE=G, HEAD_DIM=D, NUM_KV_HEADS=Hkv, K_SPLIT=k_split,
+        )
+        return out
+
+
+def get_inputs():
+    B = BATCH
+    H = NUM_HEADS
+    Hkv = NUM_KV_HEADS
+    D = HEAD_DIM
+    L = SEQ_LEN
+    P = PAGE_SIZE
+
+    pages_per_seq = (L + P - 1) // P
+    total_pages = max(B * pages_per_seq + 8, 64)
+
+    query = torch.randn(B, H, D, dtype=torch.bfloat16) * 0.1
+    kv_cache = torch.randn(total_pages, P, Hkv, 2 * D, dtype=torch.bfloat16) * 0.1
+
+    perm = torch.randperm(total_pages)[: B * pages_per_seq].reshape(B, pages_per_seq).int()
+    block_table = perm.contiguous()
+    seq_lens = torch.full((B,), L, dtype=torch.int32)
+
+    return [query, kv_cache, block_table, seq_lens]
+
+
+def get_init_inputs():
+    return [BATCH, NUM_HEADS, NUM_KV_HEADS, HEAD_DIM, SEQ_LEN, PAGE_SIZE]

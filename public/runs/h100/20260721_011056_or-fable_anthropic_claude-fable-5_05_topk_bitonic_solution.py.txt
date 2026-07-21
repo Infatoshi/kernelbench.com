@@ -1,0 +1,950 @@
+"""Fused single-kernel top-k for small/medium rows on H100 (SM90).
+
+These shapes are all latency-bound (0.5-2 MB inputs). On this system every
+GPU command costs ~3-4 us of front-end processing, so the whole operation is
+exactly ONE kernel launched from a pre-instantiated CUDA graph, and the host
+path is a 2-integer pybind call:
+
+  - grid = (S slices, batch rows). Each CTA loads its slice once (float4,
+    4-deep prefetch), stages order-preserving uint32 keys in shared memory and
+    simultaneously builds a histogram of the top bits (parity-split shared
+    atomics to halve hot-bin contention).
+  - A block scan over the histogram finds the threshold bin. One more pass
+    collects the >bin winners and the ==bin tie candidates; ties are resolved
+    by a warp bitonic sort of the tie group (small) or exact multi-round
+    radix refinement (large). A single warp sorts the k results and writes
+    fp32 values + int64 indices.
+  - If S > 1, slice CTAs write k packed (key<<32|idx) candidates to a
+    workspace, fence (acq_rel), and take an atomic ticket; the last CTA
+    merges. Small merges (S*k <= 128) run in warp 0 alone as one bitonic
+    sort; larger ones keep the whole block and run an adaptive-shift radix
+    select (merge candidates cluster in few high bins, so the histogram
+    shift is derived from min/max of the keys).
+  - k == 1 takes a register/warp-shuffle argmax path (no staging at all).
+
+Host-side: outputs preallocated, launch parameters frozen into a C++-side
+plan holding an instantiated cudaGraphExec (patched only when the input
+pointer changes), custom __call__ bypassing nn.Module hook machinery.
+"""
+import os
+
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+os.environ.setdefault("TORCH_CUDA_ARCH_LIST", "9.0")
+os.environ.setdefault(
+    "TORCH_EXTENSIONS_DIR",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), ".torchext"),
+)
+
+_CUDA_SRC = r"""
+#include <torch/extension.h>
+#include <ATen/cuda/CUDAContext.h>
+#include <cuda_runtime.h>
+#include <vector>
+
+#define DEV_INLINE __device__ __forceinline__
+
+#define TCAP 1024        // tie-candidate buffer entries
+#define WMERGE_MAX 128   // largest S*k handled by the warp-only sort merge
+
+// Order-preserving float -> uint32 transform (descending topk == largest keys).
+DEV_INLINE unsigned fkey(float x) {
+    unsigned u = __float_as_uint(x);
+    return (u & 0x80000000u) ? ~u : (u | 0x80000000u);
+}
+DEV_INLINE float ikey(unsigned k) {
+    return __uint_as_float((k & 0x80000000u) ? (k & 0x7FFFFFFFu) : ~k);
+}
+
+DEV_INLINE void fence_acqrel() {
+    asm volatile("fence.acq_rel.gpu;" ::: "memory");
+}
+
+template <int T>
+struct Smem {
+    unsigned hist[2 * T];
+    unsigned hist2[2 * T];  // parity-split partner for the staging histogram
+    unsigned warpScan[32];
+    unsigned selK[64];
+    unsigned selI[64];
+    unsigned tieK[TCAP];
+    unsigned tieI[TCAP];
+    unsigned minK, maxK;
+    int bBin, bAbove, bTie;
+    int cA, cT, cE;
+    int ticket;
+};
+
+// Block scan over nb bins (top-down suffix): find bin b with
+// count(>b) < need <= count(>=b). Broadcasts {bBin,bAbove,bTie}.
+// nb <= 2*T. Caller must barrier so hist is ready. If SPLIT, bins are
+// hist[i] + hist2[i].
+template <int T, bool SPLIT>
+DEV_INLINE void find_bin(int nb, int need, Smem<T>& s) {
+    const int tid = threadIdx.x;
+    const int C = (nb + T - 1) / T;  // 1 or 2
+    const int hi = nb - 1 - tid * C;
+    unsigned v = 0;
+#pragma unroll
+    for (int c = 0; c < 2; ++c)
+        if (c < C) {
+            int b = hi - c;
+            if (b >= 0) {
+                unsigned h = s.hist[b];
+                if (SPLIT) h += s.hist2[b];
+                if (SPLIT) s.hist[b] = h;  // merge so later reads see totals
+                v += h;
+            }
+        }
+    const unsigned lane = tid & 31, wid = tid >> 5;
+    unsigned p = v;
+#pragma unroll
+    for (int d = 1; d < 32; d <<= 1) {
+        unsigned q = __shfl_up_sync(0xffffffffu, p, d);
+        if (lane >= d) p += q;
+    }
+    if (lane == 31) s.warpScan[wid] = p;
+    __syncthreads();
+    if (wid == 0) {
+        unsigned w = (lane < T / 32) ? s.warpScan[lane] : 0;
+#pragma unroll
+        for (int d = 1; d < 32; d <<= 1) {
+            unsigned q = __shfl_up_sync(0xffffffffu, w, d);
+            if (lane >= d) w += q;
+        }
+        s.warpScan[lane] = w;
+    }
+    __syncthreads();
+    const unsigned incl = p + (wid > 0 ? s.warpScan[wid - 1] : 0);
+    const unsigned excl = incl - v;
+    if (excl < (unsigned)need && (unsigned)need <= incl) {
+        int acc = (int)excl;
+#pragma unroll
+        for (int c = 0; c < 2; ++c) {
+            if (c < C) {
+                int b = hi - c;
+                if (b >= 0) {
+                    int h = (int)s.hist[b];
+                    if (acc + h >= need) { s.bBin = b; s.bAbove = acc; s.bTie = h; break; }
+                    acc += h;
+                }
+            }
+        }
+    }
+    __syncthreads();
+}
+
+// ---- register bitonic sorts on packed (key<<32|idx) u64, one warp ----
+// Element order: e = c*32 + lane. All sorts ascending; callers read from the
+// top ranks. Pure shfl_xor exchanges: no shared memory, no __syncwarp.
+
+DEV_INLINE unsigned long long bsw(unsigned long long v, int stride, bool takeMin) {
+    unsigned long long o = __shfl_xor_sync(0xffffffffu, v, stride);
+    return takeMin ? min(v, o) : max(v, o);
+}
+DEV_INLINE void cswap(unsigned long long& a, unsigned long long& b, bool asc) {
+    unsigned long long mn = min(a, b), mx = max(a, b);
+    a = asc ? mn : mx;
+    b = asc ? mx : mn;
+}
+
+// 32 elements, 1 per lane.
+DEV_INLINE void reg_sort32(unsigned long long& v0) {
+    const int lane = threadIdx.x & 31;
+#pragma unroll
+    for (int size = 2; size <= 16; size <<= 1) {
+#pragma unroll
+        for (int stride = size >> 1; stride > 0; stride >>= 1) {
+            bool lower = (lane & stride) == 0;
+            bool asc = ((lane & size) == 0);
+            v0 = bsw(v0, stride, lower == asc);
+        }
+    }
+#pragma unroll
+    for (int stride = 16; stride > 0; stride >>= 1) {
+        bool lower = (lane & stride) == 0;
+        v0 = bsw(v0, stride, lower);
+    }
+}
+
+// 64 elements, 2 per lane (v0 at e=lane, v1 at e=32+lane).
+DEV_INLINE void reg_sort64(unsigned long long& v0, unsigned long long& v1) {
+    const int lane = threadIdx.x & 31;
+#pragma unroll
+    for (int size = 2; size <= 32; size <<= 1) {
+#pragma unroll
+        for (int stride = size >> 1; stride > 0; stride >>= 1) {
+            bool lower = (lane & stride) == 0;
+            bool asc0 = ((lane & size) == 0);
+            bool asc1 = (size == 32) ? false : asc0;
+            v0 = bsw(v0, stride, lower == asc0);
+            v1 = bsw(v1, stride, lower == asc1);
+        }
+    }
+    cswap(v0, v1, true);  // size = 64, stride = 32
+#pragma unroll
+    for (int stride = 16; stride > 0; stride >>= 1) {
+        bool lower = (lane & stride) == 0;
+        v0 = bsw(v0, stride, lower);
+        v1 = bsw(v1, stride, lower);
+    }
+}
+
+// 128 elements, 4 per lane (v_c at e = c*32 + lane).
+DEV_INLINE void reg_sort128(unsigned long long& v0, unsigned long long& v1,
+                            unsigned long long& v2, unsigned long long& v3) {
+    const int lane = threadIdx.x & 31;
+#pragma unroll
+    for (int size = 2; size <= 128; size <<= 1) {
+#pragma unroll
+        for (int stride = 64; stride > 0; stride >>= 1) {
+            if (stride > (size >> 1)) continue;
+            if (stride == 64) {
+                cswap(v0, v2, true);   // size == 128 only; e&128 == 0 always
+                cswap(v1, v3, true);
+            } else if (stride == 32) {
+                bool ascA = ((lane & size) == 0);          // pair (v0, v1)
+                bool ascB = (((64 + lane) & size) == 0);   // pair (v2, v3)
+                cswap(v0, v1, ascA);
+                cswap(v2, v3, ascB);
+            } else {
+                bool lower = (lane & stride) == 0;
+                bool a0 = (((0 * 32 + lane) & size) == 0);
+                bool a1 = (((1 * 32 + lane) & size) == 0);
+                bool a2 = (((2 * 32 + lane) & size) == 0);
+                bool a3 = (((3 * 32 + lane) & size) == 0);
+                v0 = bsw(v0, stride, lower == a0);
+                v1 = bsw(v1, stride, lower == a1);
+                v2 = bsw(v2, stride, lower == a2);
+                v3 = bsw(v3, stride, lower == a3);
+            }
+        }
+    }
+}
+
+// Full multi-round radix refinement (rare: expensive tie groups). Block-wide.
+// Continues below bit `shiftRem0` given (prefix0, mask0, need0) from the
+// caller's first-round selection. Fills s.selK/selI[0..kk) unordered.
+template <int T>
+DEV_INLINE void radix_fallback(const unsigned* __restrict__ keys,
+                               const unsigned* __restrict__ idxArr,
+                               int m, int kk, int base, unsigned prefix0,
+                               unsigned mask0, int need0, int shiftRem0,
+                               Smem<T>& s) {
+    const int tid = threadIdx.x;
+    constexpr int LOGB = (T == 1024) ? 11 : (T == 512) ? 10 : (T == 256) ? 9 : 8;
+    unsigned prefix = prefix0, mask = mask0;
+    int need = need0;
+    int shiftRem = shiftRem0;
+
+    while (shiftRem > 0) {
+        const int bits = LOGB < shiftRem ? LOGB : shiftRem;
+        const int shift = shiftRem - bits;
+        const int nb = 1 << bits;
+        for (int i = tid; i < nb; i += T) s.hist[i] = 0;
+        __syncthreads();
+        for (int j = tid; j < m; j += T) {
+            unsigned key = keys[j];
+            if ((key & mask) == prefix)
+                atomicAdd(&s.hist[(key >> shift) & (nb - 1)], 1u);
+        }
+        __syncthreads();
+        find_bin<T, false>(nb, need, s);
+        const int b = s.bBin, above = s.bAbove, tie = s.bTie;
+        prefix |= ((unsigned)b) << shift;
+        mask |= ((unsigned)(nb - 1)) << shift;
+        need -= above;
+        shiftRem = shift;
+        __syncthreads();
+        if (need == tie) break;
+    }
+    if (tid == 0) { s.cA = 0; s.cE = 0; }
+    __syncthreads();
+    const int A = kk - need;
+    for (int j = tid; j < m; j += T) {
+        unsigned key = keys[j];
+        unsigned km = key & mask;
+        if (km > prefix) {
+            int p = atomicAdd(&s.cA, 1);
+            s.selK[p] = key; s.selI[p] = idxArr ? idxArr[j] : (unsigned)(base + j);
+        } else if (km == prefix) {
+            int p = atomicAdd(&s.cE, 1);
+            if (p < need) {
+                s.selK[A + p] = key;
+                s.selI[A + p] = idxArr ? idxArr[j] : (unsigned)(base + j);
+            }
+        }
+    }
+    __syncthreads();
+}
+
+// Core select over staged keys[0..m) with bin(key) = (key >> shift) & (NB-1),
+// where all keys agree on bits above shift+LOGB. Caller has the (possibly
+// split) histogram ready + barriered. Fills s.selK/selI[0..kk) unordered;
+// only warp 0 may use the result (block-synced on fallback path).
+template <int T, bool SPLIT>
+DEV_INLINE void select_core(const unsigned* __restrict__ keys,
+                            const unsigned* __restrict__ idxArr,
+                            int m, int kk, int base, int shift,
+                            unsigned commonHigh, Smem<T>& s) {
+    const int tid = threadIdx.x;
+    constexpr int LOGB = (T == 1024) ? 11 : (T == 512) ? 10 : (T == 256) ? 9 : 8;
+    constexpr int NB = 1 << LOGB;
+
+    find_bin<T, SPLIT>(NB, kk, s);
+    const int b = s.bBin, tie = s.bTie;
+    const int need = kk - s.bAbove;
+
+    // Tie groups too big for the warp-local resolvers go through the
+    // block-wide multi-round radix refinement instead (exact either way).
+    if (need != tie && (tie > TCAP || (tie > 64 && need > 4))) {
+        const unsigned mask0 = shift ? ~((1u << shift) - 1u) : 0xffffffffu;
+        const unsigned prefix0 = commonHigh | (((unsigned)b) << shift);
+        radix_fallback<T>(keys, idxArr, m, kk, base, prefix0, mask0, need,
+                          shift, s);
+        return;
+    }
+
+    if (tid == 0) { s.cA = 0; s.cT = 0; }
+    __syncthreads();
+    const int A = kk - need;
+    if (need == tie) {
+        for (int j = tid; j < m; j += T) {
+            unsigned key = keys[j];
+            int bin = (int)((key >> shift) & (NB - 1));
+            if (bin > b) {
+                int p = atomicAdd(&s.cA, 1);
+                s.selK[p] = key; s.selI[p] = idxArr ? idxArr[j] : (unsigned)(base + j);
+            } else if (bin == b) {
+                int p = A + atomicAdd(&s.cT, 1);
+                s.selK[p] = key; s.selI[p] = idxArr ? idxArr[j] : (unsigned)(base + j);
+            }
+        }
+        __syncthreads();
+        return;
+    }
+
+    for (int j = tid; j < m; j += T) {
+        unsigned key = keys[j];
+        int bin = (int)((key >> shift) & (NB - 1));
+        if (bin > b) {
+            int p = atomicAdd(&s.cA, 1);
+            s.selK[p] = key; s.selI[p] = idxArr ? idxArr[j] : (unsigned)(base + j);
+        } else if (bin == b) {
+            int p = atomicAdd(&s.cT, 1);
+            if (p < TCAP) { s.tieK[p] = key; s.tieI[p] = idxArr ? idxArr[j] : (unsigned)(base + j); }
+        }
+    }
+    __syncthreads();
+
+    // warp 0 resolves the tie group
+    if (tid < 32) {
+        const int lane = tid;
+        if (tie <= 64) {
+            // register bitonic sort of the tie group, take top `need`
+            unsigned long long v0 =
+                (lane < tie)
+                    ? (((unsigned long long)s.tieK[lane] << 32) | s.tieI[lane])
+                    : 0ull;
+            if (tie <= 32) {
+                reg_sort32(v0);
+                int r = 31 - lane;
+                if (r < need) {
+                    s.selK[A + r] = (unsigned)(v0 >> 32);
+                    s.selI[A + r] = (unsigned)v0;
+                }
+            } else {
+                unsigned long long v1 =
+                    (lane + 32 < tie)
+                        ? (((unsigned long long)s.tieK[lane + 32] << 32) |
+                           s.tieI[lane + 32])
+                        : 0ull;
+                reg_sort64(v0, v1);
+                int r1 = 31 - lane;
+                if (r1 < need) {
+                    s.selK[A + r1] = (unsigned)(v1 >> 32);
+                    s.selI[A + r1] = (unsigned)v1;
+                }
+                int r0 = 63 - lane;
+                if (r0 < need) {
+                    s.selK[A + r0] = (unsigned)(v0 >> 32);
+                    s.selI[A + r0] = (unsigned)v0;
+                }
+            }
+            __syncwarp();
+        } else {
+            // need <= 4: repeated warp-max over the tie buffer
+            const int tcnt = min(tie, TCAP);  // tie <= TCAP here in practice
+            for (int r = 0; r < need; ++r) {
+                unsigned bk = 0, bj = 0;
+                for (int j = lane; j < tcnt; j += 32) {
+                    unsigned kx = s.tieK[j];
+                    if (kx > bk) { bk = kx; bj = (unsigned)j; }
+                }
+#pragma unroll
+                for (int d = 16; d; d >>= 1) {
+                    unsigned ok = __shfl_down_sync(0xffffffffu, bk, d);
+                    unsigned oj = __shfl_down_sync(0xffffffffu, bj, d);
+                    if (ok > bk) { bk = ok; bj = oj; }
+                }
+                bk = __shfl_sync(0xffffffffu, bk, 0);
+                bj = __shfl_sync(0xffffffffu, bj, 0);
+                if (lane == 0) {
+                    s.selK[A + r] = bk;
+                    s.selI[A + r] = s.tieI[bj];
+                    s.tieK[bj] = 0;  // consume
+                }
+                __syncwarp();
+            }
+        }
+    }
+}
+
+// Warp-0-only: register-sort s.selK/selI[0..k) descending, emit values +
+// int64 indices.
+template <int T>
+DEV_INLINE void emit_sorted(int row, int k, int kp,
+                            float* __restrict__ outV,
+                            long long* __restrict__ outI, Smem<T>& s) {
+    const int lane = threadIdx.x & 31;
+    __syncwarp();
+    unsigned long long v0 =
+        (lane < k) ? (((unsigned long long)s.selK[lane] << 32) | s.selI[lane])
+                   : 0ull;
+    if (k <= 32) {
+        reg_sort32(v0);
+        int t = 31 - lane;
+        if (t < k) {
+            outV[(size_t)row * k + t] = ikey((unsigned)(v0 >> 32));
+            outI[(size_t)row * k + t] = (long long)(unsigned)v0;
+        }
+    } else {
+        unsigned long long v1 =
+            (lane + 32 < k)
+                ? (((unsigned long long)s.selK[lane + 32] << 32) | s.selI[lane + 32])
+                : 0ull;
+        reg_sort64(v0, v1);
+        int t1 = 31 - lane;
+        if (t1 < k) {
+            outV[(size_t)row * k + t1] = ikey((unsigned)(v1 >> 32));
+            outI[(size_t)row * k + t1] = (long long)(unsigned)v1;
+        }
+        int t0 = 63 - lane;
+        if (t0 < k) {
+            outV[(size_t)row * k + t0] = ikey((unsigned)(v0 >> 32));
+            outI[(size_t)row * k + t0] = (long long)(unsigned)v0;
+        }
+    }
+}
+
+template <int T, bool K1>
+__global__ void __launch_bounds__(T, 1) topk_kernel(
+    const float* __restrict__ x, int n, int k, int S, int sliceLen,
+    int stageCap, int kp,
+    float* __restrict__ outV, long long* __restrict__ outI,
+    unsigned long long* __restrict__ wsP, int* __restrict__ counters,
+    int vec4) {
+    extern __shared__ __align__(16) unsigned dyn[];
+    __shared__ Smem<T> s;
+    const int tid = threadIdx.x;
+    const int row = blockIdx.y;
+    const int slice = blockIdx.x;
+    const float* __restrict__ xr = x + (size_t)row * n;
+    const int start = slice * sliceLen;
+    const int m = max(0, min(sliceLen, n - start));
+    const unsigned lane = tid & 31, wid = tid >> 5;
+    unsigned* keys = dyn;
+    const int M = S * k;
+
+    // The benchmark flushes L2 before each call, so the output lines and the
+    // ticket counter would be DRAM round-trips on the critical path at the
+    // end of the kernel. Prefetch them into L2 now (one CTA per row).
+    if (slice == 0 && wid == 0) {
+        const char* pv = (const char*)(outV + (size_t)row * k);
+        const char* pi = (const char*)(outI + (size_t)row * k);
+        const int nv = (k * 4 + 127) / 128;
+        const int ni = (k * 8 + 127) / 128;
+        if ((int)lane < nv)
+            asm volatile("prefetch.global.L2 [%0];" ::"l"(pv + lane * 128));
+        else if ((int)lane - nv < ni)
+            asm volatile("prefetch.global.L2 [%0];" ::"l"(pi + (lane - nv) * 128));
+        if (S > 1 && lane == 31)
+            asm volatile("prefetch.global.L2 [%0];" ::"l"((const char*)&counters[row]));
+    }
+
+    if (K1) {
+        unsigned bk = 0;
+        unsigned bi = (unsigned)start;
+        if (vec4) {
+            const float4* x4 = reinterpret_cast<const float4*>(xr + start);
+            const int m4 = m >> 2;
+            for (int j = tid; j < m4; j += T) {
+                float4 v = x4[j];
+                unsigned k0 = fkey(v.x), k1 = fkey(v.y), k2 = fkey(v.z), k3 = fkey(v.w);
+                unsigned b4 = (unsigned)(start + 4 * j);
+                if (k0 > bk) { bk = k0; bi = b4; }
+                if (k1 > bk) { bk = k1; bi = b4 + 1; }
+                if (k2 > bk) { bk = k2; bi = b4 + 2; }
+                if (k3 > bk) { bk = k3; bi = b4 + 3; }
+            }
+            for (int j = (m & ~3) + tid; j < m; j += T) {
+                unsigned kx = fkey(xr[start + j]);
+                if (kx > bk) { bk = kx; bi = (unsigned)(start + j); }
+            }
+        } else {
+            for (int j = tid; j < m; j += T) {
+                unsigned kx = fkey(xr[start + j]);
+                if (kx > bk) { bk = kx; bi = (unsigned)(start + j); }
+            }
+        }
+#pragma unroll
+        for (int d = 16; d; d >>= 1) {
+            unsigned ok = __shfl_down_sync(0xffffffffu, bk, d);
+            unsigned oi = __shfl_down_sync(0xffffffffu, bi, d);
+            if (ok > bk) { bk = ok; bi = oi; }
+        }
+        if (lane == 0) { s.selK[wid] = bk; s.selI[wid] = bi; }
+        __syncthreads();
+        if (wid != 0) return;
+        bk = (lane < T / 32) ? s.selK[lane] : 0;
+        bi = (lane < T / 32) ? s.selI[lane] : 0;
+#pragma unroll
+        for (int d = 16; d; d >>= 1) {
+            unsigned ok = __shfl_down_sync(0xffffffffu, bk, d);
+            unsigned oi = __shfl_down_sync(0xffffffffu, bi, d);
+            if (ok > bk) { bk = ok; bi = oi; }
+        }
+        if (S == 1) {
+            if (lane == 0) {
+                outV[row] = ikey(bk);
+                outI[row] = (long long)bi;
+            }
+            return;
+        }
+        if (lane == 0)
+            wsP[(size_t)row * S + slice] = ((unsigned long long)bk << 32) | bi;
+        fence_acqrel();
+        __syncwarp();
+        int ticket = 0;
+        if (lane == 0) ticket = atomicAdd(&counters[row], 1);
+        ticket = __shfl_sync(0xffffffffu, ticket, 0);
+        if (ticket != S - 1) return;
+        if (lane == 0) counters[row] = 0;
+        fence_acqrel();
+        unsigned long long best = 0;
+        for (int j = (int)lane; j < S; j += 32)
+            best = max(best, wsP[(size_t)row * S + j]);
+#pragma unroll
+        for (int d = 16; d; d >>= 1)
+            best = max(best, __shfl_down_sync(0xffffffffu, best, d));
+        if (lane == 0) {
+            outV[row] = ikey((unsigned)(best >> 32));
+            outI[row] = (long long)(unsigned)best;
+        }
+        return;
+    }
+
+    // ------- generic k > 1 path -------
+    constexpr int LOGB = (T == 1024) ? 11 : (T == 512) ? 10 : (T == 256) ? 9 : 8;
+    constexpr int SHIFT1 = 32 - LOGB;
+    constexpr int NB = 1 << LOGB;
+
+    // Fused stage + histogram. Prefetch up to 4 float4 before zeroing hist.
+    {
+        const int m4 = vec4 ? (m >> 2) : 0;
+        const float4* x4 = reinterpret_cast<const float4*>(xr + start);
+        uint4* k4 = reinterpret_cast<uint4*>(keys);
+        float4 r0, r1, r2, r3;
+        const bool h0 = vec4 && tid < m4;
+        const bool h1 = vec4 && tid + T < m4;
+        const bool h2 = vec4 && tid + 2 * T < m4;
+        const bool h3 = vec4 && tid + 3 * T < m4;
+        if (h0) r0 = x4[tid];
+        if (h1) r1 = x4[tid + T];
+        if (h2) r2 = x4[tid + 2 * T];
+        if (h3) r3 = x4[tid + 3 * T];
+        for (int i = tid; i < NB; i += T) { s.hist[i] = 0; s.hist2[i] = 0; }
+        if (tid == 0) { s.cA = 0; s.cT = 0; }
+        __syncthreads();
+        unsigned* h = (wid & 1) ? s.hist2 : s.hist;
+#define STAGE4(r, base4)                                                     \
+        {                                                                    \
+            uint4 u;                                                         \
+            u.x = fkey(r.x); u.y = fkey(r.y); u.z = fkey(r.z); u.w = fkey(r.w); \
+            k4[base4] = u;                                                   \
+            atomicAdd(&h[u.x >> SHIFT1], 1u);                                \
+            atomicAdd(&h[u.y >> SHIFT1], 1u);                                \
+            atomicAdd(&h[u.z >> SHIFT1], 1u);                                \
+            atomicAdd(&h[u.w >> SHIFT1], 1u);                                \
+        }
+        if (h0) STAGE4(r0, tid)
+        if (h1) STAGE4(r1, tid + T)
+        if (h2) STAGE4(r2, tid + 2 * T)
+        if (h3) STAGE4(r3, tid + 3 * T)
+        if (vec4) {
+            for (int j = tid + 4 * T; j < m4; j += T) {
+                float4 v = x4[j];
+                STAGE4(v, j)
+            }
+            for (int j = (m & ~3) + tid; j < m; j += T) {
+                unsigned u = fkey(xr[start + j]);
+                keys[j] = u;
+                atomicAdd(&h[u >> SHIFT1], 1u);
+            }
+        } else {
+            for (int j = tid; j < m; j += T) {
+                unsigned u = fkey(xr[start + j]);
+                keys[j] = u;
+                atomicAdd(&h[u >> SHIFT1], 1u);
+            }
+        }
+#undef STAGE4
+        __syncthreads();
+    }
+
+    const int kEff = min(k, m);
+    if (kEff > 0) select_core<T, true>(keys, nullptr, m, kEff, start, SHIFT1, 0u, s);
+
+    const bool blockMerge = (S > 1) && (M > WMERGE_MAX);
+    if (!blockMerge && wid != 0) return;
+
+    if (wid == 0) {
+        // pad [kEff, k) if the slice was shorter than k
+#pragma unroll
+        for (int c = 0; c < 2; ++c) {
+            int t = kEff + (int)lane + 32 * c;
+            if (t < k) { s.selK[t] = 0u; s.selI[t] = 0u; }
+        }
+        __syncwarp();
+    }
+
+    if (S == 1) {
+        emit_sorted<T>(row, k, kp, outV, outI, s);
+        return;
+    }
+
+    if (wid == 0) {
+        // write packed candidates
+#pragma unroll
+        for (int c = 0; c < 2; ++c) {
+            int t = (int)lane + 32 * c;
+            if (t < k) {
+                wsP[((size_t)row * S + slice) * k + t] =
+                    ((unsigned long long)s.selK[t] << 32) | s.selI[t];
+            }
+        }
+        fence_acqrel();
+    }
+
+    if (!blockMerge) {
+        // ---- warp-only ticket + sort merge (M <= 128) ----
+        __syncwarp();
+        int ticket = 0;
+        if (lane == 0) ticket = atomicAdd(&counters[row], 1);
+        ticket = __shfl_sync(0xffffffffu, ticket, 0);
+        if (ticket != S - 1) return;
+        if (lane == 0) counters[row] = 0;
+        fence_acqrel();
+        const unsigned long long* wp = wsP + (size_t)row * M;
+        unsigned long long v0 = (lane < M) ? wp[lane] : 0ull;
+        unsigned long long v1 = (lane + 32 < M) ? wp[lane + 32] : 0ull;
+        if (M <= 64) {
+            reg_sort64(v0, v1);
+            int t1 = 31 - (int)lane;
+            if (t1 < k) {
+                outV[(size_t)row * k + t1] = ikey((unsigned)(v1 >> 32));
+                outI[(size_t)row * k + t1] = (long long)(unsigned)v1;
+            }
+            int t0 = 63 - (int)lane;
+            if (t0 < k) {
+                outV[(size_t)row * k + t0] = ikey((unsigned)(v0 >> 32));
+                outI[(size_t)row * k + t0] = (long long)(unsigned)v0;
+            }
+        } else {
+            unsigned long long v2 = (lane + 64 < M) ? wp[lane + 64] : 0ull;
+            unsigned long long v3 = (lane + 96 < M) ? wp[lane + 96] : 0ull;
+            reg_sort128(v0, v1, v2, v3);
+            int t3 = 31 - (int)lane;
+            if (t3 < k) {
+                outV[(size_t)row * k + t3] = ikey((unsigned)(v3 >> 32));
+                outI[(size_t)row * k + t3] = (long long)(unsigned)v3;
+            }
+            int t2 = 63 - (int)lane;
+            if (t2 < k) {
+                outV[(size_t)row * k + t2] = ikey((unsigned)(v2 >> 32));
+                outI[(size_t)row * k + t2] = (long long)(unsigned)v2;
+            }
+        }
+        return;
+    }
+
+    // ---- block ticket + block adaptive merge (M > 128) ----
+    __syncthreads();  // candidates written (warp0 fenced) before ticket
+    if (tid == 0) s.ticket = atomicAdd(&counters[row], 1);
+    __syncthreads();
+    if (s.ticket != S - 1) return;
+    if (tid == 0) counters[row] = 0;
+    fence_acqrel();
+
+    unsigned* midx = keys + M;  // stageCap >= 2*M guaranteed by host
+    if (tid == 0) { s.minK = 0xffffffffu; s.maxK = 0u; s.cA = 0; s.cT = 0; }
+    for (int i = tid; i < NB; i += T) s.hist[i] = 0;
+    __syncthreads();
+    {
+        unsigned mn = 0xffffffffu, mx = 0u;
+        for (int j = tid; j < M; j += T) {
+            unsigned long long p = wsP[(size_t)row * M + j];
+            unsigned key = (unsigned)(p >> 32);
+            keys[j] = key;
+            midx[j] = (unsigned)p;
+            mn = min(mn, key);
+            mx = max(mx, key);
+        }
+#pragma unroll
+        for (int d = 16; d; d >>= 1) {
+            mn = min(mn, __shfl_down_sync(0xffffffffu, mn, d));
+            mx = max(mx, __shfl_down_sync(0xffffffffu, mx, d));
+        }
+        if (lane == 0) { atomicMin(&s.minK, mn); atomicMax(&s.maxK, mx); }
+        __syncthreads();
+    }
+    const unsigned diff = s.minK ^ s.maxK;
+    const int msb = diff ? (31 - __clz(diff)) : 0;
+    const int shiftM = max(0, msb + 1 - LOGB);
+    const unsigned commonHigh =
+        (shiftM + LOGB >= 32) ? 0u
+                              : (s.minK & ~((1u << (shiftM + LOGB)) - 1u));
+    for (int j = tid; j < M; j += T)
+        atomicAdd(&s.hist[(keys[j] >> shiftM) & (NB - 1)], 1u);
+    __syncthreads();
+    select_core<T, false>(keys, midx, M, k, 0, shiftM, commonHigh, s);
+    if (wid != 0) return;
+    emit_sorted<T>(row, k, kp, outV, outI, s);
+}
+
+// ---------------- host side ----------------
+
+struct Plan {
+    const void* func;
+    dim3 grid, block;
+    size_t dyn;
+    cudaStream_t stream;
+    cudaGraphExec_t exec;
+    cudaGraphNode_t node;
+    cudaGraph_t graph;
+    const float* x;
+    int n, k, S, sliceLen, stageCap, kp;
+    float* outV;
+    long long* outI;
+    unsigned long long* wsP;
+    int* counters;
+    int vec4;
+    void* args[12];
+    void fillArgs() {
+        args[0] = (void*)&x; args[1] = &n; args[2] = &k; args[3] = &S;
+        args[4] = &sliceLen; args[5] = &stageCap; args[6] = &kp;
+        args[7] = (void*)&outV; args[8] = (void*)&outI; args[9] = (void*)&wsP;
+        args[10] = (void*)&counters; args[11] = &vec4;
+    }
+    cudaKernelNodeParams nodeParams() {
+        cudaKernelNodeParams np = {};
+        np.func = (void*)func;
+        np.gridDim = grid;
+        np.blockDim = block;
+        np.sharedMemBytes = (unsigned)dyn;
+        np.kernelParams = args;
+        return np;
+    }
+};
+static std::vector<Plan*> g_plans;
+
+template <int T, bool K1>
+static const void* kfunc() {
+    return (const void*)&topk_kernel<T, K1>;
+}
+
+void setup(int64_t dynBytes) {
+    static int done = 0;
+    int b = (int)dynBytes;
+    if (b <= done) return;
+    done = b;
+#define SETA(T, K1) \
+    cudaFuncSetAttribute(kfunc<T, K1>(), cudaFuncAttributeMaxDynamicSharedMemorySize, b);
+    SETA(128, false) SETA(256, false) SETA(512, false) SETA(1024, false)
+    SETA(128, true) SETA(256, true) SETA(512, true) SETA(1024, true)
+#undef SETA
+}
+
+int64_t make_plan(int64_t vp, int64_t ip, int64_t wp, int64_t cp, int64_t batch,
+                  int64_t n, int64_t k, int64_t S, int64_t sliceLen,
+                  int64_t stageCap, int64_t kp, int64_t threads,
+                  int64_t dynBytes, int64_t vec4) {
+    Plan* p = new Plan();
+    const bool k1 = (k == 1);
+    switch ((int)threads) {
+        case 128: p->func = k1 ? kfunc<128, true>() : kfunc<128, false>(); break;
+        case 256: p->func = k1 ? kfunc<256, true>() : kfunc<256, false>(); break;
+        case 512: p->func = k1 ? kfunc<512, true>() : kfunc<512, false>(); break;
+        default: p->func = k1 ? kfunc<1024, true>() : kfunc<1024, false>(); break;
+    }
+    p->grid = dim3((unsigned)S, (unsigned)batch);
+    p->block = dim3((unsigned)threads);
+    p->dyn = (size_t)dynBytes;
+    p->stream = at::cuda::getCurrentCUDAStream();
+    p->x = nullptr;
+    p->n = (int)n; p->k = (int)k; p->S = (int)S; p->sliceLen = (int)sliceLen;
+    p->stageCap = (int)stageCap; p->kp = (int)kp;
+    p->outV = (float*)vp; p->outI = (long long*)ip;
+    p->wsP = (unsigned long long*)wp;
+    p->counters = (int*)cp;
+    p->vec4 = (int)vec4;
+    p->fillArgs();
+
+    cudaGraphCreate(&p->graph, 0);
+    cudaKernelNodeParams np = p->nodeParams();
+    cudaGraphAddKernelNode(&p->node, p->graph, nullptr, 0, &np);
+    cudaGraphInstantiate(&p->exec, p->graph, 0);
+    cudaGraphUpload(p->exec, p->stream);
+
+    g_plans.push_back(p);
+    return (int64_t)(g_plans.size() - 1);
+}
+
+void run(int64_t plan, int64_t xp) {
+    Plan* p = g_plans[plan];
+    if ((const float*)xp != p->x) {
+        p->x = (const float*)xp;
+        cudaKernelNodeParams np = p->nodeParams();
+        cudaGraphExecKernelNodeSetParams(p->exec, p->node, &np);
+        cudaGraphUpload(p->exec, p->stream);
+    }
+    cudaGraphLaunch(p->exec, p->stream);
+}
+"""
+
+_CPP_SRC = r"""
+#include <cstdint>
+void setup(int64_t dynBytes);
+int64_t make_plan(int64_t vp, int64_t ip, int64_t wp, int64_t cp, int64_t batch,
+                  int64_t n, int64_t k, int64_t S, int64_t sliceLen,
+                  int64_t stageCap, int64_t kp, int64_t threads,
+                  int64_t dynBytes, int64_t vec4);
+void run(int64_t plan, int64_t xp);
+"""
+
+_ext = load_inline(
+    name="topk_fused_v11",
+    cpp_sources=_CPP_SRC,
+    cuda_sources=_CUDA_SRC,
+    functions=["run", "setup", "make_plan"],
+    extra_cuda_cflags=["-O3", "--use_fast_math"],
+    verbose=False,
+)
+_run = _ext.run
+
+# Tuned per-benchmark-shape configs: (batch, n, k) -> (threads, S)
+_TABLE = {
+    (1, 131072, 64): (512, 32),
+    (64, 8192, 8): (1024, 1),
+    (32, 16384, 32): (1024, 1),
+    (16, 12000, 16): (1024, 1),
+    (128, 4096, 1): (256, 1),
+}
+
+
+def _pick(batch: int, n: int, k: int):
+    if (batch, n, k) in _TABLE:
+        return _TABLE[(batch, n, k)]
+    S = 1
+    while (n + S - 1) // S > 16384:
+        S *= 2
+    while (
+        batch * S < 114
+        and S * 2 * k <= 2048
+        and (n + 2 * S - 1) // (2 * S) >= max(64, k)
+        and S < 64
+    ):
+        S *= 2
+    assert S * k <= 2048, "unsupported shape (n too large for this k)"
+    slice_len = (n + S - 1) // S
+    threads = 1024 if slice_len >= 4096 else (512 if slice_len >= 2048 else 256)
+    if k == 1:
+        threads = 256
+    return threads, S
+
+
+class Model(nn.Module):
+    def __init__(self, batch: int, n: int, k: int):
+        super().__init__()
+        self.batch, self.n, self.k = batch, n, k
+        self.register_buffer("_dummy", torch.zeros(1))
+        assert k <= 64, "kernel supports k <= 64"
+
+        threads, S = _pick(batch, n, k)
+        slice_len = (n + S - 1) // S
+        slice_len = (slice_len + 3) & ~3  # pad for uint4 staging
+        kp = 1 if k == 1 else 1 << (k - 1).bit_length()
+        vec4 = 1 if (n % 4 == 0 and slice_len % 4 == 0) else 0
+
+        dev = torch.device("cuda")
+        self._vals = torch.empty(batch, k, dtype=torch.float32, device=dev)
+        self._idx = torch.empty(batch, k, dtype=torch.int64, device=dev)
+
+        M = S * k
+        if S > 1:
+            self._ws = torch.empty(batch * M, dtype=torch.int64, device=dev)
+            self._cnt = torch.zeros(batch, dtype=torch.int32, device=dev)
+            wp, cp = self._ws.data_ptr(), self._cnt.data_ptr()
+        else:
+            wp = cp = 0
+
+        if k == 1:
+            stage_cap = 0
+            dyn_bytes = 0
+        else:
+            # dyn is reused: uint keys[stage_cap] for slices; u64 stage[M]
+            # (warp merge) or uint keys[M] + midx[M] (block merge).
+            stage_cap = max(slice_len, 2 * M)
+            dyn_bytes = stage_cap * 4
+        _ext.setup(dyn_bytes)
+
+        self._plan = _ext.make_plan(
+            self._vals.data_ptr(),
+            self._idx.data_ptr(),
+            wp,
+            cp,
+            batch,
+            n,
+            k,
+            S,
+            slice_len,
+            stage_cap,
+            kp,
+            threads,
+            dyn_bytes,
+            vec4,
+        )
+        self._ret = (self._vals, self._idx)
+
+    def forward(self, x):
+        _run(self._plan, x.data_ptr())
+        return self._ret
+
+    __call__ = forward
+
+
+# Module-level shims rebuilt by check.py / benchmark.py per shape.
+batch = 64
+n = 8192
+k = 8
+
+
+def get_inputs():
+    x = torch.randn(batch, n, dtype=torch.float32)
+    return [x]
+
+
+def get_init_inputs():
+    return [batch, n, k]

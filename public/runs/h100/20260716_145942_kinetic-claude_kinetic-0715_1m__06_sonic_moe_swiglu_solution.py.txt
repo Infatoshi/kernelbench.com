@@ -1,0 +1,1127 @@
+"""Grouped GEMM + fused SwiGLU for top-K MoE up-projection (SM90/H100).
+
+Per expert e: out[start:end] = silu(x_e @ W_gate[e]) * (x_e @ W_up[e])
+given x rows [offsets[e]:offsets[e+1]] of the permuted hidden states.
+
+Design (CUTLASS 3.x, SM90):
+  * Weights are packed once (cached, version-checked) as W_pack[e] = (H, 2I)
+    with column pairs (2j, 2j+1) = (W_gate[:, j], W_up[:, j]).
+  * A grouped cooperative warp-specialized kernel (TMA multicast loads +
+    WGMMA) computes C_e = x_e @ W_pack[e] with variable M_e per expert read
+    from on-device problem shapes (no host sync on expert_offsets).
+  * A custom collective epilogue fuses SwiGLU: out[m, j] =
+    silu(C[m, 2j]) * C[m, 2j+1] -- the paired columns sit in the same WGMMA
+    accumulator thread -- and writes full tiles via swizzled smem + TMA store.
+    Non-full (expert-boundary) tiles use predicated direct global stores, so
+    arbitrary/imbalanced routing incl. empty experts is handled. Between timed
+    calls nothing is reused: problem shapes/pointer arrays are rebuilt on
+    device by a prep kernel on every invocation.
+
+Fallback: a Triton grouped-GEMM kernel with dual gate/up accumulators is used
+if the CUDA extension cannot be built (e.g. missing CUTLASS headers).
+"""
+from __future__ import annotations
+
+import os
+
+import torch
+import torch.nn as nn
+
+OP_TYPE = "grouped_gemm_swiglu"
+SUPPORTED_PRECISIONS = ["bf16"]
+HARDWARE_REQUIRED = ["H100"]
+
+_HERE = os.path.dirname(os.path.abspath(__file__))
+
+_CUDA_SRC = r'''
+// Grouped GEMM + fused SwiGLU epilogue for top-K MoE up-projection (SM90/H100).
+// Store variants: MOE_STORE_U32 uses __stcs (evict-first streaming) u32 stores.
+#if defined(MOE_STCS)
+#define MOE_STG32(ptr, val) __stcs(reinterpret_cast<uint32_t*>(ptr), (val))
+#else
+#define MOE_STG32(ptr, val) *reinterpret_cast<uint32_t*>(ptr) = (val)
+#endif
+
+
+//
+//   per expert e: out[s_e:t_e, :] = silu(x[s_e:t_e] @ W_gate[e]) * (x[s_e:t_e] @ W_up[e])
+//
+// Design:
+//  * Weights are packed once on the host side as W_pack[e] (H, 2I) with column
+//    pairs (2j, 2j+1) = (W_gate[:, j], W_up[:, j]).
+//  * A CUTLASS 3.x grouped cooperative warp-specialized kernel computes
+//    C (M_e, 2I) per expert; a custom collective epilogue applies
+//    out[m, j] = silu(C[m, 2j]) * C[m, 2j+1].
+//  * The D TMA descriptor spans the whole output tensor; per-group row bases
+//    come from expert_offsets read on device. Full tiles go out through a
+//    swizzled smem stage + TMA store; partial (expert-boundary) tiles fall
+//    back to predicated direct global stores of the same fragment values.
+//  * Problem shapes / pointer + stride arrays are built on device each call
+//    by a tiny prep kernel (no host sync on expert_offsets).
+
+
+
+#include <torch/extension.h>
+#include <ATen/cuda/CUDAContext.h>
+#include <cuda_runtime.h>
+
+#include "cutlass/cutlass.h"
+#include "cute/tensor.hpp"
+#include "cutlass/gemm/dispatch_policy.hpp"
+#include "cutlass/gemm/group_array_problem_shape.hpp"
+#include "cutlass/gemm/collective/collective_builder.hpp"
+#include "cutlass/gemm/device/gemm_universal_adapter.h"
+#include "cutlass/gemm/kernel/gemm_universal.hpp"
+#include "cutlass/epilogue/dispatch_policy.hpp"
+#include "cutlass/epilogue/collective/detail.hpp"
+#include "cutlass/epilogue/thread/linear_combination.h"
+#include "cutlass/pipeline/pipeline.hpp"
+#include "cutlass/fast_math.h"
+#include "cutlass/util/packed_stride.hpp"
+
+namespace moe {
+
+using namespace cute;
+torch::Tensor& dbg_tensor();
+
+using ProblemShape = cutlass::gemm::GroupProblemShape<Shape<int, int, int>>;
+using ElementA = cutlass::bfloat16_t;
+using ElementB = cutlass::bfloat16_t;
+using ElementD = cutlass::bfloat16_t;
+using ElementAccumulator = float;
+using LayoutA = cutlass::layout::RowMajor;
+using LayoutB = cutlass::layout::RowMajor;  // B (N, K) row-major == packed (K,N) row-major memory
+using LayoutD = cutlass::layout::RowMajor;
+
+constexpr int AlignmentA = 128 / cutlass::sizeof_bits<ElementA>::value;
+constexpr int AlignmentB = 128 / cutlass::sizeof_bits<ElementB>::value;
+constexpr int AlignmentD = 128 / cutlass::sizeof_bits<ElementD>::value;
+
+///////////////////////////////////////////////////////////////////////////////
+// Custom collective epilogue: SwiGLU over adjacent packed columns + TMA store.
+///////////////////////////////////////////////////////////////////////////////
+
+template <
+    class CtaTileMNK_,     // full mainloop CTA tile (M, N_packed, K)
+    class EpilogueTile_,   // epilogue subtile in OUTPUT units (EPI_M, EPI_N)
+    int StagesD_,
+    class SmemLayoutAtomD_,
+    bool NoopEpi_ = false,
+    bool UseTma_ = false>
+struct SwiGLUGroupedEpilogue {
+  static constexpr bool NoopEpi = NoopEpi_;
+  static constexpr bool UseTma = UseTma_;
+  using CtaTileMNK = CtaTileMNK_;
+  using EpilogueTile = EpilogueTile_;
+  using SmemLayoutAtomD = SmemLayoutAtomD_;
+  using ElementC = moe::ElementD;  // source C unused (beta=0), kept non-void for adapter traits
+  // Dummy rank-3 C strides (kernel static_asserts rank==3).
+  using StrideC = cute::Stride<int64_t, cute::Int<1>, int64_t>;
+  using InternalStrideC = StrideC;
+  using ElementD = moe::ElementD;
+  // D is row-major (M, N): stride (N, 1, 0)
+  using StrideD = cute::Stride<int64_t, cute::Int<1>, int64_t>;
+  using InternalStrideD = StrideD;
+
+  struct DispatchPolicy {
+    static constexpr int StagesD = StagesD_;
+  };
+  static constexpr int NumEpilogueWarpGroups = 2;
+  using ThreadEpilogueOp = cutlass::epilogue::thread::LinearCombination<
+      ElementD, 8, ElementAccumulator, ElementAccumulator>;
+  using GmemTiledCopyC = SM90_TMA_LOAD;
+  using GmemTiledCopyD = SM90_TMA_STORE;
+
+  static constexpr int StagesC = 1;
+  static constexpr int StagesD = StagesD_;
+
+  static constexpr int CTA_M = cute::size<0>(CtaTileMNK{});
+  static constexpr int CTA_N_PACKED = cute::size<1>(CtaTileMNK{});
+  static constexpr int CTA_N_OUT = CTA_N_PACKED / 2;
+
+  using OutTileMN = Shape<Int<CTA_M>, Int<CTA_N_OUT>>;
+
+  using SmemLayoutD = decltype(cute::tile_to_shape(
+      SmemLayoutAtomD{},
+      cute::make_shape(cute::size<0>(EpilogueTile{}), cute::size<1>(EpilogueTile{}), cute::Int<StagesD>{}),
+      cute::Step<cute::_1, cute::_2, cute::_3>{}));
+
+  constexpr static size_t SmemAlignmentD = cutlass::detail::alignment_for_swizzle(SmemLayoutD{});
+
+  struct TensorStorage {
+    alignas(SmemAlignmentD) cute::ArrayEngine<ElementD, cute::cosize_v<SmemLayoutD>> smem_D;
+  };
+  struct TensorMapStorage : cute::aligned_struct<128, _0> {};
+
+  using LoadPipeline = cutlass::PipelineTransactionAsync<StagesC>;
+  using LoadPipelineState = cutlass::PipelineState<StagesC>;
+  static constexpr bool RequiresTransactionBytes = false;
+  using StorePipeline = cutlass::PipelineTmaStore<StagesD>;
+  using StorePipelineState = cutlass::PipelineState<StagesD>;
+
+  using PipelineStorage = typename LoadPipeline::SharedStorage;
+
+  struct SharedStorage {
+    TensorStorage tensors;
+    PipelineStorage pipeline;
+  };
+
+  // Host-side arguments.
+  struct Arguments {
+    ElementD* ptr_D = nullptr;                // global output base (T_perm, I)
+    int64_t stride_d_m = 0;                   // = I
+    int32_t const* expert_offsets = nullptr;  // device (E+1,)
+    int m_total = 0;                          // T_perm rows
+    int i_out = 0;                            // output columns I
+    unsigned long long* dbg = nullptr;        // optional timing counters
+  };
+
+  struct Params {
+    using TMA_D = decltype(cute::make_tma_copy(
+        SM90_TMA_STORE{},
+        cute::make_tensor(
+            cute::make_gmem_ptr(static_cast<ElementD*>(nullptr)),
+            cute::make_layout(cute::make_shape(int32_t(0), int32_t(0), cute::Int<1>{}),
+                              cute::make_stride(int64_t(0), cute::Int<1>{}, int64_t(0)))),
+        cute::take<0, 2>(SmemLayoutD{}),
+        EpilogueTile{},
+        cute::_1{}));
+
+    TMA_D tma_store_d;
+    ElementD* ptr_D = nullptr;
+    int32_t const* expert_offsets = nullptr;
+    int m_total = 0;
+    int i_out = 0;
+    unsigned long long* dbg = nullptr;
+  };
+
+  template <class ProblemShape_>
+  static constexpr Params to_underlying_arguments(
+      ProblemShape_ const& problem_shape, Arguments const& args, void* /*workspace*/) {
+    auto tensor_d = cute::make_tensor(
+        cute::make_gmem_ptr(args.ptr_D),
+        cute::make_layout(cute::make_shape(args.m_total, args.i_out, cute::Int<1>{}),
+                          cute::make_stride(int64_t(args.stride_d_m), cute::Int<1>{}, int64_t(0))));
+    auto tma_store_d = cute::make_tma_copy(
+        SM90_TMA_STORE{},
+        tensor_d,
+        cute::take<0, 2>(SmemLayoutD{}),
+        EpilogueTile{},
+        cute::_1{});
+    return {tma_store_d, args.ptr_D, args.expert_offsets, args.m_total, args.i_out, args.dbg};
+  }
+
+  template <class ProblemShape_>
+  static size_t get_workspace_size(ProblemShape_ const&, Arguments const&, int /*sm_count*/) {
+    return 0;
+  }
+
+  template <class ProblemShape_>
+  static cutlass::Status initialize_workspace(
+      ProblemShape_ const&, Arguments const&, void*, cudaStream_t,
+      cutlass::CudaHostAdapter* = nullptr) {
+    return cutlass::Status::kSuccess;
+  }
+
+  template <class ProblemShape_>
+  static bool can_implement(ProblemShape_ const&, Arguments const&) {
+    return true;
+  }
+
+  template <class TileShapeMNK>
+  CUTLASS_HOST_DEVICE static constexpr int get_load_pipe_increment(TileShapeMNK) {
+    return (CTA_M / cute::size<0>(EpilogueTile{})) * (CTA_N_OUT / cute::size<1>(EpilogueTile{}));
+  }
+
+  template <class TileShapeMNK>
+  CUTLASS_HOST_DEVICE static constexpr int get_store_pipe_increment(TileShapeMNK tile) {
+    return get_load_pipe_increment(tile);
+  }
+
+  Params const& params;
+
+  CUTLASS_HOST_DEVICE
+  SwiGLUGroupedEpilogue(Params const& params_, TensorStorage& /*shared_tensors*/) : params(params_) {}
+
+  CUTLASS_DEVICE
+  bool is_producer_load_needed() const { return false; }
+
+  // ---- no-op tensormap machinery (D descriptor is global/static) ----
+  CUTLASS_DEVICE auto
+  load_init(Params const&, TensorMapStorage&, int32_t, int32_t) {
+    return cute::make_tuple(static_cast<cute::TmaDescriptor const*>(nullptr));
+  }
+  CUTLASS_DEVICE auto
+  store_init(Params const&, TensorMapStorage&, int32_t, int32_t, int) {
+    return cute::make_tuple(static_cast<cute::TmaDescriptor const*>(nullptr));
+  }
+  template <bool IsEpiLoad, class TensorMap_, class PS_>
+  CUTLASS_DEVICE void
+  tensormaps_perform_update(TensorMapStorage&, Params const&, TensorMap_ const&, PS_, int32_t, int) {}
+  template <bool IsEpiLoad, class TensorMap_>
+  CUTLASS_DEVICE void
+  tensormaps_cp_fence_release(TensorMapStorage&, TensorMap_ const&, int) {}
+  template <bool IsEpiLoad, class TensorMap_>
+  CUTLASS_DEVICE void
+  tensormaps_fence_acquire(TensorMap_ const&) {}
+
+  CUTLASS_DEVICE auto load(LoadPipeline, LoadPipelineState s, auto&&...) { return s; }
+  CUTLASS_DEVICE auto load_tail(LoadPipeline, LoadPipelineState s) { return s; }
+
+  // ---- the actual epilogue ----
+  template <
+      class ProblemShapeMNKL,
+      class TileShapeMNK,
+      class TileCoordMNKL,
+      class AccEngine, class AccLayout,
+      class TiledMma>
+  CUTLASS_DEVICE auto
+  store(LoadPipeline /*load_pipeline*/,
+        LoadPipelineState load_pipe_consumer_state,
+        StorePipeline store_pipeline,
+        StorePipelineState store_pipe_producer_state,
+        ProblemShapeMNKL problem_shape_mnkl,
+        TileShapeMNK /*tile_shape_MNK*/,
+        TileCoordMNKL tile_coord_mnkl,
+        cute::Tensor<AccEngine, AccLayout> accumulators,
+        TiledMma tiled_mma,
+        int thread_idx,
+        TensorStorage& shared_tensors,
+        cute::TmaDescriptor const* /*store_tensormap*/,
+        int /*subtile_idx*/ = -1) {
+    using namespace cute;
+
+    if constexpr (NoopEpi) {
+      float acc_sink = 0.f;
+      CUTLASS_PRAGMA_UNROLL
+      for (int i = 0; i < cute::size(accumulators); ++i) acc_sink += accumulators(i);
+      if (thread_idx == 1025) params.ptr_D[0] = static_cast<ElementD>(acc_sink);
+      return cute::make_tuple(load_pipe_consumer_state, store_pipe_producer_state);
+    }
+    auto [M, N_p, K, L] = problem_shape_mnkl;
+    auto [m_coord, n_coord, k_coord, l_coord] = tile_coord_mnkl;
+#ifdef MOE_TIME_DEBUG
+    unsigned long long t_epi0 = (thread_idx == 0) ? clock64() : 0ull;
+#endif
+#ifdef MOE_TIME_DEBUG
+    auto dbg_close = [&]() {
+      if (thread_idx == 0 && params.dbg != nullptr) {
+        atomicAdd(params.dbg + 1, (unsigned long long)(clock64() - t_epi0));
+        atomicAdd(params.dbg + 2, 1ull);
+      }
+    };
+#else
+    auto dbg_close = [&]() {};
+#endif
+
+    int const I_out = params.i_out;
+    int const row_base = __ldg(&params.expert_offsets[l_coord]);
+    int const rows_here = M - m_coord * CTA_M;  // rows of this expert in the tile's span
+    int const n0_out = n_coord * CTA_N_OUT;
+    bool tile_full = (rows_here >= CTA_M) && (n0_out + CTA_N_OUT <= I_out);
+#ifdef MOE_FORCE_DIRECT_STORE
+    tile_full = false;
+#endif
+#ifdef MOE_EPILOGUE_MATH_ONLY
+    float acc_sink = 0.f;
+    CUTLASS_PRAGMA_UNROLL
+    for (int i = 0; i < cute::size(accumulators); i += 2)
+      acc_sink += swiglu(accumulators(i), accumulators(i+1));
+    if (thread_idx == 1025) params.ptr_D[0] = static_cast<ElementD>(acc_sink);
+    return cute::make_tuple(load_pipe_consumer_state, store_pipe_producer_state);
+#endif
+
+    // Per-value coordinates on the packed (CTA_M, CTA_N_packed) tile.
+    Tensor cPacked = cute::make_identity_tensor(
+        cute::make_shape(Int<CTA_M>{}, Int<CTA_N_PACKED>{}));
+    auto thread_mma = tiled_mma.get_thread_slice(thread_idx);
+    Tensor tCcD = thread_mma.partition_C(cPacked);  // (V, MMA_M, MMA_N) -> (m, p)
+
+    constexpr int kEPI_M = cute::size<0>(EpilogueTile{});
+    constexpr int kEPI_N = cute::size<1>(EpilogueTile{});
+    constexpr int kSubM = CTA_M / kEPI_M;
+    constexpr int kSubN = CTA_N_OUT / kEPI_N;
+
+    auto synchronize = [&]() {
+      cutlass::arch::NamedBarrier::sync(cute::size(TiledMma{}),
+                                        cutlass::arch::ReservedNamedBarriers::EpilogueBarrier);
+    };
+    bool const issue_tma_store = (thread_idx / cutlass::NumThreadsPerWarp) == 0;
+
+    if constexpr (!UseTma) {
+    if constexpr (cute::size(TiledMma{}) != 256 || CTA_M != 128) {
+      // generic fallback: per-value coordinates version.
+      if (tile_full) {
+        Tensor cPacked0 = cute::make_identity_tensor(
+            cute::make_shape(Int<CTA_M>{}, Int<CTA_N_PACKED>{}));
+        auto thread_mma = tiled_mma.get_thread_slice(thread_idx);
+        Tensor tCcD0 = thread_mma.partition_C(cPacked0);
+        ElementD* __restrict__ dbase = params.ptr_D + int64_t(n0_out);
+        CUTLASS_PRAGMA_UNROLL
+        for (int b2 = 0; b2 < cute::size(accumulators); b2 += 8) {
+          CUTLASS_PRAGMA_UNROLL
+          for (int half = 0; half < 4; half += 2) {
+            int iA = b2 + half;
+            int iB = b2 + half + 4;
+            float o0 = swiglu(accumulators(iA), accumulators(iA + 1));
+            float o1 = swiglu(accumulators(iB), accumulators(iB + 1));
+            auto coord = tCcD0(iA);
+            int m = cute::get<0>(coord);
+            int p = cute::get<1>(coord);
+            int off16 = p & 15;
+            int j = (p & ~15) / 2 + (off16 < 8 ? off16 : off16 - 7);
+            ElementD lo = static_cast<ElementD>(o0);
+            ElementD hi = static_cast<ElementD>(o1);
+            uint32_t val = (uint32_t(reinterpret_cast<uint16_t&>(lo)) |
+                            (uint32_t(reinterpret_cast<uint16_t&>(hi)) << 16));
+            int64_t gm = int64_t(row_base) + int64_t(m_coord) * CTA_M + m;
+            MOE_STG32(dbase + gm * params.i_out + j, val);
+          }
+        }
+        dbg_close();
+      return cute::make_tuple(load_pipe_consumer_state, store_pipe_producer_state);
+      }
+    } else if (tile_full) {
+      // Merged u32 stores with analytic fragment addressing (no cute layout
+      // objects in the hot loop; accumulators are adressed directly).
+      // acc linear index: i = v0 + 2*v1 + 4*v2; per 8-col atom groups.
+      static_assert(CTA_N_PACKED % 16 == 0, "packed N must be multiple of 16");
+      ElementD* __restrict__ dbase = params.ptr_D + int64_t(n0_out);
+      int const a = thread_idx & 3;
+      int const b = (thread_idx >> 2) & 7;
+      int const w4 = (thread_idx >> 5) & 3;
+      int const wg = thread_idx >> 7;
+      constexpr int kV2 = CTA_N_PACKED / 8;
+      int64_t const gm_base = int64_t(row_base) + int64_t(m_coord) * CTA_M;
+      CUTLASS_PRAGMA_UNROLL
+      for (int v1 = 0; v1 < 2; ++v1) {
+        int const m = b + 16 * w4 + 8 * v1 + 64 * wg;
+        ElementD* __restrict__ drow = dbase + (gm_base + m) * params.i_out;
+        CUTLASS_PRAGMA_UNROLL
+        for (int v2 = 0; v2 < kV2; v2 += 2) {
+          int const iA = 2 * v1 + 4 * v2;
+          int const iB = iA + 4;
+          float const o0 = swiglu(accumulators(iA), accumulators(iA + 1));
+          float const o1 = swiglu(accumulators(iB), accumulators(iB + 1));
+          int const p = 2 * a + 8 * v2;  // even packed col of pair A
+          int const off16 = p & 15;
+          int const j = (p & ~15) / 2 + (off16 < 8 ? off16 : off16 - 7);
+          ElementD lo = static_cast<ElementD>(o0);
+          ElementD hi = static_cast<ElementD>(o1);
+          uint32_t const val = (uint32_t(reinterpret_cast<uint16_t&>(lo)) |
+                                (uint32_t(reinterpret_cast<uint16_t&>(hi)) << 16));
+          MOE_STG32(drow + j, val);
+        }
+      }
+      dbg_close();
+      return cute::make_tuple(load_pipe_consumer_state, store_pipe_producer_state);
+    }
+    }
+    if constexpr (UseTma) {
+    if (tile_full) {
+      // u32-pair staging to swizzled smem, then bulk TMA store.
+      static_assert(kEPI_M == CTA_M, "UseTma arm expects full-row epilogue tiles");
+      Tensor mD = params.tma_store_d.get_tma_tensor(
+          cute::make_shape(params.m_total, I_out, cute::Int<1>{}));   // (M, N, L)
+      Tensor mD_off = cute::domain_offset(cute::make_coord(row_base, 0, 0), mD);
+
+      Tensor sD_epi = cute::as_position_independent_swizzle_tensor(
+          cute::make_tensor(cute::make_smem_ptr(shared_tensors.smem_D.begin()),
+                            SmemLayoutD{}));  // (EPI_M,EPI_N,PIPE)
+
+      ThrCopy thrblk_s2g = params.tma_store_d.get_slice(Int<0>{});
+      Tensor bSG_sD = thrblk_s2g.partition_S(sD_epi);
+
+      int const a = thread_idx & 3;
+      int const b = (thread_idx >> 2) & 7;
+      int const w4 = (thread_idx >> 5) & 3;
+      int const wg = thread_idx >> 7;
+      constexpr int kV2 = CTA_N_PACKED / 8;
+
+      CUTLASS_PRAGMA_UNROLL
+      for (int en = 0; en < kSubN; ++en) {
+        CUTLASS_PRAGMA_UNROLL
+        for (int em = 0; em < kSubM; ++em) {
+          Tensor gD_tile = cute::local_tile(
+              mD_off, EpilogueTile{},
+              cute::make_coord(m_coord * kSubM + em, n_coord * kSubN + en, 0));
+          Tensor bSG_gD = thrblk_s2g.partition_D(gD_tile);
+
+          CUTLASS_PRAGMA_UNROLL
+          for (int v1 = 0; v1 < 2; ++v1) {
+            int const m0 = b + 16 * w4 + 8 * v1 + 64 * wg;
+            if (m0 / kEPI_M != em) continue;
+            CUTLASS_PRAGMA_UNROLL
+            for (int v2 = 0; v2 < kV2; v2 += 2) {
+              int const iA = 2 * v1 + 4 * v2;
+              int const iB = iA + 4;
+              float const o0 = swiglu(accumulators(iA), accumulators(iA + 1));
+              float const o1 = swiglu(accumulators(iB), accumulators(iB + 1));
+              int const p = 2 * a + 8 * v2;
+              int const off16 = p & 15;
+              int const j = (p & ~15) / 2 + (off16 < 8 ? off16 : off16 - 7);
+              if (j / kEPI_N != en) continue;
+              ElementD lo = static_cast<ElementD>(o0);
+              ElementD hi = static_cast<ElementD>(o1);
+              uint32_t const val = (uint32_t(reinterpret_cast<uint16_t&>(lo)) |
+                                    (uint32_t(reinterpret_cast<uint16_t&>(hi)) << 16));
+              *reinterpret_cast<uint32_t*>(
+                  &sD_epi(m0 - em * kEPI_M, j - en * kEPI_N, store_pipe_producer_state.index())) = val;
+            }
+          }
+          cutlass::arch::fence_view_async_shared();
+          synchronize();
+          if (issue_tma_store) {
+            copy(params.tma_store_d,
+                 bSG_sD(_, _, _, store_pipe_producer_state.index()),
+                 bSG_gD);
+            store_pipeline.producer_commit(store_pipe_producer_state);
+            store_pipeline.producer_acquire(store_pipe_producer_state);
+          }
+          ++store_pipe_producer_state;
+          synchronize();
+        }
+      }
+    }
+    }
+    if (!tile_full) {
+      // Predicated direct global stores for boundary tiles (shared by all modes).
+      CUTLASS_PRAGMA_UNROLL
+      for (int i = 0; i < cute::size(accumulators); i += 2) {
+        auto coord = tCcD(i);
+        int m = cute::get<0>(coord);
+        int p = cute::get<1>(coord);
+        int gm = row_base + m_coord * CTA_M + m;
+        int off16 = p & 15;
+        int j = (p & ~15) / 2 + (off16 < 8 ? off16 : off16 - 7);
+        int gj = n0_out + j;
+        if (m < rows_here && gj < I_out) {
+          float g = accumulators(i);
+          float u = accumulators(i + 1);
+          float o = swiglu(g, u);
+          params.ptr_D[int64_t(gj) + int64_t(gm) * params.i_out] = static_cast<ElementD>(o);
+        }
+      }
+    }
+
+    dbg_close();
+    return cute::make_tuple(load_pipe_consumer_state, store_pipe_producer_state);
+  }
+
+  CUTLASS_DEVICE auto
+  store_tail(LoadPipeline, LoadPipelineState load_pipe_consumer_state,
+             StorePipeline store_pipeline,
+             StorePipelineState store_pipe_producer_state) {
+    store_pipeline.producer_tail(store_pipe_producer_state);
+    return cute::make_tuple(load_pipe_consumer_state, store_pipe_producer_state);
+  }
+
+private:
+  CUTLASS_DEVICE float swiglu(float g, float u) const {
+    // silu(g) * u = g * sigmoid(g) * u
+    float s = __frcp_rn(1.0f + __expf(-g));
+    return g * s * u;
+  }
+};
+
+///////////////////////////////////////////////////////////////////////////////
+// GEMM instantiation
+///////////////////////////////////////////////////////////////////////////////
+
+template <int TM_, int TN_, int TK_, int CM_, int CN_, int CK_,
+          int StageD_, int EpiN_, bool Noop_ = false, bool UseTma_ = false>
+struct MoeGemmT {
+  using TileShape = Shape<Int<TM_>, Int<TN_>, Int<TK_>>;
+  using ClusterShape = Shape<Int<CM_>, Int<CN_>, Int<CK_>>;
+
+  using KernelSchedule = cutlass::gemm::KernelPtrArrayTmaWarpSpecializedCooperative;
+  using CollectiveEpilogue = SwiGLUGroupedEpilogue<
+      TileShape,
+      Shape<Int<TM_>, Int<EpiN_>>,
+      StageD_,
+      decltype(cutlass::gemm::collective::detail::ss_smem_selector<
+               cute::GMMA::Major::K, ElementD, Int<TM_>, Int<EpiN_>>()),
+      Noop_, UseTma_>;
+
+  using CollectiveMainloop = typename cutlass::gemm::collective::CollectiveBuilder<
+      cutlass::arch::Sm90, cutlass::arch::OpClassTensorOp,
+      ElementA, LayoutA*, AlignmentA,
+      ElementB, LayoutB*, AlignmentB,
+      ElementAccumulator,
+      TileShape, ClusterShape,
+      cutlass::gemm::collective::StageCountAutoCarveout<
+          static_cast<int>(sizeof(typename CollectiveEpilogue::SharedStorage))>,
+      KernelSchedule>::CollectiveOp;
+
+  using GemmKernel = cutlass::gemm::kernel::GemmUniversal<
+      ProblemShape, CollectiveMainloop, CollectiveEpilogue>;
+  using Gemm = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;
+};
+
+template <int TM_, int TN_, int TK_, int CM_, int CN_, int CK_,
+          int StageD_, int EpiN_>
+struct MoeGemmPP {
+  using TileShape = Shape<Int<TM_>, Int<TN_>, Int<TK_>>;
+  using ClusterShape = Shape<Int<CM_>, Int<CN_>, Int<CK_>>;
+
+  using KernelSchedule = cutlass::gemm::KernelPtrArrayTmaWarpSpecializedPingpong;
+  using CollectiveEpilogue = SwiGLUGroupedEpilogue<
+      TileShape,
+      Shape<Int<TM_>, Int<EpiN_>>,
+      StageD_,
+      decltype(cutlass::gemm::collective::detail::ss_smem_selector<
+               cute::GMMA::Major::K, ElementD, Int<TM_>, Int<EpiN_>>())>;
+
+  using CollectiveMainloop = typename cutlass::gemm::collective::CollectiveBuilder<
+      cutlass::arch::Sm90, cutlass::arch::OpClassTensorOp,
+      ElementA, LayoutA*, AlignmentA,
+      ElementB, LayoutB*, AlignmentB,
+      ElementAccumulator,
+      TileShape, ClusterShape,
+      cutlass::gemm::collective::StageCountAutoCarveout<
+          static_cast<int>(sizeof(typename CollectiveEpilogue::SharedStorage))>,
+      KernelSchedule>::CollectiveOp;
+
+  using GemmKernel = cutlass::gemm::kernel::GemmUniversal<
+      ProblemShape, CollectiveMainloop, CollectiveEpilogue>;
+  using Gemm = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;
+};
+
+///////////////////////////////////////////////////////////////////////////////
+// Runner: prep kernel + adapter glue
+///////////////////////////////////////////////////////////////////////////////
+
+// Prep kernel: build per-group problem shapes, A/B pointer + stride arrays.
+template <class StrideA, class StrideB, class UnderlyingShape>
+__global__ static void prep(
+    int32_t const* __restrict__ offsets,
+    int E, int H, int N_packed,
+    uint8_t const* __restrict__ A_base,
+    uint8_t const* __restrict__ B_base,
+    UnderlyingShape* __restrict__ shapes,
+    ElementA const** __restrict__ ptrA,
+    ElementB const** __restrict__ ptrB,
+    StrideA* __restrict__ strideA,
+    StrideB* __restrict__ strideB) {
+  int e = blockIdx.x * blockDim.x + threadIdx.x;
+  if (e >= E) return;
+  int s = offsets[e];
+  int t = offsets[e + 1];
+  shapes[e] = make_shape(t - s, N_packed, H);
+  ptrA[e] = reinterpret_cast<ElementA const*>(A_base) + int64_t(s) * H;
+  ptrB[e] = reinterpret_cast<ElementB const*>(B_base) + int64_t(e) * H * N_packed;
+  strideA[e] = cutlass::make_cute_packed_stride(StrideA{}, {t - s, H, 1});
+  strideB[e] = cutlass::make_cute_packed_stride(StrideB{}, {N_packed, H, 1});
+}
+
+template <class GemmT>
+struct GemmRunner {
+  using GemmKernel = typename GemmT::GemmKernel;
+  using Gemm = typename GemmT::Gemm;
+  using CollectiveEpilogue = typename GemmT::CollectiveEpilogue;
+  using StrideA = typename Gemm::GemmKernel::InternalStrideA;
+  using StrideB = typename Gemm::GemmKernel::InternalStrideB;
+  using UnderlyingShape = typename ProblemShape::UnderlyingProblemShape;
+
+  // scalar workspace layout (bytes):
+  //   [0, 12E)                 problem shapes (Shape<int,int,int>)
+  //   [align16(12E), ...)      ptr_A (8B each)
+  //   + 8E                     ptr_B
+  //   + 8E                     stride_A (sizeof(StrideA) each)
+  //   + sizeof(StrideA)*E      stride_B
+  static int64_t align16(int64_t x) { return (x + 15) & ~int64_t(15); }
+  static int64_t scalars_bytes(int E) {
+    int64_t off = align16(12 * E);
+    off += align16(8 * E);              // ptr_A
+    off += align16(8 * E);              // ptr_B
+    off += align16(sizeof(StrideA) * E);
+    off += align16(sizeof(StrideB) * E);
+    return off + 256;
+  }
+
+  static void run(
+      torch::Tensor hidden,       // (T_perm, H) bf16
+      torch::Tensor offsets,      // (E+1,) int32
+      torch::Tensor w_packed,     // (E, H, N_packed) bf16
+      torch::Tensor out,          // (T_perm, I) bf16
+      torch::Tensor ws_scalars,   // int8/uint8 scratch
+      torch::Tensor ws_gemm,
+      int64_t swizzle,
+      int64_t raster) {
+    int const E = w_packed.size(0);
+    int const H = w_packed.size(1);
+    int const N_packed = w_packed.size(2);
+    int const T_perm = hidden.size(0);
+    int const I_out = out.size(1);
+
+    auto stream = at::cuda::getCurrentCUDAStream();
+
+    char* ws = reinterpret_cast<char*>(ws_scalars.data_ptr());
+    int64_t off = align16(12 * E);
+    UnderlyingShape* d_shapes = reinterpret_cast<UnderlyingShape*>(ws);
+    ElementA const** d_ptrA = reinterpret_cast<ElementA const**>(ws + off); off += align16(8 * E);
+    ElementB const** d_ptrB = reinterpret_cast<ElementB const**>(ws + off); off += align16(8 * E);
+    StrideA* d_strideA = reinterpret_cast<StrideA*>(ws + off); off += align16(sizeof(StrideA) * E);
+    StrideB* d_strideB = reinterpret_cast<StrideB*>(ws + off);
+
+    prep<StrideA, StrideB, UnderlyingShape><<<(E + 127) / 128, 128, 0, stream>>>(
+        offsets.data_ptr<int32_t>(), E, H, N_packed,
+        reinterpret_cast<uint8_t const*>(hidden.data_ptr()),
+        reinterpret_cast<uint8_t const*>(w_packed.data_ptr()),
+        d_shapes, d_ptrA, d_ptrB, d_strideA, d_strideB);
+
+    cutlass::KernelHardwareInfo hw_info =
+        cutlass::KernelHardwareInfo::make_kernel_hardware_info<GemmKernel>(hidden.get_device());
+
+    typename CollectiveEpilogue::Arguments epi_args{};
+    epi_args.dbg = reinterpret_cast<unsigned long long*>(dbg_tensor().data_ptr());
+    epi_args.ptr_D = reinterpret_cast<ElementD*>(out.data_ptr());
+    epi_args.stride_d_m = int64_t(I_out);
+    epi_args.expert_offsets = offsets.data_ptr<int32_t>();
+    epi_args.m_total = T_perm;
+    epi_args.i_out = I_out;
+
+    typename Gemm::GemmKernel::TileSchedulerArguments sched_args{};
+    sched_args.max_swizzle_size = int(swizzle);
+    sched_args.raster_order = raster == 1
+        ? cutlass::gemm::kernel::detail::PersistentTileSchedulerSm90GroupParams<
+              UnderlyingShape>::RasterOrderOptions::AlongN
+        : cutlass::gemm::kernel::detail::PersistentTileSchedulerSm90GroupParams<
+              UnderlyingShape>::RasterOrderOptions::AlongM;
+
+    typename Gemm::Arguments arguments{
+        cutlass::gemm::GemmUniversalMode::kGrouped,
+        {E, d_shapes, static_cast<UnderlyingShape*>(nullptr)},
+        {d_ptrA, d_strideA, d_ptrB, d_strideB},
+        epi_args,
+        hw_info,
+        sched_args};
+
+    Gemm gemm;
+    size_t wsize = Gemm::get_workspace_size(arguments);
+    TORCH_CHECK(size_t(ws_gemm.numel()) >= wsize, "gemm workspace too small: need ", wsize);
+    auto status = gemm.can_implement(arguments);
+    TORCH_CHECK(status == cutlass::Status::kSuccess, "can_implement failed");
+    status = gemm.initialize(arguments, ws_gemm.data_ptr());
+    TORCH_CHECK(status == cutlass::Status::kSuccess, "gemm initialize failed");
+    status = gemm.run(stream);
+    TORCH_CHECK(status == cutlass::Status::kSuccess, "gemm run failed");
+  }
+};
+
+torch::Tensor& dbg_tensor() {
+  static torch::Tensor dbg_buf = torch::zeros({16}, torch::TensorOptions().dtype(torch::kUInt64).device(torch::kCUDA));
+  return dbg_buf;
+}
+
+/////////////////////////////////////////////////////////////////////////////////
+// Cached-params fast path: reuse initialized Gemm::Params across calls;
+// per call we only refresh D-descriptor, offsets, and device-side scaling arrays.
+/////////////////////////////////////////////////////////////////////////////////
+
+template <class GemmT>
+struct GemmCache {
+  using Gemm = typename GemmT::Gemm;
+  using CollectiveEpilogue = typename GemmT::CollectiveEpilogue;
+  using StrideA = typename Gemm::GemmKernel::InternalStrideA;
+  using StrideB = typename Gemm::GemmKernel::InternalStrideB;
+  using UnderlyingShape = typename ProblemShape::UnderlyingProblemShape;
+
+  struct Entry {
+    bool initialized = false;
+    torch::Tensor ws_scalars;
+    torch::Tensor ws_gemm;
+    typename Gemm::GemmKernel::Params params;
+    UnderlyingShape* d_shapes = nullptr;
+    ElementA const** d_ptrA = nullptr;
+    ElementB const** d_ptrB = nullptr;
+    StrideA* d_strideA = nullptr;
+    StrideB* d_strideB = nullptr;
+  };
+
+  static int64_t align16(int64_t x) { return (x + 15) & ~int64_t(15); }
+
+  static void init_entry(Entry& e, int E, torch::Device dev) {
+    auto opts = torch::TensorOptions().dtype(torch::kUInt8).device(dev);
+    e.ws_scalars = torch::zeros({GemmRunner<GemmT>::scalars_bytes(E)}, opts);
+    e.ws_gemm = torch::zeros({4 * 1024 * 1024}, opts);
+    char* ws = reinterpret_cast<char*>(e.ws_scalars.data_ptr());
+    int64_t off = align16(12 * E);
+    e.d_shapes = reinterpret_cast<UnderlyingShape*>(ws);
+    e.d_ptrA = reinterpret_cast<ElementA const**>(ws + off); off += align16(8 * E);
+    e.d_ptrB = reinterpret_cast<ElementB const**>(ws + off); off += align16(8 * E);
+    e.d_strideA = reinterpret_cast<StrideA*>(ws + off); off += align16(sizeof(StrideA) * E);
+    e.d_strideB = reinterpret_cast<StrideB*>(ws + off);
+  }
+
+  static Entry& entry_for(int E, int64_t key, torch::Device dev) {
+    static std::array<Entry, 64> cache{};
+    static std::array<int64_t, 64> keys{};
+    for (int i = 0; i < 64; ++i) {
+      if (cache[i].initialized && keys[i] == key) return cache[i];
+    }
+    for (int i = 0; i < 64; ++i) {
+      if (!cache[i].initialized) {
+        keys[i] = key;
+        cache[i].initialized = true;  // entry slots reserved; params later
+        init_entry(cache[i], E, dev);
+        cache[i].initialized = false;
+        return cache[i];
+      }
+    }
+    TORCH_CHECK(false, "gemm cache full");
+  }
+
+  static void run(int64_t cfg_tag,
+      torch::Tensor hidden,
+      torch::Tensor offsets,
+      torch::Tensor w_packed,
+      torch::Tensor out,
+      int64_t swizzle, int64_t raster) {
+    int const E = w_packed.size(0);
+    int const H = w_packed.size(1);
+    int const N_packed = w_packed.size(2);
+    int const T_perm = hidden.size(0);
+    int const I_out = out.size(1);
+    auto stream = at::cuda::getCurrentCUDAStream();
+
+    int64_t key = (int64_t(E) << 24) ^ cfg_tag ^ (swizzle << 40) ^ (raster << 48);
+    Entry& e = entry_for(E, key, hidden.device());
+
+    typename CollectiveEpilogue::Arguments epi_args{};
+    epi_args.ptr_D = reinterpret_cast<ElementD*>(out.data_ptr());
+    epi_args.stride_d_m = int64_t(I_out);
+    epi_args.expert_offsets = offsets.data_ptr<int32_t>();
+    epi_args.m_total = T_perm;
+    epi_args.i_out = I_out;
+
+    if (!e.initialized) {
+      // first call for this (E, cfg): full initialize
+      cutlass::KernelHardwareInfo hw_info =
+          cutlass::KernelHardwareInfo::make_kernel_hardware_info<typename Gemm::GemmKernel>(hidden.get_device());
+      typename Gemm::Arguments arguments{
+          cutlass::gemm::GemmUniversalMode::kGrouped,
+          {E, e.d_shapes, static_cast<UnderlyingShape*>(nullptr)},
+          {e.d_ptrA, e.d_strideA, e.d_ptrB, e.d_strideB},
+          epi_args,
+          hw_info,
+          {int(swizzle), raster == 1
+              ? cutlass::gemm::kernel::detail::PersistentTileSchedulerSm90GroupParams<
+                    UnderlyingShape>::RasterOrderOptions::AlongN
+              : cutlass::gemm::kernel::detail::PersistentTileSchedulerSm90GroupParams<
+                    UnderlyingShape>::RasterOrderOptions::AlongM}};
+      size_t wsize = Gemm::get_workspace_size(arguments);
+      TORCH_CHECK(size_t(e.ws_gemm.numel()) >= wsize, "gemm workspace too small: need ", wsize);
+      auto status = Gemm::can_implement(arguments);
+      TORCH_CHECK(status == cutlass::Status::kSuccess, "can_implement failed");
+      // one-time smem attribute for this kernel type (static run() skips it)
+      {
+        int smem_size = Gemm::GemmKernel::SharedStorageSize;
+        cudaError_t cerr = cudaFuncSetAttribute(
+            cutlass::device_kernel<typename Gemm::GemmKernel>,
+            cudaFuncAttributeMaxDynamicSharedMemorySize,
+            smem_size);
+        TORCH_CHECK(cerr == cudaSuccess, "cudaFuncSetAttribute failed: ", cudaGetErrorString(cerr));
+      }
+      e.params = Gemm::GemmKernel::to_underlying_arguments(arguments, e.ws_gemm.data_ptr());
+      e.initialized = true;
+    }
+
+    // per call: refresh device scaling arrays from CURRENT tensors
+    prep<StrideA, StrideB, UnderlyingShape><<<(E + 127) / 128, 128, 0, stream>>>(
+        offsets.data_ptr<int32_t>(), E, H, N_packed,
+        reinterpret_cast<uint8_t const*>(hidden.data_ptr()),
+        reinterpret_cast<uint8_t const*>(w_packed.data_ptr()),
+        e.d_shapes, e.d_ptrA, e.d_ptrB, e.d_strideA, e.d_strideB);
+
+    // per call: refresh epilogue params (D descriptor + offsets)
+    e.params.epilogue = CollectiveEpilogue::to_underlying_arguments(
+        e.params.problem_shape, epi_args, nullptr);
+
+    auto status = Gemm::run(e.params, stream);
+    TORCH_CHECK(status == cutlass::Status::kSuccess, "gemm run failed, status=", int(status));
+    auto err = cudaGetLastError();
+    TORCH_CHECK(err == cudaSuccess, "gemm run cuda err: ", cudaGetErrorString(err));
+  }
+};
+
+}  // namespace moe
+
+// Extension entry (final lean set): config selection + pybind.
+
+
+namespace moe {
+
+// Final configs: (TM, TN, TK, CM, CN, CK, StagesD, EpiN)
+using Cfg0 = MoeGemmT<128, 256, 64, 1, 1, 1, 2, 128>;  // coop tile(128,256,64) cluster1, u32-store epilogue
+using Cfg2 = MoeGemmT<128, 128, 64, 1, 1, 1, 2, 64>;   // coop tile(128,128,64), u32-store epilogue
+using Cfg3 = MoeGemmT<256, 128, 64, 1, 1, 1, 2, 64>;   // coop tile(256,128,64), u32-store epilogue
+using CfgTMA = MoeGemmT<128, 256, 64, 1, 1, 1, 2, 128, false, true>;  // u32-STS + bulk TMA store
+
+int64_t scalars_bytes(int64_t E, int64_t cfg) {
+  switch (cfg) {
+    case 0: return GemmRunner<Cfg0>::scalars_bytes(E);
+    case 3: return GemmRunner<Cfg3>::scalars_bytes(E);
+    case 50: return GemmRunner<CfgTMA>::scalars_bytes(E);
+    default: return GemmRunner<Cfg2>::scalars_bytes(E);
+  }
+}
+
+template <class Cfg>
+static void run_t(torch::Tensor& h, torch::Tensor& o, torch::Tensor& wp, torch::Tensor& out,
+                  torch::Tensor& s, torch::Tensor& g, int64_t swizzle, int64_t raster) {
+  GemmRunner<Cfg>::run(h, o, wp, out, s, g, swizzle, raster);
+}
+
+void forward(torch::Tensor hidden, torch::Tensor offsets, torch::Tensor w_packed,
+             torch::Tensor out, torch::Tensor ws_scalars, torch::Tensor ws_gemm,
+             int64_t cfg, int64_t swizzle, int64_t raster) {
+  switch (cfg) {
+    case 0: run_t<Cfg0>(hidden, offsets, w_packed, out, ws_scalars, ws_gemm, swizzle, raster); return;
+    case 3: run_t<Cfg3>(hidden, offsets, w_packed, out, ws_scalars, ws_gemm, swizzle, raster); return;
+    case 50: run_t<CfgTMA>(hidden, offsets, w_packed, out, ws_scalars, ws_gemm, swizzle, raster); return;
+    default: run_t<Cfg2>(hidden, offsets, w_packed, out, ws_scalars, ws_gemm, swizzle, raster); return;
+  }
+}
+
+void forward_cached(torch::Tensor hidden, torch::Tensor offsets, torch::Tensor w_packed,
+                    torch::Tensor out, int64_t cfg, int64_t swizzle, int64_t raster) {
+  switch (cfg) {
+    case 0: GemmCache<Cfg0>::run(0, hidden, offsets, w_packed, out, swizzle, raster); return;
+    case 3: GemmCache<Cfg3>::run(3, hidden, offsets, w_packed, out, swizzle, raster); return;
+    case 50: GemmCache<CfgTMA>::run(50, hidden, offsets, w_packed, out, swizzle, raster); return;
+    default: GemmCache<Cfg2>::run(2, hidden, offsets, w_packed, out, swizzle, raster); return;
+  }
+}
+
+}  // namespace moe
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+  m.def("scalars_bytes", &moe::scalars_bytes, "scalar workspace bytes");
+  m.def("forward", &moe::forward, "grouped gemm + swiglu forward");
+  m.def("forward_cached", &moe::forward_cached, "cached-params forward");
+}
+
+'''
+
+_ext = None
+_ext_failed = None
+_REPACK_J = [0, 2, 4, 6, 1, 3, 5, 7]
+
+
+def _pick_cfg(H, I, E):
+    # (128,128,64) tiles win for the small/BW-bound shape; (128,256,64) otherwise.
+    if H <= 2048 and I <= 1024:
+        return 2
+    return 0
+
+
+def _get_ext():
+    global _ext, _ext_failed
+    if _ext is not None or _ext_failed:
+        return _ext
+    try:
+        from torch.utils.cpp_extension import load
+
+        cutlass = os.path.join(_HERE, "third_party", "cutlass")
+        if not os.path.isdir(os.path.join(cutlass, "include")):
+            raise RuntimeError("cutlass headers missing")
+        bdir = os.path.join(_HERE, "build")
+        os.makedirs(bdir, exist_ok=True)
+        src_path = os.path.join(bdir, "moe_ext_embedded.cu")
+        prev = None
+        if os.path.exists(src_path):
+            with open(src_path) as f:
+                prev = f.read()
+        if prev != _CUDA_SRC:
+            with open(src_path, "w") as f:
+                f.write(_CUDA_SRC)
+        _ext = load(
+            name="moe_swiglu_ext",
+            sources=[src_path],
+            extra_include_paths=[
+                os.path.join(cutlass, "include"),
+                os.path.join(cutlass, "tools", "util", "include"),
+            ],
+            extra_cuda_cflags=[
+                "-O3",
+                "-std=c++17",
+                "--expt-relaxed-constexpr",
+                "--expt-extended-lambda",
+                "-gencode=arch=compute_90a,code=sm_90a",
+                "--use_fast_math",
+                "-DCUTLASS_ENABLE_TENSOR_CORE_MMA=1",
+                "-w",
+                "-DNDEBUG",
+            ],
+            extra_cflags=["-O3", "-std=c++17"],
+            build_directory=bdir,
+            verbose=False,
+        )
+    except Exception:
+        _ext_failed = True
+        _ext = None
+    return _ext
+
+
+class Model(nn.Module):
+    """Up-projection of a top-K MoE FFN with fused SwiGLU."""
+
+    def __init__(self, T_total: int, H: int, I: int, E: int, K: int):  # noqa: E741
+        super().__init__()
+        self.T_total = T_total
+        self.H = H
+        self.I = I
+        self.E = E
+        self.K = K
+        self.W_gate = nn.Parameter(torch.empty(E, H, I, dtype=torch.bfloat16))
+        self.W_up = nn.Parameter(torch.empty(E, H, I, dtype=torch.bfloat16))
+        nn.init.normal_(self.W_gate, std=0.02)
+        nn.init.normal_(self.W_up, std=0.02)
+
+        self._packed = None
+        self._packed_key = None
+        self._scalars = None
+        self._gemm_ws = None
+        self._cfg = _pick_cfg(H, I, E)
+
+    def _refresh_packed(self):
+        wg = self.W_gate
+        key = (wg.data_ptr(), wg._version, self.W_up.data_ptr(), self.W_up._version,
+               wg.device.index)
+        if self._packed is not None and self._packed_key == key:
+            return
+        self._packed = None
+        # 16-col-block repack: [g0,u0,g2,u2,g4,u4,g6,u6, g1,u1,g3,u3,g5,u5,g7,u7]
+        # so each WGMMA accumulator thread holds adjacent output column pairs.
+        wg_d, wu_d = wg.detach(), self.W_up.detach()
+        if self.I % 8 == 0:
+            b = torch.stack([wg_d, wu_d], dim=-1)
+            b = b.view(self.E, self.H, self.I // 8, 8, 2)
+            b = b[:, :, :, _REPACK_J, :]
+            self._packed = b.reshape(self.E, self.H, 2 * self.I).contiguous()
+        else:  # generic fallback: plain [g,u] interleave (kernel handles via masked path)
+            packed0 = torch.stack([wg_d, wu_d], dim=-1)
+            self._packed = packed0.reshape(self.E, self.H, 2 * self.I).contiguous()
+        self._packed_key = key
+        _get_ext()
+
+    def forward(self, hidden_states: torch.Tensor, expert_offsets: torch.Tensor) -> torch.Tensor:
+        T_perm, _ = hidden_states.shape
+        ext = _get_ext()
+        if ext is not None:
+            self._refresh_packed()
+            if not hidden_states.is_contiguous():
+                hidden_states = hidden_states.contiguous()
+            offsets = expert_offsets
+            if offsets.device != hidden_states.device:
+                offsets = offsets.to(hidden_states.device)
+            if offsets.dtype != torch.int32:
+                offsets = offsets.to(torch.int32)
+            if not offsets.is_contiguous():
+                offsets = offsets.contiguous()
+            out = torch.empty((T_perm, self.I), dtype=torch.bfloat16, device=hidden_states.device)
+            if T_perm == 0:
+                return out
+            ext.forward_cached(hidden_states, offsets, self._packed, out, self._cfg, 1, 0)
+            return out
+
+        out = torch.empty((T_perm, self.I), dtype=torch.bfloat16, device=hidden_states.device)
+        if T_perm == 0:
+            return out
+        return _triton_forward(self, hidden_states, expert_offsets, out)
+
+
+
+def _triton_forward(model, hidden_states, expert_offsets, out):
+    import triton
+    import triton.language as tl
+    from triton.tools.tensor_descriptor import TensorDescriptor
+
+    @triton.jit
+    def _kern(x_desc, wg_desc, wu_desc, out_ptr, offsets_ptr, H, I, E,
+              NEP: tl.constexpr, BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr):
+        pid = tl.program_id(0)
+        num_n = (I + BN - 1) // BN
+        er = tl.arange(0, NEP)
+        emask = er < E
+        off_lo = tl.load(offsets_ptr + er, mask=emask, other=0)
+        off_hi = tl.load(offsets_ptr + er + 1, mask=emask, other=0)
+        tiles = (off_hi - off_lo + (BM - 1)) // BM
+        exc = tl.cumsum(tiles) - tiles
+        total_m = tl.sum(tiles)
+        total_tiles = total_m * num_n
+        if pid >= total_tiles:
+            return
+        e = tl.sum(tl.where(exc * num_n <= pid, 1, 0)) - 1
+        exc_e = tl.sum(tl.where(er < e, tiles, 0))
+        t_local = pid - exc_e * num_n
+        m_local = t_local // num_n
+        n_tile = t_local - m_local * num_n
+        row_start = tl.load(offsets_ptr + e)
+        row_end = tl.load(offsets_ptr + e + 1)
+        row0 = row_start + m_local * BM
+        n0 = n_tile * BN
+        acc_g = tl.zeros((BM, BN), dtype=tl.float32)
+        acc_u = tl.zeros((BM, BN), dtype=tl.float32)
+        e_row = e * H
+        for k0 in range(0, H, BK):
+            a = tl.load_tensor_descriptor(x_desc, [row0, k0])
+            bg = tl.load_tensor_descriptor(wg_desc, [e_row + k0, n0])
+            bu = tl.load_tensor_descriptor(wu_desc, [e_row + k0, n0])
+            acc_g = tl.dot(a, bg, acc_g)
+            acc_u = tl.dot(a, bu, acc_u)
+        g = acc_g
+        res = (g * tl.sigmoid(g)) * acc_u
+        res_bf = res.to(tl.bfloat16)
+        offs_m = row0 + tl.arange(0, BM)
+        offs_n = n0 + tl.arange(0, BN)
+        mask = (offs_m[:, None] < row_end) & (offs_n[None, :] < I)
+        tl.store(out_ptr + offs_m[:, None] * I + offs_n[None, :], res_bf, mask=mask)
+
+    def _next_pow2(x):
+        v = 1
+        while v < x:
+            v <<= 1
+        return v
+
+    T_perm, H = hidden_states.shape
+    I, E = model.I, model.E
+    if not hidden_states.is_contiguous():
+        hidden_states = hidden_states.contiguous()
+    BM, BN, BK = 128, 128, 64
+    wg2d = model.W_gate.view(E * H, I)
+    wu2d = model.W_up.view(E * H, I)
+    x_desc = TensorDescriptor.from_tensor(hidden_states, [BM, BK])
+    wg_desc = TensorDescriptor.from_tensor(wg2d, [BK, BN])
+    wu_desc = TensorDescriptor.from_tensor(wu2d, [BK, BN])
+    grid = (((T_perm + BM - 1) // BM + E) * ((I + BN - 1) // BN),)
+    _kern[grid](x_desc, wg_desc, wu_desc, out, expert_offsets.to(torch.int32),
+                H, I, E, NEP=_next_pow2(E), BM=BM, BN=BN, BK=BK,
+                num_warps=8, num_stages=3)
+    return out
+
+
+
+# Module-level shape shims (mirrors reference.py; rewritten by harness per shape).
+T_total = 32768
+H = 4096
+I = 1536  # noqa: E741
+E = 128
+K = 8
+
+
+def get_inputs():
+    T_perm = T_total * K
+    hidden_states = torch.randn(T_perm, H, dtype=torch.bfloat16) * 0.1
+    base = T_perm // E
+    rem = T_perm - base * E
+    counts = torch.full((E,), base, dtype=torch.int32)
+    counts[:rem] += 1
+    offsets = torch.zeros(E + 1, dtype=torch.int32)
+    offsets[1:] = torch.cumsum(counts, dim=0)
+    return [hidden_states, offsets]
+
+
+def get_init_inputs():
+    return [T_total, H, I, E, K]

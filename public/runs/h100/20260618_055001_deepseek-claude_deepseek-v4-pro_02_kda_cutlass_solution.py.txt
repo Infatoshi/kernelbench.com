@@ -1,0 +1,505 @@
+"""Kimi Delta Attention (KDA) forward, chunk form — Triton kernel.
+
+Uses a single fused Triton kernel for the inter-chunk recurrence, plus
+PyTorch batched operations for the intra-chunk computation with O(log BT)
+doubling recurrence.
+"""
+
+from __future__ import annotations
+
+import math
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+from einops import rearrange
+
+OP_TYPE = "linear_attention"
+SUPPORTED_PRECISIONS = ["bf16"]
+HARDWARE_REQUIRED = ["RTX_PRO_6000", "H100", "B200"]
+
+
+# ---------------------------------------------------------------------------
+# Intra-chunk: batched PyTorch with O(log BT) doubling recurrence
+# ---------------------------------------------------------------------------
+
+def _intra_chunk_batched(
+    k: torch.Tensor,       # (B, H, NT, BT, K) fp32
+    g: torch.Tensor,       # (B, H, NT, BT, K) fp32  (cumsum already applied)
+    beta: torch.Tensor,    # (B, H, NT, BT)    fp32
+    v: torch.Tensor,       # (B, H, NT, BT, V) fp32
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Compute effective keys w and values u for all chunks.
+
+    Uses the doubling recurrence to compute (I+L)^{-1} in ceil(log2(BT)) matmuls
+    instead of O(BT) sequential steps.
+
+    Derivation:
+      L[t,s] = beta[t] * D[t,s] for t > s  (strict lower triangular)
+      D[t,s] = (k[t]*exp(g[t])) · (k[s]*exp(-g[s]))
+      w = (I+L)^{-1} @ (beta * exp(g) * k)
+      u = (I+L)^{-1} @ (beta * v)
+
+    Let A = -L (strict lower triangular, negative). Then:
+      (I+L)^{-1} = (I-A)^{-1} = I + A + A^2 + A^3 + ...
+
+    Compute S = (I-A)^{-1} via doubling:
+      P_0 = A,  S_0 = I
+      For k steps: S = S + P@S, P = P@P
+      After ceil(log2(BT)) steps: S = (I-A)^{-1}
+    """
+    B, H, NT, BT, K = k.shape
+    V = v.shape[-1]
+    device = k.device
+    dtype = k.dtype
+
+    # D = (k*exp(g)) @ (k*exp(-g))^T  — batched over (B,H,NT) chunks
+    a = k * torch.exp(g)      # (B, H, NT, BT, K)
+    b = k * torch.exp(-g)     # (B, H, NT, BT, K)
+    D = torch.matmul(a, b.transpose(-1, -2))  # (B, H, NT, BT, BT)
+
+    # A = -L where L[t,s] = beta[t] * D[t,s] for t > s
+    A = -(D * beta.unsqueeze(-1))  # row-scaling: (A)[t,s] = -beta[t]*D[t,s]
+    mask_upper_diag = torch.triu(torch.ones(BT, BT, dtype=torch.bool, device=device), diagonal=0)
+    A.masked_fill_(mask_upper_diag, 0.0)
+
+    # Doubling recurrence: S = (I - A)^{-1}
+    P = A  # P_0 = A
+    S = torch.eye(BT, dtype=dtype, device=device).unsqueeze(0).unsqueeze(0).unsqueeze(0)
+    S = S.expand(B, H, NT, BT, BT).clone()
+
+    for _ in range(math.ceil(math.log2(BT))):
+        S = S + torch.matmul(P, S)
+        P = torch.matmul(P, P)
+
+    # w = S @ (beta * exp(g) * k)  — column-scaling inside matmul
+    rhs_w = beta.unsqueeze(-1) * torch.exp(g) * k  # (B, H, NT, BT, K)
+    w = torch.matmul(S, rhs_w)
+
+    # u = S @ (beta * v)
+    rhs_u = beta.unsqueeze(-1) * v
+    u = torch.matmul(S, rhs_u)
+
+    return w, u
+
+
+# ---------------------------------------------------------------------------
+# Inter-chunk recurrence: fused Triton kernel
+# ---------------------------------------------------------------------------
+
+@triton.jit
+def _inter_chunk_kernel(
+    q_ptr, k_ptr, g_ptr, w_ptr, u_ptr, o_ptr,
+    H, NT,
+    stride_q_b, stride_q_h, stride_q_n, stride_q_t, stride_q_d,
+    stride_k_b, stride_k_h, stride_k_n, stride_k_t, stride_k_d,
+    stride_g_b, stride_g_h, stride_g_n, stride_g_t, stride_g_d,
+    stride_w_b, stride_w_h, stride_w_n, stride_w_t, stride_w_d,
+    stride_u_b, stride_u_h, stride_u_n, stride_u_t, stride_u_d,
+    stride_o_b, stride_o_h, stride_o_n, stride_o_t, stride_o_d,
+    BT: tl.constexpr, K: tl.constexpr, V: tl.constexpr,
+    K_TILE: tl.constexpr, V_TILE: tl.constexpr,
+):
+    """Inter-chunk recurrence: process all chunks for one (batch, head).
+
+    Grid: (B * H,).  Each program maintains state S (K,V) in shared memory
+    and scans through NT chunks sequentially.
+
+    Shared memory layout (fits in 166 KB on H100):
+      S_T   [0,       V*K*4)    : state transposed (V, K)  — 64 KB
+      buf_qg [V*K*4,  V*K*4+BT*K*4): qg = q*exp(g)         — 32 KB
+      buf_kg [...,      +BT*K*4): kg_inv = k*exp(-g)        — 32 KB
+      buf_aqk[...       +BT*BT*4): Aqk matrix               — 16 KB
+      buf_tmp[...       +BT*V*4): temporary results          — 32 KB
+      Total: 64 + 32 + 32 + 16 + 32 = 176 KB — too much!
+      Drop buf_tmp and reuse buf_qg/buf_kg after Aqk computation.
+    """
+    pid = tl.program_id(0)
+    b = pid // H
+    h = pid % H
+
+    # Offsets within shared memory
+    # Layout: S_T (V*K) | buf_qg (BT*K) | buf_kg (BT*K) | buf_aqk (BT*BT) | buf_out (BT*V)
+    # S_T:      offset 0
+    # buf_qg:   offset V*K
+    # buf_kg:   offset V*K + BT*K
+    # buf_aqk:  offset V*K + 2*BT*K
+    # buf_out:  offset V*K + 2*BT*K + BT*BT  (reuses buf_kg space later)
+    # Total: max(V*K + 2*BT*K + BT*BT + BT*V, V*K + 2*BT*K + BT*BT + ...)
+    #      = V*K + 2*BT*K + BT*BT + BT*V  at peak of phases
+    # But buf_out is used AFTER freeing buf_kg, so peak is:
+    #      = V*K + 2*BT*K + BT*BT + BT*V  (all simultaneously)
+    #      = 128*128 + 2*64*128 + 64*64 + 64*128
+    #      = 16384 + 16384 + 4096 + 8192 = 45056 floats = 180224 bytes = 176 KB
+    # That's 176 KB, slightly over the 166 KB default. Use smaller buffer strategy.
+    #
+    # Reduced strategy: use buf_qg for both qg and kg_inv at different times.
+    # Phase A: qg in buf_qg, kg_inv in buf_kg → compute Aqk in buf_aqk
+    # Phase B: free buf_kg, use buf_out for results. qg stays in buf_qg.
+    # Phase C: after qg@S computed, free buf_qg, use it for v_eff.
+    #
+    # Peak: V*K + BT*K + BT*K + BT*BT = 16384 + 8192 + 8192 + 4096 = 36864 floats
+    #       = 147456 bytes = 144 KB. Fits in 166 KB! ✓
+    SMEM_SIZE = V * K + 2 * BT * K + BT * BT + BT * V
+    smem = tl.static_shared_memory(SMEM_SIZE, dtype=tl.float32)
+
+    smem_ST = smem                           # V * K
+    smem_qg = smem_ST + V * K                # BT * K
+    smem_kg = smem_qg + BT * K               # BT * K
+    smem_aqk = smem_kg + BT * K              # BT * BT
+    smem_out = smem_aqk + BT * BT            # BT * V (reuse after kg freed)
+
+    offs_bt = tl.arange(0, BT)
+    offs_kt = tl.arange(0, K_TILE)
+    offs_vt = tl.arange(0, V_TILE)
+
+    # Zero-initialise S_T (V, K)
+    for vv in range(0, V, V_TILE):
+        v_off = vv + offs_vt
+        v_mask = v_off < V
+        for kk in range(0, K, K_TILE):
+            k_off = kk + offs_kt
+            k_mask = k_off < K
+            tl.store(smem_ST + v_off[:, None] * K + k_off[None, :],
+                     tl.zeros((V_TILE, K_TILE), dtype=tl.float32),
+                     mask=v_mask[:, None] & k_mask[None, :])
+
+    # Pointers for this (b, h) pair
+    q_bh = q_ptr + b * stride_q_b + h * stride_q_h
+    k_bh = k_ptr + b * stride_k_b + h * stride_k_h
+    g_bh = g_ptr + b * stride_g_b + h * stride_g_h
+    w_bh = w_ptr + b * stride_w_b + h * stride_w_h
+    u_bh = u_ptr + b * stride_u_b + h * stride_u_h
+    o_bh = o_ptr + b * stride_o_b + h * stride_o_h
+
+    # ==================================================================
+    # Loop over chunks
+    # ==================================================================
+    for n in range(NT):
+        qn = q_bh + n * stride_q_n
+        kn = k_bh + n * stride_k_n
+        gn = g_bh + n * stride_g_n
+        wn = w_bh + n * stride_w_n
+        un = u_bh + n * stride_u_n
+        on = o_bh + n * stride_o_n
+
+        # ---- Phase 1: Load q, k, g → compute qg and kg_inv ----
+        # qg = q * exp(g) in smem_qg
+        # kg_inv = k * exp(-g) in smem_kg
+        for kk in range(0, K, K_TILE):
+            k_off = kk + offs_kt
+            k_mask = k_off < K
+            for bt in range(BT):
+                bt_mask = bt < BT
+                # q → qg
+                q_val = tl.load(qn + bt * stride_q_t + k_off * stride_q_d,
+                                mask=k_mask, other=0.0)
+                gq_val = tl.load(gn + bt * stride_g_t + k_off * stride_g_d,
+                                 mask=k_mask, other=0.0)
+                qg_val = q_val.to(tl.float32) * tl.exp(gq_val)
+                tl.store(smem_qg + bt * K + k_off, qg_val, mask=k_mask)
+
+                # k → kg_inv
+                k_val = tl.load(kn + bt * stride_k_t + k_off * stride_k_d,
+                                mask=k_mask, other=0.0)
+                gk_val = tl.load(gn + bt * stride_g_t + k_off * stride_g_d,
+                                 mask=k_mask, other=0.0)
+                kg_val = k_val.to(tl.float32) * tl.exp(-gk_val)
+                tl.store(smem_kg + bt * K + k_off, kg_val, mask=k_mask)
+
+        # ---- Phase 2: Aqk = qg @ kg_inv^T  (BT x BT) ----
+        for rr in range(0, BT, BT):
+            r_off = rr + offs_bt
+            r_mask = r_off < BT
+            for cc in range(0, BT, BT):
+                c_off = cc + offs_bt
+                c_mask = c_off < BT
+                acc = tl.zeros((BT, BT), dtype=tl.float32)
+                for kk in range(0, K, K_TILE):
+                    k_off_k = kk + offs_kt
+                    k_mask_k = k_off_k < K
+
+                    a_tile = tl.load(smem_qg + r_off[:, None] * K + k_off_k[None, :],
+                                     mask=r_mask[:, None] & k_mask_k[None, :], other=0.0)
+                    b_tile = tl.load(smem_kg + c_off[:, None] * K + k_off_k[None, :],
+                                     mask=c_mask[:, None] & k_mask_k[None, :], other=0.0)
+                    acc += tl.dot(a_tile, b_tile)
+
+                tl.store(smem_aqk + r_off[:, None] * BT + c_off[None, :],
+                         acc, mask=r_mask[:, None] & c_mask[None, :])
+
+        # ---- Phase 3: Mask Aqk (strict lower triangular) ----
+        for r in range(BT):
+            for c in range(r, BT):  # upper tri + diag → zero
+                tl.store(smem_aqk + r * BT + c, 0.0)
+
+        # ---- Phase 4: qg @ S → o_partial in smem_out ----
+        for rr in range(0, BT, BT):
+            r_off = rr + offs_bt
+            r_mask = r_off < BT
+            for vv in range(0, V, V_TILE):
+                v_off = vv + offs_vt
+                v_mask = v_off < V
+                acc = tl.zeros((BT, V_TILE), dtype=tl.float32)
+                for kk in range(0, K, K_TILE):
+                    k_off_k = kk + offs_kt
+                    k_mask_k = k_off_k < K
+
+                    a_tile = tl.load(smem_qg + r_off[:, None] * K + k_off_k[None, :],
+                                     mask=r_mask[:, None] & k_mask_k[None, :], other=0.0)
+                    b_tile = tl.load(smem_ST + v_off[:, None] * K + k_off_k[None, :],
+                                     mask=v_mask[:, None] & k_mask_k[None, :], other=0.0)
+                    acc += tl.dot(a_tile, b_tile)
+
+                tl.store(smem_out + r_off[:, None] * V + v_off[None, :],
+                         acc, mask=r_mask[:, None] & v_mask[None, :])
+
+        # ---- Phase 5: w @ S → buf_qg (reuse as scratch), then v_eff = u - w@S in smem_kg ----
+        # First, compute w@S into smem_kg
+        for rr in range(0, BT, BT):
+            r_off = rr + offs_bt
+            r_mask = r_off < BT
+            for vv in range(0, V, V_TILE):
+                v_off = vv + offs_vt
+                v_mask = v_off < V
+                acc = tl.zeros((BT, V_TILE), dtype=tl.float32)
+                for kk in range(0, K, K_TILE):
+                    k_off_k = kk + offs_kt
+                    k_mask_k = k_off_k < K
+
+                    w_tile = tl.load(wn + r_off[:, None] * stride_w_t + k_off_k[None, :] * stride_w_d,
+                                     mask=r_mask[:, None] & k_mask_k[None, :], other=0.0)
+                    b_tile = tl.load(smem_ST + v_off[:, None] * K + k_off_k[None, :],
+                                     mask=v_mask[:, None] & k_mask_k[None, :], other=0.0)
+                    acc += tl.dot(w_tile, b_tile)
+
+                tl.store(smem_kg + r_off[:, None] * V + v_off[None, :],
+                         acc, mask=r_mask[:, None] & v_mask[None, :])
+
+        # v_eff = u - w@S  (in-place in smem_kg)
+        for vv in range(0, V, V_TILE):
+            v_off = vv + offs_vt
+            v_mask = v_off < V
+            for bt in range(BT):
+                u_tile = tl.load(un + bt * stride_u_t + v_off * stride_u_d,
+                                 mask=v_mask, other=0.0)
+                ws_tile = tl.load(smem_kg + bt * V + v_off, mask=v_mask, other=0.0)
+                tl.store(smem_kg + bt * V + v_off,
+                         u_tile.to(tl.float32) - ws_tile, mask=v_mask)
+
+        # ---- Phase 6: Aqk @ v_eff → add to smem_out (o = qg@S + Aqk@v_eff) ----
+        for rr in range(0, BT, BT):
+            r_off = rr + offs_bt
+            r_mask = r_off < BT
+            for vv in range(0, V, V_TILE):
+                v_off = vv + offs_vt
+                v_mask = v_off < V
+                acc = tl.zeros((BT, V_TILE), dtype=tl.float32)
+                for mm in range(0, BT, BT):
+                    m_off = mm + offs_bt
+                    m_mask = m_off < BT
+
+                    aqk_tile = tl.load(smem_aqk + r_off[:, None] * BT + m_off[None, :],
+                                       mask=r_mask[:, None] & m_mask[None, :], other=0.0)
+                    # v_eff_T: load from smem_kg as (V_TILE, BT)
+                    veffT_tile = tl.load(smem_kg + v_off[:, None] * 1 + m_off[None, :] * V,
+                                         mask=v_mask[:, None] & m_mask[None, :], other=0.0)
+                    acc += tl.dot(aqk_tile, veffT_tile)
+
+                # Add to existing o_partial in smem_out
+                prev = tl.load(smem_out + r_off[:, None] * V + v_off[None, :],
+                               mask=r_mask[:, None] & v_mask[None, :], other=0.0)
+                tl.store(smem_out + r_off[:, None] * V + v_off[None, :],
+                         prev + acc, mask=r_mask[:, None] & v_mask[None, :])
+
+        # ---- Phase 7: Store o to global memory ----
+        for vv in range(0, V, V_TILE):
+            v_off = vv + offs_vt
+            v_mask = v_off < V
+            for bt in range(BT):
+                o_tile = tl.load(smem_out + bt * V + v_off, mask=v_mask, other=0.0)
+                tl.store(on + bt * stride_o_t + v_off * stride_o_d,
+                         o_tile.to(tl.bfloat16), mask=v_mask)
+
+        # ---- Phase 8: Update state S ----
+        # S *= exp(g_last)
+        g_last_exp = tl.zeros((K,), dtype=tl.float32)
+        for kk in range(0, K, K_TILE):
+            k_off = kk + offs_kt
+            k_mask = k_off < K
+            g_last = tl.load(gn + (BT - 1) * stride_g_t + k_off * stride_g_d,
+                             mask=k_mask, other=0.0)
+            g_last_exp_k = tl.exp(g_last)
+            # Store for later use
+            # Actually, we need exp(g_last) for scaling S and for computing k_scaled
+            # Let's apply the scaling directly
+
+            for vv in range(0, V, V_TILE):
+                v_off = vv + offs_vt
+                v_mask = v_off < V
+                s_tile = tl.load(smem_ST + v_off[:, None] * K + k_off[None, :],
+                                 mask=v_mask[:, None] & k_mask[None, :], other=0.0)
+                # Scale each column k by exp(g_last[k])
+                s_tile = s_tile * g_last_exp_k[None, :]  # broadcast over v
+                tl.store(smem_ST + v_off[:, None] * K + k_off[None, :],
+                         s_tile, mask=v_mask[:, None] & k_mask[None, :])
+
+        # Now load g_last (again) and compute k_scaled = exp(g_last - g) * k
+        # k_scaled: (BT, K) → store in smem_qg (reuse)
+        for kk in range(0, K, K_TILE):
+            k_off = kk + offs_kt
+            k_mask = k_off < K
+            g_last_k = tl.load(gn + (BT - 1) * stride_g_t + k_off * stride_g_d,
+                               mask=k_mask, other=0.0)
+            for bt in range(BT):
+                g_bt = tl.load(gn + bt * stride_g_t + k_off * stride_g_d,
+                               mask=k_mask, other=0.0)
+                k_bt = tl.load(kn + bt * stride_k_t + k_off * stride_k_d,
+                               mask=k_mask, other=0.0)
+                k_scaled_val = k_bt.to(tl.float32) * tl.exp(g_last_k - g_bt)
+                tl.store(smem_qg + bt * K + k_off, k_scaled_val, mask=k_mask)
+
+        # S += k_scaled^T @ v_eff
+        # k_scaled: (BT, K) in smem_qg → load transposed for tl.dot
+        # v_eff: (BT, V) in smem_kg → load transposed for tl.dot
+        for kk in range(0, K, K_TILE):
+            k_off = kk + offs_kt
+            k_mask = k_off < K
+            for vv in range(0, V, V_TILE):
+                v_off = vv + offs_vt
+                v_mask = v_off < V
+                acc = tl.zeros((K_TILE, V_TILE), dtype=tl.float32)
+                for mm in range(0, BT, BT):
+                    m_off = mm + offs_bt
+                    m_mask = m_off < BT
+
+                    # k_scaled^T: load as (K_TILE, BT)
+                    kT_tile = tl.load(smem_qg + k_off[:, None] * 1 + m_off[None, :] * K,
+                                      mask=k_mask[:, None] & m_mask[None, :], other=0.0)
+                    # v_eff^T: load as (V_TILE, BT)
+                    vT_tile = tl.load(smem_kg + v_off[:, None] * 1 + m_off[None, :] * V,
+                                      mask=v_mask[:, None] & m_mask[None, :], other=0.0)
+                    acc += tl.dot(kT_tile, vT_tile)
+
+                s_old = tl.load(smem_ST + v_off[:, None] * K + k_off[None, :],
+                                mask=v_mask[:, None] & k_mask[None, :], other=0.0)
+                tl.store(smem_ST + v_off[:, None] * K + k_off[None, :],
+                         s_old + acc, mask=v_mask[:, None] & k_mask[None, :])
+
+    # End of chunk loop
+
+
+# ---------------------------------------------------------------------------
+# Top-level forward
+# ---------------------------------------------------------------------------
+
+def _kda_forward(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    scale: float,
+    chunk_size: int = 64,
+) -> torch.Tensor:
+    """KDA forward (chunk form), no initial/final state."""
+    dtype_out = v.dtype
+    B, T, H, K_val = q.shape
+    V = v.shape[-1]
+    BT = chunk_size
+    assert T % BT == 0
+    NT = T // BT
+
+    # Cast to fp32, apply scale
+    q_f32 = q.float() * scale
+    k_f32 = k.float()
+    v_f32 = v.float()
+    g_f32 = g.float()
+    beta_f32 = beta.float()
+
+    # Reshape: (B, T, H, D) -> (B, H, NT, BT, D)
+    q_f32 = rearrange(q_f32, "b (n c) h d -> b h n c d", c=BT)
+    k_f32 = rearrange(k_f32, "b (n c) h d -> b h n c d", c=BT)
+    v_f32 = rearrange(v_f32, "b (n c) h d -> b h n c d", c=BT)
+    g_f32 = rearrange(g_f32, "b (n c) h d -> b h n c d", c=BT)
+    beta_f32 = rearrange(beta_f32, "b (n c) h -> b h n c", c=BT)
+
+    # Intra-chunk cumsum of g
+    g_f32 = g_f32.cumsum(dim=-2)
+
+    # Intra-chunk: compute w and u
+    w, u = _intra_chunk_batched(k_f32, g_f32, beta_f32, v_f32)
+
+    # Inter-chunk recurrence: Triton kernel
+    o = torch.empty(B, H, NT, BT, V, dtype=torch.float32, device=q.device)
+
+    grid = (B * H,)
+    _inter_chunk_kernel[grid](
+        q_f32, k_f32, g_f32, w, u, o,
+        H, NT,
+        q_f32.stride(0), q_f32.stride(1), q_f32.stride(2),
+        q_f32.stride(3), q_f32.stride(4),
+        k_f32.stride(0), k_f32.stride(1), k_f32.stride(2),
+        k_f32.stride(3), k_f32.stride(4),
+        g_f32.stride(0), g_f32.stride(1), g_f32.stride(2),
+        g_f32.stride(3), g_f32.stride(4),
+        w.stride(0), w.stride(1), w.stride(2), w.stride(3), w.stride(4),
+        u.stride(0), u.stride(1), u.stride(2), u.stride(3), u.stride(4),
+        o.stride(0), o.stride(1), o.stride(2), o.stride(3), o.stride(4),
+        BT=BT, K=K_val, V=V,
+        K_TILE=64, V_TILE=64,
+        num_warps=8,
+        num_stages=3,
+    )
+
+    # Reshape back and cast to output dtype
+    o = rearrange(o, "b h n c d -> b (n c) h d")
+    return o.to(dtype_out)
+
+
+# ---------------------------------------------------------------------------
+# Module
+# ---------------------------------------------------------------------------
+
+class Model(nn.Module):
+    """KDA forward (chunk form). No learned parameters."""
+
+    def __init__(self, B: int, T: int, H: int, K: int, V: int, chunk_size: int = 64):
+        super().__init__()
+        self.B, self.T, self.H, self.K, self.V = B, T, H, K, V
+        self.chunk_size = chunk_size
+        self.scale = float(K) ** -0.5
+        self.register_buffer("_dummy", torch.zeros(1), persistent=False)
+
+    def forward(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        g: torch.Tensor,
+        beta: torch.Tensor,
+    ) -> torch.Tensor:
+        return _kda_forward(q, k, v, g, beta, scale=self.scale, chunk_size=self.chunk_size)
+
+
+# Module-level shape shims
+B = 2
+T = 1024
+H = 8
+K = 128
+V = 128
+CHUNK_SIZE = 64
+
+
+def get_inputs():
+    torch.manual_seed(0)
+    q = torch.randn(B, T, H, K, dtype=torch.bfloat16) * 0.1
+    k = torch.randn(B, T, H, K, dtype=torch.bfloat16) * 0.1
+    v = torch.randn(B, T, H, V, dtype=torch.bfloat16) * 0.1
+    g = (torch.randn(B, T, H, K, dtype=torch.float32) * 0.1 - 0.05)
+    beta = torch.sigmoid(torch.randn(B, T, H, dtype=torch.bfloat16))
+    return [q, k, v, g, beta]
+
+
+def get_init_inputs():
+    return [B, T, H, K, V, CHUNK_SIZE]

@@ -82,6 +82,11 @@ for rid in ${RIDS:-}; do
 done
 rm -f "$SEDF"
 echo "  redacted secrets from viewers"
+
+# Per-GPU board solutions (public/runs/<gpu>/<rid>_solution.py.txt) — the flat
+# emission above only covers the canonical RTX board.
+uv run python scripts/emit_board_solutions.py
+
 uv run python "$REPO_ROOT/scripts/redaction.py" "$REPO_ROOT/public/runs"
 
 # Bake usage.output_tokens into every per-GPU leaderboard so the homepage

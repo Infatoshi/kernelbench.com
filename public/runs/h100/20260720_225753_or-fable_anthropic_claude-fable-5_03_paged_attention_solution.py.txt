@@ -1,0 +1,147 @@
+"""Paged-attention decode for H100 (SM90), hand-written CUDA via load_inline.
+
+Two-stage flash-decoding with GQA head-group packing on tensor cores:
+  Stage 1: grid (B, Hkv, SPLITS), 4 warps/CTA, each warp streams pages of its
+  split. K/V pages are gathered into shared memory with cp.async (double
+  buffered, L2 evict_first streaming hint). Per 16-token page:
+  S = Q @ K^T via mma.m16n8k16 (M = head group padded to 16, N = tokens,
+  K = head_dim), online softmax on fragments, O += P @ V reusing the
+  S-accumulator -> A-operand fragment identity.
+  Stage 2: combine splits with logsumexp weighting.
+
+Forward wraps both launches in a cached CUDA graph keyed on input pointers,
+eliminating launch overhead (the small shapes are tens of microseconds).
+"""
+import math
+import os
+
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+CUDA_SRC = '\n#include <torch/extension.h>\n#include <ATen/cuda/CUDAContext.h>\n#include <cuda_bf16.h>\n#include <cuda_runtime.h>\n#include <functional>\n#include <vector>\n\n#define DEVINL __device__ __forceinline__\n\nDEVINL void cp_async16(void* smem, const void* gmem) {\n  unsigned s = (unsigned)__cvta_generic_to_shared(smem);\n  asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\\n" :: "r"(s), "l"(gmem));\n}\n// Streamed variant: L2 lines marked evict-first. KV has zero L2 reuse, so this\n// makes fills churn our own clean lines instead of evicting (dirty) lines of\n// other data, avoiding writeback stalls.\nDEVINL void cp_async16_stream(void* smem, const void* gmem, unsigned long long pol) {\n  unsigned s = (unsigned)__cvta_generic_to_shared(smem);\n  asm volatile("cp.async.cg.shared.global.L2::cache_hint [%0], [%1], 16, %2;\\n"\n               :: "r"(s), "l"(gmem), "l"(pol));\n}\nDEVINL unsigned long long make_evict_first_policy() {\n  unsigned long long pol;\n  asm volatile("createpolicy.fractional.L2::evict_first.b64 %0, 1.0;\\n" : "=l"(pol));\n  return pol;\n}\nDEVINL void cp_async_commit() { asm volatile("cp.async.commit_group;\\n"); }\ntemplate<int N> DEVINL void cp_async_wait() { asm volatile("cp.async.wait_group %0;\\n" :: "n"(N)); }\n\nDEVINL uint4 ldmatrix_x4(const void* smem) {\n  unsigned a = (unsigned)__cvta_generic_to_shared(smem);\n  uint4 r;\n  asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\\n"\n               : "=r"(r.x), "=r"(r.y), "=r"(r.z), "=r"(r.w) : "r"(a));\n  return r;\n}\nDEVINL uint4 ldmatrix_x4_trans(const void* smem) {\n  unsigned a = (unsigned)__cvta_generic_to_shared(smem);\n  uint4 r;\n  asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, [%4];\\n"\n               : "=r"(r.x), "=r"(r.y), "=r"(r.z), "=r"(r.w) : "r"(a));\n  return r;\n}\n// D = A * B + C, A: m16k16 bf16 (4 regs), B: k16n8 bf16 (2 regs), C/D: m16n8 fp32\nDEVINL void mma_16816(float4& c, uint4 a, unsigned b0, unsigned b1) {\n  asm volatile(\n    "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "\n    "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\\n"\n    : "+f"(c.x), "+f"(c.y), "+f"(c.z), "+f"(c.w)\n    : "r"(a.x), "r"(a.y), "r"(a.z), "r"(a.w), "r"(b0), "r"(b1));\n}\n\nDEVINL unsigned pack_bf16(float x, float y) {\n  __nv_bfloat162 h = __floats2bfloat162_rn(x, y);\n  return *reinterpret_cast<unsigned*>(&h);\n}\n\n// ---------------------------------------------------------------------------\n// Stage 1. grid (B, Hkv, SPLITS), block = WARPS*32 threads.\n// kv layout: (num_pages, PAGE, HKV, 2*D) bf16; q: (B, Hkv*G, D) bf16\n// partials: Ms/Ls (B, Hkv, S, G) fp32, Os (B, Hkv, S, G, D) fp32\n// ---------------------------------------------------------------------------\ntemplate<int D, int G, int HKV, int HP, int WARPS, int SLOTS>\n__global__ __launch_bounds__(WARPS * 32) void paged_stage1(\n    const __nv_bfloat16* __restrict__ q,\n    const __nv_bfloat16* __restrict__ kv,\n    const int* __restrict__ bt,\n    const int* __restrict__ seq_lens,\n    float* __restrict__ Ms,\n    float* __restrict__ Ls,\n    float* __restrict__ Os,\n    __nv_bfloat16* __restrict__ out,\n    int* __restrict__ counters,\n    int max_pages, int splits, float qk_scale_log2e)\n{\n  static_assert(G <= 8, "head group must fit the fragment row half");\n  constexpr int PAGE = 16;\n  constexpr int TOK_STRIDE = HKV * 2 * D;       // gmem elements between tokens\n  constexpr int SM_TOK = HP * 2 * D + 8;        // smem token stride (+16B pad)\n  constexpr int PAGE_ELEMS = PAGE * SM_TOK;     // page footprint in smem\n  constexpr int SQ = D + 8;                     // smem Q row stride\n  constexpr int NT = D / 8;                     // output n-tiles (8 cols each)\n\n  const int b = blockIdx.x, h = blockIdx.y, split = blockIdx.z;\n  const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;\n  const int L = seq_lens[b];\n  const int pages_total = (L + PAGE - 1) / PAGE;\n  const int pps = (pages_total + splits - 1) / splits;\n  const int p0 = split * pps;\n  const int p1 = min(p0 + pps, pages_total);\n\n  extern __shared__ __nv_bfloat16 smem[];\n  __nv_bfloat16* sq = smem;                          // (HP, 16, SQ)\n  __nv_bfloat16* kvbuf = smem + HP * 16 * SQ;        // WARPS * 2 * PAGE_ELEMS\n  __nv_bfloat16* buf = kvbuf + warp * SLOTS * PAGE_ELEMS;\n\n  // Per-lane fragment coordinates.\n  const int gRow = lane >> 2;        // head row (0..7) of x/y fragment slots\n  const int cPair = (lane & 3) * 2;  // column pair within an 8-wide tile\n\n  float m0[HP], l0[HP];              // softmax state for row gRow, per head\n  float4 acc[HP][NT];\n  #pragma unroll\n  for (int hp = 0; hp < HP; hp++) {\n    m0[hp] = -INFINITY; l0[hp] = 0.f;\n    #pragma unroll\n    for (int i = 0; i < NT; i++) acc[hp][i] = make_float4(0.f, 0.f, 0.f, 0.f);\n  }\n\n  const int* bt_row = bt + (size_t)b * max_pages;\n  const __nv_bfloat16* kv_h = kv + h * HP * 2 * D;\n  const unsigned long long pol = make_evict_first_policy();\n\n  auto load_page = [&](int p, int slot) {\n    const int page_id = __ldg(bt_row + p);\n    const __nv_bfloat16* base = kv_h + (size_t)page_id * PAGE * TOK_STRIDE;\n    __nv_bfloat16* dst = buf + slot * PAGE_ELEMS;\n    constexpr int CHUNKS_PER_TOKEN = (HP * 2 * D) / 8;  // 16B chunks per token\n    constexpr int TOK_PER_ITER = 32 / CHUNKS_PER_TOKEN; // 1 (D=128) or 2 (D=64)\n    const int t0 = lane / CHUNKS_PER_TOKEN;\n    const int c = lane % CHUNKS_PER_TOKEN;\n    #pragma unroll\n    for (int it = 0; it < PAGE / TOK_PER_ITER; it++) {\n      const int t = it * TOK_PER_ITER + t0;\n      cp_async16_stream(dst + t * SM_TOK + c * 8, base + (size_t)t * TOK_STRIDE + c * 8, pol);\n    }\n    cp_async_commit();\n  };\n\n  // ldmatrix lane->address maps (element offsets within a tile).\n  const int aRow = lane & 15, aCol = (lane >> 4) * 8;           // A operand (Q, 16x16)\n  const int kTok = (lane & 7) + ((lane >> 4) << 3);             // K: quadrants over tokens\n  const int kOff = ((lane >> 3) & 1) * 8;                       //    and k halves\n  const int vTok = lane & 15, vOff = (lane >> 4) * 8;           // V (trans)\n\n  int p = p0 + warp;\n  int slot = 0;\n  // Prime the pipeline. Empty commit groups keep the wait_group accounting\n  // aligned when a slot has no page to load (stream shorter than SLOTS-1, and\n  // at the stream tail below) -- otherwise the newest real copy could still be\n  // in flight when its page is computed.\n  #pragma unroll\n  for (int k = 0; k < SLOTS - 1; k++) {\n    if (p + k * WARPS < p1) load_page(p + k * WARPS, k);\n    else cp_async_commit();\n  }\n\n  // Load Q tiles (HP x 16 x D) after the KV prefetch is in flight: rows g < G\n  // real, rest zero.\n  {\n    const int Hq = HKV * G;\n    const __nv_bfloat16* qsrc = q + ((size_t)b * Hq + h * HP * G) * D;\n    for (int idx = threadIdx.x; idx < HP * 16 * D; idx += WARPS * 32) {\n      const int hp = idx / (16 * D), rem = idx % (16 * D);\n      const int r = rem / D, ccol = rem % D;\n      sq[(hp * 16 + r) * SQ + ccol] =\n          (r < G) ? qsrc[(hp * G + r) * D + ccol] : __float2bfloat16(0.f);\n    }\n  }\n  __syncthreads();\n  for (; p < p1; p += WARPS) {\n    const int pn = p + (SLOTS - 1) * WARPS;\n    if (pn < p1) load_page(pn, (slot + SLOTS - 1) % SLOTS);\n    else cp_async_commit();\n    cp_async_wait<SLOTS - 2>();\n    __syncwarp();\n\n    const __nv_bfloat16* pg = buf + slot * PAGE_ELEMS;\n    const int tokens_left = L - p * PAGE;  // >= 1\n\n    #pragma unroll\n    for (int hp = 0; hp < HP; hp++) {\n      const __nv_bfloat16* pgh = pg + hp * 2 * D;\n      // S = Q @ K^T : two n-tiles of 8 tokens.\n      float4 sf0 = make_float4(0.f, 0.f, 0.f, 0.f);\n      float4 sf1 = make_float4(0.f, 0.f, 0.f, 0.f);\n      #pragma unroll\n      for (int ks = 0; ks < D / 16; ks++) {\n        const uint4 aq = ldmatrix_x4(sq + (hp * 16 + aRow) * SQ + ks * 16 + aCol);\n        const uint4 bk = ldmatrix_x4(pgh + kTok * SM_TOK + ks * 16 + kOff);\n        mma_16816(sf0, aq, bk.x, bk.y);\n        mma_16816(sf1, aq, bk.z, bk.w);\n      }\n\n      // Scale into log2 domain; mask invalid tokens.\n      sf0.x *= qk_scale_log2e; sf0.y *= qk_scale_log2e;\n      sf1.x *= qk_scale_log2e; sf1.y *= qk_scale_log2e;\n      if (tokens_left < 16) {\n        if (cPair + 0 >= tokens_left) sf0.x = -INFINITY;\n        if (cPair + 1 >= tokens_left) sf0.y = -INFINITY;\n        if (cPair + 8 >= tokens_left) sf1.x = -INFINITY;\n        if (cPair + 9 >= tokens_left) sf1.y = -INFINITY;\n      }\n\n      // Row max over 16 tokens (4 local values + quad butterfly).\n      float rmax = fmaxf(fmaxf(sf0.x, sf0.y), fmaxf(sf1.x, sf1.y));\n      rmax = fmaxf(rmax, __shfl_xor_sync(0xffffffffu, rmax, 1));\n      rmax = fmaxf(rmax, __shfl_xor_sync(0xffffffffu, rmax, 2));\n\n      const float m_new = fmaxf(m0[hp], rmax);\n      const float alpha = exp2f(m0[hp] - m_new);   // exp2f(-inf)=0 on first page\n      m0[hp] = m_new;\n      const float p0x = exp2f(sf0.x - m_new);\n      const float p0y = exp2f(sf0.y - m_new);\n      const float p1x = exp2f(sf1.x - m_new);\n      const float p1y = exp2f(sf1.y - m_new);\n      float rsum = p0x + p0y + p1x + p1y;\n      rsum += __shfl_xor_sync(0xffffffffu, rsum, 1);\n      rsum += __shfl_xor_sync(0xffffffffu, rsum, 2);\n      l0[hp] = l0[hp] * alpha + rsum;\n\n      // P fragments as A operand (z/w rows are dead for G<=8 -> zeros).\n      uint4 ap;\n      ap.x = pack_bf16(p0x, p0y);\n      ap.y = 0u;\n      ap.z = pack_bf16(p1x, p1y);\n      ap.w = 0u;\n\n      // Rescale accumulators, then O += P @ V.\n      #pragma unroll\n      for (int i = 0; i < NT; i++) { acc[hp][i].x *= alpha; acc[hp][i].y *= alpha; }\n      #pragma unroll\n      for (int dt = 0; dt < D / 16; dt++) {\n        const uint4 bv = ldmatrix_x4_trans(pgh + vTok * SM_TOK + D + dt * 16 + vOff);\n        mma_16816(acc[hp][2 * dt], ap, bv.x, bv.y);\n        mma_16816(acc[hp][2 * dt + 1], ap, bv.z, bv.w);\n      }\n    }\n    slot = (slot + 1) % SLOTS;\n  }\n\n  // Cross-warp merge in shared memory (reuse K/V buffers -- sync first).\n  __syncthreads();\n  constexpr int GG = HP * G;                               // logical rows per CTA\n  float* sh_acc = reinterpret_cast<float*>(smem);          // [WARPS][GG][D]\n  float* sh_ml = sh_acc + WARPS * GG * D;                  // m then l: [2][WARPS][GG]\n  if (gRow < G) {\n    #pragma unroll\n    for (int hp = 0; hp < HP; hp++) {\n      #pragma unroll\n      for (int i = 0; i < NT; i++) {\n        sh_acc[(warp * GG + hp * G + gRow) * D + i * 8 + cPair] = acc[hp][i].x;\n        sh_acc[(warp * GG + hp * G + gRow) * D + i * 8 + cPair + 1] = acc[hp][i].y;\n      }\n      if ((lane & 3) == 0) {\n        sh_ml[warp * GG + hp * G + gRow] = m0[hp];\n        sh_ml[WARPS * GG + warp * GG + hp * G + gRow] = l0[hp];\n      }\n    }\n  }\n  __syncthreads();\n\n  const int tid = threadIdx.x;\n  // Global group index of logical row gg: (b, h*HP + gg/G) with sub-row gg%G.\n  const size_t grp0 = (size_t)b * HKV + h * HP;\n\n  if (splits == 1) {\n    // Single split: write the final normalized bf16 output directly.\n    if (tid < D) {\n      #pragma unroll\n      for (int gg = 0; gg < GG; gg++) {\n        float m_tot = -INFINITY;\n        #pragma unroll\n        for (int w = 0; w < WARPS; w++) m_tot = fmaxf(m_tot, sh_ml[w * GG + gg]);\n        float o = 0.f, l_tot = 0.f;\n        #pragma unroll\n        for (int w = 0; w < WARPS; w++) {\n          const float mw = sh_ml[w * GG + gg];\n          const float wgt = (mw == -INFINITY) ? 0.f : exp2f(mw - m_tot);\n          o = fmaf(sh_acc[(w * GG + gg) * D + tid], wgt, o);\n          l_tot = fmaf(sh_ml[WARPS * GG + w * GG + gg], wgt, l_tot);\n        }\n        out[((grp0 + gg / G) * G + gg % G) * D + tid] = __float2bfloat16(o / l_tot);\n      }\n    }\n    return;\n  }\n\n  if (tid < D) {\n    #pragma unroll\n    for (int gg = 0; gg < GG; gg++) {\n      const size_t out_base = ((grp0 + gg / G) * splits + split) * G + gg % G;\n      float m_tot = -INFINITY;\n      #pragma unroll\n      for (int w = 0; w < WARPS; w++) m_tot = fmaxf(m_tot, sh_ml[w * GG + gg]);\n      float o = 0.f, l_tot = 0.f;\n      #pragma unroll\n      for (int w = 0; w < WARPS; w++) {\n        const float mw = sh_ml[w * GG + gg];\n        const float wgt = (mw == -INFINITY) ? 0.f : exp2f(mw - m_tot);\n        o = fmaf(sh_acc[(w * GG + gg) * D + tid], wgt, o);\n        l_tot = fmaf(sh_ml[WARPS * GG + w * GG + gg], wgt, l_tot);\n      }\n      Os[out_base * D + tid] = o;\n      if (tid == 0) { Ms[out_base] = m_tot; Ls[out_base] = l_tot; }\n    }\n  }\n}\n\n// ---------------------------------------------------------------------------\n// Stage 2: one CTA per (b, hq) output row. 2D block (32, SW): warp sw handles\n// splits sw, sw+SW, ... so all split loads issue concurrently; tree-reduce in\n// shared memory.\n// ---------------------------------------------------------------------------\ntemplate<int D, int SW>\n__global__ void paged_combine(\n    const float* __restrict__ Ms,\n    const float* __restrict__ Ls,\n    const float* __restrict__ Os,\n    __nv_bfloat16* __restrict__ out,\n    int splits, int G)\n{\n  const int row = blockIdx.x;              // b*Hq + hq\n  const int lane = threadIdx.x;            // 0..31\n  const int sw = threadIdx.y;              // 0..SW-1\n  const int bh = row / G, g = row % G;\n  const size_t base = ((size_t)bh * splits) * G + g;\n\n  // Programmatic dependent launch: CTAs may start before stage1 finishes;\n  // block here until its memory is visible.\n  cudaGridDependencySynchronize();\n\n  float mv = (lane < splits) ? Ms[base + (size_t)lane * G] : -INFINITY;\n  float lv = (lane < splits) ? Ls[base + (size_t)lane * G] : 0.f;\n  float m_max = mv;\n  #pragma unroll\n  for (int off = 16; off; off >>= 1)\n    m_max = fmaxf(m_max, __shfl_xor_sync(0xffffffffu, m_max, off));\n  const float wgt = (mv == -INFINITY) ? 0.f : exp2f(mv - m_max);\n  float l_tot = lv * wgt;\n  #pragma unroll\n  for (int off = 16; off; off >>= 1)\n    l_tot += __shfl_xor_sync(0xffffffffu, l_tot, off);\n  const float inv_l = 1.f / l_tot;\n\n  float o[D / 32];\n  #pragma unroll\n  for (int i = 0; i < D / 32; i++) o[i] = 0.f;\n  for (int ss = sw; ss < splits; ss += SW) {\n    const float w = __shfl_sync(0xffffffffu, wgt, ss);\n    const float* src = Os + (base + (size_t)ss * G) * D;\n    #pragma unroll\n    for (int i = 0; i < D / 32; i++)\n      o[i] = fmaf(src[lane + 32 * i], w, o[i]);\n  }\n\n  __shared__ float sh[SW][D];\n  #pragma unroll\n  for (int i = 0; i < D / 32; i++) sh[sw][lane + 32 * i] = o[i];\n  __syncthreads();\n  const int tid = threadIdx.y * 32 + threadIdx.x;\n  if (tid < D) {\n    float v = sh[0][tid];\n    #pragma unroll\n    for (int w = 1; w < SW; w++) v += sh[w][tid];\n    out[(size_t)row * D + tid] = __float2bfloat16(v * inv_l);\n  }\n}\n\ntemplate<int D, int G, int HKV, int HP, int WARPS, int SLOTS>\nvoid launch_cfg(const at::Tensor& q, const at::Tensor& kv, const at::Tensor& bt,\n                const at::Tensor& sl, at::Tensor& Ms, at::Tensor& Ls, at::Tensor& Os,\n                at::Tensor& out, at::Tensor& counters,\n                int64_t splits, double scale, cudaStream_t stream)\n{\n  const int B = q.size(0);\n  constexpr int PAGE_ELEMS = 16 * (HP * 2 * D + 8);\n  constexpr int SQ_ELEMS = HP * 16 * (D + 8);\n  const int smem1 = std::max((SQ_ELEMS + WARPS * SLOTS * PAGE_ELEMS) * 2,\n                             (int)((WARPS * HP * G * D + 2 * WARPS * HP * G) * 4));\n  dim3 grid1(B, HKV / HP, splits);\n  const float qk_scale_log2e = (float)(scale * 1.44269504088896340736);\n  auto kfn = paged_stage1<D, G, HKV, HP, WARPS, SLOTS>;\n  cudaFuncSetAttribute(kfn, cudaFuncAttributeMaxDynamicSharedMemorySize, 200 * 1024);\n  kfn<<<grid1, WARPS * 32, smem1, stream>>>(\n      reinterpret_cast<const __nv_bfloat16*>(q.data_ptr()),\n      reinterpret_cast<const __nv_bfloat16*>(kv.data_ptr()),\n      bt.data_ptr<int>(), sl.data_ptr<int>(),\n      Ms.data_ptr<float>(), Ls.data_ptr<float>(), Os.data_ptr<float>(),\n      reinterpret_cast<__nv_bfloat16*>(out.data_ptr()),\n      counters.data_ptr<int>(),\n      (int)bt.size(1), (int)splits, qk_scale_log2e);\n  if (splits > 1) {\n    const int Hq = q.size(1);\n    constexpr int SW = 8;\n    dim3 grid2(B * Hq);\n    dim3 block2(32, SW);\n    cudaLaunchAttribute attr[1];\n    attr[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;\n    attr[0].val.programmaticStreamSerializationAllowed = 1;\n    cudaLaunchConfig_t cfg;\n    cfg.gridDim = grid2; cfg.blockDim = block2; cfg.dynamicSmemBytes = 0;\n    cfg.stream = stream; cfg.attrs = attr; cfg.numAttrs = 1;\n    cudaLaunchKernelEx(&cfg, paged_combine<D, SW>,\n        Ms.data_ptr<float>(), Ls.data_ptr<float>(), Os.data_ptr<float>(),\n        reinterpret_cast<__nv_bfloat16*>(out.data_ptr()), (int)splits, (int)G);\n  }\n}\n\ntemplate<int D, int G, int HKV, int HP>\nvoid launch_typed(const at::Tensor& q, const at::Tensor& kv, const at::Tensor& bt,\n                  const at::Tensor& sl, at::Tensor& Ms, at::Tensor& Ls, at::Tensor& Os,\n                  at::Tensor& out, at::Tensor& counters,\n                  int64_t splits, double scale, cudaStream_t stream, int warps, int slots)\n{\n  #define CFG(W, S) launch_cfg<D, G, HKV, HP, W, S>(q, kv, bt, sl, Ms, Ls, Os, out, counters, splits, scale, stream)\n  if (warps == 4 && slots == 2)      CFG(4, 2);\n  else if (warps == 4 && slots == 3) CFG(4, 3);\n  else if (warps == 4 && slots == 4) CFG(4, 4);\n  else if (warps == 2 && slots == 2) CFG(2, 2);\n  else if (warps == 2 && slots == 3) CFG(2, 3);\n  else if (warps == 2 && slots == 4) CFG(2, 4);\n  else TORCH_CHECK(false, "unsupported warps/slots: ", warps, " ", slots);\n  #undef CFG\n}\n\nstatic void launch_dispatch(at::Tensor& q, at::Tensor& kv, at::Tensor& bt, at::Tensor& sl,\n                            at::Tensor& Ms, at::Tensor& Ls, at::Tensor& Os, at::Tensor& out,\n                            at::Tensor& counters, int64_t splits, double scale,\n                            cudaStream_t stream, int warps, int slots)\n{\n  const int D = q.size(2);\n  const int Hkv = kv.size(2);\n  const int G = q.size(1) / Hkv;\n  TORCH_CHECK(splits <= 32, "splits must be <= 32");\n\n  if (D == 128 && G == 4 && Hkv == 8)      launch_typed<128, 4, 8, 1>(q, kv, bt, sl, Ms, Ls, Os, out, counters, splits, scale, stream, warps, slots);\n  else if (D == 128 && G == 8 && Hkv == 8) launch_typed<128, 8, 8, 1>(q, kv, bt, sl, Ms, Ls, Os, out, counters, splits, scale, stream, warps, slots);\n  else if (D == 64 && G == 4 && Hkv == 4)  launch_typed<64, 4, 4, 1>(q, kv, bt, sl, Ms, Ls, Os, out, counters, splits, scale, stream, warps, slots);\n  else if (D == 128 && G == 4 && Hkv == 4) launch_typed<128, 4, 4, 1>(q, kv, bt, sl, Ms, Ls, Os, out, counters, splits, scale, stream, warps, slots);\n  else if (D == 64 && G == 8 && Hkv == 4)  launch_typed<64, 8, 4, 1>(q, kv, bt, sl, Ms, Ls, Os, out, counters, splits, scale, stream, warps, slots);\n  else if (D == 128 && G == 2 && Hkv == 8) launch_typed<128, 2, 8, 1>(q, kv, bt, sl, Ms, Ls, Os, out, counters, splits, scale, stream, warps, slots);\n  else if (D == 128 && G == 1 && Hkv == 8) launch_typed<128, 1, 8, 1>(q, kv, bt, sl, Ms, Ls, Os, out, counters, splits, scale, stream, warps, slots);\n  else TORCH_CHECK(false, "unsupported (D, G, Hkv) combo: ", D, " ", G, " ", Hkv);\n}\n\nvoid paged_decode(at::Tensor q, at::Tensor kv, at::Tensor bt, at::Tensor sl,\n                  at::Tensor Ms, at::Tensor Ls, at::Tensor Os, at::Tensor out,\n                  at::Tensor counters, int64_t splits, double scale,\n                  int64_t warps, int64_t slots)\n{\n  launch_dispatch(q, kv, bt, sl, Ms, Ls, Os, out, counters, splits, scale,\n                  at::cuda::getCurrentCUDAStream(), (int)warps, (int)slots);\n}\n\n// Graph capture / replay with a C++-side exec cache (minimal per-call overhead).\nstatic std::vector<cudaGraphExec_t> g_execs;\n\nint64_t paged_capture(at::Tensor q, at::Tensor kv, at::Tensor bt, at::Tensor sl,\n                      at::Tensor Ms, at::Tensor Ls, at::Tensor Os, at::Tensor out,\n                      at::Tensor counters, int64_t splits, double scale,\n                      int64_t warps, int64_t slots)\n{\n  at::cuda::CUDAStream cap_stream = at::cuda::getStreamFromPool();\n  cudaStream_t s = cap_stream.stream();\n  // Warm-up launch (also produces valid output for the first call).\n  launch_dispatch(q, kv, bt, sl, Ms, Ls, Os, out, counters, splits, scale, s,\n                  (int)warps, (int)slots);\n  cudaStreamSynchronize(s);\n  cudaGraph_t graph;\n  TORCH_CHECK(cudaStreamBeginCapture(s, cudaStreamCaptureModeThreadLocal) == cudaSuccess);\n  launch_dispatch(q, kv, bt, sl, Ms, Ls, Os, out, counters, splits, scale, s,\n                  (int)warps, (int)slots);\n  TORCH_CHECK(cudaStreamEndCapture(s, &graph) == cudaSuccess);\n  cudaGraphExec_t exec;\n  TORCH_CHECK(cudaGraphInstantiate(&exec, graph, 0) == cudaSuccess);\n  cudaGraphDestroy(graph);\n  g_execs.push_back(exec);\n  return (int64_t)g_execs.size() - 1;\n}\n\nvoid paged_replay(int64_t idx)\n{\n  cudaGraphLaunch(g_execs[idx], at::cuda::getCurrentCUDAStream());\n}\n\n// Direct re-launch path (no graph): capture args in a lambda once, then each\n// call is just cudaLaunchKernel(s) on the current stream.\nstatic std::vector<std::function<void(cudaStream_t)>> g_baked;\n\nint64_t paged_bake(at::Tensor q, at::Tensor kv, at::Tensor bt, at::Tensor sl,\n                   at::Tensor Ms, at::Tensor Ls, at::Tensor Os, at::Tensor out,\n                   at::Tensor counters, int64_t splits, double scale,\n                   int64_t warps, int64_t slots)\n{\n  auto fn = [=](cudaStream_t s) mutable {\n    launch_dispatch(q, kv, bt, sl, Ms, Ls, Os, out, counters, splits, scale, s,\n                    (int)warps, (int)slots);\n  };\n  g_baked.push_back(fn);\n  return (int64_t)g_baked.size() - 1;\n}\n\nvoid paged_run(int64_t idx)\n{\n  g_baked[idx](at::cuda::getCurrentCUDAStream());\n}\n'
+
+CPP_SRC = '\nvoid paged_decode(at::Tensor q, at::Tensor kv, at::Tensor bt, at::Tensor sl,\n                  at::Tensor Ms, at::Tensor Ls, at::Tensor Os, at::Tensor out,\n                  at::Tensor counters, int64_t splits, double scale,\n                  int64_t warps, int64_t slots);\nint64_t paged_capture(at::Tensor q, at::Tensor kv, at::Tensor bt, at::Tensor sl,\n                      at::Tensor Ms, at::Tensor Ls, at::Tensor Os, at::Tensor out,\n                      at::Tensor counters, int64_t splits, double scale,\n                      int64_t warps, int64_t slots);\nvoid paged_replay(int64_t idx);\nint64_t paged_bake(at::Tensor q, at::Tensor kv, at::Tensor bt, at::Tensor sl,\n                   at::Tensor Ms, at::Tensor Ls, at::Tensor Os, at::Tensor out,\n                   at::Tensor counters, int64_t splits, double scale,\n                   int64_t warps, int64_t slots);\nvoid paged_run(int64_t idx);\n'
+
+_ext = None
+
+
+def _get_ext():
+    global _ext
+    if _ext is None:
+        os.environ.setdefault("TORCH_CUDA_ARCH_LIST", "9.0")
+        _ext = load_inline(
+            name="paged_decode_ext",
+            cpp_sources=CPP_SRC,
+            cuda_sources=CUDA_SRC,
+            functions=["paged_decode", "paged_capture", "paged_replay"],
+            extra_cuda_cflags=["-O3", "--use_fast_math", "-std=c++17"],
+            verbose=False,
+        )
+    return _ext
+
+
+class Model(nn.Module):
+    def __init__(self, batch, num_heads, num_kv_heads, head_dim, seq_len, page_size):
+        super().__init__()
+        assert num_heads % num_kv_heads == 0
+        self.batch = batch
+        self.num_heads = num_heads
+        self.num_kv_heads = num_kv_heads
+        self.head_dim = head_dim
+        self.seq_len = seq_len
+        self.page_size = page_size
+        self.group_size = num_heads // num_kv_heads
+        self.scale = 1.0 / math.sqrt(head_dim)
+        self.register_buffer("_dummy", torch.zeros(1, dtype=torch.bfloat16), persistent=False)
+
+        pages_total = (seq_len + page_size - 1) // page_size
+        groups = batch * num_kv_heads
+        # >= ~64 CTAs saturates DRAM; longer per-CTA streams beat more splits.
+        splits = 1 if groups >= 64 else -(-96 // groups)
+        self.splits = max(1, min(pages_total, 32, splits))
+        self.warps = 4
+        # Small grids benefit from a deeper cp.async pipeline; large grids from
+        # the extra CTA occupancy of smaller shared-memory footprints.
+        self.slots = 3 if groups * self.splits <= 128 else 2
+        self._scratch = None
+        self._graphs = {}
+        self._last = None
+        self._ext = _get_ext()
+        self._replay = self._ext.paged_replay
+
+    def _get_scratch(self, device):
+        if self._scratch is None:
+            B, Hkv, S = self.batch, self.num_kv_heads, self.splits
+            G, D = self.group_size, self.head_dim
+            self._scratch = (
+                torch.empty(B, Hkv, S, G, dtype=torch.float32, device=device),
+                torch.empty(B, Hkv, S, G, dtype=torch.float32, device=device),
+                torch.empty(B, Hkv, S, G, D, dtype=torch.float32, device=device),
+                torch.empty(B, self.num_heads, D, dtype=torch.bfloat16, device=device),
+                torch.zeros(B * Hkv, dtype=torch.int32, device=device),
+            )
+        return self._scratch
+
+    def forward(self, query, kv_cache, block_table, seq_lens):
+        # Fast path: same tensor objects as the previous call (the benchmark
+        # loop) -> replay without any data_ptr() round trips. Holding strong
+        # refs in _last keeps the captured addresses valid.
+        e = self._last
+        if (e is not None and e[0] is query and e[1] is kv_cache
+                and e[2] is block_table and e[3] is seq_lens):
+            self._replay(e[4])
+            return self._out
+        key = (query.data_ptr(), kv_cache.data_ptr(), block_table.data_ptr(),
+               seq_lens.data_ptr())
+        idx = self._graphs.get(key)
+        if idx is None:
+            ms, ls, os_, out, ctr = self._get_scratch(query.device)
+            self._out = out
+            try:
+                idx = self._ext.paged_capture(query, kv_cache, block_table, seq_lens,
+                                              ms, ls, os_, out, ctr,
+                                              self.splits, self.scale,
+                                              self.warps, self.slots)
+            except Exception:
+                # Graph capture unavailable: eager launch.
+                self._ext.paged_decode(query, kv_cache, block_table, seq_lens,
+                                       ms, ls, os_, out, ctr,
+                                       self.splits, self.scale,
+                                       self.warps, self.slots)
+                return out
+            self._graphs[key] = idx
+            self._last = (query, kv_cache, block_table, seq_lens, idx)
+            return out
+        self._last = (query, kv_cache, block_table, seq_lens, idx)
+        self._replay(idx)
+        return self._out
+
+    def __call__(self, *args, **kwargs):
+        # Bypass nn.Module's hook machinery on the hot path.
+        return self.forward(*args, **kwargs)
+
+
+# --- Shape knobs (mirrors reference.py; check.py/benchmark.py override) ------
+BATCH = 8
+NUM_HEADS = 32
+NUM_KV_HEADS = 8
+HEAD_DIM = 128
+SEQ_LEN = 1024
+PAGE_SIZE = 16
+
+
+def get_inputs():
+    B, H, Hkv, D, L, P = BATCH, NUM_HEADS, NUM_KV_HEADS, HEAD_DIM, SEQ_LEN, PAGE_SIZE
+    pages_per_seq = (L + P - 1) // P
+    total_pages = max(B * pages_per_seq + 8, 64)
+    query = torch.randn(B, H, D, dtype=torch.bfloat16) * 0.1
+    kv_cache = torch.randn(total_pages, P, Hkv, 2 * D, dtype=torch.bfloat16) * 0.1
+    perm = torch.randperm(total_pages)[: B * pages_per_seq].reshape(B, pages_per_seq).int()
+    block_table = perm.contiguous()
+    seq_lens = torch.full((B,), L, dtype=torch.int32)
+    return [query, kv_cache, block_table, seq_lens]
+
+
+def get_init_inputs():
+    return [BATCH, NUM_HEADS, NUM_KV_HEADS, HEAD_DIM, SEQ_LEN, PAGE_SIZE]

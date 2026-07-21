@@ -1,0 +1,1033 @@
+"""FP8 e4m3 GEMM for H100 (SM90): custom WGMMA + TMA persistent kernel.
+
+y = ((x @ w.T) * weight_scale).to(bf16), with x (M,K) fp8_e4m3, w (N,K) fp8_e4m3,
+weight_scale (N,) fp32. The kernel:
+  - TMA (cp.async.bulk.tensor.2d, SW128 swizzle) loads of A/B tiles through a
+    multi-stage mbarrier pipeline driven by a dedicated producer warp,
+  - two consumer warpgroups issuing wgmma.mma_async m64nBNk32.f32.e4m3.e4m3 with
+    deferred empty-stage arrival for overlap,
+  - epilogue: per-channel scale fused, bf16 convert, SW128-swizzled smem bounce,
+    async TMA stores (overlapped with the next tile's mainloop),
+  - grouped persistent rasterization for L2 reuse.
+For K % 128 != 0 the K dim is padded once per call into contiguous aligned
+buffers (TMA requires 16B-aligned strides). Odd/smaller shapes fall back to a
+Triton tl.dot fp8 kernel.
+"""
+import hashlib
+import os
+from pathlib import Path
+
+os.environ["TORCH_CUDA_ARCH_LIST"] = "9.0a"  # force sm_90a: sm_100 targets break wgmma compile
+
+import torch
+import torch.nn as nn
+
+OP_TYPE = "gemm"
+SUPPORTED_PRECISIONS = ["fp8_e4m3"]
+E4M3_MAX = 448.0
+
+_CUDA_SRC = r'''// SPDX-License-Identifier: MIT
+// FP8 e4m3 GEMM for SM90, v3: TMA-store epilogue with swizzled smem subtiles.
+// A(M,K) fp8, B(N,K) fp8 (K-contig), C(M,N) bf16, per-N fp32 scale in epilogue.
+//
+// 288 threads: warps 0-7 = two consumer warpgroups (each m64 x BN), warp 8 = TMA producer.
+// Pipeline: TMA -> full_bar -> wgmma (deferred empty arrival, PD deep) -> accumulator
+// -> scales from smem (double-buffered) -> cvt bf16 -> SW128-swizzled smem subtile
+// -> cp.async.bulk.tensor.2d store (async, overlaps next tile's mainloop).
+#include <cuda.h>
+#include <cuda_bf16.h>
+#include <cstdint>
+
+#define DEV_INLINE __device__ __forceinline__
+
+DEV_INLINE uint32_t smem_u32(const void* p) {
+    return static_cast<uint32_t>(__cvta_generic_to_shared(p));
+}
+
+struct MBarrier {
+    DEV_INLINE static void init(uint64_t* bar, uint32_t count) {
+        asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;" :: "r"(smem_u32(bar)), "r"(count));
+    }
+    DEV_INLINE static void arrive_expect_tx(uint64_t* bar, uint32_t tx_bytes) {
+        asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;"
+                     :: "r"(smem_u32(bar)), "r"(tx_bytes));
+    }
+    DEV_INLINE static void arrive(uint64_t* bar) {
+        asm volatile("mbarrier.arrive.shared::cta.b64 _, [%0];" :: "r"(smem_u32(bar)));
+    }
+    DEV_INLINE static void wait(uint64_t* bar, uint32_t phase) {
+        asm volatile(
+            "{\n"
+            ".reg .pred P;\n"
+            "LAB_WAIT_%=:\n"
+            "mbarrier.try_wait.parity.shared::cta.b64 P, [%0], %1;\n"
+            "@P bra DONE_%=;\n"
+            "bra LAB_WAIT_%=;\n"
+            "DONE_%=:\n"
+            "}\n" :: "r"(smem_u32(bar)), "r"(phase));
+    }
+};
+
+DEV_INLINE void fence_mbarrier_init() {
+    asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
+}
+
+DEV_INLINE void tma_load_2d(const CUtensorMap* desc, uint64_t* bar, void* smem,
+                            int32_t c0, int32_t c1) {
+    asm volatile(
+        "cp.async.bulk.tensor.2d.shared::cluster.global.mbarrier::complete_tx::bytes"
+        " [%0], [%1, {%3, %4}], [%2];"
+        :: "r"(smem_u32(smem)), "l"(reinterpret_cast<uint64_t>(desc)),
+           "r"(smem_u32(bar)), "r"(c0), "r"(c1)
+        : "memory");
+}
+
+DEV_INLINE void tma_store_2d(const CUtensorMap* desc, const void* smem, int32_t c0, int32_t c1) {
+    asm volatile(
+        "cp.async.bulk.tensor.2d.global.shared::cta.bulk_group [%0, {%2, %3}], [%1];"
+        :: "l"(reinterpret_cast<uint64_t>(desc)), "r"(smem_u32(smem)), "r"(c0), "r"(c1)
+        : "memory");
+}
+DEV_INLINE void tma_store_commit() { asm volatile("cp.async.bulk.commit_group;" ::: "memory"); }
+template <int N> DEV_INLINE void tma_store_wait() {
+    asm volatile("cp.async.bulk.wait_group.read %0;" :: "n"(N) : "memory");
+}
+DEV_INLINE void tma_store_fence() { asm volatile("fence.proxy.async.shared::cta;" ::: "memory"); }
+
+DEV_INLINE uint64_t make_desc(const void* smem_ptr, uint32_t lbo, uint32_t sbo, uint32_t layout) {
+    uint32_t addr = smem_u32(smem_ptr);
+    return (uint64_t)(addr >> 4) | ((uint64_t)(lbo >> 4) << 16) | ((uint64_t)(sbo >> 4) << 32) |
+           ((uint64_t)layout << 62);
+}
+DEV_INLINE uint64_t gmma_desc_kmajor_sw128(const void* smem_ptr) {
+    return make_desc(smem_ptr, 0, 1024, 1);  // B128 swizzle, K-major
+}
+
+DEV_INLINE void wgmma_fence() { asm volatile("wgmma.fence.sync.aligned;" ::: "memory"); }
+DEV_INLINE void wgmma_commit() { asm volatile("wgmma.commit_group.sync.aligned;" ::: "memory"); }
+template <int N> DEV_INLINE void wgmma_wait() {
+    asm volatile("wgmma.wait_group.sync.aligned %0;" :: "n"(N) : "memory");
+}
+DEV_INLINE void fence_op(float& r) { asm volatile("" : "+f"(r) :: "memory"); }
+
+DEV_INLINE void consumer_barrier() {
+    asm volatile("bar.sync 15, 256;" ::: "memory");
+}
+
+#define WGMMA_FP8_N256(d, da, db, sd)                                                                                \
+    asm volatile(                                                                                                    \
+        "{\n"                                                                                                        \
+        "wgmma.mma_async.sync.aligned.m64n256k32.f32.e4m3.e4m3 "                                                     \
+        "{%0,%1,%2,%3,%4,%5,%6,%7,%8,%9,%10,%11,%12,%13,%14,%15,"                                                    \
+        "%16,%17,%18,%19,%20,%21,%22,%23,%24,%25,%26,%27,%28,%29,%30,%31,"                                           \
+        "%32,%33,%34,%35,%36,%37,%38,%39,%40,%41,%42,%43,%44,%45,%46,%47,"                                           \
+        "%48,%49,%50,%51,%52,%53,%54,%55,%56,%57,%58,%59,%60,%61,%62,%63,"                                           \
+        "%64,%65,%66,%67,%68,%69,%70,%71,%72,%73,%74,%75,%76,%77,%78,%79,"                                           \
+        "%80,%81,%82,%83,%84,%85,%86,%87,%88,%89,%90,%91,%92,%93,%94,%95,"                                           \
+        "%96,%97,%98,%99,%100,%101,%102,%103,%104,%105,%106,%107,%108,%109,%110,%111,"                               \
+        "%112,%113,%114,%115,%116,%117,%118,%119,%120,%121,%122,%123,%124,%125,%126,%127}, "                         \
+        "%128, %129, %130, 1, 1;\n"                                                                                  \
+        "}\n"                                                                                                        \
+        : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3]), "+f"(d[4]), "+f"(d[5]), "+f"(d[6]), "+f"(d[7]),            \
+          "+f"(d[8]), "+f"(d[9]), "+f"(d[10]), "+f"(d[11]), "+f"(d[12]), "+f"(d[13]), "+f"(d[14]), "+f"(d[15]),      \
+          "+f"(d[16]), "+f"(d[17]), "+f"(d[18]), "+f"(d[19]), "+f"(d[20]), "+f"(d[21]), "+f"(d[22]), "+f"(d[23]),    \
+          "+f"(d[24]), "+f"(d[25]), "+f"(d[26]), "+f"(d[27]), "+f"(d[28]), "+f"(d[29]), "+f"(d[30]), "+f"(d[31]),    \
+          "+f"(d[32]), "+f"(d[33]), "+f"(d[34]), "+f"(d[35]), "+f"(d[36]), "+f"(d[37]), "+f"(d[38]), "+f"(d[39]),    \
+          "+f"(d[40]), "+f"(d[41]), "+f"(d[42]), "+f"(d[43]), "+f"(d[44]), "+f"(d[45]), "+f"(d[46]), "+f"(d[47]),    \
+          "+f"(d[48]), "+f"(d[49]), "+f"(d[50]), "+f"(d[51]), "+f"(d[52]), "+f"(d[53]), "+f"(d[54]), "+f"(d[55]),    \
+          "+f"(d[56]), "+f"(d[57]), "+f"(d[58]), "+f"(d[59]), "+f"(d[60]), "+f"(d[61]), "+f"(d[62]), "+f"(d[63]),    \
+          "+f"(d[64]), "+f"(d[65]), "+f"(d[66]), "+f"(d[67]), "+f"(d[68]), "+f"(d[69]), "+f"(d[70]), "+f"(d[71]),    \
+          "+f"(d[72]), "+f"(d[73]), "+f"(d[74]), "+f"(d[75]), "+f"(d[76]), "+f"(d[77]), "+f"(d[78]), "+f"(d[79]),    \
+          "+f"(d[80]), "+f"(d[81]), "+f"(d[82]), "+f"(d[83]), "+f"(d[84]), "+f"(d[85]), "+f"(d[86]), "+f"(d[87]),    \
+          "+f"(d[88]), "+f"(d[89]), "+f"(d[90]), "+f"(d[91]), "+f"(d[92]), "+f"(d[93]), "+f"(d[94]), "+f"(d[95]),    \
+          "+f"(d[96]), "+f"(d[97]), "+f"(d[98]), "+f"(d[99]), "+f"(d[100]), "+f"(d[101]), "+f"(d[102]),              \
+          "+f"(d[103]), "+f"(d[104]), "+f"(d[105]), "+f"(d[106]), "+f"(d[107]), "+f"(d[108]), "+f"(d[109]),          \
+          "+f"(d[110]), "+f"(d[111]), "+f"(d[112]), "+f"(d[113]), "+f"(d[114]), "+f"(d[115]), "+f"(d[116]),          \
+          "+f"(d[117]), "+f"(d[118]), "+f"(d[119]), "+f"(d[120]), "+f"(d[121]), "+f"(d[122]), "+f"(d[123]),          \
+          "+f"(d[124]), "+f"(d[125]), "+f"(d[126]), "+f"(d[127])                                                     \
+        : "l"(da), "l"(db), "n"(sd))
+
+#define WGMMA_FP8_N128(d, da, db, sd)                                                                                \
+    asm volatile(                                                                                                    \
+        "{\n"                                                                                                        \
+        "wgmma.mma_async.sync.aligned.m64n128k32.f32.e4m3.e4m3 "                                                     \
+        "{%0,%1,%2,%3,%4,%5,%6,%7,%8,%9,%10,%11,%12,%13,%14,%15,"                                                    \
+        "%16,%17,%18,%19,%20,%21,%22,%23,%24,%25,%26,%27,%28,%29,%30,%31,"                                           \
+        "%32,%33,%34,%35,%36,%37,%38,%39,%40,%41,%42,%43,%44,%45,%46,%47,"                                           \
+        "%48,%49,%50,%51,%52,%53,%54,%55,%56,%57,%58,%59,%60,%61,%62,%63}, "                                         \
+        "%64, %65, %66, 1, 1;\n"                                                                                     \
+        "}\n"                                                                                                        \
+        : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3]), "+f"(d[4]), "+f"(d[5]), "+f"(d[6]), "+f"(d[7]),            \
+          "+f"(d[8]), "+f"(d[9]), "+f"(d[10]), "+f"(d[11]), "+f"(d[12]), "+f"(d[13]), "+f"(d[14]), "+f"(d[15]),      \
+          "+f"(d[16]), "+f"(d[17]), "+f"(d[18]), "+f"(d[19]), "+f"(d[20]), "+f"(d[21]), "+f"(d[22]), "+f"(d[23]),    \
+          "+f"(d[24]), "+f"(d[25]), "+f"(d[26]), "+f"(d[27]), "+f"(d[28]), "+f"(d[29]), "+f"(d[30]), "+f"(d[31]),    \
+          "+f"(d[32]), "+f"(d[33]), "+f"(d[34]), "+f"(d[35]), "+f"(d[36]), "+f"(d[37]), "+f"(d[38]), "+f"(d[39]),    \
+          "+f"(d[40]), "+f"(d[41]), "+f"(d[42]), "+f"(d[43]), "+f"(d[44]), "+f"(d[45]), "+f"(d[46]), "+f"(d[47]),    \
+          "+f"(d[48]), "+f"(d[49]), "+f"(d[50]), "+f"(d[51]), "+f"(d[52]), "+f"(d[53]), "+f"(d[54]), "+f"(d[55]),    \
+          "+f"(d[56]), "+f"(d[57]), "+f"(d[58]), "+f"(d[59]), "+f"(d[60]), "+f"(d[61]), "+f"(d[62]), "+f"(d[63])     \
+        : "l"(da), "l"(db), "n"(sd))
+
+#define WGMMA_FP8_N192(d, da, db, sd)                                                                                \
+    asm volatile(                                                                                                    \
+        "{\n"                                                                                                        \
+        "wgmma.mma_async.sync.aligned.m64n192k32.f32.e4m3.e4m3 "                                                     \
+        "{%0,%1,%2,%3,%4,%5,%6,%7,%8,%9,%10,%11,%12,%13,%14,%15,"                                                    \
+        "%16,%17,%18,%19,%20,%21,%22,%23,%24,%25,%26,%27,%28,%29,%30,%31,"                                           \
+        "%32,%33,%34,%35,%36,%37,%38,%39,%40,%41,%42,%43,%44,%45,%46,%47,"                                           \
+        "%48,%49,%50,%51,%52,%53,%54,%55,%56,%57,%58,%59,%60,%61,%62,%63,"                                           \
+        "%64,%65,%66,%67,%68,%69,%70,%71,%72,%73,%74,%75,%76,%77,%78,%79,"                                           \
+        "%80,%81,%82,%83,%84,%85,%86,%87,%88,%89,%90,%91,%92,%93,%94,%95}, "                                         \
+        "%96, %97, %98, 1, 1;\n"                                                                                     \
+        "}\n"                                                                                                        \
+        : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3]), "+f"(d[4]), "+f"(d[5]), "+f"(d[6]), "+f"(d[7]),            \
+          "+f"(d[8]), "+f"(d[9]), "+f"(d[10]), "+f"(d[11]), "+f"(d[12]), "+f"(d[13]), "+f"(d[14]), "+f"(d[15]),      \
+          "+f"(d[16]), "+f"(d[17]), "+f"(d[18]), "+f"(d[19]), "+f"(d[20]), "+f"(d[21]), "+f"(d[22]), "+f"(d[23]),    \
+          "+f"(d[24]), "+f"(d[25]), "+f"(d[26]), "+f"(d[27]), "+f"(d[28]), "+f"(d[29]), "+f"(d[30]), "+f"(d[31]),    \
+          "+f"(d[32]), "+f"(d[33]), "+f"(d[34]), "+f"(d[35]), "+f"(d[36]), "+f"(d[37]), "+f"(d[38]), "+f"(d[39]),    \
+          "+f"(d[40]), "+f"(d[41]), "+f"(d[42]), "+f"(d[43]), "+f"(d[44]), "+f"(d[45]), "+f"(d[46]), "+f"(d[47]),    \
+          "+f"(d[48]), "+f"(d[49]), "+f"(d[50]), "+f"(d[51]), "+f"(d[52]), "+f"(d[53]), "+f"(d[54]), "+f"(d[55]),    \
+          "+f"(d[56]), "+f"(d[57]), "+f"(d[58]), "+f"(d[59]), "+f"(d[60]), "+f"(d[61]), "+f"(d[62]), "+f"(d[63]),    \
+          "+f"(d[64]), "+f"(d[65]), "+f"(d[66]), "+f"(d[67]), "+f"(d[68]), "+f"(d[69]), "+f"(d[70]), "+f"(d[71]),    \
+          "+f"(d[72]), "+f"(d[73]), "+f"(d[74]), "+f"(d[75]), "+f"(d[76]), "+f"(d[77]), "+f"(d[78]), "+f"(d[79]),    \
+          "+f"(d[80]), "+f"(d[81]), "+f"(d[82]), "+f"(d[83]), "+f"(d[84]), "+f"(d[85]), "+f"(d[86]), "+f"(d[87]),    \
+          "+f"(d[88]), "+f"(d[89]), "+f"(d[90]), "+f"(d[91]), "+f"(d[92]), "+f"(d[93]), "+f"(d[94]), "+f"(d[95])     \
+        : "l"(da), "l"(db), "n"(sd))
+
+
+#define WGMMA_FP8_N64(d, da, db, sd)                                                                                 \
+    asm volatile(                                                                                                    \
+        "{\n"                                                                                                        \
+        "wgmma.mma_async.sync.aligned.m64n64k32.f32.e4m3.e4m3 "                                                      \
+        "{%0,%1,%2,%3,%4,%5,%6,%7,%8,%9,%10,%11,%12,%13,%14,%15,"                                                    \
+        "%16,%17,%18,%19,%20,%21,%22,%23,%24,%25,%26,%27,%28,%29,%30,%31}, "                                         \
+        "%32, %33, %34, 1, 1;\n"                                                                                     \
+        "}\n"                                                                                                        \
+        : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3]), "+f"(d[4]), "+f"(d[5]), "+f"(d[6]), "+f"(d[7]),            \
+          "+f"(d[8]), "+f"(d[9]), "+f"(d[10]), "+f"(d[11]), "+f"(d[12]), "+f"(d[13]), "+f"(d[14]), "+f"(d[15]),      \
+          "+f"(d[16]), "+f"(d[17]), "+f"(d[18]), "+f"(d[19]), "+f"(d[20]), "+f"(d[21]), "+f"(d[22]), "+f"(d[23]),    \
+          "+f"(d[24]), "+f"(d[25]), "+f"(d[26]), "+f"(d[27]), "+f"(d[28]), "+f"(d[29]), "+f"(d[30]), "+f"(d[31])     \
+        : "l"(da), "l"(db), "n"(sd))
+
+template <int BN>
+DEV_INLINE void wgmma_fp8(uint64_t da, uint64_t db, float* d, bool scale_d) {
+    if constexpr (BN == 64) {
+        if (scale_d) WGMMA_FP8_N64(d, da, db, 1); else WGMMA_FP8_N64(d, da, db, 0);
+    } else if constexpr (BN == 256) {
+        if (scale_d) WGMMA_FP8_N256(d, da, db, 1); else WGMMA_FP8_N256(d, da, db, 0);
+    } else if constexpr (BN == 192) {
+        if (scale_d) WGMMA_FP8_N192(d, da, db, 1); else WGMMA_FP8_N192(d, da, db, 0);
+    } else if constexpr (BN == 128) {
+        if (scale_d) WGMMA_FP8_N128(d, da, db, 1); else WGMMA_FP8_N128(d, da, db, 0);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Kernel v3
+// ---------------------------------------------------------------------------
+template <int BM, int BN, int BK, int STAGES, int PIPE_DEPTH, int GROUP, int S_K = 1, int A_ROWS = -1, int DO_MMA = 1>
+__global__ void __launch_bounds__(288, 1)
+fp8_gemm_kernel_v3(const __grid_constant__ CUtensorMap tma_a,
+                   const __grid_constant__ CUtensorMap tma_b,
+                   const __grid_constant__ CUtensorMap tma_c,
+                   const float* __restrict__ scales,
+                   __nv_bfloat16* __restrict__ c_ptr,
+                   int M, int N, int K, int num_m_tiles, int num_n_tiles) {
+    static_assert(BK == 128, "BK must be 128 for SW128 K-major wgmma flow");
+    static_assert((BN % 64) == 0, "epilogue subtiles are 64 cols wide");
+
+    constexpr int SMEM_A_STAGE = BM * BK * S_K;
+    constexpr int SMEM_B_STAGE = BN * BK * S_K;
+    constexpr int D_SUB = 64;                       // epilogue subtile width (cols)
+    constexpr int SMEM_D = 2 * BM * D_SUB * 2;      // two bf16 subtile buffers
+    constexpr int SMEM_SF = ((2 * BN * 4) + 1023) / 1024 * 1024;  // two scale buffers per tile
+    extern __shared__ __align__(1024) uint8_t smem[];
+    __nv_bfloat16* smem_d = reinterpret_cast<__nv_bfloat16*>(smem);       // 2 x (BM x 64)
+    float* smem_sf = reinterpret_cast<float*>(smem + SMEM_D);             // 2 x BN floats
+    uint8_t* smem_a = smem + SMEM_D + SMEM_SF;
+    uint8_t* smem_b = smem_a + STAGES * SMEM_A_STAGE;
+    uint64_t* full_bar = reinterpret_cast<uint64_t*>(smem + SMEM_D + SMEM_SF + STAGES * (SMEM_A_STAGE + SMEM_B_STAGE));
+    uint64_t* empty_bar = full_bar + STAGES;
+
+    const int warp_idx = threadIdx.x >> 5;
+    const int lane_idx = threadIdx.x & 31;
+    const int tid = threadIdx.x;
+    const int k_tiles = K / (BK * S_K);
+    const int total_tiles = num_m_tiles * num_n_tiles;
+    const int ldc = N;
+
+    auto tile_to_mn = [&](int t, int& pm, int& pn) {
+        int num_in_group = GROUP * num_n_tiles;
+        int group = t / num_in_group;
+        int first_m = group * GROUP;
+        int gsz = min(num_m_tiles - first_m, GROUP);
+        pm = first_m + (t % gsz);
+        pn = (t % num_in_group) / gsz;
+    };
+
+    constexpr int A_REAL_ROWS = (A_ROWS <= 0 ? BM : A_ROWS);
+    if (warp_idx == 8 && lane_idx == 0) {
+        #pragma unroll
+        for (int s = 0; s < STAGES; ++s) {
+            MBarrier::init(&full_bar[s], 1);
+            MBarrier::init(&empty_bar[s], 8);
+        }
+        fence_mbarrier_init();
+    }
+    // zero the unused A rows once (TMA A box only covers A_REAL_ROWS rows),
+    // strip per (stage, slab): rows [A_REAL_ROWS, BM)
+    if (A_REAL_ROWS < BM) {
+        constexpr int STRIP = (BM - A_REAL_ROWS) * BK;  // bytes per strip
+        for (int i = tid; i < STAGES * S_K * STRIP / 16; i += 288) {
+            int stage = i / (S_K * STRIP / 16);
+            int rem = i % (S_K * STRIP / 16);
+            int slab = rem / (STRIP / 16);
+            int off = rem % (STRIP / 16);
+            uint4* dst = reinterpret_cast<uint4*>(
+                smem_a + stage * SMEM_A_STAGE + slab * (BM * BK) + A_REAL_ROWS * BK) + off;
+            *dst = make_uint4(0, 0, 0, 0);
+        }
+    }
+    __syncthreads();
+
+    if (warp_idx == 8) {
+        // producer warp
+        if (lane_idx == 0) {
+            int tma_iter = 0;
+            for (int t = blockIdx.x; t < total_tiles; t += gridDim.x) {
+                int pm, pn;
+                tile_to_mn(t, pm, pn);
+                int m0 = pm * BM, n0 = pn * BN;
+                for (int kt = 0; kt < k_tiles; ++kt, ++tma_iter) {
+                    int stage = tma_iter % STAGES;
+                    int phase = (tma_iter / STAGES) & 1;
+                    MBarrier::wait(&empty_bar[stage], phase ^ 1);
+                    MBarrier::arrive_expect_tx(&full_bar[stage], A_REAL_ROWS * BK * S_K + SMEM_B_STAGE);
+                    #pragma unroll
+                    for (int s = 0; s < S_K; ++s) {
+                        tma_load_2d(&tma_a, &full_bar[stage], smem_a + stage * SMEM_A_STAGE + s * (BM * BK), (kt * S_K + s) * BK, m0);
+                        tma_load_2d(&tma_b, &full_bar[stage], smem_b + stage * SMEM_B_STAGE + s * (BN * BK), (kt * S_K + s) * BK, n0);
+                    }
+                }
+            }
+        }
+    } else {
+        // consumer warpgroups
+        const int wg = warp_idx >> 2;
+        const int w = warp_idx & 3;
+        const int row0 = wg * 64 + w * 16 + (lane_idx >> 2);
+        const int col0 = (lane_idx & 3) * 2;
+
+        int tma_iter = 0;
+        int tile_parity = 0;
+        int n_stores_issued = 0;
+        for (int t = blockIdx.x; t < total_tiles; t += gridDim.x) {
+            int pm, pn;
+            tile_to_mn(t, pm, pn);
+            int m0 = pm * BM, n0 = pn * BN;
+
+            // stage this tile's scales into smem (double-buffered by tile parity)
+            float* sf = smem_sf + tile_parity * BN;
+            if (tid < BN) {
+                int n = n0 + tid;
+                sf[tid] = (n < N) ? __ldg(scales + n) : 0.0f;
+            }
+
+            constexpr int NACC = 4 * (BN / 8);
+            float acc[NACC];
+            bool first_stage = true;
+            constexpr int PD = PIPE_DEPTH;
+            for (int kt = 0; kt < k_tiles; ++kt, ++tma_iter) {
+                int stage = tma_iter % STAGES;
+                int phase = (tma_iter / STAGES) & 1;
+                MBarrier::wait(&full_bar[stage], phase);
+                if (DO_MMA == 0) {
+                    if (lane_idx == 0) MBarrier::arrive(&empty_bar[stage]);
+                    first_stage = false;
+                    continue;
+                }
+
+                #pragma unroll
+                for (int i = 0; i < NACC; ++i) fence_op(acc[i]);
+                wgmma_fence();
+                uint8_t* a_stage = smem_a + stage * SMEM_A_STAGE + wg * (64 * BK);
+                uint8_t* b_stage = smem_b + stage * SMEM_B_STAGE;
+                if constexpr (S_K == 1) {
+                    #pragma unroll
+                    for (int k = 0; k < BK / 32; ++k) {
+                        uint64_t da = gmma_desc_kmajor_sw128(a_stage + k * 32);
+                        uint64_t db = gmma_desc_kmajor_sw128(b_stage + k * 32);
+                        wgmma_fp8<BN>(da, db, acc, !(first_stage && k == 0));
+                    }
+                } else {
+                    #pragma unroll
+                    for (int s = 0; s < S_K; ++s) {
+                        #pragma unroll
+                        for (int k = 0; k < BK / 32; ++k) {
+                            uint64_t da = gmma_desc_kmajor_sw128(a_stage + s * (BM * BK) + k * 32);
+                            uint64_t db = gmma_desc_kmajor_sw128(b_stage + s * (BN * BK) + k * 32);
+                            wgmma_fp8<BN>(da, db, acc, !(first_stage && s == 0 && k == 0));
+                        }
+                    }
+                }
+                wgmma_commit();
+                #pragma unroll
+                for (int i = 0; i < NACC; ++i) fence_op(acc[i]);
+
+                if (tma_iter >= PD) {
+                    wgmma_wait<PD>();
+                    int old_stage = (tma_iter - PD) % STAGES;
+                    if (lane_idx == 0) MBarrier::arrive(&empty_bar[old_stage]);
+                }
+                first_stage = false;
+            }
+
+            if (DO_MMA == 0) continue;
+            wgmma_wait<0>();
+            consumer_barrier();  // sf ready for everyone
+
+            // ------------------------------------------------------------------
+            // epilogue: per-warp private panels. Each warp converts its own 16 rows
+            // to bf16 in a private swizzled smem panel and issues its own TMA store;
+            // no cross-warp barriers (bulk groups are per-thread, so reuse is tracked
+            // privately by each warp's lane 0).
+            // ------------------------------------------------------------------
+            __nv_bfloat16* dbuf_wg = smem_d + wg * (2 * 64 * D_SUB);
+            int r0 = w * 16 + (lane_idx >> 2), r1 = r0 + 8;
+            #pragma unroll
+            for (int sub = 0; sub < BN / D_SUB; ++sub) {
+                __nv_bfloat16* dbuf = dbuf_wg + (sub & 1) * (64 * D_SUB);
+                if (lane_idx == 0 && n_stores_issued >= 2)
+                    tma_store_wait<1>();
+                __syncwarp();
+                #pragma unroll
+                for (int i = 0; i < D_SUB / 8; ++i) {
+                    int ii = sub * (D_SUB / 8) + i;
+                    float2 sc = *reinterpret_cast<float2*>(sf + sub * D_SUB + col0 + i * 8);
+                    float c00 = acc[4 * ii + 0] * sc.x, c01 = acc[4 * ii + 1] * sc.y;
+                    float c10 = acc[4 * ii + 2] * sc.x, c11 = acc[4 * ii + 3] * sc.y;
+                    int cb = (col0 + i * 8) * 2;              // byte col within row
+                    int ch = cb >> 4;                          // 16B chunk idx
+                    int chs0 = ch ^ (r0 & 7);
+                    int chs1 = ch ^ (r1 & 7);
+                    uint32_t v0, v1;
+                    asm("cvt.rn.bf16x2.f32 %0, %1, %2;" : "=r"(v0) : "f"(c01), "f"(c00));
+                    asm("cvt.rn.bf16x2.f32 %0, %1, %2;" : "=r"(v1) : "f"(c11), "f"(c10));
+                    uint32_t addr0 = r0 * (D_SUB * 2) + chs0 * 16 + (cb & 15);
+                    uint32_t addr1 = r1 * (D_SUB * 2) + chs1 * 16 + (cb & 15);
+                    *reinterpret_cast<uint32_t*>(reinterpret_cast<uint8_t*>(dbuf) + addr0) = v0;
+                    *reinterpret_cast<uint32_t*>(reinterpret_cast<uint8_t*>(dbuf) + addr1) = v1;
+                }
+                tma_store_fence();
+                __syncwarp();
+                if (lane_idx == 0) {
+                    tma_store_2d(&tma_c, dbuf + w * 16 * D_SUB, n0 + sub * D_SUB,
+                                 m0 + wg * 64 + w * 16);
+                    tma_store_commit();
+                    ++n_stores_issued;
+                }
+            }
+            tile_parity ^= 1;
+        }
+        // drain all outstanding TMA stores
+        if (warp_idx == 0 && lane_idx == 0) {
+            // must not touch dbuf memory anymore; ensures visibility at kernel end
+        }
+        tma_store_wait<0>();
+        __syncwarp();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Fused pad kernel: x (M,K) -> xp (M,Kp) with zeroed tail; w (N,K) -> wp (N,Kp)
+// garbage tail is ok for w (products are killed by x's zero tail), but cheap to
+// zero both. One launch handles both tensors (grid.y selects).
+// ---------------------------------------------------------------------------
+__global__ void __launch_bounds__(256, 1)
+pad_k_kernel(const uint8_t* __restrict__ src0, uint8_t* __restrict__ dst0,
+             const uint8_t* __restrict__ src1, uint8_t* __restrict__ dst1,
+             int rows0, int rows1, int K, int Kp) {
+    const uint8_t* src = blockIdx.y ? src1 : src0;
+    uint8_t* dst = blockIdx.y ? dst1 : dst0;
+    int rows = blockIdx.y ? rows1 : rows0;
+    // each CTA handles a slab of rows; 4B dst words; u8 src bytes (rows may be odd-aligned)
+    constexpr int ROWS_PER_CTA = 8;
+    int r0 = blockIdx.x * ROWS_PER_CTA;
+    int r1 = min(r0 + ROWS_PER_CTA, rows);
+    int nword = Kp >> 2;  // Kp % 128 == 0
+    for (int r = r0; r < r1; ++r) {
+        const uint8_t* srow = src + (size_t)r * K;
+        uint32_t* drow = reinterpret_cast<uint32_t*>(dst + (size_t)r * Kp);
+        for (int w = threadIdx.x; w < nword; w += 256) {
+            int c = w << 2;
+            uint32_t v = 0;
+            #pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                uint32_t b = (c + j < K) ? srow[c + j] : uint8_t(0);
+                v |= b << (8 * j);
+            }
+            drow[w] = v;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Split-K small-M kernel (M <= BM): virtual tiles = (n_tile, k_slice); partial
+// sums go to an fp32 psum workspace via atomicAdd; the last CTA per n-tile
+// (ticket) applies scales and writes bf16. Aimed at memory-bound skinny GEMMs.
+// ---------------------------------------------------------------------------
+template <int BM, int BN, int BK, int STAGES, int PIPE_DEPTH, int GROUP>
+__global__ void __launch_bounds__(288, 1)
+fp8_gemm_kernel_splitk(const __grid_constant__ CUtensorMap tma_a,
+                       const __grid_constant__ CUtensorMap tma_b,
+                       const float* __restrict__ scales,
+                       __nv_bfloat16* __restrict__ c_ptr,
+                       float* __restrict__ psum,
+                       int* __restrict__ tickets,
+                       int M, int N, int K, int num_m_tiles, int num_n_tiles,
+                       int k_tiles_per_split, int num_splits) {
+    static_assert(BK == 128);
+    constexpr int SMEM_A_STAGE = BM * BK;
+    constexpr int SMEM_B_STAGE = BN * BK;
+    extern __shared__ __align__(1024) uint8_t smem[];
+    uint8_t* smem_a = smem;
+    uint8_t* smem_b = smem_a + STAGES * SMEM_A_STAGE;
+    uint64_t* full_bar = reinterpret_cast<uint64_t*>(smem + STAGES * (SMEM_A_STAGE + SMEM_B_STAGE));
+    uint64_t* empty_bar = full_bar + STAGES;
+
+    const int warp_idx = threadIdx.x >> 5;
+    const int lane_idx = threadIdx.x & 31;
+    const int tid = threadIdx.x;
+    const int k_tiles_total = K / BK;
+    const int ldc = N;
+    const int total_v = num_m_tiles * num_n_tiles * num_splits;
+
+    auto v_to_mnk = [&](int v, int& pm, int& pn, int& ks) {
+        int nm = v / num_splits;
+        ks = v % num_splits;
+        int t = nm;
+        int num_in_group = GROUP * num_n_tiles;
+        int group = t / num_in_group;
+        int first_m = group * GROUP;
+        int gsz = min(num_m_tiles - first_m, GROUP);
+        pm = first_m + (t % gsz);
+        pn = (t % num_in_group) / gsz;
+    };
+
+    if (warp_idx == 8 && lane_idx == 0) {
+        #pragma unroll
+        for (int s = 0; s < STAGES; ++s) {
+            MBarrier::init(&full_bar[s], 1);
+            MBarrier::init(&empty_bar[s], 8);
+        }
+        fence_mbarrier_init();
+    }
+    __syncthreads();
+
+    if (warp_idx == 8) {
+        if (lane_idx == 0) {
+            int tma_iter = 0;
+            for (int v = blockIdx.x; v < total_v; v += gridDim.x) {
+                int pm, pn, ks;
+                v_to_mnk(v, pm, pn, ks);
+                int m0 = pm * BM, n0 = pn * BN;
+                int kt0 = ks * k_tiles_per_split;
+                int kt1 = min(kt0 + k_tiles_per_split, k_tiles_total);
+                for (int kt = kt0; kt < kt1; ++kt, ++tma_iter) {
+                    int stage = tma_iter % STAGES;
+                    int phase = (tma_iter / STAGES) & 1;
+                    MBarrier::wait(&empty_bar[stage], phase ^ 1);
+                    MBarrier::arrive_expect_tx(&full_bar[stage], SMEM_A_STAGE + SMEM_B_STAGE);
+                    tma_load_2d(&tma_a, &full_bar[stage], smem_a + stage * SMEM_A_STAGE, kt * BK, m0);
+                    tma_load_2d(&tma_b, &full_bar[stage], smem_b + stage * SMEM_B_STAGE, kt * BK, n0);
+                }
+            }
+        }
+    } else {
+        const int wg = warp_idx >> 2;
+        const int w = warp_idx & 3;
+        const int row0 = wg * 64 + w * 16 + (lane_idx >> 2);
+        const int col0 = (lane_idx & 3) * 2;
+
+        int tma_iter = 0;
+        for (int v = blockIdx.x; v < total_v; v += gridDim.x) {
+            int pm, pn, ks;
+            v_to_mnk(v, pm, pn, ks);
+            int m0 = pm * BM, n0 = pn * BN;
+            int kt0 = ks * k_tiles_per_split;
+            int kt1 = min(kt0 + k_tiles_per_split, k_tiles_total);
+
+            constexpr int NACC = 4 * (BN / 8);
+            float acc[NACC];
+            if (kt1 <= kt0) {
+                #pragma unroll
+                for (int i = 0; i < NACC; ++i) acc[i] = 0.0f;
+            }
+            bool first_stage = true;
+            constexpr int PD = PIPE_DEPTH;
+            for (int kt = kt0; kt < kt1; ++kt, ++tma_iter) {
+                int stage = tma_iter % STAGES;
+                int phase = (tma_iter / STAGES) & 1;
+                MBarrier::wait(&full_bar[stage], phase);
+
+                #pragma unroll
+                for (int i = 0; i < NACC; ++i) fence_op(acc[i]);
+                wgmma_fence();
+                uint8_t* a_stage = smem_a + stage * SMEM_A_STAGE + wg * (64 * BK);
+                uint8_t* b_stage = smem_b + stage * SMEM_B_STAGE;
+                #pragma unroll
+                for (int k = 0; k < BK / 32; ++k) {
+                    uint64_t da = gmma_desc_kmajor_sw128(a_stage + k * 32);
+                    uint64_t db = gmma_desc_kmajor_sw128(b_stage + k * 32);
+                    wgmma_fp8<BN>(da, db, acc, !(first_stage && k == 0));
+                }
+                wgmma_commit();
+                #pragma unroll
+                for (int i = 0; i < NACC; ++i) fence_op(acc[i]);
+
+                if (tma_iter >= PD) {
+                    wgmma_wait<PD>();
+                    int old_stage = (tma_iter - PD) % STAGES;
+                    if (lane_idx == 0) MBarrier::arrive(&empty_bar[old_stage]);
+                }
+                first_stage = false;
+            }
+            wgmma_wait<0>();
+
+            // epilogue: atomicAdd fp32 partials (skip padded rows)
+            #pragma unroll
+            for (int i = 0; i < BN / 8; ++i) {
+                int n = n0 + col0 + i * 8;
+                if (n + 1 < N) {
+                    if (m0 + row0 < M)
+                        atomicAdd(psum + (size_t)(m0 + row0) * ldc + n, acc[4 * i + 0]),
+                        atomicAdd(psum + (size_t)(m0 + row0) * ldc + n + 1, acc[4 * i + 1]);
+                    if (m0 + row0 + 8 < M)
+                        atomicAdd(psum + (size_t)(m0 + row0 + 8) * ldc + n, acc[4 * i + 2]),
+                        atomicAdd(psum + (size_t)(m0 + row0 + 8) * ldc + n + 1, acc[4 * i + 3]);
+                }
+            }
+            __threadfence();
+
+            // ticket: last CTA for this (pm,pn) applies scales and writes bf16
+            __shared__ uint32_t is_last;
+            if (tid == 0)
+                is_last = (atomicAdd(&tickets[pm * num_n_tiles + pn], 1) == num_splits - 1) ? 1u : 0u;
+            consumer_barrier();
+            if (is_last) {
+                int base_m = m0;
+                int rows = min(BM, M - base_m);
+                int cols = min(BN, N - n0);
+                for (int idx = tid; idx < rows * cols; idx += 256) {
+                    int r = idx / cols, c = idx % cols;
+                    int n = n0 + c;
+                    float v = psum[(size_t)(base_m + r) * ldc + n] * scales[n];
+                    c_ptr[(size_t)(base_m + r) * ldc + n] = __float2bfloat16(v);
+                }
+            }
+            consumer_barrier();
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Host side
+// ---------------------------------------------------------------------------
+#include <torch/extension.h>
+#include <ATen/cuda/CUDAContext.h>
+
+static CUtensorMap encode_map_u8(const void* ptr, uint64_t inner, uint64_t outer, uint64_t stride_b,
+                                 uint32_t box_inner, uint32_t box_outer) {
+    CUtensorMap m;
+    uint64_t dims[2] = {inner, outer};
+    uint64_t strides[1] = {stride_b};
+    uint32_t box[2] = {box_inner, box_outer};
+    uint32_t estr[2] = {1, 1};
+    CUresult r = cuTensorMapEncodeTiled(
+        &m, CU_TENSOR_MAP_DATA_TYPE_UINT8, 2, const_cast<void*>(ptr), dims, strides, box, estr,
+        CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B,
+        CU_TENSOR_MAP_L2_PROMOTION_L2_128B, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+    TORCH_CHECK(r == CUDA_SUCCESS, "tma encode failed: ", (int)r);
+    return m;
+}
+
+static CUtensorMap encode_map_bf16(const void* ptr, uint64_t inner, uint64_t outer, uint64_t stride_b,
+                                   uint32_t box_inner, uint32_t box_outer) {
+    CUtensorMap m;
+    uint64_t dims[2] = {inner, outer};
+    uint64_t strides[1] = {stride_b};
+    uint32_t box[2] = {box_inner, box_outer};
+    uint32_t estr[2] = {1, 1};
+    CUresult r = cuTensorMapEncodeTiled(
+        &m, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 2, const_cast<void*>(ptr), dims, strides, box, estr,
+        CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B,
+        CU_TENSOR_MAP_L2_PROMOTION_L2_128B, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+    TORCH_CHECK(r == CUDA_SUCCESS, "tma c encode failed: ", (int)r);
+    return m;
+}
+
+template <int BM, int BN, int BK, int STAGES, int PIPE_DEPTH, int GROUP, int S_K = 1, int A_ROWS = -1, int DO_MMA = 1>
+void launch_gemm_v3(const at::Tensor& x, const at::Tensor& w, const at::Tensor& s, at::Tensor& out,
+                    int64_t grid_dim) {
+    int M = x.size(0), K = x.size(1), N = w.size(0);
+    constexpr int A_REAL_ROWS = (A_ROWS <= 0 ? BM : A_ROWS);
+    TORCH_CHECK(K % (BK * S_K) == 0, "K must be padded to BK * S_K");
+    TORCH_CHECK((N * 2) % 16 == 0, "N must give 16B-aligned rows for TMA store");
+    TORCH_CHECK(M <= A_REAL_ROWS || A_REAL_ROWS == BM, "A_ROWS shrink only for tiny M");
+    CUtensorMap tma_a = encode_map_u8(x.data_ptr(), (uint64_t)K, (uint64_t)M, (uint64_t)K, BK, (uint32_t)A_REAL_ROWS);
+    CUtensorMap tma_b = encode_map_u8(w.data_ptr(), (uint64_t)K, (uint64_t)N, (uint64_t)K, BK, BN);
+    CUtensorMap tma_c = encode_map_bf16(out.data_ptr(), (uint64_t)N, (uint64_t)M, (uint64_t)(N * 2), 64, 16);
+    int num_m_tiles = (M + BM - 1) / BM;
+    int num_n_tiles = (N + BN - 1) / BN;
+    constexpr int SMEM_D = 2 * BM * 64 * 2;
+    constexpr int SMEM_SF = ((2 * BN * 4) + 1023) / 1024 * 1024;
+    constexpr int SMEM = SMEM_D + SMEM_SF + STAGES * (BM + BN) * BK * S_K + 2 * STAGES * 8;
+    static_assert(SMEM <= 232448, "smem overflow");
+    auto* kfn = &fp8_gemm_kernel_v3<BM, BN, BK, STAGES, PIPE_DEPTH, GROUP, S_K, A_ROWS, DO_MMA>;
+    static bool once = [&]() {
+        cudaFuncSetAttribute((const void*)kfn, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM);
+        return true;
+    }();
+    (void)once;
+    auto stream = at::cuda::getCurrentCUDAStream();
+    kfn<<<grid_dim, 288, SMEM, stream>>>(tma_a, tma_b, tma_c, s.data_ptr<float>(),
+                                         reinterpret_cast<__nv_bfloat16*>(out.data_ptr()),
+                                         M, N, K, num_m_tiles, num_n_tiles);
+}
+
+void fp8_gemm_sm90_v3(at::Tensor x, at::Tensor w, at::Tensor s, at::Tensor out,
+                      int64_t bn_cfg, int64_t stages_cfg, int64_t grid_dim, int64_t pipe_depth,
+                      int64_t group_cfg, int64_t s_k, int64_t a_rows) {
+    #define CASE(BN_, ST_, PD_, G_, SK_, AR_) \
+        if (bn_cfg == BN_ && stages_cfg == ST_ && pipe_depth == PD_ && group_cfg == G_ && s_k == SK_ && a_rows == AR_) { \
+            launch_gemm_v3<128, BN_, 128, ST_, PD_, G_, SK_, AR_>(x, w, s, out, grid_dim); return; }
+    CASE(256, 4, 1, 16, 1, 128)
+    CASE(256, 4, 1, 8, 1, 128)
+    CASE(256, 4, 2, 8, 1, 128)
+    CASE(128, 6, 1, 8, 1, 128)
+    CASE(128, 6, 2, 8, 1, 128)
+    CASE(64, 8, 1, 8, 1, 128)
+    CASE(64, 8, 2, 8, 1, 128)
+    CASE(64, 4, 1, 8, 2, 128)
+    CASE(64, 4, 2, 8, 2, 128)
+    CASE(64, 2, 1, 8, 4, 128)
+    CASE(64, 2, 2, 8, 4, 128)
+    CASE(64, 3, 1, 8, 2, 128)
+    CASE(128, 3, 1, 8, 2, 128)
+    CASE(128, 3, 2, 8, 2, 128)
+    CASE(64, 8, 1, 8, 1, 32)
+    CASE(64, 8, 2, 8, 1, 32)
+    CASE(64, 4, 1, 8, 2, 32)
+    CASE(64, 4, 2, 8, 2, 32)
+    CASE(64, 2, 1, 8, 4, 32)
+    CASE(64, 2, 2, 8, 4, 32)
+    CASE(64, 3, 1, 8, 2, 32)
+    CASE(128, 3, 1, 8, 2, 32)
+    CASE(128, 3, 2, 8, 2, 32)
+    #undef CASE
+    TORCH_CHECK(false, "bad cfg");
+}
+
+template <int BM, int BN, int BK, int STAGES, int PIPE_DEPTH, int GROUP>
+void launch_gemm_splitk(const at::Tensor& x, const at::Tensor& w, const at::Tensor& s,
+                        at::Tensor& out, at::Tensor& psum, at::Tensor& tickets, int64_t splits) {
+    int M = x.size(0), K = x.size(1), N = w.size(0);
+    TORCH_CHECK(K % BK == 0, "K must be padded to BK");
+    TORCH_CHECK(M <= BM, "splitk path is for small M");
+    CUtensorMap tma_a = encode_map_u8(x.data_ptr(), (uint64_t)K, (uint64_t)M, (uint64_t)K, BK, BM);
+    CUtensorMap tma_b = encode_map_u8(w.data_ptr(), (uint64_t)K, (uint64_t)N, (uint64_t)K, BK, BN);
+    int num_m_tiles = 1;
+    int num_n_tiles = (N + BN - 1) / BN;
+    int k_tiles = K / BK;
+    int k_tiles_per_split = (k_tiles + (int)splits - 1) / (int)splits;
+    int num_splits = (k_tiles + k_tiles_per_split - 1) / k_tiles_per_split;
+    constexpr int SMEM = STAGES * (BM + BN) * BK + 2 * STAGES * 8;
+    static_assert(SMEM <= 232448, "smem overflow");
+    auto* kfn = &fp8_gemm_kernel_splitk<BM, BN, BK, STAGES, PIPE_DEPTH, GROUP>;
+    static bool once = [&]() {
+        cudaFuncSetAttribute((const void*)kfn, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM);
+        return true;
+    }();
+    (void)once;
+    auto stream = at::cuda::getCurrentCUDAStream();
+    int grid = num_m_tiles * num_n_tiles * num_splits;
+    kfn<<<grid, 288, SMEM, stream>>>(tma_a, tma_b, s.data_ptr<float>(),
+                                     reinterpret_cast<__nv_bfloat16*>(out.data_ptr()),
+                                     psum.data_ptr<float>(), tickets.data_ptr<int>(),
+                                     M, N, K, num_m_tiles, num_n_tiles,
+                                     k_tiles_per_split, num_splits);
+}
+
+void fp8_gemm_sm90_ablate(at::Tensor x, at::Tensor w, at::Tensor s, at::Tensor out,
+                          int64_t bn_cfg, int64_t stages_cfg, int64_t grid_dim, int64_t s_k, int64_t a_rows) {
+    #define CASEA(BN_, ST_, SK_, AR_) \
+        if (bn_cfg == BN_ && stages_cfg == ST_ && s_k == SK_ && a_rows == AR_) { \
+            launch_gemm_v3<128, BN_, 128, ST_, 1, 8, SK_, AR_, 0>(x, w, s, out, grid_dim); return; }
+    CASEA(64, 8, 1, 32)
+    CASEA(64, 4, 2, 32)
+    CASEA(64, 8, 1, 128)
+    CASEA(128, 6, 1, 128)
+    #undef CASEA
+    TORCH_CHECK(false, "bad ablate cfg");
+}
+
+void fp8_gemm_sm90_splitk(at::Tensor x, at::Tensor w, at::Tensor s, at::Tensor out,
+                          at::Tensor psum, at::Tensor tickets,
+                          int64_t bn_cfg, int64_t stages_cfg, int64_t splits) {
+    #define CASEK(BN_, ST_, PD_) \
+        if (bn_cfg == BN_ && stages_cfg == ST_) { \
+            launch_gemm_splitk<128, BN_, 128, ST_, PD_, 8>(x, w, s, out, psum, tickets, splits); return; }
+    CASEK(64, 8, 2)
+    CASEK(64, 6, 2)
+    CASEK(128, 6, 2)
+    CASEK(128, 5, 1)
+    CASEK(256, 4, 2)
+    CASEK(256, 4, 1)
+    #undef CASEK
+    TORCH_CHECK(false, "bad splitk cfg");
+}
+
+void pad_k(at::Tensor x, at::Tensor w, at::Tensor xp, at::Tensor wp) {
+    int K = x.size(1);
+    int Kp = xp.size(1);
+    TORCH_CHECK(Kp % 128 == 0 && x.size(1) <= Kp);
+    int rows0 = x.size(0), rows1 = w.size(0);
+    dim3 grid((unsigned)((std::max(rows0, rows1) + 7) / 8), 2u, 1u);
+    auto stream = at::cuda::getCurrentCUDAStream();
+    pad_k_kernel<<<grid, 256, 0, stream>>>(
+        reinterpret_cast<const uint8_t*>(x.data_ptr()), reinterpret_cast<uint8_t*>(xp.data_ptr()),
+        reinterpret_cast<const uint8_t*>(w.data_ptr()), reinterpret_cast<uint8_t*>(wp.data_ptr()),
+        rows0, rows1, K, Kp);
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("fp8_gemm_sm90_v3", &fp8_gemm_sm90_v3, "fp8 gemm v3 tma-store epilogue");
+    m.def("fp8_gemm_sm90_splitk", &fp8_gemm_sm90_splitk, "fp8 gemm splitk small-M");
+    m.def("fp8_gemm_sm90_ablate", &fp8_gemm_sm90_ablate);
+    m.def("pad_k", &pad_k, "pad K dim into aligned buffers");
+}
+'''
+
+_ext = None
+
+
+def _build_ext():
+    global _ext
+    if _ext is not None:
+        return _ext
+    import shutil
+    from torch.utils.cpp_extension import load
+
+    tag = hashlib.sha256(_CUDA_SRC.encode()).hexdigest()[:10]
+    name = f"fp8_gemm_sol_{tag}"
+    build_root = Path.home() / ".cache" / name
+    build_root.mkdir(parents=True, exist_ok=True)
+    src = build_root / "fp8_gemm_sol.cu"
+    if not src.exists() or src.read_text() != _CUDA_SRC:
+        src.write_text(_CUDA_SRC)
+    # A previously killed build may leave a build dir without the .so; clean it.
+    so_path = build_root / f"{name}.so"
+    if not so_path.exists():
+        for junk in build_root.iterdir():
+            if junk.name not in ("fp8_gemm_sol.cu",):
+                if junk.is_dir():
+                    shutil.rmtree(junk, ignore_errors=True)
+                else:
+                    junk.unlink(missing_ok=True)
+    _ext = load(
+        name=name,
+        sources=[str(src)],
+        extra_cuda_cflags=["-O3", "-std=c++17"],
+        extra_ldflags=["-lcuda"],
+        build_directory=str(build_root),
+        verbose=False,
+    )
+    return _ext
+
+
+# ---------------------------------------------------------------------------
+# Triton fallback (generic shapes / non-TMA-friendly layouts)
+# ---------------------------------------------------------------------------
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def _fp8_gemm_tri(
+    a_ptr, b_ptr, c_ptr, s_ptr,
+    M, N, K,
+    stride_am, stride_ak,
+    stride_bn, stride_bk,
+    stride_cm, stride_cn,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+    GROUP_M: tl.constexpr,
+):
+    pid = tl.program_id(axis=0)
+    num_pid_m = tl.cdiv(M, BLOCK_M)
+    num_pid_n = tl.cdiv(N, BLOCK_N)
+    num_pid_in_group = GROUP_M * num_pid_n
+    group_id = pid // num_pid_in_group
+    first_pid_m = group_id * GROUP_M
+    group_size_m = min(num_pid_m - first_pid_m, GROUP_M)
+    pid_m = first_pid_m + ((pid % num_pid_in_group) % group_size_m)
+    pid_n = (pid % num_pid_in_group) // group_size_m
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+    a_ptrs = a_ptr + offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak
+    b_ptrs = b_ptr + offs_n[None, :] * stride_bn + offs_k[:, None] * stride_bk
+
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    m_mask = offs_m[:, None] < M
+    n_mask = offs_n[None, :] < N
+    k_full = K // BLOCK_K
+    for k in range(0, k_full):
+        a = tl.load(a_ptrs, mask=m_mask, other=0.0)
+        b = tl.load(b_ptrs, mask=n_mask, other=0.0)
+        acc = tl.dot(a, b, acc)
+        a_ptrs += BLOCK_K * stride_ak
+        b_ptrs += BLOCK_K * stride_bk
+    k_rem = K - k_full * BLOCK_K
+    if k_rem > 0:
+        a = tl.load(a_ptrs, mask=m_mask & (offs_k[None, :] < k_rem), other=0.0)
+        b = tl.load(b_ptrs, mask=n_mask & (offs_k[:, None] < k_rem), other=0.0)
+        acc = tl.dot(a, b, acc)
+
+    s = tl.load(s_ptr + offs_n, mask=offs_n < N, other=0.0).to(tl.float32)
+    acc = acc * s[None, :]
+    c_ptrs = c_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
+    tl.store(c_ptrs, acc.to(tl.bfloat16), mask=(offs_m[:, None] < M) & (offs_n[None, :] < N))
+
+
+def _pick_triton_cfg(M, N, K):
+    if M <= 64:
+        return (32, 128, 128, 1, 4, 4)
+    return (128, 128, 64, 8, 4, 8)
+
+
+def _triton_gemm(x, w, ws, out=None):
+    M, K = x.shape
+    N = w.shape[0]
+    c = out if out is not None else torch.empty((M, N), device=x.device, dtype=torch.bfloat16)
+    BM, BN, BK, GM, ns, nw = _pick_triton_cfg(M, N, K)
+    grid = (triton.cdiv(M, BM) * triton.cdiv(N, BN),)
+    _fp8_gemm_tri[grid](
+        x, w, c, ws, M, N, K,
+        x.stride(0), x.stride(1), w.stride(0), w.stride(1), c.stride(0), c.stride(1),
+        BLOCK_M=BM, BLOCK_N=BN, BLOCK_K=BK, GROUP_M=GM, num_stages=ns, num_warps=nw,
+    )
+    return c
+
+
+# ---------------------------------------------------------------------------
+# Fast path dispatch
+# ---------------------------------------------------------------------------
+_NUM_SMS = None
+
+
+def _num_sms():
+    global _NUM_SMS
+    if _NUM_SMS is None:
+        _NUM_SMS = torch.cuda.get_device_properties(0).multi_processor_count
+    return _NUM_SMS
+
+
+def _fast_ok(x, w):
+    M, K = x.shape
+    N = w.shape[0]
+    if not (x.is_cuda and x.dtype == torch.float8_e4m3fn):
+        return False
+    if w.dtype != torch.float8_e4m3fn:
+        return False
+    if not (x.is_contiguous() and w.is_contiguous()):
+        return False
+    if (N * 2) % 16 != 0:
+        return False
+    return True
+
+
+_PAD_WS = {}
+
+
+def fp8_gemm(x: torch.Tensor, w: torch.Tensor, ws: torch.Tensor) -> torch.Tensor:
+    ext = _build_ext()
+    xx, ww = x, w
+    M, K = x.shape
+    N = w.shape[0]
+    if K % 128 != 0:
+        if not (x.is_contiguous() and w.is_contiguous()):
+            return _triton_gemm(x, w, ws)
+        Kp = (K + 127) // 128 * 128
+        key = (M, N, Kp, x.dtype, x.device.index)
+        ws_buf = _PAD_WS.get(key)
+        if ws_buf is None:
+            ws_buf = (torch.empty((M, Kp), dtype=x.dtype, device=x.device),
+                      torch.empty((N, Kp), dtype=w.dtype, device=w.device))
+            _PAD_WS[key] = ws_buf
+        xx, ww = ws_buf
+        ext.pad_k(x, w, xx, ww)
+    if _fast_ok(xx, ww):
+        out = torch.empty((M, N), device=x.device, dtype=torch.bfloat16)
+        if M > 32:
+            ext.fp8_gemm_sm90_v3(xx, ww, ws, out, 256, 4, _num_sms(), 1, 16, 1, 128)
+        else:
+            ext.fp8_gemm_sm90_v3(xx, ww, ws, out, 128, 6, _num_sms(), 1, 8, 1, 128)
+        return out
+    return _triton_gemm(xx, ww, ws)
+
+
+_IS_SM90 = None
+
+
+def _is_sm90():
+    global _IS_SM90
+    if _IS_SM90 is None:
+        _IS_SM90 = torch.cuda.is_available() and torch.cuda.get_device_capability(0)[0] == 9
+    return _IS_SM90
+
+
+class Model(nn.Module):
+    """y = ((x @ w.T) * weight_scale).to(bf16).
+
+    Registers the same buffers as the reference: weight (N,K) fp8_e4m3 and
+    weight_scale (N,) fp32.
+    """
+
+    def __init__(self, M: int, N: int, K: int):
+        super().__init__()
+        self.M, self.N, self.K = M, N, K
+        w = torch.empty(N, K, dtype=torch.bfloat16)
+        nn.init.normal_(w, std=0.02)
+        s = (w.float().abs().amax(dim=1, keepdim=True) / E4M3_MAX).clamp(min=1e-12)
+        w_fp8 = (w.float() / s).to(torch.float8_e4m3fn)
+        self.register_buffer("weight", w_fp8)
+        self.register_buffer("weight_scale", s.squeeze(1).to(torch.float32))
+        if _is_sm90():
+            try:
+                _build_ext()
+            except Exception:
+                pass  # Triton fallback remains
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if _IS_SM90 is None:
+            _is_sm90()
+        if _IS_SM90 and x.is_cuda:
+            try:
+                return fp8_gemm(x, self.weight, self.weight_scale)
+            except Exception:
+                pass
+        return _triton_gemm(x, self.weight, self.weight_scale)
+
+
+M = 4096
+N = 4096
+K = 4096
+
+
+def get_inputs():
+    x = (torch.rand(M, K) * 8 - 4).to(torch.float8_e4m3fn)
+    return [x]
+
+
+def get_init_inputs():
+    return [M, N, K]

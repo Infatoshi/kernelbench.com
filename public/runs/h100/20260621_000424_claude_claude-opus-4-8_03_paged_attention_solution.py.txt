@@ -1,0 +1,242 @@
+"""Paged-attention decode kernel (Triton flash-decoding, split-K) for H100.
+
+Single-query decode is memory-bound: the win is streaming the KV cache once at
+near-peak HBM bandwidth. One program handles a (batch, kv_head, seq_split) and
+computes the partial attention for all GQA-group query heads sharing that kv head
+(KV tile read once per group). A small combine kernel reduces the splits with the
+log-sum-exp trick; when a single split suffices (enough parallelism), the split
+kernel writes the final output directly and the combine launch is skipped.
+"""
+import math
+
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def _split_kernel(
+    Q, KV, BT, SL, OP, LSE, OUT, scale,
+    H: tl.constexpr, Hkv: tl.constexpr, G: tl.constexpr,
+    D: tl.constexpr, P: tl.constexpr,
+    max_blocks, num_splits: tl.constexpr,
+    skb, skt, skh,
+    BLOCK_G: tl.constexpr, BLOCK_N: tl.constexpr, CHUNK: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    ps = tl.program_id(1)
+    b = pid // Hkv
+    kh = pid % Hkv
+
+    L = tl.load(SL + b)
+    lo = ps * CHUNK
+    hi = tl.minimum(lo + CHUNK, L)
+
+    og = tl.arange(0, BLOCK_G)
+    od = tl.arange(0, D)
+    on = tl.arange(0, BLOCK_N)
+    h0 = kh * G
+
+    q = tl.load(Q + (b * H + h0 + og[:, None]) * D + od[None, :],
+                mask=og[:, None] < G, other=0.0)
+
+    if lo >= hi:
+        # Empty split: emit zero output / -inf lse so the combine ignores it.
+        if num_splits != 1:
+            opb = ((b * H + h0 + og[:, None]) * num_splits + ps) * D + od[None, :]
+            lsb = (b * H + h0 + og) * num_splits + ps
+            tl.store(OP + opb, tl.zeros([BLOCK_G, D], dtype=OP.dtype.element_ty),
+                     mask=og[:, None] < G)
+            tl.store(LSE + lsb, tl.full([BLOCK_G], -float("inf"), dtype=tl.float32),
+                     mask=og < G)
+        return
+
+    m = tl.full([BLOCK_G], -float("inf"), dtype=tl.float32)
+    l = tl.zeros([BLOCK_G], dtype=tl.float32)
+    acc = tl.zeros([BLOCK_G, D], dtype=tl.float32)
+
+    kho = kh * skh
+    NITER: tl.constexpr = CHUNK // BLOCK_N
+    for i in range(NITER):
+        cur = lo + i * BLOCK_N + on
+        mk = cur < hi
+        bid = tl.load(BT + b * max_blocks + cur // P, mask=mk, other=0)
+        base = bid * skb + (cur % P) * skt + kho
+        k = tl.load(KV + base[:, None] + od[None, :], mask=mk[:, None], other=0.0)
+        v = tl.load(KV + base[:, None] + (D + od[None, :]), mask=mk[:, None], other=0.0)
+        s = tl.dot(q, tl.trans(k)).to(tl.float32) * scale
+        s = tl.where(mk[None, :], s, -float("inf"))
+        mn = tl.maximum(m, tl.max(s, 1))
+        p = tl.exp(s - mn[:, None])
+        al = tl.exp(m - mn)
+        l = l * al + tl.sum(p, 1)
+        acc = acc * al[:, None] + tl.dot(p.to(tl.bfloat16), v)
+        m = mn
+
+    ls = tl.where(l > 0, l, 1.0)
+    o = acc / ls[:, None]
+    if num_splits == 1:
+        tl.store(OUT + (b * H + h0 + og[:, None]) * D + od[None, :],
+                 o.to(OUT.dtype.element_ty), mask=og[:, None] < G)
+    else:
+        opb = ((b * H + h0 + og[:, None]) * num_splits + ps) * D + od[None, :]
+        lsb = (b * H + h0 + og) * num_splits + ps
+        tl.store(OP + opb, o.to(OP.dtype.element_ty), mask=og[:, None] < G)
+        tl.store(LSE + lsb, m + tl.log(ls), mask=og < G)
+
+
+@triton.jit
+def _combine_kernel(OP, LSE, OUT, H: tl.constexpr, D: tl.constexpr,
+                    ns: tl.constexpr, BS: tl.constexpr):
+    pid = tl.program_id(0)
+    os_ = tl.arange(0, BS)
+    od = tl.arange(0, D)
+    ms = os_ < ns
+    lse = tl.load(LSE + pid * ns + os_, mask=ms, other=-float("inf"))
+    m = tl.max(lse, 0)
+    w = tl.where(ms, tl.exp(lse - m), 0.0)
+    dn = tl.sum(w, 0)
+    op = tl.load(OP + (pid * ns + os_[:, None]) * D + od[None, :],
+                 mask=ms[:, None], other=0.0).to(tl.float32)
+    out = tl.sum(w[:, None] * op, 0) / dn
+    tl.store(OUT + pid * D + od, out.to(OUT.dtype.element_ty))
+
+
+# Tuned (split, block_n, num_stages) per benchmarked shape (B, H, Hkv, D, L, P).
+_TUNED = {
+    (8, 32, 8, 128, 1024, 16): (8, 32, 2),
+    (32, 32, 8, 128, 2048, 16): (1, 64, 2),
+    (4, 64, 8, 128, 4096, 16): (16, 32, 2),
+    (16, 32, 8, 128, 1535, 16): (1, 128, 3),
+    (8, 16, 4, 64, 2000, 16): (16, 32, 2),
+}
+
+
+def _plan(B, H, Hkv, D, L, P):
+    key = (B, H, Hkv, D, L, P)
+    if key in _TUNED:
+        return _TUNED[key]
+    pairs = B * Hkv
+    BN = 128 if D <= 64 else 64
+    ns = 3
+    if pairs >= 160:
+        S = 1
+    else:
+        # Aim for ~512-1024 resident CTAs without over-splitting short sequences.
+        S = max(1, min(max(1, L // 64), -(-768 // pairs)))
+    return S, BN, ns
+
+
+class Model(nn.Module):
+    def __init__(self, batch, num_heads, num_kv_heads, head_dim, seq_len, page_size):
+        super().__init__()
+        self.batch = batch
+        self.num_heads = num_heads
+        self.num_kv_heads = num_kv_heads
+        self.head_dim = head_dim
+        self.seq_len = seq_len
+        self.page_size = page_size
+        self.group_size = num_heads // num_kv_heads
+        self.scale = 1.0 / math.sqrt(head_dim)
+        self.register_buffer("_dummy", torch.zeros(1, dtype=torch.bfloat16), persistent=False)
+
+        # Everything except the input tensor pointers is fixed per shape -> precompute.
+        B, H, Hkv, D, L, P = batch, num_heads, num_kv_heads, head_dim, seq_len, page_size
+        S, BN, ns = _plan(B, H, Hkv, D, L, P)
+        self._S = S
+        self._BN = BN
+        self._ns = ns
+        self._CHUNK = ((L + S - 1) // S + BN - 1) // BN * BN
+        self._BLOCK_G = 16
+        twoD = 2 * D
+        self._skb = P * Hkv * twoD
+        self._skt = Hkv * twoD
+        self._skh = twoD
+        self._grid_split = (B * Hkv, S)
+        self._grid_comb = (B * H,)
+        self._BLOCK_S = triton.next_power_of_2(S)
+        self._buffers_ready = False
+        self._graphs = {}
+        self._use_graph = True
+        self._last_key = None
+        self._last_graph = None
+
+    def _alloc(self, device, dtype):
+        B, H, D = self.batch, self.num_heads, self.head_dim
+        self._out = torch.empty((B, H, D), dtype=dtype, device=device)
+        if self._S > 1:
+            self._o_part = torch.empty((B, H, self._S, D), dtype=torch.bfloat16, device=device)
+            self._lse = torch.empty((B, H, self._S), dtype=torch.float32, device=device)
+        self._buffers_ready = True
+
+    def _launch(self, query, kv_cache, block_table, seq_lens, max_blocks):
+        H, Hkv, G, D, P = self.num_heads, self.num_kv_heads, self.group_size, self.head_dim, self.page_size
+        S, BN, ns = self._S, self._BN, self._ns
+        out = self._out
+        if S == 1:
+            _split_kernel[self._grid_split](
+                query, kv_cache, block_table, seq_lens, query, query, out,
+                self.scale, H, Hkv, G, D, P, max_blocks, 1,
+                self._skb, self._skt, self._skh,
+                BLOCK_G=self._BLOCK_G, BLOCK_N=BN, CHUNK=self._CHUNK,
+                num_warps=4, num_stages=ns,
+            )
+        else:
+            _split_kernel[self._grid_split](
+                query, kv_cache, block_table, seq_lens, self._o_part, self._lse, out,
+                self.scale, H, Hkv, G, D, P, max_blocks, S,
+                self._skb, self._skt, self._skh,
+                BLOCK_G=self._BLOCK_G, BLOCK_N=BN, CHUNK=self._CHUNK,
+                num_warps=4, num_stages=ns,
+            )
+            _combine_kernel[self._grid_comb](
+                self._o_part, self._lse, out, H, D, S, self._BLOCK_S, num_warps=2,
+            )
+
+    def forward(self, query, kv_cache, block_table, seq_lens):
+        if not self._buffers_ready or self._out.device != query.device:
+            self._alloc(query.device, query.dtype)
+
+        max_blocks = block_table.shape[1]
+
+        if not self._use_graph:
+            self._launch(query, kv_cache, block_table, seq_lens, max_blocks)
+            return self._out
+
+        key = (query.data_ptr(), kv_cache.data_ptr(),
+               block_table.data_ptr(), seq_lens.data_ptr(), max_blocks)
+        if key == self._last_key:
+            self._last_graph.replay()
+            return self._out
+        graph = self._graphs.get(key)
+        if graph is None:
+            try:
+                # Warm up (compile triton kernels + populate output) before capture.
+                self._launch(query, kv_cache, block_table, seq_lens, max_blocks)
+                torch.cuda.synchronize()
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph):
+                    self._launch(query, kv_cache, block_table, seq_lens, max_blocks)
+                self._graphs[key] = graph
+                self._last_key = key
+                self._last_graph = graph
+                graph.replay()
+            except Exception:
+                self._use_graph = False
+                self._launch(query, kv_cache, block_table, seq_lens, max_blocks)
+            return self._out
+        self._last_key = key
+        self._last_graph = graph
+        graph.replay()
+        return self._out
+
+
+def get_inputs():
+    import reference
+    return reference.get_inputs()
+
+
+def get_init_inputs():
+    import reference
+    return reference.get_init_inputs()

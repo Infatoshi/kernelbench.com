@@ -1,0 +1,621 @@
+"""Paged-attention decode kernel for H100 PCIe (SM90).
+
+Memory-bound problem: the whole KV cache is streamed once per call, so the
+kernel is organized to saturate DRAM while keeping per-SM work negligible.
+
+  * Grid = (num_kv_heads, batch, splits). Each CTA handles one
+    (batch, kv_head, sequence-split) with all G = H/Hkv query heads, so KV is
+    read exactly once from DRAM.
+  * K|V token rows (2*D bf16, contiguous in the page pool) are staged into
+    shared memory with a multi-stage cp.async pipeline using an L2
+    "evict_first" policy (the harness dirties L2 with a 128MB zero-fill right
+    before each timed run; streaming policy dodges the writeback storm).
+  * Compute uses mma.m16n8k16 (bf16 -> fp32) tensor-core tiles: warps own
+    disjoint 16-token sub-chunks, Q lives in A-fragments (registers) for the
+    whole split, K/V are fed by ldmatrix from swizzled smem, and the QK^T
+    score fragment is reused directly as the A operand of P@V (FlashAttention
+    fragment-reuse trick). No cross-warp traffic in the main loop: one
+    __syncthreads per chunk (the pipeline barrier).
+  * Online softmax in fp32 (exp2 domain), per-warp (m, l); the 4 warps merge
+    once per split via smem.
+  * Sequence splits are merged inside the same kernel launch: split CTAs write
+    fp32 partials (acc, m, l); the last CTA of each (b, kv_head) group
+    (atomic ticket) reduces them. No second kernel launch.
+  * Host path is minimal (one lean pybind call, preallocated output/workspace,
+    nn.Module.__call__ overridden): launch + event overhead is a large slice
+    of the budget for the small shapes.
+"""
+import math
+import os
+
+import torch
+import torch.nn as nn
+
+OP_TYPE = "attention"
+SUPPORTED_PRECISIONS = ["bf16"]
+HARDWARE_REQUIRED = ["RTX_PRO_6000", "H100", "B200"]
+
+# --- Shape knobs (kept for interface parity with reference.py) ----------
+BATCH = 8
+NUM_HEADS = 32
+NUM_KV_HEADS = 8
+HEAD_DIM = 128
+SEQ_LEN = 1024
+PAGE_SIZE = 16
+
+_CUDA_SRC = r"""
+#include <torch/extension.h>
+#include <ATen/cuda/CUDAContext.h>
+#include <cuda_runtime.h>
+#include <cuda_bf16.h>
+#include <unordered_map>
+#include <cstdint>
+
+#define DEVINL __device__ __forceinline__
+
+constexpr int PAGE = 16;
+constexpr int NWARPS = 4;
+constexpr int NTHREADS = NWARPS * 32;
+
+DEVINL void ldmx4(unsigned addr, unsigned& r0, unsigned& r1, unsigned& r2, unsigned& r3) {
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+                 : "=r"(r0), "=r"(r1), "=r"(r2), "=r"(r3) : "r"(addr));
+}
+DEVINL void ldmx4t(unsigned addr, unsigned& r0, unsigned& r1, unsigned& r2, unsigned& r3) {
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+                 : "=r"(r0), "=r"(r1), "=r"(r2), "=r"(r3) : "r"(addr));
+}
+DEVINL void mma16816(const unsigned a0, const unsigned a1, const unsigned a2, const unsigned a3,
+                     const unsigned b0, const unsigned b1, float& c0, float& c1, float& c2, float& c3) {
+    asm volatile(
+        "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
+        "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+        : "+f"(c0), "+f"(c1), "+f"(c2), "+f"(c3)
+        : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+}
+
+// ---------------------------------------------------------------------------
+// Main kernel. D in {64,128}; G <= 8; TC = 64 tokens per pipeline chunk.
+// smem stage layout: K rows [TC][2D bytes] then V rows [TC][2D bytes]; each
+// 16B unit u of row t stored at u ^ (t & 7) (ldmatrix-conflict-free swizzle).
+// ---------------------------------------------------------------------------
+template <int D, int G, int TC, int STAGES>
+__global__ void __launch_bounds__(NTHREADS)
+pa_kernel(const __nv_bfloat16* __restrict__ q,    // [B, H, D]
+          const __nv_bfloat16* __restrict__ kv,   // [nb, PAGE, Hkv, 2D]
+          const int* __restrict__ block_table,    // [B, MB]
+          const int* __restrict__ seq_lens,       // [B]
+          __nv_bfloat16* __restrict__ out,        // [B, H, D]
+          float* __restrict__ pacc,               // [B*Hkv*S, G, D]
+          float2* __restrict__ pml,               // [B*Hkv*S, G]
+          int* __restrict__ sem,                  // [B*Hkv]
+          const int Hkv, const int MB, const int S, const int Tsplit,
+          const float scale2 /* softmax_scale * log2(e) */) {
+    constexpr int RB = 2 * D;             // bytes per K (or V) row
+    constexpr int STAGE_BYTES = TC * 2 * RB;
+    constexpr int KSTEPS = D / 16;        // QK k-steps
+    constexpr int NT2 = D / 8;            // PV output n-tiles (8 cols each)
+    constexpr int MAXPG = 256;            // max pages per split (4096 tokens)
+
+    const int kvh = blockIdx.x;
+    const int b = blockIdx.y;
+    const int s = blockIdx.z;
+    const int tid = threadIdx.x;
+    const int lane = tid & 31;
+    const int warp = tid >> 5;
+    const int H = Hkv * G;
+
+    extern __shared__ char smem[];
+    // fixed tail after the pipeline stages:
+    //   sbt   : int[MAXPG]            page ids of this split
+    //   mlbuf : float2[4][8]          per-warp (m, l)
+    //   wgt   : float[4][8]           merge weights (also reused: [S][G] for
+    //                                 the split reduction, S*G <= 256)
+    //   den   : float[8]
+    //   flag  : int
+    char* tail = smem + STAGES * STAGE_BYTES;
+    int* sbt = reinterpret_cast<int*>(tail);
+    float2* mlbuf = reinterpret_cast<float2*>(tail + MAXPG * 4);
+    float* wgt = reinterpret_cast<float*>(tail + MAXPG * 4 + 32 * 8);
+    float* den = wgt + 256;
+    int* flag = reinterpret_cast<int*>(den + 8);
+
+    const int L = seq_lens[b];
+    const int t0 = s * Tsplit;
+    const int t1 = min(t0 + Tsplit, L);
+    const int pair = b * Hkv + kvh;
+
+    unsigned long long policy;
+    asm volatile("createpolicy.fractional.L2::evict_first.b64 %0, 1.0;" : "=l"(policy));
+
+    // ---- empty split (possible only when seq_lens[b] < planned max) -------
+    if (t1 <= t0) {
+        if (S > 1) {
+            if (tid < G)
+                pml[(pair * S + s) * G + tid] = make_float2(-INFINITY, 0.f);
+            __threadfence();
+            __syncthreads();
+            if (tid == 0) flag[0] = (atomicAdd(&sem[pair], 1) == S - 1) ? 1 : 0;
+            __syncthreads();
+            if (flag[0]) goto reduce_splits;
+        }
+        return;
+    }
+
+    {
+        // ---- prefetch this split's page ids into smem ----------------------
+        const int p0 = t0 >> 4;
+        const int npages = (t1 - t0 + PAGE - 1) >> 4;
+        for (int i = tid; i < npages; i += NTHREADS)
+            sbt[i] = __ldg(block_table + (size_t)b * MB + p0 + i);
+
+        // ---- Q -> A fragments (held in registers for the whole split) ------
+        // a-frag rows: r (=lane/4) and r+8; row >= G is padding (clamped q, or 0)
+        unsigned aq[KSTEPS][2];
+        {
+            const int r = lane >> 2;
+            const int qrow = (r < G) ? r : (G - 1);
+            const __nv_bfloat16* qp = q + ((size_t)b * H + kvh * G + qrow) * D + (lane & 3) * 2;
+            #pragma unroll
+            for (int ks = 0; ks < KSTEPS; ++ks) {
+                aq[ks][0] = *reinterpret_cast<const unsigned*>(qp + ks * 16);
+                aq[ks][1] = *reinterpret_cast<const unsigned*>(qp + ks * 16 + 8);
+            }
+        }
+        __syncthreads();  // sbt visible
+
+        const int n_tok = t1 - t0;
+        const int NCH = (n_tok + TC - 1) / TC;
+        const size_t row_stride2 = (size_t)Hkv * 2 * D * 2;  // bytes per pool token
+        const char* kv_base = reinterpret_cast<const char*>(kv) + (size_t)kvh * 2 * D * 2;
+        const unsigned smem_base = (unsigned)__cvta_generic_to_shared(smem);
+
+        // cp.async: each thread moves 16B units; unit-in-row is constant.
+        constexpr int UPR = 4 * D / 16;              // 16B units per K|V row
+        constexpr int ROWS_PER_ROUND = NTHREADS / UPR;
+        const int cunit = tid % UPR;
+        const int crow0 = tid / UPR;
+        auto issue_chunk = [&](int c) {
+            const int lt0 = c * TC;                  // token offset within split
+            const unsigned kbase = smem_base + (c % STAGES) * STAGE_BYTES;
+            const unsigned vbase = kbase + TC * RB;
+            #pragma unroll
+            for (int rr = 0; rr < TC / ROWS_PER_ROUND; ++rr) {
+                const int tok = crow0 + rr * ROWS_PER_ROUND;   // row in chunk
+                const int t = lt0 + tok;                       // token in split
+                const bool valid = t < n_tok;
+                const int blk = sbt[valid ? (t >> 4) : 0];
+                const char* src = kv_base + ((size_t)blk * PAGE + ((t0 + t) & 15)) * row_stride2 + cunit * 16;
+                unsigned dst = (cunit < UPR / 2)
+                    ? kbase + tok * RB + ((cunit ^ (tok & 7)) & (UPR / 2 - 1)) * 16
+                    : vbase + tok * RB + (((cunit - UPR / 2) ^ (tok & 7)) & (UPR / 2 - 1)) * 16;
+                const int sz = valid ? 16 : 0;
+                asm volatile("cp.async.cg.shared.global.L2::cache_hint [%0], [%1], 16, %2, %3;\n"
+                             :: "r"(dst), "l"(src), "r"(sz), "l"(policy));
+            }
+            asm volatile("cp.async.commit_group;\n");
+        };
+
+        #pragma unroll
+        for (int c = 0; c < STAGES - 1; ++c) issue_chunk(c);
+
+        // per-lane softmax state for this lane's head row r = lane>>2
+        float m2 = -INFINITY, lsum = 0.f;
+        float o[NT2][2];
+        #pragma unroll
+        for (int i = 0; i < NT2; ++i) o[i][0] = o[i][1] = 0.f;
+
+        const int r = lane >> 2;
+        const int cpair = (lane & 3) * 2;     // this lane's 2 columns in a tile
+
+        for (int c = 0; c < NCH; ++c) {
+            asm volatile("cp.async.wait_group %0;\n" :: "n"(STAGES - 2));
+            __syncthreads();
+            issue_chunk(c + STAGES - 1);
+
+            const unsigned kbase = smem_base + (c % STAGES) * STAGE_BYTES;
+            const unsigned vbase = kbase + TC * RB;
+            const int wt0 = warp * 16;                    // warp sub-chunk in chunk
+            const int gt0 = t0 + c * TC + wt0;            // its global token base
+
+            // ---- QK^T: scores fragment sc[nn] = rows x 8 tokens ------------
+            float sc[2][4];
+            #pragma unroll
+            for (int nn = 0; nn < 2; ++nn) { sc[nn][0]=0.f; sc[nn][1]=0.f; sc[nn][2]=0.f; sc[nn][3]=0.f; }
+            {
+                const int lgrp = lane >> 3, lrow = lane & 7;
+                #pragma unroll
+                for (int nn = 0; nn < 2; ++nn) {
+                    const int tok = wt0 + nn * 8 + lrow;
+                    #pragma unroll
+                    for (int kb = 0; kb < KSTEPS / 2; ++kb) {
+                        const int u = kb * 4 + lgrp;      // 16B dim-unit
+                        const unsigned addr = kbase + tok * RB + ((u ^ (tok & 7)) & (RB/16 - 1)) * 16;
+                        unsigned b0, b1, b2, b3;
+                        ldmx4(addr, b0, b1, b2, b3);
+                        mma16816(aq[2*kb][0], 0u, aq[2*kb][1], 0u, b0, b1,
+                                 sc[nn][0], sc[nn][1], sc[nn][2], sc[nn][3]);
+                        mma16816(aq[2*kb+1][0], 0u, aq[2*kb+1][1], 0u, b2, b3,
+                                 sc[nn][0], sc[nn][1], sc[nn][2], sc[nn][3]);
+                    }
+                }
+            }
+
+            // ---- online softmax (per lane: head row r; 4 score values) -----
+            float p4[4];
+            {
+                const int base_tok = gt0 + cpair;
+                const bool v0 = (base_tok + 0) < t1, v1 = (base_tok + 1) < t1;
+                const bool v2 = (base_tok + 8) < t1, v3 = (base_tok + 9) < t1;
+                const float s0 = v0 ? sc[0][0] * scale2 : -INFINITY;
+                const float s1 = v1 ? sc[0][1] * scale2 : -INFINITY;
+                const float s2v = v2 ? sc[1][0] * scale2 : -INFINITY;
+                const float s3 = v3 ? sc[1][1] * scale2 : -INFINITY;
+                float mloc = fmaxf(fmaxf(s0, s1), fmaxf(s2v, s3));
+                mloc = fmaxf(mloc, __shfl_xor_sync(0xffffffffu, mloc, 1));
+                mloc = fmaxf(mloc, __shfl_xor_sync(0xffffffffu, mloc, 2));
+                const float mnew = fmaxf(m2, mloc);
+                const float corr = (mnew == -INFINITY) ? 1.f : exp2f(m2 - mnew);
+                m2 = mnew;
+                p4[0] = v0 ? exp2f(s0 - mnew) : 0.f;
+                p4[1] = v1 ? exp2f(s1 - mnew) : 0.f;
+                p4[2] = v2 ? exp2f(s2v - mnew) : 0.f;
+                p4[3] = v3 ? exp2f(s3 - mnew) : 0.f;
+                float ps = p4[0] + p4[1] + p4[2] + p4[3];
+                ps += __shfl_xor_sync(0xffffffffu, ps, 1);
+                ps += __shfl_xor_sync(0xffffffffu, ps, 2);
+                lsum = lsum * corr + ps;
+                #pragma unroll
+                for (int i = 0; i < NT2; ++i) { o[i][0] *= corr; o[i][1] *= corr; }
+            }
+
+            // ---- P @ V ------------------------------------------------------
+            // c2/c3 of each PV mma belong to pad rows (A rows 8..15 are zero),
+            // so they never change; route them to two junk registers.
+            {
+                __nv_bfloat162 b01 = __floats2bfloat162_rn(p4[0], p4[1]);
+                __nv_bfloat162 b23 = __floats2bfloat162_rn(p4[2], p4[3]);
+                const unsigned pa0 = *reinterpret_cast<unsigned*>(&b01);
+                const unsigned pa2 = *reinterpret_cast<unsigned*>(&b23);
+                const int lgrp = lane >> 3, lrow = lane & 7;
+                float jk0 = 0.f, jk1 = 0.f;
+                const int tok = wt0 + (lgrp >> 1) * 8 + lrow;
+                #pragma unroll
+                for (int nb = 0; nb < NT2 / 2; ++nb) {
+                    const int u = nb * 2 + (lgrp & 1);
+                    const unsigned addr = vbase + tok * RB + ((u ^ (tok & 7)) & (RB/16 - 1)) * 16;
+                    unsigned v0, v1, v2, v3;
+                    ldmx4t(addr, v0, v1, v2, v3);
+                    mma16816(pa0, 0u, pa2, 0u, v0, v2,
+                             o[2*nb][0], o[2*nb][1], jk0, jk1);
+                    mma16816(pa0, 0u, pa2, 0u, v1, v3,
+                             o[2*nb+1][0], o[2*nb+1][1], jk0, jk1);
+                }
+            }
+        }
+
+        asm volatile("cp.async.wait_group 0;\n" ::);
+        __syncthreads();
+
+        // ---- merge the 4 warps via smem (reuse stage 0 as [4][G][D] fp32) ---
+        float* macc = reinterpret_cast<float*>(smem);
+        if (r < G) {
+            #pragma unroll
+            for (int i = 0; i < NT2; ++i) {
+                macc[((warp * G + r) * D) + i * 8 + cpair] = o[i][0];
+                macc[((warp * G + r) * D) + i * 8 + cpair + 1] = o[i][1];
+            }
+            if ((lane & 3) == 0) mlbuf[warp * 8 + r] = make_float2(m2, lsum);
+        }
+        __syncthreads();
+        if (warp == 0 && lane < 4 * G) {
+            // lanes: w4 = lane / G, g = lane % G  (4*G <= 32 lanes participate)
+            const unsigned msk = (4 * G == 32) ? 0xffffffffu : ((1u << (4 * G)) - 1u);
+            const int w4 = lane / G, g = lane % G;
+            const float2 ml = mlbuf[w4 * 8 + g];
+            float mmax = ml.x;
+            #pragma unroll
+            for (int off = G; off < 4 * G; off <<= 1)
+                mmax = fmaxf(mmax, __shfl_xor_sync(msk, mmax, off));
+            const float wv = (ml.x == -INFINITY) ? 0.f : exp2f(ml.x - mmax);
+            float dv = wv * ml.y;
+            #pragma unroll
+            for (int off = G; off < 4 * G; off <<= 1)
+                dv += __shfl_xor_sync(msk, dv, off);
+            wgt[w4 * 8 + g] = wv;
+            if (w4 == 0) {
+                den[g] = dv;
+                if (S > 1) pml[(pair * S + s) * G + g] = make_float2(mmax, dv);
+            }
+        }
+        __syncthreads();
+
+        if (S == 1) {
+            #pragma unroll 2
+            for (int i = tid; i < G * D; i += NTHREADS) {
+                const int g = i / D;
+                const float val = macc[(0 * G + g) * D + i % D] * wgt[0 * 8 + g]
+                                + macc[(1 * G + g) * D + i % D] * wgt[1 * 8 + g]
+                                + macc[(2 * G + g) * D + i % D] * wgt[2 * 8 + g]
+                                + macc[(3 * G + g) * D + i % D] * wgt[3 * 8 + g];
+                out[((size_t)b * H + kvh * G) * D + i] = __float2bfloat16_rn(val / den[g]);
+            }
+            return;
+        }
+        #pragma unroll 2
+        for (int i = tid; i < G * D; i += NTHREADS) {
+            const int g = i / D;
+            const float val = macc[(0 * G + g) * D + i % D] * wgt[0 * 8 + g]
+                            + macc[(1 * G + g) * D + i % D] * wgt[1 * 8 + g]
+                            + macc[(2 * G + g) * D + i % D] * wgt[2 * 8 + g]
+                            + macc[(3 * G + g) * D + i % D] * wgt[3 * 8 + g];
+            pacc[((size_t)(pair * S + s) * G) * D + i] = val;
+        }
+        __threadfence();
+        __syncthreads();
+        if (tid == 0) flag[0] = (atomicAdd(&sem[pair], 1) == S - 1) ? 1 : 0;
+        __syncthreads();
+        if (!flag[0]) return;
+    }
+
+reduce_splits:
+    __threadfence();
+    {
+        const int pair2 = b * Hkv + kvh;
+        // warp 0 precomputes weights for all (s, g); one pml load per (s, g)
+        if (warp == 0) {
+            for (int g = lane; g < G; g += 32) {
+                float mv[32], lv[32];
+                float mmax = -INFINITY;
+                for (int ss = 0; ss < S; ++ss) {
+                    const float2 ml = *reinterpret_cast<const float2*>(
+                        __builtin_assume_aligned(&pml[(pair2 * S + ss) * G + g], 8));
+                    mv[ss] = ml.x; lv[ss] = ml.y;
+                    mmax = fmaxf(mmax, ml.x);
+                }
+                float dv = 0.f;
+                for (int ss = 0; ss < S; ++ss) {
+                    const float wv = (mv[ss] == -INFINITY) ? 0.f : exp2f(mv[ss] - mmax);
+                    wgt[ss * 8 + g] = wv;   // NB: needs S*8 <= 256 -> S <= 32
+                    dv += wv * lv[ss];
+                }
+                den[g] = dv;
+            }
+        }
+        __syncthreads();
+        // vectorized: each thread owns consecutive float4s of the G*D output
+        const float4* pv4 = reinterpret_cast<const float4*>(pacc + (size_t)pair2 * S * G * D);
+        #pragma unroll 1
+        for (int i4 = tid; i4 < G * D / 4; i4 += NTHREADS) {
+            const int g = (i4 * 4) / D;
+            float4 acc4 = make_float4(0.f, 0.f, 0.f, 0.f);
+            for (int ss = 0; ss < S; ++ss) {
+                const float wv = wgt[ss * 8 + g];
+                const float4 v = __ldcg(pv4 + (size_t)ss * (G * D / 4) + i4);
+                acc4.x += wv * v.x; acc4.y += wv * v.y;
+                acc4.z += wv * v.z; acc4.w += wv * v.w;
+            }
+            const float inv = 1.f / den[g];
+            __nv_bfloat16* dst = out + ((size_t)b * (Hkv * G) + kvh * G) * D + i4 * 4;
+            dst[0] = __float2bfloat16_rn(acc4.x * inv);
+            dst[1] = __float2bfloat16_rn(acc4.y * inv);
+            dst[2] = __float2bfloat16_rn(acc4.z * inv);
+            dst[3] = __float2bfloat16_rn(acc4.w * inv);
+        }
+        __threadfence();
+        __syncthreads();
+        if (tid == 0) sem[pair2] = 0;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Host side.
+// ---------------------------------------------------------------------------
+struct PACtx {
+    torch::Tensor out, pacc, pml, sem;
+    int B, H, Hkv, D, S, Tsplit, stages;
+    float scale2;
+};
+static std::unordered_map<uint64_t, PACtx> g_ctx;
+
+static inline uint64_t make_key(int64_t B, int64_t H, int64_t Hkv, int64_t D) {
+    return (uint64_t)B << 40 | (uint64_t)H << 24 | (uint64_t)Hkv << 12 | (uint64_t)D;
+}
+
+template <int D, int G, int TC, int STAGES>
+void launch_one(const PACtx& c, const torch::Tensor& q, const torch::Tensor& kv,
+                const torch::Tensor& bt, const torch::Tensor& sl, cudaStream_t stream) {
+    constexpr int SMEM = STAGES * TC * 4 * D + 256 * 4 + 32 * 8 + 256 * 4 + 32 + 16;
+    static bool configured = false;
+    if (!configured) {
+        cudaFuncSetAttribute(pa_kernel<D, G, TC, STAGES>,
+                             cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM);
+        configured = true;
+    }
+    dim3 grid(c.Hkv, c.B, c.S);
+    pa_kernel<D, G, TC, STAGES><<<grid, NTHREADS, SMEM, stream>>>(
+        reinterpret_cast<const __nv_bfloat16*>(q.data_ptr()),
+        reinterpret_cast<const __nv_bfloat16*>(kv.data_ptr()),
+        bt.data_ptr<int>(), sl.data_ptr<int>(),
+        reinterpret_cast<__nv_bfloat16*>(c.out.data_ptr()),
+        c.pacc.data_ptr<float>(),
+        reinterpret_cast<float2*>(c.pml.data_ptr<float>()),
+        c.sem.data_ptr<int>(),
+        c.Hkv, (int)bt.size(1), c.S, c.Tsplit, c.scale2);
+}
+
+void pa_init(torch::Tensor out, torch::Tensor pacc, torch::Tensor pml, torch::Tensor sem,
+             int64_t Hkv, int64_t S, int64_t Tsplit, int64_t stages, double scale2) {
+    const int B = out.size(0), H = out.size(1), D = out.size(2);
+    PACtx c{out, pacc, pml, sem, B, H, (int)Hkv, D, (int)S, (int)Tsplit, (int)stages, (float)scale2};
+    g_ctx[make_key(B, H, Hkv, D)] = c;
+}
+
+torch::Tensor pa_run(torch::Tensor q, torch::Tensor kv, torch::Tensor bt, torch::Tensor sl) {
+    const auto it = g_ctx.find(make_key(q.size(0), q.size(1), kv.size(2), q.size(2)));
+    TORCH_CHECK(it != g_ctx.end(), "pa_init not called for this shape");
+    const PACtx& c = it->second;
+    const int G = c.H / c.Hkv;
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    if (c.D == 128 && G == 4) {
+        if (c.stages == 2)      launch_one<128, 4, 64, 2>(c, q, kv, bt, sl, stream);
+        else if (c.stages == 3) launch_one<128, 4, 64, 3>(c, q, kv, bt, sl, stream);
+        else                    launch_one<128, 4, 64, 4>(c, q, kv, bt, sl, stream);
+    } else if (c.D == 128 && G == 8) {
+        if (c.stages == 2)      launch_one<128, 8, 64, 2>(c, q, kv, bt, sl, stream);
+        else if (c.stages == 3) launch_one<128, 8, 64, 3>(c, q, kv, bt, sl, stream);
+        else                    launch_one<128, 8, 64, 4>(c, q, kv, bt, sl, stream);
+    } else if (c.D == 64 && G == 4) {
+        if (c.stages == 2)      launch_one<64, 4, 64, 2>(c, q, kv, bt, sl, stream);
+        else if (c.stages == 3) launch_one<64, 4, 64, 3>(c, q, kv, bt, sl, stream);
+        else if (c.stages == 4) launch_one<64, 4, 64, 4>(c, q, kv, bt, sl, stream);
+        else                    launch_one<64, 4, 64, 6>(c, q, kv, bt, sl, stream);
+    } else TORCH_CHECK(false, "unsupported (D, G)");
+    return c.out;
+}
+"""
+
+_CPP_SRC = """
+void pa_init(torch::Tensor out, torch::Tensor pacc, torch::Tensor pml, torch::Tensor sem,
+             int64_t Hkv, int64_t S, int64_t Tsplit, int64_t stages, double scale2);
+torch::Tensor pa_run(torch::Tensor q, torch::Tensor kv, torch::Tensor bt, torch::Tensor sl);
+"""
+
+_ext = None
+
+
+def _get_ext():
+    global _ext
+    if _ext is None:
+        from torch.utils.cpp_extension import load_inline
+
+        build_dir = None
+        try:
+            d = os.path.join(os.path.dirname(os.path.abspath(__file__)), "build_pa")
+            os.makedirs(d, exist_ok=True)
+            build_dir = d
+        except OSError:
+            build_dir = None
+        _ext = load_inline(
+            name="paged_attn_h100_v2",
+            cpp_sources=_CPP_SRC,
+            cuda_sources=_CUDA_SRC,
+            functions=["pa_init", "pa_run"],
+            extra_cuda_cflags=["-O3", "--use_fast_math", "-arch=sm_90a", "-std=c++17"],
+            build_directory=build_dir,
+            verbose=False,
+        )
+    return _ext
+
+
+class Model(nn.Module):
+    """Single-query paged attention decode (see reference.py for semantics)."""
+
+    _TC = 64
+    _TARGET_CTAS = 456
+    # per-shape plan overrides: (B, H, Hkv, D, L) -> (num_splits, pipeline stages)
+    _PLAN = {}
+
+    def __init__(self, batch, num_heads, num_kv_heads, head_dim, seq_len, page_size):
+        super().__init__()
+        assert num_heads % num_kv_heads == 0
+        self.batch = batch
+        self.num_heads = num_heads
+        self.num_kv_heads = num_kv_heads
+        self.head_dim = head_dim
+        self.seq_len = seq_len
+        self.page_size = page_size
+        self.group_size = num_heads // num_kv_heads
+        self.scale = 1.0 / math.sqrt(head_dim)
+
+        self.register_buffer("_dummy", torch.zeros(1, dtype=torch.bfloat16), persistent=False)
+
+        self._fast = (
+            page_size == 16
+            and (head_dim, self.group_size) in ((128, 4), (128, 8), (64, 4))
+        )
+        self._initialized = False
+        if self._fast:
+            tc = self._TC
+            pairs = batch * num_kv_heads
+            key = (batch, num_heads, num_kv_heads, head_dim, seq_len)
+            plan = self._PLAN.get(key)
+            if plan is not None:
+                s, self._stages = plan
+                s = min(max(1, s), max(1, math.ceil(seq_len / tc)), 32)
+            else:
+                max_s = max(1, math.ceil(seq_len / tc))
+                s = min(max(1, math.ceil(self._TARGET_CTAS / pairs)), max_s, 32)
+                self._stages = 3 if head_dim == 128 else 4
+            tsplit = math.ceil(seq_len / (s * tc)) * tc
+            s = math.ceil(seq_len / tsplit)
+            # each split must fit the smem page-id buffer (256 pages)
+            assert tsplit <= 256 * page_size
+            self._S = s
+            self._Tsplit = tsplit
+            g = self.group_size
+            self.register_buffer(
+                "_out", torch.zeros(batch, num_heads, head_dim, dtype=torch.bfloat16), persistent=False
+            )
+            self.register_buffer(
+                "_pacc", torch.zeros(pairs * s, g, head_dim, dtype=torch.float32), persistent=False
+            )
+            self.register_buffer(
+                "_pml", torch.zeros(pairs * s, g, 2, dtype=torch.float32), persistent=False
+            )
+            self.register_buffer("_sem", torch.zeros(pairs, dtype=torch.int32), persistent=False)
+            _get_ext()  # compile at construction time, outside any timed region
+
+    def _lazy_init(self):
+        _get_ext().pa_init(
+            self._out, self._pacc, self._pml, self._sem,
+            self.num_kv_heads, self._S, self._Tsplit, self._stages,
+            self.scale * math.log2(math.e),
+        )
+        self._initialized = True
+
+    def forward(self, query, kv_cache, block_table, seq_lens):
+        if self._fast:
+            if not self._initialized:
+                self._lazy_init()
+                self._run = _ext.pa_run
+            return self._run(query, kv_cache, block_table, seq_lens)
+        return self._fallback(query, kv_cache, block_table, seq_lens)
+
+    def __call__(self, *args, **kwargs):  # skip nn.Module hook machinery
+        return self.forward(*args, **kwargs)
+
+    def _fallback(self, query, kv_cache, block_table, seq_lens):
+        """Pure-torch paged attention (no SDPA); only used for unplanned shapes."""
+        B, H, Dh = query.shape
+        Hkv = self.num_kv_heads
+        Gs = self.group_size
+        P = self.page_size
+        out = torch.empty_like(query)
+        for b in range(B):
+            L = int(seq_lens[b].item())
+            pages = block_table[b, : (L + P - 1) // P].long()
+            kvb = kv_cache.index_select(0, pages).reshape(-1, Hkv, 2 * Dh)[:L]
+            k = kvb[..., :Dh].repeat_interleave(Gs, dim=1).float()
+            v = kvb[..., Dh:].repeat_interleave(Gs, dim=1).float()
+            qf = query[b].float()
+            scores = torch.einsum("hd,lhd->hl", qf, k) * self.scale
+            probs = torch.softmax(scores, dim=-1)
+            out[b] = torch.einsum("hl,lhd->hd", probs, v).to(query.dtype)
+        return out
+
+
+def get_inputs():
+    B, H, Hkv, D, L, P = BATCH, NUM_HEADS, NUM_KV_HEADS, HEAD_DIM, SEQ_LEN, PAGE_SIZE
+    pages_per_seq = (L + P - 1) // P
+    total_pages = max(B * pages_per_seq + 8, 64)
+    query = torch.randn(B, H, D, dtype=torch.bfloat16) * 0.1
+    kv_cache = torch.randn(total_pages, P, Hkv, 2 * D, dtype=torch.bfloat16) * 0.1
+    perm = torch.randperm(total_pages)[: B * pages_per_seq].reshape(B, pages_per_seq).int()
+    block_table = perm.contiguous()
+    seq_lens = torch.full((B,), L, dtype=torch.int32)
+    return [query, kv_cache, block_table, seq_lens]
+
+
+def get_init_inputs():
+    return [BATCH, NUM_HEADS, NUM_KV_HEADS, HEAD_DIM, SEQ_LEN, PAGE_SIZE]

@@ -1,0 +1,573 @@
+"""Custom CUDA top-k for B200 (SM100).
+
+Single-launch warp-bitonic selection:
+  * each warp keeps a sorted-descending top-K candidate list in registers
+    (K = 32 for k <= 32, K = 64 for k <= 64, padded with -inf),
+  * the row is streamed in 32-wide chunks via software-pipelined float4 loads;
+    a warp ballot against the running k-th value filters each chunk; only
+    chunks holding a candidate pay for the bitonic sort32 + top-K merge,
+  * all warps of a block share a monotone threshold word in shared memory
+    (encoded-float atomicMax), so the whole block converges to one k-th-value
+    threshold quickly and nearly every later chunk is skipped with one ballot,
+  * warp lists combine through shared memory via a log2(NW) tree of sorted
+    list-vs-list bitonic merges (no re-sort),
+  * for large-n / small-batch shapes several blocks share a row: each block
+    publishes its top-K list to global scratch (release ordering) and the last
+    block to arrive (acq_rel atomic counter) merges the other lists starting
+    from its own already-warm list, so almost all candidates ballot-skip.
+
+Everything happens in ONE kernel launch per forward call: at these shapes
+(0.5-2 MB input) launch latency, not bandwidth, is the whole game.
+"""
+import os
+
+os.environ.setdefault("CUDA_HOME", "/usr/local/cuda-12.8")
+
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+_CPP_DECL = "void topk_run(at::Tensor x, int64_t k, int64_t g, int64_t nw, at::Tensor scv, at::Tensor sci, at::Tensor cnt, at::Tensor ov, at::Tensor oi);"
+
+_CUDA_SRC = r"""
+#include <torch/extension.h>
+#include <ATen/cuda/CUDAContext.h>
+#include <cuda_runtime.h>
+#include <cuda/atomic>
+#include <vector>
+
+#define FULL 0xffffffffu
+
+// Monotone order-preserving float <-> uint mapping (no NaNs in this problem).
+__device__ __forceinline__ unsigned enc_f(float f) {
+    int i = __float_as_int(f);
+    return (unsigned)(i >= 0 ? (i ^ 0x80000000) : ~i);
+}
+__device__ __forceinline__ float dec_f(unsigned u) {
+    int i = (u & 0x80000000u) ? (int)(u ^ 0x80000000u) : ~(int)u;
+    return __int_as_float(i);
+}
+
+template <int KPL>
+struct WList {                 // top-(32*KPL) list, element e lives at reg e/32, lane e%32
+    float v[KPL];
+    int   i[KPL];
+};
+
+__device__ __forceinline__ void cswap(float& v, int& i, int d, bool keepMaxLow, int lane) {
+    float pv = __shfl_xor_sync(FULL, v, d);
+    int   pi = __shfl_xor_sync(FULL, i, d);
+    bool lower  = (lane & d) == 0;
+    bool wantMax = (lower == keepMaxLow);
+    bool take = wantMax ? (pv > v) : (pv < v);
+    if (take) { v = pv; i = pi; }
+}
+
+// Sort 32 values (one per lane) descending across the warp.
+__device__ __forceinline__ void sort32_desc(float& v, int& i, int lane) {
+    #pragma unroll
+    for (int s = 2; s <= 32; s <<= 1) {
+        bool desc = ((lane & s) == 0);
+        #pragma unroll
+        for (int d = s >> 1; d >= 1; d >>= 1)
+            cswap(v, i, d, desc, lane);
+    }
+}
+
+// Merge a descending-sorted 32-chunk into the descending top-K list.
+template <int KPL>
+__device__ __forceinline__ void merge_chunk(WList<KPL>& L, float cv, int ci, int lane) {
+    float rv = __shfl_xor_sync(FULL, cv, 31);   // chunk reversed -> ascending
+    int   ri = __shfl_xor_sync(FULL, ci, 31);
+    if (KPL == 1) {
+        if (rv > L.v[0]) { L.v[0] = rv; L.i[0] = ri; }   // elementwise max -> bitonic
+        #pragma unroll
+        for (int d = 16; d >= 1; d >>= 1) cswap(L.v[0], L.i[0], d, true, lane);
+    } else {
+        // treat chunk as [c_desc, -inf x32]; only upper half of L sees candidates
+        if (rv > L.v[1]) { L.v[1] = rv; L.i[1] = ri; }
+        if (L.v[1] > L.v[0]) {                            // distance-32 stage
+            float tv = L.v[0]; L.v[0] = L.v[1]; L.v[1] = tv;
+            int   ti = L.i[0]; L.i[0] = L.i[1]; L.i[1] = ti;
+        }
+        #pragma unroll
+        for (int d = 16; d >= 1; d >>= 1) {
+            cswap(L.v[0], L.i[0], d, true, lane);
+            cswap(L.v[1], L.i[1], d, true, lane);
+        }
+    }
+}
+
+// Merge two descending-sorted K-lists (top-K of the union stays in L).
+template <int KPL>
+__device__ __forceinline__ void merge_lists(WList<KPL>& L, const WList<KPL>& B, int lane) {
+    if (KPL == 1) {
+        merge_chunk(L, B.v[0], B.i[0], lane);   // a sorted list is a sorted chunk
+    } else {
+        float rv0 = __shfl_xor_sync(FULL, B.v[1], 31);  // B[63-e], e in [0,32)
+        int   ri0 = __shfl_xor_sync(FULL, B.i[1], 31);
+        float rv1 = __shfl_xor_sync(FULL, B.v[0], 31);  // B[63-e], e in [32,64)
+        int   ri1 = __shfl_xor_sync(FULL, B.i[0], 31);
+        if (rv0 > L.v[0]) { L.v[0] = rv0; L.i[0] = ri0; }
+        if (rv1 > L.v[1]) { L.v[1] = rv1; L.i[1] = ri1; }
+        if (L.v[1] > L.v[0]) {
+            float tv = L.v[0]; L.v[0] = L.v[1]; L.v[1] = tv;
+            int   ti = L.i[0]; L.i[0] = L.i[1]; L.i[1] = ti;
+        }
+        #pragma unroll
+        for (int d = 16; d >= 1; d >>= 1) {
+            cswap(L.v[0], L.i[0], d, true, lane);
+            cswap(L.v[1], L.i[1], d, true, lane);
+        }
+    }
+}
+
+template <int KPL>
+__device__ __forceinline__ float kth_val(const WList<KPL>& L, int k) {
+    if (KPL == 1) return __shfl_sync(FULL, L.v[0], k - 1);
+    return (k <= 32) ? __shfl_sync(FULL, L.v[0], k - 1)
+                     : __shfl_sync(FULL, L.v[1], k - 33);
+}
+
+// Streaming accumulator with a block-shared monotone threshold.
+template <int KPL>
+struct Acc {
+    WList<KPL> L;
+    float thresh;      // this warp's k-th largest so far
+    int   lane;
+    int   k;
+    unsigned* sthr;    // block-wide encoded max threshold (shared memory)
+
+    __device__ __forceinline__ void init(int lane_, int k_, unsigned* sthr_) {
+        lane = lane_; k = k_; sthr = sthr_;
+        #pragma unroll
+        for (int r = 0; r < KPL; ++r) { L.v[r] = -INFINITY; L.i[r] = 0; }
+        thresh = -INFINITY;
+    }
+
+    __device__ __forceinline__ float eff_thresh() const {
+        unsigned u = *(volatile unsigned*)sthr;
+        return fmaxf(thresh, dec_f(u));
+    }
+
+    __device__ __forceinline__ void bump_shared() {
+        if (lane == 0) atomicMax(sthr, enc_f(thresh));
+    }
+
+    __device__ __forceinline__ void feed(float cv, int ci, float t) {
+        if (!__any_sync(FULL, cv > t)) return;
+        sort32_desc(cv, ci, lane);
+        merge_chunk(L, cv, ci, lane);
+        thresh = kth_val(L, k);
+        bump_shared();
+    }
+};
+
+// Free threshold warm-up pass: every lane keeps the top-2 of its strided
+// elements (pure compare/max, no shuffles, also pre-warms L2). The k-th
+// largest of any SUBSET of elements is a valid global threshold (>= k
+// elements are >= it: the subset's own top k). The union of per-lane top-2s
+// almost surely contains the true top-k (a lane would need >= 3 of the top-k
+// to break tightness), so t0 lands within a hair of the exact k-th value and
+// the main pass ballot-skips nearly everything. Elements EQUAL to t0 are not
+// held in any list yet, so publish enc(t0)-1 (one step down in the
+// order-isomorphic encoded space) to keep ties streaming in.
+template <int KPL, int NW>
+__device__ void warm_thresh(const float* __restrict__ vals, int count,
+                            Acc<KPL>& A, float* sv, int warp) {
+    const int lane = A.lane;
+    const int nvec = count >> 2;
+    const float4* v4 = reinterpret_cast<const float4*>(vals);
+    float m1 = -INFINITY, m2 = -INFINITY;      // lane top-2
+    for (int p = warp * 32 + lane; p < nvec; p += NW * 32) {
+        float4 q = v4[p];
+        float a1 = fmaxf(q.x, q.y), a2 = fminf(q.x, q.y);
+        float b1 = fmaxf(q.z, q.w), b2 = fminf(q.z, q.w);
+        float hi = fmaxf(a1, b1);                                // max of 4
+        float s2 = fmaxf(fminf(a1, b1), fmaxf(a2, b2));          // 2nd of 4
+        if (hi > m1) { m2 = fmaxf(m1, s2); m1 = hi; }
+        else         { m2 = fmaxf(m2, hi); }
+    }
+    if (warp == 0) {
+        int pos = (nvec << 2) + lane;
+        if (pos < count) {
+            float v = vals[pos];
+            if (v > m1) { m2 = m1; m1 = v; }
+            else        { m2 = fmaxf(m2, v); }
+        }
+    }
+    int d1 = 0, d2 = 0;
+    sort32_desc(m1, d1, lane);
+    sort32_desc(m2, d2, lane);
+    if (KPL == 1) {                       // k <= 32: top-32 of the 64 subset values
+        WList<1> P;
+        P.v[0] = m1; P.i[0] = 0;
+        merge_chunk(P, m2, d2, lane);
+        float t0 = kth_val(P, A.k);
+        if (lane == 0) atomicMax(A.sthr, enc_f(t0) - 1);
+    } else {                              // k <= 64: pool two warps' 64-value subsets
+        WList<2> P;
+        P.v[0] = m1; P.i[0] = 0;
+        P.v[1] = -INFINITY; P.i[1] = 0;
+        merge_chunk(P, m2, d2, lane);     // sorted top-64 of this warp's subset
+        #pragma unroll
+        for (int r = 0; r < 2; ++r) sv[warp * 64 + r * 32 + lane] = P.v[r];
+        __syncthreads();
+        if (warp < NW / 2) {
+            WList<2> P2, Q;
+            #pragma unroll
+            for (int r = 0; r < 2; ++r) {
+                P2.v[r] = sv[(2 * warp) * 64 + r * 32 + lane];     P2.i[r] = 0;
+                Q.v[r]  = sv[(2 * warp + 1) * 64 + r * 32 + lane]; Q.i[r] = 0;
+            }
+            merge_lists(P2, Q, lane);     // top-64 of the pooled 128 subset values
+            float t0 = kth_val(P2, A.k);
+            if (lane == 0) atomicMax(A.sthr, enc_f(t0) - 1);
+        }
+        __syncthreads();
+    }
+}
+
+// Generic scalar streaming (candidate arrays / unaligned fallback).
+// idxs == nullptr -> index is idx_base + position.
+template <int KPL>
+__device__ void stream_topk(const float* vals, const int* idxs, int count, int idx_base,
+                            int warp, int nwarps, Acc<KPL>& A) {
+    const int lane = A.lane;
+    for (int base = warp * 32; base < count; base += nwarps * 32) {
+        int pos = base + lane;
+        bool in = pos < count;
+        float cv = in ? vals[pos] : -INFINITY;
+        int   ci = idxs ? (in ? idxs[pos] : 0) : (idx_base + (in ? pos : 0));
+        A.feed(cv, ci, A.eff_thresh());
+    }
+}
+
+// Vectorized, software-pipelined streaming: each lane loads a float4
+// (128 elems / warp / iter); the next iteration's load is issued before
+// the current chunk is examined so DRAM latency overlaps the filtering.
+template <int KPL>
+__device__ void stream_vec(const float* __restrict__ vals, int count, int idx_base,
+                           int warp, int nwarps, Acc<KPL>& A) {
+    const int lane = A.lane;
+    const int nvec = count >> 2;
+    const float4* v4 = reinterpret_cast<const float4*>(vals);
+    const int step = nwarps * 32;
+
+    int p = warp * 32 + lane;
+    bool in = p < nvec;
+    float4 q = make_float4(-INFINITY, -INFINITY, -INFINITY, -INFINITY);
+    if (in) q = v4[p];
+
+    for (int base = warp * 32; base < nvec; base += step) {
+        // prefetch next chunk before touching this one
+        int pn = p + step;
+        bool inn = pn < nvec;
+        float4 qn = make_float4(-INFINITY, -INFINITY, -INFINITY, -INFINITY);
+        if (inn) qn = v4[pn];
+
+        float t = A.eff_thresh();
+        float m = fmaxf(fmaxf(q.x, q.y), fmaxf(q.z, q.w));
+        if (__any_sync(FULL, m > t)) {
+            float qa[4] = {q.x, q.y, q.z, q.w};
+            int ibase = in ? (idx_base + 4 * p) : idx_base;
+            int ia[4] = {ibase, ibase + 1, ibase + 2, ibase + 3};
+            if (!in) { ia[1] = ia[2] = ia[3] = idx_base; }
+            #pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                A.feed(qa[j], ia[j], t);
+                t = A.eff_thresh();
+            }
+        }
+        q = qn; p = pn; in = inn;
+    }
+
+    int tail = nvec << 2;
+    if (tail < count && warp == 0) {           // < 4 leftover elements
+        int pos = tail + lane;
+        bool tin = pos < count;
+        float cv = tin ? vals[pos] : -INFINITY;
+        int   ci = tin ? (idx_base + pos) : idx_base;
+        A.feed(cv, ci, A.eff_thresh());
+    }
+}
+
+// Tree-combine the NW warp lists through shared memory. On return warp 0's
+// A.L (and sv/si[0..K)) hold the block's top-K list.
+template <int KPL, int NW>
+__device__ void combine_block(Acc<KPL>& A, float* sv, int* si, int lane, int warp) {
+    constexpr int K = 32 * KPL;
+    #pragma unroll
+    for (int r = 0; r < KPL; ++r) {
+        sv[warp * K + r * 32 + lane] = A.L.v[r];
+        si[warp * K + r * 32 + lane] = A.L.i[r];
+    }
+    __syncthreads();
+    #pragma unroll
+    for (int stride = NW / 2; stride >= 1; stride >>= 1) {
+        if (warp < stride) {
+            WList<KPL> B;
+            #pragma unroll
+            for (int r = 0; r < KPL; ++r) {
+                B.v[r] = sv[(warp + stride) * K + r * 32 + lane];
+                B.i[r] = si[(warp + stride) * K + r * 32 + lane];
+            }
+            merge_lists(A.L, B, lane);
+            #pragma unroll
+            for (int r = 0; r < KPL; ++r) {
+                sv[warp * K + r * 32 + lane] = A.L.v[r];
+                si[warp * K + r * 32 + lane] = A.L.i[r];
+            }
+        }
+        __syncthreads();
+    }
+}
+
+template <int KPL>
+__device__ __forceinline__ void write_out(const WList<KPL>& L, float* out_v, int64_t* out_i,
+                                          int row, int k, int lane) {
+    #pragma unroll
+    for (int r = 0; r < KPL; ++r) {
+        int e = r * 32 + lane;
+        if (e < k) {
+            out_v[(size_t)row * k + e] = L.v[r];
+            out_i[(size_t)row * k + e] = (int64_t)L.i[r];
+        }
+    }
+}
+
+template <int KPL, int NW>
+__global__ void __launch_bounds__(NW * 32)
+topk_kernel(const float* __restrict__ x, int n, int k,
+            float* __restrict__ out_v, int64_t* __restrict__ out_i,
+            float* __restrict__ sc_v, int* __restrict__ sc_i,
+            int* __restrict__ counters) {
+    constexpr int K = 32 * KPL;
+    __shared__ float sv[NW * K];
+    __shared__ int   si[NW * K];
+    __shared__ unsigned s_thr;
+    __shared__ bool  s_last;
+
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    const int row  = blockIdx.y;
+    const int g    = gridDim.x;
+    const int bid  = blockIdx.x;
+    const float* xrow = x + (size_t)row * n;
+
+    if (threadIdx.x == 0) s_thr = enc_f(-INFINITY);
+    __syncthreads();
+
+    int seg = ((n + g - 1) / g + 3) & ~3;     // per-block slice, multiple of 4
+    int s0 = bid * seg;
+    int s1 = min(n, s0 + seg);
+    int cnt = max(0, s1 - s0);
+
+    Acc<KPL> A;
+    A.init(lane, k, &s_thr);
+
+    if (cnt > 0) {
+        const float* seg_ptr = xrow + s0;
+        if ((reinterpret_cast<uintptr_t>(seg_ptr) & 15) == 0) {
+            warm_thresh<KPL, NW>(seg_ptr, cnt, A, sv, warp);
+            stream_vec<KPL>(seg_ptr, cnt, s0, warp, NW, A);
+        } else {
+            stream_topk<KPL>(seg_ptr, nullptr, cnt, s0, warp, NW, A);
+        }
+    }
+
+    combine_block<KPL, NW>(A, sv, si, lane, warp);
+
+    if (g == 1) {
+        if (warp == 0) write_out(A.L, out_v, out_i, row, k, lane);
+        return;
+    }
+
+    // multi-block row: publish this block's list, last block merges
+    float* scv = sc_v + (size_t)row * g * K;
+    int*   sci = sc_i + (size_t)row * g * K;
+    if (warp == 0) {
+        #pragma unroll
+        for (int r = 0; r < KPL; ++r) {
+            scv[bid * K + r * 32 + lane] = A.L.v[r];
+            sci[bid * K + r * 32 + lane] = A.L.i[r];
+        }
+    }
+    __syncthreads();   // scratch writes happen-before the release below
+    if (threadIdx.x == 0) {
+        cuda::atomic_ref<int, cuda::thread_scope_device> c(counters[row]);
+        int prev = c.fetch_add(1, cuda::memory_order_acq_rel);
+        s_last = (prev == g - 1);
+    }
+    __syncthreads();
+    if (!s_last) return;
+
+    // The scratch lists are already sorted, so no re-sorting: each warp
+    // directly merge_lists() its share of the other blocks' lists (skipping
+    // any list whose max cannot improve its running k-th). Warp 0 keeps this
+    // block's own list (sv/si[0..K)); exactly one warp owns each element.
+    if (warp == 0) {
+        #pragma unroll
+        for (int r = 0; r < KPL; ++r) {
+            A.L.v[r] = sv[r * 32 + lane];
+            A.L.i[r] = si[r * 32 + lane];
+        }
+        A.thresh = kth_val(A.L, k);
+    } else {
+        A.init(lane, k, &s_thr);
+    }
+
+    __syncthreads();   // done reading sv/si; combine_block below reuses them
+    for (int b = warp; b < g; b += NW) {
+        if (b == bid) continue;
+        WList<KPL> B;
+        #pragma unroll
+        for (int r = 0; r < KPL; ++r) {
+            B.v[r] = scv[b * K + r * 32 + lane];
+            B.i[r] = sci[b * K + r * 32 + lane];
+        }
+        float bmax = __shfl_sync(FULL, B.v[0], 0);
+        if (bmax > A.thresh) {
+            merge_lists(A.L, B, lane);
+            A.thresh = kth_val(A.L, k);
+        }
+    }
+    combine_block<KPL, NW>(A, sv, si, lane, warp);
+    if (warp == 0) {
+        write_out(A.L, out_v, out_i, row, k, lane);
+        if (lane == 0) counters[row] = 0;      // self-reset for the next launch
+    }
+}
+
+void topk_run(at::Tensor x, int64_t k, int64_t g, int64_t nw,
+              at::Tensor scv, at::Tensor sci, at::Tensor cnt,
+              at::Tensor ov, at::Tensor oi) {
+    TORCH_CHECK(x.is_cuda() && x.scalar_type() == at::kFloat, "x must be CUDA fp32");
+    TORCH_CHECK(x.dim() == 2 && x.is_contiguous(), "x must be contiguous 2D");
+    const int batch = (int)x.size(0);
+    const int n = (int)x.size(1);
+    TORCH_CHECK(k >= 1 && k <= 64 && k <= n, "k out of supported range");
+
+    dim3 grid((unsigned)g, (unsigned)batch);
+    auto stream = at::cuda::getCurrentCUDAStream();
+    const float* xp = x.data_ptr<float>();
+    float* ovp = ov.data_ptr<float>();
+    int64_t* oip = oi.data_ptr<int64_t>();
+    float* scvp = scv.data_ptr<float>();
+    int* scip = sci.data_ptr<int>();
+    int* cntp = cnt.data_ptr<int>();
+
+    if (k <= 32) {
+        if (nw == 16) topk_kernel<1, 16><<<grid, 512, 0, stream>>>(xp, n, (int)k, ovp, oip, scvp, scip, cntp);
+        else          topk_kernel<1, 8><<<grid, 256, 0, stream>>>(xp, n, (int)k, ovp, oip, scvp, scip, cntp);
+    } else {
+        if (nw == 16) topk_kernel<2, 16><<<grid, 512, 0, stream>>>(xp, n, (int)k, ovp, oip, scvp, scip, cntp);
+        else          topk_kernel<2, 8><<<grid, 256, 0, stream>>>(xp, n, (int)k, ovp, oip, scvp, scip, cntp);
+    }
+}
+"""
+
+_mod = load_inline(
+    name="topk_warpsel_b200_v3",
+    cpp_sources=_CPP_DECL,
+    cuda_sources=_CUDA_SRC,
+    functions=["topk_run"],
+    verbose=False,
+    extra_cuda_cflags=["-O3", "-arch=sm_100"],
+)
+
+
+def _pick_config(batch: int, n: int, k: int) -> tuple[int, int]:
+    """Blocks-per-row and warps-per-block, tuned on B200 for the deck shapes."""
+    if os.environ.get("TOPK_G"):
+        return int(os.environ["TOPK_G"]), int(os.environ.get("TOPK_NW", "16"))
+    if batch >= 48:
+        # enough rows to fill the GPU with one block each
+        return 1, (8 if k == 1 else 16)
+    g = max(1, min(64, 128 // max(batch, 1), (n + 2047) // 2048))
+    return g, 16
+
+
+class Model(nn.Module):
+    """Top-k over the last dim of a 2D fp32 tensor (values desc + int64 indices).
+
+    Output tensors are preallocated once and rewritten by the kernel on every
+    forward call (recomputed from the live input each time); this removes two
+    allocator round-trips from the latency-critical path.
+    """
+
+    def __init__(self, batch: int, n: int, k: int):
+        super().__init__()
+        self.batch, self.n, self.k = batch, n, k
+        self.register_buffer("_dummy", torch.zeros(1))
+        g, nw = _pick_config(batch, n, k)
+        self.g = g
+        self.nw = nw
+        K = 32 if k <= 32 else 64
+        sc = batch * g * K if g > 1 else 1
+        self.register_buffer("_scv", torch.empty(sc, dtype=torch.float32), persistent=False)
+        self.register_buffer("_sci", torch.empty(sc, dtype=torch.int32), persistent=False)
+        self.register_buffer("_cnt", torch.zeros(batch, dtype=torch.int32), persistent=False)
+        self.register_buffer("_ov", torch.empty(batch, k, dtype=torch.float32), persistent=False)
+        self.register_buffer("_oi", torch.empty(batch, k, dtype=torch.int64), persistent=False)
+
+        self._graph = None
+        self._gkey = None
+        self._no_graph = os.environ.get("TOPK_NO_GRAPH") == "1"
+
+    def _launch(self, x: torch.Tensor):
+        _mod.topk_run(x, self.k, self.g, self.nw, self._scv, self._sci, self._cnt,
+                      self._ov, self._oi)
+
+    def forward(self, x: torch.Tensor):
+        """Run the top-k kernel on the CURRENT contents of x.
+
+        Launch latency on this box is ~14.5us even for an empty kernel while a
+        CUDA-graph replay of the same kernel is ~9.3us, so the single kernel
+        launch is wrapped in a graph keyed on (input ptr, buffer ptrs). This is
+        NOT result caching: the graph re-reads whatever data sits at x's
+        address at replay time and recomputes the full selection every call —
+        a new tensor at a new address (or moved module buffers) triggers a
+        recapture, and a reused address is recomputed on its live contents.
+        """
+        if x.shape[0] != self.batch or x.shape[1] != self.n:
+            raise ValueError("input shape does not match Model(batch, n, k)")
+        if self._no_graph or not x.is_cuda:
+            self._launch(x)
+            return self._ov, self._oi
+        key = (x.data_ptr(), self._scv.data_ptr(), self._ov.data_ptr(),
+               self._oi.data_ptr(), self._cnt.data_ptr())
+        if key != self._gkey:
+            try:
+                torch.cuda.synchronize()
+                self._launch(x)              # warm launch; also serves this call
+                torch.cuda.synchronize()
+                gr = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(gr):   # record (does not execute)
+                    self._launch(x)
+                self._graph, self._gkey = gr, key
+            except Exception:
+                self._graph, self._gkey = None, None
+                self._no_graph = True
+                self._launch(x)
+            return self._ov, self._oi
+        self._graph.replay()
+        return self._ov, self._oi
+
+    # Bypass nn.Module.__call__'s hook machinery: this module has no hooks and
+    # the dispatch overhead is measurable against a ~10us kernel.
+    __call__ = forward
+
+
+batch = 64
+n = 8192
+k = 8
+
+
+def get_inputs():
+    x = torch.randn(batch, n, dtype=torch.float32)
+    return [x]
+
+
+def get_init_inputs():
+    return [batch, n, k]

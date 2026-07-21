@@ -1,0 +1,590 @@
+"""Top-k via radix-filter + register-resident compaction (custom CUDA kernels).
+
+fp32 2D input -> top-k (values desc, int64 indices) over the last dim.
+
+Algorithm
+---------
+1. Histogram phase: map fp32 to order-preserving uint32, take top 11 bits as a
+   bin (2048 bins). Per-row histogram tells us which bin the k-th largest
+   falls into (tau). All elements with bin >= tau form a candidate superset of
+   the true top-k. Exact for any input; ties only inflate the candidate set.
+2. Compaction phase: warp-ballot + prefix scans emit candidates contiguously
+   (no atomic hot-spot); candidates stay register-resident until written.
+3. Selection phase: an exact truncated bitonic network in shared memory takes
+   the top-k2 (k2 = pow2 >= k) of the (usually tiny) candidate set.
+4. Multi-chunk rows (n > 16384) run a 3-kernel pipeline: K1 histogram, K2
+   filter+local top-k2 per chunk, K3 merge sorted chunk lists.
+
+Same contract as the framework top-k op (largest=True, sorted=True).
+"""
+
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+_CUDA_SRC = r"""
+#include <torch/extension.h>
+#include <ATen/cuda/CUDAContext.h>
+#include <cuda_runtime.h>
+#include <math_constants.h>
+
+namespace {
+
+#define FULLMASK 0xffffffffu
+#define NEG_INF (-CUDART_INF_F)
+
+__device__ __forceinline__ unsigned map_key(float v) {
+  unsigned u = __float_as_uint(v);
+  return (u & 0x80000000u) ? ~u : (u | 0x80000000u);
+}
+__device__ __forceinline__ void hist_add(unsigned* hist, float v) {
+  atomicAdd(&hist[map_key(v) >> 21], 1u);
+}
+__device__ __forceinline__ bool key_before(float va, int ia, float vb, int ib) {
+  return (va > vb) || (va == vb && ia < ib);
+}
+__device__ __forceinline__ void cswap(float* val, int* idx, int i, int j, bool desc) {
+  float vi = val[i], vj = val[j];
+  int ii = idx[i], ij = idx[j];
+  bool i_better = (vi > vj) || (vi == vj && ii < ij);
+  bool swap = (i_better != desc);
+  if (swap) { val[i] = vj; idx[i] = ij; val[j] = vi; idx[j] = ii; }
+}
+__device__ __forceinline__ int ilog2(int x) { return 31 - __clz(x); }
+
+// ---------------------------------------------------------------------------
+// Parallel tau seek: locate the smallest bin b with sum_{h>=b} hist[h] >= k.
+// All warps participate; ~3 short stages.
+// ---------------------------------------------------------------------------
+__device__ int seek_tau_parallel(const unsigned* hist, int* scratch, int k, int tid) {
+  const int nwarps = blockDim.x >> 5;
+  const int wid = tid >> 5;
+  const int lane = tid & 31;
+  const int S = 2048 / nwarps;           // bins per warp (pow2, >= 64)
+  // A: per-warp slice totals
+  if (wid < nwarps) {
+    int base = wid * S;
+    unsigned c = 0;
+    for (int i = lane; i < S; i += 32) c += hist[base + i];
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) c += __shfl_down_sync(FULLMASK, c, off);
+    if (lane == 0) scratch[wid] = (int)c;
+  }
+  __syncthreads();
+  // B: warp 0 finds owning slice (from the top) and counts above it
+  if (wid == 0) {
+    // c_j = total of j-th slice from top
+    int myc = (lane < nwarps) ? scratch[nwarps - 1 - lane] : 0;
+    int pre = myc;
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+      int t = __shfl_up_sync(FULLMASK, pre, off);
+      if (lane >= off) pre += t;
+    }
+    bool hit = pre >= k;
+    unsigned m = __ballot_sync(FULLMASK, hit);
+    int fl = m ? (__ffs(m) - 1) : 0;   // first (top-most) slice reaching k
+    int acc_above = pre - myc;         // counts strictly above owning slice
+    // broadcast owner + need
+    int aaf = __shfl_sync(FULLMASK, acc_above, fl);
+    if (lane == 0) scratch[32] = nwarps - 1 - fl;      // owner warp id
+    if (lane == 1) scratch[33] = aaf;                  // counts above owner
+
+  }
+  __syncthreads();
+  const int owner = scratch[32];
+  const int acc0 = scratch[33];
+  // C: owning warp scans its slice from top
+  int result = 0;
+  if (wid == owner) {
+    int acc = acc0;
+    int base_hi = (owner + 1) * S;     // one past slice end
+    for (int rounds = 0; rounds < S / 32; ++rounds) {
+      int hi = base_hi - 32 * rounds;  // window (hi-32, hi]
+      int idx = hi - 32 + lane;        // lane maps ascending bins
+      int c = (int)hist[idx];
+      // suffix sums (higher lanes = higher bins)
+      int suf = c;
+      #pragma unroll
+      for (int off = 16; off > 0; off >>= 1) suf += __shfl_down_sync(FULLMASK, suf, off);
+      int need = k - acc;
+      unsigned m = __ballot_sync(FULLMASK, suf >= need);
+      if (m) {
+        result = hi - 32 + (31 - __clz((int)m));
+        break;
+      }
+      acc += __shfl_sync(FULLMASK, suf, 0);
+    }
+  }
+  // broadcast result via scratch
+  if (wid == owner && lane == 0) scratch[34] = result;
+  __syncthreads();
+  return scratch[34];
+}
+
+// ---------------------------------------------------------------------------
+// Truncated bitonic top-k: region of length 2^Llog (>= 2*k2) -> top-k2 sorted
+// desc in [0, k2).
+// ---------------------------------------------------------------------------
+__device__ void block_topk(float* val, int* idx, int Llog, int k2log, int tid) {
+  const int L = 1 << Llog;
+  const int k2 = 1 << k2log;
+  const int T = blockDim.x;
+  const int m1 = 2 << k2log;
+  const int mmask = m1 - 1;
+  for (int sizelog = 1; sizelog <= k2log + 1; ++sizelog) {
+    for (int s = 1 << (sizelog - 1); s > 0; s >>= 1) {
+      for (int i = tid; i < L; i += T) {
+        if (i & s) continue;
+        bool desc = ((((i & mmask) >> sizelog) & 1) == 0);
+        cswap(val, idx, i, i + s, desc);
+      }
+      __syncthreads();
+    }
+  }
+  for (int mlog = k2log + 1; mlog < Llog; ++mlog) {
+    const int npair = L >> (mlog + 1);
+    const int items = npair << k2log;
+    for (int t = tid; t < items; t += T) {
+      int pair = t >> k2log;
+      int i = t & (k2 - 1);
+      int head = pair << (mlog + 1);
+      int a = head + i;
+      int b = head + (1 << mlog) + k2 - 1 - i;
+      float va = val[a], vb = val[b];
+      int ia = idx[a], ib = idx[b];
+      if (key_before(vb, ib, va, ia)) { val[a] = vb; idx[a] = ib; }
+    }
+    __syncthreads();
+    for (int s = k2 >> 1; s > 0; s >>= 1) {
+      for (int i = tid; i < items; i += T) {
+        int p = i & (k2 - 1);
+        if (p & s) continue;
+        int head = (i >> k2log) << (mlog + 1);
+        cswap(val, idx, head + p, head + p + s, true);
+      }
+      __syncthreads();
+    }
+  }
+}
+
+__device__ void merge_sorted_lists(float* val, int* idx, int Lflog, int k2log, int tid) {
+  const int k2 = 1 << k2log;
+  const int T = blockDim.x;
+  for (int mlog = k2log; mlog < Lflog; ++mlog) {
+    const int npair = 1 << (Lflog - mlog - 1);
+    const int items = npair << k2log;
+    for (int t = tid; t < items; t += T) {
+      int pair = t >> k2log;
+      int i = t & (k2 - 1);
+      int head = pair << (mlog + 1);
+      int a = head + i;
+      int b = head + (1 << mlog) + k2 - 1 - i;
+      float va = val[a], vb = val[b];
+      int ia = idx[a], ib = idx[b];
+      if (key_before(vb, ib, va, ia)) { val[a] = vb; idx[a] = ib; }
+    }
+    __syncthreads();
+    for (int s = k2 >> 1; s > 0; s >>= 1) {
+      for (int i = tid; i < items; i += T) {
+        int p = i & (k2 - 1);
+        if (p & s) continue;
+        int head = (i >> k2log) << (mlog + 1);
+        cswap(val, idx, head + p, head + p + s, true);
+      }
+      __syncthreads();
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Register-resident load + ballot compaction core (shared by fused & k2).
+// Fills: v[] registers with chunk values, histograms them, then after tau is
+// known compacts candidates to (pval, pidx). Returns candidate count in ctl[0]
+// (smem). c0 = global index of chunk start.
+// ---------------------------------------------------------------------------
+template <int TpE>
+struct ChunkRegs {
+  float v[TpE];
+};
+
+// global element index for register slot e (must match load_chunk mapping)
+template <int TpE>
+__device__ __forceinline__ int slot_gidx(int e, int tid, int T, int c0, bool vectorizable) {
+  if (vectorizable) {
+    int j = e >> 2, sp = e & 3;
+    return c0 + (tid + j * T) * 4 + sp;
+  }
+  return c0 + tid + e * T;
+}
+
+template <int TpE>
+__device__ __forceinline__ void load_chunk(const float* __restrict__ xrow, int clen,
+                                           ChunkRegs<TpE>& r, int tid, int T, int c0,
+                                           bool vectorizable) {
+  if (vectorizable) {
+    const float4* x4 = reinterpret_cast<const float4*>(xrow);
+    #pragma unroll
+    for (int j = 0; j < TpE / 4; ++j) {
+      int base = (tid + j * T) * 4;
+      if (base + 3 < clen) {
+        float4 t = x4[tid + j * T];
+        r.v[4*j] = t.x; r.v[4*j+1] = t.y; r.v[4*j+2] = t.z; r.v[4*j+3] = t.w;
+      } else {
+        #pragma unroll
+        for (int s = 0; s < 4; ++s) {
+          int g = base + s;
+          r.v[4*j+s] = (g < clen) ? xrow[g] : NEG_INF;
+        }
+      }
+    }
+  } else {
+    #pragma unroll
+    for (int e = 0; e < TpE; ++e) {
+      int g = tid + e * T;
+      r.v[e] = (g < clen) ? xrow[g] : NEG_INF;
+    }
+  }
+}
+
+// after tau known: emit candidates to smem pairs; returns via ctl[0]
+template <int TpE>
+__device__ __forceinline__ void compact_candidates(ChunkRegs<TpE>& r, int tau_bin,
+                                                   float* pval, int* pidx, int* ctl,
+                                                   int tid, int T, int c0, bool vectorizable) {
+  const int lane = tid & 31;
+  const int lt = (1 << lane) - 1;
+  // pass 1: warp count
+  int cnt = 0;
+  #pragma unroll
+  for (int e = 0; e < TpE; ++e)
+    cnt += ((int)(map_key(r.v[e]) >> 21) >= tau_bin) ? 1 : 0;
+  #pragma unroll
+  for (int off = 16; off > 0; off >>= 1) cnt += __shfl_down_sync(FULLMASK, cnt, off);
+  __shared__ int wbase[32];
+  if (lane == 0) wbase[tid >> 5] = atomicAdd(&ctl[0], cnt);
+  __syncthreads();
+  int base = wbase[tid >> 5];
+  // pass 2: emit (intra-warp order via ballots)
+  int run = 0;
+  #pragma unroll
+  for (int e = 0; e < TpE; ++e) {
+    bool cand = (int)(map_key(r.v[e]) >> 21) >= tau_bin;
+    unsigned m = __ballot_sync(FULLMASK, cand);
+    if (cand) {
+      int pos = base + run + __popc(m & lt);
+      pval[pos] = r.v[e];
+      pidx[pos] = slot_gidx<TpE>(e, tid, T, c0, vectorizable);
+    }
+    run += __popc(m);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Fused kernel: one block per row.
+// smem: hist 2048*4 + ctl 4*4 + pairs L*8
+// ---------------------------------------------------------------------------
+template <int TpE>
+__global__ void fused_kernel(const float* __restrict__ x,
+                             float* __restrict__ out_v, long long* __restrict__ out_i,
+                             int n, int k, int Llog, int k2log, int vect) {
+  extern __shared__ float smem[];
+  const int tid = threadIdx.x;
+  const int row = blockIdx.x;
+  const int row_g = tid;  // dummy
+  (void)row_g;
+  const int T = blockDim.x;
+  const int L = 1 << Llog;
+  const int k2 = 1 << k2log;
+  unsigned* shist = reinterpret_cast<unsigned*>(smem);
+  int* sctl = reinterpret_cast<int*>(smem + 2048);         // [0]=counter [1]=tau
+  int* sscratch = sctl + 4;                                // 40 ints seek scratch
+  float* pval = smem + 2048 + 44;
+  int* pidx = reinterpret_cast<int*>(pval + L);
+
+  const int clen = min(L, n);
+  const float* xrow = x + (long)row * n;
+
+  for (int i = tid; i < 2048 + 44; i += T) reinterpret_cast<unsigned*>(smem)[i] = 0;
+  __syncthreads();
+
+  ChunkRegs<TpE> r;
+  load_chunk<TpE>(xrow, clen, r, tid, T, 0, vect != 0);
+  #pragma unroll
+  for (int e = 0; e < TpE; ++e)
+    if (r.v[e] > NEG_INF) hist_add(shist, r.v[e]);
+  __syncthreads();
+
+  int tau = seek_tau_parallel(shist, sscratch, k, tid);
+  __syncthreads();
+
+  compact_candidates<TpE>(r, tau, pval, pidx, sctl, tid, T, 0, vect != 0);
+  __syncthreads();
+  const int c = sctl[0];
+
+  int rlog = c <= 1 ? 0 : ilog2(c - 1) + 1;
+  rlog = max(rlog, k2log + 1);
+  const int rlen = 1 << rlog;
+  for (int i = c + tid; i < rlen; i += T) { pval[i] = NEG_INF; pidx[i] = 0x7fffffff; }
+  __syncthreads();
+
+  if (c > 0) block_topk(pval, pidx, rlog, k2log, tid);
+
+  for (int j = tid; j < k; j += T) {
+    out_v[(long)row * k + j] = (c > 0) ? pval[j] : NEG_INF;
+    out_i[(long)row * k + j] = (c > 0) ? (long long)pidx[j] : 0;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Piped: K1 histogram (deterministic partial hists, no atomics on gmem)
+// ---------------------------------------------------------------------------
+__global__ void k1_hist(const float* __restrict__ x, unsigned* __restrict__ parts,
+                        int n, int Cb, int Llog, int vect) {
+  __shared__ unsigned shist[2048];
+  const int tid = threadIdx.x;
+  const int row = blockIdx.y;
+  const int chunk = blockIdx.x;
+  const int L = 1 << Llog;
+  const int c0 = chunk * L;
+  const int clen = min(c0 + L, n) - c0;
+  const float* xrow = x + (long)row * n + c0;
+  for (int i = tid; i < 2048; i += blockDim.x) shist[i] = 0;
+  __syncthreads();
+  if (vect) {
+    const float4* x4 = reinterpret_cast<const float4*>(xrow);
+    const int c4 = clen >> 2;
+    for (int i = tid; i < c4; i += blockDim.x) {
+      float4 v = x4[i];
+      hist_add(shist, v.x); hist_add(shist, v.y); hist_add(shist, v.z); hist_add(shist, v.w);
+    }
+    for (int i = (c4 << 2) + tid; i < clen; i += blockDim.x) hist_add(shist, xrow[i]);
+  } else {
+    for (int i = tid; i < clen; i += blockDim.x) hist_add(shist, xrow[i]);
+  }
+  __syncthreads();
+  unsigned* out = parts + ((long)row * Cb + chunk) * 2048;
+  for (int i = tid; i < 2048; i += blockDim.x) out[i] = shist[i];
+}
+
+// Piped: K2 reduce hists, seek tau, filter chunk, local top-k2 -> scratch
+template <int TpE>
+__global__ void k2_filter(const float* __restrict__ x, const unsigned* __restrict__ parts,
+                          float* __restrict__ ws_v, int* __restrict__ ws_i,
+                          int n, int k, int Cb, int Llog, int k2log, int vect) {
+  extern __shared__ float smem[];
+  const int tid = threadIdx.x;
+  const int row = blockIdx.y;
+  const int chunk = blockIdx.x;
+  const int T = blockDim.x;
+  const int L = 1 << Llog;
+  const int k2 = 1 << k2log;
+  unsigned* shist = reinterpret_cast<unsigned*>(smem);
+  int* sctl = reinterpret_cast<int*>(smem + 2048);
+  int* sscratch = sctl + 4;
+  float* pval = smem + 2048 + 44;
+  int* pidx = reinterpret_cast<int*>(pval + L);
+
+  const unsigned* rowparts = parts + (long)row * Cb * 2048;
+  for (int i = tid; i < 2048 + 44; i += T) {
+    unsigned s = 0;
+    if (i < 2048) {
+      for (int c = 0; c < Cb; ++c) s += rowparts[c * 2048 + i];
+    }
+    reinterpret_cast<unsigned*>(smem)[i] = s;
+  }
+  __syncthreads();
+
+  int tau = seek_tau_parallel(shist, sscratch, k, tid);
+  __syncthreads();
+
+  const int c0 = chunk * L;
+  const int clen = min(c0 + L, n) - c0;
+  const float* xrow = x + (long)row * n + c0;
+
+  ChunkRegs<TpE> r;
+  load_chunk<TpE>(xrow, clen, r, tid, T, c0, vect != 0);
+  compact_candidates<TpE>(r, tau, pval, pidx, sctl, tid, T, c0, vect != 0);
+  __syncthreads();
+  const int c = sctl[0];
+
+  int rlog = c <= 1 ? 0 : ilog2(c - 1) + 1;
+  rlog = max(rlog, k2log + 1);
+  const int rlen = 1 << rlog;
+  for (int i = c + tid; i < rlen; i += T) { pval[i] = NEG_INF; pidx[i] = 0x7fffffff; }
+  __syncthreads();
+
+  if (c > 0) block_topk(pval, pidx, rlog, k2log, tid);
+
+  const long slot = ((long)row * Cb + chunk) * k2;
+  for (int j = tid; j < k2; j += T) {
+    ws_v[slot + j] = (c > 0) ? pval[j] : NEG_INF;
+    ws_i[slot + j] = (c > 0) ? pidx[j] : 0x7fffffff;
+  }
+}
+
+// Piped: K3 merge per row -> outputs
+__global__ void k3_merge(const float* __restrict__ ws_v, const int* __restrict__ ws_i,
+                         float* __restrict__ out_v, long long* __restrict__ out_i,
+                         int k, int Cb, int Lflog, int k2log) {
+  extern __shared__ float smem[];
+  const int tid = threadIdx.x;
+  const int row = blockIdx.x;
+  const int Lf = 1 << Lflog;
+  const int k2 = 1 << k2log;
+  float* sval = smem;
+  int* sidx = reinterpret_cast<int*>(smem + Lf);
+  const long base = (long)row * Cb * k2;
+  const int real = Cb * k2;
+  for (int i = tid; i < real; i += blockDim.x) { sval[i] = ws_v[base+i]; sidx[i] = ws_i[base+i]; }
+  for (int i = real + tid; i < Lf; i += blockDim.x) { sval[i] = NEG_INF; sidx[i] = 0x7fffffff; }
+  __syncthreads();
+  merge_sorted_lists(sval, sidx, Lflog, k2log, tid);
+  for (int j = tid; j < k; j += blockDim.x) {
+    out_v[(long)row * k + j] = sval[j];
+    out_i[(long)row * k + j] = (long long)sidx[j];
+  }
+}
+
+// ------------------------------ host --------------------------------------
+int pow2ceil_h(int x) { int p = 1; while (p < x) p <<= 1; return p; }
+int ilog2_h(int x) { return 31 - __builtin_clz(x); }
+
+unsigned* g_parts = nullptr;
+float* g_ws_v = nullptr;
+int* g_ws_i = nullptr;
+
+void ensure_workspace(int parts_words, int pair_elems, const at::TensorOptions& opt) {
+  static int parts_cap = 0, pair_cap = 0;
+  static std::vector<at::Tensor> keep;
+  if (parts_words > parts_cap) {
+    keep.push_back(at::empty({(long)parts_words}, opt.dtype(at::kInt)));
+    g_parts = reinterpret_cast<unsigned*>(keep.back().data_ptr<int>());
+    parts_cap = parts_words;
+  }
+  if (pair_elems > pair_cap) {
+    keep.push_back(at::empty({(long)pair_elems}, opt.dtype(at::kFloat)));
+    g_ws_v = keep.back().data_ptr<float>();
+    keep.push_back(at::empty({(long)pair_elems}, opt.dtype(at::kInt)));
+    g_ws_i = keep.back().data_ptr<int>();
+    pair_cap = pair_elems;
+  }
+}
+
+}  // namespace
+
+void init_ext() {
+  cudaFuncSetAttribute(fused_kernel<8>, cudaFuncAttributeMaxDynamicSharedMemorySize, 220 * 1024);
+  cudaFuncSetAttribute(fused_kernel<16>, cudaFuncAttributeMaxDynamicSharedMemorySize, 220 * 1024);
+  cudaFuncSetAttribute(k2_filter<8>, cudaFuncAttributeMaxDynamicSharedMemorySize, 220 * 1024);
+  cudaFuncSetAttribute(k2_filter<16>, cudaFuncAttributeMaxDynamicSharedMemorySize, 220 * 1024);
+  cudaFuncSetAttribute(k3_merge, cudaFuncAttributeMaxDynamicSharedMemorySize, 64 * 1024);
+}
+
+std::tuple<at::Tensor, at::Tensor> topk(const at::Tensor& x, int64_t k_in,
+                                        int64_t mode_ovr, int64_t Llog_ovr) {
+  const int B = (int)x.size(0);
+  const int N = (int)x.size(1);
+  const int k = (int)k_in;
+  const int k2 = pow2ceil_h(k);
+  const int k2log = ilog2_h(k2);
+
+  auto stream = at::cuda::getCurrentCUDAStream();
+  auto vals = at::empty({B, k_in}, x.options());
+  auto idxs = at::empty({B, k_in}, x.options().dtype(at::kLong));
+  const int vect = (N % 4 == 0) ? 1 : 0;
+
+  int Llog, mode;
+  if (N <= 16384) {
+    mode = 0;
+    Llog = ilog2_h(pow2ceil_h(N));
+    if (Llog < 10) Llog = 10;
+  } else {
+    mode = 1;
+    Llog = 13;  // 8192 per chunk
+  }
+  if ((int)Llog_ovr > 0) {
+    Llog = (int)Llog_ovr;
+    mode = (((int64_t)N <= (1LL << Llog) && (int)mode_ovr == 0) || (int)mode_ovr != 1) && (int)mode_ovr == 0 ? 0 : 1;
+  }
+  if ((int)mode_ovr >= 0) mode = (int)mode_ovr;
+  if (mode == 0 && N > (1 << Llog)) mode = 1;
+
+  if (mode == 0) {
+    const int L = 1 << Llog;
+    const int smem = (2048 + 44) * 4 + L * 8;
+    if (Llog <= 12) {
+      fused_kernel<8><<<B, 512, smem, stream>>>(
+          x.data_ptr<float>(), vals.data_ptr<float>(),
+          (long long*)idxs.data_ptr<long>(), N, k, Llog, k2log, vect);
+    } else if (Llog == 13) {
+      fused_kernel<8><<<B, 1024, smem, stream>>>(
+          x.data_ptr<float>(), vals.data_ptr<float>(),
+          (long long*)idxs.data_ptr<long>(), N, k, Llog, k2log, vect);
+    } else {
+      fused_kernel<16><<<B, 1024, smem, stream>>>(
+          x.data_ptr<float>(), vals.data_ptr<float>(),
+          (long long*)idxs.data_ptr<long>(), N, k, Llog, k2log, vect);
+    }
+    return std::make_tuple(vals, idxs);
+  }
+
+  const int L = 1 << Llog;
+  const int Cb = (N + L - 1) / L;
+  ensure_workspace(B * Cb * 2048, B * Cb * k2, x.options());
+  dim3 grid(Cb, B);
+  k1_hist<<<grid, 512, 0, stream>>>(x.data_ptr<float>(), g_parts, N, Cb, Llog, vect);
+  const int smem2 = (2048 + 44) * 4 + L * 8;
+  if (Llog <= 12) {
+    k2_filter<8><<<grid, 512, smem2, stream>>>(
+        x.data_ptr<float>(), g_parts, g_ws_v, g_ws_i, N, k, Cb, Llog, k2log, vect);
+  } else {
+    k2_filter<16><<<grid, 512, smem2, stream>>>(
+        x.data_ptr<float>(), g_parts, g_ws_v, g_ws_i, N, k, Cb, Llog, k2log, vect);
+  }
+  const int Lf = pow2ceil_h(Cb * k2);
+  const int Lflog = ilog2_h(Lf);
+  k3_merge<<<B, 256, Lf * 8, stream>>>(
+      g_ws_v, g_ws_i, vals.data_ptr<float>(), (long long*)idxs.data_ptr<long>(),
+      k, Cb, Lflog, k2log);
+  return std::make_tuple(vals, idxs);
+}
+"""
+
+_CPP_SRC = "void init_ext(); std::tuple<at::Tensor, at::Tensor> topk(const at::Tensor& x, int64_t k, int64_t mode_ovr, int64_t Llog_ovr);"
+
+_ext = load_inline(
+    name="topk_radix2_ext",
+    cpp_sources=[_CPP_SRC],
+    cuda_sources=[_CUDA_SRC],
+    functions=["init_ext", "topk"],
+    extra_cuda_cflags=["-O3"],
+    verbose=False,
+)
+_ext.init_ext()
+
+
+class Model(nn.Module):
+    def __init__(self, batch: int, n: int, k: int):
+        super().__init__()
+        self.k = int(k)
+        self.register_buffer("_dummy", torch.zeros(1))
+        self._fn = _ext.topk
+
+    def forward(self, x: torch.Tensor):
+        return self._fn(x, self.k, -1, -1)
+
+    __call__ = forward
+
+
+batch = 64
+n = 8192
+k = 8
+
+
+def get_inputs():
+    return [torch.randn(batch, n, dtype=torch.float32)]
+
+
+def get_init_inputs():
+    return [batch, n, k]

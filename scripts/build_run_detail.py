@@ -33,6 +33,7 @@ BOARDS = [
     ("hard", "results/leaderboard.b200.json", "b200", "problems-b200", "runs-b200"),
     ("hard", "results/leaderboard.rtx3090.json", "rtx3090", "problems-3090", "runs-rtx3090"),
     ("cuda", "results/leaderboard.json", "rtxpro6000", "problems-rtxpro6000", "runs"),
+    ("cuda", "results/leaderboard.b200.json", "b200", "problems-rtxpro6000", "runs-b200"),
 ]
 
 CANONICAL_GPU = "rtxpro6000"
@@ -162,6 +163,11 @@ def build_cell(
     bench: str, gpu: str, deck: str, runs: str, run_id: str, cell: dict
 ) -> dict | None:
     run_dir = ROOT / "benchmarks" / bench / "outputs" / runs / run_id
+    if not run_dir.exists() and runs != "runs":
+        # Boards that predate the runs-<gpu> split (rtx3090) archive in plain
+        # runs/. Only fires when the board copy is absent, so a colliding rid
+        # present in both dirs always resolves to the board's own session.
+        run_dir = ROOT / "benchmarks" / bench / "outputs" / "runs" / run_id
     if not run_dir.exists():
         return None
     try:
@@ -218,11 +224,16 @@ def build_cell(
         },
         "gpu_lock": parse_lock_log(run_dir / "gpu_lock.log"),
         "shapes": shapes,
-        # Redacted solution text is only emitted for canonical boards; a bare
-        # public/runs/<rid> file may belong to the canonical session, so
-        # non-canonical boards must not claim it.
-        "has_solution_text": gpu == CANONICAL_GPU
-        and (ROOT / "public" / "runs" / f"{run_id}_solution.py.txt").exists(),
+        # Canonical boards read the flat public/runs/<rid> file; per-GPU
+        # boards read public/runs/<gpu>/<rid> (emit_board_solutions.py) — a
+        # bare file with a colliding rid belongs to the canonical session.
+        "has_solution_text": (
+            ROOT
+            / "public"
+            / "runs"
+            / ("" if gpu == CANONICAL_GPU else gpu)
+            / f"{run_id}_solution.py.txt"
+        ).exists(),
     }
     return detail
 

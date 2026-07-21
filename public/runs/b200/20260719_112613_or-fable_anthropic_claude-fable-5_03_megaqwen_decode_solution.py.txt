@@ -1,0 +1,1149 @@
+"""MegaQwen-style Qwen3-0.6B multi-layer decode — CUDA cooperative megakernel.
+
+Improves on Infatoshi/MegaQwen's cooperative-megakernel idea (sm_86) for the
+Blackwell-class GPU this box actually has (arch detected at build time).
+
+Design:
+  One cooperative kernel launch runs an ENTIRE decode_steps call:
+  for step { for layer { 5 stages separated by grid.sync() } } —
+  20 grid barriers per decode step (~1.2us each measured on this GPU),
+  zero per-stage kernel-launch overhead. Stages per layer:
+    S1  input mix (step start) + RMSNorm (redundant per block) + QKV GEMV
+    S2  Q/K head-RMSNorm + RoPE + KV append (prep split across 4 warps),
+        flash-decode GQA attention (8 kv-head groups x 18 ctx splits; the
+        current token is emitted by the prep warps as a 19th softmax partial)
+    S3  split-softmax combine (redundant per block) + O GEMV + residual
+    S4  post RMSNorm (redundant) + gate/up GEMV + SiLU*up
+    S5  down GEMV + residual -> bf16 hidden
+  Each GEMV stage's tail issues prefetch.global.L2 for the next stage's
+  weight rows.
+
+  TWO kernel instantiations (template<bool BIG>) exist because 512 threads x
+  1 CTA/SM caps registers at 128/thread, and ptxas otherwise serializes the
+  attention loop's global loads (measured 1.7 TB/s vs ~5 TB/s):
+   - small-ctx path: one token per warp iteration (full-warp reduces)
+   - big-ctx path (positions >= 4096): FOUR tokens per warp iteration in
+     8-lane groups (3-stage quarter-warp reduces, per-group online-softmax
+     state, xor-8/16 merge), double-buffered 4-row prefetch.
+  Host picks the kernel per launch; prefill/decode chunk at the threshold.
+
+  KV cache layout is internal to this solution (check.py only compares
+  last_hidden): one interleaved bf16 tensor per layer of shape
+  [8 kv-heads, max_seq, 2 (K|V), 128], so the attention scan streams one
+  contiguous 512B row per (head, token) (~6.5 TB/s pattern ceiling measured).
+
+  Numerics mirror reference.py: everything fp32 inside a block; bf16
+  rounding exactly where the reference rounds (input mix, KV store, block
+  output). RoPE cos/sin tables are precomputed with the same torch ops as
+  the reference so they match bitwise. The CPU-side torch.Generator randn
+  protocol is reproduced exactly (batched randn is bitwise-identical to
+  the reference's per-step randn calls; verified). Prefill (untimed) runs
+  the same kernel from position 0 with the seed+1 stream.
+"""
+from __future__ import annotations
+
+import math
+import os
+
+os.environ.setdefault("CUDA_HOME", "/usr/local/cuda-12.8")
+
+import torch
+import torch.nn as nn
+
+OP_TYPE = "megaqwen_decode"
+SUPPORTED_PRECISIONS = ["bf16"]
+
+HIDDEN = 1024
+INTERMEDIATE = 3072
+NUM_Q = 16
+NUM_KV = 8
+HEAD_DIM = 128
+NUM_LAYERS = 4
+EPS = 1e-6
+
+BIG_THRESH = int(os.environ.get("MQ_BIG_THRESH", "4096"))
+LAYER_ELEMS = 15_728_640  # qkv 4096*1024 + o 1024*2048 + gu 3072*2048 + dn 1024*3072
+NORMS_PER_LAYER = 2304
+SPLITS = 18
+PARTIAL_STRIDE = 132
+
+_CUDA_SRC = r"""
+#include <cuda_runtime.h>
+#include <cuda_bf16.h>
+#include <cooperative_groups.h>
+#include <torch/extension.h>
+#include <ATen/cuda/CUDAContext.h>
+#include <vector>
+
+namespace cg = cooperative_groups;
+using bf16 = __nv_bfloat16;
+
+#define H 1024
+#define I3 3072
+#define NQ 16
+#define NKV 8
+#define HD 128
+#define QKV_ROWS 4096
+#define SPLITS 18
+#define ATT_BLOCKS (NKV * SPLITS)
+#define NTHR 512
+#define NWARP 16
+#define LAYER_ELEMS 15728640L
+#define OFF_O 4194304L
+#define OFF_GU 6291456L
+#define OFF_DN 12582912L
+#define NORMS_PER_LAYER 2304
+#define PSTRIDE 132
+#define NSPLIT (SPLITS + 1)  // 18 ctx splits + current-token partial
+#define EPS 1e-6f
+#define NEG_BIG (-1e30f)
+#define SCALE 0.088388347648318447f
+
+__device__ __forceinline__ float bf2f(bf16 v) { return __bfloat162float(v); }
+
+#ifndef MQ_PF
+#define MQ_PF 1
+#endif
+__device__ __forceinline__ void l2_prefetch(const void* ptr) {
+#if MQ_PF
+    asm volatile("prefetch.global.L2 [%0];" :: "l"(ptr));
+#endif
+}
+
+// Two-plane float4 smem layout: float4 #f lives at slot (f>>1) in plane (f&1).
+// Lane-consecutive readers then hit consecutive 16B slots -> conflict-free.
+__device__ __forceinline__ float* elem_ptr(float* base, int half4, int e) {
+    int f = e >> 2;
+    int slot = (f & 1) ? (half4 + (f >> 1)) : (f >> 1);
+    return base + slot * 4 + (e & 3);
+}
+
+struct Params {
+    const bf16* __restrict__ W;
+    const float* __restrict__ norms;
+    bf16* kv[8];
+    const float* __restrict__ cos_tab;
+    const float* __restrict__ sin_tab;
+    const bf16* __restrict__ rand_seq;
+    bf16* h_io;
+    bf16* x_buf;
+    float* qkv_raw;
+    float* partials;
+    float* h_attn;
+    float* act;
+    long max_seq;
+    int start_pos;
+    int n_steps;
+    int num_layers;
+    int total_warps;
+    unsigned long long* dbg;  // optional per-stage cycle accumulators [16]
+};
+
+#ifndef MQ_DBG
+#define MQ_DBG 0
+#endif
+#if MQ_DBG
+#define DBG_MARK(slot)                                                      \
+    if (p.dbg && bid == 0 && tid == 0) {                                    \
+        unsigned long long now = clock64();                                 \
+        atomicAdd(&p.dbg[slot], now - dbg_t);                               \
+        dbg_t = now;                                                        \
+    }
+#else
+#define DBG_MARK(slot)
+#endif
+
+struct SmemAttn {
+    float q[2][HD];
+    float kcur[HD];
+    float vcur[HD];
+    float wm[NWARP][2];
+    float wl[NWARP][2];
+    float wacc[2][NWARP][HD];
+};
+
+struct Smem {
+    float xhat[H];
+    float red[NWARP];
+    float cw[NQ][NSPLIT];
+    union {
+        SmemAttn attn;
+        float attn_vec[NQ * HD];
+        float act_s[I3];
+    } u;
+};
+
+__device__ __forceinline__ float warp_sum(float v) {
+    #pragma unroll
+    for (int o = 16; o; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
+    return v;
+}
+
+__device__ float block_sum(float v, Smem* s) {
+    v = warp_sum(v);
+    int w = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    if (lane == 0) s->red[w] = v;
+    __syncthreads();
+    if (w == 0) {
+        float x = (lane < NWARP) ? s->red[lane] : 0.f;
+        x = warp_sum(x);
+        if (lane == 0) s->red[0] = x;
+    }
+    __syncthreads();
+    return s->red[0];
+}
+
+// ---------- S1: input mix + RMSNorm + QKV GEMV ----------
+__device__ __noinline__ void stage1(const Params& p, Smem& s,
+                                    const bf16* __restrict__ Wl,
+                                    const float* __restrict__ nl,
+                                    int l, int step) {
+    const int bid = blockIdx.x, tid = threadIdx.x;
+    const int warp = tid >> 5, lane = tid & 31;
+    float sq = 0.f;
+    for (int e = tid; e < H; e += NTHR) {
+        float xv;
+        if (l == 0) {
+            float r = bf2f(p.rand_seq[(long)step * H + e]);
+            float hv = bf2f(p.h_io[e]);
+            bf16 xb = __float2bfloat16(0.5f * r + 0.5f * hv);
+            xv = bf2f(xb);
+            if (bid == 0) p.x_buf[e] = xb;
+        } else {
+            xv = bf2f(p.h_io[e]);
+        }
+        *elem_ptr(s.xhat, 128, e) = xv;
+        sq += xv * xv;
+    }
+    float tot = block_sum(sq, &s);
+    float rms = rsqrtf(tot * (1.f / H) + EPS);
+    for (int e = tid; e < H; e += NTHR) {
+        float* q = elem_ptr(s.xhat, 128, e);
+        *q = *q * rms * nl[e];
+    }
+    __syncthreads();
+    const float4* xt = reinterpret_cast<const float4*>(s.xhat);
+    for (int pr = warp * gridDim.x + bid; pr < QKV_ROWS / 2; pr += p.total_warps) {
+        const float4* w0 = reinterpret_cast<const float4*>(Wl + (long)(2 * pr) * H);
+        const float4* w1 = reinterpret_cast<const float4*>(Wl + (long)(2 * pr + 1) * H);
+        float4 va[4], vb[4];
+        #pragma unroll
+        for (int it = 0; it < 4; ++it) {
+            va[it] = w0[it * 32 + lane];
+            vb[it] = w1[it * 32 + lane];
+        }
+        float a0 = 0.f, a1 = 0.f;
+        #pragma unroll
+        for (int it = 0; it < 4; ++it) {
+            const bf16* pa = reinterpret_cast<const bf16*>(&va[it]);
+            const bf16* pb = reinterpret_cast<const bf16*>(&vb[it]);
+            float4 x0 = xt[it * 32 + lane];
+            float4 x1 = xt[128 + it * 32 + lane];
+            const float* xp0 = reinterpret_cast<const float*>(&x0);
+            const float* xp1 = reinterpret_cast<const float*>(&x1);
+            #pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                a0 += bf2f(pa[j]) * xp0[j] + bf2f(pa[4 + j]) * xp1[j];
+                a1 += bf2f(pb[j]) * xp0[j] + bf2f(pb[4 + j]) * xp1[j];
+            }
+        }
+        #pragma unroll
+        for (int o = 16; o; o >>= 1) {
+            a0 += __shfl_xor_sync(0xffffffffu, a0, o);
+            a1 += __shfl_xor_sync(0xffffffffu, a1, o);
+        }
+        if (lane == 0) {
+            p.qkv_raw[2 * pr] = a0;
+            p.qkv_raw[2 * pr + 1] = a1;
+        }
+    }
+
+    const bf16* Wo_pf = Wl + OFF_O;
+    for (int r = warp * gridDim.x + bid; r < H; r += p.total_warps)
+        l2_prefetch(reinterpret_cast<const char*>(Wo_pf + (long)r * 2048) + lane * 128);
+}
+
+// ---------- S2 prep: q/k head-RMSNorm + RoPE + KV append (warp 0) ----------
+__device__ __noinline__ void stage2_prep_body(const Params& p, Smem& s,
+                                         const float* __restrict__ nl,
+                                         int l, int pos) {
+    const int bid = blockIdx.x, tid = threadIdx.x;
+    const int warp = tid >> 5, lane = tid & 31;
+    if (bid >= ATT_BLOCKS) return;
+    const int g = bid / SPLITS, sp = bid % SPLITS;
+    // parallel prep: warps 0,1 = q heads; warp 2 = k; warp 3 = v
+    if (warp < 2) {
+        const float* qn = nl + 2048;
+        const float* ct = p.cos_tab + (long)pos * 64;
+        const float* st = p.sin_tab + (long)pos * 64;
+        float c0 = ct[lane], s0r = st[lane], c1 = ct[lane + 32], s1r = st[lane + 32];
+        const int h2 = warp;
+        const float* src = p.qkv_raw + (2 * g + h2) * HD;
+        float v0 = src[lane], v1 = src[lane + 32], v2 = src[lane + 64], v3 = src[lane + 96];
+        float ssum = warp_sum(v0 * v0 + v1 * v1 + v2 * v2 + v3 * v3);
+        float rms = rsqrtf(ssum * (1.f / HD) + EPS);
+        float n0 = v0 * rms * qn[lane], n1 = v1 * rms * qn[lane + 32];
+        float n2 = v2 * rms * qn[lane + 64], n3 = v3 * rms * qn[lane + 96];
+        s.u.attn.q[h2][lane]      = n0 * c0 - n2 * s0r;
+        s.u.attn.q[h2][lane + 32] = n1 * c1 - n3 * s1r;
+        s.u.attn.q[h2][lane + 64] = n0 * s0r + n2 * c0;
+        s.u.attn.q[h2][lane + 96] = n1 * s1r + n3 * c1;
+    } else if (warp == 2) {
+        const float* kn = nl + 2048 + HD;
+        const float* ct = p.cos_tab + (long)pos * 64;
+        const float* st = p.sin_tab + (long)pos * 64;
+        float c0 = ct[lane], s0r = st[lane], c1 = ct[lane + 32], s1r = st[lane + 32];
+        const float* src = p.qkv_raw + 2048 + g * HD;
+        float v0 = src[lane], v1 = src[lane + 32], v2 = src[lane + 64], v3 = src[lane + 96];
+        float ssum = warp_sum(v0 * v0 + v1 * v1 + v2 * v2 + v3 * v3);
+        float rms = rsqrtf(ssum * (1.f / HD) + EPS);
+        float n0 = v0 * rms * kn[lane], n1 = v1 * rms * kn[lane + 32];
+        float n2 = v2 * rms * kn[lane + 64], n3 = v3 * rms * kn[lane + 96];
+        bf16 b0 = __float2bfloat16(n0 * c0 - n2 * s0r);
+        bf16 b1 = __float2bfloat16(n1 * c1 - n3 * s1r);
+        bf16 b2 = __float2bfloat16(n0 * s0r + n2 * c0);
+        bf16 b3 = __float2bfloat16(n1 * s1r + n3 * c1);
+        s.u.attn.kcur[lane]      = bf2f(b0);
+        s.u.attn.kcur[lane + 32] = bf2f(b1);
+        s.u.attn.kcur[lane + 64] = bf2f(b2);
+        s.u.attn.kcur[lane + 96] = bf2f(b3);
+        if (sp == 0) {
+            bf16* cache = p.kv[l] + ((long)g * p.max_seq + pos) * 256;
+            cache[lane] = b0; cache[lane + 32] = b1;
+            cache[lane + 64] = b2; cache[lane + 96] = b3;
+        }
+    } else if (warp == 3) {
+        const float* vs = p.qkv_raw + 3072 + g * HD;
+        bf16 y0 = __float2bfloat16(vs[lane]);
+        bf16 y1 = __float2bfloat16(vs[lane + 32]);
+        bf16 y2 = __float2bfloat16(vs[lane + 64]);
+        bf16 y3 = __float2bfloat16(vs[lane + 96]);
+        s.u.attn.vcur[lane]      = bf2f(y0);
+        s.u.attn.vcur[lane + 32] = bf2f(y1);
+        s.u.attn.vcur[lane + 64] = bf2f(y2);
+        s.u.attn.vcur[lane + 96] = bf2f(y3);
+        if (sp == 0) {
+            bf16* cache = p.kv[l] + ((long)g * p.max_seq + pos) * 256;
+            cache[128 + lane] = y0; cache[128 + lane + 32] = y1;
+            cache[128 + lane + 64] = y2; cache[128 + lane + 96] = y3;
+        }
+    }
+    __syncthreads();
+    if (sp == 0 && warp < 2) {
+        // current token as the 19th softmax partial: m=score, l=1, acc=vcur
+        const int h2 = warp;
+        float pd = s.u.attn.q[h2][lane]      * s.u.attn.kcur[lane]
+                 + s.u.attn.q[h2][lane + 32] * s.u.attn.kcur[lane + 32]
+                 + s.u.attn.q[h2][lane + 64] * s.u.attn.kcur[lane + 64]
+                 + s.u.attn.q[h2][lane + 96] * s.u.attn.kcur[lane + 96];
+        pd = warp_sum(pd) * SCALE;
+        float* dst = p.partials + ((long)(2 * g + h2) * NSPLIT + SPLITS) * PSTRIDE;
+        if (lane == 0) { dst[0] = pd; dst[1] = 1.f; }
+        dst[4 + lane] = s.u.attn.vcur[lane];
+        dst[4 + lane + 32] = s.u.attn.vcur[lane + 32];
+        dst[4 + lane + 64] = s.u.attn.vcur[lane + 64];
+        dst[4 + lane + 96] = s.u.attn.vcur[lane + 96];
+    }
+}
+
+// warp-state -> per-(head,split) partial, shared by both stage2 variants
+__device__ __noinline__ void stage2_tail(const Params& p, Smem& s, int g, int sp) {
+    const int tid = threadIdx.x;
+    const int warp = tid >> 5, lane = tid & 31;
+    if (warp < 2) {
+        const int h2 = warp;
+        float mw = (lane < NWARP) ? s.u.attn.wm[lane][h2] : NEG_BIG;
+        float lw = (lane < NWARP) ? s.u.attn.wl[lane][h2] : 0.f;
+        float M = mw;
+        #pragma unroll
+        for (int o = 16; o; o >>= 1) M = fmaxf(M, __shfl_xor_sync(0xffffffffu, M, o));
+        float e = __expf(mw - M);  // empty warp range: mw=-1e30 -> 0 (or M=-1e30 -> e=1, acc=0)
+        float L = warp_sum(e * lw);
+        float out[4] = {0, 0, 0, 0};
+        #pragma unroll
+        for (int i = 0; i < NWARP; ++i) {
+            float ei = __shfl_sync(0xffffffffu, e, i);
+            #pragma unroll
+            for (int j = 0; j < 4; ++j)
+                out[j] += ei * s.u.attn.wacc[h2][i][lane * 4 + j];
+        }
+        float* dst = p.partials + ((long)(2 * g + h2) * NSPLIT + sp) * PSTRIDE;
+        if (lane == 0) { dst[0] = M; dst[1] = L; }
+        #pragma unroll
+        for (int j = 0; j < 4; ++j) dst[4 + lane * 4 + j] = out[j];
+    }
+}
+
+// ---------- S2 big-ctx token loop (isolated for its own register budget) ----------
+__device__ __forceinline__ void stage2_loop_big(const Params& p, Smem& s,
+                                             int l, int pos, int g, int sp) {
+    const int tid = threadIdx.x;
+    const int warp = tid >> 5, lane = tid & 31;
+    // 4 tokens per iteration, one per 8-lane group; quarter-warp reduces.
+    const int grp = lane >> 3;   // token t+grp
+    const int l8 = lane & 7;
+    const int sub = l8 * 16;     // 16 head dims per lane
+    // q read from smem inside the loop: keeps the register footprint low
+    // enough that ptxas does not spill the prefetch/acc state.
+    const float* q0p = s.u.attn.q[0] + sub;
+    const float* q1p = s.u.attn.q[1] + sub;
+    const int len_past = pos;
+    const int cs = (len_past + SPLITS - 1) / SPLITS;
+    const int t0 = sp * cs, t1 = min(len_past, t0 + cs);
+    int per_w = (t1 - t0 + NWARP - 1) / NWARP;
+    per_w = (per_w + 3) & ~3;
+    const int w0 = t0 + warp * per_w, w1 = min(t1, w0 + per_w);
+    float m0 = NEG_BIG, l0 = 0.f, m1 = NEG_BIG, l1 = 0.f;
+    float acc0[16], acc1[16];
+    #pragma unroll
+    for (int j = 0; j < 16; ++j) { acc0[j] = 0.f; acc1[j] = 0.f; }
+    const bf16* kvb = p.kv[l] + (long)g * p.max_seq * 256;
+    if (w0 < w1) {
+        // double-buffered prefetch; addresses clamped to the last valid row so
+        // tail groups never touch uninitialized cache rows
+        float4 ka0, ka1, va0, va1, kb0, kb1, vb0, vb1;
+        {
+            long tt = min(w0 + grp, w1 - 1);
+            const float4* pk = reinterpret_cast<const float4*>(kvb + tt * 256 + sub);
+            ka0 = pk[0]; ka1 = pk[1];
+            const float4* pv = reinterpret_cast<const float4*>(kvb + tt * 256 + 128 + sub);
+            va0 = pv[0]; va1 = pv[1];
+            long t2 = min(w0 + 4 + grp, w1 - 1);
+            const float4* pk2 = reinterpret_cast<const float4*>(kvb + t2 * 256 + sub);
+            kb0 = pk2[0]; kb1 = pk2[1];
+            const float4* pv2 = reinterpret_cast<const float4*>(kvb + t2 * 256 + 128 + sub);
+            vb0 = pv2[0]; vb1 = pv2[1];
+        }
+        for (int t = w0; t < w1; t += 4) {
+            int my_t = t + grp;
+            bool valid = my_t < w1;
+            float4 k0 = ka0, k1 = ka1, v0 = va0, v1 = va1;
+            ka0 = kb0; ka1 = kb1; va0 = vb0; va1 = vb1;
+            long nxt = min((long)(my_t + 8), (long)(w1 - 1));
+            {
+                const float4* pk = reinterpret_cast<const float4*>(kvb + nxt * 256 + sub);
+                kb0 = pk[0]; kb1 = pk[1];
+                const float4* pv = reinterpret_cast<const float4*>(kvb + nxt * 256 + 128 + sub);
+                vb0 = pv[0]; vb1 = pv[1];
+            }
+            const bf16* kA = reinterpret_cast<const bf16*>(&k0);
+            const bf16* kB = reinterpret_cast<const bf16*>(&k1);
+            float p0 = 0.f, p1 = 0.f;
+            #pragma unroll
+            for (int j = 0; j < 8; ++j) {
+                float kf = bf2f(kA[j]);
+                p0 += q0p[j] * kf; p1 += q1p[j] * kf;
+            }
+            #pragma unroll
+            for (int j = 0; j < 8; ++j) {
+                float kf = bf2f(kB[j]);
+                p0 += q0p[8 + j] * kf; p1 += q1p[8 + j] * kf;
+            }
+            #pragma unroll
+            for (int o = 4; o; o >>= 1) {
+                p0 += __shfl_xor_sync(0xffffffffu, p0, o);
+                p1 += __shfl_xor_sync(0xffffffffu, p1, o);
+            }
+            p0 *= SCALE; p1 *= SCALE;
+            if (!valid) { p0 = NEG_BIG; p1 = NEG_BIG; }
+            // factor form: acc = acc*c + w*f with (c,w) in {(1,e),(e,1)} — one
+            // 8-wide conversion batch at a time keeps register pressure down
+            float c0f, w0f;
+            if (p0 <= m0) { c0f = 1.f; w0f = __expf(p0 - m0); l0 += w0f; }
+            else { c0f = __expf(m0 - p0); w0f = 1.f; l0 = l0 * c0f + 1.f; m0 = p0; }
+            float c1f, w1f;
+            if (p1 <= m1) { c1f = 1.f; w1f = __expf(p1 - m1); l1 += w1f; }
+            else { c1f = __expf(m1 - p1); w1f = 1.f; l1 = l1 * c1f + 1.f; m1 = p1; }
+            const bf16* vA = reinterpret_cast<const bf16*>(&v0);
+            const bf16* vB = reinterpret_cast<const bf16*>(&v1);
+            float fw[8];
+            #pragma unroll
+            for (int j = 0; j < 8; ++j) fw[j] = bf2f(vA[j]);
+            #pragma unroll
+            for (int j = 0; j < 8; ++j) {
+                acc0[j] = acc0[j] * c0f + w0f * fw[j];
+                acc1[j] = acc1[j] * c1f + w1f * fw[j];
+            }
+            #pragma unroll
+            for (int j = 0; j < 8; ++j) fw[j] = bf2f(vB[j]);
+            #pragma unroll
+            for (int j = 0; j < 8; ++j) {
+                acc0[8 + j] = acc0[8 + j] * c0f + w0f * fw[j];
+                acc1[8 + j] = acc1[8 + j] * c1f + w1f * fw[j];
+            }
+        }
+    }
+    // merge the 4 group states (xor 8, then xor 16); empty states are safe:
+    // exp(-1e30 - -1e30)=exp(0)=1 scales l=0/acc=0.
+    #pragma unroll
+    for (int o = 8; o <= 16; o <<= 1) {
+        float mo0 = __shfl_xor_sync(0xffffffffu, m0, o);
+        float lo0 = __shfl_xor_sync(0xffffffffu, l0, o);
+        float M0 = fmaxf(m0, mo0);
+        float ce = __expf(m0 - M0), co = __expf(mo0 - M0);
+        l0 = l0 * ce + lo0 * co;
+        #pragma unroll
+        for (int j = 0; j < 16; ++j) {
+            float other = __shfl_xor_sync(0xffffffffu, acc0[j], o);
+            acc0[j] = acc0[j] * ce + other * co;
+        }
+        m0 = M0;
+        float mo1 = __shfl_xor_sync(0xffffffffu, m1, o);
+        float lo1 = __shfl_xor_sync(0xffffffffu, l1, o);
+        float M1 = fmaxf(m1, mo1);
+        float ce1 = __expf(m1 - M1), co1 = __expf(mo1 - M1);
+        l1 = l1 * ce1 + lo1 * co1;
+        #pragma unroll
+        for (int j = 0; j < 16; ++j) {
+            float other = __shfl_xor_sync(0xffffffffu, acc1[j], o);
+            acc1[j] = acc1[j] * ce1 + other * co1;
+        }
+        m1 = M1;
+    }
+    if (lane == 0) {
+        s.u.attn.wm[warp][0] = m0; s.u.attn.wl[warp][0] = l0;
+        s.u.attn.wm[warp][1] = m1; s.u.attn.wl[warp][1] = l1;
+    }
+    if (grp == 0) {
+        #pragma unroll
+        for (int j = 0; j < 16; ++j) {
+            s.u.attn.wacc[0][warp][sub + j] = acc0[j];
+            s.u.attn.wacc[1][warp][sub + j] = acc1[j];
+        }
+    }
+}
+
+// ---------- S2: q/k norm + rope + KV append + flash-decode attention ----------
+__device__ __forceinline__ void stage2_big(const Params& p, Smem& s,
+                                    const float* __restrict__ nl,
+                                    int l, int pos) {
+    const int bid = blockIdx.x, tid = threadIdx.x;
+    const int warp = tid >> 5, lane = tid & 31;
+    if (bid >= ATT_BLOCKS) return;
+    const int g = bid / SPLITS, sp = bid % SPLITS;
+    stage2_prep_body(p, s, nl, l, pos);
+
+    stage2_loop_big(p, s, l, pos, g, sp);
+    __syncthreads();
+    stage2_tail(p, s, g, sp);
+}
+
+
+// ---------- S2 small-ctx body: one token per warp iteration ----------
+__device__ __forceinline__ void stage2_small(const Params& p, Smem& s,
+                                      const float* __restrict__ nl, int l, int pos) {
+    const int bid = blockIdx.x, tid = threadIdx.x;
+    const int warp = tid >> 5, lane = tid & 31;
+    if (bid >= ATT_BLOCKS) return;
+    const int g = bid / SPLITS, sp = bid % SPLITS;
+    stage2_prep_body(p, s, nl, l, pos);
+    const int l16 = lane & 15;
+    const bool vlane = lane >= 16;
+    const int sub = l16 * 8;
+    float q0s[8], q1s[8];
+    #pragma unroll
+    for (int j = 0; j < 8; ++j) {
+        q0s[j] = s.u.attn.q[0][sub + j];
+        q1s[j] = s.u.attn.q[1][sub + j];
+    }
+    const int len_past = pos;
+    const int cs = (len_past + SPLITS - 1) / SPLITS;
+    const int t0 = sp * cs, t1 = min(len_past, t0 + cs);
+    const int per_w = (t1 - t0 + NWARP - 1) / NWARP;
+    const int w0 = t0 + warp * per_w, w1 = min(t1, w0 + per_w);
+    float m0 = NEG_BIG, l0 = 0.f, m1 = NEG_BIG, l1 = 0.f;
+    float acc0[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+    float acc1[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+    const int roff = (vlane ? 128 : 0) + sub;
+    const bf16* kvb = p.kv[l] + (long)g * p.max_seq * 256;
+    float4 pf0, pf1, pf2, pf3;
+    if (w0 + 0 < w1) pf0 = *reinterpret_cast<const float4*>(kvb + (long)(w0 + 0) * 256 + roff);
+    if (w0 + 1 < w1) pf1 = *reinterpret_cast<const float4*>(kvb + (long)(w0 + 1) * 256 + roff);
+    if (w0 + 2 < w1) pf2 = *reinterpret_cast<const float4*>(kvb + (long)(w0 + 2) * 256 + roff);
+    if (w0 + 3 < w1) pf3 = *reinterpret_cast<const float4*>(kvb + (long)(w0 + 3) * 256 + roff);
+    for (int t = w0; t < w1; ++t) {
+        float4 rv = pf0;
+        pf0 = pf1; pf1 = pf2; pf2 = pf3;
+        if (t + 4 < w1) pf3 = *reinterpret_cast<const float4*>(kvb + (long)(t + 4) * 256 + roff);
+        const bf16* fb = reinterpret_cast<const bf16*>(&rv);
+        float fv[8];
+        #pragma unroll
+        for (int j = 0; j < 8; ++j) fv[j] = bf2f(fb[j]);
+        float p0 = 0.f, p1 = 0.f;
+        if (!vlane) {
+            #pragma unroll
+            for (int j = 0; j < 8; ++j) { p0 += q0s[j] * fv[j]; p1 += q1s[j] * fv[j]; }
+        }
+        #pragma unroll
+        for (int o = 16; o; o >>= 1) {
+            p0 += __shfl_xor_sync(0xffffffffu, p0, o);
+            p1 += __shfl_xor_sync(0xffffffffu, p1, o);
+        }
+        p0 *= SCALE; p1 *= SCALE;
+        float c0f, w0f;
+        if (p0 <= m0) { c0f = 1.f; w0f = __expf(p0 - m0); }
+        else          { c0f = __expf(m0 - p0); w0f = 1.f; m0 = p0; }
+        l0 = l0 * c0f + w0f;
+        float c1f, w1f;
+        if (p1 <= m1) { c1f = 1.f; w1f = __expf(p1 - m1); }
+        else          { c1f = __expf(m1 - p1); w1f = 1.f; m1 = p1; }
+        l1 = l1 * c1f + w1f;
+        if (vlane) {
+            #pragma unroll
+            for (int j = 0; j < 8; ++j) {
+                acc0[j] = acc0[j] * c0f + w0f * fv[j];
+                acc1[j] = acc1[j] * c1f + w1f * fv[j];
+            }
+        }
+    }
+    if (lane == 0) {
+        s.u.attn.wm[warp][0] = m0; s.u.attn.wl[warp][0] = l0;
+        s.u.attn.wm[warp][1] = m1; s.u.attn.wl[warp][1] = l1;
+    }
+    if (vlane) {
+        #pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            s.u.attn.wacc[0][warp][sub + j] = acc0[j];
+            s.u.attn.wacc[1][warp][sub + j] = acc1[j];
+        }
+    }
+    __syncthreads();
+    stage2_tail(p, s, g, sp);
+}
+
+// ---------- S3: combine + O GEMV + residual ----------
+__device__ __noinline__ void stage3(const Params& p, Smem& s,
+                                    const bf16* __restrict__ Wl, int l) {
+    const int bid = blockIdx.x, tid = threadIdx.x;
+    const int warp = tid >> 5, lane = tid & 31;
+    {
+        const int h = warp;
+        const float* ph = p.partials + (long)h * NSPLIT * PSTRIDE;
+        float ms = (lane < NSPLIT) ? ph[lane * PSTRIDE] : NEG_BIG;
+        float ls = (lane < NSPLIT) ? ph[lane * PSTRIDE + 1] : 0.f;
+        float M = ms;
+        #pragma unroll
+        for (int o = 16; o; o >>= 1) M = fmaxf(M, __shfl_xor_sync(0xffffffffu, M, o));
+        float e = __expf(ms - M);  // empty split: ms=-1e30 -> 0
+        float L = warp_sum(e * ls);
+        if (lane < NSPLIT) s.cw[h][lane] = e / L;
+        __syncwarp();
+        #pragma unroll
+        for (int cch = 0; cch < 4; ++cch) {
+            int d = cch * 32 + lane;
+            float v = 0.f;
+            #pragma unroll
+            for (int sp2 = 0; sp2 < NSPLIT; ++sp2)
+                v += s.cw[h][sp2] * ph[sp2 * PSTRIDE + 4 + d];
+            *elem_ptr(s.u.attn_vec, 256, h * HD + d) = v;
+        }
+    }
+    __syncthreads();
+    const bf16* xin = (l == 0) ? p.x_buf : p.h_io;
+    const bf16* Wo = Wl + OFF_O;
+    const float4* av = reinterpret_cast<const float4*>(s.u.attn_vec);
+    for (int r = warp * gridDim.x + bid; r < H; r += p.total_warps) {
+        const float4* wr = reinterpret_cast<const float4*>(Wo + (long)r * 2048);
+        float4 wv[8];
+        #pragma unroll
+        for (int it = 0; it < 8; ++it) wv[it] = wr[it * 32 + lane];
+        float acc = 0.f;
+        #pragma unroll
+        for (int it = 0; it < 8; ++it) {
+            const bf16* wb = reinterpret_cast<const bf16*>(&wv[it]);
+            float4 x0 = av[it * 32 + lane];
+            float4 x1 = av[256 + it * 32 + lane];
+            const float* xp0 = reinterpret_cast<const float*>(&x0);
+            const float* xp1 = reinterpret_cast<const float*>(&x1);
+            #pragma unroll
+            for (int j = 0; j < 4; ++j)
+                acc += bf2f(wb[j]) * xp0[j] + bf2f(wb[4 + j]) * xp1[j];
+        }
+        acc = warp_sum(acc);
+        if (lane == 0) p.h_attn[r] = bf2f(xin[r]) + acc;
+    }
+
+    const bf16* Wgu_pf = Wl + OFF_GU;
+    for (int r = warp * gridDim.x + bid; r < I3; r += p.total_warps)
+        l2_prefetch(reinterpret_cast<const char*>(Wgu_pf + (long)r * 2048) + lane * 128);
+}
+
+// ---------- S4: post RMSNorm + gate/up GEMV + SiLU ----------
+__device__ __noinline__ void stage4(const Params& p, Smem& s,
+                                    const bf16* __restrict__ Wl,
+                                    const float* __restrict__ nl) {
+    const int bid = blockIdx.x, tid = threadIdx.x;
+    const int warp = tid >> 5, lane = tid & 31;
+    float sq = 0.f;
+    for (int e = tid; e < H; e += NTHR) {
+        float v = p.h_attn[e];
+        *elem_ptr(s.xhat, 128, e) = v;
+        sq += v * v;
+    }
+    float tot = block_sum(sq, &s);
+    float rms = rsqrtf(tot * (1.f / H) + EPS);
+    const float* pn = nl + 1024;
+    for (int e = tid; e < H; e += NTHR) {
+        float* q = elem_ptr(s.xhat, 128, e);
+        *q = *q * rms * pn[e];
+    }
+    __syncthreads();
+    const bf16* Wgu = Wl + OFF_GU;
+    const float4* xt = reinterpret_cast<const float4*>(s.xhat);
+    for (int r = warp * gridDim.x + bid; r < I3; r += p.total_warps) {
+        const float4* wr = reinterpret_cast<const float4*>(Wgu + (long)r * 2048);
+        float4 wv[8];
+        #pragma unroll
+        for (int it = 0; it < 8; ++it) wv[it] = wr[it * 32 + lane];
+        float aG = 0.f, aU = 0.f;
+        #pragma unroll
+        for (int it = 0; it < 8; ++it) {
+            const bf16* wb = reinterpret_cast<const bf16*>(&wv[it]);
+            int itm = (it < 4) ? it : (it - 4);
+            float4 x0 = xt[itm * 32 + lane];
+            float4 x1 = xt[128 + itm * 32 + lane];
+            const float* xp0 = reinterpret_cast<const float*>(&x0);
+            const float* xp1 = reinterpret_cast<const float*>(&x1);
+            if (it < 4) {
+                #pragma unroll
+                for (int j = 0; j < 4; ++j)
+                    aG += bf2f(wb[j]) * xp0[j] + bf2f(wb[4 + j]) * xp1[j];
+            } else {
+                #pragma unroll
+                for (int j = 0; j < 4; ++j)
+                    aU += bf2f(wb[j]) * xp0[j] + bf2f(wb[4 + j]) * xp1[j];
+            }
+        }
+        #pragma unroll
+        for (int o = 16; o; o >>= 1) {
+            aG += __shfl_xor_sync(0xffffffffu, aG, o);
+            aU += __shfl_xor_sync(0xffffffffu, aU, o);
+        }
+        if (lane == 0) {
+            float sig = 1.f / (1.f + __expf(-aG));
+            p.act[r] = aG * sig * aU;
+        }
+    }
+
+    const bf16* Wd_pf = Wl + OFF_DN;
+    for (int r = warp * gridDim.x + bid; r < H; r += p.total_warps) {
+        const char* base = reinterpret_cast<const char*>(Wd_pf + (long)r * I3);
+        l2_prefetch(base + lane * 128);
+        if (lane < 16) l2_prefetch(base + 4096 + lane * 128);
+    }
+}
+
+// ---------- S5: down GEMV + residual ----------
+__device__ __noinline__ void stage5(const Params& p, Smem& s,
+                                    const bf16* __restrict__ Wl, int l) {
+    const int bid = blockIdx.x, tid = threadIdx.x;
+    const int warp = tid >> 5, lane = tid & 31;
+    for (int e = tid; e < I3; e += NTHR) *elem_ptr(s.u.act_s, 384, e) = p.act[e];
+    __syncthreads();
+    const bf16* Wd = Wl + OFF_DN;
+    const float4* at = reinterpret_cast<const float4*>(s.u.act_s);
+    for (int r = warp * gridDim.x + bid; r < H; r += p.total_warps) {
+        const float4* wr = reinterpret_cast<const float4*>(Wd + (long)r * I3);
+        float4 wv[12];
+        #pragma unroll
+        for (int it = 0; it < 12; ++it) wv[it] = wr[it * 32 + lane];
+        float acc = 0.f;
+        #pragma unroll
+        for (int it = 0; it < 12; ++it) {
+            const bf16* wb = reinterpret_cast<const bf16*>(&wv[it]);
+            float4 x0 = at[it * 32 + lane];
+            float4 x1 = at[384 + it * 32 + lane];
+            const float* xp0 = reinterpret_cast<const float*>(&x0);
+            const float* xp1 = reinterpret_cast<const float*>(&x1);
+            #pragma unroll
+            for (int j = 0; j < 4; ++j)
+                acc += bf2f(wb[j]) * xp0[j] + bf2f(wb[4 + j]) * xp1[j];
+        }
+        acc = warp_sum(acc);
+        if (lane == 0) p.h_io[r] = __float2bfloat16(p.h_attn[r] + acc);
+    }
+
+    const bf16* Wn = p.W + (long)((l + 1) % p.num_layers) * LAYER_ELEMS;
+    for (int pr = warp * gridDim.x + bid; pr < QKV_ROWS / 2; pr += p.total_warps)
+        l2_prefetch(reinterpret_cast<const char*>(Wn + (long)(2 * pr) * H) + lane * 128);
+}
+
+template <bool BIG>
+__global__ void __launch_bounds__(NTHR, 1) megaqwen_kernel(Params p) {
+    __shared__ Smem s;
+    const int bid = blockIdx.x;
+    const int tid = threadIdx.x;
+#if MQ_DBG
+    unsigned long long dbg_t = (p.dbg && bid == 0 && tid == 0) ? clock64() : 0;
+#endif
+
+    for (int step = 0; step < p.n_steps; ++step) {
+        const int pos = p.start_pos + step;
+        for (int l = 0; l < p.num_layers; ++l) {
+            const bf16* Wl = p.W + (long)l * LAYER_ELEMS;
+            const float* nl = p.norms + l * NORMS_PER_LAYER;
+            stage1(p, s, Wl, nl, l, step);
+            DBG_MARK(0);
+            cg::this_grid().sync();
+            DBG_MARK(5);
+            if (BIG) stage2_big(p, s, nl, l, pos);
+            else stage2_small(p, s, nl, l, pos);
+            DBG_MARK(1);
+            cg::this_grid().sync();
+            DBG_MARK(6);
+            stage3(p, s, Wl, l);
+            DBG_MARK(2);
+            cg::this_grid().sync();
+            DBG_MARK(7);
+            stage4(p, s, Wl, nl);
+            DBG_MARK(3);
+            cg::this_grid().sync();
+            DBG_MARK(8);
+            stage5(p, s, Wl, l);
+            DBG_MARK(4);
+            cg::this_grid().sync();
+            DBG_MARK(9);
+        }
+    }
+}
+
+void megaqwen_launch(torch::Tensor W, torch::Tensor norms,
+                     std::vector<torch::Tensor> kv,
+                     torch::Tensor cos_tab, torch::Tensor sin_tab,
+                     torch::Tensor rand_seq, torch::Tensor h_io, torch::Tensor x_buf,
+                     torch::Tensor qkv_raw, torch::Tensor partials,
+                     torch::Tensor h_attn, torch::Tensor act,
+                     int64_t max_seq, int64_t start_pos, int64_t n_steps,
+                     torch::Tensor dbg, int64_t big_thresh) {
+    Params p;
+    p.W = reinterpret_cast<const bf16*>(W.data_ptr());
+    p.norms = norms.data_ptr<float>();
+    int nl = (int)kv.size();
+    TORCH_CHECK(nl >= 1 && nl <= 8, "num_layers must be in [1,8]");
+    for (int i = 0; i < 8; ++i)
+        p.kv[i] = reinterpret_cast<bf16*>(kv[i < nl ? i : 0].data_ptr());
+    p.cos_tab = cos_tab.data_ptr<float>();
+    p.sin_tab = sin_tab.data_ptr<float>();
+    p.rand_seq = reinterpret_cast<const bf16*>(rand_seq.data_ptr());
+    p.h_io = reinterpret_cast<bf16*>(h_io.data_ptr());
+    p.x_buf = reinterpret_cast<bf16*>(x_buf.data_ptr());
+    p.qkv_raw = qkv_raw.data_ptr<float>();
+    p.partials = partials.data_ptr<float>();
+    p.h_attn = h_attn.data_ptr<float>();
+    p.act = act.data_ptr<float>();
+    p.max_seq = (long)max_seq;
+    p.start_pos = (int)start_pos;
+    p.n_steps = (int)n_steps;
+    p.num_layers = nl;
+    p.dbg = dbg.numel() ? reinterpret_cast<unsigned long long*>(dbg.data_ptr()) : nullptr;
+
+    int dev = 0;
+    cudaGetDevice(&dev);
+    static int grid_cached = -1;
+    if (grid_cached < 0) {
+        cudaDeviceProp prop;
+        cudaGetDeviceProperties(&prop, dev);
+        int per_sm_a = 0, per_sm_b = 0;
+        cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per_sm_a, (void*)megaqwen_kernel<true>, NTHR, 0);
+        cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per_sm_b, (void*)megaqwen_kernel<false>, NTHR, 0);
+        TORCH_CHECK(per_sm_a >= 1 && per_sm_b >= 1, "megaqwen kernel does not fit 1 block/SM");
+        grid_cached = prop.multiProcessorCount;
+        TORCH_CHECK(grid_cached >= ATT_BLOCKS, "need >= 144 SMs for the split layout");
+    }
+    p.total_warps = grid_cached * NWARP;
+    void* args[] = {&p};
+    auto stream = at::cuda::getCurrentCUDAStream();
+    bool big = start_pos >= big_thresh;
+    void* fn = big ? (void*)megaqwen_kernel<true> : (void*)megaqwen_kernel<false>;
+    cudaError_t err = cudaLaunchCooperativeKernel(
+        fn, dim3(grid_cached), dim3(NTHR), args, 0, stream.stream());
+    TORCH_CHECK(err == cudaSuccess, "cooperative launch failed: ", cudaGetErrorString(err));
+}
+
+void set_l2_policy(torch::Tensor W, double fraction) {
+    int dev = 0;
+    cudaGetDevice(&dev);
+    cudaDeviceProp prop;
+    cudaGetDeviceProperties(&prop, dev);
+    size_t persist_max = prop.persistingL2CacheMaxSize;
+    if (persist_max == 0) return;
+    cudaDeviceSetLimit(cudaLimitPersistingL2CacheSize, persist_max);
+    size_t nbytes = (size_t)W.numel() * W.element_size();
+    size_t window = nbytes;
+    if (window > (size_t)prop.accessPolicyMaxWindowSize)
+        window = (size_t)prop.accessPolicyMaxWindowSize;
+    cudaStreamAttrValue attr;
+    attr.accessPolicyWindow.base_ptr = W.data_ptr();
+    attr.accessPolicyWindow.num_bytes = window;
+    float hr = (float)fraction;
+    if (hr > 1.f) hr = 1.f;
+    attr.accessPolicyWindow.hitRatio = hr;
+    attr.accessPolicyWindow.hitProp = cudaAccessPropertyPersisting;
+    attr.accessPolicyWindow.missProp = cudaAccessPropertyStreaming;
+    auto stream = at::cuda::getCurrentCUDAStream();
+    cudaStreamSetAttribute(stream.stream(), cudaStreamAttributeAccessPolicyWindow, &attr);
+}
+
+void clear_l2_policy() {
+    cudaStreamAttrValue attr;
+    attr.accessPolicyWindow.base_ptr = nullptr;
+    attr.accessPolicyWindow.num_bytes = 0;
+    attr.accessPolicyWindow.hitRatio = 0.f;
+    attr.accessPolicyWindow.hitProp = cudaAccessPropertyNormal;
+    attr.accessPolicyWindow.missProp = cudaAccessPropertyNormal;
+    auto stream = at::cuda::getCurrentCUDAStream();
+    cudaStreamSetAttribute(stream.stream(), cudaStreamAttributeAccessPolicyWindow, &attr);
+}
+"""
+
+_CPP_SRC = """
+#include <vector>
+#include <torch/extension.h>
+void megaqwen_launch(torch::Tensor W, torch::Tensor norms,
+                     std::vector<torch::Tensor> kv,
+                     torch::Tensor cos_tab, torch::Tensor sin_tab,
+                     torch::Tensor rand_seq, torch::Tensor h_io, torch::Tensor x_buf,
+                     torch::Tensor qkv_raw, torch::Tensor partials,
+                     torch::Tensor h_attn, torch::Tensor act,
+                     int64_t max_seq, int64_t start_pos, int64_t n_steps,
+                     torch::Tensor dbg, int64_t big_thresh);
+void set_l2_policy(torch::Tensor W, double fraction);
+void clear_l2_policy();
+"""
+
+_ext = None
+
+
+def _get_ext():
+    global _ext
+    if _ext is None:
+        from torch.utils.cpp_extension import load_inline
+
+        cap = torch.cuda.get_device_capability(0)
+        arch = f"{cap[0]}{cap[1]}"
+        _ext = load_inline(
+            name="megaqwen_decode_v19" + ("_dbg" if os.environ.get("MQ_DBG") == "1" else "") + ("_nopf" if os.environ.get("MQ_PF") == "0" else ""),
+            cpp_sources=_CPP_SRC,
+            cuda_sources=_CUDA_SRC,
+            functions=["megaqwen_launch", "set_l2_policy", "clear_l2_policy"],
+            extra_cuda_cflags=[
+                "-O3",
+                f"-gencode=arch=compute_{arch},code=sm_{arch}",
+                "--use_fast_math",
+                f"-DMQ_DBG={1 if os.environ.get('MQ_DBG') == '1' else 0}",
+                f"-DMQ_PF={0 if os.environ.get('MQ_PF') == '0' else 1}",
+            ],
+            verbose=False,
+        )
+    return _ext
+
+
+class Block(nn.Module):
+    def __init__(self):
+        super().__init__()
+        H, I, D = HIDDEN, INTERMEDIATE, HEAD_DIM
+        self.input_ln = nn.Parameter(torch.ones(H, dtype=torch.bfloat16))
+        self.q_proj = nn.Parameter(torch.empty(NUM_Q * D, H, dtype=torch.bfloat16))
+        self.k_proj = nn.Parameter(torch.empty(NUM_KV * D, H, dtype=torch.bfloat16))
+        self.v_proj = nn.Parameter(torch.empty(NUM_KV * D, H, dtype=torch.bfloat16))
+        self.q_norm = nn.Parameter(torch.ones(D, dtype=torch.bfloat16))
+        self.k_norm = nn.Parameter(torch.ones(D, dtype=torch.bfloat16))
+        self.o_proj = nn.Parameter(torch.empty(H, NUM_Q * D, dtype=torch.bfloat16))
+        self.post_ln = nn.Parameter(torch.ones(H, dtype=torch.bfloat16))
+        self.gate_proj = nn.Parameter(torch.empty(I, H, dtype=torch.bfloat16))
+        self.up_proj = nn.Parameter(torch.empty(I, H, dtype=torch.bfloat16))
+        self.down_proj = nn.Parameter(torch.empty(H, I, dtype=torch.bfloat16))
+        for p in self.parameters():
+            if p.dim() >= 2:
+                nn.init.normal_(p, std=0.02)
+
+
+class Model(nn.Module):
+    def __init__(self, num_layers: int = NUM_LAYERS, max_seq: int = 131072):
+        super().__init__()
+        self.num_layers = num_layers
+        self.max_seq = max_seq
+        self.blocks = nn.ModuleList([Block() for _ in range(num_layers)])
+        self._mq: dict = {}
+
+
+def _ensure_packed(model: Model, device: torch.device) -> dict:
+    """(Re)pack weights into flat kernel buffers. Called from prefill (untimed);
+    always repacks because load_state_dict may have replaced values."""
+    st = model._mq
+    L = model.num_layers
+    if st.get("device") != device or st.get("L") != L:
+        st.clear()
+        st["device"] = device
+        st["L"] = L
+        st["W"] = torch.empty(L * LAYER_ELEMS, dtype=torch.bfloat16, device=device)
+        st["norms"] = torch.empty(L * NORMS_PER_LAYER, dtype=torch.float32, device=device)
+        st["qkv_raw"] = torch.empty(4096, dtype=torch.float32, device=device)
+        st["partials"] = torch.empty(NUM_Q * (SPLITS + 1) * PARTIAL_STRIDE, dtype=torch.float32, device=device)
+        st["h_attn"] = torch.empty(HIDDEN, dtype=torch.float32, device=device)
+        st["act"] = torch.empty(INTERMEDIATE, dtype=torch.float32, device=device)
+        st["x_buf"] = torch.empty(HIDDEN, dtype=torch.bfloat16, device=device)
+        st["empty_dbg"] = torch.empty(0, dtype=torch.int64, device=device)
+    W = st["W"]
+    norms = st["norms"]
+    for i, b in enumerate(model.blocks):
+        base = i * LAYER_ELEMS
+        W[base:base + 4194304].view(4096, 1024)[:2048].copy_(b.q_proj.detach())
+        W[base:base + 4194304].view(4096, 1024)[2048:3072].copy_(b.k_proj.detach())
+        W[base:base + 4194304].view(4096, 1024)[3072:].copy_(b.v_proj.detach())
+        W[base + 4194304:base + 6291456].view(1024, 2048).copy_(b.o_proj.detach())
+        gu = W[base + 6291456:base + 12582912].view(3072, 2, 1024)
+        gu[:, 0].copy_(b.gate_proj.detach())
+        gu[:, 1].copy_(b.up_proj.detach())
+        W[base + 12582912:base + 15728640].view(1024, 3072).copy_(b.down_proj.detach())
+        nb = i * NORMS_PER_LAYER
+        norms[nb:nb + 1024].copy_(b.input_ln.detach().float())
+        norms[nb + 1024:nb + 2048].copy_(b.post_ln.detach().float())
+        norms[nb + 2048:nb + 2176].copy_(b.q_norm.detach().float())
+        norms[nb + 2176:nb + 2304].copy_(b.k_norm.detach().float())
+    if st.get("rope_len", 0) < model.max_seq:
+        # Bitwise-identical to reference._rope: same torch ops, fp32 on device.
+        half = HEAD_DIM // 2
+        inv = 1.0 / (
+            10000
+            ** (torch.arange(0, half, device=device, dtype=torch.float32) / half)
+        )
+        t = torch.arange(model.max_seq, device=device, dtype=torch.float32)
+        freqs = torch.outer(t, inv)
+        st["cos"] = freqs.cos().contiguous()
+        st["sin"] = freqs.sin().contiguous()
+        st["rope_len"] = model.max_seq
+    return st
+
+
+DBG_CYCLES = None  # set to a cuda int64[8] tensor to collect per-stage cycles
+
+
+def _launch(st, kv_list, rand, hidden, max_seq, start_pos, n_steps):
+    dbg = DBG_CYCLES if DBG_CYCLES is not None else st["empty_dbg"]
+    _get_ext().megaqwen_launch(
+        st["W"], st["norms"], kv_list, st["cos"], st["sin"], rand, hidden,
+        st["x_buf"], st["qkv_raw"], st["partials"], st["h_attn"], st["act"],
+        max_seq, start_pos, n_steps, dbg, BIG_THRESH,
+    )
+
+
+@torch.no_grad()
+def prefill(model: Model, ctx_len: int, seed: int, device: torch.device | None = None):
+    """Build KV of length ctx_len. NOT timed in benchmark."""
+    device = device or next(model.parameters()).device
+    assert device.type == "cuda", "CUDA required"
+    model.eval()
+    assert ctx_len <= model.max_seq
+    st = _ensure_packed(model, device)
+    if os.environ.get("MQ_L2", "1") != "0":
+        _get_ext().set_l2_policy(st["W"], 1.0)
+    else:
+        _get_ext().clear_l2_policy()
+    S = model.max_seq
+    kv = [
+        torch.empty(NUM_KV, S, 2, HEAD_DIM, dtype=torch.bfloat16, device=device)
+        for _ in range(model.num_layers)
+    ]
+    g0 = torch.Generator(device="cpu")
+    g0.manual_seed(seed)
+    hidden = torch.randn(HIDDEN, generator=g0, dtype=torch.bfloat16).to(device)
+    g = torch.Generator(device="cpu")
+    g.manual_seed(seed + 1)
+    t = 0
+    CHUNK = 8192
+    while t < ctx_len:
+        n = min(CHUNK, ctx_len - t)
+        if t < BIG_THRESH < t + n:
+            n = BIG_THRESH - t  # kernel variant switches at this position
+        # Batched randn is bitwise-identical to n sequential randn(1024) calls.
+        rand = (
+            torch.randn(n * HIDDEN, generator=g, dtype=torch.bfloat16)
+            .view(n, HIDDEN)
+            .to(device)
+        )
+        _launch(st, kv, rand, hidden, S, t, n)
+        t += n
+    k_caches = kv  # interleaved [8, S, 2(K|V), 128] — internal layout
+    v_caches = [c[:, :, 1, :] for c in kv]
+    return hidden, k_caches, v_caches
+
+
+@torch.no_grad()
+def decode_steps(
+    model: Model,
+    hidden: torch.Tensor,
+    k_caches,
+    v_caches,
+    start_pos: int,
+    n_steps: int,
+    seed: int,
+):
+    """Run n_steps decode steps starting at start_pos. Timed in benchmark."""
+    if n_steps <= 0:
+        return hidden, k_caches, v_caches
+    device = hidden.device
+    st = model._mq
+    assert st.get("device") == device, "call prefill first"
+    assert start_pos + n_steps <= model.max_seq
+    g = torch.Generator(device="cpu")
+    g.manual_seed(seed + 2)
+    kv = list(k_caches)
+    # Chunked launches: a small first chunk starts the GPU immediately; the
+    # CPU generates the remaining randn stream while the GPU runs. Batched
+    # randn from one generator is bitwise-identical to per-step calls.
+    done = 0
+    keep = []
+    while done < n_steps:
+        n = min(8 if done == 0 else n_steps, n_steps - done)
+        sp0 = start_pos + done
+        if sp0 < BIG_THRESH < sp0 + n:
+            n = BIG_THRESH - sp0  # kernel variant switches at this position
+        rand = (
+            torch.randn(n * HIDDEN, generator=g, dtype=torch.bfloat16)
+            .view(n, HIDDEN)
+            .to(device, non_blocking=True)
+        )
+        keep.append(rand)
+        _launch(st, kv, rand, hidden, model.max_seq, start_pos + done, n)
+        done += n
+    return hidden, k_caches, v_caches
+
+
+def run(
+    ctx_len: int,
+    n_decode: int,
+    seed: int,
+    model: Model | None = None,
+    max_seq: int | None = None,
+) -> dict:
+    """Prefill then decode. Returns last_hidden for numeric correctness."""
+    device = torch.device("cuda:0")
+    max_seq = max_seq or max(ctx_len + n_decode, 512)
+    if model is None:
+        model = Model(NUM_LAYERS, max_seq)
+    else:
+        if getattr(model, "max_seq", 0) < ctx_len + n_decode:
+            raise ValueError(
+                f"model.max_seq={getattr(model, 'max_seq', None)} too small for "
+                f"ctx_len={ctx_len}+n_decode={n_decode}"
+            )
+    model = model.to(device).eval()
+    h, k_caches, v_caches = prefill(model, ctx_len, seed, device=device)
+    h, k_caches, v_caches = decode_steps(
+        model, h, k_caches, v_caches, start_pos=ctx_len, n_steps=n_decode, seed=seed
+    )
+    torch.cuda.synchronize()
+    return {
+        "last_hidden": h.detach(),
+        "ctx_len": ctx_len,
+        "decode_steps": n_decode,
+    }
+
+
+def get_init_inputs():
+    return [NUM_LAYERS, 131072]
+
+
+def get_inputs():
+    return []

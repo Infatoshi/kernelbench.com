@@ -1,0 +1,434 @@
+"""Custom top-k kernel for RTX 3090 (SM86).
+
+Returns the k largest values per row of a (batch, n) fp32 tensor, sorted
+descending, with their int64 indices -- same contract as the reference, but
+implemented from scratch in CUDA (no library selection/sort calls).
+
+Design
+------
+The deck is bandwidth/launch bound: each row read is tiny (0.5-2 MB), so the
+wall-clock floor is dominated by kernel launch/dispatch overhead and cold-DRAM
+latency, not the selection compute. Levers:
+
+  1. A custom kernel (block-per-row, templated on K). Each thread streams its
+     slice with vectorized float4 loads and keeps a register-resident sorted
+     top-K buffer, updated with a *branchless, compile-time-indexed* insertion
+     so the buffer never spills to local memory.
+       - K<=32: lanes are reduced by a warp-shuffle butterfly using an in-place
+         bitonic top-K merge (C[i]=max(A[i],B[K-1-i]) is bitonic; bitonic-sort
+         it), so only T/32 partials hit shared memory -> high occupancy.
+       - K==64: the warp bitonic merge would need 256 registers and spill to
+         (DRAM-backed) local memory, which is ruinous on the cold path, so the
+         block reduces all T lists through a shared-memory merge-tree instead.
+     For the single very-large row (batch=1, n=131072) one block cannot saturate
+     DRAM, so the row is split across BPR blocks (each emits a partial top-K)
+     and a second tiny kernel merges the partials.
+
+  2. Reusable output buffers (allocated once per Model) plus CUDA-graph
+     capture/replay, which collapses per-call launch + Python dispatch overhead
+     to a single graph launch. Replay reads live memory at the captured input
+     pointer, so it stays correct as the input data changes between calls.
+"""
+from __future__ import annotations
+
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+_CUDA_SRC = r"""
+#include <torch/extension.h>
+#include <ATen/cuda/CUDAContext.h>
+#include <c10/cuda/CUDAStream.h>
+#include <cuda_runtime.h>
+#include <cfloat>
+
+// Branchless insert of (v, idx) into a descending register-resident top-K
+// buffer (drops the current min). All indices are compile-time so tv/ti stay
+// in registers.
+template <int K>
+__device__ __forceinline__ void insert(float* tv, int* ti, float v, int idx) {
+    if (v <= tv[K - 1]) return;
+    float pv = v;  int pi = idx;
+    #pragma unroll
+    for (int p = 0; p < K; ++p) {
+        bool take = (pv > tv[p]);
+        float cur_v = tv[p];  int cur_i = ti[p];
+        tv[p] = take ? pv : cur_v;
+        ti[p] = take ? pi : cur_i;
+        pv = take ? cur_v : pv;
+        pi = take ? cur_i : pi;
+    }
+}
+
+// Merge two descending length-K lists (A,B) -> top-K of union into (ov,oi).
+template <int K>
+__device__ __forceinline__ void merge2(
+    const float* Av, const int* Ai, const float* Bv, const int* Bi,
+    float* ov, int* oi) {
+    int i = 0, j = 0;
+    #pragma unroll
+    for (int m = 0; m < K; ++m) {
+        float a = Av[i], b = Bv[j];
+        if (a >= b) { ov[m] = a; oi[m] = Ai[i]; ++i; }
+        else        { ov[m] = b; oi[m] = Bi[j]; ++j; }
+    }
+}
+
+// Warp reduction: 32 lanes each hold a descending top-K in registers; butterfly
+// shuffle so lane 0 ends with the warp-wide top-K.  Each step merges two
+// descending K-lists in place via the bitonic top-K trick
+// (C[i] = max(A[i], B[K-1-i]) is bitonic and holds the top-K; bitonic-sort it),
+// which needs only the received list as scratch (4K regs, no 6K two-pointer).
+template <int K>
+__device__ __forceinline__ void warp_merge(float* tv, int* ti) {
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        float rv[K]; int ri[K];
+        #pragma unroll
+        for (int m = 0; m < K; ++m) {
+            rv[m] = __shfl_down_sync(0xffffffffu, tv[m], off);
+            ri[m] = __shfl_down_sync(0xffffffffu, ti[m], off);
+        }
+        #pragma unroll
+        for (int i = 0; i < K; ++i) {
+            int j = K - 1 - i;
+            if (rv[j] > tv[i]) { tv[i] = rv[j]; ti[i] = ri[j]; }
+        }
+        #pragma unroll
+        for (int s = K >> 1; s >= 1; s >>= 1) {
+            #pragma unroll
+            for (int i = 0; i < K; ++i) {
+                int p = i ^ s;
+                if (p > i && tv[i] < tv[p]) {
+                    float fv = tv[i]; tv[i] = tv[p]; tv[p] = fv;
+                    int   gi = ti[i]; ti[i] = ti[p]; ti[p] = gi;
+                }
+            }
+        }
+    }
+}
+
+// In-shared merge-tree: T lists of length K (one per thread) -> list 0 holds
+// the block-wide top-K, sorted descending.
+template <int K>
+__device__ __forceinline__ void block_merge(float* sval, int* sidx, int T, int tid) {
+    for (int stride = 1; stride < T; stride <<= 1) {
+        __syncthreads();
+        if ((tid & ((stride << 1) - 1)) == 0 && (tid + stride) < T) {
+            float ov[K]; int oi[K];
+            merge2<K>(sval + tid * K, sidx + tid * K,
+                      sval + (tid + stride) * K, sidx + (tid + stride) * K, ov, oi);
+            #pragma unroll
+            for (int m = 0; m < K; ++m) { sval[tid * K + m] = ov[m]; sidx[tid * K + m] = oi[m]; }
+        }
+    }
+    __syncthreads();
+}
+
+// Block kernel: grid = batch * bpr.  Each block reduces its segment to top-K.
+template <int K>
+__global__ void topk_block_kernel(
+    const float* __restrict__ x,
+    float* __restrict__ out_val, long long* __restrict__ out_idx,
+    float* __restrict__ inter_val, int* __restrict__ inter_idx,
+    int n, int bpr) {
+
+    extern __shared__ unsigned char smem[];
+    // K<=32 stores one list per warp (T/32 lists); K==64 stores one per thread.
+    int nlists = (K <= 32) ? ((blockDim.x >> 5) < 1 ? 1 : (blockDim.x >> 5)) : blockDim.x;
+    float* sval = reinterpret_cast<float*>(smem);
+    int*   sidx = reinterpret_cast<int*>(sval + nlists * K);
+
+    const int T = blockDim.x, tid = threadIdx.x;
+    const int row = blockIdx.x / bpr, seg = blockIdx.x % bpr;
+    const int base = n / bpr;
+    const int start = seg * base;
+    const int end = (seg == bpr - 1) ? n : start + base;
+    const float* xr = x + (long long)row * n;
+
+    float tv[K]; int ti[K];
+    #pragma unroll
+    for (int m = 0; m < K; ++m) { tv[m] = -FLT_MAX; ti[m] = 0; }
+
+    // Vectorized float4 scan.  Issue 4 independent float4 loads before any
+    // insert so the cold-DRAM reads overlap (memory-level parallelism), which
+    // is the limiter on these tiny transfers.  Segments start on a 16-byte
+    // boundary for the canonical shapes; if not, fall back to scalar.
+    bool aligned = ((((uintptr_t)(xr + start)) & 15u) == 0);
+    if (aligned) {
+        const float4* x4 = reinterpret_cast<const float4*>(xr + start);
+        int n4 = (end - start) >> 2;
+        int vi = tid;
+        for (; vi + 3 * T < n4; vi += 4 * T) {
+            float4 f0 = __ldg(x4 + vi);
+            float4 f1 = __ldg(x4 + vi + T);
+            float4 f2 = __ldg(x4 + vi + 2 * T);
+            float4 f3 = __ldg(x4 + vi + 3 * T);
+            int b0 = start + (vi << 2), b1 = start + ((vi + T) << 2);
+            int b2 = start + ((vi + 2 * T) << 2), b3 = start + ((vi + 3 * T) << 2);
+            insert<K>(tv, ti, f0.x, b0 + 0); insert<K>(tv, ti, f0.y, b0 + 1);
+            insert<K>(tv, ti, f0.z, b0 + 2); insert<K>(tv, ti, f0.w, b0 + 3);
+            insert<K>(tv, ti, f1.x, b1 + 0); insert<K>(tv, ti, f1.y, b1 + 1);
+            insert<K>(tv, ti, f1.z, b1 + 2); insert<K>(tv, ti, f1.w, b1 + 3);
+            insert<K>(tv, ti, f2.x, b2 + 0); insert<K>(tv, ti, f2.y, b2 + 1);
+            insert<K>(tv, ti, f2.z, b2 + 2); insert<K>(tv, ti, f2.w, b2 + 3);
+            insert<K>(tv, ti, f3.x, b3 + 0); insert<K>(tv, ti, f3.y, b3 + 1);
+            insert<K>(tv, ti, f3.z, b3 + 2); insert<K>(tv, ti, f3.w, b3 + 3);
+        }
+        for (; vi < n4; vi += T) {
+            float4 f = __ldg(x4 + vi);
+            int base = start + (vi << 2);
+            insert<K>(tv, ti, f.x, base + 0); insert<K>(tv, ti, f.y, base + 1);
+            insert<K>(tv, ti, f.z, base + 2); insert<K>(tv, ti, f.w, base + 3);
+        }
+        for (int i = start + (n4 << 2) + tid; i < end; i += T) insert<K>(tv, ti, __ldg(xr + i), i);
+    } else {
+        for (int i = start + tid; i < end; i += T) insert<K>(tv, ti, __ldg(xr + i), i);
+    }
+
+    // K<=32: reduce 32 lanes per warp with shuffles (no shared), then only the
+    // W=T/32 warp leaders hit shared.  K==64 would need 256 regs in the warp
+    // bitonic merge and spill to (DRAM-backed) local memory -- ruinous on the
+    // cold path -- so route it through the all-lists shared merge-tree instead.
+    if constexpr (K <= 32) {
+        warp_merge<K>(tv, ti);
+        const int lane = tid & 31, warp = tid >> 5, W = T >> 5;
+        if (lane == 0) {
+            #pragma unroll
+            for (int m = 0; m < K; ++m) { sval[warp * K + m] = tv[m]; sidx[warp * K + m] = ti[m]; }
+        }
+        block_merge<K>(sval, sidx, W, tid);
+    } else {
+        #pragma unroll
+        for (int m = 0; m < K; ++m) { sval[tid * K + m] = tv[m]; sidx[tid * K + m] = ti[m]; }
+        block_merge<K>(sval, sidx, T, tid);
+    }
+
+    if (bpr == 1) {
+        for (int m = tid; m < K; m += T) {
+            out_val[(long long)row * K + m] = sval[m];
+            out_idx[(long long)row * K + m] = (long long)sidx[m];
+        }
+    } else {
+        for (int m = tid; m < K; m += T) {
+            long long off = ((long long)row * bpr + seg) * K + m;
+            inter_val[off] = sval[m];
+            inter_idx[off] = sidx[m];
+        }
+    }
+}
+
+// Merge kernel: grid = batch, blockDim = padded multiple of 32 >= bpr.
+// Each thread loads one partial top-K list (padding lanes load -inf), then the
+// same warp + cross-warp reduction yields the row's final top-K.
+template <int K>
+__global__ void topk_merge_kernel(
+    const float* __restrict__ inter_val, const int* __restrict__ inter_idx,
+    float* __restrict__ out_val, long long* __restrict__ out_idx, int bpr) {
+
+    extern __shared__ unsigned char smem[];
+    int nlists = (K <= 32) ? ((blockDim.x >> 5) < 1 ? 1 : (blockDim.x >> 5)) : blockDim.x;
+    float* sval = reinterpret_cast<float*>(smem);
+    int*   sidx = reinterpret_cast<int*>(sval + nlists * K);
+
+    const int T = blockDim.x, tid = threadIdx.x, row = blockIdx.x;
+
+    float tv[K]; int ti[K];
+    if (tid < bpr) {
+        long long off = ((long long)row * bpr + tid) * K;
+        #pragma unroll
+        for (int m = 0; m < K; ++m) { tv[m] = inter_val[off + m]; ti[m] = inter_idx[off + m]; }
+    } else {
+        #pragma unroll
+        for (int m = 0; m < K; ++m) { tv[m] = -FLT_MAX; ti[m] = 0; }
+    }
+
+    if constexpr (K <= 32) {
+        warp_merge<K>(tv, ti);
+        const int lane = tid & 31, warp = tid >> 5, W = T >> 5;
+        if (lane == 0) {
+            #pragma unroll
+            for (int m = 0; m < K; ++m) { sval[warp * K + m] = tv[m]; sidx[warp * K + m] = ti[m]; }
+        }
+        block_merge<K>(sval, sidx, W, tid);
+    } else {
+        #pragma unroll
+        for (int m = 0; m < K; ++m) { sval[tid * K + m] = tv[m]; sidx[tid * K + m] = ti[m]; }
+        block_merge<K>(sval, sidx, T, tid);
+    }
+
+    for (int m = tid; m < K; m += T) {
+        out_val[(long long)row * K + m] = sval[m];
+        out_idx[(long long)row * K + m] = (long long)sidx[m];
+    }
+}
+
+#define LAUNCH(KK)                                                                 \
+    if (smem > 48 * 1024)                                                          \
+        cudaFuncSetAttribute((const void*)topk_block_kernel<KK>,                   \
+            cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem);               \
+    topk_block_kernel<KK><<<total, (int)threads, smem, stream>>>(                  \
+        x.data_ptr<float>(), out_val.data_ptr<float>(),                           \
+        reinterpret_cast<long long*>(out_idx.data_ptr<int64_t>()),                \
+        inter_val.data_ptr<float>(), inter_idx.data_ptr<int>(), (int)n, (int)bpr); \
+    if (bpr > 1) {                                                                 \
+        int mergeT = ((int)bpr + 31) & ~31; if (mergeT < 32) mergeT = 32;          \
+        int mlists = (KK <= 32) ? (mergeT >> 5) : mergeT;                          \
+        size_t smem2 = (size_t)mlists * KK * (sizeof(float) + sizeof(int));        \
+        if (smem2 > 48 * 1024)                                                     \
+            cudaFuncSetAttribute((const void*)topk_merge_kernel<KK>,               \
+                cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem2);          \
+        topk_merge_kernel<KK><<<(int)batch, mergeT, smem2, stream>>>(              \
+            inter_val.data_ptr<float>(), inter_idx.data_ptr<int>(),               \
+            out_val.data_ptr<float>(),                                            \
+            reinterpret_cast<long long*>(out_idx.data_ptr<int64_t>()), (int)bpr); \
+    }
+
+void topk_forward(torch::Tensor x, torch::Tensor out_val, torch::Tensor out_idx,
+                  torch::Tensor inter_val, torch::Tensor inter_idx,
+                  int64_t batch, int64_t n, int64_t k, int64_t bpr, int64_t threads) {
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    int total = (int)(batch * bpr);
+    int warps = (int)threads / 32; if (warps < 1) warps = 1;
+    int blists = (k <= 32) ? warps : (int)threads;
+    size_t smem = (size_t)blists * k * (sizeof(float) + sizeof(int));
+    switch (k) {
+        case 1:  { LAUNCH(1);  break; }
+        case 8:  { LAUNCH(8);  break; }
+        case 16: { LAUNCH(16); break; }
+        case 32: { LAUNCH(32); break; }
+        case 64: { LAUNCH(64); break; }
+        default: TORCH_CHECK(false, "unsupported k=", k);
+    }
+}
+"""
+
+_CPP_DECL = (
+    "void topk_forward(torch::Tensor x, torch::Tensor out_val, torch::Tensor out_idx, "
+    "torch::Tensor inter_val, torch::Tensor inter_idx, "
+    "int64_t batch, int64_t n, int64_t k, int64_t bpr, int64_t threads);"
+)
+
+_mod = load_inline(
+    name="topk_sm86_v8",
+    cpp_sources=_CPP_DECL,
+    cuda_sources=_CUDA_SRC,
+    functions=["topk_forward"],
+    extra_cuda_cflags=["-O3", "-gencode", "arch=compute_86,code=sm_86"],
+    extra_cflags=["-O3"],
+    verbose=False,
+)
+
+
+def _next_pow2(v: int) -> int:
+    p = 1
+    while p < v:
+        p <<= 1
+    return p
+
+
+# Tuned (threads, bpr) per exact canonical shape, picked from a graph + L2-flush
+# sweep on the RTX 3090. Falls back to a heuristic for any other shape.
+_TUNED = {
+    (1, 131072, 64): (64, 32),   # k64 uses the shared merge-tree (no warp spill)
+    (64, 8192, 8):   (256, 1),
+    (32, 16384, 32): (128, 2),
+    (16, 12000, 16): (64, 8),
+    (128, 4096, 1):  (256, 1),
+}
+
+
+def _threads_for_k(k: int) -> int:
+    # k==64 takes the all-lists shared merge path; cap T so T*K*8 <= 32KB.
+    return {1: 256, 8: 256, 16: 128, 32: 128, 64: 64}.get(k, 128)
+
+
+def _config_for(batch: int, n: int, k: int) -> tuple[int, int]:
+    if (batch, n, k) in _TUNED:
+        return _TUNED[(batch, n, k)]
+    threads = _threads_for_k(k)
+    target = 192
+    bpr = _next_pow2(max(1, target // batch))
+    bpr = min(bpr, max(1, n // max(1, threads)))   # keep >= ~1 elem/thread
+    bpr = min(bpr, 64)                             # bound merge-kernel work
+    return threads, max(1, bpr)
+
+
+class Model(nn.Module):
+    def __init__(self, batch: int, n: int, k: int):
+        super().__init__()
+        self.batch, self.n, self.k = batch, n, k
+        self.register_buffer("_dummy", torch.zeros(1))
+        self.threads, self.bpr = _config_for(batch, n, k)
+        self._ready = False
+        self._graph = None
+        self._graph_key = None
+        self._use_graph = True
+
+    def _alloc(self, device):
+        b, k, bpr = self.batch, self.k, self.bpr
+        self.out_val = torch.empty((b, k), dtype=torch.float32, device=device)
+        self.out_idx = torch.empty((b, k), dtype=torch.int64, device=device)
+        sz = b * bpr * k if bpr > 1 else 1
+        self.inter_val = torch.empty(sz, dtype=torch.float32, device=device)
+        self.inter_idx = torch.empty(sz, dtype=torch.int32, device=device)
+        self._ready = True
+
+    def _run(self, x: torch.Tensor):
+        _mod.topk_forward(
+            x, self.out_val, self.out_idx, self.inter_val, self.inter_idx,
+            self.batch, self.n, self.k, self.bpr, self.threads,
+        )
+
+    def _capture(self, x: torch.Tensor):
+        # Warm up on a side stream (PyTorch CUDA-graph capture protocol), then
+        # record the kernel launches into a graph that reads from x's pointer
+        # and writes the reusable output buffers.
+        s = torch.cuda.Stream()
+        s.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(s):
+            for _ in range(2):
+                self._run(x)
+        torch.cuda.current_stream().wait_stream(s)
+        self._x_ref = x  # keep the captured input alive
+        g = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g):
+            self._run(x)
+        self._graph = g
+
+    def forward(self, x: torch.Tensor):
+        if not self._ready:
+            self._alloc(x.device)
+
+        if not (self._use_graph and x.is_cuda):
+            self._run(x)
+            return self.out_val, self.out_idx
+
+        key = (x.data_ptr(), tuple(x.shape))
+        if self._graph_key != key:
+            try:
+                self._capture(x)
+                self._graph_key = key
+            except Exception:
+                # Capture failed -> fall back to eager launches for good.
+                self._use_graph = False
+                self._graph = None
+                self._run(x)
+                return self.out_val, self.out_idx
+        self._graph.replay()
+        return self.out_val, self.out_idx
+
+
+def get_inputs():
+    x = torch.randn(batch, n, dtype=torch.float32)
+    return [x]
+
+
+def get_init_inputs():
+    return [batch, n, k]
+
+
+# Module-level shims rebuilt by check.py / benchmark.py per shape.
+batch = 64
+n = 8192
+k = 8

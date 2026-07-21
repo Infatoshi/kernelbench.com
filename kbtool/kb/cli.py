@@ -32,8 +32,9 @@ kb — KernelBench operator CLI   (repo: {root})
   kb lint <run_id|--all>                        static reward-hack tripwire (scans solution.py)
   kb contamination <hard|mega|cuda|v3|path> [--published <lb.json>]   cross-run contamination audit
   kb traces-to-hf <out_dir> [run_dirs...]       convert run transcripts to HF agent-trace JSONL
-  kb push-runs <hard|mega|cuda> [--board h100|b200|rtx3090] [--dataset R] [--dry-run]   convert published runs' traces and push to HF (per-GPU boards upload under <board>/)
+  kb push-runs <hard|mega|cuda> [--board h100|b200|rtx3090] [--dataset R] [--dry-run]   convert published runs' traces and push to HF (per-GPU hard/cuda boards upload under <board>/)
   kb brev <up|sync|bootstrap|run|regrade|pull|down> <instance> [...]   Brev GPU worker lifecycle (scripts/brev_worker.sh)
+  kb lambda <list|ls|up|sync|bootstrap|run|regrade|pull|down|ssh> [...]  Lambda Cloud worker (scripts/lambda_worker.sh; $10k Zach credits)
   kb help
 
 Keys live in ~/.env_vars. Bench a new model: add its key, then  kb sweep <harness> <model>.
@@ -217,20 +218,30 @@ def _mega_csv_run_ids(root: Path) -> list[str]:
         return sorted({row["run_id"] for row in csv.DictReader(fh) if row.get("run_id")})
 
 
-def _check_rid_collisions(root: Path, bench: str, rids: list[str], src_dir: str) -> None:
+def _check_rid_collisions(
+    root: Path, bench: str, rids: list[str], src_dir: str
+) -> list[str]:
     """The same rid can live in two runs dirs (two different sessions, one per
     GPU board). Artifact paths are namespaced per board (flat = canonical from
     outputs/runs; per-GPU boards upload under <gpu>/), so pushes are
     deterministic — but each rid must exist in THIS push's source dir, and
-    cross-dir duplicates are still worth flagging."""
+    cross-dir duplicates are still worth flagging. Returns the rids that have
+    an archive; a minority of missing archives (permanently lost runs) is
+    warned and dropped, but a fully-missing set means a wrong --board."""
     bench_out = root / "benchmarks" / bench / "outputs"
     dirs = sorted(d for d in bench_out.glob("runs*") if d.is_dir())
     missing = [r for r in rids if not (bench_out / src_dir / r).is_dir()]
-    if missing:
+    if len(missing) == len(rids):
         sys.exit(
-            f"kb: {len(missing)} published run_ids missing from {src_dir} "
-            f"(first: {missing[0]}) — wrong --board, or archive not synced?"
+            f"kb: all {len(missing)} published run_ids missing from {src_dir} "
+            f"— wrong --board, or archive not synced?"
         )
+    if missing:
+        sys.stderr.write(
+            f"kb: WARNING dropping {len(missing)} run_ids with no archive in "
+            f"{src_dir}: {', '.join(missing)}\n"
+        )
+        rids = [r for r in rids if r not in set(missing)]
     for rid in rids:
         hits = [str(d.relative_to(root)) for d in dirs if (d / rid).is_dir()]
         if len(hits) > 1:
@@ -238,6 +249,7 @@ def _check_rid_collisions(root: Path, bench: str, rids: list[str], src_dir: str)
                 f"note: {rid} exists in {len(hits)} runs dirs "
                 f"({', '.join(hits)}); pushing the {src_dir} copy\n"
             )
+    return rids
 
 
 def cmd_push_runs(root: Path, args: list[str]) -> int:
@@ -256,8 +268,8 @@ def cmd_push_runs(root: Path, args: list[str]) -> int:
     bench = args[0] if args else "hard"
     if bench not in ("hard", "mega", "cuda"):
         sys.exit("kb push-runs: only hard|mega|cuda have trace datasets (v3 is archived)")
-    if board and bench != "hard":
-        sys.exit("kb push-runs: --board only applies to hard (per-GPU boards)")
+    if board and bench not in ("hard", "cuda"):
+        sys.exit("kb push-runs: --board only applies to hard|cuda (per-GPU boards)")
     bench_dir = _bench_dir(root, bench)
     dataset = dataset or f"Infatoshi/kernelbench-{bench}-traces"
 
@@ -272,6 +284,15 @@ def cmd_push_runs(root: Path, args: list[str]) -> int:
         rids = sorted({c.get("run_id") for m in data.get("models", [])
                        for c in m.get("results", {}).values() if c.get("run_id")})
         src_dir = f"runs-{board}"
+        # Boards that predate the runs-<gpu> split (rtx3090) archive in plain
+        # runs/; fall back when the board dir holds none of this board's rids.
+        out = bench_dir / "outputs"
+        if not any((out / src_dir / r).is_dir() for r in rids) and any(
+            (out / "runs" / r).is_dir() for r in rids
+        ):
+            print(f"kb push-runs: {src_dir} has no archives for this board; "
+                  f"using runs/ (pre-split board)")
+            src_dir = "runs"
     else:
         rids = _leaderboard_run_ids(bench_dir)
         if not rids and bench == "mega":
@@ -280,7 +301,7 @@ def cmd_push_runs(root: Path, args: list[str]) -> int:
     if not rids:
         src = "public/data/mega/results.csv" if bench == "mega" else f"{bench}/results/leaderboard.json"
         sys.exit(f"kb push-runs: no run_ids in {src}")
-    _check_rid_collisions(root, bench, rids, src_dir)
+    rids = _check_rid_collisions(root, bench, rids, src_dir)
 
     staging = root / "runs" / bench / ("traces" if not board else f"traces-{board}")
     staging.mkdir(parents=True, exist_ok=True)
@@ -390,6 +411,11 @@ def cmd_brev(root: Path, args: list[str]) -> int:
     return _exec([str(root / "scripts" / "brev_worker.sh"), *args])
 
 
+def cmd_lambda(root: Path, args: list[str]) -> int:
+    """Lambda Cloud worker: kb lambda <list|ls|up|sync|bootstrap|run|regrade|pull|down|ssh> ..."""
+    return _exec([str(root / "scripts" / "lambda_worker.sh"), *args])
+
+
 def cmd_traces_to_hf(root: Path, args: list[str]) -> int:
     script = _bench_dir(root, "hard") / "scripts" / "traces_to_hf.py"
     os.chdir(_bench_dir(root, "hard"))
@@ -407,6 +433,7 @@ _COMMANDS = {
     "lint": cmd_lint,
     "contamination": cmd_contamination,
     "brev": cmd_brev,
+    "lambda": cmd_lambda,
     "traces-to-hf": cmd_traces_to_hf,
     "push-runs": cmd_push_runs,
 }

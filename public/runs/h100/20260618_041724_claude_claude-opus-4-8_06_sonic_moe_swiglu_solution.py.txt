@@ -1,0 +1,181 @@
+"""Top-K MoE up-projection: variable-length grouped GEMM + fused SwiGLU.
+
+Per expert e:  h_e = silu(x_e @ W_gate[e]) * (x_e @ W_up[e])
+
+Implemented as a single Triton grouped-GEMM kernel. Each program computes one
+(BLOCK_M, BLOCK_N) output tile, accumulating *both* the gate and up projections
+over the H (K) dimension reusing the same A tile, then fuses SwiGLU in the
+epilogue. Tokens are already permuted into expert order, so each M-tile lives
+entirely within one expert; an M-tile schedule (tile -> expert, tile -> row
+start) is precomputed on-device with no host sync.
+"""
+from __future__ import annotations
+
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+# ----------------------------------------------------------------------------
+# M-tile schedule: map each padded M-tile to (expert_id, global_row_start).
+# Computed entirely on-device with searchsorted -> no CUDA sync.
+# ----------------------------------------------------------------------------
+def _build_schedule(expert_offsets: torch.Tensor, E: int, T_perm: int, BLOCK_M: int):
+    counts = (expert_offsets[1:] - expert_offsets[:-1]).to(torch.int64)        # (E,)
+    ntiles = (counts + (BLOCK_M - 1)) // BLOCK_M                               # (E,)
+    cum = torch.cumsum(ntiles, 0)                                             # (E,)
+    total_tiles = int(T_perm // BLOCK_M + E)  # host-side upper bound (no sync)
+    t = torch.arange(total_tiles, device=expert_offsets.device, dtype=torch.int64)
+    # expert for tile t = number of experts whose cumulative tile count <= t
+    expert_of = torch.searchsorted(cum, t, right=True)                        # (total,)
+    valid = expert_of < E
+    e_clamped = torch.clamp(expert_of, max=E - 1)
+    tile_base = cum - ntiles                                                   # first tile idx of each expert
+    tile_in_e = t - tile_base[e_clamped]
+    row_start = expert_offsets[:-1].to(torch.int64)[e_clamped] + tile_in_e * BLOCK_M
+    # encode invalid tiles with expert = E (kernel early-exits)
+    expert_id = torch.where(valid, e_clamped, torch.full_like(e_clamped, E))
+    return (expert_id.to(torch.int32).contiguous(),
+            row_start.to(torch.int32).contiguous(),
+            total_tiles)
+
+
+def _configs():
+    cfgs = []
+    for bn in (128, 256):
+        for bk in (64, 128):
+            for w in (4, 8):
+                for s in (3, 4):
+                    cfgs.append(triton.Config(
+                        {"BLOCK_N": bn, "BLOCK_K": bk}, num_warps=w, num_stages=s))
+    return cfgs
+
+
+@triton.autotune(configs=_configs(), key=["H", "I", "BLOCK_M"])
+@triton.jit
+def _grouped_swiglu_kernel(
+    a_ptr, wg_ptr, wu_ptr, out_ptr,
+    expert_id_ptr, row_start_ptr, expert_offsets_ptr,
+    T_perm, H, I, n_experts,
+    stride_am, stride_ak,
+    stride_we, stride_wk, stride_wn,
+    stride_om, stride_on,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+):
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+
+    e = tl.load(expert_id_ptr + pid_m)
+    # early-exit padding tiles (sentinel expert == n_experts)
+    if e >= n_experts:
+        return
+
+    row0 = tl.load(row_start_ptr + pid_m)
+    # number of experts available via expert_offsets length is E+1; sentinel handled below
+    n_valid_total = tl.load(expert_offsets_ptr + e + 1)
+
+    rm = row0 + tl.arange(0, BLOCK_M)
+    rn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    rk = tl.arange(0, BLOCK_K)
+
+    row_mask = rm < n_valid_total
+
+    a_base = a_ptr + rm[:, None] * stride_am
+    wg_base = wg_ptr + e * stride_we + rn[None, :] * stride_wn
+    wu_base = wu_ptr + e * stride_we + rn[None, :] * stride_wn
+
+    acc_g = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    acc_u = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    for k0 in range(0, H, BLOCK_K):
+        k = k0 + rk
+        a = tl.load(a_base + k[None, :] * stride_ak,
+                    mask=row_mask[:, None], other=0.0)
+        wg = tl.load(wg_base + k[:, None] * stride_wk)
+        wu = tl.load(wu_base + k[:, None] * stride_wk)
+        acc_g = tl.dot(a, wg, acc_g)
+        acc_u = tl.dot(a, wu, acc_u)
+
+    # SwiGLU: silu(g) * u
+    g = acc_g
+    silu = g * tl.sigmoid(g)
+    out = (silu * acc_u).to(out_ptr.dtype.element_ty)
+
+    out_ptrs = out_ptr + rm[:, None] * stride_om + rn[None, :] * stride_on
+    tl.store(out_ptrs, out, mask=row_mask[:, None])
+
+
+class Model(nn.Module):
+    def __init__(self, T_total: int, H: int, I: int, E: int, K: int):  # noqa: E741
+        super().__init__()
+        self.T_total = T_total
+        self.H = H
+        self.I = I
+        self.E = E
+        self.K = K
+        self.W_gate = nn.Parameter(torch.empty(E, H, I, dtype=torch.bfloat16))
+        self.W_up = nn.Parameter(torch.empty(E, H, I, dtype=torch.bfloat16))
+        nn.init.normal_(self.W_gate, std=0.02)
+        nn.init.normal_(self.W_up, std=0.02)
+        self.BLOCK_M = 128
+        self._sched_cache = {}
+
+    def _schedule(self, expert_offsets, T_perm):
+        key = (expert_offsets.data_ptr(), T_perm, self.BLOCK_M)
+        cached = self._sched_cache.get(key)
+        if cached is not None:
+            return cached
+        sched = _build_schedule(expert_offsets, self.E, T_perm, self.BLOCK_M)
+        self._sched_cache[key] = sched
+        return sched
+
+    def forward(self, hidden_states: torch.Tensor, expert_offsets: torch.Tensor):
+        T_perm, H = hidden_states.shape
+        I = self.I
+        out = torch.empty(T_perm, I, dtype=torch.bfloat16, device=hidden_states.device)
+        expert_id, row_start, total_tiles = self._schedule(expert_offsets, T_perm)
+
+        wg = self.W_gate
+        wu = self.W_up
+        grid = lambda meta: (total_tiles, triton.cdiv(I, meta["BLOCK_N"]))
+        _grouped_swiglu_kernel[grid](
+            hidden_states, wg, wu, out,
+            expert_id, row_start, expert_offsets,
+            T_perm, H, I, self.E,
+            hidden_states.stride(0), hidden_states.stride(1),
+            wg.stride(0), wg.stride(1), wg.stride(2),
+            out.stride(0), out.stride(1),
+            BLOCK_M=self.BLOCK_M,
+        )
+        return out
+
+
+# Module-level shape shims (rewritten by check.py / benchmark.py per shape).
+T_total = 32768
+H = 4096
+I = 1536  # noqa: E741
+E = 128
+K = 8
+
+
+def _build_routing(T_total: int, E: int, K: int, device: str = "cpu") -> torch.Tensor:
+    T_perm = T_total * K
+    base = T_perm // E
+    rem = T_perm - base * E
+    counts = torch.full((E,), base, dtype=torch.int32, device=device)
+    counts[:rem] += 1
+    offsets = torch.zeros(E + 1, dtype=torch.int32, device=device)
+    offsets[1:] = torch.cumsum(counts, dim=0)
+    return offsets
+
+
+def get_inputs():
+    T_perm = T_total * K
+    hidden_states = torch.randn(T_perm, H, dtype=torch.bfloat16) * 0.1
+    expert_offsets = _build_routing(T_total, E, K)
+    return [hidden_states, expert_offsets]
+
+
+def get_init_inputs():
+    return [T_total, H, I, E, K]

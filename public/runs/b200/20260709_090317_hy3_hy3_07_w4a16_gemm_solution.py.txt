@@ -1,0 +1,283 @@
+"""W4A16 weight-only quantized GEMM (fused unpack + dequant + GEMM).
+
+AWQ/GPTQ-style scheme:
+  x:      (M, K)               bf16
+  w_q:    (K // 2, N)          uint8   -- two int4 weights packed per byte
+                                     (low nibble = even-K row, high = odd-K row)
+  scales: (K // 128, N)        bf16
+  zeros:  (K // 128, N)        bf16    -- asymmetric zero-point (float value)
+  out:    (M, N)               bf16
+
+Dequant (per group along K):
+  w_bf[k, n] = (unpack(w_q)[k, n] - zeros[k // 128, n]) * scales[k // 128, n]
+
+A single Triton kernel fuses the int4 unpack, the per-group dequant, and the
+matrix multiply: weight bytes are loaded once from HBM as packed int4, unpacked
+in registers, dequantized against bf16 scales/zeros, and accumulated with
+tl.dot. No separate dequantized weight matrix is ever materialized, which is
+what preserves the int4 bandwidth advantage.
+
+The reference weight layout is column-major-contiguous along N
+(w_q: (K//2, N), scales/zeros: (K//128, N)), and x / out are row-major along K
+/ N respectively, so the natural tiling streams K in blocks and tiles M x N.
+"""
+
+from __future__ import annotations
+
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+OP_TYPE = "gemm_w4a16"
+SUPPORTED_PRECISIONS = ["int4_bf16"]
+HARDWARE_REQUIRED = ["RTX_PRO_6000", "H100", "B200"]
+
+GROUP_SIZE = 128
+
+
+def _pack_int4(w_q: torch.Tensor) -> torch.Tensor:
+    K, N = w_q.shape
+    assert K % 2 == 0
+    lo = w_q[0::2].to(torch.uint8) & 0xF
+    hi = w_q[1::2].to(torch.uint8) & 0xF
+    return (lo | (hi << 4)).contiguous()
+
+
+@triton.jit
+def _w4a16_gemm_kernel(
+    x_ptr, w_ptr, s_ptr, z_ptr, y_ptr,
+    M, N, K,
+    stride_xm, stride_xk,
+    stride_wk, stride_wn,
+    stride_sn,  # scales are (G, N); stride_sn is the group (row) stride, N stride is 1
+    stride_zn,
+    stride_ym, stride_yn,
+    GROUP_SIZE: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+    offs_kh = tl.arange(0, BLOCK_K // 2)   # half-K index (one per packed byte)
+
+    # x tile (BLOCK_M, BLOCK_K) -- row-major along K
+    x_ptrs = x_ptr + (offs_m[:, None] * stride_xm + offs_k[None, :] * stride_xk)
+    # weight tile (BLOCK_K//2 packed rows, BLOCK_N) -- col-major along N
+    w_ptrs = w_ptr + (offs_kh[:, None] * stride_wk + offs_n[None, :] * stride_wn)
+
+    # scales/zeros for this K-block: BLOCK_K is a multiple of GROUP_SIZE, so
+    # each block spans exactly BLOCK_K // GROUP_SIZE contiguous groups.
+    offs_g = tl.arange(0, BLOCK_K // GROUP_SIZE)
+    s_ptrs = s_ptr + (offs_g[:, None] * stride_sn + offs_n[None, :])
+    z_ptrs = z_ptr + (offs_g[:, None] * stride_zn + offs_n[None, :])
+
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    mask_m = offs_m[:, None] < M
+    mask_n = offs_n[None, :] < N
+    mask_kh = offs_kh[:, None] < K // 2
+
+    for k in range(0, K, BLOCK_K):
+        # load x (BLOCK_M, BLOCK_K) in bf16
+        x = tl.load(x_ptrs, mask=mask_m & (offs_k[None, :] + k < K), other=0.0).to(tl.bfloat16)
+
+        # load packed weights (BLOCK_K//2, BLOCK_N) uint8
+        w_packed = tl.load(w_ptrs, mask=mask_kh & mask_n, other=0).to(tl.uint8)
+
+        # unpack: low nibble -> even k, high nibble -> odd k
+        lo = (w_packed & 0x0F).to(tl.bfloat16)        # (BLOCK_K//2, BLOCK_N)
+        hi = ((w_packed >> 4) & 0x0F).to(tl.bfloat16)
+
+        # load scales / zeros for this K-block (broadcast across group)
+        g_mask = (offs_g[:, None] + k // GROUP_SIZE < K // GROUP_SIZE) & mask_n
+        scales = tl.load(s_ptrs, mask=g_mask, other=0.0).to(tl.bfloat16)
+        zeros = tl.load(z_ptrs, mask=g_mask, other=0.0).to(tl.bfloat16)
+        s_k = tl.broadcast_to(scales, (BLOCK_K // 2, BLOCK_N))
+        z_k = tl.broadcast_to(zeros, (BLOCK_K // 2, BLOCK_N))
+
+        # dequant both halves (bf16)
+        dlo = (lo - z_k) * s_k   # (BLOCK_K//2, BLOCK_N) bf16
+        dhi = (hi - z_k) * s_k
+
+        # Interleave even/odd K rows into a single (BLOCK_K, BLOCK_N) dequantized
+        # tile so the contraction is ONE tensor-core MMA (full K per dot).
+        # join+reshape interleaves along the innermost dim, so we first transpose
+        # the half-K tiles to (BLOCK_N, BLOCK_K//2), join, reshape to
+        # (BLOCK_N, BLOCK_K) -- giving rows [lo0,hi0,lo1,hi1,...] -- then
+        # transpose back to (BLOCK_K, BLOCK_N).
+        dloT = tl.permute(dlo, (1, 0))   # (BLOCK_N, BLOCK_K//2)
+        dhiT = tl.permute(dhi, (1, 0))
+        w_full = tl.permute(tl.reshape(tl.join(dloT, dhiT), (BLOCK_N, BLOCK_K)), (1, 0))
+
+        acc += tl.dot(x, w_full)
+
+        x_ptrs += BLOCK_K * stride_xk
+        w_ptrs += (BLOCK_K // 2) * stride_wk
+        s_ptrs += (BLOCK_K // GROUP_SIZE) * stride_sn
+        z_ptrs += (BLOCK_K // GROUP_SIZE) * stride_zn
+
+    y = acc.to(tl.bfloat16)
+    y_ptrs = y_ptr + (offs_m[:, None] * stride_ym + offs_n[None, :] * stride_yn)
+    tl.store(y_ptrs, y, mask=mask_m & mask_n)
+
+
+@triton.jit
+def _w4a16_gemv_kernel(
+    x_ptr, w_ptr, s_ptr, z_ptr, y_ptr,
+    N, K,
+    stride_wk, stride_wn,
+    stride_sn, stride_zn,
+    GROUP_SIZE: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    """M = 1 decode GEMV: y[n] = sum_k x[k] * dequant(w[k,n]).
+
+    Each program handles a block of N output columns and streams the int4
+    weight (K/2 * BLOCK_N bytes) once, fully coalesced along N. No tensor-core
+    MMA is used because M=1 has no M-dimension to tile across.
+    """
+    pid_n = tl.program_id(0)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    mask_n = offs_n < N
+    offs_kh = tl.arange(0, BLOCK_K // 2)
+
+    w_ptrs = w_ptr + (offs_kh[:, None] * stride_wk + offs_n[None, :] * stride_wn)
+    offs_g = tl.arange(0, BLOCK_K // GROUP_SIZE)
+    s_ptrs = s_ptr + (offs_g[:, None] * stride_sn + offs_n[None, :])
+    z_ptrs = z_ptr + (offs_g[:, None] * stride_zn + offs_n[None, :])
+
+    acc = tl.zeros((BLOCK_N,), dtype=tl.float32)
+
+    for k in range(0, K, BLOCK_K):
+        # x[2h], x[2h+1] for h in [0, BLOCK_K//2)
+        x_even = tl.load(x_ptr + (2 * offs_kh + k), mask=(2 * offs_kh + k < K)).to(tl.float32)
+        x_odd = tl.load(x_ptr + (2 * offs_kh + 1 + k), mask=(2 * offs_kh + 1 + k < K)).to(tl.float32)
+
+        w_packed = tl.load(w_ptrs, mask=mask_n & (offs_kh[:, None] + k // 2 < K // 2), other=0).to(tl.uint8)
+
+        lo = (w_packed & 0x0F).to(tl.float32)        # (BLOCK_K//2, BLOCK_N)
+        hi = ((w_packed >> 4) & 0x0F).to(tl.float32)
+
+        g_mask = (offs_g[:, None] + k // GROUP_SIZE < K // GROUP_SIZE) & mask_n
+        scales = tl.load(s_ptrs, mask=g_mask, other=0.0).to(tl.bfloat16).to(tl.float32)
+        zeros = tl.load(z_ptrs, mask=g_mask, other=0.0).to(tl.bfloat16).to(tl.float32)
+        s_k = tl.reshape(scales, (BLOCK_K // GROUP_SIZE, 1, BLOCK_N))
+        s_k = tl.broadcast_to(s_k, (BLOCK_K // GROUP_SIZE, GROUP_SIZE // 2, BLOCK_N))
+        s_k = tl.reshape(s_k, (BLOCK_K // 2, BLOCK_N))
+        z_k = tl.reshape(zeros, (BLOCK_K // GROUP_SIZE, 1, BLOCK_N))
+        z_k = tl.broadcast_to(z_k, (BLOCK_K // GROUP_SIZE, GROUP_SIZE // 2, BLOCK_N))
+        z_k = tl.reshape(z_k, (BLOCK_K // 2, BLOCK_N))
+
+        deq_lo = (lo - z_k) * s_k
+        deq_hi = (hi - z_k) * s_k
+        # acc[n] += sum_h ( x_even[h]*deq_lo[h,n] + x_odd[h]*deq_hi[h,n] )
+        # expressed as two 1x(BLOCK_K//2) @ (BLOCK_K//2)xBLOCK_N matvecs.
+        acc += tl.reshape(tl.dot(x_even[None, :], deq_lo), (BLOCK_N,))
+        acc += tl.reshape(tl.dot(x_odd[None, :], deq_hi), (BLOCK_N,))
+
+        w_ptrs += (BLOCK_K // 2) * stride_wk
+        s_ptrs += (BLOCK_K // GROUP_SIZE) * stride_sn
+        z_ptrs += (BLOCK_K // GROUP_SIZE) * stride_zn
+
+    tl.store(y_ptr + offs_n, acc.to(tl.bfloat16), mask=mask_n)
+
+
+class Model(nn.Module):
+    def __init__(self, M: int, N: int, K: int, group_size: int = GROUP_SIZE):
+        super().__init__()
+        assert K % group_size == 0
+        assert K % 2 == 0
+        self.M, self.N, self.K = M, N, K
+        self.group_size = group_size
+        n_groups = K // group_size
+
+        torch.manual_seed(0xC0DE ^ (M * 1315423911 + N * 2654435761 + K))
+        w_full = torch.randn(K, N, dtype=torch.float32) * 0.02
+
+        w_g = w_full.view(n_groups, group_size, N)
+        w_min = w_g.min(dim=1, keepdim=True).values
+        w_max = w_g.max(dim=1, keepdim=True).values
+        scales = (w_max - w_min).clamp_min(1e-8) / 15.0
+        zeros = (-w_min / scales).round().clamp(0, 15)
+        w_q = ((w_g / scales) + zeros).round().clamp(0, 15).to(torch.uint8)
+        w_q = w_q.view(K, N)
+
+        scales_2d = scales.squeeze(1).to(torch.bfloat16)
+        zeros_2d = zeros.squeeze(1).to(torch.bfloat16)
+        w_packed = _pack_int4(w_q)
+
+        self.register_buffer("w_q", w_packed)
+        self.register_buffer("scales", scales_2d)
+        self.register_buffer("zeros", zeros_2d)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = x.to(torch.bfloat16).contiguous()
+        M, K = x.shape
+        N = self.N
+        G = self.group_size
+
+        y = torch.empty((M, N), dtype=torch.bfloat16, device=x.device)
+
+        # Decode (M == 1): memory-bound GEMV over the int4 weight stream. The
+        # 1xK vector-matrix product is computed as two matvecs (even/odd K
+        # nibbles) with no tensor-core M tiling, so no M-dimension is wasted.
+        if M == 1:
+            BLOCK_N = 32
+            BLOCK_K = 256
+            grid = (triton.cdiv(N, BLOCK_N),)
+            _w4a16_gemv_kernel[grid](
+                x, self.w_q, self.scales, self.zeros, y,
+                N, K,
+                self.w_q.stride(0), self.w_q.stride(1),
+                self.scales.stride(0),  # group (row) stride; N stride is 1
+                self.zeros.stride(0),
+                GROUP_SIZE=G,
+                BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
+                num_warps=4, num_stages=3,
+            )
+            return y
+
+        # Prefill / batched: tiled tensor-core GEMM with fused, single-MMA
+        # dequant. Small N-tiles maximize CTA count to saturate HBM bandwidth;
+        # the M-tile is sized to the batch dimension.
+        if M <= 64:
+            BLOCK_M, BLOCK_N, NW, NS = 64, 32, 4, 3
+        else:
+            BLOCK_M, BLOCK_N, NW, NS = 128, 32, 4, 2
+        BLOCK_K = 128
+
+        grid = (triton.cdiv(M, BLOCK_M), triton.cdiv(N, BLOCK_N))
+        _w4a16_gemm_kernel[grid](
+            x, self.w_q, self.scales, self.zeros, y,
+            M, N, K,
+            x.stride(0), x.stride(1),
+            self.w_q.stride(0), self.w_q.stride(1),
+            self.scales.stride(0),  # group (row) stride; N stride is 1
+            self.zeros.stride(0),
+            y.stride(0), y.stride(1),
+            GROUP_SIZE=G,
+            BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
+            num_warps=NW, num_stages=NS,
+        )
+        return y
+
+
+M = 1
+N = 12288
+K = 4096
+
+
+def get_inputs():
+    x = torch.randn(M, K, dtype=torch.bfloat16)
+    return [x]
+
+
+def get_init_inputs():
+    return [M, N, K]

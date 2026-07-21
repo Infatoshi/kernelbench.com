@@ -1,0 +1,753 @@
+"""Top-k over the last dim of a 2D fp32 tensor via a single fused CUDA kernel.
+
+Design notes (H100 PCIe; graded inputs are only 0.5-2 MB, so launch/dispatch
+latency dominates and every phase is tuned for microsecond-scale latency):
+  - ONE kernel launch per forward. Cross-block combining happens inside the
+    same kernel: blocks of a row write candidates to a pool slot and take a
+    ticket (release/acquire atomic); the last block of the row merges.
+  - Histogram radix-select over monotonically-mapped uint32 keys, straight
+    from global memory (inputs are L2-resident after first touch). A 12-bit
+    histogram in shared memory plus a warp-0 window scan (starting at the
+    block-max key's bin) locates the threshold bin; up to two refinement
+    rounds (12 + 8 more bits) bound the candidate set even under massive
+    ties; survivors (~k + epsilon) are compacted and emitted by rank
+    (count-of-greater), which needs no sort network at all.
+  - Slices small enough to fit in registers keep their mapped keys there
+    (KR template), so refine/compact never re-touch memory.
+  - Values are compared as mapped uint32 keys packed with the column index
+    into a uint64: total order, consistent tie-breaks, distinct ranks, and
+    output values are exact input bits.
+  - k == 1 uses a dedicated argmax reduction kernel.
+  - Python-side per-call work is one cached extension call; outputs and
+    scratch are preallocated at first use.
+"""
+
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+_CUDA_SRC = r"""
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <ATen/cuda/CUDAContext.h>
+#include <vector>
+#include <algorithm>
+
+using ull = unsigned long long;
+#define FULLM 0xffffffffu
+
+constexpr int NB = 4096;   // first/second-round histogram bins (12 bits)
+constexpr int CAP = 256;   // candidate buffer entries
+
+__device__ __forceinline__ unsigned mapf(float f) {
+  unsigned u = __float_as_uint(f);
+  return u ^ (((int)u >> 31) | 0x80000000u);
+}
+__device__ __forceinline__ float unmapf(unsigned key) {
+  unsigned u = (key & 0x80000000u) ? (key ^ 0x80000000u) : ~key;
+  return __uint_as_float(u);
+}
+
+__device__ __forceinline__ long long gtimer() {
+  long long t;
+  asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
+  return t;
+}
+
+// Emit the top-k of cand[0..cnt) in descending order WITHOUT sorting: each
+// candidate's output slot is the count of strictly-greater candidates (packed
+// keys are distinct, so ranks are a permutation). The inner scan reads the
+// same smem word across the whole block (broadcast), so it costs O(cnt).
+__device__ void rank_output(ull* cand, int cnt, int k,
+                            float* __restrict__ ovals, long long* __restrict__ oidx) {
+  const int T = blockDim.x;
+  // zero-pad to a multiple of 8 so the inner scan can prefetch in groups
+  for (int t = cnt + threadIdx.x; t < ((cnt + 7) & ~7); t += T) cand[t] = 0ull;
+  __syncthreads();
+  for (int i = threadIdx.x; i < cnt; i += T) {
+    const ull me = cand[i];
+    int r = 0;
+    for (int j0 = 0; j0 < cnt; j0 += 8) {
+      ull cj[8];
+      #pragma unroll
+      for (int u = 0; u < 8; ++u) cj[u] = cand[j0 + u];
+      #pragma unroll
+      for (int u = 0; u < 8; ++u) r += (cj[u] > me);
+    }
+    if (r < k) {
+      ovals[r] = unmapf((unsigned)(me >> 32));
+      oidx[r] = (long long)(unsigned)me;
+    }
+  }
+}
+
+// The float (!packed) path always reads GLOBAL memory -> __ldg keeps the
+// loads independent of shared-memory stores (no aliasing stalls); the packed
+// path always reads shared memory.
+__device__ __forceinline__ unsigned hs_key(const ull* stage, int i, bool packed) {
+  if (packed) return (unsigned)(__ldg(stage + i) >> 32);
+  return mapf(__ldg((const float*)stage + i));
+}
+__device__ __forceinline__ ull hs_pack(const ull* stage, int i, int colbase, bool packed) {
+  if (packed) return __ldg(stage + i);
+  return ((ull)mapf(__ldg((const float*)stage + i)) << 32) | (unsigned)(colbase + i);
+}
+
+// Warp-inclusive suffix sum (lane l gets sum over lanes >= l).
+__device__ __forceinline__ unsigned wsufsum(unsigned v, int lane) {
+  #pragma unroll
+  for (int off = 1; off < 32; off <<= 1) {
+    unsigned o = __shfl_down_sync(FULLM, v, off);
+    if (lane + off < 32) v += o;
+  }
+  return v;
+}
+
+// Histogram add. (A __match_any_sync warp-aggregated variant measured SLOWER
+// on H100 -- warp collectives issue at ~4 cycles each -- so plain atomics win.)
+__device__ __forceinline__ void hadd(unsigned* hist, unsigned bin, bool active) {
+  if (active) atomicAdd(&hist[bin], 1u);
+}
+
+__device__ __forceinline__ unsigned wmax(unsigned v) {
+  #pragma unroll
+  for (int off = 16; off > 0; off >>= 1) {
+    unsigned o = __shfl_xor_sync(FULLM, v, off);
+    v = v > o ? v : o;
+  }
+  return v;
+}
+
+// Select the klocal largest keys among stage[0..N): fill cand[] with all
+// elements >= a refined threshold (a superset of the top-klocal, <= CAP
+// entries except via the tie-claim path which writes exactly klocal), and
+// return the count. Caller sorts cand and keeps the first klocal.
+// aux must hold >= 64 unsigneds.
+template <int KR>
+__device__ int hist_select(const ull* stage, int N, int klocal, bool packed,
+                           unsigned* hist, unsigned* aux, ull* cand, int colbase,
+                           int capq = CAP, long long* dbg = nullptr, ull* candout = nullptr) {
+  if (candout == nullptr) candout = cand;
+  const int T = blockDim.x;
+  const int W = T >> 5;
+  const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+  __shared__ int sh_b, sh_def, sh_tot, sh_pos, sh_eq;
+  unsigned lo = 0;
+  unsigned bandw = 0;
+  unsigned mymax = 0;   // max key over THIS thread's elements (round-0 layout)
+  unsigned wgmax = 0;   // warp-wide max (gates whole-warp rescans)
+  int defcnt = 0;
+  int final_cnt = -1;
+  const bool v4 = !packed && ((N & 3) == 0) && (((size_t)stage & 15) == 0);
+  const float4* s4v = (const float4*)stage;
+  const int n4s = N >> 2;
+  // Register-resident keys: when the whole slice fits in KR float4s per
+  // thread, later phases (refine/compact) never touch memory again.
+  unsigned kreg[KR > 0 ? KR * 4 : 4];
+  const bool useR = (KR > 0) && v4 && (n4s <= KR * T);
+  #pragma unroll 1
+  for (int r = 0; r < 3; ++r) {
+    const int sh = (r == 0) ? 20 : (r == 1 ? 8 : 0);
+    const int nb = (r == 2) ? 256 : NB;
+    if (r > 0) {  // round 0 zeroes the histogram before the call
+      for (int i = threadIdx.x * 4; i < nb; i += T * 4)
+        *(uint4*)&hist[i] = make_uint4(0u, 0u, 0u, 0u);
+      __syncthreads();
+    }
+    if (r == 0) {
+      if (useR) {
+        #pragma unroll
+        for (int u = 0; u < (KR > 0 ? KR : 1); ++u) {
+          const int i = u * T + threadIdx.x;
+          float4 w;
+          if (i < n4s) w = __ldg(&s4v[i]); else w = make_float4(0.f, 0.f, 0.f, 0.f);
+          kreg[4 * u + 0] = mapf(w.x);
+          kreg[4 * u + 1] = mapf(w.y);
+          kreg[4 * u + 2] = mapf(w.z);
+          kreg[4 * u + 3] = mapf(w.w);
+        }
+        #pragma unroll
+        for (int u = 0; u < (KR > 0 ? KR : 1); ++u) {
+          const int i = u * T + threadIdx.x;
+          const bool valid = i < n4s;
+          hadd(hist, kreg[4 * u + 0] >> 20, valid);
+          hadd(hist, kreg[4 * u + 1] >> 20, valid);
+          hadd(hist, kreg[4 * u + 2] >> 20, valid);
+          hadd(hist, kreg[4 * u + 3] >> 20, valid);
+          if (valid) {
+            unsigned m01 = kreg[4 * u] > kreg[4 * u + 1] ? kreg[4 * u] : kreg[4 * u + 1];
+            unsigned m23 = kreg[4 * u + 2] > kreg[4 * u + 3] ? kreg[4 * u + 2] : kreg[4 * u + 3];
+            unsigned m = m01 > m23 ? m01 : m23;
+            mymax = mymax > m ? mymax : m;
+          }
+        }
+      } else if (v4) {
+        for (int base = 0; base < n4s; base += T) {
+          const int i = base + threadIdx.x;
+          const bool valid = i < n4s;
+          float4 w;
+          if (valid) w = __ldg(&s4v[i]); else w = make_float4(0.f, 0.f, 0.f, 0.f);
+          unsigned k0 = mapf(w.x), k1 = mapf(w.y), k2 = mapf(w.z), k3 = mapf(w.w);
+          hadd(hist, k0 >> 20, valid);
+          hadd(hist, k1 >> 20, valid);
+          hadd(hist, k2 >> 20, valid);
+          hadd(hist, k3 >> 20, valid);
+          if (valid) {
+            unsigned m01 = k0 > k1 ? k0 : k1, m23 = k2 > k3 ? k2 : k3;
+            unsigned m = m01 > m23 ? m01 : m23;
+            mymax = mymax > m ? mymax : m;
+          }
+        }
+      } else {
+        for (int base = 0; base < N; base += 8 * T) {
+          unsigned keys[8];
+          bool val[8];
+          #pragma unroll
+          for (int u = 0; u < 8; ++u) {
+            const int i = base + u * T + threadIdx.x;
+            val[u] = i < N;
+            keys[u] = val[u] ? hs_key(stage, i, packed) : 0u;
+            if (packed) val[u] = val[u] && (keys[u] != 0u);  // skip pool pads
+          }
+          #pragma unroll
+          for (int u = 0; u < 8; ++u) {
+            hadd(hist, keys[u] >> 20, val[u]);
+            if (val[u]) mymax = mymax > keys[u] ? mymax : keys[u];
+          }
+        }
+      }
+      wgmax = wmax(mymax);
+      if (lane == 0) aux[32 + warp] = wgmax;  // for the block-max window scan
+      if (dbg) {
+        __syncthreads();
+        if (threadIdx.x == 0) dbg[0] = gtimer();
+      }
+    } else if (wgmax >= lo) {  // only warps owning candidates re-scan
+      if (useR) {
+        #pragma unroll
+        for (int u = 0; u < (KR > 0 ? KR : 1); ++u) {
+          const int i = u * T + threadIdx.x;
+          const bool valid = i < n4s;
+          #pragma unroll
+          for (int c = 0; c < 4; ++c) {
+            const unsigned key = kreg[4 * u + c];
+            bool in = valid && (key >= lo) && ((key - lo) < bandw);
+            hadd(hist, (key >> sh) & (nb - 1), in);
+          }
+        }
+      } else if (v4) {
+        for (int base = 0; base < n4s; base += T) {
+          const int i = base + threadIdx.x;
+          const bool valid = i < n4s;
+          float4 w;
+          if (valid) w = __ldg(&s4v[i]); else w = make_float4(0.f, 0.f, 0.f, 0.f);
+          unsigned kk[4] = {mapf(w.x), mapf(w.y), mapf(w.z), mapf(w.w)};
+          #pragma unroll
+          for (int c = 0; c < 4; ++c) {
+            bool in = valid && (kk[c] >= lo) && ((kk[c] - lo) < bandw);
+            hadd(hist, (kk[c] >> sh) & (nb - 1), in);
+          }
+        }
+      } else {
+        for (int base = 0; base < N; base += T) {
+          const int i = base + threadIdx.x;
+          const bool valid = i < N;
+          unsigned key = valid ? hs_key(stage, i, packed) : 0u;
+          bool in = valid && (key >= lo) && ((key - lo) < bandw);
+          hadd(hist, (key >> sh) & (nb - 1), in);
+        }
+      }
+    }
+    __syncthreads();
+    // Locate the crossing bin with warp 0 alone.
+    if (warp == 0) {
+      if (r == 0) {
+        // Descend 128-bin windows starting at the block-max key's bin; the
+        // crossing is almost always inside the first window.
+        unsigned bm = (lane < W) ? aux[32 + lane] : 0;
+        bm = wmax(bm);
+        const int topbin = (int)(bm >> 20);
+        int wlo = min(max(0, (topbin - 124) & ~3), nb - 128);
+        int carried = defcnt;
+        for (;;) {
+          const int b0l = wlo + lane * 4;
+          uint4 h4 = *(const uint4*)&hist[b0l];
+          const unsigned gsum = h4.x + h4.y + h4.z + h4.w;
+          const unsigned gsuf = wsufsum(gsum, lane);  // bins >= b0l within window
+          const int gafter = carried + (int)(gsuf - gsum);
+          if ((carried + (int)gsuf >= klocal) && (gafter < klocal)) {
+            int run = gafter;
+            #pragma unroll
+            for (int c = 3; c >= 0; --c) {
+              unsigned hv = (c == 0) ? h4.x : (c == 1 ? h4.y : (c == 2 ? h4.z : h4.w));
+              int cum = run + (int)hv;
+              if (cum >= klocal && run < klocal) { sh_b = b0l + c; sh_tot = cum; sh_def = run; }
+              run = cum;
+            }
+          }
+          const int wtot = __shfl_sync(FULLM, (int)gsuf, 0);
+          if (carried + wtot >= klocal || wlo == 0) break;
+          carried += wtot;
+          wlo = max(0, wlo - 128);
+        }
+      } else {
+        // Refinement rounds (rare): full-span hierarchical scan.
+        const int span = nb >> 5;
+        unsigned lsum = 0;
+        {
+          const uint4* h4p = (const uint4*)hist;
+          const int spanq = span >> 2;
+          const int qb0 = lane * spanq;
+          for (int jj = 0; jj < spanq; ++jj) {
+            uint4 h4 = h4p[qb0 + ((jj + lane) & (spanq - 1))];
+            lsum += h4.x + h4.y + h4.z + h4.w;
+          }
+        }
+        const unsigned lsuf = wsufsum(lsum, lane);
+        const int lafter = defcnt + (int)(lsuf - lsum);
+        const bool own1 = (defcnt + (int)lsuf >= klocal) && (lafter < klocal);
+        const unsigned om1 = __ballot_sync(FULLM, own1);
+        const int ol1 = __ffs(om1) - 1;
+        const int after1 = __shfl_sync(FULLM, lafter, ol1);
+        const int sb0 = ol1 * span;
+        int run = after1;
+        if (own1) {
+          for (int j = sb0 + span - 1; j >= sb0; --j) {
+            int c = run + (int)hist[j];
+            if (c >= klocal && run < klocal) { sh_b = j; sh_tot = c; sh_def = run; }
+            run = c;
+          }
+        }
+      }
+    }
+    __syncthreads();
+    lo = lo | ((unsigned)sh_b << sh);
+    defcnt = sh_def;
+    int tot = sh_tot;
+    bandw = 1u << sh;
+    if (dbg && r == 0 && threadIdx.x == 0) dbg[1] = gtimer();
+    if (tot <= capq) { final_cnt = tot; break; }
+    __syncthreads();
+  }
+  if (threadIdx.x == 0) { sh_pos = 0; sh_eq = 0; }
+  __syncthreads();
+  if (dbg && threadIdx.x == 0) dbg[2] = gtimer();
+  if (final_cnt >= 0) {
+    if (mymax >= lo) {
+      if (useR) {
+        #pragma unroll
+        for (int u = 0; u < (KR > 0 ? KR : 1); ++u) {
+          const int i = u * T + threadIdx.x;
+          if (i < n4s) {
+            #pragma unroll
+            for (int c = 0; c < 4; ++c) {
+              const unsigned key = kreg[4 * u + c];
+              if (key >= lo) {
+                int p = atomicAdd(&sh_pos, 1);
+                candout[p] = ((ull)key << 32) | (unsigned)(colbase + 4 * i + c);
+              }
+            }
+          }
+        }
+      } else if (v4) {
+        // stage 8 loads per iteration so L2 latency is paid once, not per trip
+        for (int base = 0; base < n4s; base += 8 * T) {
+          float4 w[8];
+          #pragma unroll
+          for (int u = 0; u < 8; ++u) {
+            const int i = base + u * T + threadIdx.x;
+            if (i < n4s) w[u] = __ldg(&s4v[i]);
+            else w[u] = make_float4(0.f, 0.f, 0.f, 0.f);
+          }
+          #pragma unroll
+          for (int u = 0; u < 8; ++u) {
+            const int i = base + u * T + threadIdx.x;
+            if (i < n4s) {
+              unsigned kk[4] = {mapf(w[u].x), mapf(w[u].y), mapf(w[u].z), mapf(w[u].w)};
+              #pragma unroll
+              for (int c = 0; c < 4; ++c)
+                if (kk[c] >= lo) {
+                  int p = atomicAdd(&sh_pos, 1);
+                  candout[p] = ((ull)kk[c] << 32) | (unsigned)(colbase + 4 * i + c);
+                }
+            }
+          }
+        }
+      } else {
+        for (int base = 0; base < N; base += 8 * T) {
+          ull pk[8];
+          #pragma unroll
+          for (int u = 0; u < 8; ++u) {
+            const int i = base + u * T + threadIdx.x;
+            pk[u] = (i < N) ? hs_pack(stage, i, colbase, packed) : 0ull;
+          }
+          #pragma unroll
+          for (int u = 0; u < 8; ++u) {
+            if (pk[u] != 0ull && (unsigned)(pk[u] >> 32) >= lo) {
+              int p = atomicAdd(&sh_pos, 1);
+              candout[p] = pk[u];
+            }
+          }
+        }
+      }
+    }
+    __syncthreads();
+    if (dbg && threadIdx.x == 0) dbg[3] = gtimer();
+    return sh_pos;
+  }
+  // Tie flood at the fully-refined boundary (rare; no gating): take all
+  // strictly-above keys, then claim just enough boundary-equal elements.
+  for (int i = threadIdx.x; i < N; i += T) {
+    unsigned key = hs_key(stage, i, packed);
+    if (key > lo) {
+      int p = atomicAdd(&sh_pos, 1);
+      candout[p] = hs_pack(stage, i, colbase, packed);
+    }
+  }
+  __syncthreads();
+  const int defs = sh_pos;
+  for (int i = threadIdx.x; i < N; i += T) {
+    unsigned key = hs_key(stage, i, packed);
+    if (key == lo) {
+      int e = atomicAdd(&sh_eq, 1);
+      if (defs + e < klocal) candout[defs + e] = hs_pack(stage, i, colbase, packed);
+    }
+  }
+  __syncthreads();
+  return min(klocal, defs + sh_eq);
+}
+
+// Phase stamps for offline profiling; free when dbg == nullptr.
+#define STAMP(i)                                                        \
+  do {                                                                  \
+    if (dbg) {                                                          \
+      __syncthreads();                                                  \
+      if (threadIdx.x == 0) dbg[blockIdx.x * 16 + (i)] = gtimer();      \
+    }                                                                   \
+  } while (0)
+
+template <int KR>
+__device__ __forceinline__ void tk_hist_body(
+    const float4* __restrict__ x4, int n, int k, int S, int sliceE, int vec,
+    float* __restrict__ ovals, long long* __restrict__ oidx,
+    ull* __restrict__ pool, unsigned* __restrict__ pcnt,
+    unsigned* __restrict__ tickets, int capq,
+    long long* __restrict__ dbg) {
+  extern __shared__ __align__(16) ull smemu[];
+  ull* cand = smemu;
+  unsigned* hist = (unsigned*)(cand + CAP);
+  unsigned* aux = hist + NB;
+
+  const int T = blockDim.x;
+  const int row = blockIdx.x / S, sl = blockIdx.x - row * S;
+  const int sE = sl * sliceE;
+  const int eE = min(sE + sliceE, n);
+  const int N = (eE > sE) ? (eE - sE) : 0;
+  const int klocal = min(k, N);
+
+  STAMP(0);
+  ull* prow = pool + ((size_t)row * S + sl) * capq;
+  if (S > 1) {
+    // pre-zero this block's pool slot; compact writes candidates directly
+    for (int t = threadIdx.x; t < capq; t += T) prow[t] = 0ull;
+  }
+  for (int i = threadIdx.x * 4; i < NB; i += T * 4)
+    *(uint4*)&hist[i] = make_uint4(0u, 0u, 0u, 0u);
+  __syncthreads();
+  STAMP(1);
+
+  // Select straight from global memory: the first pass streams from DRAM, the
+  // gated second pass (compact) hits L2 (inputs are far smaller than L2).
+  const ull* src = (const ull*)((const float*)x4 + (size_t)row * n + sE);
+  int scnt = 0;
+  if (klocal > 0) {
+    scnt = hist_select<KR>(src, N, klocal, false, hist, aux, cand, sE, capq,
+                           dbg ? dbg + blockIdx.x * 16 + 6 : nullptr,
+                           (S > 1) ? prow : nullptr);
+  }
+  STAMP(2);
+
+  if (S == 1) {
+    rank_output(cand, scnt, k, ovals + (size_t)row * k, oidx + (size_t)row * k);
+    STAMP(3);
+    return;
+  }
+
+  // Candidates already live in this block's pool slot; take a ticket.
+  __shared__ bool amlast;
+  if (threadIdx.x == 0) {
+    unsigned old;
+    asm volatile("atom.add.acq_rel.gpu.u32 %0, [%1], %2;"
+                 : "=r"(old) : "l"(&tickets[row]), "r"(1u) : "memory");
+    amlast = (old == (unsigned)(S - 1));
+  }
+  __syncthreads();
+  STAMP(3);
+  if (!amlast) return;
+
+  // Merge: the same select, straight over the row's pool slots in L2
+  // (zero pads lose to every real candidate).
+  const int M = S * capq;
+  const ull* pr = pool + (size_t)row * S * capq;
+  STAMP(4);
+  for (int i = threadIdx.x * 4; i < NB; i += T * 4)
+    *(uint4*)&hist[i] = make_uint4(0u, 0u, 0u, 0u);
+  __syncthreads();
+  int mcnt = hist_select<0>(pr, M, k, true, hist, aux, cand, 0, max(128, k),
+                            dbg ? dbg + blockIdx.x * 16 + 10 : nullptr);
+  rank_output(cand, mcnt, k, ovals + (size_t)row * k, oidx + (size_t)row * k);
+  if (threadIdx.x == 0) tickets[row] = 0;
+  STAMP(5);
+}
+
+template <int KR>
+__global__ void __launch_bounds__(512) tk_hist(
+    const float4* __restrict__ x4, int n, int k, int S, int sliceE, int vec,
+    float* __restrict__ ovals, long long* __restrict__ oidx,
+    ull* __restrict__ pool, unsigned* __restrict__ pcnt,
+    unsigned* __restrict__ tickets, int capq, long long* __restrict__ dbg) {
+  tk_hist_body<KR>(x4, n, k, S, sliceE, vec, ovals, oidx, pool, pcnt, tickets, capq, dbg);
+}
+
+__global__ void __launch_bounds__(512) tk_argmax(
+    const float4* __restrict__ x4, int n, int n4,
+    float* __restrict__ ovals, long long* __restrict__ oidx) {
+  const int row = blockIdx.x;
+  const int T = blockDim.x;
+  __shared__ ull sm[32];
+  const float4* xr = x4 + (size_t)row * n4;
+  ull best = 0;
+  for (int base = 0; base < n4; base += 4 * T) {
+    float4 vv[4];
+    #pragma unroll
+    for (int u = 0; u < 4; ++u) {
+      const int i = base + u * T + threadIdx.x;
+      if (i < n4) vv[u] = __ldg(&xr[i]); else vv[u] = make_float4(0.f, 0.f, 0.f, 0.f);
+    }
+    #pragma unroll
+    for (int u = 0; u < 4; ++u) {
+      const int i = base + u * T + threadIdx.x;
+      if (i < n4) {
+        unsigned c = ((unsigned)i) << 2;
+        ull p0 = ((ull)mapf(vv[u].x) << 32) | c;
+        ull p1 = ((ull)mapf(vv[u].y) << 32) | (c + 1u);
+        ull p2 = ((ull)mapf(vv[u].z) << 32) | (c + 2u);
+        ull p3 = ((ull)mapf(vv[u].w) << 32) | (c + 3u);
+        ull m01 = p0 > p1 ? p0 : p1, m23 = p2 > p3 ? p2 : p3;
+        ull m = m01 > m23 ? m01 : m23;
+        best = best > m ? best : m;
+      }
+    }
+  }
+  const float* xs = (const float*)x4 + (size_t)row * n;
+  for (int i = n4 * 4 + threadIdx.x; i < n; i += T) {
+    ull p = ((ull)mapf(xs[i]) << 32) | (unsigned)i;
+    best = best > p ? best : p;
+  }
+  #pragma unroll
+  for (int j = 16; j > 0; j >>= 1) {
+    ull o = __shfl_xor_sync(FULLM, best, j);
+    best = best > o ? best : o;
+  }
+  if ((threadIdx.x & 31) == 0) sm[threadIdx.x >> 5] = best;
+  __syncthreads();
+  if (threadIdx.x < 32) {
+    int W = T >> 5;
+    ull b = (threadIdx.x < W) ? sm[threadIdx.x] : 0;
+    #pragma unroll
+    for (int j = 16; j > 0; j >>= 1) {
+      ull o = __shfl_xor_sync(FULLM, b, j);
+      b = b > o ? b : o;
+    }
+    if (threadIdx.x == 0) {
+      ovals[row] = unmapf((unsigned)(b >> 32));
+      oidx[row] = (long long)(unsigned)b;
+    }
+  }
+}
+
+struct Cfg {
+  int batch, n, k, S, T, sliceE, vec, smem, KR, CAPQ;
+  bool argmax;
+  float* vals;
+  long long* idx;
+  ull* pool;
+  unsigned* pcnt;
+  unsigned* tickets;
+};
+static std::vector<Cfg> g_cfgs;
+
+int64_t tk_make(at::Tensor vals, at::Tensor idx, at::Tensor pool, at::Tensor pcnt,
+                at::Tensor tickets, int64_t batch, int64_t n, int64_t k, int64_t S,
+                int64_t T, int64_t is_argmax) {
+  Cfg c;
+  TORCH_CHECK(S >= 1 && S <= 32, "S out of range");
+  c.batch = (int)batch; c.n = (int)n; c.k = (int)k;
+  c.S = (int)S; c.T = (int)T;
+  c.vec = (n % 4 == 0) ? 1 : 0;
+  int sliceE = (int)((n + S - 1) / S);
+  if (c.vec) sliceE = ((sliceE + 3) / 4) * 4;
+  c.sliceE = sliceE;
+  c.KR = 0;
+  if (c.vec) {
+    int n4slice = (sliceE + 3) / 4;
+    if (n4slice <= 4 * c.T) c.KR = 4;
+    else if (n4slice <= 8 * c.T) c.KR = 8;
+  }
+  c.CAPQ = (S > 1 && k <= 64) ? 128 : CAP;
+  TORCH_CHECK(k >= 1 && k <= CAP, "k out of supported range");
+  c.smem = (CAP + NB / 2 + c.T / 2 + 8) * 8;
+  c.argmax = is_argmax != 0;
+  c.vals = vals.data_ptr<float>();
+  c.idx = (long long*)idx.data_ptr<int64_t>();
+  c.pool = (ull*)pool.data_ptr<int64_t>();
+  c.pcnt = (unsigned*)pcnt.data_ptr<int>();
+  c.tickets = (unsigned*)tickets.data_ptr<int>();
+  if (!c.argmax && c.smem > 48 * 1024) {
+    cudaFuncSetAttribute(tk_hist<0>, cudaFuncAttributeMaxDynamicSharedMemorySize, c.smem);
+    cudaFuncSetAttribute(tk_hist<4>, cudaFuncAttributeMaxDynamicSharedMemorySize, c.smem);
+    cudaFuncSetAttribute(tk_hist<8>, cudaFuncAttributeMaxDynamicSharedMemorySize, c.smem);
+  }
+  g_cfgs.push_back(c);
+  return (int64_t)g_cfgs.size() - 1;
+}
+
+static void tk_launch(const Cfg& c, const float4* x4, cudaStream_t stream, long long* dbg) {
+  if (c.argmax) {
+    tk_argmax<<<c.batch, c.T, 0, stream>>>(x4, c.n, c.n / 4, c.vals, c.idx);
+    return;
+  }
+  #define TKL(F, KR) F<KR><<<c.batch * c.S, c.T, c.smem, stream>>>( \
+      x4, c.n, c.k, c.S, c.sliceE, c.vec, c.vals, c.idx, c.pool, c.pcnt, \
+      c.tickets, c.CAPQ, dbg)
+  TORCH_CHECK(c.T <= 512, "T > 512 unsupported");
+  if (c.KR == 4) TKL(tk_hist, 4);
+  else if (c.KR == 8) TKL(tk_hist, 8);
+  else TKL(tk_hist, 0);
+  #undef TKL
+}
+
+void tk_run(int64_t slot, at::Tensor x) {
+  const Cfg& c = g_cfgs[slot];
+  TORCH_CHECK(x.is_contiguous(), "input must be contiguous");
+  tk_launch(c, reinterpret_cast<const float4*>(x.data_ptr<float>()),
+            at::cuda::getCurrentCUDAStream(), nullptr);
+}
+
+void tk_run_dbg(int64_t slot, at::Tensor x, at::Tensor dbg) {
+  const Cfg& c = g_cfgs[slot];
+  tk_launch(c, reinterpret_cast<const float4*>(x.data_ptr<float>()),
+            at::cuda::getCurrentCUDAStream(), (long long*)dbg.data_ptr<int64_t>());
+}
+"""
+
+_CPP_DECLS = r"""
+int64_t tk_make(at::Tensor vals, at::Tensor idx, at::Tensor pool, at::Tensor pcnt,
+                at::Tensor tickets, int64_t batch, int64_t n, int64_t k, int64_t S,
+                int64_t T, int64_t is_argmax);
+void tk_run(int64_t slot, at::Tensor x);
+void tk_run_dbg(int64_t slot, at::Tensor x, at::Tensor dbg);
+"""
+
+_ext_cache = None
+
+
+def _ext():
+    global _ext_cache
+    if _ext_cache is None:
+        import os
+
+        if "TORCH_CUDA_ARCH_LIST" not in os.environ and torch.cuda.is_available():
+            maj, mnr = torch.cuda.get_device_capability(0)
+            os.environ["TORCH_CUDA_ARCH_LIST"] = f"{maj}.{mnr}"
+        _ext_cache = load_inline(
+            name="tk_hist_v2",
+            cpp_sources=_CPP_DECLS,
+            cuda_sources=_CUDA_SRC,
+            functions=["tk_make", "tk_run", "tk_run_dbg"],
+            extra_cuda_cflags=["-O3", "--use_fast_math"],
+            verbose=False,
+        )
+    return _ext_cache
+
+
+# Per-shape launch configs: S slices per row, T threads per block.
+_CONFIGS = {
+    (1, 131072, 64): dict(S=16, T=512),
+    (64, 8192, 8): dict(S=1, T=512),
+    (32, 16384, 32): dict(S=1, T=512),
+    (16, 12000, 16): dict(S=1, T=512),
+    (128, 4096, 1): dict(argmax=True, T=512),
+}
+
+
+def _pick_cfg(b, n, k):
+    cfg = _CONFIGS.get((b, n, k))
+    if cfg is not None:
+        return dict(cfg)
+    if k == 1:
+        return dict(argmax=True, T=256 if n < 2048 else 512)
+    if k > 256:
+        raise NotImplementedError("k > 256 not supported by this kernel")
+    # generic: keep the staged slice near 8K elements, S within the merge cap
+    S = 1
+    while (n + S - 1) // S > 8192 and S < 32:
+        S += 1
+    return dict(S=S, T=512)
+
+
+class Model(nn.Module):
+    """Top-k over the last dim of a 2D fp32 tensor (values desc + int64 indices)."""
+
+    def __init__(self, batch: int, n: int, k: int):
+        super().__init__()
+        self.batch, self.n, self.k = int(batch), int(n), int(k)
+        self.register_buffer("_dummy", torch.zeros(1))
+        self._slot = None
+
+    def _lazy_init(self, x):
+        ext = _ext()
+        b, n, k = self.batch, self.n, self.k
+        cfg = _pick_cfg(b, n, k)
+        dev = x.device
+        vals = torch.empty((b, k), dtype=torch.float32, device=dev)
+        idx = torch.empty((b, k), dtype=torch.int64, device=dev)
+        if cfg.get("argmax"):
+            pool = torch.empty(1, dtype=torch.int64, device=dev)
+            pcnt = torch.zeros(1, dtype=torch.int32, device=dev)
+            tick = torch.zeros(1, dtype=torch.int32, device=dev)
+            slot = ext.tk_make(vals, idx, pool, pcnt, tick, b, n, k, 1, cfg["T"], 1)
+        else:
+            S, T = cfg["S"], cfg["T"]
+            assert S <= 32
+            pool = torch.empty(max(1, b * S * 256), dtype=torch.int64, device=dev)
+            pcnt = torch.zeros(max(1, b * S), dtype=torch.int32, device=dev)
+            tick = torch.zeros(max(1, b), dtype=torch.int32, device=dev)
+            slot = ext.tk_make(vals, idx, pool, pcnt, tick, b, n, k, S, T, 0)
+        self._keep = (vals, idx, pool, pcnt, tick)
+        self._out = (vals, idx)
+        self._runf = ext.tk_run
+        self._slot = slot
+
+    def forward(self, x):
+        if self._slot is None:
+            self._lazy_init(x)
+        self._runf(self._slot, x)
+        return self._out
+
+    __call__ = forward
+
+
+# Module-level shims rebuilt by check.py / benchmark.py per shape.
+batch = 64
+n = 8192
+k = 8
+
+
+def get_inputs():
+    x = torch.randn(batch, n, dtype=torch.float32)
+    return [x]
+
+
+def get_init_inputs():
+    return [batch, n, k]

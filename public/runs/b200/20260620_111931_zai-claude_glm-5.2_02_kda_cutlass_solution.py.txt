@@ -1,0 +1,313 @@
+"""Custom Triton kernel for Kimi Delta Attention (KDA) forward, chunk form, on B200 (SM100).
+
+Two kernels, mirroring the FLA production decomposition but written from scratch
+(no fla.ops imports):
+  1. INTRA  (grid: NT x B*H)  -- per chunk, fully parallel:
+       * in-chunk cumulative gate g_cum = cumsum(g)
+       * gated K-K gram G[c,i] = sum_d k[c,d] exp(g[c,d]-g[i,d]) k[i,d]
+       * T = (I - M)^{-1},  M = strictly_lower(-beta * G)
+            computed exactly via the nilpotent product form
+            T = prod_{i=0}^{5} (I + M^{2^i})   (BT=64, strictly-lower => M^64 = 0)
+       * Aqk = lower_tri( (q*exp(g)) @ (k*exp(-g))^T )   (q pre-scaled by `scale`)
+       * w = T @ (beta * exp(g) * k) ,  u = T @ (beta * v)
+       * qg = q*scale*exp(g) ,  kg = k*exp(g_last - g) ,  g_last (per-channel decay)
+  2. FWD_H_FUSED (grid: B*H x V/BV) -- sequential inter-chunk recurrence, also writes o:
+       state S held as a single (K, BV) tile so the K-contracting matmuls
+       (w @ S and kg^T @ v_new) are single tl.dot calls, halving the per-step
+       critical-path depth versus splitting K. The smaller BV also raises program
+       count (B*H * V/BV) for better SM occupancy. per chunk i:
+         v_new = u - w @ S
+         o_i   = qg @ S + Aqk @ v_new
+         S     = diag(exp(g_last)) * S + kg^T @ v_new
+
+The delta-rule transition is the full K x K matrix M = diag(d) - kg^T w, so -- like
+the reference FLA implementation -- the inter-chunk pass is sequential (a parallel
+scan would need K x K x K combines, far costlier than the recurrence). exp2 (with g
+pre-scaled by 1/ln2) is used for the fast PTX ex2 path; GEMMs use bf16 operands with
+fp32 accum.
+"""
+from __future__ import annotations
+
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+OP_TYPE = "linear_attention"
+SUPPORTED_PRECISIONS = ["bf16"]
+HARDWARE_REQUIRED = ["RTX_PRO_6000", "H100", "B200"]
+
+_RCP_LN2 = 1.4426950408889634  # 1 / ln(2)
+
+
+@triton.jit
+def _product_solve(M, BT: tl.constexpr, BF16: tl.constexpr):
+    """T = (I - M)^{-1} for strictly-lower-triangular nilpotent M (M^BT = 0).
+
+    Exact closed form: T = prod_{i=0}^{log2(BT)-1} (I + M^{2^i})
+      = I + M + M^2 + ... + M^{BT-1} = (I - M)^{-1}   (since M^BT = 0).
+    Implemented for BT = 64 (six factors, M^64 = 0).
+    BF16: dot inputs are recast to bf16 (2x MMA throughput on the latency-bound
+    small tiles) while accumulation stays in fp32.
+    """
+    idx = tl.arange(0, BT)
+    eye = idx[:, None] == idx[None, :]
+    I = tl.where(eye, 1.0, 0.0)            # fp32
+    T = I + M
+    if BF16:
+        P = tl.dot(M.to(tl.bfloat16), M.to(tl.bfloat16))
+        T = tl.dot(T.to(tl.bfloat16), (I + P).to(tl.bfloat16))
+        P = tl.dot(P.to(tl.bfloat16), P.to(tl.bfloat16)); T = tl.dot(T.to(tl.bfloat16), (I + P).to(tl.bfloat16))
+        P = tl.dot(P.to(tl.bfloat16), P.to(tl.bfloat16)); T = tl.dot(T.to(tl.bfloat16), (I + P).to(tl.bfloat16))
+        P = tl.dot(P.to(tl.bfloat16), P.to(tl.bfloat16)); T = tl.dot(T.to(tl.bfloat16), (I + P).to(tl.bfloat16))
+        P = tl.dot(P.to(tl.bfloat16), P.to(tl.bfloat16)); T = tl.dot(T.to(tl.bfloat16), (I + P).to(tl.bfloat16))
+    else:
+        P = tl.dot(M, M);            T = tl.dot(T, I + P)
+        P = tl.dot(P, P);            T = tl.dot(T, I + P)
+        P = tl.dot(P, P);            T = tl.dot(T, I + P)
+        P = tl.dot(P, P);            T = tl.dot(T, I + P)
+        P = tl.dot(P, P);            T = tl.dot(T, I + P)
+    return T
+
+
+@triton.jit
+def _kda_intra_kernel(
+    Q, Kp, Vp, G, Beta,
+    W, U, QG, KG, AQK, GLAST,
+    scale,
+    T_total,
+    H: tl.constexpr,
+    KDIM: tl.constexpr,
+    VDIM: tl.constexpr,
+    BT: tl.constexpr,
+    BK: tl.constexpr,
+    BV: tl.constexpr,
+):
+    i_t = tl.program_id(0)
+    i_bh = tl.program_id(1)
+    i_b = i_bh // H
+    i_h = i_bh % H
+    NT = T_total // BT
+    NK: tl.constexpr = KDIM // BK
+    NV: tl.constexpr = VDIM // BV
+    rcp = 1.4426950408889634
+
+    # bases at the (b, h) origin; block offsets carry the chunk position i_t*BT
+    base_qk = i_b * (T_total * H * KDIM) + i_h * KDIM
+    base_v = i_b * (T_total * H * VDIM) + i_h * VDIM
+    base_beta = i_b * (T_total * H) + i_h
+
+    b_beta = tl.load(
+        tl.make_block_ptr(Beta + base_beta, (T_total,), (H,), (i_t * BT,), (BT,), (0,)),
+        boundary_check=(0,)).to(tl.float32)
+
+    # ---- Pass 1: accumulate grams G, Aqk; store qg, kg, g_last ----
+    b_G = tl.zeros([BT, BT], dtype=tl.float32)
+    b_Aqk = tl.zeros([BT, BT], dtype=tl.float32)
+    sk = tl.arange(0, BK)
+    glast_base = (i_bh * NT + i_t) * KDIM
+    for i_k in range(NK):
+        p_off = i_k * BK
+        b_g = tl.load(
+            tl.make_block_ptr(G + base_qk, (T_total, KDIM), (H * KDIM, 1),
+                              (i_t * BT, p_off), (BT, BK), (1, 0)),
+            boundary_check=(0, 1)).to(tl.float32)
+        gc = tl.cumsum(b_g, axis=0)
+        eg = tl.math.exp2(gc * rcp)
+        eng = tl.math.exp2(-gc * rcp)
+        b_k = tl.load(
+            tl.make_block_ptr(Kp + base_qk, (T_total, KDIM), (H * KDIM, 1),
+                              (i_t * BT, p_off), (BT, BK), (1, 0)),
+            boundary_check=(0, 1)).to(tl.float32)
+        b_q = tl.load(
+            tl.make_block_ptr(Q + base_qk, (T_total, KDIM), (H * KDIM, 1),
+                              (i_t * BT, p_off), (BT, BK), (1, 0)),
+            boundary_check=(0, 1)).to(tl.float32) * scale
+
+        b_G += tl.dot((b_k * eg).to(tl.bfloat16), tl.trans((b_k * eng).to(tl.bfloat16)))
+        b_Aqk += tl.dot((b_q * eg).to(tl.bfloat16), tl.trans((b_k * eng).to(tl.bfloat16)))
+
+        g_last_cum = tl.sum(b_g, axis=0)  # = inclusive-cumsum last row for this K block
+        kg_blk = b_k * tl.math.exp2((g_last_cum[None, :] - gc) * rcp)
+        tl.store(
+            tl.make_block_ptr(QG + base_qk, (T_total, KDIM), (H * KDIM, 1),
+                              (i_t * BT, p_off), (BT, BK), (1, 0)),
+            (b_q * eg).to(tl.bfloat16), boundary_check=(0, 1))
+        tl.store(
+            tl.make_block_ptr(KG + base_qk, (T_total, KDIM), (H * KDIM, 1),
+                              (i_t * BT, p_off), (BT, BK), (1, 0)),
+            kg_blk.to(tl.bfloat16), boundary_check=(0, 1))
+        tl.store(GLAST + glast_base + p_off + sk, g_last_cum)
+
+    # ---- T = (I - M)^{-1},  M = strictly_lower(-beta * G) ----
+    idx = tl.arange(0, BT)
+    b_M = tl.where(idx[:, None] > idx[None, :], -b_beta[:, None] * b_G, 0.0)
+    b_T = _product_solve(b_M, BT, 1)
+
+    loweq = idx[:, None] >= idx[None, :]
+    b_Aqk = tl.where(loweq, b_Aqk, 0.0)
+    tl.store(
+        tl.make_block_ptr(AQK + (i_bh * NT + i_t) * BT * BT,
+                          (BT, BT), (BT, 1), (0, 0), (BT, BT), (1, 0)),
+        b_Aqk.to(tl.bfloat16))
+
+    # ---- Pass 2: w = T @ (beta * exp(g) * k) ----
+    for i_k in range(NK):
+        p_off = i_k * BK
+        b_g = tl.load(
+            tl.make_block_ptr(G + base_qk, (T_total, KDIM), (H * KDIM, 1),
+                              (i_t * BT, p_off), (BT, BK), (1, 0)),
+            boundary_check=(0, 1)).to(tl.float32)
+        eg = tl.math.exp2(tl.cumsum(b_g, axis=0) * rcp)
+        b_k = tl.load(
+            tl.make_block_ptr(Kp + base_qk, (T_total, KDIM), (H * KDIM, 1),
+                              (i_t * BT, p_off), (BT, BK), (1, 0)),
+            boundary_check=(0, 1)).to(tl.float32)
+        b_w = tl.dot(b_T.to(tl.bfloat16), (b_beta[:, None] * eg * b_k).to(tl.bfloat16))
+        tl.store(
+            tl.make_block_ptr(W + base_qk, (T_total, KDIM), (H * KDIM, 1),
+                              (i_t * BT, p_off), (BT, BK), (1, 0)),
+            b_w.to(tl.bfloat16), boundary_check=(0, 1))
+
+    # ---- Pass 3: u = T @ (beta * v) ----
+    for i_v in range(NV):
+        p_off = i_v * BV
+        b_v = tl.load(
+            tl.make_block_ptr(Vp + base_v, (T_total, VDIM), (H * VDIM, 1),
+                              (i_t * BT, p_off), (BT, BV), (1, 0)),
+            boundary_check=(0, 1)).to(tl.float32)
+        b_u = tl.dot(b_T.to(tl.bfloat16), (b_beta[:, None] * b_v).to(tl.bfloat16))
+        tl.store(
+            tl.make_block_ptr(U + base_v, (T_total, VDIM), (H * VDIM, 1),
+                              (i_t * BT, p_off), (BT, BV), (1, 0)),
+            b_u.to(tl.bfloat16), boundary_check=(0, 1))
+
+
+@triton.jit
+def _kda_fwd_h_fused_kernel(
+    U, W, QG, KG, AQK, GLAST, O,
+    T_total,
+    H: tl.constexpr,
+    KDIM: tl.constexpr,
+    VDIM: tl.constexpr,
+    BT: tl.constexpr,
+    BV: tl.constexpr,
+):
+    """Sequential inter-chunk recurrence; fuses the output (o) write.
+
+    State S held as a single (KDIM, BV) tile so the K-contracting matmuls
+    (w @ S and kg^T @ v_new) are single tl.dot calls -- this halves the
+    per-step critical-path depth versus splitting K, and the smaller BV raises
+    program count (B*H * V/BV) for better SM occupancy.
+    """
+    i_bh = tl.program_id(0)
+    i_v = tl.program_id(1)
+    i_b = i_bh // H
+    i_h = i_bh % H
+    NT = T_total // BT
+    RCP: tl.constexpr = 1.4426950408889634
+
+    base_qk = i_b * (T_total * H * KDIM) + i_h * KDIM
+    base_v = i_b * (T_total * H * VDIM) + i_h * VDIM
+
+    s = tl.zeros([KDIM, BV], dtype=tl.float32)   # full-K recurrent state
+    sk = tl.arange(0, KDIM)
+
+    for i_t in range(NT):
+        b_u = tl.load(
+            tl.make_block_ptr(U + base_v, (T_total, VDIM), (H * VDIM, 1),
+                              (i_t * BT, i_v * BV), (BT, BV), (1, 0)),
+            boundary_check=(0, 1)).to(tl.float32)
+        # w @ S  -> (BT, BV), single dot over full K
+        b_w = tl.load(
+            tl.make_block_ptr(W + base_qk, (T_total, KDIM), (H * KDIM, 1),
+                              (i_t * BT, 0), (BT, KDIM), (1, 0)),
+            boundary_check=(0, 1))
+        b_vnew = b_u - tl.dot(b_w, s.to(tl.bfloat16))
+
+        # o = qg @ S + Aqk @ v_new
+        b_qg = tl.load(
+            tl.make_block_ptr(QG + base_qk, (T_total, KDIM), (H * KDIM, 1),
+                              (i_t * BT, 0), (BT, KDIM), (1, 0)),
+            boundary_check=(0, 1))
+        b_Aqk = tl.load(
+            tl.make_block_ptr(AQK + (i_bh * NT + i_t) * BT * BT,
+                              (BT, BT), (BT, 1), (0, 0), (BT, BT), (1, 0)))
+        b_o = tl.dot(b_qg, s.to(tl.bfloat16)) + tl.dot(b_Aqk, b_vnew.to(tl.bfloat16))
+        tl.store(
+            tl.make_block_ptr(O + base_v, (T_total, VDIM), (H * VDIM, 1),
+                              (i_t * BT, i_v * BV), (BT, BV), (1, 0)),
+            b_o.to(tl.bfloat16), boundary_check=(0, 1))
+
+        # S = diag(exp(g_last)) * S + kg^T @ v_new
+        d = tl.math.exp2(tl.load(GLAST + (i_bh * NT + i_t) * KDIM + sk) * RCP)
+        b_kg = tl.load(
+            tl.make_block_ptr(KG + base_qk, (T_total, KDIM), (H * KDIM, 1),
+                              (i_t * BT, 0), (BT, KDIM), (1, 0)),
+            boundary_check=(0, 1))
+        s = d[:, None] * s + tl.dot(tl.trans(b_kg), b_vnew.to(tl.bfloat16))
+
+
+def _run_kda(q, k, v, g, beta, scale, BT=64, BK=64, BV=16,
+             intra_warps=4, intra_stages=1, fwd_warps=4, fwd_stages=4):
+    B, T, H, K = q.shape
+    V = v.shape[-1]
+    NT = T // BT
+    # Thin (b,h) grids underfill the GPU; give the intra kernel more warps.
+    if intra_warps is None:
+        intra_warps = 8 if B * H <= 4 else 4
+    q = q.contiguous(); k = k.contiguous(); v = v.contiguous()
+    g = g.contiguous(); beta = beta.contiguous()
+    w = torch.empty(B, T, H, K, dtype=torch.bfloat16, device=q.device)
+    u = torch.empty(B, T, H, V, dtype=torch.bfloat16, device=q.device)
+    qg = torch.empty(B, T, H, K, dtype=torch.bfloat16, device=q.device)
+    kg = torch.empty(B, T, H, K, dtype=torch.bfloat16, device=q.device)
+    Aqk = torch.empty(B * H * NT, BT, BT, dtype=torch.bfloat16, device=q.device)
+    glast = torch.empty(B * H, NT, K, dtype=torch.float32, device=q.device)
+    _kda_intra_kernel[(NT, B * H)](
+        q, k, v, g, beta, w, u, qg, kg, Aqk, glast,
+        scale, T, H, K, V, BT, BK, V,
+        num_stages=intra_stages, num_warps=intra_warps)
+    o = torch.empty(B, T, H, V, dtype=torch.bfloat16, device=q.device)
+    _kda_fwd_h_fused_kernel[(B * H, V // BV)](
+        u, w, qg, kg, Aqk, glast, o,
+        T, H, K, V, BT, BV,
+        num_stages=fwd_stages, num_warps=fwd_warps)
+    return o
+
+
+class Model(nn.Module):
+    """KDA forward (chunk form). No learned parameters; all inputs are activations."""
+
+    def __init__(self, B: int, T: int, H: int, K: int, V: int, chunk_size: int = 64):
+        super().__init__()
+        self.B, self.T, self.H, self.K, self.V = B, T, H, K, V
+        self.chunk_size = chunk_size
+        self.scale = float(K) ** -0.5
+        self.register_buffer("_dummy", torch.zeros(1), persistent=False)
+
+    def forward(self, q, k, v, g, beta):
+        return _run_kda(q, k, v, g, beta, scale=self.scale, BT=self.chunk_size)
+
+
+# Module-level shape shims (overridden by check.py / benchmark.py per shape via reference).
+B = 2
+T = 1024
+H = 8
+K = 128
+V = 128
+CHUNK_SIZE = 64
+
+
+def get_inputs():
+    torch.manual_seed(0)
+    q = torch.randn(B, T, H, K, dtype=torch.bfloat16) * 0.1
+    k = torch.randn(B, T, H, K, dtype=torch.bfloat16) * 0.1
+    v = torch.randn(B, T, H, V, dtype=torch.bfloat16) * 0.1
+    g = (torch.randn(B, T, H, K, dtype=torch.float32) * 0.1 - 0.05)
+    beta = torch.sigmoid(torch.randn(B, T, H, dtype=torch.bfloat16))
+    return [q, k, v, g, beta]
+
+
+def get_init_inputs():
+    return [B, T, H, K, V, CHUNK_SIZE]

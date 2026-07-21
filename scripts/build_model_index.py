@@ -136,6 +136,16 @@ def trace_url(bench: str, run_id: str, gpu_key: str | None = None) -> str | None
     ds = TRACE_DATASETS.get(bench)
     if not ds or not run_id:
         return None
+    if gpu_key:
+        # A few pre-split board runs were lost before their traces could be
+        # pushed; don't bake a dead HF link for them. Gate only when local
+        # archives are present at all (canonical home has them).
+        out = REPO / "benchmarks" / bench / "outputs"
+        if any(out.glob("runs*")) and not (
+            (out / f"runs-{gpu_key}" / run_id).is_dir()
+            or (out / "runs" / run_id).is_dir()
+        ):
+            return None
     prefix = f"{gpu_key}/" if gpu_key else ""
     return f"https://huggingface.co/datasets/Infatoshi/{ds}/blob/main/{prefix}{run_id}.jsonl"
 
@@ -143,12 +153,20 @@ def trace_url(bench: str, run_id: str, gpu_key: str | None = None) -> str | None
 def solution_url(run_id: str, gpu_key: str | None = None) -> str | None:
     if not run_id:
         return None
-    # public/runs only carries canonical-board solutions; a bare file with a
-    # colliding rid belongs to the canonical session, never a per-GPU board's.
-    if gpu_key:
+    # Canonical-board solutions are flat under public/runs; per-GPU boards
+    # namespace as public/runs/<gpu>/ (emit_board_solutions.py) — a bare file
+    # with a colliding rid belongs to the canonical session, never a board's.
+    prefix = f"{gpu_key}/" if gpu_key else ""
+    p = REPO / "public" / "runs" / prefix / f"{run_id}_solution.py.txt"
+    return f"/runs/{prefix}{run_id}_solution.py.txt" if p.exists() else None
+
+
+def mega_solution_url(run_id: str) -> str | None:
+    """Mega solutions live under public/data/mega/code, not public/runs."""
+    if not run_id:
         return None
-    p = REPO / "public" / "runs" / f"{run_id}_solution.py.txt"
-    return f"/runs/{run_id}_solution.py.txt" if p.exists() else None
+    p = REPO / "public" / "data" / "mega" / "code" / f"{run_id}.solution.py.txt"
+    return f"/data/mega/code/{run_id}.solution.py.txt" if p.exists() else None
 
 
 def detail_url(bench: str, run_id: str, gpu_key: str | None = None) -> str | None:
@@ -324,7 +342,7 @@ def load_mega(models: Models, csv_path: Path) -> None:
                 "tok_s": int(float(r["tok_s"])) if r.get("tok_s") else None,
                 "ctx": {k: float(r[k]) for k in ("ctx2048", "ctx8192", "ctx16384") if r.get(k)},
                 "framework": r.get("framework") or None,
-                "solution_url": solution_url(r.get("run_id") or ""),
+                "solution_url": mega_solution_url(r.get("run_id") or ""),
                 "trace_url": trace_url("mega", r.get("run_id") or ""),
                 # verdict/validity filled in after annotations are joined
                 "verdict": "unaudited",

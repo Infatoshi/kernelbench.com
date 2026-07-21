@@ -1,0 +1,582 @@
+"""Paged-attention decode kernel for B200 (SM100 Blackwell, HBM3e 8 TB/s).
+
+Split-K design:
+  - Chunk kernel: one block per (batch, kv_head, chunk).  Processes a
+    contiguous slice (CHUNK_SIZE tokens) of the KV cache and writes partial
+    (acc_o, m, l) per query head.
+  - Reduce kernel: one block per (batch, head).  Merges chunk partials via
+    online-softmax combine and writes the final bf16 output.
+"""
+
+import math
+from typing import List
+
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+OP_TYPE = "attention"
+SUPPORTED_PRECISIONS = ["bf16"]
+HARDWARE_REQUIRED = ["RTX_PRO_6000", "H100", "B200"]
+
+# --- Shape knobs (overridden by check.py / benchmark.py from shapes.py) ---
+BATCH = 8
+NUM_HEADS = 32
+NUM_KV_HEADS = 8
+HEAD_DIM = 128
+SEQ_LEN = 1024
+PAGE_SIZE = 16
+
+# Split-K chunk size in tokens (must be a multiple of PAGE_SIZE=16).
+CHUNK_SIZE = 256  # 16 pages per chunk
+
+# ---------------------------------------------------------------------------
+# CUDA source
+# ---------------------------------------------------------------------------
+
+cuda_src = r"""
+#include <cuda_bf16.h>
+#include <cuda_fp16.h>
+#include <math.h>
+#include <stdint.h>
+
+#define WARP_SIZE 32
+
+// -------------------------------------------------------------------------
+// Chunk kernel — processes CHUNK_SIZE tokens of one (batch, kv_head) pair.
+//
+// Grid:  (num_chunks, batch, num_kv_heads)
+// Block: GROUP_SIZE * WARP_SIZE  threads
+//
+// Each warp handles one query head in the GQA group.  K/V pages are staged
+// through shared memory.
+//
+// Partial buffers (float32):
+//   partial_o  [num_flat_chunks * GROUP_SIZE * HEAD_DIM]
+//   partial_m  [num_flat_chunks * GROUP_SIZE]
+//   partial_l  [num_flat_chunks * GROUP_SIZE]
+//
+// Flat index: ((c * B + b) * Hkv + hkv) * G + g
+//   c = chunk_idx, b = batch_idx, hkv = kv_head, g = head_in_group (0..G-1)
+// -------------------------------------------------------------------------
+template <int HEAD_DIM, int PAGE_SIZE, int GROUP_SIZE, int CHUNK_SIZE>
+__global__ void paged_attention_chunk_kernel(
+    const __nv_bfloat16* __restrict__ query,
+    const __nv_bfloat16* __restrict__ kv_cache,
+    const int32_t* __restrict__ block_table,
+    const int32_t* __restrict__ seq_lens,
+    float* __restrict__ partial_o,
+    float* __restrict__ partial_m,
+    float* __restrict__ partial_l,
+    const int num_heads,
+    const int num_kv_heads,
+    const int max_blocks,
+    const int kv_stride_token,
+    const int kv_stride_block,
+    const float scale
+) {
+    constexpr int BLOCK_DIM = GROUP_SIZE * WARP_SIZE;
+    constexpr int D_PER_THREAD = HEAD_DIM / WARP_SIZE;
+
+    // Shared memory sized for one page (we load one page at a time).
+    __shared__ __nv_bfloat16 smem_k[PAGE_SIZE * HEAD_DIM];
+    __shared__ __nv_bfloat16 smem_v[PAGE_SIZE * HEAD_DIM];
+
+    const int c         = blockIdx.x;   // chunk index
+    const int b         = blockIdx.y;   // batch index
+    const int hkv       = blockIdx.z;   // kv_head index
+    const int B         = gridDim.y;    // total batch
+    const int Hkv       = gridDim.z;    // total kv_heads
+    const int g         = threadIdx.x / WARP_SIZE;  // head within GQA group
+    const int lane_id   = threadIdx.x % WARP_SIZE;
+
+    if (g >= GROUP_SIZE) return;
+    const int h         = hkv * GROUP_SIZE + g;  // global head index
+    const int seq_len   = seq_lens[b];
+
+    // ---- flat index into partial buffers ----
+    // partials[chunk][batch][kv_head][head_in_group]
+    int flat_idx = ((c * B + b) * Hkv + hkv) * GROUP_SIZE + g;
+
+    // ---- load query ----
+    float q_val[D_PER_THREAD];
+    const __nv_bfloat16* q_ptr = query + b * num_heads * HEAD_DIM + h * HEAD_DIM;
+    #pragma unroll
+    for (int i = 0; i < D_PER_THREAD; ++i) {
+        q_val[i] = __bfloat162float(q_ptr[lane_id + i * WARP_SIZE]);
+    }
+
+    // ---- online-softmax accumulators ----
+    float acc_o[D_PER_THREAD];
+    #pragma unroll
+    for (int i = 0; i < D_PER_THREAD; ++i) acc_o[i] = 0.0f;
+    float m_val = -1e30f;
+    float l_val = 0.0f;
+
+    // ---- page range for this chunk ----
+    int token_start  = c * CHUNK_SIZE;
+    int token_end    = min(token_start + CHUNK_SIZE, seq_len);
+
+    if (token_end <= token_start) {
+        // No valid tokens — write zero partials.
+        #pragma unroll
+        for (int i = 0; i < D_PER_THREAD; ++i) {
+            partial_o[flat_idx * HEAD_DIM + lane_id + i * WARP_SIZE] = 0.0f;
+        }
+        if (lane_id == 0) {
+            partial_m[flat_idx] = -1e30f;
+            partial_l[flat_idx] = 0.0f;
+        }
+        return;
+    }
+
+    int page_start  = token_start / PAGE_SIZE;
+    int page_end    = (token_end + PAGE_SIZE - 1) / PAGE_SIZE;
+
+    // ---- page loop ----
+    for (int page = page_start; page < page_end; ++page) {
+        int block_idx   = block_table[b * max_blocks + page];
+        int page_begin  = page * PAGE_SIZE;
+        // Valid tokens in this page belonging to the current chunk.
+        int first_tok   = max(token_start, page_begin);
+        int last_tok    = min(token_end, page_begin + PAGE_SIZE);
+        int page_valid  = last_tok - first_tok;
+        if (page_valid <= 0) continue;
+
+        int base_k = block_idx * kv_stride_block + hkv * 2 * HEAD_DIM;
+        int base_v = base_k + HEAD_DIM;
+
+        // Load the full page into shared memory (we only use the valid slice).
+        int total_elems = PAGE_SIZE * HEAD_DIM;
+        int elems_per_thread = (total_elems + BLOCK_DIM - 1) / BLOCK_DIM;
+        for (int i = 0; i < elems_per_thread; ++i) {
+            int idx = threadIdx.x + i * BLOCK_DIM;
+            if (idx < total_elems) {
+                int tok = idx / HEAD_DIM;
+                int d   = idx % HEAD_DIM;
+                smem_k[idx] = kv_cache[base_k + tok * kv_stride_token + d];
+                smem_v[idx] = kv_cache[base_v + tok * kv_stride_token + d];
+            }
+        }
+        __syncthreads();
+
+        // Process only the tokens that belong to this chunk.
+        int smem_offset = first_tok - page_begin;  // first valid token row in smem
+        for (int t = smem_offset; t < smem_offset + page_valid; ++t) {
+            float k_vals[D_PER_THREAD], v_vals[D_PER_THREAD];
+            const __nv_bfloat16* k_row = smem_k + t * HEAD_DIM;
+            const __nv_bfloat16* v_row = smem_v + t * HEAD_DIM;
+            #pragma unroll
+            for (int i = 0; i < D_PER_THREAD; ++i) {
+                int d = lane_id + i * WARP_SIZE;
+                k_vals[i] = __bfloat162float(k_row[d]);
+                v_vals[i] = __bfloat162float(v_row[d]);
+            }
+
+            // Q·K dot product.
+            float score = 0.0f;
+            #pragma unroll
+            for (int i = 0; i < D_PER_THREAD; ++i) {
+                score += q_val[i] * k_vals[i];
+            }
+            #pragma unroll
+            for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
+                score += __shfl_xor_sync(0xffffffff, score, offset);
+            }
+            score *= scale;
+
+            // Online softmax step.
+            float m_new     = fmaxf(m_val, score);
+            float exp_diff  = __expf(m_val - m_new);
+            float exp_score = __expf(score - m_new);
+            l_val = exp_diff * l_val + exp_score;
+
+            #pragma unroll
+            for (int i = 0; i < D_PER_THREAD; ++i) {
+                acc_o[i] = fmaf(exp_diff, acc_o[i], exp_score * v_vals[i]);
+            }
+            m_val = m_new;
+        }
+        __syncthreads();
+    }
+
+    // ---- write partial results ----
+    #pragma unroll
+    for (int i = 0; i < D_PER_THREAD; ++i) {
+        partial_o[flat_idx * HEAD_DIM + lane_id + i * WARP_SIZE] = acc_o[i];
+    }
+    if (lane_id == 0) {
+        partial_m[flat_idx] = m_val;
+        partial_l[flat_idx] = l_val;
+    }
+}
+
+// -------------------------------------------------------------------------
+// Reduce kernel — combines chunk partials for each (batch, head).
+//
+// Grid:  (batch, num_heads)
+// Block: HEAD_DIM  threads (each thread handles one output dim element)
+// -------------------------------------------------------------------------
+template <int HEAD_DIM>
+__global__ void paged_attention_reduce_kernel(
+    const float* __restrict__ partial_o,
+    const float* __restrict__ partial_m,
+    const float* __restrict__ partial_l,
+    __nv_bfloat16* __restrict__ output,
+    const int num_heads,
+    const int num_kv_heads,
+    const int group_size,
+    const int num_chunks_per_seq
+) {
+    const int B   = gridDim.x;
+    const int Hkv = num_kv_heads;
+    const int G   = group_size;
+    const int b   = blockIdx.x;   // batch
+    const int h   = blockIdx.y;   // head
+    const int hkv = h / G;         // kv_head
+    const int g   = h % G;         // head within GQA group
+    const int d   = threadIdx.x;   // dimension (0..HEAD_DIM-1)
+
+    float acc_o = 0.0f;
+    float m_val = -1e30f;
+    float l_val = 0.0f;
+
+    for (int c = 0; c < num_chunks_per_seq; ++c) {
+        // partials[chunk][batch][kv_head][head_in_group]
+        int flat_idx = ((c * B + b) * Hkv + hkv) * G + g;
+
+        float chunk_m = partial_m[flat_idx];
+        float chunk_l = partial_l[flat_idx];
+        if (chunk_l <= 0.0f) continue;
+
+        float chunk_o_val = partial_o[flat_idx * HEAD_DIM + d];
+
+        float m_new     = fmaxf(m_val, chunk_m);
+        float exp_self  = __expf(m_val - m_new);
+        float exp_chunk = __expf(chunk_m - m_new);
+
+        acc_o = exp_self * acc_o + exp_chunk * chunk_o_val;
+        l_val = exp_self * l_val + exp_chunk * chunk_l;
+        m_val = m_new;
+    }
+
+    float inv_l = (l_val > 0.0f) ? (1.0f / l_val) : 0.0f;
+    output[(b * num_heads + h) * HEAD_DIM + d] = __float2bfloat16(acc_o * inv_l);
+}
+
+// -------------------------------------------------------------------------
+// Explicit template instantiations.
+// -------------------------------------------------------------------------
+#define INST_CHUNK(HD, PS, GS, CS) \
+    template __global__ void paged_attention_chunk_kernel<HD, PS, GS, CS>( \
+        const __nv_bfloat16* __restrict__, \
+        const __nv_bfloat16* __restrict__, \
+        const int32_t* __restrict__, \
+        const int32_t* __restrict__, \
+        float* __restrict__, float* __restrict__, float* __restrict__, \
+        const int, const int, const int, const int, const int, const float);
+
+#define INST_REDUCE(HD) \
+    template __global__ void paged_attention_reduce_kernel<HD>( \
+        const float* __restrict__, const float* __restrict__, \
+        const float* __restrict__, __nv_bfloat16* __restrict__, \
+        const int, const int, const int, const int);
+
+// head_dim = 128
+INST_CHUNK(128, 16, 4, 256);
+INST_CHUNK(128, 16, 8, 256);
+INST_REDUCE(128);
+
+// head_dim = 64
+INST_CHUNK(64, 16, 4, 256);
+INST_REDUCE(64);
+
+// -------------------------------------------------------------------------
+// Host launch helpers
+// -------------------------------------------------------------------------
+static void launch_chunk_kernel(
+    const __nv_bfloat16* q_ptr,
+    const __nv_bfloat16* kv_ptr,
+    const int32_t* bt_ptr,
+    const int32_t* sl_ptr,
+    float* po_ptr, float* pm_ptr, float* pl_ptr,
+    int batch, int num_heads, int num_kv_heads,
+    int head_dim, int group_size, int page_size,
+    int max_blocks, int num_chunks_per_seq,
+    int kv_stride_token, int kv_stride_block,
+    float scale)
+{
+    dim3 grid(num_chunks_per_seq, batch, num_kv_heads);
+
+    if (head_dim == 128) {
+        if (group_size == 4) {
+            dim3 block(4 * WARP_SIZE);
+            paged_attention_chunk_kernel<128, 16, 4, 256>
+                <<<grid, block>>>(q_ptr, kv_ptr, bt_ptr, sl_ptr,
+                    po_ptr, pm_ptr, pl_ptr,
+                    num_heads, num_kv_heads, max_blocks,
+                    kv_stride_token, kv_stride_block, scale);
+        } else if (group_size == 8) {
+            dim3 block(8 * WARP_SIZE);
+            paged_attention_chunk_kernel<128, 16, 8, 256>
+                <<<grid, block>>>(q_ptr, kv_ptr, bt_ptr, sl_ptr,
+                    po_ptr, pm_ptr, pl_ptr,
+                    num_heads, num_kv_heads, max_blocks,
+                    kv_stride_token, kv_stride_block, scale);
+        }
+    } else if (head_dim == 64) {
+        if (group_size == 4) {
+            dim3 block(4 * WARP_SIZE);
+            paged_attention_chunk_kernel<64, 16, 4, 256>
+                <<<grid, block>>>(q_ptr, kv_ptr, bt_ptr, sl_ptr,
+                    po_ptr, pm_ptr, pl_ptr,
+                    num_heads, num_kv_heads, max_blocks,
+                    kv_stride_token, kv_stride_block, scale);
+        }
+    }
+}
+
+static void launch_reduce_kernel(
+    const float* po_ptr, const float* pm_ptr, const float* pl_ptr,
+    __nv_bfloat16* out_ptr,
+    int batch, int num_heads, int num_kv_heads,
+    int head_dim, int group_size, int num_chunks_per_seq)
+{
+    dim3 grid(batch, num_heads);
+    dim3 block(head_dim);
+
+    if (head_dim == 128) {
+        paged_attention_reduce_kernel<128>
+            <<<grid, block>>>(po_ptr, pm_ptr, pl_ptr, out_ptr,
+                num_heads, num_kv_heads, group_size, num_chunks_per_seq);
+    } else if (head_dim == 64) {
+        paged_attention_reduce_kernel<64>
+            <<<grid, block>>>(po_ptr, pm_ptr, pl_ptr, out_ptr,
+                num_heads, num_kv_heads, group_size, num_chunks_per_seq);
+    }
+}
+
+// -------------------------------------------------------------------------
+// Top-level launch function.
+// -------------------------------------------------------------------------
+void launch_paged_attention(
+    const torch::Tensor& query,
+    const torch::Tensor& kv_cache,
+    const torch::Tensor& block_table,
+    const torch::Tensor& seq_lens,
+    torch::Tensor& output,
+    torch::Tensor& partial_o,
+    torch::Tensor& partial_m,
+    torch::Tensor& partial_l,
+    int num_kv_heads,
+    int head_dim,
+    int page_size,
+    int chunk_size)
+{
+    int batch      = query.size(0);
+    int num_heads  = query.size(1);
+    int group_size = num_heads / num_kv_heads;
+    int max_blocks = block_table.size(1);
+
+    int kv_stride_token = num_kv_heads * 2 * head_dim;
+    int kv_stride_block = page_size * num_kv_heads * 2 * head_dim;
+
+    float scale = 1.0f / sqrtf(static_cast<float>(head_dim));
+
+    // Max seq_len across batch for chunk count.
+    auto sl_cpu = seq_lens.cpu();
+    auto sl_acc = sl_cpu.data_ptr<int32_t>();
+    int max_seq = 0;
+    for (int i = 0; i < batch; ++i) {
+        int sl = sl_acc[i];
+        if (sl > max_seq) max_seq = sl;
+    }
+    int num_chunks_per_seq = (max_seq + chunk_size - 1) / chunk_size;
+    if (num_chunks_per_seq < 1) num_chunks_per_seq = 1;
+
+    auto* q_ptr   = reinterpret_cast<const __nv_bfloat16*>(query.const_data_ptr());
+    auto* kv_ptr  = reinterpret_cast<const __nv_bfloat16*>(kv_cache.const_data_ptr());
+    auto* bt_ptr  = reinterpret_cast<const int32_t*>(block_table.const_data_ptr());
+    auto* sl_ptr  = reinterpret_cast<const int32_t*>(seq_lens.const_data_ptr());
+    auto* out_ptr = reinterpret_cast<__nv_bfloat16*>(output.data_ptr());
+    auto* po_ptr  = reinterpret_cast<float*>(partial_o.data_ptr());
+    auto* pm_ptr  = reinterpret_cast<float*>(partial_m.data_ptr());
+    auto* pl_ptr  = reinterpret_cast<float*>(partial_l.data_ptr());
+
+    launch_chunk_kernel(
+        q_ptr, kv_ptr, bt_ptr, sl_ptr, po_ptr, pm_ptr, pl_ptr,
+        batch, num_heads, num_kv_heads, head_dim, group_size,
+        page_size, max_blocks, num_chunks_per_seq,
+        kv_stride_token, kv_stride_block, scale);
+
+    launch_reduce_kernel(
+        po_ptr, pm_ptr, pl_ptr, out_ptr,
+        batch, num_heads, num_kv_heads, head_dim, group_size,
+        num_chunks_per_seq);
+}
+"""
+
+cpp_src = r"""
+#include <torch/extension.h>
+
+void launch_paged_attention(
+    const torch::Tensor& query,
+    const torch::Tensor& kv_cache,
+    const torch::Tensor& block_table,
+    const torch::Tensor& seq_lens,
+    torch::Tensor& output,
+    torch::Tensor& partial_o,
+    torch::Tensor& partial_m,
+    torch::Tensor& partial_l,
+    int num_kv_heads,
+    int head_dim,
+    int page_size,
+    int chunk_size);
+"""
+
+# ---------------------------------------------------------------------------
+# Compile the extension.
+# ---------------------------------------------------------------------------
+_extension = None
+
+
+def _get_extension():
+    global _extension
+    if _extension is None:
+        _extension = load_inline(
+            name="paged_attention_decode",
+            cpp_sources=[cpp_src],
+            cuda_sources=[cuda_src],
+            functions=["launch_paged_attention"],
+            extra_cuda_cflags=[
+                "-arch=sm_100a",
+                "--expt-relaxed-constexpr",
+                "-O3",
+                "--use_fast_math",
+                "-maxrregcount=128",
+            ],
+            verbose=False,
+        )
+    return _extension
+
+
+# ---------------------------------------------------------------------------
+# Python Model
+# ---------------------------------------------------------------------------
+class Model(nn.Module):
+    """Single-query paged attention decode — split-K CUDA kernel."""
+
+    def __init__(
+        self,
+        batch: int,
+        num_heads: int,
+        num_kv_heads: int,
+        head_dim: int,
+        seq_len: int,
+        page_size: int,
+    ):
+        super().__init__()
+        assert num_heads % num_kv_heads == 0
+        self.batch = batch
+        self.num_heads = num_heads
+        self.num_kv_heads = num_kv_heads
+        self.head_dim = head_dim
+        self.seq_len = seq_len
+        self.page_size = page_size
+        self.group_size = num_heads // num_kv_heads
+        self.scale = 1.0 / math.sqrt(head_dim)
+
+        self._partial_o = None
+        self._partial_m = None
+        self._partial_l = None
+
+        self.register_buffer("_dummy", torch.zeros(1, dtype=torch.bfloat16), persistent=False)
+
+    def _ensure_partials(self, device, num_chunks_per_seq):
+        B = self.batch
+        Hkv = self.num_kv_heads
+        G = self.group_size
+        num_flat = num_chunks_per_seq * B * Hkv
+        need = (
+            self._partial_o is None
+            or self._partial_o.device != device
+            or self._partial_o.shape[0] != num_flat
+        )
+        if need:
+            self._partial_o = torch.empty(num_flat, G, self.head_dim,
+                                          dtype=torch.float32, device=device)
+            self._partial_m = torch.empty(num_flat, G,
+                                          dtype=torch.float32, device=device)
+            self._partial_l = torch.empty(num_flat, G,
+                                          dtype=torch.float32, device=device)
+
+    def forward(
+        self,
+        query: torch.Tensor,
+        kv_cache: torch.Tensor,
+        block_table: torch.Tensor,
+        seq_lens: torch.Tensor,
+    ) -> torch.Tensor:
+        B, H, D = query.shape
+
+        query = query.contiguous()
+        kv_cache = kv_cache.contiguous()
+        block_table = block_table.contiguous()
+        seq_lens = seq_lens.contiguous()
+
+        out = torch.empty(B, H, D, dtype=query.dtype, device=query.device)
+
+        max_sl = int(seq_lens.max().item())
+        num_chunks_per_seq = max((max_sl + CHUNK_SIZE - 1) // CHUNK_SIZE, 1)
+        self._ensure_partials(query.device, num_chunks_per_seq)
+        num_flat = num_chunks_per_seq * B * self.num_kv_heads
+
+        partial_o = self._partial_o[:num_flat].reshape(num_flat * self.group_size, self.head_dim)
+        partial_m = self._partial_m[:num_flat].reshape(num_flat * self.group_size)
+        partial_l = self._partial_l[:num_flat].reshape(num_flat * self.group_size)
+
+        ext = _get_extension()
+        ext.launch_paged_attention(
+            query,
+            kv_cache,
+            block_table.to(torch.int32),
+            seq_lens.to(torch.int32),
+            out,
+            partial_o,
+            partial_m,
+            partial_l,
+            self.num_kv_heads,
+            self.head_dim,
+            self.page_size,
+            CHUNK_SIZE,
+        )
+
+        return out
+
+
+# ---------------------------------------------------------------------------
+# Input builders (mirror reference.py exactly)
+# ---------------------------------------------------------------------------
+def get_inputs():
+    B = BATCH
+    H = NUM_HEADS
+    Hkv = NUM_KV_HEADS
+    D = HEAD_DIM
+    L = SEQ_LEN
+    P = PAGE_SIZE
+
+    pages_per_seq = (L + P - 1) // P
+    total_pages = max(B * pages_per_seq + 8, 64)
+
+    query = torch.randn(B, H, D, dtype=torch.bfloat16) * 0.1
+    kv_cache = torch.randn(total_pages, P, Hkv, 2 * D, dtype=torch.bfloat16) * 0.1
+
+    perm = torch.randperm(total_pages)[: B * pages_per_seq].reshape(B, pages_per_seq).int()
+    block_table = perm.contiguous()
+    seq_lens = torch.full((B,), L, dtype=torch.int32)
+
+    return [query, kv_cache, block_table, seq_lens]
+
+
+def get_init_inputs():
+    return [BATCH, NUM_HEADS, NUM_KV_HEADS, HEAD_DIM, SEQ_LEN, PAGE_SIZE]

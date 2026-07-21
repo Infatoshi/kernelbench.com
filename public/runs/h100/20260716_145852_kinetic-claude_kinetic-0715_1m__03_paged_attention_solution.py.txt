@@ -1,0 +1,808 @@
+"""Paged attention decode for H100 (SM90 HBM, ~2.0 TB/s).
+
+Custom CUDA kernel (torch load_inline, flash-decoding style split-K):
+  - Work item = (batch, kv_head, page_chunk). Every (b, kvh) group is
+    processed by CTA(s) covering the whole GQA group (all query heads that
+    share the KV head), so every KV byte is gathered from DRAM exactly once.
+  - Item-major persistent CTAs: each CTA reads a contiguous span of items;
+    the cp.async issue stream runs STAGES-1 tiles ahead across item
+    boundaries, keeping the gather pipeline free of per-chunk fill/drain.
+  - QK^T and P·V run on mma.m16n8k16 tensor cores (bf16 in, fp32 acc);
+    ldmatrix feeds from padded, bank-conflict-free smem row layout.
+  - Per-tile cross-warp max/rowsum exchange keeps the online softmax
+    consistent across the warp-tile mapping; scaled in log2 domain (exp2f).
+  - Split-K partials (m, l, O, fp32, G rows only) go to global scratch; the
+    last-arriving CTA per (batch, kv_head) (atomic counter trick, no reset
+    needed) merges partials with log-sum-exp and writes bf16 out.
+
+A generic per-(batch, head) fallback kernel handles shapes off the fast
+path (any head_dim % 8 == 0, any page_size, any GQA ratio).
+"""
+import math
+
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+OP_TYPE = "attention"
+SUPPORTED_PRECISIONS = ["bf16"]
+HARDWARE_REQUIRED = ["RTX_PRO_6000", "H100", "B200"]
+
+# --- Shape knobs (overridden by check.py / benchmark.py from shapes.py) ----
+BATCH = 8
+NUM_HEADS = 32
+NUM_KV_HEADS = 8
+HEAD_DIM = 128
+SEQ_LEN = 1024
+PAGE_SIZE = 16
+
+_CPP_SRC = r"""
+#include <torch/extension.h>
+torch::Tensor paged_attn(torch::Tensor q, torch::Tensor kvc, torch::Tensor bt, torch::Tensor seq_lens, double scale);
+"""
+
+_CUDA_SRC = r"""
+#include <torch/extension.h>
+#include <ATen/cuda/CUDAContext.h>
+#include <cuda_bf16.h>
+#include <cuda_runtime.h>
+#include <unordered_map>
+#include <mutex>
+#include <cstdint>
+#include <cstdlib>
+
+#define DEVINL __device__ __forceinline__
+
+constexpr int kThreads = 128;
+constexpr int kMRows = 16;
+
+DEVINL uint32_t smem_u32(const void* p) {
+    return static_cast<uint32_t>(__cvta_generic_to_shared(p));
+}
+DEVINL void cp_async_16(void* dst, const void* src) {
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"(smem_u32(dst)), "l"(src));
+}
+DEVINL uint64_t make_evict_first_policy() {
+    uint64_t pol;
+    asm volatile("createpolicy.fractional.L2::evict_first.b64 %0, 1.0;\n" : "=l"(pol));
+    return pol;
+}
+DEVINL void cp_async_16_ef(void* dst, const void* src, uint64_t pol) {
+    asm volatile("cp.async.cg.shared.global.L2::cache_hint [%0], [%1], 16, %2;\n"
+                 ::"r"(smem_u32(dst)), "l"(src), "l"(pol));
+}
+DEVINL void cp_commit() { asm volatile("cp.async.commit_group;\n"); }
+template <int N>
+DEVINL void cp_wait() { asm volatile("cp.async.wait_group %0;\n" ::"n"(N)); }
+
+DEVINL void ldsm_x4(uint32_t (&r)[4], const void* addr) {
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+                 : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "r"(smem_u32(addr)));
+}
+DEVINL void ldsm_x4_t(uint32_t (&r)[4], const void* addr) {
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+                 : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "r"(smem_u32(addr)));
+}
+DEVINL void ldsm_x2(uint32_t (&r)[2], const void* addr) {
+    asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0,%1}, [%2];\n"
+                 : "=r"(r[0]), "=r"(r[1]) : "r"(smem_u32(addr)));
+}
+DEVINL void ldsm_x2_t(uint32_t (&r)[2], const void* addr) {
+    asm volatile("ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%0,%1}, [%2];\n"
+                 : "=r"(r[0]), "=r"(r[1]) : "r"(smem_u32(addr)));
+}
+DEVINL void mma_16816(float (&c)[4], const uint32_t (&a)[4], const uint32_t (&b)[2]) {
+    asm volatile(
+        "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
+        "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+        : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
+        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
+}
+
+// ---------------------------------------------------------------------------
+// Persistent item-major flash decoding.
+//   item = (unit = b*Hkv+kvh, split) -> chunk_pages pages of one (b,kvh) seq.
+//   CTA c owns a contiguous span of items; the cp.async issue stream is the
+//   item-major tile series delayed by STAGES-1 tiles, so prefetch flows
+//   across item boundaries (no per-item fill/drain bubbles).
+// ---------------------------------------------------------------------------
+template <int D, int LOG2P, int STAGES, int TOK, int NT>
+__global__ void __launch_bounds__(NT)
+paged_attn_kernel(const __nv_bfloat16* __restrict__ q,
+                  const __nv_bfloat16* __restrict__ kvc,
+                  const int* __restrict__ bt,
+                  const int* __restrict__ seq_lens,
+                  __nv_bfloat16* __restrict__ out,
+                  float* __restrict__ partials,
+                  int* __restrict__ counters,
+                  int B, int H, int Hkv,
+                  int num_blocks, int max_pages,
+                  int chunk_pages, int splits, int ntiles_per_chunk,
+                  int items_per_cta, int units,
+                  float scale_log2e) {
+    constexpr int P = 1 << LOG2P;
+    constexpr int RowPad = D * 2 + 16;
+    constexpr int PD = D + 8;
+    constexpr int StageBytes = TOK * 2 * RowPad;
+    constexpr int KS = D / 16;
+    constexpr int VEC = D / 8;
+    constexpr int NBLK = TOK / 8;
+    constexpr int NW = NT / 32;
+    constexpr int ND8 = D / (NW * 8);
+    constexpr int OREG = 4 * ND8;
+
+    const int tid = threadIdx.x;
+    const int warp = tid >> 5;
+    const int lane = tid & 31;
+    const int G = H / Hkv;
+
+    extern __shared__ char smem[];
+    char* q_s = smem;                                  // 2 buffers x 16 x RowPad
+    char* p_s = q_s + 2 * kMRows * RowPad;
+    constexpr int PRow = TOK * 2 + 16;
+    char* stages = p_s + kMRows * PRow;
+    __shared__ float mxbuf_s[2 * 16 * kMRows];
+    __shared__ float rsbuf_s[2 * 16 * kMRows];
+    float* mxbuf = mxbuf_s;
+    float* rsbuf = rsbuf_s;
+
+    const int NTPC = ntiles_per_chunk;
+    const int n_items = units * splits;
+    const int i0 = blockIdx.x * items_per_cta;
+    int i1 = i0 + items_per_cta;
+    if (i1 > n_items) i1 = n_items;
+    const int my_tiles = (i1 > i0) ? (i1 - i0) * NTPC : 0;
+    if (i0 >= i1) return;
+
+    // ---- issue-side cursor ---------------------------------------------------
+    struct IssueCursor {
+        int item;
+        int tile;
+        int np;
+        const int* bt_row;
+    } ic;
+    auto ic_load_item = [&](int item) {
+        ic.item = item;
+        ic.tile = 0;
+        int u = item / splits;
+        int b = u / Hkv;
+        int L = __ldg(seq_lens + b);
+        int np = (L + P - 1) >> LOG2P;
+        ic.np = np > 0 ? np : 0;
+        ic.bt_row = bt + (size_t)b * max_pages;
+    };
+
+    int issue_flat = 0;   // local flat tiles issued
+    const uint64_t l2pol = make_evict_first_policy();
+    auto issue_next = [&]() -> void {
+        // capture current item state; the cursor advances at the end
+        const int my_item = ic.item;
+        const int ti = ic.tile;
+        int u = my_item / splits;
+        int s_ = my_item % splits;
+        int kvh = u % Hkv;
+        int page0 = s_ * chunk_pages;
+        const int* row_c = ic.bt_row;
+        const int np_c = ic.np;
+        const int nphi = np_c > 0 ? (np_c < max_pages ? np_c : max_pages) : 1;
+        int stage = issue_flat % STAGES;
+        ++issue_flat;
+        if (++ic.tile == NTPC) ic_load_item(my_item + 1);
+        if (ti == 0) {
+            char* qb = q_s + (my_item & 1) * kMRows * RowPad;
+            const __nv_bfloat16* q_base = q + ((size_t)u * G) * D;
+            for (int i = tid; i < G * VEC; i += NT) {
+                int r = i / VEC, c = i % VEC;
+                cp_async_16(qb + r * RowPad + c * 16, q_base + r * D + c * 8);
+            }
+        }
+        char* stK = stages + stage * StageBytes;
+        char* stV = stK + TOK * RowPad;
+        // round-strided mapping: warp covers one token's 512B per instruction
+        constexpr int ROUNDS = TOK * 2 * VEC / NT;     // vecs per thread
+        int tok_base = ti * TOK;
+        #pragma unroll
+        for (int r = 0; r < ROUNDS; ++r) {
+            int idx = tid + r * NT;
+            int tk = idx / (2 * VEC);
+            int part = idx % (2 * VEC);
+            int gtok = tok_base + tk;
+            int pg_in_chunk = gtok >> LOG2P;             // page within chunk slice
+            int slot = gtok & (P - 1);
+            int pagep = page0 + pg_in_chunk;
+            pagep = pagep < nphi ? pagep : (nphi - 1);
+            int bid = __ldg(row_c + pagep);
+            bool vis = part >= VEC;
+            int v = vis ? part - VEC : part;
+            const __nv_bfloat16* src =
+                kvc + (((size_t)bid * P + slot) * Hkv + kvh) * (2 * D) + (vis ? D : 0) + v * 8;
+            cp_async_16((vis ? stV : stK) + tk * RowPad + v * 16, src);
+        }
+        cp_commit();
+    };
+    // prologue: fill up to STAGES-1 groups
+    ic_load_item(i0);
+    #pragma unroll
+    for (int s = 0; s < STAGES - 1; ++s) {
+        if (s < my_tiles) issue_next(); else cp_commit();
+    }
+
+    uint32_t qfrag[KS][4];
+    const __nv_bfloat16* qbase_sm = nullptr;
+    auto load_qfrags = [&](int item) {
+        qbase_sm = reinterpret_cast<const __nv_bfloat16*>(q_s + (item & 1) * kMRows * RowPad);
+        int r = (lane & 7) + ((lane & 8) ? 8 : 0);
+        int coff = (lane & 16) ? 16 : 0;
+        #pragma unroll
+        for (int ks = 0; ks < KS; ++ks)
+            ldsm_x4(qfrag[ks], reinterpret_cast<const char*>(qbase_sm) + r * RowPad + ks * 32 + coff);
+    };
+
+    float m0, m1, l0, l1, a0_, a1_;
+    float oreg[OREG];
+    const int r_q = lane >> 2;
+    const int c_q = (lane & 3) * 2;
+    auto reset_state = [&]() {
+        m0 = -1e30f; m1 = -1e30f; l0 = 0.f; l1 = 0.f;
+        a0_ = 1.f; a1_ = 1.f;
+        #pragma unroll
+        for (int i = 0; i < OREG; ++i) oreg[i] = 0.f;
+    };
+
+    auto flush_item = [&](int item) {
+        int u = item / splits;
+        int s_ = item - u * splits;
+        int b = u / Hkv;
+        int kvh = u % Hkv;
+        float* part = partials + (size_t)item * G * PD;
+        #pragma unroll
+        for (int j = 0; j < ND8; ++j) {
+            int col = warp * ND8 * 8 + j * 8 + c_q;
+            if (r_q < G) {
+                part[r_q * PD + col] = oreg[j * 4 + 0];
+                part[r_q * PD + col + 1] = oreg[j * 4 + 1];
+            }
+            if (r_q + 8 < G) {
+                part[(r_q + 8) * PD + col] = oreg[j * 4 + 2];
+                part[(r_q + 8) * PD + col + 1] = oreg[j * 4 + 3];
+            }
+        }
+        if (warp == 0 && (lane & 3) == 0) {
+            if (r_q < G) { part[r_q * PD + D] = m0; part[r_q * PD + D + 1] = l0; }
+            if (r_q + 8 < G) { part[(r_q + 8) * PD + D] = m1; part[(r_q + 8) * PD + D + 1] = l1; }
+        }
+        __threadfence();
+        __shared__ int is_last_s;
+        __syncthreads();
+        if (tid == 0) {
+            int old = atomicAdd(&counters[u], 1);
+            is_last_s = ((old + 1) % splits == 0) ? 1 : 0;
+        }
+        __syncthreads();
+        if (!is_last_s) return;
+        __threadfence();
+        // merge all splits' partials for this unit; thread handles (row, 8-col
+        // group); unroll splits by 4 for memory-level parallelism.
+        constexpr int CPG = D / 8;                 // col groups per row
+        const float* unit_base = partials + (size_t)(u * splits) * G * PD;
+        for (int idx = tid; idx < G * CPG; idx += NT) {
+            const int r = idx / CPG;
+            const int cg = idx % CPG;
+            const int col0 = cg * 8;
+            const float* base = unit_base + r * PD;
+            // pass 1: M = max_j m_j  (strided scalar loads, unroll 8)
+            float M = -1e30f;
+            int j = 0;
+            for (; j + 8 <= splits; j += 8) {
+                float m0_ = __ldg(base + (size_t)(j + 0) * G * PD + D);
+                float m1_ = __ldg(base + (size_t)(j + 1) * G * PD + D);
+                float m2_ = __ldg(base + (size_t)(j + 2) * G * PD + D);
+                float m3_ = __ldg(base + (size_t)(j + 3) * G * PD + D);
+                float m4_ = __ldg(base + (size_t)(j + 4) * G * PD + D);
+                float m5_ = __ldg(base + (size_t)(j + 5) * G * PD + D);
+                float m6_ = __ldg(base + (size_t)(j + 6) * G * PD + D);
+                float m7_ = __ldg(base + (size_t)(j + 7) * G * PD + D);
+                M = fmaxf(M, fmaxf(fmaxf(fmaxf(m0_, m1_), fmaxf(m2_, m3_)),
+                                   fmaxf(fmaxf(m4_, m5_), fmaxf(m6_, m7_))));
+            }
+            for (; j < splits; ++j) M = fmaxf(M, __ldg(base + (size_t)j * G * PD + D));
+            // pass 2: denom and O accumulation, unroll 4
+            float denom = 0.f;
+            float oacc[8];
+            #pragma unroll
+            for (int i = 0; i < 8; ++i) oacc[i] = 0.f;
+            for (j = 0; j + 4 <= splits; j += 4) {
+                float m0_ = __ldg(base + (size_t)(j + 0) * G * PD + D);
+                float l0_ = __ldg(base + (size_t)(j + 0) * G * PD + D + 1);
+                float m1_ = __ldg(base + (size_t)(j + 1) * G * PD + D);
+                float l1_ = __ldg(base + (size_t)(j + 1) * G * PD + D + 1);
+                float m2_ = __ldg(base + (size_t)(j + 2) * G * PD + D);
+                float l2_ = __ldg(base + (size_t)(j + 2) * G * PD + D + 1);
+                float m3_ = __ldg(base + (size_t)(j + 3) * G * PD + D);
+                float l3_ = __ldg(base + (size_t)(j + 3) * G * PD + D + 1);
+                float4 v0a = *reinterpret_cast<const float4*>(base + (size_t)(j + 0) * G * PD + col0);
+                float4 v0b = *reinterpret_cast<const float4*>(base + (size_t)(j + 0) * G * PD + col0 + 4);
+                float4 v1a = *reinterpret_cast<const float4*>(base + (size_t)(j + 1) * G * PD + col0);
+                float4 v1b = *reinterpret_cast<const float4*>(base + (size_t)(j + 1) * G * PD + col0 + 4);
+                float4 v2a = *reinterpret_cast<const float4*>(base + (size_t)(j + 2) * G * PD + col0);
+                float4 v2b = *reinterpret_cast<const float4*>(base + (size_t)(j + 2) * G * PD + col0 + 4);
+                float4 v3a = *reinterpret_cast<const float4*>(base + (size_t)(j + 3) * G * PD + col0);
+                float4 v3b = *reinterpret_cast<const float4*>(base + (size_t)(j + 3) * G * PD + col0 + 4);
+                float w0_ = exp2f(m0_ - M), w1_ = exp2f(m1_ - M);
+                float w2_ = exp2f(m2_ - M), w3_ = exp2f(m3_ - M);
+                denom += w0_ * l0_ + w1_ * l1_ + w2_ * l2_ + w3_ * l3_;
+                oacc[0] += w0_ * v0a.x + w1_ * v1a.x + w2_ * v2a.x + w3_ * v3a.x;
+                oacc[1] += w0_ * v0a.y + w1_ * v1a.y + w2_ * v2a.y + w3_ * v3a.y;
+                oacc[2] += w0_ * v0a.z + w1_ * v1a.z + w2_ * v2a.z + w3_ * v3a.z;
+                oacc[3] += w0_ * v0a.w + w1_ * v1a.w + w2_ * v2a.w + w3_ * v3a.w;
+                oacc[4] += w0_ * v0b.x + w1_ * v1b.x + w2_ * v2b.x + w3_ * v3b.x;
+                oacc[5] += w0_ * v0b.y + w1_ * v1b.y + w2_ * v2b.y + w3_ * v3b.y;
+                oacc[6] += w0_ * v0b.z + w1_ * v1b.z + w2_ * v2b.z + w3_ * v3b.z;
+                oacc[7] += w0_ * v0b.w + w1_ * v1b.w + w2_ * v2b.w + w3_ * v3b.w;
+            }
+            for (; j < splits; ++j) {
+                const float* pj = base + (size_t)j * G * PD;
+                float wj = exp2f(__ldg(pj + D) - M);
+                denom += wj * __ldg(pj + D + 1);
+                float4 va = *reinterpret_cast<const float4*>(pj + col0);
+                float4 vb = *reinterpret_cast<const float4*>(pj + col0 + 4);
+                oacc[0] += wj * va.x; oacc[1] += wj * va.y; oacc[2] += wj * va.z; oacc[3] += wj * va.w;
+                oacc[4] += wj * vb.x; oacc[5] += wj * vb.y; oacc[6] += wj * vb.z; oacc[7] += wj * vb.w;
+            }
+            if (r < G) {
+                float inv = denom > 0.f ? (1.f / denom) : 0.f;
+                __nv_bfloat162 ob[4];
+                #pragma unroll
+                for (int i = 0; i < 4; ++i)
+                    ob[i] = __floats2bfloat162_rn(oacc[2 * i] * inv, oacc[2 * i + 1] * inv);
+                uint4* dst = reinterpret_cast<uint4*>(
+                    out + ((size_t)b * H + (size_t)kvh * G + r) * D + col0);
+                uint4 val;
+                val.x = reinterpret_cast<uint32_t*>(&ob[0])[0];
+                val.y = reinterpret_cast<uint32_t*>(&ob[1])[0];
+                val.z = reinterpret_cast<uint32_t*>(&ob[2])[0];
+                val.w = reinterpret_cast<uint32_t*>(&ob[3])[0];
+                *dst = val;
+            }
+        }
+    };
+
+    cp_wait<STAGES - 2>();   // tile0 group (Q + tile0) resident
+    __syncthreads();
+    load_qfrags(i0);
+    reset_state();
+    int cur_item = i0;
+    int cur_L = __ldg(seq_lens + (cur_item / splits) / Hkv);
+
+    for (int n = 0; n < my_tiles; ++n) {
+        int s_tile = n % NTPC;
+        char* stK = stages + (n % STAGES) * StageBytes;
+        char* stV = stK + TOK * RowPad;
+
+        if (n + STAGES - 1 < my_tiles) issue_next(); else cp_commit();
+
+        int split_local = cur_item % splits;
+        int valid = cur_L - split_local * chunk_pages * P;
+        if (valid > chunk_pages * P) valid = chunk_pages * P;
+
+        float rs0 = 0.f, rs1 = 0.f;
+        float gg0 = -1e30f, gg1 = -1e30f;
+        float ssave[(NBLK / NW) * 4];
+        #pragma unroll
+        for (int nb = 0; nb < NBLK / NW; ++nb) {
+            int wblk = warp + nb * NW;
+            float sacc[4] = {0.f, 0.f, 0.f, 0.f};
+#ifndef SKIP_S
+            {
+                int kr = wblk * 8 + (lane & 7);
+                int kc = (lane & 8) ? 16 : 0;
+                #pragma unroll
+                for (int ks = 0; ks < KS; ++ks) {
+                    uint32_t bfrag[2];
+                    ldsm_x2(bfrag, stK + kr * RowPad + ks * 32 + kc);
+                    uint32_t aqk[4];
+#ifdef Q_NOCACHE
+                    int qr = (lane & 7) + ((lane & 8) ? 8 : 0);
+                    int qc = (lane & 16) ? 16 : 0;
+                    ldsm_x4(aqk, reinterpret_cast<const char*>(qbase_sm) + qr * RowPad + ks * 32 + qc);
+                    mma_16816(sacc, aqk, bfrag);
+#else
+                    mma_16816(sacc, qfrag[ks], bfrag);
+#endif
+                }
+            }
+#endif
+            int tbase = s_tile * TOK + wblk * 8 + c_q;
+            #pragma unroll
+            for (int i = 0; i < 4; ++i) sacc[i] *= scale_log2e;
+            if (tbase >= valid) { sacc[0] = -INFINITY; sacc[2] = -INFINITY; }
+            if (tbase + 1 >= valid) { sacc[1] = -INFINITY; sacc[3] = -INFINITY; }
+            float mx0 = fmaxf(sacc[0], sacc[1]);
+            float mx1 = fmaxf(sacc[2], sacc[3]);
+            mx0 = fmaxf(mx0, __shfl_xor_sync(0xffffffff, mx0, 1));
+            mx1 = fmaxf(mx1, __shfl_xor_sync(0xffffffff, mx1, 1));
+            mx0 = fmaxf(mx0, __shfl_xor_sync(0xffffffff, mx0, 2));
+            mx1 = fmaxf(mx1, __shfl_xor_sync(0xffffffff, mx1, 2));
+            gg0 = fmaxf(gg0, mx0);
+            gg1 = fmaxf(gg1, mx1);
+            ssave[nb * 4 + 0] = sacc[0];
+            ssave[nb * 4 + 1] = sacc[1];
+            ssave[nb * 4 + 2] = sacc[2];
+            ssave[nb * 4 + 3] = sacc[3];
+        }
+        const int par = n & 1;
+        if ((lane & 3) == 0) {
+            mxbuf[(par * NW + warp) * kMRows + r_q] = gg0;
+            mxbuf[(par * NW + warp) * kMRows + r_q + 8] = gg1;
+        }
+#ifndef SKIP_EXCH
+        __syncthreads();  // sync A
+#endif
+        float g0 = gg0;
+        float g1 = gg1;
+#ifndef SKIP_EXCH
+        g0 = fmaxf(g0, mxbuf[(par * NW + 0) * kMRows + r_q]);
+        g1 = fmaxf(g1, mxbuf[(par * NW + 0) * kMRows + r_q + 8]);
+        #pragma unroll
+        for (int w = 1; w < NW; ++w) {
+            g0 = fmaxf(g0, mxbuf[(par * NW + w) * kMRows + r_q]);
+            g1 = fmaxf(g1, mxbuf[(par * NW + w) * kMRows + r_q + 8]);
+        }
+#endif
+        float mn0 = fmaxf(m0, g0);
+        float mn1 = fmaxf(m1, g1);
+        a0_ = exp2f(m0 - mn0);
+        a1_ = exp2f(m1 - mn1);
+        m0 = mn0; m1 = mn1;
+
+        #pragma unroll
+        for (int nb = 0; nb < NBLK / NW; ++nb) {
+            float p0 = exp2f(ssave[nb * 4 + 0] - mn0);
+            float p1 = exp2f(ssave[nb * 4 + 1] - mn0);
+            float p2 = exp2f(ssave[nb * 4 + 2] - mn1);
+            float p3 = exp2f(ssave[nb * 4 + 3] - mn1);
+            float r0 = p0 + p1, r1 = p2 + p3;
+            r0 += __shfl_xor_sync(0xffffffff, r0, 1);
+            r1 += __shfl_xor_sync(0xffffffff, r1, 1);
+            r0 += __shfl_xor_sync(0xffffffff, r0, 2);
+            r1 += __shfl_xor_sync(0xffffffff, r1, 2);
+            rs0 += r0; rs1 += r1;
+            int wblk = warp + nb * NW;
+            __nv_bfloat162 pv0 = __floats2bfloat162_rn(p0, p1);
+            __nv_bfloat162 pv1 = __floats2bfloat162_rn(p2, p3);
+            char* prow = p_s + r_q * PRow + wblk * 16 + c_q * 2;
+            *reinterpret_cast<__nv_bfloat162*>(prow) = pv0;
+            *reinterpret_cast<__nv_bfloat162*>(prow + 8 * PRow) = pv1;
+        }
+        if ((lane & 3) == 0) {
+            rsbuf[(par * NW + warp) * kMRows + r_q] = rs0;
+            rsbuf[(par * NW + warp) * kMRows + r_q + 8] = rs1;
+        }
+#ifndef SKIP_EXCH
+        __syncthreads();  // sync B
+        {
+            float s0 = 0.f, s1 = 0.f;
+            #pragma unroll
+            for (int w = 0; w < NW; ++w) {
+                s0 += rsbuf[(par * NW + w) * kMRows + r_q];
+                s1 += rsbuf[(par * NW + w) * kMRows + r_q + 8];
+            }
+            l0 = l0 * a0_ + s0;
+            l1 = l1 * a1_ + s1;
+        }
+#else
+        l0 = l0 * a0_ + rs0;
+        l1 = l1 * a1_ + rs1;
+#endif
+        #pragma unroll
+        for (int i = 0; i < OREG; ++i) oreg[i] *= ((i & 2) ? a1_ : a0_);
+
+#ifndef SKIP_PV
+        {
+            #pragma unroll
+            for (int kt = 0; kt < TOK / 16; ++kt) {
+                uint32_t afrag[4];
+                {
+                    int ar = (lane & 7) + ((lane & 8) ? 8 : 0);
+                    int ac = (lane & 16) ? 16 : 0;
+                    ldsm_x4(afrag, p_s + ar * PRow + kt * 32 + ac);
+                }
+                #pragma unroll
+                for (int j = 0; j < ND8; ++j) {
+                    uint32_t vfrag[2];
+                    int vr = kt * 16 + (lane & 15);
+                    int vc = (warp * ND8 + j) * 16;
+                    ldsm_x2_t(vfrag, stV + vr * RowPad + vc);
+                    mma_16816(*reinterpret_cast<float(*)[4]>(&oreg[j * 4]), afrag, vfrag);
+                }
+            }
+        }
+#endif
+        __syncthreads();   // P consumed
+        cp_wait<STAGES - 2>();
+        __syncthreads();   // next tile (+ its Q group) visible
+
+        int next_item = i0 + ((n + 1) / NTPC);
+        if (next_item != cur_item) {
+            flush_item(cur_item);
+            reset_state();
+            if (next_item < i1) {
+                // Q frags for new item (already visible: same group as its tile0)
+                load_qfrags(next_item);
+                cur_L = __ldg(seq_lens + ((next_item / splits) / Hkv));
+            }
+            cur_item = next_item;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+__global__ void paged_attn_fallback(const __nv_bfloat16* __restrict__ q,
+                                    const __nv_bfloat16* __restrict__ kvc,
+                                    const int* __restrict__ bt,
+                                    const int* __restrict__ seq_lens,
+                                    __nv_bfloat16* __restrict__ out,
+                                    int B, int H, int Hkv, int D, int P,
+                                    int max_pages, float scale) {
+    int b = blockIdx.y, h = blockIdx.x;
+    int Hq = gridDim.x;
+    int kvh = h / (Hq / Hkv);
+    int tid = threadIdx.x;
+    int nthr = blockDim.x;
+    const __nv_bfloat16* qb = q + ((size_t)b * Hq + h) * D;
+    int L = seq_lens[b];
+    if (L <= 0) {
+        for (int d = tid; d < D; d += nthr) out[((size_t)b * Hq + h) * D + d] = __float2bfloat16(0.f);
+        return;
+    }
+    extern __shared__ float fq[];
+    for (int d = tid; d < D; d += nthr) fq[d] = __bfloat162float(qb[d]);
+    for (int d = tid; d < D; d += nthr) fq[D + d] = 0.f;
+    __syncthreads();
+    float m = -1e30f, l = 0.f;
+    int npages = (L + P - 1) / P;
+    const int* bt_row = bt + (size_t)b * max_pages;
+    for (int p = 0; p < npages; ++p) {
+        int bid = bt_row[p];
+        const __nv_bfloat16* kbase = kvc + ((size_t)bid * P) * (size_t)Hkv * (2 * D) + (size_t)kvh * (2 * D);
+        for (int t = 0; t < P; ++t) {
+            int gt = p * P + t;
+            if (gt >= L) break;
+            const __nv_bfloat16* krow = kbase + (size_t)t * Hkv * (2 * D);
+            float s = 0.f;
+            for (int d = 0; d < D; ++d) s += fq[d] * __bfloat162float(krow[d]);
+            s *= scale;
+            float mn = fmaxf(m, s);
+            float alpha = expf(m - mn);
+            float pr = expf(s - mn);
+            l = l * alpha + pr;
+            m = mn;
+            const __nv_bfloat16* vrow = krow + D;
+            for (int d = tid; d < D; d += nthr)
+                fq[D + d] = fq[D + d] * alpha + pr * __bfloat162float(vrow[d]);
+        }
+    }
+    {
+        float invl = l > 0.f ? 1.f / l : 0.f;
+        for (int d = tid; d < D; d += nthr)
+            out[((size_t)b * Hq + h) * D + d] = __float2bfloat16(fq[D + d] * invl);
+    }
+}
+
+// ---------------------------------------------------------------------------
+namespace {
+struct Scratch {
+    torch::Tensor partials;
+    torch::Tensor counters;
+    int splits = 0;
+};
+std::unordered_map<int64_t, Scratch> g_scratch;
+std::mutex g_mutex;
+
+int64_t key_of(int D, int H, int Hkv, int B, int splits) {
+    int64_t k = 0;
+    k = k * 131 + D; k = k * 131 + H; k = k * 131 + Hkv; k = k * 131 + B;
+    k = k * 131 + splits;
+    return k;
+}
+int env_int(const char* name, int dflt) {
+    const char* v = getenv(name);
+    return v ? atoi(v) : dflt;
+}
+}  // namespace
+
+template <int D, int STAGES, int TOK, int NT>
+void launch_paged(dim3 grid, size_t smem, cudaStream_t stream,
+                  const __nv_bfloat16* q, const __nv_bfloat16* kvc, const int* bt,
+                  const int* sl, __nv_bfloat16* out, float* partials, int* counters,
+                  int B, int H, int Hkv, int num_blocks, int max_pages,
+                  int chunk_pages, int splits, int ntpc, int items_per_cta, int units,
+                  float s2l) {
+    auto kfn = paged_attn_kernel<D, 4, STAGES, TOK, NT>;
+    static bool once = [kfn] {
+        cudaFuncSetAttribute(kfn, cudaFuncAttributeMaxDynamicSharedMemorySize, 200 * 1024);
+        return true;
+    }();
+    (void)once;
+    kfn<<<grid, NT, smem, stream>>>(q, kvc, bt, sl, out, partials, counters,
+                                          B, H, Hkv, num_blocks, max_pages,
+                                          chunk_pages, splits, ntpc, items_per_cta, units, s2l);
+}
+
+torch::Tensor paged_attn(torch::Tensor q_in, torch::Tensor kvc_in, torch::Tensor bt, torch::Tensor seq_lens, double scale) {
+    auto q = q_in;
+    auto kvc = kvc_in;
+    if (q.scalar_type() != torch::kBFloat16 || kvc.scalar_type() != torch::kBFloat16) {
+        q = q.to(torch::kBFloat16);
+        kvc = kvc.to(torch::kBFloat16);
+    }
+    if (!q.is_contiguous()) q = q.contiguous();
+    if (!kvc.is_contiguous()) kvc = kvc.contiguous();
+    auto bt_c = bt.is_contiguous() ? bt : bt.contiguous();
+    auto sl_c = seq_lens.is_contiguous() ? seq_lens : seq_lens.contiguous();
+    if (bt_c.scalar_type() != torch::kInt) bt_c = bt_c.to(torch::kInt);
+    if (sl_c.scalar_type() != torch::kInt) sl_c = sl_c.to(torch::kInt);
+
+    const int B = q.size(0), H = q.size(1), D = q.size(2);
+    const int max_pages = bt_c.size(1);
+    const int Hkv = kvc.size(2);
+    const int P = kvc.size(1);
+    const int num_blocks = kvc.size(0);
+    const int G = H / Hkv;
+
+    auto opts = q.options();
+    torch::Tensor out = torch::empty({B, H, D}, opts);
+    if (B == 0 || H == 0) {
+        if (q_in.scalar_type() != torch::kBFloat16) out = out.to(q_in.scalar_type());
+        return out;
+    }
+
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+
+    const bool fast = (D == 128 || D == 64) && P == 16 && G <= 16 && G > 0;
+    if (!fast) {
+        dim3 grid(H, B);
+        size_t smem = sizeof(float) * 2 * D;
+        paged_attn_fallback<<<grid, 128, smem, stream>>>(
+            (const __nv_bfloat16*)q.data_ptr(), (const __nv_bfloat16*)kvc.data_ptr(),
+            bt_c.data_ptr<int>(), sl_c.data_ptr<int>(), (__nv_bfloat16*)out.data_ptr(),
+            B, H, Hkv, D, P, max_pages, (float)scale);
+        if (q_in.scalar_type() != torch::kBFloat16) out = out.to(q_in.scalar_type());
+        return out;
+    }
+
+    const int units = B * Hkv;
+    int target_items = env_int("KBH_PA_ITEMS", 342);
+    int splits = env_int("KBH_PA_SPLITS", 0);
+    if (splits <= 0) {
+        splits = target_items / units;
+        if (splits < 1) splits = 1;
+        int max_spl = (max_pages + 1) / 2;
+        if (max_spl < 1) max_spl = 1;
+        if (splits > max_spl) splits = max_spl;
+    }
+    int tok_env = env_int("KBH_PA_TOK", 32);
+    int pg_mult = tok_env / 16;              // pages per tile (2 or 4)
+    int chunk_pages = (max_pages + splits - 1) / splits;
+    chunk_pages = (chunk_pages + pg_mult - 1) / pg_mult * pg_mult;
+    splits = (max_pages + chunk_pages - 1) / chunk_pages;
+    const int ntpc = chunk_pages / pg_mult;  // tiles per chunk
+
+    const int n_items = units * splits;
+    int target_ctas = env_int("KBH_PA_CTAS", 684);
+    int items_per_cta = (n_items + target_ctas - 1) / target_ctas;
+    int n_ctas = (n_items + items_per_cta - 1) / items_per_cta;
+
+    int PDs = D + 8;
+    int64_t key = key_of(D, H, Hkv, B, splits);
+    Scratch* S;
+    {
+        std::lock_guard<std::mutex> lk(g_mutex);
+        auto it = g_scratch.find(key);
+        if (it == g_scratch.end()) {
+            Scratch sc;
+            sc.splits = splits;
+            size_t np = (size_t)units * splits * (H / Hkv) * PDs;
+            sc.partials = torch::empty({(int64_t)np}, opts.dtype(torch::kFloat));
+            sc.counters = torch::zeros({units}, opts.dtype(torch::kInt));
+            it = g_scratch.emplace(key, std::move(sc)).first;
+        }
+        S = &it->second;
+    }
+
+    int stages = env_int("KBH_PA_STAGES", 3);
+    int tok_v = env_int("KBH_PA_TOK", 32);
+    dim3 grid(n_ctas);
+    int RowPadD = D * 2 + 16;
+    size_t smem = (size_t)2 * 16 * RowPadD + 16 * (tok_v * 2 + 16) + (size_t)stages * tok_v * 2 * RowPadD;
+    const float s2l = (float)(scale * 1.4426950408889634);
+#define LAUNCH_ARGS (const __nv_bfloat16*)q.data_ptr(), (const __nv_bfloat16*)kvc.data_ptr(), bt_c.data_ptr<int>(), sl_c.data_ptr<int>(), (__nv_bfloat16*)out.data_ptr(), S->partials.data_ptr<float>(), S->counters.data_ptr<int>(), B, H, Hkv, num_blocks, max_pages, chunk_pages, splits, ntpc, items_per_cta, units, s2l
+    int nt_v = env_int("KBH_PA_NT", 128);
+    int vkey = stages * 1000000 + tok_v * 1000 + nt_v;
+    if (D == 128) {
+        switch (vkey) {
+            case 2032128: launch_paged<128, 2, 32, 128>(grid, smem, stream, LAUNCH_ARGS); break;
+            case 3032128: launch_paged<128, 3, 32, 128>(grid, smem, stream, LAUNCH_ARGS); break;
+            case 2064128: launch_paged<128, 2, 64, 128>(grid, smem, stream, LAUNCH_ARGS); break;
+            case 3064128: launch_paged<128, 3, 64, 128>(grid, smem, stream, LAUNCH_ARGS); break;
+            case 3064256: launch_paged<128, 3, 64, 256>(grid, smem, stream, LAUNCH_ARGS); break;
+            case 4032128: launch_paged<128, 4, 32, 128>(grid, smem, stream, LAUNCH_ARGS); break;
+            case 4064128: launch_paged<128, 4, 64, 128>(grid, smem, stream, LAUNCH_ARGS); break;
+            case 4064256: launch_paged<128, 4, 64, 256>(grid, smem, stream, LAUNCH_ARGS); break;
+            case 6032128: launch_paged<128, 6, 32, 128>(grid, smem, stream, LAUNCH_ARGS); break;
+            case 6064128: launch_paged<128, 6, 64, 128>(grid, smem, stream, LAUNCH_ARGS); break;
+            case 6064256: launch_paged<128, 6, 64, 256>(grid, smem, stream, LAUNCH_ARGS); break;
+            default: TORCH_CHECK(false, "no D=128 variant for key ", vkey);
+        }
+    } else {
+        switch (vkey) {
+            case 2032128: launch_paged<64, 2, 32, 128>(grid, smem, stream, LAUNCH_ARGS); break;
+            case 3032128: launch_paged<64, 3, 32, 128>(grid, smem, stream, LAUNCH_ARGS); break;
+            case 2064128: launch_paged<64, 2, 64, 128>(grid, smem, stream, LAUNCH_ARGS); break;
+            case 3064128: launch_paged<64, 3, 64, 128>(grid, smem, stream, LAUNCH_ARGS); break;
+            case 3064256: launch_paged<64, 3, 64, 256>(grid, smem, stream, LAUNCH_ARGS); break;
+            case 4032128: launch_paged<64, 4, 32, 128>(grid, smem, stream, LAUNCH_ARGS); break;
+            case 4064128: launch_paged<64, 4, 64, 128>(grid, smem, stream, LAUNCH_ARGS); break;
+            case 4064256: launch_paged<64, 4, 64, 256>(grid, smem, stream, LAUNCH_ARGS); break;
+            case 6032128: launch_paged<64, 6, 32, 128>(grid, smem, stream, LAUNCH_ARGS); break;
+            case 6064128: launch_paged<64, 6, 64, 128>(grid, smem, stream, LAUNCH_ARGS); break;
+            case 6064256: launch_paged<64, 6, 64, 256>(grid, smem, stream, LAUNCH_ARGS); break;
+            default: TORCH_CHECK(false, "no D=64 variant for key ", vkey);
+        }
+    }
+#undef LAUNCH_ARGS
+    if (q_in.scalar_type() != torch::kBFloat16) out = out.to(q_in.scalar_type());
+    return out;
+}
+"""
+
+_ext = None
+
+
+def _get_ext():
+    global _ext
+    if _ext is None:
+        _ext = load_inline(
+            name="paged_attn_sol_v2",
+            cpp_sources=_CPP_SRC,
+            cuda_sources=_CUDA_SRC,
+            functions=["paged_attn"],
+            extra_cuda_cflags=["-O3", "-gencode=arch=compute_90a,code=sm_90a"],
+            verbose=False,
+        )
+    return _ext
+
+
+class Model(nn.Module):
+    """Single-query paged attention decode (custom CUDA kernel)."""
+
+    def __init__(self, batch, num_heads, num_kv_heads, head_dim, seq_len, page_size):
+        super().__init__()
+        assert num_heads % num_kv_heads == 0
+        self.batch = batch
+        self.num_heads = num_heads
+        self.num_kv_heads = num_kv_heads
+        self.head_dim = head_dim
+        self.seq_len = seq_len
+        self.page_size = page_size
+        self.group_size = num_heads // num_kv_heads
+        self.scale = 1.0 / math.sqrt(head_dim)
+        _get_ext()
+        self.register_buffer("_dummy", torch.zeros(1, dtype=torch.bfloat16), persistent=False)
+
+    # Bypass nn.Module.__call__ dispatch on the hot path.
+    def __call__(self, *args):
+        return _ext.paged_attn(*args, self.scale)
+
+    def forward(self, query, kv_cache, block_table, seq_lens):
+        return _ext.paged_attn(query, kv_cache, block_table, seq_lens, self.scale)
+
+
+def get_inputs():
+    """Build random paged inputs for the current module-level shape knobs."""
+    import reference
+    return reference.get_inputs()
+
+
+def get_init_inputs():
+    return [BATCH, NUM_HEADS, NUM_KV_HEADS, HEAD_DIM, SEQ_LEN, PAGE_SIZE]
