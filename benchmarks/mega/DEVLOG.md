@@ -4,6 +4,18 @@ A running record of decisions, dead ends, and lessons. Newest entries on top. Th
 
 ---
 
+## 2026-07-21 - 01_rl_grid_ppo removed from the deck
+
+Mega is now a single-problem bench: `02_kimi_linear_decode`. The RL-env
+megakernel skill that `01_rl_grid_ppo` graded is covered by the CUDA bench's
+craftax problem, so keeping both double-counted the same surface. It had
+already been soft-hidden from the site (MEGA_HIDDEN_PROBLEMS) since the CUDA
+deck landed; this makes the removal real: the deck dir is deleted,
+`build_mega_leaderboard.py` filters the problem out of results.csv
+(REMOVED_PROBLEMS), and the site constants are cleared. Archived runs, traces,
+and annotations for old PPO cells are untouched. Do not re-add — same standing
+rule as hard's `04_kahan_softmax`.
+
 ## 2026-07-09 - Agent-side CUDA disabling removed
 
 `KBH_DISABLE_AGENT_CUDA` was removed from the harness, parallel launcher, and

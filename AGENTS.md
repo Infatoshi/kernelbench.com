@@ -26,7 +26,7 @@ command, and wall-clock budget differ:
 | | `benchmarks/hard/` | `benchmarks/mega/` | `benchmarks/cuda/` |
 | --- | --- | --- | --- |
 | What | per-op kernel deck (CUDA **or** Triton) | full fused **megakernels** | **CUDA-only** writing deck |
-| Deck | `01_fp8_gemm`, `02_kda_cutlass`, `03_paged_attention`, `05_topk_bitonic`, `06_sonic_moe_swiglu`, `07_w4a16_gemm` (6) | `01_rl_grid_ppo`, `02_kimi_linear_decode` (2) | `01_glm52_fused_moe`, `02_deepseek_nsa`, `03_megaqwen_decode`, `04_grid_mingru_sps` (4) |
+| Deck | `01_fp8_gemm`, `02_kda_cutlass`, `03_paged_attention`, `05_topk_bitonic`, `06_sonic_moe_swiglu`, `07_w4a16_gemm` (6) | `02_kimi_linear_decode` (1; `01_rl_grid_ppo` removed 2026-07-21) | `01_glm52_fused_moe`, `02_deepseek_nsa`, `03_megaqwen_decode`, `04_grid_mingru_sps` (4) |
 | Drive it with | the `kb` CLI / `uv run kbh run` (from any cwd) | `cd benchmarks/mega && ./scripts/run_hard.sh ...` | `cd benchmarks/cuda && uv run kbh run ...` (or `./scripts/run_hard.sh`) |
 | Wall-clock | **unlimited** (`BUDGET_SECONDS=0`) | **unlimited** (`BUDGET_SECONDS=0`, since 2026-07-15) | **unlimited** (same as hard) |
 | Published to | `/hard` | `/mega` | `/cuda` (coming soon) |
@@ -34,9 +34,12 @@ command, and wall-clock budget differ:
 
 **How to tell which you're editing:** your cwd (`benchmarks/hard` vs
 `benchmarks/mega` vs `benchmarks/cuda`), the problem names above, and the entry
-command. When in doubt, check the deck — `01_fp8_gemm` is hard, `01_rl_grid_ppo`
-is mega, `01_glm52_fused_moe` is cuda. Mega and CUDA reuse hard's
-harness/archive/roofline machinery.
+command. When in doubt, check the deck — `01_fp8_gemm` is hard,
+`02_kimi_linear_decode` is mega, `01_glm52_fused_moe` is cuda. Mega and CUDA
+reuse hard's harness/archive/roofline machinery.
+(`01_rl_grid_ppo` was removed from the mega deck 2026-07-21 — the CUDA bench's
+craftax problem covers that skill; do not re-add, same rule as hard's
+`04_kahan_softmax`.)
 
 **KernelBench-CUDA language gate:** `src/eval/cuda_language.py` hard-fails
 Triton (`@triton.jit`, `triton.language`), kernel DSLs (CuteDSL, TileLang,

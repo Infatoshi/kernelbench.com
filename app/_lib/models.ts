@@ -94,7 +94,6 @@ export const PROBLEM_LABELS: Record<string, string> = {
   "05_topk_bitonic": "TopK Bitonic",
   "06_sonic_moe_swiglu": "Sonic MoE",
   "07_w4a16_gemm": "W4A16 GEMM",
-  "01_rl_grid_ppo": "RL Grid PPO",
   "02_kimi_linear_decode": "Kimi-Linear Decode",
   "01_glm52_fused_moe": "GLM-5.2 Fused MoE",
   "02_deepseek_nsa": "DeepSeek NSA",
@@ -104,13 +103,12 @@ export const PROBLEM_LABELS: Record<string, string> = {
   "02_online_softmax": "Online Softmax",
 }
 
-/** Mega problems hidden from public UI (homepage, /mega, model pages) and
- *  held out of ranking. `01_rl_grid_ppo` is still run, archived, and kept in
- *  catalog/models.json (runs, traces, solutions intact) but not shown — the
- *  same fused-megakernel skill surface is graded on KernelBench-CUDA, so Mega
- *  presents the head-to-head Kimi-Linear cell only. Presentation filter only;
- *  mirrors PERF_EXCLUDE in scripts/build_model_index.py. */
-export const MEGA_HIDDEN_PROBLEMS = new Set(["01_rl_grid_ppo"])
+/** Mega problems hidden from public UI. Empty since 2026-07-21:
+ *  `01_rl_grid_ppo` was fully REMOVED from the deck (dropped at the CSV /
+ *  models.json level — the CUDA bench's craftax problem covers that skill),
+ *  so no presentation filter is needed anymore. Mega is the single
+ *  Kimi-Linear megakernel cell. Keep the mechanism for future soft-hides. */
+export const MEGA_HIDDEN_PROBLEMS = new Set<string>([])
 
 export const FLAG_VERDICTS = new Set([
   "reward_hack",
@@ -718,9 +716,9 @@ export function barsForBench(
 //
 // 2) MEGA performance chart:
 //      score_m = max(speedup) over the model's valid cells on the canonical
-//                board, EXCLUDING problems in MEGA_HIDDEN_PROBLEMS (currently
-//                01_rl_grid_ppo — hidden on site; skill covered on CUDA; flagships
-//                attempted it, so its cells can't set a rank). Each cell's
+//                board, EXCLUDING problems in MEGA_HIDDEN_PROBLEMS (empty
+//                since 2026-07-21 — 01_rl_grid_ppo was removed from the deck
+//                entirely; craftax on CUDA covers it). Each cell's
 //                score is already the run's geomean decode speedup vs the
 //                optimized-PyTorch baseline across contexts; the model's best
 //                published head-to-head cell wins.

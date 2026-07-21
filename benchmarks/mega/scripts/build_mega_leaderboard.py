@@ -23,6 +23,10 @@ _HERE = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(_HERE))
 from src.eval.megakernel import extract_evidence  # noqa: E402
 
+# Deck problems removed after release; archives keep their runs but the
+# published CSV/board drops them. Do not re-add 01 (craftax on CUDA covers it).
+REMOVED_PROBLEMS = {"01_rl_grid_ppo"}
+
 
 def _bench(bench_log: Path):
     """Parse benchmark.log -> (best tok/s, {ctx: speedup}). Empty if absent."""
@@ -238,6 +242,10 @@ def main() -> None:
         # genuine fused megakernel (graph/compile/per-op-loop). None = unjudged, kept.
         if megakernel_authentic(rid, annotations_dir) is False:
             print(f"  EXCLUDED (not a megakernel, judge verdict): {run_dir.name}")
+            continue
+        # 01_rl_grid_ppo was removed from the deck 2026-07-21 (the CUDA bench's
+        # craftax problem covers that skill); archives stay, board drops it.
+        if d.get("problem") in REMOVED_PROBLEMS:
             continue
         gpu = (run_dir / "gpu").read_text().strip()
         tok_s, ctx = _bench(run_dir / "benchmark.log")
