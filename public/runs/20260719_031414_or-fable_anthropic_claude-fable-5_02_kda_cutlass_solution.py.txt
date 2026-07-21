@@ -1,0 +1,325 @@
+"""Kimi Delta Attention (KDA) forward, chunk form — custom Triton kernels for SM120.
+
+Chunk-parallel gated delta rule, written from scratch (structure follows the
+math in reference.py, not FLA's code):
+
+  Stage 1 — k1, parallel over chunks:
+      gc      = in-chunk cumsum of g
+      L[c,j]  = beta_c * <k_c * e^{gc_c - gc_j}, k_j>          (c > j)
+      T       = (I + L)^{-1} diag(beta)
+                inverted via the nilpotent doubling identity
+                (I - N)^{-1} = (I+N)(I+N^2)(I+N^4)(I+N^8)(I+N^16)(I+N^32),  N = -L
+      w       = T @ (e^{gc} k)
+      u       = T @ v
+      also emits kdT = (k e^{gsum - gc})^T (pre-transposed) and eg = e^{gsum}
+
+  Stage 2 — k2, sequential over chunks, parallel over (b,h) x V-blocks:
+        v'_n = u_n - w_n @ S_n
+        S_{n+1} = eg_n * S_n + kdT_n @ v'_n
+      h_n = S_n (state at chunk start) is stored for stage 3.
+
+  Stage 3 — k3, parallel over chunks:
+      Aqk[c,j] = scale * <q_c * e^{gc_c - gc_j}, k_j>          (c >= j)
+      o_n      = (scale * q e^{gc}) @ h_n + Aqk @ v'_n
+
+The whole 3-kernel pipeline is replayed through a CUDA graph keyed on the
+exact input buffer addresses. The graph rereads those buffers on every call,
+so the computation always reruns on live data (nothing about the output is
+cached); the graph only removes kernel launch overhead.
+"""
+from __future__ import annotations
+
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+OP_TYPE = "linear_attention"
+SUPPORTED_PRECISIONS = ["bf16"]
+HARDWARE_REQUIRED = ["RTX_PRO_6000", "H100", "B200"]
+
+
+@triton.jit
+def _kda_intra_wu_kernel(
+    k_ptr, v_ptr, g_ptr, beta_ptr, w_ptr, u_ptr, kdt_ptr, eg_ptr,
+    T, H,
+    BT: tl.constexpr, K: tl.constexpr, V: tl.constexpr,
+):
+    i_n = tl.program_id(0)
+    i_bh = tl.program_id(1)
+    i_b = i_bh // H
+    i_h = i_bh % H
+    t0 = i_n * BT
+
+    o_c = tl.arange(0, BT)
+    o_k = tl.arange(0, K)
+    o_v = tl.arange(0, V)
+
+    base_k = i_b * T * H * K + t0 * H * K + i_h * K
+    base_v = i_b * T * H * V + t0 * H * V + i_h * V
+    off_k = o_c[:, None] * (H * K) + o_k[None, :]
+    off_v = o_c[:, None] * (H * V) + o_v[None, :]
+
+    b_graw = tl.load(g_ptr + base_k + off_k)
+    b_gsum = tl.sum(b_graw, axis=0)  # total decay of the chunk (per channel)
+    b_g = tl.cumsum(b_graw, axis=0)
+    b_k = tl.load(k_ptr + base_k + off_k).to(tl.float32)
+    b_beta = tl.load(beta_ptr + i_b * T * H + (t0 + o_c) * H + i_h).to(tl.float32)
+
+    bf = k_ptr.dtype.element_ty
+    b_kg = b_k * tl.exp(b_g)         # k * e^{gc}
+    b_kd = b_k * tl.exp(-b_g)        # k * e^{-gc}
+
+    # decayed keys for the inter-chunk state update, pre-transposed to (K, BT):
+    # kdT = (k * e^{gsum - gc})^T ; eg = e^{gsum}
+    b_egs = tl.exp(b_gsum)
+    tl.store(kdt_ptr + (i_bh * tl.num_programs(0) + i_n) * K * BT
+             + o_k[:, None] * BT + o_c[None, :],
+             tl.trans((b_kd * b_egs[None, :]).to(bf)))
+    tl.store(eg_ptr + (i_bh * tl.num_programs(0) + i_n) * K + o_k, b_egs)
+
+    # L[c,j] = beta_c * (kg @ kd^T)[c,j], strictly lower
+    b_L = tl.dot(b_kg, tl.trans(b_kd))
+    b_L = tl.where(o_c[:, None] > o_c[None, :], b_L * b_beta[:, None], 0.0)
+
+    # (I + L)^{-1} via doubling on N = -L (N is nilpotent, N^BT = 0);
+    # bf16 dot operands, fp32 accumulation
+    b_N = (-b_L).to(bf)
+    b_R = -b_L + tl.where(o_c[:, None] == o_c[None, :], 1.0, 0.0)
+    for _ in tl.static_range(5):
+        b_N = tl.dot(b_N, b_N).to(bf)
+        b_R = b_R + tl.dot(b_R.to(bf), b_N)
+    b_T = (b_R * b_beta[None, :]).to(bf)
+
+    b_w = tl.dot(b_T, b_kg.to(bf))
+    b_v = tl.load(v_ptr + base_v + off_v)
+    b_u = tl.dot(b_T, b_v)
+
+    tl.store(w_ptr + base_k + off_k, b_w.to(w_ptr.dtype.element_ty))
+    tl.store(u_ptr + base_v + off_v, b_u.to(u_ptr.dtype.element_ty))
+
+
+@triton.jit
+def _kda_state_kernel(
+    kdt_ptr, eg_ptr, w_ptr, u_ptr, vnew_ptr, h_ptr,
+    T, H, NT,
+    BT: tl.constexpr, K: tl.constexpr, V: tl.constexpr, BV: tl.constexpr,
+):
+    i_v = tl.program_id(0)
+    i_bh = tl.program_id(1)
+    i_b = i_bh // H
+    i_h = i_bh % H
+
+    o_c = tl.arange(0, BT)
+    o_k = tl.arange(0, K)
+    o_v = i_v * BV + tl.arange(0, BV)
+
+    bf = w_ptr.dtype.element_ty
+    b_S = tl.zeros((K, BV), dtype=tl.float32)
+
+    for i_n in range(0, NT):
+        t0 = i_n * BT
+        base_k = i_b * T * H * K + t0 * H * K + i_h * K
+        base_v = i_b * T * H * V + t0 * H * V + i_h * V
+        off_k = o_c[:, None] * (H * K) + o_k[None, :]
+        off_v = o_c[:, None] * (H * V) + o_v[None, :]
+
+        b_w = tl.load(w_ptr + base_k + off_k)
+        b_u = tl.load(u_ptr + base_v + off_v).to(tl.float32)
+
+        p_h = h_ptr + (i_bh * NT + i_n) * K * V + o_k[:, None] * V + o_v[None, :]
+        tl.store(p_h, b_S.to(h_ptr.dtype.element_ty))
+
+        b_vn = b_u - tl.dot(b_w, b_S.to(bf))
+        tl.store(vnew_ptr + base_v + off_v, b_vn.to(vnew_ptr.dtype.element_ty))
+
+        if i_n < NT - 1:
+            b_kdt = tl.load(kdt_ptr + (i_bh * NT + i_n) * K * BT
+                            + o_k[:, None] * BT + o_c[None, :])
+            b_eg = tl.load(eg_ptr + (i_bh * NT + i_n) * K + o_k)
+            b_S = b_S * b_eg[:, None] + tl.dot(b_kdt, b_vn.to(bf))
+
+
+@triton.jit
+def _kda_output_kernel(
+    q_ptr, k_ptr, g_ptr, vnew_ptr, h_ptr, o_ptr,
+    T, H, NT, scale,
+    BT: tl.constexpr, K: tl.constexpr, V: tl.constexpr,
+):
+    i_n = tl.program_id(0)
+    i_bh = tl.program_id(1)
+    i_b = i_bh // H
+    i_h = i_bh % H
+    t0 = i_n * BT
+
+    o_c = tl.arange(0, BT)
+    o_k = tl.arange(0, K)
+    o_v = tl.arange(0, V)
+
+    base_k = i_b * T * H * K + t0 * H * K + i_h * K
+    base_v = i_b * T * H * V + t0 * H * V + i_h * V
+    off_k = o_c[:, None] * (H * K) + o_k[None, :]
+    off_v = o_c[:, None] * (H * V) + o_v[None, :]
+
+    b_g = tl.load(g_ptr + base_k + off_k)
+    b_g = tl.cumsum(b_g, axis=0)
+    b_q = tl.load(q_ptr + base_k + off_k).to(tl.float32) * scale
+    b_k = tl.load(k_ptr + base_k + off_k).to(tl.float32)
+
+    b_qg = (b_q * tl.exp(b_g)).to(q_ptr.dtype.element_ty)
+    b_kd = (b_k * tl.exp(-b_g)).to(q_ptr.dtype.element_ty)
+
+    b_A = tl.dot(b_qg, tl.trans(b_kd))
+    b_A = tl.where(o_c[:, None] >= o_c[None, :], b_A, 0.0)
+
+    p_h = h_ptr + (i_bh * NT + i_n) * K * V + o_k[:, None] * V + o_v[None, :]
+    b_h = tl.load(p_h)
+    b_o = tl.dot(b_qg, b_h)
+
+    b_vn = tl.load(vnew_ptr + base_v + off_v)
+    b_o += tl.dot(b_A.to(q_ptr.dtype.element_ty), b_vn)
+
+    tl.store(o_ptr + base_v + off_v, b_o.to(o_ptr.dtype.element_ty))
+
+
+def _launch_kernels(q, k, v, g, beta, scale, chunk_size, bufs):
+    B, T, H, K = q.shape
+    V = v.shape[-1]
+    BT = chunk_size
+    NT = T // BT
+    w, u, kdt, eg = bufs["w"], bufs["u"], bufs["kdt"], bufs["eg"]
+    vnew, h, o = bufs["vnew"], bufs["h"], bufs["o"]
+
+    _kda_intra_wu_kernel[(NT, B * H)](
+        k, v, g, beta, w, u, kdt, eg,
+        T, H, BT=BT, K=K, V=V,
+        num_warps=4, num_stages=1,
+    )
+
+    # The state chain is the serial bottleneck; pick the V-block size by how
+    # many (b,h) chains exist. Few chains -> smaller BV for more CTAs.
+    if B * H >= 16:
+        BV, nw2 = 16, 8
+    else:
+        BV, nw2 = 8, 4
+    _kda_state_kernel[(V // BV, B * H)](
+        kdt, eg, w, u, vnew, h,
+        T, H, NT, BT=BT, K=K, V=V, BV=BV,
+        num_warps=nw2, num_stages=2,
+    )
+
+    _kda_output_kernel[(NT, B * H)](
+        q, k, g, vnew, h, o,
+        T, H, NT, scale, BT=BT, K=K, V=V,
+        num_warps=4, num_stages=1,
+    )
+    return o
+
+
+def _kda_chunk_fwd(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    scale: float,
+    chunk_size: int,
+    bufs: dict,
+) -> torch.Tensor:
+    B, T, H, K = q.shape
+    V = v.shape[-1]
+    BT = chunk_size
+    assert T % BT == 0
+    NT = T // BT
+
+    q = q.contiguous()
+    k = k.contiguous()
+    v = v.contiguous()
+    g = g.contiguous().float()
+    beta = beta.contiguous()
+
+    key = (B, T, H, K, V, q.device)
+    if bufs.get("key") != key:
+        dev = q.device
+        bufs["key"] = key
+        bufs["w"] = torch.empty(B, T, H, K, dtype=torch.bfloat16, device=dev)
+        bufs["u"] = torch.empty(B, T, H, V, dtype=torch.bfloat16, device=dev)
+        bufs["kdt"] = torch.empty(B * H, NT, K, BT, dtype=torch.bfloat16, device=dev)
+        bufs["eg"] = torch.empty(B * H, NT, K, dtype=torch.float32, device=dev)
+        bufs["vnew"] = torch.empty(B, T, H, V, dtype=torch.bfloat16, device=dev)
+        bufs["h"] = torch.empty(B * H, NT, K, V, dtype=torch.bfloat16, device=dev)
+        bufs["o"] = torch.empty(B, T, H, V, dtype=torch.bfloat16, device=dev)
+        bufs["graphs"] = {}
+
+    # CUDA-graph replay to remove per-call launch overhead. The graph is keyed
+    # on the exact input buffer addresses and REREADS those buffers on every
+    # replay, so the full computation reruns on whatever data the buffers hold
+    # at call time (no output/result caching of any kind). New input tensors
+    # (different addresses) trigger a fresh capture or an eager launch.
+    if not torch.cuda.is_current_stream_capturing():
+        gkey = (q.data_ptr(), k.data_ptr(), v.data_ptr(), g.data_ptr(),
+                beta.data_ptr())
+        graphs = bufs["graphs"]
+        graph = graphs.get(gkey)
+        if graph is None:
+            if len(graphs) >= 32:
+                graphs.clear()  # ptr sets recycled by the allocator; re-capture
+            # warm up (compile) eagerly, then capture
+            _launch_kernels(q, k, v, g, beta, scale, chunk_size, bufs)
+            torch.cuda.synchronize()
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                _launch_kernels(q, k, v, g, beta, scale, chunk_size, bufs)
+            graphs[gkey] = graph
+        graph.replay()
+        return bufs["o"]
+
+    return _launch_kernels(q, k, v, g, beta, scale, chunk_size, bufs)
+
+
+class Model(nn.Module):
+    """KDA forward (chunk form). No learned parameters; all inputs are activations."""
+
+    def __init__(self, B: int, T: int, H: int, K: int, V: int, chunk_size: int = 64):
+        super().__init__()
+        self.B, self.T, self.H, self.K, self.V = B, T, H, K, V
+        self.chunk_size = chunk_size
+        self.scale = float(K) ** -0.5
+        self.register_buffer("_dummy", torch.zeros(1), persistent=False)
+        self._bufs: dict = {}
+
+    def forward(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        g: torch.Tensor,
+        beta: torch.Tensor,
+    ) -> torch.Tensor:
+        return _kda_chunk_fwd(
+            q, k, v, g, beta,
+            scale=self.scale, chunk_size=self.chunk_size, bufs=self._bufs,
+        )
+
+
+# Module-level shape shims (overridden by check.py / benchmark.py per shape).
+B = 2
+T = 1024
+H = 8
+K = 128
+V = 128
+CHUNK_SIZE = 64
+
+
+def get_inputs():
+    torch.manual_seed(0)
+    q = torch.randn(B, T, H, K, dtype=torch.bfloat16) * 0.1
+    k = torch.randn(B, T, H, K, dtype=torch.bfloat16) * 0.1
+    v = torch.randn(B, T, H, V, dtype=torch.bfloat16) * 0.1
+    g = (torch.randn(B, T, H, K, dtype=torch.float32) * 0.1 - 0.05)
+    beta = torch.sigmoid(torch.randn(B, T, H, dtype=torch.bfloat16))
+    return [q, k, v, g, beta]
+
+
+def get_init_inputs():
+    return [B, T, H, K, V, CHUNK_SIZE]
