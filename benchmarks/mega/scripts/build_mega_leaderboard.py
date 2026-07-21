@@ -231,6 +231,13 @@ def main() -> None:
         # of the transcript) overrides the tripwire, mirroring hard's builder;
         # anything unaudited or non-clean stays excluded.
         rid = d.get("run_id", run_dir.name)
+        # A manual audit verdict of `contaminated` excludes the run outright:
+        # grok streaming transcripts carry no tool events or paths, so the
+        # regex tripwire below can pass a run that copied another archive's
+        # solution (2026-07-21 B200 incident).
+        if annotation_verdict(rid, annotations_dir) == "contaminated":
+            print(f"  EXCLUDED (manual audit verdict=contaminated): {run_dir.name}")
+            continue
         nc = contamination(run_dir)
         if nc >= 1:
             if annotation_verdict(rid, annotations_dir) == "clean":

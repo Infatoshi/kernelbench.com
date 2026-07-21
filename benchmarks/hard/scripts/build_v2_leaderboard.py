@@ -100,6 +100,13 @@ for rj in glob.glob(str(RUNS_DIR/"2026*/result.json")):
     h, m, e = r.get("harness"), r.get("model"), r.get("reasoning_effort") or ""
     if not h or not m: continue
     run_dir = os.path.dirname(rj)
+    # A manual audit verdict of `contaminated` excludes the run outright. The
+    # transcript tripwire below cannot catch every case: grok streaming
+    # transcripts carry no tool events or paths, so a run that copied another
+    # archive's solution can pass the regex clean (2026-07-21 B200 incident).
+    if ann.get(rid, (None, None))[0] == "contaminated":
+        print(f"  EXCLUDED (manual audit verdict=contaminated): {rid}", file=sys.stderr)
+        continue
     if _contaminated(run_dir, rid):
         # The regex tripwire over-fires on parallel sweeps: sibling run ids leak
         # into transcripts passively via the shared gpu.lock owner file and ps

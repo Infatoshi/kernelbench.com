@@ -1,0 +1,1078 @@
+"""Fast multi-layer Qwen3-0.6B geometry decode (CUDA).
+
+4-layer stack: RMSNorm → QKV → Q/K RMSNorm → RoPE → GQA attn → O
+→ residual → RMSNorm → SwiGLU → residual.
+
+Optimizations vs MegaQwen cooperative megakernel:
+  - No grid.sync cooperative launch (better residency on SM100/SM120)
+  - Split-KV flash-decoding attention (many CTAs, high BW)
+  - Vectorized bf16 loads (uint4 / 8-wide)
+  - Fused QKV and gate+up GEMVs
+  - Single host entry per token (all 4 layers)
+"""
+from __future__ import annotations
+
+import math
+import os
+
+import torch
+import torch.nn as nn
+
+HIDDEN = 1024
+INTERMEDIATE = 3072
+NUM_Q = 16
+NUM_KV = 8
+HEAD_DIM = 128
+NUM_LAYERS = 4
+EPS = 1e-6
+Q_SIZE = NUM_Q * HEAD_DIM
+KV_SIZE = NUM_KV * HEAD_DIM
+
+_CPP_SRC = r"""
+#include <torch/extension.h>
+#include <vector>
+
+void decode_token(
+    torch::Tensor hidden_bf16,
+    torch::Tensor residual_f,
+    torch::Tensor normed,
+    torch::Tensor q,
+    torch::Tensor k,
+    torch::Tensor v,
+    torch::Tensor attn_out,
+    torch::Tensor mlp_gate,
+    torch::Tensor mlp_up,
+    torch::Tensor attn_partial,  // [NQ, max_splits, HD+2] float workspace
+    const std::vector<torch::Tensor>& k_caches,
+    const std::vector<torch::Tensor>& v_caches,
+    const std::vector<torch::Tensor>& input_lns,
+    const std::vector<torch::Tensor>& q_projs,
+    const std::vector<torch::Tensor>& k_projs,
+    const std::vector<torch::Tensor>& v_projs,
+    const std::vector<torch::Tensor>& q_norms,
+    const std::vector<torch::Tensor>& k_norms,
+    const std::vector<torch::Tensor>& o_projs,
+    const std::vector<torch::Tensor>& post_lns,
+    const std::vector<torch::Tensor>& gate_projs,
+    const std::vector<torch::Tensor>& up_projs,
+    const std::vector<torch::Tensor>& down_projs,
+    torch::Tensor cos_pos,
+    torch::Tensor sin_pos,
+    int64_t position,
+    int64_t max_seq,
+    int64_t num_layers);
+"""
+
+_CUDA_SRC = r"""
+#include <torch/extension.h>
+#include <ATen/cuda/CUDAContext.h>
+#include <cuda_runtime.h>
+#include <cuda_bf16.h>
+#include <vector>
+#include <cmath>
+#include <algorithm>
+
+constexpr int H = 1024;
+constexpr int II = 3072;
+constexpr int NQ = 16;
+constexpr int NKV = 8;
+constexpr int HD = 128;
+constexpr int QS = NQ * HD;
+constexpr int KVS = NKV * HD;
+constexpr float RMS_EPS = 1e-6f;
+constexpr float ATTN_SCALE = 0.08838834764831843f;
+
+__device__ __forceinline__ float warp_sum(float v) {
+#pragma unroll
+  for (int o = 16; o > 0; o >>= 1)
+    v += __shfl_down_sync(0xffffffff, v, o);
+  return v;
+}
+
+__device__ __forceinline__ float warp_max(float v) {
+#pragma unroll
+  for (int o = 16; o > 0; o >>= 1)
+    v = fmaxf(v, __shfl_down_sync(0xffffffff, v, o));
+  return v;
+}
+
+__device__ __forceinline__ void load8_bf16(const __nv_bfloat16* p, float out[8]) {
+  uint4 u = *reinterpret_cast<const uint4*>(p);
+  const __nv_bfloat16* b = reinterpret_cast<const __nv_bfloat16*>(&u);
+#pragma unroll
+  for (int i = 0; i < 8; ++i) out[i] = __bfloat162float(b[i]);
+}
+
+// =====================================================================
+// RMSNorm
+// =====================================================================
+__global__ void rmsnorm_kernel(
+    const __nv_bfloat16* __restrict__ x_bf16,
+    const float* __restrict__ x_f32,
+    const __nv_bfloat16* __restrict__ w,
+    float* __restrict__ y,
+    float* __restrict__ residual_out,
+    int n, int use_f32
+) {
+  __shared__ float s_sum;
+  __shared__ float warp_sums[32];
+  float local = 0.f;
+  if (use_f32) {
+    for (int i = threadIdx.x; i < n; i += blockDim.x) {
+      float v = x_f32[i];
+      if (residual_out) residual_out[i] = v;
+      local += v * v;
+    }
+  } else {
+    for (int i = threadIdx.x; i < n; i += blockDim.x) {
+      float v = __bfloat162float(x_bf16[i]);
+      if (residual_out) residual_out[i] = v;
+      local += v * v;
+    }
+  }
+  local = warp_sum(local);
+  int lane = threadIdx.x & 31, wid = threadIdx.x >> 5;
+  if (lane == 0) warp_sums[wid] = local;
+  __syncthreads();
+  if (wid == 0) {
+    float s = (lane < (blockDim.x >> 5)) ? warp_sums[lane] : 0.f;
+    s = warp_sum(s);
+    if (lane == 0) s_sum = s;
+  }
+  __syncthreads();
+  float rstd = rsqrtf(s_sum / float(n) + RMS_EPS);
+  for (int i = threadIdx.x; i < n; i += blockDim.x) {
+    float v = residual_out ? residual_out[i]
+                           : (use_f32 ? x_f32[i] : __bfloat162float(x_bf16[i]));
+    y[i] = v * rstd * __bfloat162float(w[i]);
+  }
+}
+
+__global__ void head_rmsnorm_kernel(
+    float* __restrict__ x, const __nv_bfloat16* __restrict__ w, int num_heads
+) {
+  int h = blockIdx.x;
+  if (h >= num_heads) return;
+  float* row = x + h * HD;
+  float local = 0.f;
+  for (int i = threadIdx.x; i < HD; i += blockDim.x) local += row[i] * row[i];
+  local = warp_sum(local);
+  __shared__ float ws[8];
+  __shared__ float s;
+  int lane = threadIdx.x & 31, wid = threadIdx.x >> 5;
+  if (lane == 0) ws[wid] = local;
+  __syncthreads();
+  if (wid == 0) {
+    float v = (lane < (blockDim.x >> 5)) ? ws[lane] : 0.f;
+    v = warp_sum(v);
+    if (lane == 0) s = rsqrtf(v / float(HD) + RMS_EPS);
+  }
+  __syncthreads();
+  float rstd = s;
+  for (int i = threadIdx.x; i < HD; i += blockDim.x)
+    row[i] = row[i] * rstd * __bfloat162float(w[i]);
+}
+
+// =====================================================================
+// GEMV: one warp per output row, activation in smem
+// =====================================================================
+__global__ void gemv_warp_kernel(
+    const __nv_bfloat16* __restrict__ W,
+    const float* __restrict__ x,
+    float* __restrict__ y,
+    int M, int K
+) {
+  extern __shared__ float sx[];
+  for (int i = threadIdx.x; i < K; i += blockDim.x) sx[i] = x[i];
+  __syncthreads();
+  int wpb = blockDim.x >> 5;
+  int wib = threadIdx.x >> 5;
+  int lane = threadIdx.x & 31;
+  int row = blockIdx.x * wpb + wib;
+  if (row >= M) return;
+  const __nv_bfloat16* wrow = W + (size_t)row * K;
+  float acc = 0.f;
+  for (int c = lane * 8; c < K; c += 256) {
+    float wv[8];
+    load8_bf16(wrow + c, wv);
+#pragma unroll
+    for (int j = 0; j < 8; ++j) acc += wv[j] * sx[c + j];
+  }
+  acc = warp_sum(acc);
+  if (lane == 0) y[row] = acc;
+}
+
+__global__ void gemv_warp_add_kernel(
+    const __nv_bfloat16* __restrict__ W,
+    const float* __restrict__ x,
+    const float* __restrict__ residual,
+    float* __restrict__ y,
+    __nv_bfloat16* __restrict__ y_bf16,
+    int M, int K
+) {
+  extern __shared__ float sx[];
+  for (int i = threadIdx.x; i < K; i += blockDim.x) sx[i] = x[i];
+  __syncthreads();
+  int wpb = blockDim.x >> 5;
+  int wib = threadIdx.x >> 5;
+  int lane = threadIdx.x & 31;
+  int row = blockIdx.x * wpb + wib;
+  if (row >= M) return;
+  const __nv_bfloat16* wrow = W + (size_t)row * K;
+  float acc = 0.f;
+  for (int c = lane * 8; c < K; c += 256) {
+    float wv[8];
+    load8_bf16(wrow + c, wv);
+#pragma unroll
+    for (int j = 0; j < 8; ++j) acc += wv[j] * sx[c + j];
+  }
+  acc = warp_sum(acc);
+  if (lane == 0) {
+    float outv = residual[row] + acc;
+    y[row] = outv;
+    if (y_bf16) y_bf16[row] = __float2bfloat16(outv);
+  }
+}
+
+// Fused QKV: three weight matrices, same activation
+__global__ void gemv_qkv_kernel(
+    const __nv_bfloat16* __restrict__ Wq,
+    const __nv_bfloat16* __restrict__ Wk,
+    const __nv_bfloat16* __restrict__ Wv,
+    const float* __restrict__ x,
+    float* __restrict__ q,
+    float* __restrict__ k,
+    float* __restrict__ v
+) {
+  extern __shared__ float sx[];
+  for (int i = threadIdx.x; i < H; i += blockDim.x) sx[i] = x[i];
+  __syncthreads();
+  int wpb = blockDim.x >> 5;
+  int wib = threadIdx.x >> 5;
+  int lane = threadIdx.x & 31;
+  // Total rows = QS + KVS + KVS = 4096
+  int row = blockIdx.x * wpb + wib;
+  if (row >= QS + KVS + KVS) return;
+
+  const __nv_bfloat16* wrow;
+  float* out;
+  if (row < QS) {
+    wrow = Wq + (size_t)row * H;
+    out = q + row;
+  } else if (row < QS + KVS) {
+    int r = row - QS;
+    wrow = Wk + (size_t)r * H;
+    out = k + r;
+  } else {
+    int r = row - QS - KVS;
+    wrow = Wv + (size_t)r * H;
+    out = v + r;
+  }
+  float acc = 0.f;
+  for (int c = lane * 8; c < H; c += 256) {
+    float wv[8];
+    load8_bf16(wrow + c, wv);
+#pragma unroll
+    for (int j = 0; j < 8; ++j) acc += wv[j] * sx[c + j];
+  }
+  acc = warp_sum(acc);
+  if (lane == 0) *out = acc;
+}
+
+// Fused gate+up: each warp computes both gate[r] and up[r], writes silu(gate)*up
+__global__ void gemv_swiglu_kernel(
+    const __nv_bfloat16* __restrict__ Wg,
+    const __nv_bfloat16* __restrict__ Wu,
+    const float* __restrict__ x,
+    float* __restrict__ out_hidden  // [II] silu(gate)*up
+) {
+  extern __shared__ float sx[];
+  for (int i = threadIdx.x; i < H; i += blockDim.x) sx[i] = x[i];
+  __syncthreads();
+  int wpb = blockDim.x >> 5;
+  int wib = threadIdx.x >> 5;
+  int lane = threadIdx.x & 31;
+  int row = blockIdx.x * wpb + wib;
+  if (row >= II) return;
+  const __nv_bfloat16* grow = Wg + (size_t)row * H;
+  const __nv_bfloat16* urow = Wu + (size_t)row * H;
+  float ag = 0.f, au = 0.f;
+  for (int c = lane * 8; c < H; c += 256) {
+    float gw[8], uw[8];
+    load8_bf16(grow + c, gw);
+    load8_bf16(urow + c, uw);
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+      float a = sx[c + j];
+      ag += gw[j] * a;
+      au += uw[j] * a;
+    }
+  }
+  ag = warp_sum(ag);
+  au = warp_sum(au);
+  if (lane == 0) {
+    float silu = ag / (1.f + expf(-ag));
+    out_hidden[row] = silu * au;
+  }
+}
+
+// =====================================================================
+// Fused Q/K RMSNorm + RoPE + cache write
+// =====================================================================
+__global__ void qk_norm_rope_cache_kernel(
+    float* __restrict__ q,
+    float* __restrict__ k,
+    const float* __restrict__ v,
+    __nv_bfloat16* __restrict__ k_cache,
+    __nv_bfloat16* __restrict__ v_cache,
+    const __nv_bfloat16* __restrict__ q_norm,
+    const __nv_bfloat16* __restrict__ k_norm,
+    const float* __restrict__ cos_pos,
+    const float* __restrict__ sin_pos,
+    int position, int max_seq
+) {
+  // One block handles all heads; 256 threads
+  const int half = HD / 2;
+  // --- Q heads: RMSNorm then RoPE ---
+  for (int h = blockIdx.x; h < NQ; h += gridDim.x) {
+    float* row = q + h * HD;
+    // sum sq
+    float local = 0.f;
+    for (int i = threadIdx.x; i < HD; i += blockDim.x) local += row[i] * row[i];
+    local = warp_sum(local);
+    __shared__ float ws[8];
+    __shared__ float rstd_s;
+    int lane = threadIdx.x & 31, wid = threadIdx.x >> 5;
+    if (lane == 0) ws[wid] = local;
+    __syncthreads();
+    if (wid == 0) {
+      float s = (lane < (blockDim.x >> 5)) ? ws[lane] : 0.f;
+      s = warp_sum(s);
+      if (lane == 0) rstd_s = rsqrtf(s / float(HD) + RMS_EPS);
+    }
+    __syncthreads();
+    float rstd = rstd_s;
+    // norm into registers for half, apply rope
+    for (int d = threadIdx.x; d < half; d += blockDim.x) {
+      float x1 = row[d] * rstd * __bfloat162float(q_norm[d]);
+      float x2 = row[d + half] * rstd * __bfloat162float(q_norm[d + half]);
+      float c = cos_pos[d], s = sin_pos[d];
+      row[d] = x1 * c - x2 * s;
+      row[d + half] = x1 * s + x2 * c;
+    }
+    __syncthreads();
+  }
+  // --- K heads: RMSNorm + RoPE + cache; V cache ---
+  for (int h = blockIdx.x; h < NKV; h += gridDim.x) {
+    float* krow = k + h * HD;
+    const float* vrow = v + h * HD;
+    __nv_bfloat16* kc = k_cache + (size_t)h * max_seq * HD + (size_t)position * HD;
+    __nv_bfloat16* vc = v_cache + (size_t)h * max_seq * HD + (size_t)position * HD;
+    float local = 0.f;
+    for (int i = threadIdx.x; i < HD; i += blockDim.x) local += krow[i] * krow[i];
+    local = warp_sum(local);
+    __shared__ float ws2[8];
+    __shared__ float rstd_k;
+    int lane = threadIdx.x & 31, wid = threadIdx.x >> 5;
+    if (lane == 0) ws2[wid] = local;
+    __syncthreads();
+    if (wid == 0) {
+      float s = (lane < (blockDim.x >> 5)) ? ws2[lane] : 0.f;
+      s = warp_sum(s);
+      if (lane == 0) rstd_k = rsqrtf(s / float(HD) + RMS_EPS);
+    }
+    __syncthreads();
+    float rstd = rstd_k;
+    for (int d = threadIdx.x; d < half; d += blockDim.x) {
+      float x1 = krow[d] * rstd * __bfloat162float(k_norm[d]);
+      float x2 = krow[d + half] * rstd * __bfloat162float(k_norm[d + half]);
+      float c = cos_pos[d], s = sin_pos[d];
+      float k1 = x1 * c - x2 * s;
+      float k2 = x1 * s + x2 * c;
+      krow[d] = k1; krow[d + half] = k2;
+      kc[d] = __float2bfloat16(k1);
+      kc[d + half] = __float2bfloat16(k2);
+    }
+    for (int d = threadIdx.x; d < HD; d += blockDim.x)
+      vc[d] = __float2bfloat16(vrow[d]);
+    __syncthreads();
+  }
+}
+
+// =====================================================================
+// GQA split-KV attention: one block per (kv_head, split)
+// Loads K/V once, scores both Q heads that share the KV head.
+// partial layout still [NQ, n_splits, HD+2]
+// grid: (NKV, n_splits)  block: 256 threads (8 warps)
+// =====================================================================
+__global__ void attn_gqa_split_kernel(
+    const float* __restrict__ q,
+    const __nv_bfloat16* __restrict__ k_cache,
+    const __nv_bfloat16* __restrict__ v_cache,
+    float* __restrict__ partial,
+    float* __restrict__ direct_out,  // if non-null and n_splits==1, write final out here
+    int cache_len, int max_seq, int n_splits
+) {
+  const int kvh = blockIdx.x;
+  const int split = blockIdx.y;
+  if (kvh >= NKV || split >= n_splits) return;
+
+  const int qh0 = kvh * 2;
+  const int qh1 = kvh * 2 + 1;
+
+  int chunk = (cache_len + n_splits - 1) / n_splits;
+  int pos0 = split * chunk;
+  int pos1 = min(pos0 + chunk, cache_len);
+
+  auto write_empty = [&](int qh) {
+    if (threadIdx.x == 0) {
+      float* pout = partial + ((size_t)qh * n_splits + split) * (HD + 2);
+      for (int d = 0; d < HD; ++d) pout[d] = 0.f;
+      pout[HD] = -INFINITY;
+      pout[HD + 1] = 0.f;
+    }
+  };
+  if (pos0 >= pos1) {
+    write_empty(qh0);
+    write_empty(qh1);
+    return;
+  }
+
+  const int warp_id = threadIdx.x >> 5;
+  const int lane = threadIdx.x & 31;
+  const int nwarps = blockDim.x >> 5;  // 8
+
+  // Two Q heads in registers
+  float q0[4], q1[4];
+#pragma unroll
+  for (int j = 0; j < 4; ++j) {
+    q0[j] = q[qh0 * HD + lane + j * 32];
+    q1[j] = q[qh1 * HD + lane + j * 32];
+  }
+
+  float m0 = -INFINITY, m1 = -INFINITY;
+  float l0 = 0.f, l1 = 0.f;
+  float a0[4] = {0.f, 0.f, 0.f, 0.f};
+  float a1[4] = {0.f, 0.f, 0.f, 0.f};
+
+  // Softmax update helper (inlined via macro-like lambda)
+#define ONLINE_UPDATE(m, l, acc, score, vdim) do { \
+    float _mn = fmaxf((m), (score)); \
+    float _em = __expf((m) - _mn); \
+    float _al = __expf((score) - _mn); \
+    (l) = (l) * _em + _al; \
+    _Pragma("unroll") \
+    for (int _j = 0; _j < 4; ++_j) (acc)[_j] = (acc)[_j] * _em + _al * (vdim)[_j]; \
+    (m) = _mn; \
+  } while (0)
+
+  // Prefetch 2 positions per iteration (ILP on loads)
+  for (int base = pos0 + warp_id; base < pos1; base += nwarps * 2) {
+    int pA = base;
+    int pB = base + nwarps;
+    const __nv_bfloat16* kpA =
+        k_cache + (size_t)kvh * max_seq * HD + (size_t)pA * HD;
+    const __nv_bfloat16* vpA =
+        v_cache + (size_t)kvh * max_seq * HD + (size_t)pA * HD;
+    float kA[4], vA[4], kB[4], vB[4];
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+      kA[j] = __bfloat162float(__ldg(kpA + lane + j * 32));
+      vA[j] = __bfloat162float(__ldg(vpA + lane + j * 32));
+    }
+    bool validB = pB < pos1;
+    if (validB) {
+      const __nv_bfloat16* kpB =
+          k_cache + (size_t)kvh * max_seq * HD + (size_t)pB * HD;
+      const __nv_bfloat16* vpB =
+          v_cache + (size_t)kvh * max_seq * HD + (size_t)pB * HD;
+#pragma unroll
+      for (int j = 0; j < 4; ++j) {
+        kB[j] = __bfloat162float(__ldg(kpB + lane + j * 32));
+        vB[j] = __bfloat162float(__ldg(vpB + lane + j * 32));
+      }
+    }
+    float s0A = 0.f, s1A = 0.f;
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+      s0A += q0[j] * kA[j];
+      s1A += q1[j] * kA[j];
+    }
+    s0A = warp_sum(s0A) * ATTN_SCALE;
+    s1A = warp_sum(s1A) * ATTN_SCALE;
+    s0A = __shfl_sync(0xffffffff, s0A, 0);
+    s1A = __shfl_sync(0xffffffff, s1A, 0);
+    float s0B = 0.f, s1B = 0.f;
+    if (validB) {
+#pragma unroll
+      for (int j = 0; j < 4; ++j) {
+        s0B += q0[j] * kB[j];
+        s1B += q1[j] * kB[j];
+      }
+      s0B = warp_sum(s0B) * ATTN_SCALE;
+      s1B = warp_sum(s1B) * ATTN_SCALE;
+      s0B = __shfl_sync(0xffffffff, s0B, 0);
+      s1B = __shfl_sync(0xffffffff, s1B, 0);
+    }
+    ONLINE_UPDATE(m0, l0, a0, s0A, vA);
+    ONLINE_UPDATE(m1, l1, a1, s1A, vA);
+    if (validB) {
+      ONLINE_UPDATE(m0, l0, a0, s0B, vB);
+      ONLINE_UPDATE(m1, l1, a1, s1B, vB);
+    }
+  }
+#undef ONLINE_UPDATE
+
+  // Support up to 16 warps (512 threads)
+  __shared__ float s_m0[16], s_l0[16], s_m1[16], s_l1[16];
+  __shared__ float s_a0[16][HD], s_a1[16][HD];
+  if (lane == 0) {
+    s_m0[warp_id] = m0; s_l0[warp_id] = l0;
+    s_m1[warp_id] = m1; s_l1[warp_id] = l1;
+  }
+#pragma unroll
+  for (int j = 0; j < 4; ++j) {
+    s_a0[warp_id][lane + j * 32] = a0[j];
+    s_a1[warp_id][lane + j * 32] = a1[j];
+  }
+  __syncthreads();
+
+  if (warp_id == 0) {
+    auto reduce_head = [&](float* s_m, float* s_l, float s_a[][HD], int qh) {
+      float gm = -INFINITY;
+      for (int w = 0; w < nwarps; ++w) gm = fmaxf(gm, s_m[w]);
+      float gl = 0.f;
+      float fout[4] = {0.f, 0.f, 0.f, 0.f};
+      for (int w = 0; w < nwarps; ++w) {
+        float sc = expf(s_m[w] - gm);
+        gl += s_l[w] * sc;
+#pragma unroll
+        for (int j = 0; j < 4; ++j)
+          fout[j] += s_a[w][lane + j * 32] * sc;
+      }
+      if (direct_out != nullptr && n_splits == 1) {
+        float inv = 1.f / fmaxf(gl, 1e-20f);
+#pragma unroll
+        for (int j = 0; j < 4; ++j)
+          direct_out[qh * HD + lane + j * 32] = fout[j] * inv;
+      } else {
+        float* pout = partial + ((size_t)qh * n_splits + split) * (HD + 2);
+#pragma unroll
+        for (int j = 0; j < 4; ++j)
+          pout[lane + j * 32] = fout[j];
+        if (lane == 0) {
+          pout[HD] = gm;
+          pout[HD + 1] = gl;
+        }
+      }
+    };
+    reduce_head(s_m0, s_l0, s_a0, qh0);
+    reduce_head(s_m1, s_l1, s_a1, qh1);
+  }
+}
+
+// Combine splits → attn_out[NQ, HD]
+// One block per Q head, 256 threads. Parallel max/sum over splits.
+__global__ void attn_combine_kernel(
+    const float* __restrict__ partial,
+    float* __restrict__ out,
+    int n_splits
+) {
+  const int qh = blockIdx.x;
+  if (qh >= NQ) return;
+  const int tid = threadIdx.x;
+  const int lane = tid & 31;
+  const int warp_id = tid >> 5;
+  const int nwarps = blockDim.x >> 5;
+
+  // Phase 1: parallel max over split m values
+  float local_m = -INFINITY;
+  for (int s = tid; s < n_splits; s += blockDim.x) {
+    const float* p = partial + ((size_t)qh * n_splits + s) * (HD + 2);
+    local_m = fmaxf(local_m, p[HD]);
+  }
+  local_m = warp_max(local_m);
+  __shared__ float s_m[32];
+  __shared__ float s_gm;
+  if (lane == 0) s_m[warp_id] = local_m;
+  __syncthreads();
+  if (warp_id == 0) {
+    float v = (lane < nwarps) ? s_m[lane] : -INFINITY;
+    v = warp_max(v);
+    if (lane == 0) s_gm = v;
+  }
+  __syncthreads();
+  float gm = s_gm;
+
+  // Phase 2: accumulate l and out vectors with rescaling
+  float local_l = 0.f;
+  float local_acc[4] = {0.f, 0.f, 0.f, 0.f};
+  // Each thread owns a subset of splits; lane owns 4 dims of the vector
+  // Strategy: every thread iterates all splits for its dim components —
+  // better: warps cooperate on dims, threads on splits.
+  // Simpler fast path: each warp handles a subset of splits, reduces.
+  for (int s = warp_id; s < n_splits; s += nwarps) {
+    const float* p = partial + ((size_t)qh * n_splits + s) * (HD + 2);
+    float sc = expf(p[HD] - gm);
+    if (lane == 0) local_l += p[HD + 1] * sc;
+#pragma unroll
+    for (int j = 0; j < 4; ++j)
+      local_acc[j] += p[lane + j * 32] * sc;
+  }
+  // local_l only valid on lane 0 of each warp
+  local_l = __shfl_sync(0xffffffff, local_l, 0);
+  // Reduce across warps
+  __shared__ float s_l[32];
+  __shared__ float s_acc[32][HD];
+  if (lane == 0) s_l[warp_id] = local_l;
+#pragma unroll
+  for (int j = 0; j < 4; ++j)
+    s_acc[warp_id][lane + j * 32] = local_acc[j];
+  __syncthreads();
+  if (warp_id == 0) {
+    float gl = 0.f;
+    float fout[4] = {0.f, 0.f, 0.f, 0.f};
+    for (int w = 0; w < nwarps; ++w) {
+      gl += s_l[w];
+#pragma unroll
+      for (int j = 0; j < 4; ++j)
+        fout[j] += s_acc[w][lane + j * 32];
+    }
+    float inv = 1.f / fmaxf(gl, 1e-20f);
+#pragma unroll
+    for (int j = 0; j < 4; ++j)
+      out[qh * HD + lane + j * 32] = fout[j] * inv;
+  }
+}
+
+__global__ void silu_mul_kernel(float* __restrict__ gate, const float* __restrict__ up, int n) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < n) {
+    float g = gate[i];
+    gate[i] = (g / (1.f + expf(-g))) * up[i];
+  }
+}
+
+__global__ void f32_to_bf16_kernel(const float* __restrict__ x, __nv_bfloat16* __restrict__ y, int n) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < n) y[i] = __float2bfloat16(x[i]);
+}
+
+// =====================================================================
+// Host: one token, all layers
+// =====================================================================
+static inline int choose_splits(int cache_len) {
+  // More splits → more CTAs → better BW on large GPUs.
+  // Parallel combine keeps the reduction cheap even at high split counts.
+  if (cache_len <= 128) return 1;
+  if (cache_len <= 512) return 4;
+  if (cache_len <= 2048) return 16;
+  if (cache_len <= 8192) return 32;
+  if (cache_len <= 32768) return 64;
+  if (cache_len <= 65536) return 128;
+  return 256;
+}
+
+static void launch_gemv(
+    const __nv_bfloat16* W, const float* x, float* y, int M, int K, cudaStream_t stream
+) {
+  int threads = 256, wpb = 8;
+  int blocks = (M + wpb - 1) / wpb;
+  gemv_warp_kernel<<<blocks, threads, K * sizeof(float), stream>>>(W, x, y, M, K);
+}
+
+static void launch_gemv_add(
+    const __nv_bfloat16* W, const float* x, const float* res, float* y,
+    __nv_bfloat16* y_bf16, int M, int K, cudaStream_t stream
+) {
+  int threads = 256, wpb = 8;
+  int blocks = (M + wpb - 1) / wpb;
+  gemv_warp_add_kernel<<<blocks, threads, K * sizeof(float), stream>>>(
+      W, x, res, y, y_bf16, M, K);
+}
+
+void decode_token(
+    torch::Tensor hidden_bf16,
+    torch::Tensor residual_f,
+    torch::Tensor normed,
+    torch::Tensor q,
+    torch::Tensor k,
+    torch::Tensor v,
+    torch::Tensor attn_out,
+    torch::Tensor mlp_gate,
+    torch::Tensor mlp_up,
+    torch::Tensor attn_partial,
+    const std::vector<torch::Tensor>& k_caches,
+    const std::vector<torch::Tensor>& v_caches,
+    const std::vector<torch::Tensor>& input_lns,
+    const std::vector<torch::Tensor>& q_projs,
+    const std::vector<torch::Tensor>& k_projs,
+    const std::vector<torch::Tensor>& v_projs,
+    const std::vector<torch::Tensor>& q_norms,
+    const std::vector<torch::Tensor>& k_norms,
+    const std::vector<torch::Tensor>& o_projs,
+    const std::vector<torch::Tensor>& post_lns,
+    const std::vector<torch::Tensor>& gate_projs,
+    const std::vector<torch::Tensor>& up_projs,
+    const std::vector<torch::Tensor>& down_projs,
+    torch::Tensor cos_pos,
+    torch::Tensor sin_pos,
+    int64_t position,
+    int64_t max_seq,
+    int64_t num_layers
+) {
+  auto stream = at::cuda::getCurrentCUDAStream();
+  int pos = (int)position;
+  int mseq = (int)max_seq;
+  int nlayers = (int)num_layers;
+  int cache_len = pos + 1;
+  int n_splits = choose_splits(cache_len);
+  // ensure partial buffer is large enough: NQ * n_splits * (HD+2)
+  TORCH_CHECK(attn_partial.numel() >= (size_t)NQ * n_splits * (HD + 2),
+              "attn_partial too small");
+
+  float* residual = residual_f.data_ptr<float>();
+  float* normed_p = normed.data_ptr<float>();
+  float* q_p = q.data_ptr<float>();
+  float* k_p = k.data_ptr<float>();
+  float* v_p = v.data_ptr<float>();
+  float* attn_p = attn_out.data_ptr<float>();
+  float* gate_p = mlp_gate.data_ptr<float>();
+  float* up_p = mlp_up.data_ptr<float>();
+  float* partial_p = attn_partial.data_ptr<float>();
+  __nv_bfloat16* hidden_p = reinterpret_cast<__nv_bfloat16*>(hidden_bf16.data_ptr());
+  const float* cos_p = cos_pos.data_ptr<float>();
+  const float* sin_p = sin_pos.data_ptr<float>();
+
+  for (int layer = 0; layer < nlayers; ++layer) {
+    auto& kc = k_caches[layer];
+    auto& vc = v_caches[layer];
+    __nv_bfloat16* kcache = reinterpret_cast<__nv_bfloat16*>(kc.data_ptr());
+    __nv_bfloat16* vcache = reinterpret_cast<__nv_bfloat16*>(vc.data_ptr());
+    const __nv_bfloat16* iln = reinterpret_cast<const __nv_bfloat16*>(input_lns[layer].data_ptr());
+    const __nv_bfloat16* wq = reinterpret_cast<const __nv_bfloat16*>(q_projs[layer].data_ptr());
+    const __nv_bfloat16* wk = reinterpret_cast<const __nv_bfloat16*>(k_projs[layer].data_ptr());
+    const __nv_bfloat16* wv = reinterpret_cast<const __nv_bfloat16*>(v_projs[layer].data_ptr());
+    const __nv_bfloat16* qn = reinterpret_cast<const __nv_bfloat16*>(q_norms[layer].data_ptr());
+    const __nv_bfloat16* kn = reinterpret_cast<const __nv_bfloat16*>(k_norms[layer].data_ptr());
+    const __nv_bfloat16* wo = reinterpret_cast<const __nv_bfloat16*>(o_projs[layer].data_ptr());
+    const __nv_bfloat16* pln = reinterpret_cast<const __nv_bfloat16*>(post_lns[layer].data_ptr());
+    const __nv_bfloat16* wg = reinterpret_cast<const __nv_bfloat16*>(gate_projs[layer].data_ptr());
+    const __nv_bfloat16* wu = reinterpret_cast<const __nv_bfloat16*>(up_projs[layer].data_ptr());
+    const __nv_bfloat16* wd = reinterpret_cast<const __nv_bfloat16*>(down_projs[layer].data_ptr());
+
+    // 1. RMSNorm input (bf16 hidden → float normed + residual)
+    // On layer 0, hidden is bf16 input; after layer 0, we keep updating bf16 hidden
+    // Always read from hidden_bf16
+    rmsnorm_kernel<<<1, 256, 0, stream>>>(
+        hidden_p, nullptr, iln, normed_p, residual, H, 0);
+
+    // 2. Fused QKV
+    {
+      int threads = 256, wpb = 8;
+      int M = QS + KVS + KVS;
+      int blocks = (M + wpb - 1) / wpb;
+      gemv_qkv_kernel<<<blocks, threads, H * sizeof(float), stream>>>(
+          wq, wk, wv, normed_p, q_p, k_p, v_p);
+    }
+
+    // 3. Q/K RMSNorm + RoPE + cache (fused)
+    qk_norm_rope_cache_kernel<<<1, 256, 0, stream>>>(
+        q_p, k_p, v_p, kcache, vcache, qn, kn, cos_p, sin_p, pos, mseq);
+
+    // 4. GQA split-KV attention (K/V loaded once per KV head)
+    {
+      dim3 grid(NKV, n_splits);
+      // 512 threads (16 warps) for long context, 256 for short
+      int attn_threads = (cache_len >= 4096) ? 512 : 256;
+      if (n_splits == 1) {
+        attn_gqa_split_kernel<<<grid, attn_threads, 0, stream>>>(
+            q_p, kcache, vcache, partial_p, attn_p, cache_len, mseq, n_splits);
+      } else {
+        attn_gqa_split_kernel<<<grid, attn_threads, 0, stream>>>(
+            q_p, kcache, vcache, partial_p, nullptr, cache_len, mseq, n_splits);
+        attn_combine_kernel<<<NQ, 256, 0, stream>>>(partial_p, attn_p, n_splits);
+      }
+    }
+
+    // 5. O proj + residual
+    launch_gemv_add(wo, attn_p, residual, residual, nullptr, H, QS, stream);
+
+    // 6. Post RMSNorm
+    rmsnorm_kernel<<<1, 256, 0, stream>>>(
+        nullptr, residual, pln, normed_p, nullptr, H, 1);
+
+    // 7. Fused SwiGLU (gate+up+silu*)
+    {
+      int threads = 256, wpb = 8;
+      int blocks = (II + wpb - 1) / wpb;
+      gemv_swiglu_kernel<<<blocks, threads, H * sizeof(float), stream>>>(
+          wg, wu, normed_p, gate_p);
+    }
+
+    // 8. down + residual → residual + bf16 hidden
+    launch_gemv_add(wd, gate_p, residual, residual, hidden_p, H, II, stream);
+  }
+}
+"""
+
+_ext = None
+
+
+def _get_ext():
+    global _ext
+    if _ext is not None:
+        return _ext
+    from torch.utils.cpp_extension import load_inline
+
+    major, minor = torch.cuda.get_device_capability(0)
+    arch = f"{major}{minor}"
+    extra_cuda_cflags = [
+        "-O3",
+        "--use_fast_math",
+        "-lineinfo",
+        "-U__CUDA_NO_HALF_OPERATORS__",
+        "-U__CUDA_NO_HALF_CONVERSIONS__",
+        "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
+        "-U__CUDA_NO_HALF2_OPERATORS__",
+        f"-gencode=arch=compute_{arch},code=sm_{arch}",
+    ]
+    _ext = load_inline(
+        name="megaqwen_decode_v14",
+        cpp_sources=_CPP_SRC,
+        cuda_sources=_CUDA_SRC,
+        functions=["decode_token"],
+        extra_cuda_cflags=extra_cuda_cflags,
+        verbose=False,
+    )
+    return _ext
+
+
+class Block(nn.Module):
+    def __init__(self):
+        super().__init__()
+        H, I, D = HIDDEN, INTERMEDIATE, HEAD_DIM
+        self.input_ln = nn.Parameter(torch.ones(H, dtype=torch.bfloat16))
+        self.q_proj = nn.Parameter(torch.empty(NUM_Q * D, H, dtype=torch.bfloat16))
+        self.k_proj = nn.Parameter(torch.empty(NUM_KV * D, H, dtype=torch.bfloat16))
+        self.v_proj = nn.Parameter(torch.empty(NUM_KV * D, H, dtype=torch.bfloat16))
+        self.q_norm = nn.Parameter(torch.ones(D, dtype=torch.bfloat16))
+        self.k_norm = nn.Parameter(torch.ones(D, dtype=torch.bfloat16))
+        self.o_proj = nn.Parameter(torch.empty(H, NUM_Q * D, dtype=torch.bfloat16))
+        self.post_ln = nn.Parameter(torch.ones(H, dtype=torch.bfloat16))
+        self.gate_proj = nn.Parameter(torch.empty(I, H, dtype=torch.bfloat16))
+        self.up_proj = nn.Parameter(torch.empty(I, H, dtype=torch.bfloat16))
+        self.down_proj = nn.Parameter(torch.empty(H, I, dtype=torch.bfloat16))
+        for p in self.parameters():
+            if p is self.input_ln or p is self.post_ln or p is self.q_norm or p is self.k_norm:
+                continue
+            nn.init.normal_(p, std=0.02)
+
+
+class Model(nn.Module):
+    def __init__(self, num_layers: int = NUM_LAYERS, max_seq: int = 131072):
+        super().__init__()
+        self.num_layers = num_layers
+        self.max_seq = max_seq
+        self.blocks = nn.ModuleList([Block() for _ in range(num_layers)])
+        self.register_buffer("_cos", torch.empty(0), persistent=False)
+        self.register_buffer("_sin", torch.empty(0), persistent=False)
+
+    def _ensure_rope(self, device):
+        half = HEAD_DIM // 2
+        if self._cos.numel() == self.max_seq * half and self._cos.device == device:
+            return
+        inv = 1.0 / (
+            10000 ** (torch.arange(0, half, device=device, dtype=torch.float32) / half)
+        )
+        t = torch.arange(self.max_seq, device=device, dtype=torch.float32)
+        freqs = torch.outer(t, inv)
+        self._cos = freqs.cos().contiguous()
+        self._sin = freqs.sin().contiguous()
+
+
+def empty_caches(num_layers: int, max_seq: int, device, dtype=torch.bfloat16):
+    k = [
+        torch.zeros(NUM_KV, max_seq, HEAD_DIM, device=device, dtype=dtype)
+        for _ in range(num_layers)
+    ]
+    v = [
+        torch.zeros(NUM_KV, max_seq, HEAD_DIM, device=device, dtype=dtype)
+        for _ in range(num_layers)
+    ]
+    return k, v
+
+
+def _seeded_hidden(seed: int, device) -> torch.Tensor:
+    g = torch.Generator(device="cpu")
+    g.manual_seed(seed)
+    return torch.randn(HIDDEN, generator=g, dtype=torch.bfloat16).to(device)
+
+
+class _Workspace:
+    def __init__(self, device, max_splits: int = 256):
+        self.residual = torch.empty(HIDDEN, device=device, dtype=torch.float32)
+        self.normed = torch.empty(HIDDEN, device=device, dtype=torch.float32)
+        self.q = torch.empty(Q_SIZE, device=device, dtype=torch.float32)
+        self.k = torch.empty(KV_SIZE, device=device, dtype=torch.float32)
+        self.v = torch.empty(KV_SIZE, device=device, dtype=torch.float32)
+        self.attn = torch.empty(Q_SIZE, device=device, dtype=torch.float32)
+        self.gate = torch.empty(INTERMEDIATE, device=device, dtype=torch.float32)
+        self.up = torch.empty(INTERMEDIATE, device=device, dtype=torch.float32)
+        self.hidden = torch.empty(HIDDEN, device=device, dtype=torch.bfloat16)
+        # partial: [NQ, max_splits, HD+2]
+        self.partial = torch.empty(
+            NUM_Q, max_splits, HEAD_DIM + 2, device=device, dtype=torch.float32
+        )
+        self.max_splits = max_splits
+
+
+_ws_cache: dict = {}
+
+
+def _ws(device):
+    key = str(device)
+    if key not in _ws_cache:
+        _ws_cache[key] = _Workspace(device)
+    return _ws_cache[key]
+
+
+def _pack_weights(model: Model):
+    """Cache lists of per-layer weight tensors for the C++ binding."""
+    if getattr(model, "_packed", None) is not None:
+        return model._packed
+    blocks = model.blocks
+    packed = {
+        "input_lns": [b.input_ln for b in blocks],
+        "q_projs": [b.q_proj for b in blocks],
+        "k_projs": [b.k_proj for b in blocks],
+        "v_projs": [b.v_proj for b in blocks],
+        "q_norms": [b.q_norm for b in blocks],
+        "k_norms": [b.k_norm for b in blocks],
+        "o_projs": [b.o_proj for b in blocks],
+        "post_lns": [b.post_ln for b in blocks],
+        "gate_projs": [b.gate_proj for b in blocks],
+        "up_projs": [b.up_proj for b in blocks],
+        "down_projs": [b.down_proj for b in blocks],
+    }
+    model._packed = packed
+    return packed
+
+
+def _decode_one(model, hidden, k_caches, v_caches, position, ws, copy_in=True):
+    """Run one token through all layers. Result left in ws.hidden.
+
+    If copy_in is True, copy `hidden` into ws.hidden first. If False, assume
+    ws.hidden already holds the input (in-place multi-step path).
+    """
+    ext = _get_ext()
+    device = ws.hidden.device
+    model._ensure_rope(device)
+    cos_pos = model._cos[position]
+    sin_pos = model._sin[position]
+    if copy_in:
+        ws.hidden.copy_(hidden.contiguous())
+    pw = _pack_weights(model)
+    ext.decode_token(
+        ws.hidden,
+        ws.residual,
+        ws.normed,
+        ws.q,
+        ws.k,
+        ws.v,
+        ws.attn,
+        ws.gate,
+        ws.up,
+        ws.partial,
+        k_caches,
+        v_caches,
+        pw["input_lns"],
+        pw["q_projs"],
+        pw["k_projs"],
+        pw["v_projs"],
+        pw["q_norms"],
+        pw["k_norms"],
+        pw["o_projs"],
+        pw["post_lns"],
+        pw["gate_projs"],
+        pw["up_projs"],
+        pw["down_projs"],
+        cos_pos,
+        sin_pos,
+        int(position),
+        int(model.max_seq),
+        int(model.num_layers),
+    )
+    return ws.hidden
+
+
+@torch.no_grad()
+def prefill(model: Model, ctx_len: int, seed: int, device=None):
+    device = device or next(model.parameters()).device
+    model = model.to(device).eval()
+    assert ctx_len <= model.max_seq
+    _get_ext()
+    model._packed = None
+    h = _seeded_hidden(seed, device)
+    k_caches, v_caches = empty_caches(model.num_layers, model.max_seq, device)
+    ws = _ws(device)
+    g = torch.Generator(device="cpu")
+    g.manual_seed(seed + 1)
+    noise = torch.randn(ctx_len, HIDDEN, generator=g, dtype=torch.bfloat16).to(device)
+    for t in range(ctx_len):
+        # Mix into ws.hidden in-place then decode
+        torch.add(noise[t], h, alpha=1.0, out=ws.hidden)
+        ws.hidden.mul_(0.5)
+        _decode_one(model, ws.hidden, k_caches, v_caches, t, ws, copy_in=False)
+        h = ws.hidden  # view; next mix uses previous output
+    return ws.hidden.clone(), k_caches, v_caches
+
+
+@torch.no_grad()
+def decode_steps(
+    model: Model,
+    hidden: torch.Tensor,
+    k_caches: list,
+    v_caches: list,
+    start_pos: int,
+    n_steps: int,
+    seed: int,
+):
+    device = hidden.device
+    _get_ext()
+    model._packed = None
+    ws = _ws(device)
+    g = torch.Generator(device="cpu")
+    g.manual_seed(seed + 2)
+    noise = torch.randn(n_steps, HIDDEN, generator=g, dtype=torch.bfloat16).to(device)
+    h = hidden
+    for i in range(n_steps):
+        pos = start_pos + i
+        torch.add(noise[i], h, alpha=1.0, out=ws.hidden)
+        ws.hidden.mul_(0.5)
+        _decode_one(model, ws.hidden, k_caches, v_caches, pos, ws, copy_in=False)
+        h = ws.hidden
+    return ws.hidden.clone(), k_caches, v_caches
+
+
+def run(
+    ctx_len: int,
+    n_decode: int,
+    seed: int,
+    model: Model | None = None,
+    max_seq: int | None = None,
+) -> dict:
+    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    max_seq = max_seq or max(ctx_len + n_decode, 512)
+    if model is None:
+        model = Model(NUM_LAYERS, max_seq)
+    model = model.to(device).eval()
+    h, k_caches, v_caches = prefill(model, ctx_len, seed, device=device)
+    h, k_caches, v_caches = decode_steps(
+        model, h, k_caches, v_caches, start_pos=ctx_len, n_steps=n_decode, seed=seed
+    )
+    return {
+        "last_hidden": h.detach(),
+        "ctx_len": ctx_len,
+        "decode_steps": n_decode,
+    }

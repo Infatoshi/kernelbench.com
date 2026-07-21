@@ -1,0 +1,708 @@
+"""DeepSeek-NSA-style sparse attention — hand-written CUDA (mma.sync) for Blackwell.
+
+Three kernels, no torch ops in the hot path:
+
+  1. `nsa_kbar`   : per key-block mean of K.  The NSA block importance is
+                    mean_j(q.k_j)/sqrt(D) over the block, which is exactly
+                    q . kbar / sqrt(D) — so scoring a block costs one dot product
+                    instead of 64.  kbar is emitted as a hi/lo bf16 pair, and the
+                    score is accumulated as q.hi + q.lo, which keeps ~fp32 accuracy
+                    through bf16 tensor cores.  Plain bf16 kbar is *not* enough: its
+                    0.4% error is large next to the gap between the 8th and 9th block
+                    scores, and would flip top-8 selections away from the reference.
+
+  2. `nsa_select` : block scores as a tensor-core GEMM against kbar, plus the causal
+                    prefix mean for the query's own (partial) block, then a streaming
+                    top-8 per query -> block-major selection bitmask.  Ties resolve to
+                    the higher block index, matching the reference's sort order.
+
+  3. `nsa_attn`   : flash-attention-style online softmax that visits a key block only
+                    when at least one of a warp's 16 queries selected it, applying the
+                    per-query selection mask (plus causal/window masks on the diagonal
+                    blocks) to the mma output.  The sliding window is folded into the
+                    diagonal tiles, so window and selected keys are covered exactly
+                    once.  K/V are staged through shared memory with a 3-deep cp.async
+                    pipeline and read as mma fragments with ldmatrix (ldmatrix.trans
+                    for V, which needs the transposed B operand).
+
+The attention kernel is issue-bound rather than tensor-core-bound at D=64 (a 16x64
+score tile is 64 mma but a few hundred other instructions), so the inner loop is
+written to minimise instructions per mma: the off-diagonal mask is a single fma per
+element with a per-row bias, ldmatrix offsets and cp.async addresses are precomputed
+into constant strides (the xor-swizzle picks the same granule for every row a thread
+touches), and the partial-block bounds check sits on a cold path.
+
+Query tiles are dispatched longest-first: the last tile scans every key block while
+the first scans one, so in-order dispatch would leave the heavy tiles for the final
+wave and let them set the makespan.
+"""
+from __future__ import annotations
+
+import os
+import sys
+import threading
+
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# --------------------------------------------------------------------------------------
+# CUDA
+# --------------------------------------------------------------------------------------
+CUDA_SRC = r"""
+#include <torch/extension.h>
+#include <ATen/cuda/CUDAContext.h>
+#include <cuda.h>
+#include <cuda_runtime.h>
+#include <cuda_bf16.h>
+#include <cstdint>
+
+#define KB      64      // NSA block_size
+#define TOPN    8       // NSA top_n_blocks
+#define WINSZ   64      // NSA sliding_window
+
+typedef __nv_bfloat16 bf16;
+
+__device__ __forceinline__ uint32_t sm_u32(const void* p) {
+    return static_cast<uint32_t>(__cvta_generic_to_shared(p));
+}
+
+// smem tile [rows][D] bf16, xor-swizzled on 16B granules (bank-conflict free ldmatrix)
+template <int D>
+__device__ __forceinline__ int swz(int r, int c) {
+    int g = (c >> 3) ^ (r & 7);
+    return r * D + (g << 3) + (c & 7);
+}
+
+__device__ __forceinline__ void ldm_x4(uint32_t (&r)[4], uint32_t a) {
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+                 : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "r"(a));
+}
+__device__ __forceinline__ void ldm_x4_t(uint32_t (&r)[4], uint32_t a) {
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+                 : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "r"(a));
+}
+__device__ __forceinline__ void mma16816(float (&d)[4], const uint32_t (&a)[4], const uint32_t (&b)[2]) {
+    asm volatile(
+        "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
+        "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+        : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
+        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
+}
+__device__ __forceinline__ void cp16(uint32_t dst, const void* src, int bytes) {
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" ::
+                 "r"(dst), "l"(src), "r"(bytes));
+}
+__device__ __forceinline__ void cp_commit() { asm volatile("cp.async.commit_group;\n" ::); }
+template <int N>
+__device__ __forceinline__ void cp_wait() { asm volatile("cp.async.wait_group %0;\n" :: "n"(N)); }
+
+// =====================================================================================
+// 1. block means of K  ->  hi/lo bf16 split
+// =====================================================================================
+template <int D>
+__global__ void nsa_kbar(const bf16* __restrict__ K, bf16* __restrict__ kbar,
+                         int S, int nb) {
+    int bi = blockIdx.x;
+    int bh = blockIdx.y;                       // b*H + h
+    int d  = threadIdx.x;
+    int k0 = bi * KB;
+    int cnt = min(KB, S - k0);
+    const bf16* src = K + (int64_t)bh * S * D + (int64_t)k0 * D + d;
+    float s = 0.f;
+    for (int j = 0; j < cnt; ++j) s += __bfloat162float(src[(int64_t)j * D]);
+    s /= (float)cnt;
+    bf16 hi = __float2bfloat16(s);
+    bf16 lo = __float2bfloat16(s - __bfloat162float(hi));
+    bf16* dst = kbar + ((int64_t)bh * 2) * nb * D + (int64_t)bi * D + d;
+    dst[0] = hi;
+    dst[(int64_t)nb * D] = lo;
+}
+
+// =====================================================================================
+// 2. block scores + top-8 -> block-major selection bitmask
+//    grid (S/64, H*B), 128 threads.  One 64-query tile per CTA.
+// =====================================================================================
+#define SELCH 64        // blocks scored per chunk
+
+template <int D>
+__global__ __launch_bounds__(128) void nsa_select(
+    const bf16* __restrict__ Q, const bf16* __restrict__ K, const bf16* __restrict__ kbar,
+    uint32_t* __restrict__ mask, int S, int nb, int SW, float scale) {
+    extern __shared__ char smem_raw[];
+    bf16* sQ = (bf16*)smem_raw;                       // 64 x D
+    bf16* sB = sQ + 64 * D;                           // SELCH x D  (kbar hi / K diag)
+    bf16* sB2 = sB + SELCH * D;                       // SELCH x D  (kbar lo)
+    float* sS = (float*)(sB2 + SELCH * D);            // 64 x (SELCH+1)
+    uint32_t* sM = (uint32_t*)(sS + 64 * (SELCH + 1));// nb x 2
+
+    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+    const int qb = gridDim.x - 1 - blockIdx.x, bh = blockIdx.y;   // long tiles first
+    const int q0 = qb * 64;
+
+    const bf16* Qh = Q + (int64_t)bh * S * D;
+    const bf16* Kh = K + (int64_t)bh * S * D;
+    const bf16* kb = kbar + (int64_t)bh * 2 * nb * D;
+
+    // ---- Q tile -> smem
+    constexpr int GR = D / 8;
+    for (int i = tid; i < 64 * GR; i += 128) {
+        int r = i / GR, g = i - r * GR;
+        int row = q0 + r;
+        int off = swz<D>(r, g * 8);
+        int bytes = (row < S) ? 16 : 0;
+        cp16(sm_u32(sQ + off), Qh + (int64_t)min(row, S - 1) * D + g * 8, bytes);
+    }
+    for (int i = tid; i < nb * 2; i += 128) sM[i] = 0u;
+    cp_commit();
+    cp_wait<0>();
+    __syncthreads();
+
+    // Q fragments (16 rows of this warp) x (D/16 k-steps)
+    uint32_t qa[D / 16][4];
+#pragma unroll
+    for (int ks = 0; ks < D / 16; ++ks) {
+        int r = warp * 16 + (lane & 7) + 8 * ((lane >> 3) & 1);
+        int c = ks * 16 + 8 * ((lane >> 4) & 1);
+        ldm_x4(qa[ks], sm_u32(sQ + swz<D>(r, c)));
+    }
+
+    float bv[TOPN];
+    int   bidx[TOPN];
+#pragma unroll
+    for (int i = 0; i < TOPN; ++i) { bv[i] = -INFINITY; bidx[i] = -1; }
+
+    // ---- full blocks strictly before the diagonal block
+    for (int c0 = 0; c0 < qb; c0 += SELCH) {
+        int cn = min(SELCH, qb - c0);
+        __syncthreads();
+        for (int i = tid; i < SELCH * GR; i += 128) {   // hi and lo in one batch
+            int r = i / GR, g = i - r * GR;
+            int bytes = (r < cn) ? 16 : 0;
+            int64_t go = (int64_t)min(c0 + r, nb - 1) * D + g * 8;
+            cp16(sm_u32(sB + swz<D>(r, g * 8)), kb + go, bytes);
+            cp16(sm_u32(sB2 + swz<D>(r, g * 8)), kb + (int64_t)nb * D + go, bytes);
+        }
+        cp_commit();
+        cp_wait<0>();
+        __syncthreads();
+
+        float acc[SELCH / 8][4];
+#pragma unroll
+        for (int n = 0; n < SELCH / 8; ++n)
+#pragma unroll
+            for (int i = 0; i < 4; ++i) acc[n][i] = 0.f;
+
+        for (int part = 0; part < 2; ++part) {   // hi then lo, both already resident
+            const bf16* sp = part ? sB2 : sB;
+#pragma unroll
+            for (int nn = 0; nn < SELCH / 16; ++nn) {
+                uint32_t bfr[D / 16][4];
+#pragma unroll
+                for (int ks = 0; ks < D / 16; ++ks) {
+                    int r = nn * 16 + (lane & 7) + 8 * ((lane >> 3) & 1);
+                    int c = ks * 16 + 8 * ((lane >> 4) & 1);
+                    ldm_x4(bfr[ks], sm_u32(sp + swz<D>(r, c)));
+                }
+#pragma unroll
+                for (int ks = 0; ks < D / 16; ++ks) {
+                    uint32_t b0[2] = {bfr[ks][0], bfr[ks][2]};
+                    uint32_t b1[2] = {bfr[ks][1], bfr[ks][3]};
+                    mma16816(acc[nn * 2 + 0], qa[ks], b0);
+                    mma16816(acc[nn * 2 + 1], qa[ks], b1);
+                }
+            }
+        }
+        __syncthreads();
+#pragma unroll
+        for (int n = 0; n < SELCH / 8; ++n) {
+            int r0 = warp * 16 + (lane >> 2), c = n * 8 + ((lane & 3) << 1);
+            sS[r0 * (SELCH + 1) + c] = acc[n][0];
+            sS[r0 * (SELCH + 1) + c + 1] = acc[n][1];
+            sS[(r0 + 8) * (SELCH + 1) + c] = acc[n][2];
+            sS[(r0 + 8) * (SELCH + 1) + c + 1] = acc[n][3];
+        }
+        __syncthreads();
+        if (tid < 64) {
+            const float* row = sS + tid * (SELCH + 1);
+            for (int j = 0; j < cn; ++j) {
+                float s = row[j] * scale;
+                if (s >= bv[TOPN - 1]) {
+                    bv[TOPN - 1] = s; bidx[TOPN - 1] = c0 + j;
+#pragma unroll
+                    for (int p = TOPN - 1; p > 0; --p) {
+                        if (bv[p] >= bv[p - 1]) {
+                            float tv = bv[p]; bv[p] = bv[p - 1]; bv[p - 1] = tv;
+                            int ti = bidx[p]; bidx[p] = bidx[p - 1]; bidx[p - 1] = ti;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // ---- diagonal block: causal prefix mean of the raw q.k scores
+    {
+        __syncthreads();
+        for (int i = tid; i < 64 * GR; i += 128) {
+            int r = i / GR, g = i - r * GR;
+            int row = q0 + r;
+            int bytes = (row < S) ? 16 : 0;
+            cp16(sm_u32(sB + swz<D>(r, g * 8)), Kh + (int64_t)min(row, S - 1) * D + g * 8, bytes);
+        }
+        cp_commit();
+        cp_wait<0>();
+        __syncthreads();
+
+        float acc[8][4];
+#pragma unroll
+        for (int n = 0; n < 8; ++n)
+#pragma unroll
+            for (int i = 0; i < 4; ++i) acc[n][i] = 0.f;
+#pragma unroll
+        for (int nn = 0; nn < 4; ++nn) {
+            uint32_t bfr[D / 16][4];
+#pragma unroll
+            for (int ks = 0; ks < D / 16; ++ks) {
+                int r = nn * 16 + (lane & 7) + 8 * ((lane >> 3) & 1);
+                int c = ks * 16 + 8 * ((lane >> 4) & 1);
+                ldm_x4(bfr[ks], sm_u32(sB + swz<D>(r, c)));
+            }
+#pragma unroll
+            for (int ks = 0; ks < D / 16; ++ks) {
+                uint32_t b0[2] = {bfr[ks][0], bfr[ks][2]};
+                uint32_t b1[2] = {bfr[ks][1], bfr[ks][3]};
+                mma16816(acc[nn * 2 + 0], qa[ks], b0);
+                mma16816(acc[nn * 2 + 1], qa[ks], b1);
+            }
+        }
+        __syncthreads();
+#pragma unroll
+        for (int n = 0; n < 8; ++n) {
+            int r0 = warp * 16 + (lane >> 2), c = n * 8 + ((lane & 3) << 1);
+            sS[r0 * (SELCH + 1) + c] = acc[n][0];
+            sS[r0 * (SELCH + 1) + c + 1] = acc[n][1];
+            sS[(r0 + 8) * (SELCH + 1) + c] = acc[n][2];
+            sS[(r0 + 8) * (SELCH + 1) + c + 1] = acc[n][3];
+        }
+        __syncthreads();
+        if (tid < 64 && q0 + tid < S) {
+            // causal prefix mean of the diagonal block: four independent partials so the
+            // smem loads pipeline instead of forming one dependent chain.
+            const float* row = sS + tid * (SELCH + 1);
+            float s0 = 0.f, s1 = 0.f, s2 = 0.f, s3 = 0.f;
+            int n = tid + 1, j = 0;
+            for (; j + 4 <= n; j += 4) {
+                s0 += row[j]; s1 += row[j + 1]; s2 += row[j + 2]; s3 += row[j + 3];
+            }
+            for (; j < n; ++j) s0 += row[j];
+            float s = ((s0 + s1) + (s2 + s3)) * scale / (float)(tid + 1);
+            if (s >= bv[TOPN - 1]) {
+                bv[TOPN - 1] = s; bidx[TOPN - 1] = qb;
+            }
+        }
+    }
+
+    // ---- emit bitmask
+    if (tid < 64 && q0 + tid < S) {
+        int w = (tid >> 5), b = (tid & 31);
+#pragma unroll
+        for (int i = 0; i < TOPN; ++i)
+            if (bidx[i] >= 0) atomicOr(&sM[bidx[i] * 2 + w], 1u << b);
+    }
+    __syncthreads();
+    uint32_t* mh = mask + (int64_t)bh * nb * SW + (q0 >> 5);
+    for (int i = tid; i < nb * 2; i += 128) {
+        int bi = i >> 1, w = i & 1;
+        if ((q0 >> 5) + w < SW) mh[(int64_t)bi * SW + w] = sM[i];
+    }
+}
+
+// =====================================================================================
+// 3. sparse flash attention over the selected blocks.
+//    grid (S/QTA, H*B), 2*QTA threads: one QTA-query tile per CTA, 16 queries per warp.
+//    A warp skips a key block outright when none of its 16 queries selected it and the
+//    block is out of sliding-window range; otherwise the per-query selection bit becomes
+//    a row bias on the mma output.  K/V stream through a 3-deep cp.async pipeline.
+// =====================================================================================
+#define NSTAGE 3
+
+template <int D, int QTA>
+__global__ __launch_bounds__(QTA * 2) void nsa_attn(
+    const bf16* __restrict__ Q, const bf16* __restrict__ K, const bf16* __restrict__ V,
+    const uint32_t* __restrict__ mask, bf16* __restrict__ O,
+    int S, int nb, int SW, float scale_l2) {
+    constexpr int NTA = QTA * 2;        // threads
+    constexpr int MWA = QTA / 32;       // mask words spanning the tile
+    extern __shared__ char smem_raw[];
+    bf16* sQ = (bf16*)smem_raw;                    // QTA x D
+    bf16* sK = sQ + QTA * D;                       // NSTAGE x 64 x D
+    bf16* sV = sK + NSTAGE * 64 * D;               // NSTAGE x 64 x D
+    uint32_t* sM = (uint32_t*)(sV + NSTAGE * 64 * D);
+
+    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+    const int qb = gridDim.x - 1 - blockIdx.x, bh = blockIdx.y;   // long tiles first
+    const int q0 = qb * QTA;
+    const int qbF = q0 >> 6;
+    const int nblk = min((q0 + QTA - 1) >> 6, nb - 1) + 1;
+
+    const bf16* Qh = Q + (int64_t)bh * S * D;
+    const bf16* Kh = K + (int64_t)bh * S * D;
+    const bf16* Vh = V + (int64_t)bh * S * D;
+    const uint32_t* mh = mask + (int64_t)bh * nb * SW + (q0 >> 5);
+
+    constexpr int GR = D / 8;
+
+    for (int i = tid; i < QTA * GR; i += NTA) {
+        int r = i / GR, g = i - r * GR;
+        int row = q0 + r;
+        int bytes = (row < S) ? 16 : 0;
+        cp16(sm_u32(sQ + swz<D>(r, g * 8)), Qh + (int64_t)min(row, S - 1) * D + g * 8, bytes);
+    }
+    for (int i = tid; i < nblk * MWA; i += NTA) {
+        int bi = i / MWA, w = i - bi * MWA;
+        sM[i] = ((q0 >> 5) + w < SW) ? mh[(int64_t)bi * SW + w] : 0u;
+    }
+    cp_commit();
+
+    // K/V staging.  A thread's granules sit NTA/GR rows apart, and that stride is a
+    // multiple of 8, so the xor-swizzle picks the same granule for all of them: both the
+    // shared and global offsets are then base + t*const, and the per-block address math
+    // collapses to one add.  Only the last key block can be partial, so the bounds check
+    // lives on a cold path.
+    const int cg = tid & (GR - 1);                 // granule column
+    const int cr0 = tid / GR;                      // this thread's first row
+    const int csm0 = swz<D>(cr0, cg * 8) * (int)sizeof(bf16);
+    const int cgl0 = cr0 * D + cg * 8;
+    constexpr int NCP = (64 * GR) / NTA;           // granules per thread
+    constexpr int CROW = NTA / GR;                 // row stride between them
+    constexpr int CSTRIDE = CROW * D;
+    static_assert(CROW % 8 == 0, "swizzle stride assumption");
+
+    auto stage = [&](int slot, int bi) {
+        const int k0 = bi * KB;
+        const uint32_t sk = sm_u32(sK + slot * 64 * D) + csm0;
+        const uint32_t sv = sm_u32(sV + slot * 64 * D) + csm0;
+        if (k0 + 64 <= S) {
+            const bf16* kp = Kh + (int64_t)k0 * D + cgl0;
+            const bf16* vp = Vh + (int64_t)k0 * D + cgl0;
+#pragma unroll
+            for (int t = 0; t < NCP; ++t) {
+                cp16(sk + t * CSTRIDE * (int)sizeof(bf16), kp + t * CSTRIDE, 16);
+                cp16(sv + t * CSTRIDE * (int)sizeof(bf16), vp + t * CSTRIDE, 16);
+            }
+        } else {
+#pragma unroll
+            for (int t = 0; t < NCP; ++t) {
+                int row = k0 + cr0 + t * CROW;
+                int bytes = (row < S) ? 16 : 0;
+                int64_t go = (int64_t)min(row, S - 1) * D + cg * 8;
+                cp16(sk + t * CSTRIDE * (int)sizeof(bf16), Kh + go, bytes);
+                cp16(sv + t * CSTRIDE * (int)sizeof(bf16), Vh + go, bytes);
+            }
+        }
+        cp_commit();
+    };
+
+#pragma unroll
+    for (int s = 0; s < NSTAGE - 1; ++s) {
+        if (s < nblk) stage(s, s);
+        else cp_commit();
+    }
+    cp_wait<NSTAGE - 1>();
+    __syncthreads();
+
+    uint32_t qa[D / 16][4];
+#pragma unroll
+    for (int ks = 0; ks < D / 16; ++ks) {
+        int r = warp * 16 + (lane & 7) + 8 * ((lane >> 3) & 1);
+        int c = ks * 16 + 8 * ((lane >> 4) & 1);
+        ldm_x4(qa[ks], sm_u32(sQ + swz<D>(r, c)));
+    }
+
+    float acc[D / 8][4];
+#pragma unroll
+    for (int n = 0; n < D / 8; ++n)
+#pragma unroll
+        for (int i = 0; i < 4; ++i) acc[n][i] = 0.f;
+    // finite floor: a fully-masked tile leaves m unchanged and contributes exp2(-inf)=0,
+    // which an -INFINITY init would turn into (-inf) - (-inf) = NaN.
+    float mrow[2] = {-1e30f, -1e30f};
+    float lrow[2] = {0.f, 0.f};
+
+    // ldmatrix offsets: a fragment's row base is always a multiple of 16, so r&7 (and
+    // hence the swizzle granule) depends only on the lane -- the whole address is
+    // base + rowblock*16*D + soff[col group], with soff precomputed once.
+    const int frl = (lane & 7) + 8 * ((lane >> 3) & 1);
+    const int fcg = (lane >> 4) & 1;
+    int soff[D / 16];
+#pragma unroll
+    for (int t = 0; t < D / 16; ++t)
+        soff[t] = (frl * D + ((((t * 2 + fcg) ^ (frl & 7)) << 3))) * (int)sizeof(bf16);
+
+    const int qrow0 = warp * 16 + (lane >> 2);   // tile-local rows owned by this lane
+    const int qrow1 = qrow0 + 8;
+    const int t0 = q0 + qrow0, t1 = q0 + qrow1;
+
+    for (int bi = 0; bi < nblk; ++bi) {
+        int slot = bi % NSTAGE;
+        cp_wait<NSTAGE - 2>();
+        __syncthreads();
+        if (bi + NSTAGE - 1 < nblk) stage((bi + NSTAGE - 1) % NSTAGE, bi + NSTAGE - 1);
+
+        bool diag = (bi >= qbF - 1);
+        // sparsity: if none of this warp's 16 queries selected the block, and the block
+        // is out of window range, the whole 16x64 tile is masked off -- skip it.
+        uint32_t wsel = (sM[bi * MWA + (warp >> 1)] >> ((warp & 1) * 16)) & 0xFFFFu;
+        if (!diag && wsel == 0u) continue;
+
+        bool sel0 = (sM[bi * MWA + (qrow0 >> 5)] >> (qrow0 & 31)) & 1u;
+        bool sel1 = (sM[bi * MWA + (qrow1 >> 5)] >> (qrow1 & 31)) & 1u;
+
+        float sc[8][4];
+#pragma unroll
+        for (int n = 0; n < 8; ++n)
+#pragma unroll
+            for (int i = 0; i < 4; ++i) sc[n][i] = 0.f;
+        const uint32_t kbase = sm_u32(sK + slot * 64 * D);
+#pragma unroll
+        for (int nn = 0; nn < 4; ++nn) {
+            uint32_t bfr[D / 16][4];
+#pragma unroll
+            for (int ks = 0; ks < D / 16; ++ks)
+                ldm_x4(bfr[ks], kbase + nn * 16 * D * (int)sizeof(bf16) + soff[ks]);
+#pragma unroll
+            for (int ks = 0; ks < D / 16; ++ks) {
+                uint32_t b0[2] = {bfr[ks][0], bfr[ks][2]};
+                uint32_t b1[2] = {bfr[ks][1], bfr[ks][3]};
+                mma16816(sc[nn * 2 + 0], qa[ks], b0);
+                mma16816(sc[nn * 2 + 1], qa[ks], b1);
+            }
+        }
+
+        // mask + scale.  Away from the diagonal the mask is per *row* (did this query
+        // select the block?), so it collapses to one fma per element with a row bias of
+        // 0 or -1e38 -- a masked score then exps to exactly 0 without an -inf select.
+        // Only the two diagonal blocks need the per-key causal/window test.
+        const int k0 = bi * KB;
+        if (!diag) {
+            const float bias0 = sel0 ? 0.f : -1e38f;
+            const float bias1 = sel1 ? 0.f : -1e38f;
+#pragma unroll
+            for (int n = 0; n < 8; ++n) {
+                sc[n][0] = fmaf(sc[n][0], scale_l2, bias0);
+                sc[n][1] = fmaf(sc[n][1], scale_l2, bias0);
+                sc[n][2] = fmaf(sc[n][2], scale_l2, bias1);
+                sc[n][3] = fmaf(sc[n][3], scale_l2, bias1);
+            }
+        } else {
+#pragma unroll
+            for (int n = 0; n < 8; ++n) {
+                int c = n * 8 + ((lane & 3) << 1);
+                int j0 = k0 + c, j1 = j0 + 1;
+                sc[n][0] = (j0 <= t0 && (j0 + WINSZ > t0 || sel0)) ? sc[n][0] * scale_l2 : -INFINITY;
+                sc[n][1] = (j1 <= t0 && (j1 + WINSZ > t0 || sel0)) ? sc[n][1] * scale_l2 : -INFINITY;
+                sc[n][2] = (j0 <= t1 && (j0 + WINSZ > t1 || sel1)) ? sc[n][2] * scale_l2 : -INFINITY;
+                sc[n][3] = (j1 <= t1 && (j1 + WINSZ > t1 || sel1)) ? sc[n][3] * scale_l2 : -INFINITY;
+            }
+        }
+
+        // row max / online softmax
+        float rm0 = -INFINITY, rm1 = -INFINITY;
+#pragma unroll
+        for (int n = 0; n < 8; ++n) {
+            rm0 = fmaxf(rm0, fmaxf(sc[n][0], sc[n][1]));
+            rm1 = fmaxf(rm1, fmaxf(sc[n][2], sc[n][3]));
+        }
+        rm0 = fmaxf(rm0, __shfl_xor_sync(0xffffffff, rm0, 1));
+        rm0 = fmaxf(rm0, __shfl_xor_sync(0xffffffff, rm0, 2));
+        rm1 = fmaxf(rm1, __shfl_xor_sync(0xffffffff, rm1, 1));
+        rm1 = fmaxf(rm1, __shfl_xor_sync(0xffffffff, rm1, 2));
+
+        float mn0 = fmaxf(mrow[0], rm0), mn1 = fmaxf(mrow[1], rm1);
+        float al0 = exp2f(mrow[0] - mn0), al1 = exp2f(mrow[1] - mn1);
+        mrow[0] = mn0; mrow[1] = mn1;
+
+        float ps0 = 0.f, ps1 = 0.f;
+#pragma unroll
+        for (int n = 0; n < 8; ++n) {
+            sc[n][0] = exp2f(sc[n][0] - mn0); ps0 += sc[n][0];
+            sc[n][1] = exp2f(sc[n][1] - mn0); ps0 += sc[n][1];
+            sc[n][2] = exp2f(sc[n][2] - mn1); ps1 += sc[n][2];
+            sc[n][3] = exp2f(sc[n][3] - mn1); ps1 += sc[n][3];
+        }
+        ps0 += __shfl_xor_sync(0xffffffff, ps0, 1); ps0 += __shfl_xor_sync(0xffffffff, ps0, 2);
+        ps1 += __shfl_xor_sync(0xffffffff, ps1, 1); ps1 += __shfl_xor_sync(0xffffffff, ps1, 2);
+        lrow[0] = lrow[0] * al0 + ps0;
+        lrow[1] = lrow[1] * al1 + ps1;
+
+#pragma unroll
+        for (int n = 0; n < D / 8; ++n) {
+            acc[n][0] *= al0; acc[n][1] *= al0;
+            acc[n][2] *= al1; acc[n][3] *= al1;
+        }
+
+        // P V
+        const uint32_t vbase = sm_u32(sV + slot * 64 * D);
+#pragma unroll
+        for (int ks = 0; ks < 4; ++ks) {           // 4 k-steps of 16 keys
+            uint32_t pa[4];
+            {
+                __nv_bfloat162 x0 = __floats2bfloat162_rn(sc[ks * 2 + 0][0], sc[ks * 2 + 0][1]);
+                __nv_bfloat162 x1 = __floats2bfloat162_rn(sc[ks * 2 + 0][2], sc[ks * 2 + 0][3]);
+                __nv_bfloat162 x2 = __floats2bfloat162_rn(sc[ks * 2 + 1][0], sc[ks * 2 + 1][1]);
+                __nv_bfloat162 x3 = __floats2bfloat162_rn(sc[ks * 2 + 1][2], sc[ks * 2 + 1][3]);
+                pa[0] = *reinterpret_cast<uint32_t*>(&x0);
+                pa[1] = *reinterpret_cast<uint32_t*>(&x1);
+                pa[2] = *reinterpret_cast<uint32_t*>(&x2);
+                pa[3] = *reinterpret_cast<uint32_t*>(&x3);
+            }
+#pragma unroll
+            for (int dn = 0; dn < D / 16; ++dn) {
+                uint32_t vf[4];
+                ldm_x4_t(vf, vbase + ks * 16 * D * (int)sizeof(bf16) + soff[dn]);
+                uint32_t b0[2] = {vf[0], vf[1]};
+                uint32_t b1[2] = {vf[2], vf[3]};
+                mma16816(acc[dn * 2 + 0], pa, b0);
+                mma16816(acc[dn * 2 + 1], pa, b1);
+            }
+        }
+    }
+
+    // ---- epilogue
+    float r0 = (lrow[0] > 0.f) ? 1.f / lrow[0] : 0.f;
+    float r1 = (lrow[1] > 0.f) ? 1.f / lrow[1] : 0.f;
+    bf16* Oh = O + (int64_t)bh * S * D;
+#pragma unroll
+    for (int n = 0; n < D / 8; ++n) {
+        int c = n * 8 + ((lane & 3) << 1);
+        if (t0 < S) {
+            bf16 o0 = __float2bfloat16(acc[n][0] * r0), o1 = __float2bfloat16(acc[n][1] * r0);
+            *reinterpret_cast<__nv_bfloat162*>(Oh + (int64_t)t0 * D + c) = __nv_bfloat162(o0, o1);
+        }
+        if (t1 < S) {
+            bf16 o2 = __float2bfloat16(acc[n][2] * r1), o3 = __float2bfloat16(acc[n][3] * r1);
+            *reinterpret_cast<__nv_bfloat162*>(Oh + (int64_t)t1 * D + c) = __nv_bfloat162(o2, o3);
+        }
+    }
+}
+
+// =====================================================================================
+// host
+// =====================================================================================
+// Query tile of the attention kernel: a wider tile reuses each staged K/V block for
+// more queries (the kernel is bound by per-block staging latency, not by mma issue).
+#define ATTN_QT(QA, ...)                                             \
+    {                                                                \
+        const char* e_ = getenv("NSA_QTA");                          \
+        int qa_ = e_ ? atoi(e_) : 64;                               \
+        if (qa_ >= 256) { constexpr int QA = 256; __VA_ARGS__; }     \
+        else if (qa_ >= 128) { constexpr int QA = 128; __VA_ARGS__; }\
+        else { constexpr int QA = 64; __VA_ARGS__; }                 \
+    }
+
+#define DISPATCH_D(DVAL, ...)                                       \
+    if (D == 64) { constexpr int DVAL = 64; __VA_ARGS__; }          \
+    else if (D == 128) { constexpr int DVAL = 128; __VA_ARGS__; }   \
+    else TORCH_CHECK(false, "unsupported head dim ", D);
+
+torch::Tensor nsa_forward(torch::Tensor q, torch::Tensor k, torch::Tensor v) {
+    TORCH_CHECK(q.is_cuda() && k.is_cuda() && v.is_cuda(), "cuda tensors required");
+    TORCH_CHECK(q.scalar_type() == torch::kBFloat16, "bf16 required");
+    q = q.contiguous(); k = k.contiguous(); v = v.contiguous();
+    int B = q.size(0), H = q.size(1), S = q.size(2), D = q.size(3);
+    int nb = (S + KB - 1) / KB;
+    int SW = (S + 31) / 32;
+    int BH = B * H;
+
+    auto out = torch::empty_like(q);
+    auto kbar = torch::empty({B, H, 2, nb, D}, q.options());
+    auto mask = torch::empty({B, H, nb, SW}, torch::dtype(torch::kInt32).device(q.device()));
+
+    const bf16* qp = (const bf16*)q.data_ptr();
+    const bf16* kp = (const bf16*)k.data_ptr();
+    const bf16* vp = (const bf16*)v.data_ptr();
+    bf16* op = (bf16*)out.data_ptr();
+    bf16* kbp = (bf16*)kbar.data_ptr();
+    uint32_t* mp = (uint32_t*)mask.data_ptr();
+    float scale = 1.f / sqrtf((float)D);
+    auto stream = at::cuda::getCurrentCUDAStream();
+
+    DISPATCH_D(DD, {
+        nsa_kbar<DD><<<dim3(nb, BH), DD, 0, stream>>>(kp, kbp, S, nb);
+
+        int nq = (S + 63) / 64;
+        size_t sel_sm = (size_t)(64 * DD + 2 * SELCH * DD) * sizeof(bf16)
+                      + (size_t)64 * (SELCH + 1) * sizeof(float)
+                      + (size_t)nb * 2 * sizeof(uint32_t);
+        cudaFuncSetAttribute(nsa_select<DD>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)sel_sm);
+        nsa_select<DD><<<dim3(nq, BH), 128, sel_sm, stream>>>(qp, kp, kbp, mp, S, nb, SW, scale);
+
+        ATTN_QT(QA, {
+            size_t att_sm = (size_t)(QA * DD + 2 * NSTAGE * 64 * DD) * sizeof(bf16)
+                          + (size_t)nb * (QA / 32) * sizeof(uint32_t);
+            cudaFuncSetAttribute(nsa_attn<DD, QA>,
+                                 cudaFuncAttributeMaxDynamicSharedMemorySize, (int)att_sm);
+            nsa_attn<DD, QA><<<dim3((S + QA - 1) / QA, BH), QA * 2, att_sm, stream>>>(
+                qp, kp, vp, mp, op, S, nb, SW, scale * 1.4426950408889634f);
+        });
+    });
+    return out;
+}
+"""
+
+CPP_SRC = r"""
+#include <torch/extension.h>
+torch::Tensor nsa_forward(torch::Tensor q, torch::Tensor k, torch::Tensor v);
+"""
+
+_ext = None
+_lock = threading.Lock()
+
+
+def _build():
+    global _ext
+    with _lock:
+        if _ext is not None:
+            return _ext
+        # ninja ships next to the interpreter in venv installs; make sure it is findable.
+        bindir = os.path.dirname(sys.executable)
+        if bindir and bindir not in os.environ.get("PATH", "").split(os.pathsep):
+            os.environ["PATH"] = bindir + os.pathsep + os.environ.get("PATH", "")
+        major, minor = torch.cuda.get_device_capability()
+        os.environ.setdefault("TORCH_CUDA_ARCH_LIST", f"{major}.{minor}")
+        _ext = load_inline(
+            name=f"nsa_cuda_sm{major}{minor}",
+            cpp_sources=CPP_SRC,
+            cuda_sources=CUDA_SRC,
+            functions=["nsa_forward"],
+            extra_cuda_cflags=[
+                "-O3",
+                "--use_fast_math",
+                "--expt-relaxed-constexpr",
+                "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
+                "-U__CUDA_NO_BFLOAT162_OPERATORS__",
+            ],
+            extra_cflags=["-O3"],
+            verbose=False,
+        )
+        return _ext
+
+
+class Model(nn.Module):
+    def __init__(self, B: int, H: int, S: int, D: int):
+        super().__init__()
+        self.B, self.H, self.S, self.D = B, H, S, D
+        self.register_buffer("_dummy", torch.zeros(1, dtype=torch.bfloat16))
+        _build()
+
+    def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+        return _build().nsa_forward(q, k, v)
+
+
+def get_init_inputs():
+    return [1, 16, 1024, 64]
+
+
+def get_inputs():
+    return [torch.randn(1, 16, 1024, 64, dtype=torch.bfloat16) for _ in range(3)]

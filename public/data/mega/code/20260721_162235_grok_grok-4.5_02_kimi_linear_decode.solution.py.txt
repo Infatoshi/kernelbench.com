@@ -1,0 +1,985 @@
+"""Kimi-Linear W4A16 hybrid decode megakernel.
+
+Single Triton launch per step(). All weight/state pointers packed into one
+int64 table to stay under the CUDA parameter-size limit. Fuses int4
+dequant-GEMV, KDA, MLA (absorb), MoE, RMSNorm, residuals.
+"""
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+GROUP_SIZE = 128
+HIDDEN = 2304
+KDA_H = 32
+KDA_D = 128
+KDA_C = 4096
+SHORT_CONV = 4
+MLA_H = 32
+KV_LORA = 512
+QK_NOPE = 128
+QK_ROPE = 64
+V_HEAD = 128
+N_EXPERTS = 64
+N_ACTIVE = 8
+N_SHARED = 1
+MOE_INTER = 1024
+GROUP = 128
+# Cooperative grid size. Atomic barriers + private topk keep multi-SM correct.
+NPROG = 64
+N_PHASES = 800  # 2 ints per phase (arrive + release)
+BLOCK_N = 128
+
+# workspace
+WS_X = 0
+WS_XN = HIDDEN
+WS_Q = 2 * HIDDEN
+WS_K = WS_Q + KDA_C
+WS_V = WS_K + KDA_C
+WS_G = WS_V + KDA_C
+WS_BETA = WS_G + KDA_C
+WS_O = WS_BETA + KDA_H
+WS_MOE_G = WS_O + max(KDA_C, MLA_H * (QK_NOPE + QK_ROPE) + KV_LORA + QK_ROPE)
+WS_MOE_U = WS_MOE_G + (N_ACTIVE + N_SHARED) * MOE_INTER
+WS_MOE_H = WS_MOE_U + (N_ACTIVE + N_SHARED) * MOE_INTER
+WS_MOE_D = WS_MOE_H + (N_ACTIVE + N_SHARED) * MOE_INTER
+WS_ROUTER = WS_MOE_D + HIDDEN
+WS_TOPW = WS_ROUTER  # legacy constexpr (topw is a separate tensor)
+WS_QC = WS_ROUTER + N_EXPERTS
+WS_CTX = WS_QC + MLA_H * KV_LORA
+WS_TOTAL = WS_CTX + MLA_H * KV_LORA + 64
+
+# pointer table layout indices
+# Per KDA block (42 slots): an,mn, q*3,k*3,v*3,g*3,o*3, beta,conv, S,cq,ck,cv, rw,
+#   gate*3,up*3,down*3, sg*3,su*3,sd*3
+# 3 KDA + 1 MLA
+P_B0 = 0
+P_B1 = 42
+P_B2 = 84
+P_B3 = 126  # MLA uses different layout
+# MLA: an,mn, q*3, ka*3, kb*3, o*3, ckv, krope, rw, gate*3,up*3,down*3,sg*3,su*3,sd*3 = 35
+P_N = P_B3 + 35
+
+
+@dataclass(frozen=True)
+class Config:
+    hidden: int = 2304
+    kda_heads: int = 32
+    kda_head_dim: int = 128
+    short_conv: int = 4
+    mla_heads: int = 32
+    kv_lora: int = 512
+    qk_nope: int = 128
+    qk_rope: int = 64
+    v_head: int = 128
+    rope_theta: float = 10000.0
+    n_experts: int = 64
+    n_active: int = 8
+    n_shared: int = 1
+    moe_inter: int = 1024
+    routed_scaling: float = 2.446
+    group: int = 128
+    pattern: tuple = ("K", "K", "K", "M")
+    dtype: torch.dtype = field(default=torch.bfloat16)
+
+
+def build_config(shape: dict) -> Config:
+    return Config(n_experts=int(shape.get("n_experts", 64)))
+
+
+def _pack_int4(w_q: torch.Tensor) -> torch.Tensor:
+    lo = w_q[0::2] & 0xF
+    hi = w_q[1::2] & 0xF
+    return (lo | (hi << 4)).contiguous()
+
+
+def quantize(w_io: torch.Tensor, group: int = GROUP_SIZE):
+    K, N = w_io.shape
+    ng = K // group
+    wg = w_io.view(ng, group, N).float()
+    wmin = wg.min(dim=1, keepdim=True).values
+    wmax = wg.max(dim=1, keepdim=True).values
+    scales = (wmax - wmin).clamp_min(1e-8) / 15.0
+    zeros = (-wmin / scales).round().clamp(0, 15)
+    w_q = ((wg / scales) + zeros).round().clamp(0, 15).to(torch.uint8).view(K, N)
+    return _pack_int4(w_q), scales.squeeze(1).to(torch.bfloat16), zeros.squeeze(1).to(torch.bfloat16)
+
+
+class QuantLinear(nn.Module):
+    def __init__(self, in_f: int, out_f: int, group: int = GROUP_SIZE):
+        super().__init__()
+        assert in_f % group == 0 and in_f % 2 == 0
+        self.in_f, self.out_f, self.group = in_f, out_f, group
+        ng = in_f // group
+        self.register_buffer("w_q", torch.zeros(in_f // 2, out_f, dtype=torch.uint8))
+        self.register_buffer("scales", torch.zeros(ng, out_f, dtype=torch.bfloat16))
+        self.register_buffer("zeros", torch.zeros(ng, out_f, dtype=torch.bfloat16))
+
+    def init_random(self, gen: torch.Generator, std: float = 0.02) -> None:
+        w = torch.randn(self.in_f, self.out_f, generator=gen) * std
+        wq, s, z = quantize(w, self.group)
+        self.w_q.copy_(wq)
+        self.scales.copy_(s)
+        self.zeros.copy_(z)
+
+
+class QuantExperts(nn.Module):
+    def __init__(self, n: int, in_f: int, out_f: int, group: int = GROUP_SIZE):
+        super().__init__()
+        self.n, self.in_f, self.out_f, self.group = n, in_f, out_f, group
+        ng = in_f // group
+        self.register_buffer("w_q", torch.zeros(n, in_f // 2, out_f, dtype=torch.uint8))
+        self.register_buffer("scales", torch.zeros(n, ng, out_f, dtype=torch.bfloat16))
+        self.register_buffer("zeros", torch.zeros(n, ng, out_f, dtype=torch.bfloat16))
+
+    def init_random(self, gen: torch.Generator, std: float = 0.02) -> None:
+        for e in range(self.n):
+            w = torch.randn(self.in_f, self.out_f, generator=gen) * std
+            wq, s, z = quantize(w, self.group)
+            self.w_q[e].copy_(wq)
+            self.scales[e].copy_(s)
+            self.zeros[e].copy_(z)
+
+
+class KDA(nn.Module):
+    def __init__(self, cfg: Config):
+        super().__init__()
+        self.cfg = cfg
+        H, Dk, d = cfg.kda_heads, cfg.kda_head_dim, cfg.hidden
+        self.q_proj = QuantLinear(d, H * Dk, cfg.group)
+        self.k_proj = QuantLinear(d, H * Dk, cfg.group)
+        self.v_proj = QuantLinear(d, H * Dk, cfg.group)
+        self.g_proj = QuantLinear(d, H * Dk, cfg.group)
+        self.beta_proj = nn.Linear(d, H, bias=False, dtype=cfg.dtype)
+        self.conv_w = nn.Parameter(torch.empty(3, H * Dk, cfg.short_conv, dtype=cfg.dtype))
+        self.o_proj = QuantLinear(H * Dk, d, cfg.group)
+        self.scale = Dk ** -0.5
+
+
+class MLA(nn.Module):
+    def __init__(self, cfg: Config):
+        super().__init__()
+        self.cfg = cfg
+        H, d = cfg.mla_heads, cfg.hidden
+        self.q_proj = QuantLinear(d, H * (cfg.qk_nope + cfg.qk_rope), cfg.group)
+        self.kv_a = QuantLinear(d, cfg.kv_lora + cfg.qk_rope, cfg.group)
+        self.kv_b = QuantLinear(cfg.kv_lora, H * (cfg.qk_nope + cfg.v_head), cfg.group)
+        self.o_proj = QuantLinear(H * cfg.v_head, d, cfg.group)
+        self.scale = (cfg.qk_nope + cfg.qk_rope) ** -0.5
+
+
+class MoE(nn.Module):
+    def __init__(self, cfg: Config):
+        super().__init__()
+        self.cfg = cfg
+        d, m, E = cfg.hidden, cfg.moe_inter, cfg.n_experts
+        self.router = nn.Linear(d, E, bias=False, dtype=cfg.dtype)
+        self.gate = QuantExperts(E, d, m, cfg.group)
+        self.up = QuantExperts(E, d, m, cfg.group)
+        self.down = QuantExperts(E, m, d, cfg.group)
+        self.s_gate = QuantExperts(cfg.n_shared, d, m, cfg.group)
+        self.s_up = QuantExperts(cfg.n_shared, d, m, cfg.group)
+        self.s_down = QuantExperts(cfg.n_shared, m, d, cfg.group)
+
+
+class Block(nn.Module):
+    def __init__(self, cfg: Config, kind: str):
+        super().__init__()
+        self.kind = kind
+        self.attn_norm = nn.Parameter(torch.ones(cfg.hidden, dtype=cfg.dtype))
+        self.moe_norm = nn.Parameter(torch.ones(cfg.hidden, dtype=cfg.dtype))
+        self.attn = KDA(cfg) if kind == "K" else MLA(cfg)
+        self.moe = MoE(cfg)
+
+
+# --------------------------------------------------------------------------- #
+@triton.jit
+def _barrier(bar_ptr, phase, nprog):
+    """Low-contention grid barrier.
+    Layout per phase: bar[2*phase]=arrive counter, bar[2*phase+1]=release flag.
+    Only the last arriver writes release; waiters spin on the flag (not the counter).
+    """
+    arrived = tl.atomic_add(bar_ptr + (phase * 2), 1)
+    if arrived == nprog - 1:
+        tl.atomic_xchg(bar_ptr + (phase * 2 + 1), 1)
+    else:
+        while tl.atomic_add(bar_ptr + (phase * 2 + 1), 0) == 0:
+            pass
+
+
+@triton.jit
+def _load_ptr(table, idx):
+    return tl.load(table + idx).to(tl.pointer_type(tl.uint8))
+
+
+@triton.jit
+def _load_ptr_bf16(table, idx):
+    return tl.load(table + idx).to(tl.pointer_type(tl.bfloat16))
+
+
+@triton.jit
+def _load_ptr_f32(table, idx):
+    return tl.load(table + idx).to(tl.pointer_type(tl.float32))
+
+
+@triton.jit
+def _gemv_int4(x_ptr, wq_ptr, s_ptr, z_ptr, out_ptr, K, N, pid, nprog, GROUP: tl.constexpr, BLOCK_N: tl.constexpr):
+    # Stride over output columns; process K in groups of 128 with packed nibbles
+    for n0 in range(pid * BLOCK_N, N, nprog * BLOCK_N):
+        offs_n = n0 + tl.arange(0, BLOCK_N)
+        mask = offs_n < N
+        acc = tl.zeros([BLOCK_N], dtype=tl.float32)
+        for g in range(0, K // GROUP):
+            sc = tl.load(s_ptr + g * N + offs_n, mask=mask, other=0.0).to(tl.float32)
+            zz = tl.load(z_ptr + g * N + offs_n, mask=mask, other=0.0).to(tl.float32)
+            k0 = g * GROUP
+            # Unroll 4 packed bytes (8 K rows) per inner step
+            for kh0 in range(0, GROUP // 2, 4):
+                k = k0 + kh0 * 2
+                # 4 packed loads
+                pk0 = tl.load(wq_ptr + (k // 2) * N + offs_n, mask=mask, other=0)
+                pk1 = tl.load(wq_ptr + (k // 2 + 1) * N + offs_n, mask=mask, other=0)
+                pk2 = tl.load(wq_ptr + (k // 2 + 2) * N + offs_n, mask=mask, other=0)
+                pk3 = tl.load(wq_ptr + (k // 2 + 3) * N + offs_n, mask=mask, other=0)
+                x0 = tl.load(x_ptr + k)
+                x1 = tl.load(x_ptr + k + 1)
+                x2 = tl.load(x_ptr + k + 2)
+                x3 = tl.load(x_ptr + k + 3)
+                x4 = tl.load(x_ptr + k + 4)
+                x5 = tl.load(x_ptr + k + 5)
+                x6 = tl.load(x_ptr + k + 6)
+                x7 = tl.load(x_ptr + k + 7)
+                acc += x0 * (((pk0 & 0xF).to(tl.float32) - zz) * sc)
+                acc += x1 * ((((pk0 >> 4) & 0xF).to(tl.float32) - zz) * sc)
+                acc += x2 * (((pk1 & 0xF).to(tl.float32) - zz) * sc)
+                acc += x3 * ((((pk1 >> 4) & 0xF).to(tl.float32) - zz) * sc)
+                acc += x4 * (((pk2 & 0xF).to(tl.float32) - zz) * sc)
+                acc += x5 * ((((pk2 >> 4) & 0xF).to(tl.float32) - zz) * sc)
+                acc += x6 * (((pk3 & 0xF).to(tl.float32) - zz) * sc)
+                acc += x7 * ((((pk3 >> 4) & 0xF).to(tl.float32) - zz) * sc)
+        tl.store(out_ptr + offs_n, acc, mask=mask)
+
+
+@triton.jit
+def _gemv_int4_ex(x_ptr, wq_ptr, s_ptr, z_ptr, out_ptr, expert, K, N, pid, nprog, GROUP: tl.constexpr, BLOCK_N: tl.constexpr):
+    wq_e = wq_ptr + expert * (K // 2) * N
+    s_e = s_ptr + expert * (K // GROUP) * N
+    z_e = z_ptr + expert * (K // GROUP) * N
+    _gemv_int4(x_ptr, wq_e, s_e, z_e, out_ptr, K, N, pid, nprog, GROUP, BLOCK_N)
+
+
+@triton.jit
+def _gemv_bf16(x_ptr, w_ptr, out_ptr, IN, OUT, pid, nprog, BLOCK_N: tl.constexpr):
+    for n0 in range(pid * BLOCK_N, OUT, nprog * BLOCK_N):
+        offs_n = n0 + tl.arange(0, BLOCK_N)
+        mask = offs_n < OUT
+        acc = tl.zeros([BLOCK_N], dtype=tl.float32)
+        for k in range(0, IN):
+            xv = tl.load(x_ptr + k)
+            wv = tl.load(w_ptr + offs_n * IN + k, mask=mask, other=0.0).to(tl.float32)
+            acc += xv * wv
+        tl.store(out_ptr + offs_n, acc, mask=mask)
+
+
+@triton.jit
+def _rmsnorm0(x_ptr, w_ptr, out_ptr, N, eps):
+    ss = 0.0
+    for i in range(N):
+        v = tl.load(x_ptr + i)
+        ss += v * v
+    inv = tl.rsqrt(ss / N + eps)
+    for i in range(N):
+        tl.store(out_ptr + i, tl.load(x_ptr + i) * inv * tl.load(w_ptr + i).to(tl.float32))
+
+
+@triton.jit
+def _topk_private(router_ptr, topi_ptr, topw_ptr, scale, E: tl.constexpr, A: tl.constexpr):
+    """Top-k into per-program private buffers. Softmax uses a private scratch in topw[A:A+E]
+    is not available — instead re-read logits and compute softmax on the fly per index.
+    router_ptr holds pre-softmax logits (not modified).
+    """
+    # find max for stable softmax
+    maxv = tl.load(router_ptr)
+    for i in range(1, E):
+        maxv = tl.maximum(maxv, tl.load(router_ptr + i))
+    sumv = 0.0
+    for i in range(E):
+        sumv += tl.exp(tl.load(router_ptr + i) - maxv)
+    # selection-sort top-A on softmax probs (computed on the fly)
+    for a in range(A):
+        best = -1.0
+        bi = 0
+        for i in range(E):
+            taken = 0.0
+            for a2 in range(a):
+                taken += tl.where(tl.load(topi_ptr + a2) == i, 1.0, 0.0)
+            p = tl.exp(tl.load(router_ptr + i) - maxv) / sumv
+            p = tl.where(taken > 0.5, -1.0, p)
+            better = p > best
+            best = tl.where(better, p, best)
+            bi = tl.where(better, i, bi)
+        tl.store(topi_ptr + a, bi)
+        tl.store(topw_ptr + a, best)
+    sw = 0.0
+    for a in range(A):
+        sw += tl.load(topw_ptr + a)
+    for a in range(A):
+        tl.store(topw_ptr + a, tl.load(topw_ptr + a) / (sw + 1e-9) * scale)
+
+
+@triton.jit
+def _kda_conv(q_ptr, k_ptr, v_ptr, conv_ptr, cq_ptr, ck_ptr, cv_ptr, pid, nprog,
+              KDA_C: tl.constexpr, SHORT_CONV: tl.constexpr):
+    for ch in range(pid, KDA_C, nprog):
+        nq = tl.load(q_ptr + ch)
+        nk = tl.load(k_ptr + ch)
+        nv = tl.load(v_ptr + ch)
+        zq = 0.0
+        zk = 0.0
+        zv = 0.0
+        for t in range(SHORT_CONV - 1):
+            zq += tl.load(cq_ptr + t * KDA_C + ch).to(tl.float32) * tl.load(
+                conv_ptr + 0 * KDA_C * SHORT_CONV + ch * SHORT_CONV + t).to(tl.float32)
+            zk += tl.load(ck_ptr + t * KDA_C + ch).to(tl.float32) * tl.load(
+                conv_ptr + 1 * KDA_C * SHORT_CONV + ch * SHORT_CONV + t).to(tl.float32)
+            zv += tl.load(cv_ptr + t * KDA_C + ch).to(tl.float32) * tl.load(
+                conv_ptr + 2 * KDA_C * SHORT_CONV + ch * SHORT_CONV + t).to(tl.float32)
+        t = SHORT_CONV - 1
+        zq += nq * tl.load(conv_ptr + 0 * KDA_C * SHORT_CONV + ch * SHORT_CONV + t).to(tl.float32)
+        zk += nk * tl.load(conv_ptr + 1 * KDA_C * SHORT_CONV + ch * SHORT_CONV + t).to(tl.float32)
+        zv += nv * tl.load(conv_ptr + 2 * KDA_C * SHORT_CONV + ch * SHORT_CONV + t).to(tl.float32)
+        tl.store(q_ptr + ch, zq * tl.sigmoid(zq))
+        tl.store(k_ptr + ch, zk * tl.sigmoid(zk))
+        tl.store(v_ptr + ch, zv * tl.sigmoid(zv))
+        for t in range(SHORT_CONV - 2):
+            tl.store(cq_ptr + t * KDA_C + ch, tl.load(cq_ptr + (t + 1) * KDA_C + ch))
+            tl.store(ck_ptr + t * KDA_C + ch, tl.load(ck_ptr + (t + 1) * KDA_C + ch))
+            tl.store(cv_ptr + t * KDA_C + ch, tl.load(cv_ptr + (t + 1) * KDA_C + ch))
+        tl.store(cq_ptr + (SHORT_CONV - 2) * KDA_C + ch, nq.to(tl.bfloat16))
+        tl.store(ck_ptr + (SHORT_CONV - 2) * KDA_C + ch, nk.to(tl.bfloat16))
+        tl.store(cv_ptr + (SHORT_CONV - 2) * KDA_C + ch, nv.to(tl.bfloat16))
+
+
+@triton.jit
+def _kda_state(q_ptr, k_ptr, v_ptr, g_ptr, beta_ptr, S_ptr, o_ptr, pid, nprog, kda_scale,
+               KDA_H: tl.constexpr, KDA_D: tl.constexpr):
+    for h in range(pid, KDA_H, nprog):
+        b = tl.sigmoid(tl.load(beta_ptr + h))
+        for i in range(KDA_D):
+            gi = tl.load(g_ptr + h * KDA_D + i)
+            sp = tl.where(gi > 20.0, gi, tl.log(1.0 + tl.exp(tl.minimum(gi, 20.0))))
+            tl.store(g_ptr + h * KDA_D + i, tl.exp(-sp))
+        for i in range(KDA_D):
+            ge = tl.load(g_ptr + h * KDA_D + i)
+            for j in range(KDA_D):
+                idx = h * KDA_D * KDA_D + i * KDA_D + j
+                tl.store(S_ptr + idx, tl.load(S_ptr + idx) * ge)
+        for j in range(KDA_D):
+            pred = 0.0
+            for i in range(KDA_D):
+                pred += tl.load(S_ptr + h * KDA_D * KDA_D + i * KDA_D + j) * tl.load(k_ptr + h * KDA_D + i)
+            delta = b * (tl.load(v_ptr + h * KDA_D + j) - pred)
+            for i in range(KDA_D):
+                idx = h * KDA_D * KDA_D + i * KDA_D + j
+                tl.store(S_ptr + idx, tl.load(S_ptr + idx) + tl.load(k_ptr + h * KDA_D + i) * delta)
+        for j in range(KDA_D):
+            oo = 0.0
+            for i in range(KDA_D):
+                oo += tl.load(S_ptr + h * KDA_D * KDA_D + i * KDA_D + j) * (tl.load(q_ptr + h * KDA_D + i) * kda_scale)
+            tl.store(o_ptr + h * KDA_D + j, oo)
+
+
+@triton.jit
+def _kda_block(
+    table, base, ws, bar_ptr, topi_ptr, topw_ptr, phase_in, pid, nprog,
+    HIDDEN: tl.constexpr, KDA_C: tl.constexpr, KDA_H: tl.constexpr, KDA_D: tl.constexpr,
+    GROUP: tl.constexpr, MOE_INTER: tl.constexpr, N_EXPERTS: tl.constexpr, N_ACTIVE: tl.constexpr,
+    SHORT_CONV: tl.constexpr, BLOCK_N: tl.constexpr,
+    WS_XN: tl.constexpr, WS_Q: tl.constexpr, WS_K: tl.constexpr, WS_V: tl.constexpr,
+    WS_G: tl.constexpr, WS_BETA: tl.constexpr, WS_O: tl.constexpr,
+    WS_MOE_G: tl.constexpr, WS_MOE_U: tl.constexpr, WS_MOE_H: tl.constexpr, WS_MOE_D: tl.constexpr,
+    WS_ROUTER: tl.constexpr, WS_TOPW: tl.constexpr,
+):
+    """One KDA+MoE block. Returns final phase via writing to router_ptr[0] - no, use phase tracking by value.
+    Triton can't return ints easily to outer for phase - we use phase_in and count locally,
+    store final phase at bar side-channel... Actually we recompute phase offsets as fixed constexprs.
+    """
+    # Fixed phase budget per block = 60; phase_in is start.
+    phase = phase_in
+    kda_scale = 0.08838834764831845
+    eps = 1e-6
+    x_ptr = ws
+    xn = ws + WS_XN
+    q = ws + WS_Q
+    k = ws + WS_K
+    v = ws + WS_V
+    g = ws + WS_G
+    beta = ws + WS_BETA
+    o = ws + WS_O
+    moe_g = ws + WS_MOE_G
+    moe_u = ws + WS_MOE_U
+    moe_h = ws + WS_MOE_H
+    moe_d = ws + WS_MOE_D
+    router = ws + WS_ROUTER
+
+    # load pointers: base+0 an, +1 mn, +2..4 q, +5..7 k, +8..10 v, +11..13 g, +14..16 o,
+    # +17 beta, +18 conv, +19 S, +20 cq, +21 ck, +22 cv, +23 rw,
+    # +24..26 gate, +27..29 up, +30..32 down, +33..35 sg, +36..38 su, +39..41 sd
+    an = _load_ptr_bf16(table, base + 0)
+    mn = _load_ptr_bf16(table, base + 1)
+    qw = _load_ptr(table, base + 2)
+    qs = _load_ptr_bf16(table, base + 3)
+    qz = _load_ptr_bf16(table, base + 4)
+    kw = _load_ptr(table, base + 5)
+    ks = _load_ptr_bf16(table, base + 6)
+    kz = _load_ptr_bf16(table, base + 7)
+    vw = _load_ptr(table, base + 8)
+    vs = _load_ptr_bf16(table, base + 9)
+    vz = _load_ptr_bf16(table, base + 10)
+    gw = _load_ptr(table, base + 11)
+    gs = _load_ptr_bf16(table, base + 12)
+    gz = _load_ptr_bf16(table, base + 13)
+    ow = _load_ptr(table, base + 14)
+    os = _load_ptr_bf16(table, base + 15)
+    oz = _load_ptr_bf16(table, base + 16)
+    beta_w = _load_ptr_bf16(table, base + 17)
+    conv = _load_ptr_bf16(table, base + 18)
+    S = _load_ptr_f32(table, base + 19)
+    cq = _load_ptr_bf16(table, base + 20)
+    ck = _load_ptr_bf16(table, base + 21)
+    cv = _load_ptr_bf16(table, base + 22)
+    rw = _load_ptr_bf16(table, base + 23)
+    gate_w = _load_ptr(table, base + 24)
+    gate_s = _load_ptr_bf16(table, base + 25)
+    gate_z = _load_ptr_bf16(table, base + 26)
+    up_w = _load_ptr(table, base + 27)
+    up_s = _load_ptr_bf16(table, base + 28)
+    up_z = _load_ptr_bf16(table, base + 29)
+    down_w = _load_ptr(table, base + 30)
+    down_s = _load_ptr_bf16(table, base + 31)
+    down_z = _load_ptr_bf16(table, base + 32)
+    sg_w = _load_ptr(table, base + 33)
+    sg_s = _load_ptr_bf16(table, base + 34)
+    sg_z = _load_ptr_bf16(table, base + 35)
+    su_w = _load_ptr(table, base + 36)
+    su_s = _load_ptr_bf16(table, base + 37)
+    su_z = _load_ptr_bf16(table, base + 38)
+    sd_w = _load_ptr(table, base + 39)
+    sd_s = _load_ptr_bf16(table, base + 40)
+    sd_z = _load_ptr_bf16(table, base + 41)
+
+    if pid == 0:
+        _rmsnorm0(x_ptr, an, xn, HIDDEN, eps)
+    phase += 1
+    _barrier(bar_ptr, phase, nprog)
+
+    # Independent projections — one barrier after all five
+    _gemv_int4(xn, qw, qs, qz, q, HIDDEN, KDA_C, pid, nprog, GROUP, BLOCK_N)
+    _gemv_int4(xn, kw, ks, kz, k, HIDDEN, KDA_C, pid, nprog, GROUP, BLOCK_N)
+    _gemv_int4(xn, vw, vs, vz, v, HIDDEN, KDA_C, pid, nprog, GROUP, BLOCK_N)
+    _gemv_int4(xn, gw, gs, gz, g, HIDDEN, KDA_C, pid, nprog, GROUP, BLOCK_N)
+    _gemv_bf16(xn, beta_w, beta, HIDDEN, KDA_H, pid, nprog, BLOCK_N)
+    phase += 1
+    _barrier(bar_ptr, phase, nprog)
+
+    _kda_conv(q, k, v, conv, cq, ck, cv, pid, nprog, KDA_C, SHORT_CONV)
+    phase += 1
+    _barrier(bar_ptr, phase, nprog)
+    _kda_state(q, k, v, g, beta, S, o, pid, nprog, kda_scale, KDA_H, KDA_D)
+    phase += 1
+    _barrier(bar_ptr, phase, nprog)
+
+    _gemv_int4(o, ow, os, oz, xn, KDA_C, HIDDEN, pid, nprog, GROUP, BLOCK_N)
+    phase += 1
+    _barrier(bar_ptr, phase, nprog)
+    for i in range(pid, HIDDEN, nprog):
+        tl.store(x_ptr + i, tl.load(x_ptr + i) + tl.load(xn + i))
+    phase += 1
+    _barrier(bar_ptr, phase, nprog)
+
+    # MoE
+    if pid == 0:
+        _rmsnorm0(x_ptr, mn, xn, HIDDEN, eps)
+    phase += 1
+    _barrier(bar_ptr, phase, nprog)
+    _gemv_bf16(xn, rw, router, HIDDEN, N_EXPERTS, pid, nprog, BLOCK_N)
+    phase += 1
+    _barrier(bar_ptr, phase, nprog)
+    my_topi = topi_ptr + pid * N_ACTIVE
+    my_topw = topw_ptr + pid * N_ACTIVE
+    _topk_private(router, my_topi, my_topw, 2.446, E=N_EXPERTS, A=N_ACTIVE)
+    # no barrier needed: each program uses only its private topk
+    for i in range(pid, HIDDEN, nprog):
+        tl.store(o + i, 0.0)
+    phase += 1
+    _barrier(bar_ptr, phase, nprog)
+
+    for a in range(N_ACTIVE):
+        e = tl.load(my_topi + a).to(tl.int64)
+        g_out = moe_g + a * MOE_INTER
+        u_out = moe_u + a * MOE_INTER
+        h_out = moe_h + a * MOE_INTER
+        # gate + up independent
+        _gemv_int4_ex(xn, gate_w, gate_s, gate_z, g_out, e, HIDDEN, MOE_INTER, pid, nprog, GROUP, BLOCK_N)
+        _gemv_int4_ex(xn, up_w, up_s, up_z, u_out, e, HIDDEN, MOE_INTER, pid, nprog, GROUP, BLOCK_N)
+        phase += 1
+        _barrier(bar_ptr, phase, nprog)
+        for i in range(pid, MOE_INTER, nprog):
+            gv = tl.load(g_out + i)
+            tl.store(h_out + i, gv * tl.sigmoid(gv) * tl.load(u_out + i))
+        phase += 1
+        _barrier(bar_ptr, phase, nprog)
+        _gemv_int4_ex(h_out, down_w, down_s, down_z, moe_d, e, MOE_INTER, HIDDEN, pid, nprog, GROUP, BLOCK_N)
+        phase += 1
+        _barrier(bar_ptr, phase, nprog)
+        w_a = tl.load(my_topw + a)
+        for i in range(pid, HIDDEN, nprog):
+            tl.store(o + i, tl.load(o + i) + w_a * tl.load(moe_d + i))
+        phase += 1
+        _barrier(bar_ptr, phase, nprog)
+
+    g_out = moe_g + N_ACTIVE * MOE_INTER
+    u_out = moe_u + N_ACTIVE * MOE_INTER
+    h_out = moe_h + N_ACTIVE * MOE_INTER
+    _gemv_int4_ex(xn, sg_w, sg_s, sg_z, g_out, 0, HIDDEN, MOE_INTER, pid, nprog, GROUP, BLOCK_N)
+    _gemv_int4_ex(xn, su_w, su_s, su_z, u_out, 0, HIDDEN, MOE_INTER, pid, nprog, GROUP, BLOCK_N)
+    phase += 1
+    _barrier(bar_ptr, phase, nprog)
+    for i in range(pid, MOE_INTER, nprog):
+        gv = tl.load(g_out + i)
+        tl.store(h_out + i, gv * tl.sigmoid(gv) * tl.load(u_out + i))
+    phase += 1
+    _barrier(bar_ptr, phase, nprog)
+    _gemv_int4_ex(h_out, sd_w, sd_s, sd_z, moe_d, 0, MOE_INTER, HIDDEN, pid, nprog, GROUP, BLOCK_N)
+    phase += 1
+    _barrier(bar_ptr, phase, nprog)
+    for i in range(pid, HIDDEN, nprog):
+        tl.store(x_ptr + i, tl.load(x_ptr + i) + tl.load(o + i) + tl.load(moe_d + i))
+    phase += 1
+    _barrier(bar_ptr, phase, nprog)
+    # phases: 9 + 8*4 + 4 = 9+32+4 = 45
+
+
+PHASE_PER_KDA = 45
+
+
+@triton.jit
+def decode_megakernel(
+    ws_ptr, bar_ptr, out_ptr, scores_ptr, topi_ptr, topw_ptr, table_ptr,
+    ctx_len, nprog,
+    HIDDEN: tl.constexpr, KDA_C: tl.constexpr, KDA_H: tl.constexpr, KDA_D: tl.constexpr,
+    GROUP: tl.constexpr, MOE_INTER: tl.constexpr, N_EXPERTS: tl.constexpr, N_ACTIVE: tl.constexpr,
+    MLA_H: tl.constexpr, KV_LORA: tl.constexpr, QK_NOPE: tl.constexpr, QK_ROPE: tl.constexpr,
+    V_HEAD: tl.constexpr, SHORT_CONV: tl.constexpr, BLOCK_N: tl.constexpr,
+    WS_XN: tl.constexpr, WS_Q: tl.constexpr, WS_K: tl.constexpr, WS_V: tl.constexpr,
+    WS_G: tl.constexpr, WS_BETA: tl.constexpr, WS_O: tl.constexpr,
+    WS_MOE_G: tl.constexpr, WS_MOE_U: tl.constexpr, WS_MOE_H: tl.constexpr, WS_MOE_D: tl.constexpr,
+    WS_ROUTER: tl.constexpr, WS_TOPW: tl.constexpr, WS_QC: tl.constexpr, WS_CTX: tl.constexpr,
+    P_B0: tl.constexpr, P_B1: tl.constexpr, P_B2: tl.constexpr, P_B3: tl.constexpr,
+    PHASE_PER_KDA: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    # Block 0,1,2 KDA
+    _kda_block(table_ptr, P_B0, ws_ptr, bar_ptr, topi_ptr, topw_ptr, 0, pid, nprog,
+               HIDDEN, KDA_C, KDA_H, KDA_D, GROUP, MOE_INTER, N_EXPERTS, N_ACTIVE,
+               SHORT_CONV, BLOCK_N, WS_XN, WS_Q, WS_K, WS_V, WS_G, WS_BETA, WS_O,
+               WS_MOE_G, WS_MOE_U, WS_MOE_H, WS_MOE_D, WS_ROUTER, WS_TOPW)
+    _kda_block(table_ptr, P_B1, ws_ptr, bar_ptr, topi_ptr, topw_ptr, PHASE_PER_KDA, pid, nprog,
+               HIDDEN, KDA_C, KDA_H, KDA_D, GROUP, MOE_INTER, N_EXPERTS, N_ACTIVE,
+               SHORT_CONV, BLOCK_N, WS_XN, WS_Q, WS_K, WS_V, WS_G, WS_BETA, WS_O,
+               WS_MOE_G, WS_MOE_U, WS_MOE_H, WS_MOE_D, WS_ROUTER, WS_TOPW)
+    _kda_block(table_ptr, P_B2, ws_ptr, bar_ptr, topi_ptr, topw_ptr, 2 * PHASE_PER_KDA, pid, nprog,
+               HIDDEN, KDA_C, KDA_H, KDA_D, GROUP, MOE_INTER, N_EXPERTS, N_ACTIVE,
+               SHORT_CONV, BLOCK_N, WS_XN, WS_Q, WS_K, WS_V, WS_G, WS_BETA, WS_O,
+               WS_MOE_G, WS_MOE_U, WS_MOE_H, WS_MOE_D, WS_ROUTER, WS_TOPW)
+
+    # ---- MLA block ----
+    phase = 3 * PHASE_PER_KDA
+    mla_scale = 0.07216878364870323
+    eps = 1e-6
+    base = P_B3
+    x_ptr = ws_ptr
+    xn = ws_ptr + WS_XN
+    q_mla = ws_ptr + WS_Q
+    o = ws_ptr + WS_O
+    moe_g = ws_ptr + WS_MOE_G
+    moe_u = ws_ptr + WS_MOE_U
+    moe_h = ws_ptr + WS_MOE_H
+    moe_d = ws_ptr + WS_MOE_D
+    router = ws_ptr + WS_ROUTER
+    qc = ws_ptr + WS_QC
+    ctxp = ws_ptr + WS_CTX
+
+    an = _load_ptr_bf16(table_ptr, base + 0)
+    mn = _load_ptr_bf16(table_ptr, base + 1)
+    qw = _load_ptr(table_ptr, base + 2)
+    qs = _load_ptr_bf16(table_ptr, base + 3)
+    qz = _load_ptr_bf16(table_ptr, base + 4)
+    kaw = _load_ptr(table_ptr, base + 5)
+    kas = _load_ptr_bf16(table_ptr, base + 6)
+    kaz = _load_ptr_bf16(table_ptr, base + 7)
+    kbw = _load_ptr(table_ptr, base + 8)
+    kbs = _load_ptr_bf16(table_ptr, base + 9)
+    kbz = _load_ptr_bf16(table_ptr, base + 10)
+    ow = _load_ptr(table_ptr, base + 11)
+    os = _load_ptr_bf16(table_ptr, base + 12)
+    oz = _load_ptr_bf16(table_ptr, base + 13)
+    ckv = _load_ptr_bf16(table_ptr, base + 14)
+    krope = _load_ptr_bf16(table_ptr, base + 15)
+    rw = _load_ptr_bf16(table_ptr, base + 16)
+    gate_w = _load_ptr(table_ptr, base + 17)
+    gate_s = _load_ptr_bf16(table_ptr, base + 18)
+    gate_z = _load_ptr_bf16(table_ptr, base + 19)
+    up_w = _load_ptr(table_ptr, base + 20)
+    up_s = _load_ptr_bf16(table_ptr, base + 21)
+    up_z = _load_ptr_bf16(table_ptr, base + 22)
+    down_w = _load_ptr(table_ptr, base + 23)
+    down_s = _load_ptr_bf16(table_ptr, base + 24)
+    down_z = _load_ptr_bf16(table_ptr, base + 25)
+    sg_w = _load_ptr(table_ptr, base + 26)
+    sg_s = _load_ptr_bf16(table_ptr, base + 27)
+    sg_z = _load_ptr_bf16(table_ptr, base + 28)
+    su_w = _load_ptr(table_ptr, base + 29)
+    su_s = _load_ptr_bf16(table_ptr, base + 30)
+    su_z = _load_ptr_bf16(table_ptr, base + 31)
+    sd_w = _load_ptr(table_ptr, base + 32)
+    sd_s = _load_ptr_bf16(table_ptr, base + 33)
+    sd_z = _load_ptr_bf16(table_ptr, base + 34)
+
+    if pid == 0:
+        _rmsnorm0(x_ptr, an, xn, HIDDEN, eps)
+    phase += 1
+    _barrier(bar_ptr, phase, nprog)
+
+    kv_mla = q_mla + MLA_H * (QK_NOPE + QK_ROPE)
+    _gemv_int4(xn, qw, qs, qz, q_mla, HIDDEN, MLA_H * (QK_NOPE + QK_ROPE), pid, nprog, GROUP, BLOCK_N)
+    phase += 1
+    _barrier(bar_ptr, phase, nprog)
+    _gemv_int4(xn, kaw, kas, kaz, kv_mla, HIDDEN, KV_LORA + QK_ROPE, pid, nprog, GROUP, BLOCK_N)
+    phase += 1
+    _barrier(bar_ptr, phase, nprog)
+
+    # Partitioned RoPE (disjoint head writes) + partitioned cache row write
+    pos = ctx_len
+    for h in range(pid, MLA_H, nprog):
+        base_h = h * (QK_NOPE + QK_ROPE) + QK_NOPE
+        for pair in range(QK_ROPE // 2):
+            dim = pair * 2
+            inv = tl.exp(tl.log(tl.full([], 10000.0, tl.float32)) * (-(dim / QK_ROPE)))
+            ang = pos * inv
+            c = tl.cos(ang)
+            s = tl.sin(ang)
+            even = tl.load(q_mla + base_h + dim)
+            odd = tl.load(q_mla + base_h + dim + 1)
+            tl.store(q_mla + base_h + dim, even * c - odd * s)
+            tl.store(q_mla + base_h + dim + 1, even * s + odd * c)
+    # c_kv row (no rope)
+    for r in range(pid, KV_LORA, nprog):
+        tl.store(ckv + ctx_len * KV_LORA + r, tl.load(kv_mla + r).to(tl.bfloat16))
+    # k_rope: single writer rotates then writes (RMW)
+    if pid == 0:
+        for pair in range(QK_ROPE // 2):
+            dim = pair * 2
+            inv = tl.exp(tl.log(tl.full([], 10000.0, tl.float32)) * (-(dim / QK_ROPE)))
+            ang = pos * inv
+            c = tl.cos(ang)
+            s = tl.sin(ang)
+            even = tl.load(kv_mla + KV_LORA + dim)
+            odd = tl.load(kv_mla + KV_LORA + dim + 1)
+            re = even * c - odd * s
+            ro = even * s + odd * c
+            tl.store(kv_mla + KV_LORA + dim, re)
+            tl.store(kv_mla + KV_LORA + dim + 1, ro)
+            tl.store(krope + ctx_len * QK_ROPE + dim, re.to(tl.bfloat16))
+            tl.store(krope + ctx_len * QK_ROPE + dim + 1, ro.to(tl.bfloat16))
+    phase += 1
+    _barrier(bar_ptr, phase, nprog)
+
+    Ltot = ctx_len + 1
+    Nkb = MLA_H * (QK_NOPE + V_HEAD)
+
+    for hr in range(pid, MLA_H * KV_LORA, nprog):
+        h = hr // KV_LORA
+        r = hr % KV_LORA
+        acc = 0.0
+        gg = r // GROUP
+        for d in range(QK_NOPE):
+            col = h * (QK_NOPE + V_HEAD) + d
+            pk = tl.load(kbw + (r // 2) * Nkb + col)
+            nibble = tl.where((r % 2) == 0, pk & 0xF, (pk >> 4) & 0xF)
+            sc = tl.load(kbs + gg * Nkb + col).to(tl.float32)
+            zz = tl.load(kbz + gg * Nkb + col).to(tl.float32)
+            w = (nibble.to(tl.float32) - zz) * sc
+            acc += tl.load(q_mla + h * (QK_NOPE + QK_ROPE) + d) * w
+        tl.store(qc + h * KV_LORA + r, acc)
+    phase += 1
+    _barrier(bar_ptr, phase, nprog)
+
+    for lh in range(pid, Ltot * MLA_H, nprog):
+        l = lh // MLA_H
+        h = lh % MLA_H
+        sc = 0.0
+        for r in range(KV_LORA):
+            sc += tl.load(qc + h * KV_LORA + r) * tl.load(ckv + l * KV_LORA + r).to(tl.float32)
+        for d in range(QK_ROPE):
+            sc += tl.load(q_mla + h * (QK_NOPE + QK_ROPE) + QK_NOPE + d) * tl.load(
+                krope + l * QK_ROPE + d).to(tl.float32)
+        tl.store(scores_ptr + l * MLA_H + h, sc * mla_scale)
+    phase += 1
+    _barrier(bar_ptr, phase, nprog)
+
+    # Per-head softmax + ctx + V-proj fused so no cross-program ctx dependency
+    for h in range(pid, MLA_H, nprog):
+        maxv = tl.load(scores_ptr + h)
+        for l in range(1, Ltot):
+            maxv = tl.maximum(maxv, tl.load(scores_ptr + l * MLA_H + h))
+        sumv = 0.0
+        for l in range(Ltot):
+            e = tl.exp(tl.load(scores_ptr + l * MLA_H + h) - maxv)
+            tl.store(scores_ptr + l * MLA_H + h, e)
+            sumv += e
+        for l in range(Ltot):
+            tl.store(scores_ptr + l * MLA_H + h, tl.load(scores_ptr + l * MLA_H + h) / sumv)
+        # ctx into registers via ctxp then V
+        for r in range(KV_LORA):
+            acc = 0.0
+            # accumulate p·c_kv over L (scalar L loop still; L can be large)
+            for l in range(Ltot):
+                acc += tl.load(scores_ptr + l * MLA_H + h) * tl.load(ckv + l * KV_LORA + r).to(tl.float32)
+            tl.store(ctxp + h * KV_LORA + r, acc)
+        for d in range(V_HEAD):
+            col = h * (QK_NOPE + V_HEAD) + QK_NOPE + d
+            acc = 0.0
+            for r in range(KV_LORA):
+                gg = r // GROUP
+                pk = tl.load(kbw + (r // 2) * Nkb + col)
+                nibble = tl.where((r % 2) == 0, pk & 0xF, (pk >> 4) & 0xF)
+                sc = tl.load(kbs + gg * Nkb + col).to(tl.float32)
+                zz = tl.load(kbz + gg * Nkb + col).to(tl.float32)
+                w = (nibble.to(tl.float32) - zz) * sc
+                acc += tl.load(ctxp + h * KV_LORA + r) * w
+            tl.store(o + h * V_HEAD + d, acc)
+    phase += 1
+    _barrier(bar_ptr, phase, nprog)
+
+    _gemv_int4(o, ow, os, oz, xn, MLA_H * V_HEAD, HIDDEN, pid, nprog, GROUP, BLOCK_N)
+    phase += 1
+    _barrier(bar_ptr, phase, nprog)
+    for i in range(pid, HIDDEN, nprog):
+        tl.store(x_ptr + i, tl.load(x_ptr + i) + tl.load(xn + i))
+    phase += 1
+    _barrier(bar_ptr, phase, nprog)
+
+    # MoE MLA
+    if pid == 0:
+        _rmsnorm0(x_ptr, mn, xn, HIDDEN, eps)
+    phase += 1
+    _barrier(bar_ptr, phase, nprog)
+    _gemv_bf16(xn, rw, router, HIDDEN, N_EXPERTS, pid, nprog, BLOCK_N)
+    phase += 1
+    _barrier(bar_ptr, phase, nprog)
+    my_topi = topi_ptr + pid * N_ACTIVE
+    my_topw = topw_ptr + pid * N_ACTIVE
+    _topk_private(router, my_topi, my_topw, 2.446, E=N_EXPERTS, A=N_ACTIVE)
+    phase += 1
+    _barrier(bar_ptr, phase, nprog)
+    for i in range(pid, HIDDEN, nprog):
+        tl.store(o + i, 0.0)
+    phase += 1
+    _barrier(bar_ptr, phase, nprog)
+    for a in range(N_ACTIVE):
+        e = tl.load(my_topi + a).to(tl.int64)
+        g_out = moe_g + a * MOE_INTER
+        u_out = moe_u + a * MOE_INTER
+        h_out = moe_h + a * MOE_INTER
+        _gemv_int4_ex(xn, gate_w, gate_s, gate_z, g_out, e, HIDDEN, MOE_INTER, pid, nprog, GROUP, BLOCK_N)
+        _gemv_int4_ex(xn, up_w, up_s, up_z, u_out, e, HIDDEN, MOE_INTER, pid, nprog, GROUP, BLOCK_N)
+        phase += 1
+        _barrier(bar_ptr, phase, nprog)
+        for i in range(pid, MOE_INTER, nprog):
+            gv = tl.load(g_out + i)
+            tl.store(h_out + i, gv * tl.sigmoid(gv) * tl.load(u_out + i))
+        phase += 1
+        _barrier(bar_ptr, phase, nprog)
+        _gemv_int4_ex(h_out, down_w, down_s, down_z, moe_d, e, MOE_INTER, HIDDEN, pid, nprog, GROUP, BLOCK_N)
+        phase += 1
+        _barrier(bar_ptr, phase, nprog)
+        w_a = tl.load(my_topw + a)
+        for i in range(pid, HIDDEN, nprog):
+            tl.store(o + i, tl.load(o + i) + w_a * tl.load(moe_d + i))
+        phase += 1
+        _barrier(bar_ptr, phase, nprog)
+    g_out = moe_g + N_ACTIVE * MOE_INTER
+    u_out = moe_u + N_ACTIVE * MOE_INTER
+    h_out = moe_h + N_ACTIVE * MOE_INTER
+    _gemv_int4_ex(xn, sg_w, sg_s, sg_z, g_out, 0, HIDDEN, MOE_INTER, pid, nprog, GROUP, BLOCK_N)
+    _gemv_int4_ex(xn, su_w, su_s, su_z, u_out, 0, HIDDEN, MOE_INTER, pid, nprog, GROUP, BLOCK_N)
+    phase += 1
+    _barrier(bar_ptr, phase, nprog)
+    for i in range(pid, MOE_INTER, nprog):
+        gv = tl.load(g_out + i)
+        tl.store(h_out + i, gv * tl.sigmoid(gv) * tl.load(u_out + i))
+    phase += 1
+    _barrier(bar_ptr, phase, nprog)
+    _gemv_int4_ex(h_out, sd_w, sd_s, sd_z, moe_d, 0, MOE_INTER, HIDDEN, pid, nprog, GROUP, BLOCK_N)
+    phase += 1
+    _barrier(bar_ptr, phase, nprog)
+    for i in range(pid, HIDDEN, nprog):
+        tl.store(x_ptr + i, tl.load(x_ptr + i) + tl.load(o + i) + tl.load(moe_d + i))
+    phase += 1
+    _barrier(bar_ptr, phase, nprog)
+
+    for i in range(pid, HIDDEN, nprog):
+        tl.store(out_ptr + i, tl.load(x_ptr + i).to(tl.bfloat16))
+
+
+def _ptr(t: torch.Tensor) -> int:
+    return t.data_ptr()
+
+
+class Model(nn.Module):
+    def __init__(self, cfg: Config):
+        super().__init__()
+        self.cfg = cfg
+        self.blocks = nn.ModuleList(Block(cfg, k) for k in cfg.pattern)
+        self.reset_parameters()
+        self._ws = None
+        self._bar = None
+        self._topi = None
+        self._topw = None
+        self._scores = None
+        self._out = None
+        self._table = None
+
+    def reset_parameters(self):
+        g = torch.Generator(device="cpu").manual_seed(1234)
+        for mod in self.modules():
+            if isinstance(mod, (QuantLinear, QuantExperts)):
+                mod.init_random(g)
+            elif isinstance(mod, nn.Linear):
+                nn.init.normal_(mod.weight, 0.0, 0.02, generator=g)
+            elif isinstance(mod, KDA):
+                nn.init.normal_(mod.conv_w, 0.0, 0.1, generator=g)
+
+    def _ensure(self, device, L):
+        if self._ws is None or self._ws.device != device:
+            self._ws = torch.empty(WS_TOTAL, device=device, dtype=torch.float32)
+            self._bar = torch.zeros(N_PHASES, device=device, dtype=torch.int32)
+            self._topi = torch.zeros(NPROG * N_ACTIVE, device=device, dtype=torch.int32)
+            self._topw = torch.zeros(NPROG * N_ACTIVE, device=device, dtype=torch.float32)
+            self._out = torch.empty(HIDDEN, device=device, dtype=torch.bfloat16)
+            self._table = torch.zeros(P_N, device=device, dtype=torch.int64)
+        if self._scores is None or self._scores.device != device or self._scores.numel() < (L + 1) * MLA_H:
+            self._scores = torch.empty((L + 1) * MLA_H, device=device, dtype=torch.float32)
+
+    def _fill_kda(self, base, bi, state):
+        blk = self.blocks[bi]
+        a, m = blk.attn, blk.moe
+        ptrs = [
+            _ptr(blk.attn_norm), _ptr(blk.moe_norm),
+            _ptr(a.q_proj.w_q), _ptr(a.q_proj.scales), _ptr(a.q_proj.zeros),
+            _ptr(a.k_proj.w_q), _ptr(a.k_proj.scales), _ptr(a.k_proj.zeros),
+            _ptr(a.v_proj.w_q), _ptr(a.v_proj.scales), _ptr(a.v_proj.zeros),
+            _ptr(a.g_proj.w_q), _ptr(a.g_proj.scales), _ptr(a.g_proj.zeros),
+            _ptr(a.o_proj.w_q), _ptr(a.o_proj.scales), _ptr(a.o_proj.zeros),
+            _ptr(a.beta_proj.weight), _ptr(a.conv_w),
+            _ptr(state[bi]["S"]), _ptr(state[bi]["cq"]), _ptr(state[bi]["ck"]), _ptr(state[bi]["cv"]),
+            _ptr(m.router.weight),
+            _ptr(m.gate.w_q), _ptr(m.gate.scales), _ptr(m.gate.zeros),
+            _ptr(m.up.w_q), _ptr(m.up.scales), _ptr(m.up.zeros),
+            _ptr(m.down.w_q), _ptr(m.down.scales), _ptr(m.down.zeros),
+            _ptr(m.s_gate.w_q), _ptr(m.s_gate.scales), _ptr(m.s_gate.zeros),
+            _ptr(m.s_up.w_q), _ptr(m.s_up.scales), _ptr(m.s_up.zeros),
+            _ptr(m.s_down.w_q), _ptr(m.s_down.scales), _ptr(m.s_down.zeros),
+        ]
+        assert len(ptrs) == 42
+        for i, p in enumerate(ptrs):
+            self._table[base + i] = p
+
+    def step(self, hidden, state):
+        cfg = self.cfg
+        device = hidden.device
+        mla_i = list(cfg.pattern).index("M")
+        L = state[mla_i]["c_kv"].shape[0]
+        new_ckv = torch.empty(L + 1, cfg.kv_lora, device=device, dtype=cfg.dtype)
+        new_kr = torch.empty(L + 1, cfg.qk_rope, device=device, dtype=cfg.dtype)
+        new_ckv[:L].copy_(state[mla_i]["c_kv"])
+        new_kr[:L].copy_(state[mla_i]["k_rope"])
+        state[mla_i]["c_kv"] = new_ckv
+        state[mla_i]["k_rope"] = new_kr
+
+        self._ensure(device, L)
+        self._bar.zero_()
+        self._ws[:HIDDEN].copy_(hidden.float())
+
+        self._fill_kda(P_B0, 0, state)
+        self._fill_kda(P_B1, 1, state)
+        self._fill_kda(P_B2, 2, state)
+
+        b3 = self.blocks[3]
+        mla, m = b3.attn, b3.moe
+        mla_ptrs = [
+            _ptr(b3.attn_norm), _ptr(b3.moe_norm),
+            _ptr(mla.q_proj.w_q), _ptr(mla.q_proj.scales), _ptr(mla.q_proj.zeros),
+            _ptr(mla.kv_a.w_q), _ptr(mla.kv_a.scales), _ptr(mla.kv_a.zeros),
+            _ptr(mla.kv_b.w_q), _ptr(mla.kv_b.scales), _ptr(mla.kv_b.zeros),
+            _ptr(mla.o_proj.w_q), _ptr(mla.o_proj.scales), _ptr(mla.o_proj.zeros),
+            _ptr(state[mla_i]["c_kv"]), _ptr(state[mla_i]["k_rope"]),
+            _ptr(m.router.weight),
+            _ptr(m.gate.w_q), _ptr(m.gate.scales), _ptr(m.gate.zeros),
+            _ptr(m.up.w_q), _ptr(m.up.scales), _ptr(m.up.zeros),
+            _ptr(m.down.w_q), _ptr(m.down.scales), _ptr(m.down.zeros),
+            _ptr(m.s_gate.w_q), _ptr(m.s_gate.scales), _ptr(m.s_gate.zeros),
+            _ptr(m.s_up.w_q), _ptr(m.s_up.scales), _ptr(m.s_up.zeros),
+            _ptr(m.s_down.w_q), _ptr(m.s_down.scales), _ptr(m.s_down.zeros),
+        ]
+        assert len(mla_ptrs) == 35
+        for i, p in enumerate(mla_ptrs):
+            self._table[P_B3 + i] = p
+
+        decode_megakernel[(NPROG,)](
+            self._ws, self._bar, self._out, self._scores, self._topi, self._topw, self._table,
+            L, NPROG,
+            HIDDEN=HIDDEN, KDA_C=KDA_C, KDA_H=KDA_H, KDA_D=KDA_D,
+            GROUP=GROUP, MOE_INTER=MOE_INTER, N_EXPERTS=N_EXPERTS, N_ACTIVE=N_ACTIVE,
+            MLA_H=MLA_H, KV_LORA=KV_LORA, QK_NOPE=QK_NOPE, QK_ROPE=QK_ROPE,
+            V_HEAD=V_HEAD, SHORT_CONV=SHORT_CONV, BLOCK_N=BLOCK_N,
+            WS_XN=WS_XN, WS_Q=WS_Q, WS_K=WS_K, WS_V=WS_V, WS_G=WS_G, WS_BETA=WS_BETA,
+            WS_O=WS_O, WS_MOE_G=WS_MOE_G, WS_MOE_U=WS_MOE_U, WS_MOE_H=WS_MOE_H, WS_MOE_D=WS_MOE_D,
+            WS_ROUTER=WS_ROUTER, WS_TOPW=WS_TOPW, WS_QC=WS_QC, WS_CTX=WS_CTX,
+            P_B0=P_B0, P_B1=P_B1, P_B2=P_B2, P_B3=P_B3, PHASE_PER_KDA=PHASE_PER_KDA,
+            num_warps=4,
+        )
+        return self._out.clone(), state
+
+
+def init_state(cfg: Config, context_len: int, seed: int) -> list:
+    dev = torch.device("cuda:0")
+    g = torch.Generator(device=dev).manual_seed(seed)
+    H, Dk = cfg.kda_heads, cfg.kda_head_dim
+    C = H * Dk
+    state = []
+    for kind in cfg.pattern:
+        if kind == "K":
+            state.append({
+                "S": torch.randn(H, Dk, Dk, device=dev, generator=g) * 0.05,
+                "cq": torch.randn(cfg.short_conv - 1, C, device=dev, generator=g, dtype=cfg.dtype) * 0.1,
+                "ck": torch.randn(cfg.short_conv - 1, C, device=dev, generator=g, dtype=cfg.dtype) * 0.1,
+                "cv": torch.randn(cfg.short_conv - 1, C, device=dev, generator=g, dtype=cfg.dtype) * 0.1,
+            })
+        else:
+            state.append({
+                "c_kv": torch.randn(context_len, cfg.kv_lora, device=dev, generator=g, dtype=cfg.dtype) * 0.1,
+                "k_rope": torch.randn(context_len, cfg.qk_rope, device=dev, generator=g, dtype=cfg.dtype) * 0.1,
+            })
+    return state
+
+
+def init_token(cfg: Config, seed: int) -> torch.Tensor:
+    dev = torch.device("cuda:0")
+    g = torch.Generator(device=dev).manual_seed(seed + 1)
+    return torch.randn(cfg.hidden, device=dev, generator=g, dtype=cfg.dtype) * 0.25
