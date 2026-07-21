@@ -9,9 +9,11 @@ website **and** both active benches lives here; there are no per-bench
 the `benchmarks/v3/` archive, which keeps its own).
 
 This is the **canonical monorepo** for the KernelBench website AND the eval
-benchmarks. It lives on Anvil at `~/kernelbench.com` (the GPU box, where evals
-run). The Mac has a secondary clone you `git pull` when working there; Anvil is
-canonical. Deploys go out from Anvil.
+benchmarks. **Canonical home is the Mac** at `~/dev/sites/kernelbench.com`
+(edit, site dev, publish/deploy, orchestration, babysit). GPU eval sessions
+launch to NVIDIA Brev (or another remote GPU worker); they do not need Anvil's
+local GPUs. Anvil may still hold a disposable checkout or fat run caches — do
+not treat it as source of truth. Deploys go out from the Mac (`kb deploy`).
 
 ## The active benches — know which one you're writing to
 
@@ -99,7 +101,7 @@ kb deploy "bench kimi k2.7"               # publish + commit + push (Vercel auto
 # model lands" under Hard-won gotchas.
 ```
 Other commands: `kb run <harness> <model> <problem>` (one problem), `kb dev`
-(preview, view from Mac via Tailscale anvil:3000), `kb build`, `kb audit <run_id>`,
+(preview at localhost:3000), `kb build`, `kb audit <run_id>`,
 `kb contamination <hard|mega|v3>`, `kb traces-to-hf`, `kb help`. The CLI is the
 `kbtool/` uv package (`kbtool/kb/cli.py`); `bin/kb` is a thin shim that runs it
 via `uv run` (symlinked to ~/.local/bin/kb). Install standalone with
@@ -604,12 +606,15 @@ Most likely causes:
   rented Brev GPUs — two gotchas that each cost real money if you miss them:**
   - **`brev delete <name>` has a hidden interactive "are you sure?" confirmation
     that SILENTLY HANGS with no TTY** (it prints nothing and never deletes; `brev
-    stop` and `yes | brev delete` also no-op). The ONLY reliable teardown is to
-    give it a pseudo-TTY and feed it `y`:
-    `script -qec "brev delete <name>" /dev/null <<< "y"`. Any auto-teardown
-    watchdog MUST use this form — a plain `yes | brev delete` backstop does
+    stop` and `yes | brev delete` also no-op). Teardown MUST go through
+    **`scripts/brev_teardown.sh <name>`** (repo root) — it gives brev a
+    pseudo-TTY, feeds it `y`, and polls `brev ls` until the instance is gone.
+    Platform note: the old raw recipe `script -qec "brev delete <name>"
+    /dev/null <<< "y"` is util-linux-only — **on macOS it silently does
+    nothing** (`script` flags differ); the teardown script branches to
+    `expect` on Darwin. A plain `yes | brev delete` backstop also does
     nothing, so a forgotten node bills at ~$23/hr (8×H100 SXM5) until caught.
-    Always confirm teardown with `brev ls` showing "No instances".
+    Always confirm teardown with `brev ls` no longer listing the instance.
   - **torch wheel must be CUDA-driver-matched.** Hyperstack/shadeform 8×H100
     nodes ship driver CUDA 12.8; the default `uv pip install torch` pulls a cu130
     wheel that can't see the GPUs (`torch.cuda.is_available()==False`, "driver too

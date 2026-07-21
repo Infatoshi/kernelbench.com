@@ -41,7 +41,12 @@ rsync -az -e "${S[*]}" --exclude outputs --exclude __pycache__ --exclude .venv -
 "${S[@]}" "$NAME" "mkdir -p .codex .claude .config/cursor .cursor"
 rsync -az -e "${S[*]}" ~/.codex/auth.json "$NAME:.codex/auth.json"
 rsync -az -e "${S[*]}" ~/.claude/.credentials.json "$NAME:.claude/.credentials.json"
-rsync -az -e "${S[*]}" ~/.env_vars "$NAME:.env_vars"
+# Provider keys only — never ship the whole ~/.env_vars to a rented box.
+ENV_ALLOWLIST='KIMI_API_KEY|MOONSHOT_API_KEY|ZAI_API_KEY|MINIMAX_API_KEY|DEEPSEEK_API_KEY|LONGCAT_API_KEY|TENCENT_API_KEY|DASHSCOPE_API_KEY|OPENROUTER_API_KEY|OPENAI_API_KEY|GEMINI_API_KEY|ANTHROPIC_API_KEY|CLAUDE_CODE_OAUTH_TOKEN'
+TMPENV="$(mktemp)"
+grep -E "^(export )?($ENV_ALLOWLIST)=" ~/.env_vars > "$TMPENV" || true
+rsync -az -e "${S[*]}" "$TMPENV" "$NAME:.env_vars"
+rm -f "$TMPENV"
 # cursor auth (composer harness); *-claude + gemini routes use ~/.env_vars keys only
 rsync -az -e "${S[*]}" ~/.config/cursor/auth.json "$NAME:.config/cursor/auth.json" 2>/dev/null || true
 rsync -az -e "${S[*]}" ~/.cursor/cli-config.json ~/.cursor/agent-cli-state.json "$NAME:.cursor/" 2>/dev/null || true

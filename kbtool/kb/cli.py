@@ -11,8 +11,10 @@ post-hoc Python (audit, lint, contamination, traces->HF) lives here.
 """
 from __future__ import annotations
 
+import csv
 import json
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -24,13 +26,14 @@ kb — KernelBench operator CLI   (repo: {root})
   kb run <harness> <model> <problem> [effort]  one problem (problem = e.g. 05_topk_bitonic)
   kb publish [bench]                            rebuild leaderboard + viewers from archives (default: hard; benches: hard|mega|cuda)
   kb deploy [message]                           publish, commit, push -> Vercel deploys
-  kb dev                                        preview site locally (anvil:3000 via Tailscale)
+  kb dev                                        preview site locally (localhost:3000)
   kb build                                      next build
   kb audit <run_id>                             print a run's result + annotation verdict
   kb lint <run_id|--all>                        static reward-hack tripwire (scans solution.py)
   kb contamination <hard|mega|cuda|v3|path> [--published <lb.json>]   cross-run contamination audit
   kb traces-to-hf <out_dir> [run_dirs...]       convert run transcripts to HF agent-trace JSONL
   kb push-runs <hard|mega|cuda> [--dataset R] [--dry-run]   convert published runs' traces and push to HF
+  kb brev <up|sync|bootstrap|run|regrade|pull|down> <instance> [...]   Brev GPU worker lifecycle (scripts/brev_worker.sh)
   kb help
 
 Keys live in ~/.env_vars. Bench a new model: add its key, then  kb sweep <harness> <model>.
@@ -105,6 +108,21 @@ def preflight_key(harness: str, model: str = "") -> None:
         sys.exit(3)
 
 
+def _require_local_gpu() -> None:
+    """Eval sessions need a live CUDA GPU. On GPU-less hosts (the Mac control
+    plane) fail closed and point at the Brev worker path instead of silently
+    running kernels nowhere."""
+    if os.environ.get("KB_ALLOW_LOCAL") == "1":
+        return
+    if shutil.which("nvidia-smi") is None:
+        sys.exit(
+            "kb: no local GPU (nvidia-smi not found) — this host cannot run eval sessions.\n"
+            "  Launch on a Brev worker instead:  kb brev up <name> && kb brev run <name> ...\n"
+            "  (see scripts/brev_worker.sh)\n"
+            "  Deliberate local override:  KB_ALLOW_LOCAL=1 kb run ...\n"
+        )
+
+
 def _exec(cmd: list[str], cwd: Path | None = None, env: dict | None = None) -> int:
     """Replace this process with cmd (preserves TTY/signals)."""
     if cwd is not None:
@@ -122,6 +140,7 @@ def _bench_dir(root: Path, bench: str) -> Path:
 
 
 def cmd_sweep(root: Path, args: list[str]) -> int:
+    _require_local_gpu()
     harness = args[0] if args else ""
     model = args[1] if len(args) > 1 else ""
     preflight_key(harness, model)
@@ -131,6 +150,7 @@ def cmd_sweep(root: Path, args: list[str]) -> int:
 def cmd_run(root: Path, args: list[str]) -> int:
     if len(args) < 3:
         sys.exit("usage: kb run <harness> <model> <problem> [effort]")
+    _require_local_gpu()
     h, m, p = args[0], args[1], args[2]
     effort = args[3:] if len(args) > 3 else []
     preflight_key(h, m)
@@ -187,6 +207,42 @@ def _leaderboard_run_ids(bench_dir: Path) -> list[str]:
     return sorted(rids)
 
 
+def _mega_csv_run_ids(root: Path) -> list[str]:
+    """Mega has no results/leaderboard.json; its published set is
+    public/data/mega/results.csv (built by build_mega_leaderboard.py)."""
+    f = root / "public" / "data" / "mega" / "results.csv"
+    if not f.exists():
+        return []
+    with f.open() as fh:
+        return sorted({row["run_id"] for row in csv.DictReader(fh) if row.get("run_id")})
+
+
+def _check_rid_collisions(root: Path, bench: str, rids: list[str]) -> None:
+    """A run_id must resolve to exactly one archive dir. The same rid living in
+    two runs dirs (e.g. hard outputs/runs + outputs/runs-b200) with different
+    contents means public/runs and HF traces keyed by rid alone would
+    misattribute one GPU's session to another board. Hard-fail; override with
+    KB_ALLOW_RID_COLLISIONS=1 only if you know which copy wins."""
+    bench_out = root / "benchmarks" / bench / "outputs"
+    dirs = sorted(d for d in bench_out.glob("runs*") if d.is_dir())
+    dup: dict[str, list[str]] = {}
+    for rid in rids:
+        hits = [str(d.relative_to(root)) for d in dirs if (d / rid).is_dir()]
+        if len(hits) > 1:
+            dup[rid] = hits
+    if not dup:
+        return
+    msg = ["kb: run_id collision — same rid archived in multiple runs dirs:"]
+    for rid, hits in dup.items():
+        msg.append(f"  {rid}: {', '.join(hits)}")
+    msg.append("  rid-keyed artifacts (public/runs, HF traces) would misattribute these.")
+    msg.append("  Namespace or rename before pushing, or KB_ALLOW_RID_COLLISIONS=1 to force.")
+    if os.environ.get("KB_ALLOW_RID_COLLISIONS") == "1":
+        sys.stderr.write("\n".join(["WARNING (forced past):"] + msg[1:]) + "\n")
+        return
+    sys.exit("\n".join(msg))
+
+
 def cmd_push_runs(root: Path, args: list[str]) -> int:
     dry = "--dry-run" in args
     args = [a for a in args if a != "--dry-run"]
@@ -202,8 +258,12 @@ def cmd_push_runs(root: Path, args: list[str]) -> int:
     dataset = dataset or f"Infatoshi/kernelbench-{bench}-traces"
 
     rids = _leaderboard_run_ids(bench_dir)
+    if not rids and bench == "mega":
+        rids = _mega_csv_run_ids(root)
     if not rids:
-        sys.exit(f"kb push-runs: no run_ids in {bench}/results/leaderboard.json")
+        src = "public/data/mega/results.csv" if bench == "mega" else f"{bench}/results/leaderboard.json"
+        sys.exit(f"kb push-runs: no run_ids in {src}")
+    _check_rid_collisions(root, bench, rids)
 
     staging = root / "runs" / bench / "traces"
     staging.mkdir(parents=True, exist_ok=True)
@@ -243,9 +303,13 @@ def cmd_deploy(root: Path, args: list[str]) -> int:
     msg = args[0] if args else "publish kernelbench results"
     subprocess.run([str(_bench_dir(root, "hard") / "scripts" / "publish_v2.sh")], check=True)
     subprocess.run([str(_bench_dir(root, "cuda") / "scripts" / "publish_v2.sh")], check=True)
+    subprocess.run([str(_bench_dir(root, "mega") / "scripts" / "publish_mega.sh")], check=True)
+    rc = _rebuild_model_index(root)
+    if rc != 0:
+        return rc
     os.chdir(root)
     subprocess.run(["git", "add", "-A", "benchmarks/hard/results", "benchmarks/cuda/results",
-                    "public/runs", "app"], check=True)
+                    "benchmarks/mega/results", "public/runs", "public/data", "app"], check=True)
     rc = subprocess.run(
         ["git", "-c", "user.email=elliot@arledge.net", "commit", "-m", msg]
     ).returncode
@@ -293,6 +357,11 @@ def cmd_contamination(root: Path, args: list[str]) -> int:
     return contamination.run(args, repo_root=root)
 
 
+def cmd_brev(root: Path, args: list[str]) -> int:
+    """Brev worker lifecycle: kb brev <up|sync|bootstrap|run|regrade|pull|down> ..."""
+    return _exec([str(root / "scripts" / "brev_worker.sh"), *args])
+
+
 def cmd_traces_to_hf(root: Path, args: list[str]) -> int:
     script = _bench_dir(root, "hard") / "scripts" / "traces_to_hf.py"
     os.chdir(_bench_dir(root, "hard"))
@@ -309,6 +378,7 @@ _COMMANDS = {
     "audit": cmd_audit,
     "lint": cmd_lint,
     "contamination": cmd_contamination,
+    "brev": cmd_brev,
     "traces-to-hf": cmd_traces_to_hf,
     "push-runs": cmd_push_runs,
 }
