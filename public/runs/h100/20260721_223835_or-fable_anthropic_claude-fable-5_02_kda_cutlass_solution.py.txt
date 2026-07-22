@@ -1,0 +1,412 @@
+"""Custom Triton implementation of Kimi Delta Attention forward (chunk form).
+
+Pipeline (three kernels; shapes here have BT = 64, K = V = 128):
+  1. `_kda_prepare` (parallel over B*H*NT chunks): in-chunk cumsum of the
+     log-decay in log2 space, WY representation via a Newton/Neumann doubling
+     inversion of (I + L) on tensor cores, emitting w, u, the masked
+     intra-chunk Aqk, decay-weighted qg / kg and per-chunk terminal decay dn.
+  2. `_kda_seg_op` (parallel over segments x column blocks): composes the
+     per-chunk affine state update S -> diag(dn) S + kg^T (u - w S) over each
+     segment of P chunks, producing the segment operator M_seg (K x K, column
+     blocks with X0 = I) and offset C_seg (K x V, column blocks with X0 = 0)
+     in one launch with branch-free inner loops.
+  3. `_kda_scan_seg` (parallel over B*H*NSEG segments x V-blocks): recomputes
+     its segment's entry state h0 from the few segment operators in a short
+     prologue (redundant-but-parallel work instead of a serial scan kernel),
+     then replays the chunks inside the segment, producing v_new and the
+     output o = qg @ S + Aqk @ v_new with the state held in registers.
+
+The two-level (segmented) scan turns the NT-long sequential chunk recurrence
+into an NSEG-long one plus parallel work, which is what makes the thin-batch
+shapes fast on 132 SMs.
+
+forward() captures the launches into a CUDA graph when the same input buffers
+are passed repeatedly (the benchmark harness pattern).
+"""
+from __future__ import annotations
+
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+OP_TYPE = "linear_attention"
+SUPPORTED_PRECISIONS = ["bf16"]
+HARDWARE_REQUIRED = ["RTX_PRO_6000", "H100", "B200"]
+
+RCP_LN2 = tl.constexpr(1.4426950408889634)  # 1 / ln(2)
+
+
+@triton.jit
+def _kda_prepare(
+    q, k, v, g, beta,
+    w, u, qg, kg, aqk, dn,
+    scale, bh_off,
+    T: tl.constexpr, H: tl.constexpr, K: tl.constexpr, V: tl.constexpr,
+    BT: tl.constexpr, NT: tl.constexpr,
+):
+    i_t = tl.program_id(0)
+    i_bh = tl.program_id(1) + bh_off
+    i_b = i_bh // H
+    i_h = i_bh % H
+
+    o_t = tl.arange(0, BT)
+    o_k = tl.arange(0, K)
+    o_v = tl.arange(0, V)
+
+    base_tok = (i_b * T + i_t * BT) * H + i_h
+    p_g = g + base_tok * K + o_t[:, None] * (H * K) + o_k[None, :]
+    p_q = q + base_tok * K + o_t[:, None] * (H * K) + o_k[None, :]
+    p_k = k + base_tok * K + o_t[:, None] * (H * K) + o_k[None, :]
+    p_v = v + base_tok * V + o_t[:, None] * (H * V) + o_v[None, :]
+    p_beta = beta + base_tok + o_t * H
+
+    base_out = (i_bh * T + i_t * BT)
+    p_w = w + base_out * K + o_t[:, None] * K + o_k[None, :]
+    p_u = u + base_out * V + o_t[:, None] * V + o_v[None, :]
+    p_qg = qg + base_out * K + o_t[:, None] * K + o_k[None, :]
+    p_kg = kg + base_out * K + o_t[:, None] * K + o_k[None, :]
+    p_aqk = aqk + base_out * BT + o_t[:, None] * BT + o_t[None, :]
+    p_dn = dn + (i_bh * NT + i_t) * K + o_k
+
+    b_beta = tl.load(p_beta).to(tl.float32)
+
+    b_gr = tl.load(p_g).to(tl.float32) * RCP_LN2
+    b_gn = tl.sum(b_gr, 0)                       # (K,) total log2 decay
+    b_gc = tl.cumsum(b_gr, 0)                    # (BT, K)
+    b_e = tl.exp2(b_gc)
+    b_en = tl.exp2(b_gn[None, :] - b_gc)
+
+    b_k = tl.load(p_k).to(tl.float32)
+    b_kneg = (b_k * tl.exp2(-b_gc)).to(tl.bfloat16)   # k * 2^-gc
+    tl.store(p_kg, (b_k * b_en).to(tl.bfloat16))      # k * 2^(gN-gc)
+    tl.store(p_dn, tl.exp2(b_gn))
+    b_kpos = (b_k * b_e).to(tl.bfloat16)              # k * 2^gc
+
+    # scaled decayed q; Aqk right away so qg can be freed
+    b_qg = (tl.load(p_q).to(tl.float32) * (b_e * scale)).to(tl.bfloat16)
+    tl.store(p_qg, b_qg)
+    b_Aqk = tl.dot(b_qg, tl.trans(b_kneg))
+    b_Aqk = tl.where(o_t[:, None] >= o_t[None, :], b_Aqk, 0.0)
+    tl.store(p_aqk, b_Aqk.to(tl.bfloat16))
+
+    # strictly-lower K-K matrix, beta on rows
+    b_A = tl.dot(b_kpos, tl.trans(b_kneg))
+    m_lo = o_t[:, None] > o_t[None, :]
+    b_L = tl.where(m_lo, b_A, 0.0) * b_beta[:, None]
+
+    # X = (I + L)^{-1} via doubling: X += X @ R; R = R @ R (bf16 operands,
+    # fp32 accumulation -- validated against the fp32 reference).
+    m_eye = o_t[:, None] == o_t[None, :]
+    b_X = tl.where(m_eye, 1.0, 0.0) - b_L
+    b_Lb = b_L.to(tl.bfloat16)
+    b_R = tl.dot(b_Lb, b_Lb).to(tl.bfloat16)          # L^2
+    b_X += tl.dot(b_X.to(tl.bfloat16), b_R)           # covers L^3
+    b_R = tl.dot(b_R, b_R).to(tl.bfloat16)            # L^4
+    b_X += tl.dot(b_X.to(tl.bfloat16), b_R)           # covers L^7
+    b_R = tl.dot(b_R, b_R).to(tl.bfloat16)            # L^8
+    b_X += tl.dot(b_X.to(tl.bfloat16), b_R)           # covers L^15
+    b_R = tl.dot(b_R, b_R).to(tl.bfloat16)            # L^16
+    b_X += tl.dot(b_X.to(tl.bfloat16), b_R)           # covers L^31
+    b_R = tl.dot(b_R, b_R).to(tl.bfloat16)            # L^32
+    b_X += tl.dot(b_X.to(tl.bfloat16), b_R)           # covers L^63
+
+    b_Xh = b_X.to(tl.bfloat16)
+
+    # w = X @ (beta * k * 2^gc), u = X @ (beta * v)
+    b_w = tl.dot(b_Xh, (b_kpos.to(tl.float32) * b_beta[:, None]).to(tl.bfloat16))
+    tl.store(p_w, b_w.to(tl.bfloat16))
+    b_v = tl.load(p_v)
+    b_u = tl.dot(b_Xh, (b_v.to(tl.float32) * b_beta[:, None]).to(tl.bfloat16))
+    tl.store(p_u, b_u.to(tl.bfloat16))
+
+
+@triton.jit
+def _kda_seg_op(
+    w, u, kg, dn, mseg, cseg, bh_off,
+    T: tl.constexpr, H: tl.constexpr, K: tl.constexpr, V: tl.constexpr,
+    BT: tl.constexpr, NT: tl.constexpr, P: tl.constexpr, NSEG: tl.constexpr,
+    BX: tl.constexpr,
+):
+    """Segment operator column block.
+
+    Column blocks [0, K) build M_seg (X0 = I, no u term); blocks [K, K+V)
+    build C_seg (X0 = 0, with u). Update per chunk:
+        X <- dn[:, None] * X + kg^T @ ((u or 0) - w @ X)
+    The M/C decision is uniform per program, so each loop body stays
+    branch-free and pipelines.
+    """
+    i_x = tl.program_id(0)
+    i_p = tl.program_id(1)
+    i_bh = tl.program_id(2) + bh_off
+
+    o_t = tl.arange(0, BT)
+    o_k = tl.arange(0, K)
+    o_x = tl.arange(0, BX)
+
+    NXM: tl.constexpr = K // BX
+
+    if i_x < NXM:
+        # ---- M part: segments 1 .. NSEG-2 ----
+        i_s = i_p + 1
+        if i_s > NSEG - 2:
+            return
+        b_X = (o_k[:, None] == (i_x * BX + o_x)[None, :]).to(tl.float32)
+        for t in range(i_s * P, i_s * P + P):
+            base_out = (i_bh * T + t * BT)
+            b_w = tl.load(w + base_out * K + o_t[:, None] * K + o_k[None, :])
+            b_kgt = tl.load(kg + base_out * K + o_k[:, None] + o_t[None, :] * K)
+            b_dn = tl.load(dn + (i_bh * NT + t) * K + o_k)
+            b_wX = tl.dot(b_w, b_X.to(tl.bfloat16))
+            b_X = b_X * b_dn[:, None] - tl.dot(b_kgt, b_wX.to(tl.bfloat16))
+        p_m = mseg + (i_bh * NSEG + i_s) * K * K \
+            + o_k[:, None] * K + i_x * BX + o_x[None, :]
+        tl.store(p_m, b_X.to(tl.bfloat16))
+    else:
+        # ---- C part: segments 0 .. NSEG-2 ----
+        i_s = i_p
+        i_xc = i_x - NXM
+        b_X = tl.zeros([K, BX], dtype=tl.float32)
+        for t in range(i_s * P, i_s * P + P):
+            base_out = (i_bh * T + t * BT)
+            b_w = tl.load(w + base_out * K + o_t[:, None] * K + o_k[None, :])
+            b_kgt = tl.load(kg + base_out * K + o_k[:, None] + o_t[None, :] * K)
+            b_dn = tl.load(dn + (i_bh * NT + t) * K + o_k)
+            b_u = tl.load(u + base_out * V + o_t[:, None] * V
+                          + i_xc * BX + o_x[None, :])
+            b_r = b_u.to(tl.float32) - tl.dot(b_w, b_X.to(tl.bfloat16))
+            b_X = b_X * b_dn[:, None] + tl.dot(b_kgt, b_r.to(tl.bfloat16))
+        p_c = cseg + (i_bh * NSEG + i_s) * K * V \
+            + o_k[:, None] * V + i_xc * BX + o_x[None, :]
+        tl.store(p_c, b_X.to(tl.bfloat16))
+
+
+@triton.jit
+def _kda_scan_seg(
+    w, u, qg, kg, aqk, dn, mseg, cseg, o, bh_off, seg_off,
+    T: tl.constexpr, H: tl.constexpr, K: tl.constexpr, V: tl.constexpr,
+    BT: tl.constexpr, NT: tl.constexpr, P: tl.constexpr, NSEG: tl.constexpr,
+    BV: tl.constexpr,
+):
+    i_v = tl.program_id(0)
+    i_s = tl.program_id(1) + seg_off
+    i_bh = tl.program_id(2) + bh_off
+    i_b = i_bh // H
+    i_h = i_bh % H
+
+    o_t = tl.arange(0, BT)
+    o_k = tl.arange(0, K)
+    o_bv = i_v * BV + tl.arange(0, BV)
+
+    # h0 for this segment, recomputed from the segment operators: this
+    # replaces a separate serial scan kernel with redundant-but-parallel work.
+    b_S = tl.zeros([K, BV], dtype=tl.float32)
+    if i_s > 0:
+        p_c = cseg + i_bh * NSEG * K * V + o_k[:, None] * V + o_bv[None, :]
+        b_S = tl.load(p_c).to(tl.float32)
+        for j in range(1, i_s):
+            p_m = mseg + (i_bh * NSEG + j) * K * K \
+                + o_k[:, None] * K + o_k[None, :]
+            p_c = cseg + (i_bh * NSEG + j) * K * V \
+                + o_k[:, None] * V + o_bv[None, :]
+            b_m = tl.load(p_m)
+            b_c = tl.load(p_c).to(tl.float32)
+            b_S = tl.dot(b_m, b_S.to(tl.bfloat16)) + b_c
+
+    for t in range(i_s * P, i_s * P + P):
+        base_out = (i_bh * T + t * BT)
+        b_w = tl.load(w + base_out * K + o_t[:, None] * K + o_k[None, :])
+        b_qg = tl.load(qg + base_out * K + o_t[:, None] * K + o_k[None, :])
+        b_kgt = tl.load(kg + base_out * K + o_k[:, None] + o_t[None, :] * K)
+        b_u = tl.load(u + base_out * V + o_t[:, None] * V + o_bv[None, :])
+        b_aqk = tl.load(aqk + base_out * BT + o_t[:, None] * BT + o_t[None, :])
+        b_dn = tl.load(dn + (i_bh * NT + t) * K + o_k)
+
+        b_Sb = b_S.to(tl.bfloat16)
+        b_vn = b_u.to(tl.float32) - tl.dot(b_w, b_Sb)
+        b_vnb = b_vn.to(tl.bfloat16)
+        b_o = tl.dot(b_qg, b_Sb) + tl.dot(b_aqk, b_vnb)
+
+        p_o = o + ((i_b * T + t * BT) * H + i_h) * V \
+            + o_t[:, None] * (H * V) + o_bv[None, :]
+        # o is never re-read: stream the store past L2
+        tl.store(p_o, b_o.to(tl.bfloat16), cache_modifier=".cs")
+
+        b_S = b_S * b_dn[:, None] + tl.dot(b_kgt, b_vnb)
+
+
+# per-(NT, BH) tuned configs: NSEG, seg BX, scan BV
+_CONFIGS = {
+    (16, 16): dict(nseg=4, bx=64, bv=64, ons=2, sns=3),
+    (32, 16): dict(nseg=4, bx=64, bv=64, ons=2, sns=3),
+    (64, 8): dict(nseg=8, bx=64, bv=64, ons=2, sns=3),
+    (32, 4): dict(nseg=8, bx=64, bv=32, ons=3, sns=3),
+}
+
+
+def _config(NT: int, BH: int) -> dict:
+    cfg = _CONFIGS.get((NT, BH))
+    if cfg is not None:
+        return cfg
+    nseg = 1
+    while nseg < 8 and NT % (nseg * 2) == 0 and NT // (nseg * 2) >= 2 \
+            and nseg * BH < 128:
+        nseg *= 2
+    return dict(nseg=nseg, bx=64, bv=64, ons=2, sns=3)
+
+
+class Model(nn.Module):
+    """KDA forward (chunk form) with custom Triton kernels."""
+
+    def __init__(self, B: int, T: int, H: int, K: int, V: int, chunk_size: int = 64):
+        super().__init__()
+        self.B, self.T, self.H, self.K, self.V = B, T, H, K, V
+        self.chunk_size = chunk_size
+        self.scale = float(K) ** -0.5
+        self.register_buffer("_dummy", torch.zeros(1), persistent=False)
+        self._ws = None
+        self._graph = None
+        self._graph_key = None
+        self._last_key = None
+        self._repeats = 0
+
+    def _workspaces(self, device):
+        if self._ws is not None and self._ws[0] == device:
+            return self._ws[1]
+        B, T, H, K, V = self.B, self.T, self.H, self.K, self.V
+        BT = self.chunk_size
+        NT = T // BT
+        BH = B * H
+        cfg = _config(NT, BH)
+        NSEG = cfg["nseg"]
+        ws = {
+            "w": torch.empty(BH * T * K, dtype=torch.bfloat16, device=device),
+            "u": torch.empty(BH * T * V, dtype=torch.bfloat16, device=device),
+            "qg": torch.empty(BH * T * K, dtype=torch.bfloat16, device=device),
+            "kg": torch.empty(BH * T * K, dtype=torch.bfloat16, device=device),
+            "aqk": torch.empty(BH * T * BT, dtype=torch.bfloat16, device=device),
+            "dn": torch.empty(BH * NT * K, dtype=torch.float32, device=device),
+            "mseg": torch.empty(BH * NSEG * K * K, dtype=torch.bfloat16, device=device),
+            "cseg": torch.empty(BH * NSEG * K * V, dtype=torch.bfloat16, device=device),
+            "o": torch.empty(B, T, H, V, dtype=torch.bfloat16, device=device),
+            "cfg": cfg,
+        }
+        self._ws = (device, ws)
+        return ws
+
+    def _launch(self, q, k, v, g, beta, ws):
+        B, T, H, K = q.shape
+        V = v.shape[-1]
+        BT = self.chunk_size
+        NT = T // BT
+        BH = B * H
+        cfg = ws["cfg"]
+        NSEG = cfg["nseg"]
+        P = NT // NSEG
+
+        _kda_prepare[(NT, BH)](
+            q, k, v, g, beta,
+            ws["w"], ws["u"], ws["qg"], ws["kg"], ws["aqk"], ws["dn"],
+            self.scale, 0,
+            T=T, H=H, K=K, V=V, BT=BT, NT=NT,
+            num_warps=4, num_stages=1,
+        )
+        if NSEG > 1:
+            BX = cfg["bx"]
+            _kda_seg_op[((K + V) // BX, NSEG - 1, BH)](
+                ws["w"], ws["u"], ws["kg"], ws["dn"], ws["mseg"], ws["cseg"],
+                0,
+                T=T, H=H, K=K, V=V, BT=BT, NT=NT, P=P, NSEG=NSEG, BX=BX,
+                num_warps=4, num_stages=cfg["ons"],
+            )
+        BV = cfg["bv"]
+        _kda_scan_seg[(V // BV, NSEG, BH)](
+            ws["w"], ws["u"], ws["qg"], ws["kg"], ws["aqk"], ws["dn"],
+            ws["mseg"], ws["cseg"], ws["o"], 0, 0,
+            T=T, H=H, K=K, V=V, BT=BT, NT=NT, P=P, NSEG=NSEG, BV=BV,
+            num_warps=4, num_stages=cfg["sns"],
+        )
+
+    def forward(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        g: torch.Tensor,
+        beta: torch.Tensor,
+    ) -> torch.Tensor:
+        # Lean fast path: same buffers as the captured graph -> just replay.
+        # (Matching pointers imply the same tensors we captured with, which
+        # were already checked contiguous.)
+        graph = self._graph
+        if graph is not None and self._graph_key == (
+                q.data_ptr(), k.data_ptr(), v.data_ptr(), g.data_ptr(),
+                beta.data_ptr()):
+            graph.replay()
+            return self._graph_out
+
+        if not q.is_contiguous():
+            q = q.contiguous()
+        if not k.is_contiguous():
+            k = k.contiguous()
+        if not v.is_contiguous():
+            v = v.contiguous()
+        if not g.is_contiguous():
+            g = g.contiguous()
+        if not beta.is_contiguous():
+            beta = beta.contiguous()
+
+        ws = self._workspaces(q.device)
+
+        key = (q.data_ptr(), k.data_ptr(), v.data_ptr(), g.data_ptr(),
+               beta.data_ptr())
+        if key == self._last_key:
+            self._repeats += 1
+        else:
+            self._last_key = key
+            self._repeats = 0
+
+        if self._repeats >= 2:
+            try:
+                graph = torch.cuda.CUDAGraph()
+                s = torch.cuda.Stream()
+                s.wait_stream(torch.cuda.current_stream())
+                with torch.cuda.stream(s):
+                    self._launch(q, k, v, g, beta, ws)
+                torch.cuda.current_stream().wait_stream(s)
+                with torch.cuda.graph(graph):
+                    self._launch(q, k, v, g, beta, ws)
+                self._graph = graph
+                self._graph_key = key
+                self._graph_out = ws["o"]
+                graph.replay()
+                return ws["o"]
+            except Exception:
+                self._graph = None
+                self._graph_key = None
+
+        self._launch(q, k, v, g, beta, ws)
+        return ws["o"]
+
+
+# Module-level shape shims (overridden by check.py / benchmark.py per shape).
+B = 2
+T = 1024
+H = 8
+K = 128
+V = 128
+CHUNK_SIZE = 64
+
+
+def get_inputs():
+    torch.manual_seed(0)
+    q = torch.randn(B, T, H, K, dtype=torch.bfloat16) * 0.1
+    k = torch.randn(B, T, H, K, dtype=torch.bfloat16) * 0.1
+    v = torch.randn(B, T, H, V, dtype=torch.bfloat16) * 0.1
+    g = (torch.randn(B, T, H, K, dtype=torch.float32) * 0.1 - 0.05)
+    beta = torch.sigmoid(torch.randn(B, T, H, dtype=torch.bfloat16))
+    return [q, k, v, g, beta]
+
+
+def get_init_inputs():
+    return [B, T, H, K, V, CHUNK_SIZE]
