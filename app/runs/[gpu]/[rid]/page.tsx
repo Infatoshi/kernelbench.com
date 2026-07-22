@@ -172,16 +172,30 @@ function Stat({ label, value }: { label: string; value: string }) {
   )
 }
 
-function ShapeStrip({ d }: { d: RunDetailData }) {
+/** The fraction that feeds the geomean: benchmark.py's per-shape official
+ *  fraction where archived, else the bound-specific utilization. */
+function shapeFrac(s: ShapeRow): number {
+  return s.frac ?? s.util ?? 0
+}
+
+function geomean(vals: number[]): number | null {
+  const pos = vals.filter((v) => v > 0)
+  if (!pos.length) return null
+  return Math.exp(pos.reduce((a, v) => a + Math.log(v), 0) / pos.length)
+}
+
+function ShapeStrip({ d, official }: { d: RunDetailData; official: number | null }) {
   if (!d.shapes.length) {
     return (
       <p className="rdetail-muted">No per-shape benchmark data archived for this run.</p>
     )
   }
+  const fracs = d.shapes.map(shapeFrac)
+  const gm = geomean(fracs)
   return (
     <div className="rdetail-shapes">
       {d.shapes.map((s) => {
-        const util = s.util ?? 0
+        const f = shapeFrac(s)
         const achieved =
           s.bound === "memory"
             ? `${((s.gbps ?? 0) / 1000).toFixed(2)} TB/s`
@@ -207,19 +221,12 @@ function ShapeStrip({ d }: { d: RunDetailData }) {
             <span className="rdetail-shape-track">
               <span
                 className={`rdetail-shape-fill rdetail-${s.bound ?? "compute"}`}
-                style={{ width: `${Math.min(util, 1) * 100}%` }}
+                style={{ width: `${Math.min(f, 1) * 100}%` }}
               />
-              {s.frac != null && (
-                <span
-                  className="rdetail-shape-tick"
-                  title={`official fraction ${s.frac.toFixed(3)} (geomean input)`}
-                  style={{ left: `${Math.min(s.frac, 1) * 100}%` }}
-                />
-              )}
             </span>
-            <span className="rdetail-shape-util tabular">{Math.round(util * 100)}%</span>
+            <span className="rdetail-shape-util tabular">{(f * 100).toFixed(1)}%</span>
             <span className="rdetail-shape-detail">
-              {achieved} · {Math.round(util * 100)}% of {ceiling}
+              {achieved} · {Math.round((s.util ?? 0) * 100)}% of {ceiling}
               {other ? ` · ${other}` : ""}
             </span>
           </div>
@@ -227,10 +234,22 @@ function ShapeStrip({ d }: { d: RunDetailData }) {
       })}
       <p className="rdetail-legend">
         <span className="rdetail-swatch rdetail-compute" /> compute-bound
-        <span className="rdetail-swatch rdetail-memory" /> memory-bound
-        <span className="rdetail-swatch rdetail-tickswatch" /> official fraction
-        (feeds the geomean)
+        <span className="rdetail-swatch rdetail-memory" /> memory-bound · bar +
+        right column = official fraction of the ceiling (the geomean input)
       </p>
+      {gm != null && (
+        <p className="run-page-math tabular">
+          geomean({fracs.map((f) => `${(f * 100).toFixed(1)}%`).join(" · ")}) ={" "}
+          <strong>{(gm * 100).toFixed(1)}%</strong>
+          {official != null && Math.abs(gm - official) > 0.002 && (
+            <>
+              {" "}
+              · published {(official * 100).toFixed(1)}% (lower of repeated
+              isolated re-benchmark passes)
+            </>
+          )}
+        </p>
+      )}
     </div>
   )
 }
@@ -324,7 +343,10 @@ export default async function RunPage({
               HBM bandwidth
             </span>
           </h2>
-          <ShapeStrip d={detail} />
+          <ShapeStrip
+            d={detail}
+            official={cell.valid && !isSpeedup ? cell.score : null}
+          />
         </>
       )}
 
