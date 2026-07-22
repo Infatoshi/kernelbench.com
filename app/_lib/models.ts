@@ -129,6 +129,10 @@ export const SITE_HIDDEN_GPUS = new Set<string>([])
  */
 export const DEFAULT_GPU = "h100"
 
+/** GPU key for the canonical boards — cells built without an explicit gpu
+ *  belong to this board (data paths for it are un-namespaced). */
+export const CANONICAL_GPU = "rtxpro6000"
+
 /** Homepage / deck GPU tabs: H100 → RTX PRO 6000 → B200. */
 export const HOME_GPU_TABS: { key: string; label: string }[] = [
   { key: "h100", label: "H100" },
@@ -318,6 +322,8 @@ export interface ProblemChip {
   trace_url: string | null
   run_id: string | null
   detail_url?: string | null
+  /** dedicated run page: /runs/<gpu>/<run_id> (null when the cell has no run) */
+  page_url: string | null
 }
 
 export interface ReportRow {
@@ -375,13 +381,18 @@ const OUTCOME_TITLE: Record<string, string> = {
   other: "didn't pass",
 }
 
-function chipFromCell(prob: string, c: ModelCell | undefined): ProblemChip {
+function chipFromCell(
+  prob: string,
+  c: ModelCell | undefined,
+  gpuKey: string,
+): ProblemChip {
   const short = shortProblem(prob)
   const links = {
     solution_url: c?.solution_url ?? null,
     trace_url: c?.trace_url ?? null,
     run_id: c?.run_id ?? null,
     detail_url: c?.detail_url ?? null,
+    page_url: c?.run_id ? `/runs/${gpuKey}/${c.run_id}` : null,
   }
   if (!c) {
     return {
@@ -462,7 +473,7 @@ export function reportCardForBench(
     const model = index.models.find((m) => m.slug === row.slug)!
     const block = model.benches[bench]!
     const view: GpuBlock = gpu ? block.gpus[gpu]! : block
-    const chips = deck.map((p) => chipFromCell(p, view.cells[p]))
+    const chips = deck.map((p) => chipFromCell(p, view.cells[p], gpu ?? CANONICAL_GPU))
     // Pass counts from the visible deck only (mega: exclude hold-outs).
     const passed = chips.filter((c) => c.kind === "pass").length
     const total = deck.length

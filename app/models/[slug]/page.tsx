@@ -2,6 +2,7 @@ import Link from "next/link"
 import { notFound } from "next/navigation"
 import {
   BENCH_LABELS,
+  CANONICAL_GPU,
   FLAG_VERDICTS,
   SITE_HIDDEN_GPUS,
   auditChipClass,
@@ -59,10 +60,12 @@ function nativeScore(bench: Bench, block: GpuBlock): number | null {
 
 function CellCard({
   bench,
+  gpu,
   probKey,
   cell,
 }: {
   bench: Bench
+  gpu: string
   probKey: string
   cell: ModelCell | undefined
 }) {
@@ -118,6 +121,11 @@ function CellCard({
         </div>
       ) : null}
       <div className="cell-card-links">
+        {cell.run_id && (
+          <Link href={`/runs/${gpu}/${cell.run_id}`} className="link-chip">
+            run page
+          </Link>
+        )}
         {cell.solution_url && (
           <Link href={cell.solution_url} className="link-chip">
             solution
@@ -135,17 +143,19 @@ function CellCard({
 
 function CellGrid({
   bench,
+  gpu,
   problems,
   block,
 }: {
   bench: Bench
+  gpu: string
   problems: string[]
   block: GpuBlock
 }) {
   return (
     <div className="cell-grid">
       {problems.map((p) => (
-        <CellCard key={p} bench={bench} probKey={p} cell={block.cells[p]} />
+        <CellCard key={p} bench={bench} gpu={gpu} probKey={p} cell={block.cells[p]} />
       ))}
     </div>
   )
@@ -222,12 +232,12 @@ function BenchPanel({
         {canonicalLabel}
         <span className="board-kicker-dim">· canonical board</span>
       </p>
-      <CellGrid bench={bench} problems={problems} block={block} />
+      <CellGrid bench={bench} gpu={CANONICAL_GPU} problems={problems} block={block} />
 
       {gpuKeys.map((g) => (
         <div key={g} className="board-extra">
           <p className="board-kicker">{meta?.gpu_labels?.[g] ?? g}</p>
-          <CellGrid bench={bench} problems={problems} block={block.gpus[g]!} />
+          <CellGrid bench={bench} gpu={g} problems={problems} block={block.gpus[g]!} />
         </div>
       ))}
 

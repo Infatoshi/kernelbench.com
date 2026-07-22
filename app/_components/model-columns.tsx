@@ -127,7 +127,7 @@ function MultiStrip() {
         collectives as fine-grained NVLink kernels, graded on busbw, never
         TFLOPS
       </span>
-      <Link href="/multi" className="multi-strip-link">
+      <Link href="/#multi" className="multi-strip-link">
         deck →
       </Link>
     </div>

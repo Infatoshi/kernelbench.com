@@ -1,13 +1,10 @@
-"use client"
-
 import Link from "next/link"
-import { useState } from "react"
 import type { ProblemChip, ReportRow, ReportView } from "../_lib/models"
-import { RunDetailPanel } from "./run-detail"
 
 // Per-problem report card: one row per model, six (or N) chips — pass shows
 // peak fraction, fail shows a short reason. Rank is by pass count only; we
 // never compress fails into a single "half speed" bar.
+// Each chip with a run links to its /runs/<gpu>/<rid> page.
 
 function LabMark({ row }: { row: ReportRow }) {
   if (row.brand.logo) {
@@ -54,13 +51,7 @@ function FlagMark({ row }: { row: ReportRow }) {
   )
 }
 
-function Chip({
-  chip,
-  onOpen,
-}: {
-  chip: ProblemChip
-  onOpen?: (chip: ProblemChip) => void
-}) {
+function Chip({ chip }: { chip: ProblemChip }) {
   const cls =
     chip.kind === "pass"
       ? "rcell rcell-pass"
@@ -71,53 +62,32 @@ function Chip({
           : chip.kind === "no_kernel"
             ? "rcell rcell-empty"
             : "rcell rcell-fail"
-  const openable = Boolean(chip.run_id && onOpen)
-  return (
-    <span
-      className={`${cls}${openable ? " rcell-openable" : ""}`}
-      title={`${chip.problem}: ${chip.title}${openable ? " — click for shapes, kernel, trace" : ""}`}
-      role={openable ? "button" : undefined}
-      tabIndex={openable ? 0 : undefined}
-      onClick={
-        openable
-          ? (e) => {
-              e.preventDefault()
-              e.stopPropagation()
-              onOpen!(chip)
-            }
-          : undefined
-      }
-      onKeyDown={
-        openable
-          ? (e) => {
-              if (e.key === "Enter" || e.key === " ") {
-                e.preventDefault()
-                e.stopPropagation()
-                onOpen!(chip)
-              }
-            }
-          : undefined
-      }
-    >
+  const body = (
+    <>
       <span className="rcell-prob">{chip.short}</span>
       <span className="rcell-val tabular">{chip.label}</span>
+    </>
+  )
+  if (chip.page_url) {
+    return (
+      <Link
+        href={chip.page_url}
+        className={`${cls} rcell-openable no-underline`}
+        title={`${chip.problem}: ${chip.title} — open run page`}
+      >
+        {body}
+      </Link>
+    )
+  }
+  return (
+    <span className={cls} title={`${chip.problem}: ${chip.title}`}>
+      {body}
     </span>
   )
 }
 
 export function ModelReportCard({ view }: { view: ReportView }) {
   let lastTier: string | null = null
-  const [openRun, setOpenRun] = useState<{
-    slug: string
-    chip: ProblemChip
-    modelName: string
-  } | null>(null)
-  const toggleRun = (slug: string, chip: ProblemChip, modelName: string) =>
-    setOpenRun((cur) =>
-      cur && cur.slug === slug && cur.chip.run_id === chip.run_id
-        ? null
-        : { slug, chip, modelName },
-    )
   return (
     <div className="rcard" role="figure" aria-label={view.axis}>
       <div className="rcard-head" aria-hidden="true">
@@ -142,19 +112,12 @@ export function ModelReportCard({ view }: { view: ReportView }) {
                 {row.passed >= row.total ? `full pass · ${tier}` : `${tier} passed`}
               </p>
             )}
-            {openRun && openRun.slug === row.slug && (
-              <RunDetailPanel
-                chip={openRun.chip}
-                modelName={openRun.modelName}
-                onClose={() => setOpenRun(null)}
-              />
-            )}
-            <Link href={`/models/${row.slug}`} className="rcard-row no-underline">
+            <div className="rcard-row">
               <span className="mbar-label">
-                <span className="mbar-name-line">
+                <Link href={`/models/${row.slug}`} className="mbar-name-line no-underline">
                   <LabMark row={row} />
                   <span className="mbar-name">{row.name}</span>
-                </span>
+                </Link>
                 <span className="mbar-sub">
                   {row.subtitle && <span>{row.subtitle}</span>}
                   <FlagMark row={row} />
@@ -173,11 +136,7 @@ export function ModelReportCard({ view }: { view: ReportView }) {
               </span>
               <span className="rcard-chips">
                 {row.chips.map((c) => (
-                  <Chip
-                    key={c.problem}
-                    chip={c}
-                    onOpen={(chip) => toggleRun(row.slug, chip, row.name)}
-                  />
+                  <Chip key={c.problem} chip={c} />
                 ))}
               </span>
               <span className="mbar-right">
@@ -187,7 +146,7 @@ export function ModelReportCard({ view }: { view: ReportView }) {
                   {row.passed}/{row.total}
                 </span>
               </span>
-            </Link>
+            </div>
           </div>
         )
       })}

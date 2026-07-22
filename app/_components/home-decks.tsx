@@ -1,13 +1,7 @@
 "use client"
 
-import {
-  useEffect,
-  useMemo,
-  useState,
-  type CSSProperties,
-  type KeyboardEvent,
-  type MouseEvent,
-} from "react"
+import Link from "next/link"
+import { useEffect, useMemo, useState, type CSSProperties } from "react"
 import type { ProblemChip, ReportRow, ReportView } from "../_lib/models"
 import { problemLabel } from "../_lib/models"
 
@@ -17,7 +11,7 @@ import { problemLabel } from "../_lib/models"
 // Mobile multi-problem: per-problem leaderboards (best → worst).
 // Mobile single-problem: model cards.
 // No-run cells are blank (not red). Judged fails keep a short color label.
-// Artifact links: click-to-pin popover, one open cell per deck (no hover stack).
+// Every cell with a run is a link to its dedicated /runs/<gpu>/<rid> page.
 
 export interface HomeDeck {
   key: string
@@ -86,10 +80,6 @@ function rankBucket(chip: ProblemChip): number {
   return 4 // blank / empty
 }
 
-function pinKey(rowSlug: string, problem: string): string {
-  return `${rowSlug}::${problem}`
-}
-
 const BAR_GROW_MS = 1000
 
 /** Format a count-up value to match the chip's published label shape. */
@@ -111,16 +101,12 @@ function formatCountUp(t: number, finalLabel: string, score: number): string {
 function Chip({
   chip,
   best,
-  open,
-  onToggle,
   animDelayMs = 0,
   /** Side label left of the bar (mobile cards). null = no side label. */
   sideLabel = null,
 }: {
   chip: ProblemChip
   best: number | undefined
-  open: boolean
-  onToggle: () => void
   /** Stagger entrance slightly down the grid */
   animDelayMs?: number
   sideLabel?: string | null
@@ -129,7 +115,6 @@ function Chip({
   const pct = pass ? Math.min(100, (chip.score! / best) * 100) : 0
   const fillW = pass ? Math.max(pct, 4) : 0
   const win = pass && chip.score! >= best! - 1e-12
-  const hasLinks = Boolean(chip.solution_url || chip.trace_url)
   const blank = !pass && failTone(chip) === "blank"
 
   // pre → grow (line + count-up) → static
@@ -192,26 +177,35 @@ function Chip({
       : "hd-bar-pass"
     : `hd-bar-${failTone(chip)}`
 
-  const onBarClick = (e: MouseEvent) => {
-    // Links inside the popover navigate; don't re-toggle the pin.
-    if ((e.target as HTMLElement).closest("a")) return
-    if (!hasLinks) return
-    e.stopPropagation()
-    onToggle()
-  }
-
-  const onBarKey = (e: KeyboardEvent) => {
-    if (!hasLinks) return
-    if (e.key === "Enter" || e.key === " ") {
-      e.preventDefault()
-      onToggle()
-    }
-  }
-
   const fillStyle = {
     ["--hd-w" as string]: `${fillW.toFixed(1)}%`,
   } as CSSProperties
 
+  const barBody = pass ? (
+    <>
+      <span
+        className={`hd-bar-fill${phase === "pre" ? "" : " hd-bar-fill-on"}`}
+        style={fillStyle}
+      />
+      <span className="hd-bar-num tabular">
+        {phase === "static" ? chip.label : numLabel}
+      </span>
+      {win && phase !== "pre" && (
+        <span
+          className={`hd-bar-star${phase === "static" ? " hd-bar-star-in" : ""}`}
+          aria-label="best"
+        >
+          ★
+        </span>
+      )}
+    </>
+  ) : blank ? null : (
+    <span className="hd-bar-fail-label" aria-label={chip.title || chip.label || "fail"}>
+      {chip.label || "fail"}
+    </span>
+  )
+
+  const barClass = `hd-bar ${tone}${chip.page_url ? " hd-bar-hot" : ""}`
   return (
     <span className={`hd-cell${sideLabel == null ? " hd-cell-bare" : ""}`}>
       {sideLabel != null && (
@@ -219,81 +213,26 @@ function Chip({
           {sideLabel}
         </span>
       )}
-      <span
-        className={`hd-bar ${tone}${hasLinks ? " hd-bar-hot" : ""}${open ? " hd-bar-open" : ""}`}
-        onClick={onBarClick}
-        onKeyDown={onBarKey}
-        role={hasLinks ? "button" : undefined}
-        tabIndex={hasLinks ? 0 : undefined}
-        aria-expanded={hasLinks ? open : undefined}
-        aria-haspopup={hasLinks ? "dialog" : undefined}
-        title={
-          blank
-            ? chip.title || "no run"
-            : hasLinks
-              ? open
-                ? "Click to close"
-                : "Click for solution / trace"
-              : chip.title || undefined
-        }
-        aria-label={
-          blank
-            ? chip.title || "no run"
-            : hasLinks
-              ? `${problemLabel(chip.problem)}: ${chip.title || chip.label}. ${open ? "Close details" : "Open solution and trace"}`
-              : chip.title || chip.label || undefined
-        }
-      >
-        {pass ? (
-          <>
-            <span
-              className={`hd-bar-fill${phase === "pre" ? "" : " hd-bar-fill-on"}`}
-              style={fillStyle}
-            />
-            <span className="hd-bar-num tabular">
-              {phase === "static" ? chip.label : numLabel}
-            </span>
-            {win && phase !== "pre" && (
-              <span
-                className={`hd-bar-star${phase === "static" ? " hd-bar-star-in" : ""}`}
-                aria-label="best"
-              >
-                ★
-              </span>
-            )}
-          </>
-        ) : blank ? null : (
-          <span className="hd-bar-fail-label" aria-label={chip.title || chip.label || "fail"}>
-            {chip.label || "fail"}
-          </span>
-        )}
-        {hasLinks && open && (
-          <span
-            className="hd-pop"
-            role="dialog"
-            aria-label={`${problemLabel(chip.problem)} artifacts`}
-            onClick={(e) => e.stopPropagation()}
-          >
-            <span className="hd-pop-name">
-              {problemLabel(chip.problem)}
-              {win ? " · best" : ""}
-            </span>
-            <span className="hd-pop-meta">{chip.title}</span>
-            <span className="hd-pop-links">
-              {chip.solution_url && (
-                <a href={chip.solution_url} target="_blank" rel="noreferrer" className="hd-pop-a">
-                  solution
-                </a>
-              )}
-              {chip.trace_url && (
-                <a href={chip.trace_url} target="_blank" rel="noreferrer" className="hd-pop-a">
-                  trace
-                </a>
-              )}
-            </span>
-          </span>
-        )}
-      </span>
+      {chip.page_url ? (
+        <Link
+          href={chip.page_url}
+          className={`${barClass} no-underline`}
+          title={`${problemLabel(chip.problem)}: ${chip.title || chip.label} — open run page`}
+          aria-label={`${problemLabel(chip.problem)}: ${chip.title || chip.label}. Open run page`}
+        >
+          {barBody}
+        </Link>
+      ) : (
+        <span
+          className={barClass}
+          title={blank ? chip.title || "no run" : chip.title || undefined}
+          aria-label={
+            blank ? chip.title || "no run" : chip.title || chip.label || undefined
+          }
+        >
+          {barBody}
+        </span>
+      )}
     </span>
   )
 }
@@ -339,29 +278,9 @@ function rankEntriesForProblem(
 
 function DeckPanel({ deck }: { deck: HomeDeck }) {
   const [gpu, setGpu] = useState(deck.defaultGpu)
-  const [pinned, setPinned] = useState<string | null>(null)
   const active = deck.byGpu && deck.byGpu[gpu] ? gpu : deck.defaultGpu
   const view = deck.byGpu?.[active] ?? null
   const best = useMemo(() => (view ? bestByProblem(view) : new Map<string, number>()), [view])
-
-  // One open popover: dismiss on outside click or Escape.
-  useEffect(() => {
-    if (!pinned) return
-    const onDown = (e: globalThis.MouseEvent) => {
-      const t = e.target as HTMLElement | null
-      if (t?.closest(".hd-bar-open")) return
-      setPinned(null)
-    }
-    const onKey = (e: globalThis.KeyboardEvent) => {
-      if (e.key === "Escape") setPinned(null)
-    }
-    document.addEventListener("mousedown", onDown)
-    document.addEventListener("keydown", onKey)
-    return () => {
-      document.removeEventListener("mousedown", onDown)
-      document.removeEventListener("keydown", onKey)
-    }
-  }, [pinned])
 
   if (!deck.byGpu) {
     return (
@@ -385,11 +304,6 @@ function DeckPanel({ deck }: { deck: HomeDeck }) {
 
   const selectGpu = (key: string) => {
     setGpu(key)
-    setPinned(null)
-  }
-
-  const togglePin = (key: string) => {
-    setPinned((cur) => (cur === key ? null : key))
   }
 
   return (
@@ -454,15 +368,12 @@ function DeckPanel({ deck }: { deck: HomeDeck }) {
                 </span>
                 <div className="hd-cells">
                   {row.chips.map((c, i) => {
-                    const key = pinKey(row.slug, c.problem)
                     const animDelayMs = Math.min(i * 40 + rowIdx * 28, 420)
                     return (
                       <Chip
                         key={c.problem}
                         chip={c}
                         best={best.get(c.problem)}
-                        open={pinned === key}
-                        onToggle={() => togglePin(key)}
                         animDelayMs={animDelayMs}
                         sideLabel={c.short}
                       />
@@ -495,10 +406,9 @@ function DeckPanel({ deck }: { deck: HomeDeck }) {
                 </div>
                 <div className="hd-rank-list">
                   {ranked.map(({ row, chip }, i) => {
-                    const key = pinKey(row.slug, chip.problem)
                     const animDelayMs = Math.min(pIdx * 80 + i * 28, 520)
                     return (
-                      <div key={key} className="hd-rank-row">
+                      <div key={`${row.slug}::${chip.problem}`} className="hd-rank-row">
                         <span className="hd-rank-model">
                           <LabMark row={row} />
                           <span className="hd-model-name">{row.name}</span>
@@ -506,8 +416,6 @@ function DeckPanel({ deck }: { deck: HomeDeck }) {
                         <Chip
                           chip={chip}
                           best={problemBest}
-                          open={pinned === key}
-                          onToggle={() => togglePin(key)}
                           animDelayMs={animDelayMs}
                           sideLabel={null}
                         />

@@ -7,13 +7,10 @@ import { usePathname } from "next/navigation"
 // derived client-side so every page gets the same server-rendered shell.
 
 // Wordmark is the home/dashboard link; Models is the roster of every ranked
-// model. No separate "Charts" entry — the homepage IS the charts.
+// model. No per-bench entries — the homepage IS the boards (one deck per
+// bench), and each cell links to its own /runs/<gpu>/<rid> page.
 const NAV = [
   { href: "/models", label: "Models" },
-  { href: "/hard", label: "Hard" },
-  { href: "/mega", label: "Mega" },
-  { href: "/cuda", label: "CUDA" },
-  { href: "/multi", label: "Multi", soon: true },
   { href: "/runs", label: "Runs" },
 ]
 
