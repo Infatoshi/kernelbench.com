@@ -18,7 +18,7 @@
 #   (launch attaches BOTH so either machine can log in).
 #
 # Env: KB_LAMBDA_TYPE (default gpu_1x_h100_sxm5), KB_LAMBDA_REGION (auto if empty),
-#      KB_LAMBDA_SSH_KEYS (default "macbook,anvil"), KB_LAMBDA_PROBLEMS_ROOT
+#      KB_LAMBDA_SSH_KEYS (default: this host's key; API allows exactly one), KB_LAMBDA_PROBLEMS_ROOT
 #      (default problems-h100), KBH_HARDWARE (default H100) for regrade.
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")/.." && pwd)"
@@ -45,7 +45,15 @@ shift || true
 
 ENV_ALLOWLIST='KIMI_API_KEY|MOONSHOT_API_KEY|ZAI_API_KEY|MINIMAX_API_KEY|DEEPSEEK_API_KEY|LONGCAT_API_KEY|TENCENT_API_KEY|DASHSCOPE_API_KEY|OPENROUTER_API_KEY|OPENAI_API_KEY|GEMINI_API_KEY|ANTHROPIC_API_KEY|CLAUDE_CODE_OAUTH_TOKEN'
 PROBLEMS_ROOT="${KB_LAMBDA_PROBLEMS_ROOT:-problems-h100}"
-SSH_KEY_CSV="${KB_LAMBDA_SSH_KEYS:-macbook,anvil}"
+# Lambda's launch API rejects requests with more than one ssh key
+# ("Invalid number of SSH keys", observed 2026-07-21), so the default is the
+# single key for whichever control plane is running this script. The other
+# box can still log in by appending its pubkey post-boot if ever needed.
+case "$(hostname)" in
+  anvil*) _KB_LAMBDA_DEFAULT_KEY="anvil" ;;
+  *)      _KB_LAMBDA_DEFAULT_KEY="macbook" ;;
+esac
+SSH_KEY_CSV="${KB_LAMBDA_SSH_KEYS:-$_KB_LAMBDA_DEFAULT_KEY}"
 SSH_USER="${KB_LAMBDA_SSH_USER:-ubuntu}"
 
 api() {

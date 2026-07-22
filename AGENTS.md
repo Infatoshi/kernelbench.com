@@ -144,8 +144,9 @@ kb lambda ssh <name> [cmd...]
 ```
 
   Or `./scripts/lambda_worker.sh ...` from the repo root. Env overrides:
-  `KB_LAMBDA_TYPE`, `KB_LAMBDA_REGION`, `KB_LAMBDA_SSH_KEYS` (default
-  `macbook,anvil`), `KB_LAMBDA_PROBLEMS_ROOT` (default `problems-h100`).
+  `KB_LAMBDA_TYPE`, `KB_LAMBDA_REGION`, `KB_LAMBDA_SSH_KEYS` (default: the
+  current host's key — Lambda's launch API rejects more than one key),
+  `KB_LAMBDA_PROBLEMS_ROOT` (default `problems-h100`).
 - **Always `kb lambda down` when done** — idle nodes bill against the $10k.
   Confirm with `kb lambda ls` empty for that name.
 - Optional Mac-only community CLI: `brew install strand-ai/tap/lambda-cli`
