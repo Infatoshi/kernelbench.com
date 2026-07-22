@@ -61,7 +61,47 @@ def _set_shape(reference, shape: dict) -> None:
         setattr(reference, k, v)
 
 
-def run_check(reference, shapes, solution, meta, device, rank, world):
+# The c10d surface the reference oracle may call. If a solution rebinds any of
+# these (or any function/class defined in reference.py), the oracle itself is
+# compromised — caught in the wild on the first 4xH100 smoke run, where the
+# solution monkey-patched dist.all_reduce so the reference computed the same
+# fp32-accumulated sum as the solution ("_install_exact_reference_reduce").
+_GUARDED_DIST = (
+    "all_reduce", "all_gather", "all_gather_into_tensor", "reduce_scatter",
+    "reduce_scatter_tensor", "all_to_all", "all_to_all_single", "broadcast",
+    "reduce", "gather", "scatter", "send", "recv", "barrier",
+)
+
+
+def oracle_snapshot(reference) -> dict:
+    """Capture identities of everything the reference oracle depends on.
+
+    Must be called after importing reference but BEFORE importing solution.
+    """
+    snap = {f"dist.{n}": getattr(dist, n) for n in _GUARDED_DIST if hasattr(dist, n)}
+    for k, v in vars(reference).items():
+        if callable(v):
+            snap[f"reference.{k}"] = v
+            for ak, av in vars(v).items():
+                if callable(av):
+                    snap[f"reference.{k}.{ak}"] = av
+    return snap
+
+
+def oracle_tampered(reference, snap: dict) -> str | None:
+    """Return the first rebound name, or None if the oracle is intact."""
+    for key, orig in snap.items():
+        parts = key.split(".")
+        obj = dist if parts[0] == "dist" else reference
+        cur = obj
+        for attr in parts[1:]:
+            cur = getattr(cur, attr, None) if not isinstance(cur, dict) else None
+        if cur is not orig:
+            return key
+    return None
+
+
+def run_check(reference, shapes, solution, meta, device, rank, world, snap=None):
     from src.eval.compare import compare
     from src.eval.stress import apply_scale, stress_cases
 
@@ -102,6 +142,11 @@ def run_check(reference, shapes, solution, meta, device, rank, world):
                         f"rank {rank}: {msg}"
                     )
                     failed = 1
+
+    tampered = oracle_tampered(reference, snap) if snap else None
+    if tampered and not failed:
+        fail_msg = f"reference oracle tampered: {tampered} was rebound by the solution"
+        failed = 1
 
     if failed:
         print(f"RANK {rank} FAIL: {fail_msg}", flush=True)
@@ -186,6 +231,8 @@ def main():
 
     import reference  # noqa: E402
     import shapes  # noqa: E402
+
+    snap = oracle_snapshot(reference)  # BEFORE solution import: it can patch
     import solution  # noqa: E402
 
     meta = yaml.safe_load((problem_dir / "problem.yaml").read_text())
@@ -200,7 +247,7 @@ def main():
     dist.init_process_group(backend=backend, rank=rank, world_size=world)
     try:
         if args.mode == "check":
-            rc = run_check(reference, shapes, solution, meta, device, rank, world)
+            rc = run_check(reference, shapes, solution, meta, device, rank, world, snap)
         else:
             rc = run_benchmark(reference, shapes, solution, meta, device, rank, world)
     finally:
