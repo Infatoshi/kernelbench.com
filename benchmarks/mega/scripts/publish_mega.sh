@@ -35,6 +35,8 @@ echo "  generated/updated $n viewers -> $PUB_RUNS"
 echo "[1b/3] redact secrets from generated artifacts (agents can echo env keys)"
 # Build sed rules from every ~/.env_vars value + token prefixes. Never printed.
 SEDF=$(mktemp)
+# BSD sed (macOS) needs an explicit empty backup suffix for -i
+if sed --version >/dev/null 2>&1; then SED_INPLACE=(-i); else SED_INPLACE=(-i ''); fi
 if [ -f "$HOME/.env_vars" ]; then
   while IFS= read -r line; do
     val="${line#*=}"; val="${val%\"}"; val="${val#\"}"
@@ -48,7 +50,7 @@ s|github_pat_[A-Za-z0-9_]\{30,\}|github_pat_REDACTED|g
 s|hf_[A-Za-z0-9]\{30,\}|hf_REDACTED|g
 PAT
 for f in "$PUB_RUNS"/*_02_kimi_linear_decode.html "$PUB_CODE"/*; do
-  [ -f "$f" ] && sed -i -f "$SEDF" "$f"
+  [ -f "$f" ] && sed "${SED_INPLACE[@]}" -f "$SEDF" "$f"
 done
 rm -f "$SEDF"
 uv run python "$REPO/scripts/redaction.py" "$PUB_RUNS" "$PUB_CODE"

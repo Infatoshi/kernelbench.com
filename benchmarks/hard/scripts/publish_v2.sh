@@ -63,6 +63,8 @@ PY
 echo "[3b/3] redacting secrets from viewers (agents can echo env keys)"
 # Build sed rules from every ~/.env_vars value + token prefixes. Never printed.
 SEDF=$(mktemp)
+# BSD sed (macOS) needs an explicit empty backup suffix for -i
+if sed --version >/dev/null 2>&1; then SED_INPLACE=(-i); else SED_INPLACE=(-i ''); fi
 if [ -f "$HOME/.env_vars" ]; then
   while IFS= read -r line; do
     val="${line#*=}"; val="${val%\"}"; val="${val#\"}"
@@ -78,7 +80,7 @@ PAT
 # Legacy HTML viewers moved to HuggingFace; redact any that still exist locally.
 # RIDS may be unset (no local *.html viewers), so default to empty to stay set -u safe.
 for rid in ${RIDS:-}; do
-  [ -f "$REPO_ROOT/public/runs/$rid.html" ] && sed -i -f "$SEDF" "$REPO_ROOT/public/runs/$rid.html"
+  [ -f "$REPO_ROOT/public/runs/$rid.html" ] && sed "${SED_INPLACE[@]}" -f "$SEDF" "$REPO_ROOT/public/runs/$rid.html"
 done
 rm -f "$SEDF"
 echo "  redacted secrets from viewers"
