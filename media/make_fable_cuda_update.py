@@ -1,9 +1,9 @@
 """Fable rerun cells + KernelBench-CUDA board snapshot — engagement chart.
 
 Square 1:1, three stacked panels (see AGENTS.md + kbh_theme):
-  1. The three api_error-truncated fable cells, rerun with full sessions:
-     faded bar = old truncated-session score, green bar = isolated re-grade,
-     amber tick = the board ceiling BEFORE the rerun.
+  1. The three fable cells from the 45-minute-cap era, rerun unlimited-time:
+     faded bar = old 45-min score, green bar = unlimited-time isolated
+     re-grade, amber tick = the board ceiling BEFORE the rerun.
   2. KernelBench-CUDA, RTX PRO 6000 — best cell per model per problem.
   3. KernelBench-CUDA, B200 — same.
 
@@ -34,7 +34,7 @@ CUDA = ROOT / "benchmarks/cuda/results"
 OUT = Path(__file__).resolve().parent / "fable_cuda_update.png"
 
 # ---- panel 1: fable rerun cells (values frozen at publish time) ----------
-# (label, truncated-session score, full-session isolated re-grade, prior ceiling)
+# (label, 45-min-cap score, unlimited-time isolated re-grade, prior ceiling)
 RERUNS = [
     ("nsa\n(cuda PRO)", 0.2934, 0.7266, 0.4246),
     ("kda\n(hard H100)", 0.0180, 0.0527, 0.0255),
@@ -99,11 +99,11 @@ ax1.set_ylim(0, 0.97)
 ax1.grid(axis="y", linewidth=0.5)
 ax1.set_axisbelow(True)
 ax1.legend(handles=[
-    Patch(facecolor=SERIES[0], alpha=0.25, label="session cut by api_error"),
-    Patch(facecolor=C["accent"], label="full session (isolated re-grade)"),
+    Patch(facecolor=SERIES[0], alpha=0.25, label="45-minute cap"),
+    Patch(facecolor=C["accent"], label="unlimited time (isolated re-grade)"),
     Patch(facecolor=C["warn"], label="board ceiling before rerun"),
 ], loc="upper right", frameon=False, fontsize=9)
-ax1.text(0.012, 0.94, "Fable 5 — rerun of truncated cells", transform=ax1.transAxes,
+ax1.text(0.012, 0.94, "Fable 5 — 45 min vs unlimited", transform=ax1.transAxes,
          color=C["fg_muted"], fontsize=9, va="top")
 
 # ---- panels 2-3 ------------------------------------------------------------
