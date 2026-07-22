@@ -172,6 +172,11 @@ def cmd_publish(root: Path, args: list[str]) -> int:
         sys.exit(f"kb publish: no publish script for bench '{bench}' (hard|mega|cuda)")
     pub = _bench_dir(root, bench) / "scripts" / script
     subprocess.run([str(pub)], check=True)
+    # Run detail must be rebuilt BEFORE the model index: build_model_index.py
+    # only bakes a cell's detail_url when its rundetail/<rid>.json exists.
+    rc = _rebuild_run_detail(root)
+    if rc != 0:
+        return rc
     rc = _rebuild_model_index(root)
     if rc != 0:
         return rc
@@ -179,6 +184,20 @@ def cmd_publish(root: Path, args: list[str]) -> int:
         return 0
     # --push: publish, then upload the published runs' traces to HF.
     return cmd_push_runs(root, [bench])
+
+
+def _rebuild_run_detail(root: Path) -> int:
+    """Regenerate public/data/rundetail/*.json (the click-a-cell overlay data).
+    Needs the run archives locally; cells whose archive is absent are skipped
+    and keep their previous JSON."""
+    script = root / "scripts" / "build_run_detail.py"
+    if not script.exists():
+        return 0
+    print("kb: rebuilding public/data/rundetail")
+    return subprocess.run(
+        ["uv", "run", "--with", "pyyaml", "python", str(script)],
+        cwd=root,
+    ).returncode
 
 
 def _rebuild_model_index(root: Path) -> int:
