@@ -1,13 +1,13 @@
 # KernelBench-Multi: Design Specification
 
-Last updated: 2026-06-27.
+Last updated: 2026-07-22 (re-scoped from 8×H100 to 4×H100 NVSwitch).
 
 ## Purpose
 
 A small, hand-curated **multi-GPU** kernel benchmark. Frontier coding agents take
 a PyTorch + NCCL reference for a distributed op and rewrite it as a fast,
 fine-grained NVLink implementation (CUDA / Triton / NVSHMEM / CUDA symmetric
-memory / ParallelKittens) that beats the NCCL reference on an 8×H100 NVLink node.
+memory / ParallelKittens) that beats the NCCL reference on a 4×H100 NVLink node.
 
 Sibling to KernelBench-Hard. Same philosophy: a tiny deck where every cell is
 audited, the opposite of breadth. The difference is the axis under test.
@@ -26,23 +26,34 @@ kernel. This is why one SKU suffices (see below) and why the deck excludes
 compute-dominated problems like full ring/Ulysses attention — there the local
 flash-attention kernel would dominate, which is not the point.
 
-## One SKU: 8×H100 SXM (NVLink)
+## One SKU: 4×H100 SXM (NVLink)
 
-We grade only on **8×H100 SXM** (NVLink4, 900 GB/s per-GPU bidirectional).
-Rationale: the benchmark targets the NVLink fabric and the collective algorithms
-that ride it, which are architecturally the same across Hopper and Blackwell.
-The single-GPU compute engine (where H100 and B200 differ) is explicitly *not*
-the subject. Adding 8×B200 would mostly re-measure single-GPU compute at far
-higher hourly cost, so it is out of scope.
+We grade only on **4×H100 SXM behind NVSwitch** (NVLink4, 900 GB/s per-GPU
+bidirectional; the graded busbw ceiling is the 450 GB/s unidirectional rate —
+see the metric section). Rationale: the benchmark targets the NVLink fabric and the
+collective algorithms that ride it, which are architecturally the same across
+Hopper and Blackwell. The single-GPU compute engine (where H100 and B200
+differ) is explicitly *not* the subject.
 
-Deck dir: `problems-h100x8/`. (Hardware-scoped, matching the hard bench's
-`problems-h100` / `problems-rtxpro6000` convention.)
+Why 4 GPUs and not 8: per GPU the fabric is identical — all 18 NVLink4 links
+into an NVSwitch crossbar (`nvidia-smi topo -m` shows `NV18` on every pair; a
+switchless 4-GPU mesh would show ~NV6), so the graded per-GPU busbw ceiling is
+the same 900 GB/s, NVLink SHARP/multicast included. On NVSwitch, 4→8 is a
+scaling step (more peers behind the same crossbar), not a topology change, and
+the busbw convention folds the `(n-1)/n` factors into the score. 4×H100 nodes
+are far cheaper and easier to hold. 8×B200 stays out of scope for the same
+reason as before: it would mostly re-measure single-GPU compute.
+
+Deck dir: `problems-h100x4/`. (Hardware-scoped, matching the hard bench's
+`problems-h100` / `problems-rtxpro6000` convention.) `world_size: 4` is baked
+into every `problem.yaml`; a switchless or PCIe node must never be graded (the
+`remote_ceiling.sh` topology gate enforces this).
 
 ## Metric: busbw roofline
 
 ```
 busbw_achieved = busbw_bytes(shape, world_size, dtype) / time_seconds
-score          = busbw_achieved / nvlink_peak_busbw      # peak from src/hardware/h100x8.py
+score          = busbw_achieved / nvlink_peak_busbw      # peak from src/hardware/h100x4.py
 ```
 
 `busbw_bytes` already folds in the collective's bandwidth factor (NCCL
@@ -56,6 +67,13 @@ convention), declared per problem in `problem.yaml.busbw_bytes_formula`:
 | all-to-all       | `(n-1)/n`              |
 | broadcast/reduce | `1`                    |
 
+- **Peak is unidirectional:** `nvlink_peak_busbw` is **450 GB/s** (NVLink4
+  one-way rate), not the 900 GB/s bidirectional figure. NCCL's busbw convention
+  measures against the one-way rate — a ring all-reduce sends and receives
+  concurrently and its busbw can never exceed 450 — so grading against 900
+  would cap every score near 0.5. Measured NCCL c10d ceiling on a real 4×H100
+  NVSwitch node (poseidon, 2026-07-22): all-reduce 348 GB/s busbw at 512 MB =
+  **0.77 of peak**, matching the expected 70–85% NCCL band.
 - **Timing:** ThunderKittens-2 rigor — 500 warmup, 100 timed iterations.
 - **Slowest rank gates:** the collective finishes when the last rank finishes, so
   per-shape time is the **max** over ranks. busbw uses that.
@@ -106,7 +124,7 @@ problems declare their compressed volume explicitly in `problem.yaml`.)
 ## Prompt design
 
 Same voice as hard (`problems-*/PROMPT.txt` is the human-voice query sent to the
-agent under test). Hardware parenthetical is now `8×H100 SXM, NVLink4
+agent under test). Hardware parenthetical is now `4×H100 SXM, NVLink4
 (~900 GB/s/GPU)`. The forbidden bare-collective is named explicitly. Suggested
 paths named by reputation only: NVSHMEM, CUDA symmetric memory / one-shot &
 two-shot all-reduce, ParallelKittens, distributed CUTLASS. No busbw numbers, no
@@ -127,11 +145,11 @@ All busbw-graded, all forbid their bare collective.
 
 ## Harness / execution model
 
-On-node agent flywheel on the rented 8×H100 (KBH-faithful: implement → profile
+On-node agent flywheel on the rented 4×H100 (KBH-faithful: implement → profile
 with `nsys`/`ncu` → benchmark → iterate). Cost is bounded by: prebaked image,
-a node-wide 8-GPU lock so concurrent agents stay busy on API latency, a hard
+a node-wide 4-GPU lock so concurrent agents stay busy on API latency, a hard
 per-cell wall-clock budget (the metered analog of hard's unlimited time), a
-<2-min fail-fast preflight (deps + 8-GPU all-reduce + NVLink topo/busbw sanity),
+<2-min fail-fast preflight (deps + 4-GPU all-reduce + NVLink topo/busbw sanity),
 continuous artifact streaming, and a watchdog auto-teardown. See README for the
 Brev run flow.
 
@@ -141,5 +159,5 @@ The whole harness and all correctness logic validate on a single-GPU box via
 `torchrun` with the **gloo** backend on CPU tensors
 (`KBM_BACKEND=gloo KBM_DEVICE=cpu`), at a small `KBM_WORLD_SIZE`. This exercises
 the launcher, per-rank compare, rank-asymmetry seeding, and every anti-hack gate
-functionally. Real NVLink perf numbers require the 8×H100 node. The node must
+functionally. Real NVLink perf numbers require the 4×H100 node. The node must
 never see a correctness bug for the first time.

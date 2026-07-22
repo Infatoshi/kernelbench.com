@@ -22,7 +22,7 @@ WORKER = REPO_ROOT / "src" / "eval" / "worker.py"
 
 
 def _world_size(meta: dict) -> int:
-    return int(os.environ.get("KBM_WORLD_SIZE", meta.get("world_size", 8)))
+    return int(os.environ.get("KBM_WORLD_SIZE", meta.get("world_size", 4)))
 
 
 def _forbidden_check(problem_dir: Path, meta: dict) -> str | None:

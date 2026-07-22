@@ -5,7 +5,7 @@
 A small, hand-curated, reward-hack-audited benchmark where frontier coding agents
 turn a PyTorch + NCCL reference for a distributed op into a fast, fine-grained
 NVLink implementation (CUDA / Triton / NVSHMEM / CUDA symmetric memory /
-ParallelKittens) on an **8×H100 SXM** node.
+ParallelKittens) on an **4×H100 SXM** node.
 
 Sibling to KernelBench-Hard. Hard tests single-GPU kernels; Multi tests the
 **inter-GPU fabric**. The graded number is **busbw** (NVLink bandwidth
@@ -15,7 +15,7 @@ See `SPEC.md` for methodology.
 > Design inspired by and partially adapting **ParallelKernelBench** (Together AI
 > / Hazy Research), Apache-2.0. See `NOTICE`.
 
-## The deck (`problems-h100x8/`)
+## The deck (`problems-h100x4/`)
 
 | NN | problem | collective |
 | -- | ------- | ---------- |
@@ -37,14 +37,14 @@ No NVLink needed to validate correctness plumbing — run `torchrun` with the gl
 backend on CPU:
 
 ```bash
-# from a problem dir, e.g. problems-h100x8/01_allreduce_residual/
+# from a problem dir, e.g. problems-h100x4/01_allreduce_residual/
 KBM_BACKEND=gloo KBM_DEVICE=cpu KBM_WORLD_SIZE=4 python check.py
 ```
 
 This exercises the launcher, per-rank compare, rank-asymmetry seeding, and the
-anti-hack gates. Real busbw numbers require the 8×H100 node.
+anti-hack gates. Real busbw numbers require the 4×H100 node.
 
-## On the 8×H100 node (real eval)
+## On the 4×H100 node (real eval)
 
 ```bash
 # correctness (real NCCL, world_size from problem.yaml)

@@ -65,7 +65,7 @@ benchmarks/hard/           KernelBench-Hard eval — the per-op deck
   problems-rtxpro6000/         the deck — per-GPU sets: -rtxpro6000 (default, RTX PRO 6000), -h100, -b200 (RTX 3090 removed from the suite 2026-07-21)
 benchmarks/mega/           KernelBench-Mega eval — megakernel deck (single problems/; reuses hard's machinery)
 benchmarks/cuda/           KernelBench-CUDA eval — CUDA-only deck (Triton/DSL fail); /cuda
-benchmarks/multi/          KernelBench-Multi eval — 8×H100 NVLink (WIP); /multi
+benchmarks/multi/          KernelBench-Multi eval — 4×H100 NVLink (WIP); /multi
 benchmarks/v3/             offline eval archive only (not on the website; keeps its own AGENTS.md)
 environments/              Prime Intellect `verifiers` mirrors (kernel_hard / kernel_mega / kernel_v3)
 media/                     tracked chart generators (kbh_theme.py + make_*.py + generate_dark_plots.py)
@@ -649,7 +649,7 @@ Most likely causes:
   (clean | reward_hack | ...). Treat a lint HACK as "review," not "reject."
 - `04_kahan_softmax` was removed from the hard deck (rewarded skipping Kahan); do not
   re-add. (This is also why the hard deck skips 04.)
-- **KernelBench-Multi (`benchmarks/multi/`, the WIP 8×H100 NVLink bench) runs on
+- **KernelBench-Multi (`benchmarks/multi/`, the WIP 4×H100 NVLink bench) runs on
   rented Brev GPUs — two gotchas that each cost real money if you miss them:**
   - **`brev delete <name>` has a hidden interactive "are you sure?" confirmation
     that SILENTLY HANGS with no TTY** (it prints nothing and never deletes; `brev
@@ -669,9 +669,10 @@ Most likely causes:
     `uv pip install --index-url https://download.pytorch.org/whl/cu128 torch==2.8.0`.
     Bake this (plus uv + the repo) into a prebaked image so you don't pay node
     time for the reinstall.
-  - Pick the **NVSwitch** SKU (`hyperstack_H100_sxm5x8`, every pair `NV18` in
-    `nvidia-smi topo -m`), not the PCIe `hyperstack_H100x8` — this bench grades
-    NVLink busbw, so a PCIe node produces meaningless numbers. Validate
+  - The graded SKU is **4×H100 SXM behind NVSwitch** (every GPU pair `NV18` in
+    `nvidia-smi topo -m`; a PCIe or switchless node produces meaningless busbw
+    numbers — `scripts/remote_ceiling.sh` has a topology gate that enforces
+    this). The temporary poseidon/hades nodes match this SKU exactly. Validate
     correctness for free on a single GPU first via gloo+cpu
     (`KBM_BACKEND=gloo KBM_DEVICE=cpu KBM_WORLD_SIZE=4 python check.py`); the
     rented node should never see a correctness bug for the first time.

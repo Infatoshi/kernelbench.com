@@ -123,7 +123,7 @@ function MultiStrip() {
       <span className="multi-strip-pill mbar-coming-pill">coming soon</span>
       <span className="multi-strip-title">Multi</span>
       <span className="multi-strip-spec">
-        <strong>8×H100 SXM · NVSwitch · NVLink4</strong> — agents rewrite NCCL
+        <strong>4×H100 SXM · NVSwitch · NVLink4</strong> — agents rewrite NCCL
         collectives as fine-grained NVLink kernels, graded on busbw, never
         TFLOPS
       </span>

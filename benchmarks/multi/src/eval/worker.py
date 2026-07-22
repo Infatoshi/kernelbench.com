@@ -13,7 +13,7 @@ solution and reports busbw (benchmark).
 Backend / device are env-controlled so the whole thing validates on a single-GPU
 box with gloo+cpu before any NVLink node is rented:
     KBM_BACKEND=gloo KBM_DEVICE=cpu   # local correctness smoke
-    KBM_BACKEND=nccl (default)        # real 8xH100 run
+    KBM_BACKEND=nccl (default)        # real 4xH100 run
 """
 from __future__ import annotations
 
@@ -115,7 +115,7 @@ def run_benchmark(reference, shapes, solution, meta, device, rank, world):
     from src.eval.busbw import busbw_gb_s, eval_formula, geomean, peak_fraction
     from src.hardware import get as get_hw
 
-    hw = get_hw(meta.get("hardware", ["H100x8"])[0])
+    hw = get_hw(meta.get("hardware", ["H100x4"])[0])
     peak_busbw = hw.peak_nvlink_busbw_gb_s
     dtype_bytes = int(meta.get("dtype_bytes", 2))
     busbw_formula = meta["busbw_bytes_formula"]
@@ -184,8 +184,8 @@ def main():
     problem_dir = Path(args.problem_dir).resolve()
     _setup_paths(problem_dir)
 
-    import shapes  # noqa: E402
     import reference  # noqa: E402
+    import shapes  # noqa: E402
     import solution  # noqa: E402
 
     meta = yaml.safe_load((problem_dir / "problem.yaml").read_text())

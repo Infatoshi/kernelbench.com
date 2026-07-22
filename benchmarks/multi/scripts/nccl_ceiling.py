@@ -14,8 +14,8 @@ For each size it reports achieved busbw and the fraction of the NVLink4 peak
 bandwidth-bound -> little headroom for a custom kernel) vs where it is
 latency-bound (small -> big headroom for one-shot symmetric-memory).
 
-Run on the 8xH100 node:
-    torchrun --nproc_per_node=8 scripts/nccl_ceiling.py
+Run on the 4xH100 node:
+    torchrun --nproc_per_node=4 scripts/nccl_ceiling.py
 Env: KBM_WARMUP (default 200), KBM_ITERS (default 50).
 """
 from __future__ import annotations
@@ -25,7 +25,7 @@ import os
 import torch
 import torch.distributed as dist
 
-PEAK = 900.0  # NVLink4 per-GPU bidirectional, GB/s
+PEAK = 450.0  # NVLink4 per-GPU UNIDIRECTIONAL (NCCL busbw convention), GB/s
 HIDDEN = 8192
 # per-rank "tokens" sweep at fixed hidden=8192 bf16 => message 0.25MB .. 512MB
 TOKENS = [16, 64, 256, 1024, 4096, 16384, 32768]

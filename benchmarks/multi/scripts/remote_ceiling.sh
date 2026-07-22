@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Runs ON the 8xGPU node. Staged by rsync to ~/kbm then executed over ssh.
-# Phase order is fail-fast: topology gate -> torch -> 8-GPU sanity -> sweep.
+# Runs ON the 4xGPU node. Staged by rsync to ~/kbm then executed over ssh.
+# Phase order is fail-fast: topology gate -> torch -> 4-GPU sanity -> sweep.
 set -euo pipefail
 cd "$(dirname "$0")/.."   # -> ~/kbm/benchmarks/multi  (after rsync layout)
 
@@ -9,12 +9,17 @@ nvidia-smi topo -m
 echo "===== GPUS ====="
 nvidia-smi -L
 
-# Topology gate: require NVSwitch (every GPU pair NV##, no PHB/PIX/SYS between GPUs).
-if nvidia-smi topo -m | grep -E '^GPU[0-7]' | grep -qE '\b(PHB|PIX|SYS|NODE)\b'; then
+# Topology gate: require NVSwitch (every GPU pair NV##, no PHB/PIX/SYS between
+# GPUs). Only inspect the GPU x GPU submatrix — NIC/CPU columns are PCIe by
+# design and must not trip the gate.
+NGPU="$(nvidia-smi -L | wc -l)"
+if nvidia-smi topo -m | awk -v n="$NGPU" '$1 ~ /^GPU[0-9]+$/ {
+      for (i = 2; i <= n + 1; i++) if ($i ~ /^(PHB|PIX|PXB|SYS|NODE)$/) bad = 1
+    } END { exit !bad }'; then
   echo "TOPO_FAIL: non-NVLink path between GPUs (bridged/PCIe). Aborting sweep."
   exit 42
 fi
-echo "TOPO_OK: full NVLink mesh"
+echo "TOPO_OK: full NVLink mesh across ${NGPU} GPUs"
 
 export PATH="$HOME/.local/bin:$PATH"
 command -v uv >/dev/null || curl -LsSf https://astral.sh/uv/install.sh | sh
@@ -28,8 +33,8 @@ uv venv --python 3.12 .venv >/dev/null 2>&1 || true
 uv pip install --quiet --index-url "https://download.pytorch.org/whl/${CU}" "torch==2.8.0"
 python -c "import torch;print('torch',torch.__version__,'cuda',torch.cuda.is_available(),torch.cuda.device_count())"
 
-echo "===== 8-GPU all-reduce preflight ====="
-torchrun --nproc_per_node=8 - <<'PY'
+echo "===== 4-GPU all-reduce preflight ====="
+torchrun --nproc_per_node=4 - <<'PY'
 import os,torch,torch.distributed as dist
 dist.init_process_group("nccl")
 l=int(os.environ["LOCAL_RANK"]);torch.cuda.set_device(l)
@@ -42,5 +47,5 @@ PY
 
 echo "===== NCCL CEILING SWEEP ====="
 KBM_WARMUP="${KBM_WARMUP:-200}" KBM_ITERS="${KBM_ITERS:-50}" \
-  torchrun --nproc_per_node=8 scripts/nccl_ceiling.py
+  torchrun --nproc_per_node=4 scripts/nccl_ceiling.py
 echo "===== SWEEP_DONE ====="
