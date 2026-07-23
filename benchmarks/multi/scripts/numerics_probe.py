@@ -61,6 +61,15 @@ def variants(x: torch.Tensor, world: int) -> dict[str, torch.Tensor]:
         r = r + t
     out["ring_bf16"] = r
 
+    # Cheats — must FAIL the gate at EVERY input scale.
+    rank = dist.get_rank()
+    skip = torch.zeros_like(g64[0])
+    for i, t in enumerate(g64):
+        if i != (rank + 1) % world:
+            skip = skip + t
+    out["skip_rank"] = skip.to(torch.bfloat16)     # drops one rank's contribution
+    out["local_only"] = x.clone()                  # returns the local shard
+
     return out
 
 
@@ -75,12 +84,15 @@ def main():
     dist.init_process_group(backend, rank=rank, world_size=world)
 
     pairs = [
-        ("nccl_bf16", "nccl_fp32"),   # reference vs honest fp32 kernel
-        ("nccl_bf16", "exact"),       # reference vs ground truth
-        ("nccl_fp32", "exact"),       # fp32 kernel vs ground truth
-        ("nccl_bf16", "ring_bf16"),   # reference vs same-dtype other order
+        ("nccl_fp32", "nccl_bf16"),   # NEW oracle vs honest in-type bf16 kernel
+        ("nccl_fp32", "ring_bf16"),   # NEW oracle vs honest bf16 ring order
+        ("nccl_fp32", "tree_bf16"),   # NEW oracle vs honest bf16 tree order
+        ("nccl_fp32", "exact"),       # NEW oracle vs fp64 ground truth
         ("tree_bf16", "ring_bf16"),   # pure order sensitivity, same dtype
+        ("nccl_fp32", "skip_rank"),   # cheat: must FAIL at every scale
+        ("nccl_fp32", "local_only"),  # cheat: must FAIL at every scale
     ]
+    tol_override = {"bfloat16": 2.5e-2}  # problem.yaml value for reduction decks
     # aggregate: pair -> [n_fail_trials, worst_n_bad, worst_max_abs, worst_max_rel]
     agg: dict[tuple[str, str, str, str, bool], list] = {}
 
@@ -95,7 +107,7 @@ def main():
                 for use_resid in (False, True):
                     vv = {k: (t + resid if use_resid else t) for k, t in v.items()}
                     for a, b in pairs:
-                        ok, msg = compare(vv[a], vv[b])
+                        ok, msg = compare(vv[a], vv[b], tol_override)
                         key = (f"{tokens}x{hidden}", scale_name, a, b, use_resid)
                         rec = agg.setdefault(key, [0, 0, 0.0, 0.0])
                         if not ok:

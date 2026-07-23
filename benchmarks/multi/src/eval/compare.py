@@ -43,7 +43,16 @@ def compare(ref: torch.Tensor, sol: torch.Tensor, override: dict | None = None) 
     if torch.isnan(s).any() or torch.isinf(s).any():
         return False, "solution contains NaN/Inf"
     diff = (r - s).abs()
-    tol = atol + rtol * r.abs()
+    # Scale-aware atol: honest low-precision rounding in a reduction is
+    # proportional to the magnitude of the summed operands (ulps of the
+    # intermediates), not to any fixed constant — and cancellation elements
+    # (|r| ~ 0 while intermediates are O(scale)) are exactly where a fixed
+    # atol misfires in both directions: it fails honest kernels at large input
+    # scale and waves through skip-a-rank cheats at small input scale. rms(ref)
+    # tracks the operand scale, making the gate invariant under the
+    # numeric-stress rescales. Calibration: scripts/numerics_probe.py.
+    rms = float(r.pow(2).mean().sqrt().item())
+    tol = atol * max(rms, 1e-30) + rtol * r.abs()
     bad = diff > tol
     n_bad = int(bad.sum().item())
     if n_bad == 0:

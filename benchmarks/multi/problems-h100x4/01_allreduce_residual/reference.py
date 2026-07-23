@@ -26,9 +26,14 @@ class Model(nn.Module):
 
     def forward(self, x: torch.Tensor, residual: torch.Tensor) -> torch.Tensor:
         # x: (tokens, hidden) bf16 — this rank's partial output.
-        y = x.clone()
+        # fp32 accumulation: the oracle is the mathematically exact sum with a
+        # single downcast at the end, NOT NCCL's order-dependent in-type bf16
+        # reduction (measured on 4xH100: in-type bf16 orderings disagree with
+        # each other by up to ~2e-2 rel, so an order-dependent oracle would
+        # fail honest kernels — see scripts/numerics_probe.py).
+        y = x.float()
         dist.all_reduce(y, op=dist.ReduceOp.SUM)   # FORBIDDEN in solution.py
-        return (y + residual).to(torch.bfloat16)
+        return (y + residual.float()).to(torch.bfloat16)
 
 
 def get_inputs():
