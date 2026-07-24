@@ -2,6 +2,50 @@
 
 Newest first. SPEC.md holds the methodology; this holds the journey.
 
+## 2026-07-24 — contamination sweep, first clean grok-4.5 board, formula fix
+
+Five grok-4.5 waves ran on hades (waves 1/2 killed externally — see below; wave 3
+died on auth; wave 4 full-budget but co-tenant-contended; wave 5 full-budget,
+uncontended, natural exit). Every candidate cell was audited (subagent code+trace
+audit) AND swept for cross-run contamination at tool-call level. Findings:
+
+- **9 of 14 audited runs were cross-run contaminated.** The harness has no
+  filesystem sandbox, so agents in waves 2+ found `~/kbm/outputs/runs/`, read
+  prior waves' solutions/benchmarks for the same problem, and iterated on them
+  (self-iteration, same model — but the standing auto-exclude rule doesn't
+  distinguish, and one wave-1 agent even read its CONCURRENT siblings). This is
+  what produced the "improvement" trajectory across waves for 02/03/05/06.
+- **Audit method matters: grok's `agent.log` omits tool calls and fragments text
+  token-per-line, so grep-based tripwires (incl. `kb contamination`-style scans)
+  return false negatives.** The authoritative transcript is the grok session
+  store `~/.grok/sessions/<urlencoded-ws-path>/<sid>/chat_history.jsonl` (full
+  messages + tool calls + terminal logs). One cell (wave-5 06) passed an
+  agent.log-only audit and was then disqualified by the session store.
+- **Mitigation now in effect:** completed runs are relocated to `~/.kbm-archive/`
+  (outside the `~/kbm` tree agents explore) before any new wave launches. Proper
+  fix remains a sandboxed harness.
+- **05 busbw formula bug fixed** (commit e63778e): the formula multiplied the
+  per-rank buffer by world_size (algbw/busbw confusion), over-crediting 4x —
+  wave-2's cell read an impossible 1.42x peak on shape 0. All cells re-graded
+  under the per-rank NCCL convention; the ceiling script already matched it.
+- **04 deck weakness (open):** dispatch->scale->combine is algebraically
+  identity-with-scale on local data and `expert_w` is seeded rank-identical, so
+  a zero-communication solution would pass correctness. No agent exploited it
+  yet (wave-5's audit verified real wire traffic, 284 GB/s). Harden with
+  rank-distinct expert weights or a wire-traffic check before publish.
+
+**First clean grok-4.5 board (4xH100, sequential isolated re-grades,
+per-cell annotations in `results/annotations/`):**
+01 allreduce+residual 0.306 · 02 reducescatter+rmsnorm — (no clean passing
+cell) · 03 fp8 allgather 0.106 · 04 moe all2all 0.452 · 05 ulysses 0.102
+(wave-1 8.5-min artifact) · 06 fp8 reducescatter — (no clean cell).
+The waves-1/2 external SIGKILLs (below) plus contamination exclusions mean
+02/05/06 deserve a fresh wave under the relocated-archive protocol.
+
+Auth gotcha: grok CLI refresh tokens are single-use; sharing the Mac's
+auth.json with hades caused sign-outs mid-fleet (waves 3/5a) and is the lead
+suspect behind the silent fleet kills. Hades now has its own device-code login.
+
 ## 2026-07-23 — first agent wave (Grok), node-wide GPU lock, fleet-wide SIGKILL incident
 
 - Harness: `scripts/run_agent.sh` runs ON the 4xH100 node. Node-wide flock
