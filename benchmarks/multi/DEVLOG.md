@@ -37,10 +37,14 @@ audit) AND swept for cross-run contamination at tool-call level. Findings:
 **First clean grok-4.5 board (4xH100, sequential isolated re-grades,
 per-cell annotations in `results/annotations/`):**
 01 allreduce+residual 0.306 · 02 reducescatter+rmsnorm — (no clean passing
-cell) · 03 fp8 allgather 0.106 · 04 moe all2all 0.452 · 05 ulysses 0.102
-(wave-1 8.5-min artifact) · 06 fp8 reducescatter — (no clean cell).
-The waves-1/2 external SIGKILLs (below) plus contamination exclusions mean
-02/05/06 deserve a fresh wave under the relocated-archive protocol.
+cell) · 03 fp8 allgather 0.106 · 04 moe all2all 0.452 · 05 ulysses 0.204
+(wave-6, clean audit: entry+exit barriers, live copy-in before every graph
+replay; re-grade pending a quiet node) · 06 fp8 reducescatter — (no clean
+cell). Wave 6 also proved relocating archives to a hidden `~/.kbm-archive`
+is NOT a sandbox: the 02 and 06 agents found and read it (both excluded).
+Durable fix applied — all runs now pulled to the Mac
+(`outputs/runs-hades/`) and deleted from the node, so wave 7 (02, 06)
+launches against a truly empty box.
 
 Auth gotcha: grok CLI refresh tokens are single-use; sharing the Mac's
 auth.json with hades caused sign-outs mid-fleet (waves 3/5a) and is the lead
