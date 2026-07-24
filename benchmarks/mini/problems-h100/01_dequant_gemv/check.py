@@ -107,11 +107,12 @@ def _emit_framework_label():
     if not sol.exists():
         return
     code = sol.read_text()
-    label = "unknown"
-    for name, pat in patterns:
-        if re.search(pat, code):
-            label = name
-            break
+    # Compound label when several signatures are present: static detection
+    # cannot tell a live kernel from a dead one, and an unused load_inline
+    # extension sitting next to the Triton kernel that actually runs would
+    # otherwise be reported as pure CUDA. Resolve compounds during the audit.
+    hits = [name for name, pat in patterns if re.search(pat, code)]
+    label = "+".join(hits) if hits else "unknown"
     Path("framework.txt").write_text(label + "\n")
 
 

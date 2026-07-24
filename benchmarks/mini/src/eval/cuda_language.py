@@ -62,11 +62,24 @@ def _scan(code: str, patterns: list[tuple[str, str]]) -> list[str]:
     return hits
 
 
+def detect_frameworks(code: str) -> list[str]:
+    """Every framework whose signature appears, in priority order."""
+    return [name for name, pat in FRAMEWORK_PRIORITY if re.search(pat, code)]
+
+
 def detect_framework(code: str) -> str:
-    for name, pat in FRAMEWORK_PRIORITY:
-        if re.search(pat, code):
-            return name
-    return "unknown"
+    """Framework label. Static detection cannot tell live code from dead code,
+    so when several signatures are present the label is compound
+    ("cuda_wmma+triton") rather than silently crowning the highest-priority
+    one — a solution that carries an unused load_inline extension next to the
+    Triton kernel it actually runs would otherwise be labelled pure CUDA.
+    A compound label means "resolve by hand during the mandatory audit".
+    """
+    hits = detect_frameworks(code)
+    kernels = [h for h in hits if h != "pytorch_only"]
+    if kernels:
+        return "+".join(kernels)
+    return "pytorch_only" if hits else "unknown"
 
 
 def check_cuda_language(

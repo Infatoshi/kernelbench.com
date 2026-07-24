@@ -1,5 +1,88 @@
 # KernelBench-Mini — DEVLOG
 
+## 2026-07-24 — ares (2x H100 SXM) is the eval node; deck validated on it
+
+Lambda is no longer the plan: **ares** (`ssh ares`, 2x H100 80GB HBM3,
+driver 580, 5.2T free) is already-rented capacity and its GPUs are the exact
+SXM part the deck declares (`hardware: [H100_SXM]`). No metered node to
+forget about.
+
+Node bootstrap: uv, **Node 22** (ares shipped none, which also unblocked its
+pre-installed codex), hermes 0.19.0 (clone + venv, matching anvil), pi 0.73.1.
+claude 2.1.218 / grok 0.2.106 / opencode 1.17.8 were already present.
+
+**Inference stays on anvil** — the eval GPU must never host the model. anvil
+serves LFM and reverse-tunnels two ports into ares:
+`~/.kbmini/tunnel_ares.sh` (self-healing retry loop) forwards **8765** (vLLM,
+OpenAI-compatible) and **3456** (ccr-rust, Anthropic shim for Claude Code).
+Tunnelling ccr rather than installing it on ares sidesteps a glibc mismatch
+(anvil 2.43 vs ares 2.35 — an anvil-built binary will not run there).
+Verified under 5-way concurrency, which is the load the matrix produces.
+
+**Deck validated on the canonical node** (reference-as-solution, GPU1):
+- 01, 02: `check.py` **PASS** including numeric stress.
+- 03: rejected `forbidden op used: torch.sort` — the sort-free gate works.
+- 04: rejected `no CUDA kernel evidence` — the CUDA-only gate works.
+- `H100_SXM` peak entry is right: naive reference measures 28.8 GB/s =
+  **0.86%** of the 3350 GB/s HBM3 peak (arithmetic exact), so 01 has ~100x
+  headroom and is not saturated.
+
+**LFM2.5-2.6B-Agent smoke, 01_dequant_gemv, 10 sessions across both boxes:**
+
+| harness | anvil (3090) | ares (H100) |
+| --- | --- | --- |
+| lfm-opencode | check_failed | no_solution |
+| hermes | no_solution | no_solution |
+| pi | check_failed | no_solution |
+| lfm-grok | no_solution | check_failed |
+| lfm-claude | check_failed | no_solution |
+
+0/10 correct; 4/10 produced a solution at all. Every failure was inspected
+individually and none is an environment fault: opencode reasoned itself out
+of writing the file, hermes hit its own output-length truncation on both
+boxes, pi spent 14.7k tokens then emitted prose instead of a tool call,
+lfm-claude's kernel died on a stray undefined name at import. The dominant
+failure mode is **a 2.6B model narrating instead of calling tools**, and
+which harness happens to survive flips between machines — exactly the
+variance the 5-repeat cell exists to quantify.
+
+Matrix launcher added (`scripts/launch_matrix.sh`): one worker per harness
+column (never problem-major — head-of-line blocking), workers pinned
+round-robin across GPUs, **each GPU gets its own `KBH_GPU_LOCK_DIR`** so
+compile/check/benchmark serialize per GPU while different GPUs run truly
+concurrently. Its timings are contended and not publishable; the sequential
+re-grade rule still applies.
+
+**Calibration: the deck is solvable, and the cap binds.** `codex gpt-5.6-sol`
+(high) on 01: **correct at 0.0900 peak fraction**, 12.8-18.2x the naive
+reference, audited clean (see SPEC). It hit the 1800s cap mid-optimization
+(exit 124) while still improving — so even a frontier model does not converge
+on this problem inside Mini's 30 minutes. That reframes the headline: Mini
+measures *best kernel in 30 minutes*, and its numbers must never be compared
+against unlimited-time Hard.
+
+**The audit found a real bench bug.** codex's solution carried a dead
+`load_inline` WMMA extension next to the Triton kernel it actually ran, and
+the framework labeller — first-match-wins over a priority list — reported
+`cuda_wmma` for a `tl.dot` kernel. Static detection cannot distinguish live
+from dead code, so the labeller now emits a **compound** label
+(`cuda_wmma+triton`) in both `src/eval/cuda_language.py` and the copies in
+01/02's `check.py`, with a regression test pinning the exact wild case.
+Compound means "resolve by hand in the mandatory audit". The deeper version of
+this hole — dead CUDA evidence satisfying `require_cuda_evidence` on the
+CUDA-only problems — is now a named calibration debt; on 04 the forbidden list
+blocks the fast form of the cheat, leaving only a correct-but-slow mislabel.
+Fixing this now, before the matrix runs, means 200 sessions write correct
+labels rather than 200 archives needing relabelling.
+
+Operational notes: an archive costs ~4.7G once a solution triggers the graded
+`uv run` (an archive-local `.venv` of torch+cu130) — reproducible from the
+preserved `pyproject.toml`/`uv.lock`, so reapable after publish. On ares only
+**codex** has live credentials; Claude Code's OAuth expired there and grok
+401s (grok auth does not survive being copied between machines — needs a
+per-box device login or `XAI_API_KEY`). None of that blocks the LFM matrix,
+which routes entirely through the tunnelled local endpoint.
+
 ## 2026-07-23 — LFM2.5-2.6B-Agent harness probes: all five routes green
 
 First subject model wired up: LiquidAI LFM2.5-2.6B-Agent served on anvil GPU0

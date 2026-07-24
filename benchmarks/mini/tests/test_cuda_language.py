@@ -39,3 +39,25 @@ def test_dsl_fails():
     ok, msgs, rep = check_cuda_language(src)
     assert not ok
     assert rep["dsl_cheat"]
+
+
+def test_dead_cuda_next_to_triton_is_labelled_compound():
+    """A solution carrying an unused load_inline/WMMA extension beside the
+    Triton kernel it actually runs must not be reported as pure CUDA.
+    Caught in the wild on the codex gpt-5.6-sol 01_dequant_gemv calibration
+    cell (2026-07-24), where framework.txt read `cuda_wmma` for a kernel
+    whose executed path was `tl.dot`."""
+    src = (
+        "import triton\nimport triton.language as tl\n"
+        "_ext = load_inline(cuda_sources='using nvcuda::wmma; wmma::fragment<> f;')\n"
+        "@triton.jit\ndef k(): tl.dot(a, b)\n"
+    )
+    label = detect_framework(src)
+    assert "triton" in label
+    assert "cuda_wmma" in label
+    assert label != "cuda_wmma"
+
+
+def test_single_framework_label_stays_scalar():
+    assert detect_framework("@triton.jit\ndef k(): tl.dot(a,b)\n") == "triton"
+    assert detect_framework("out = torch.nn.functional.silu(x)\n") == "pytorch_only"

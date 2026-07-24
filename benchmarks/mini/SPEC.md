@@ -129,8 +129,30 @@ through five agent harnesses at two weight precisions:
   200 sessions. Precision is encoded in the served model name, so every run
   archive self-describes its weight format.
 - The eval GPU (Lambda H100) never hosts inference; agents on the eval node
-  reach the anvil server via a reverse tunnel
-  (`ssh -N -R 8765:127.0.0.1:8765 ubuntu@<lambda-ip>` from anvil).
+  reach the anvil server via a reverse tunnel. The node is **ares**
+  (`ssh ares`, 2x H100 80GB HBM3 = the SXM part the deck declares); anvil runs
+  `~/.kbmini/tunnel_ares.sh`, which forwards **8765** (vLLM) and **3456**
+  (ccr-rust) into ares and retries on drop.
+
+## Deck calibration anchor (01_dequant_gemv)
+
+`codex gpt-5.6-sol` (effort high) on the canonical node, 2026-07-24:
+**correct, peak_fraction 0.0900** — 126-587 GB/s across the four shapes,
+12.8-18.2x the naive reference. Audited `clean` (problem files byte-identical,
+no grader writes in 128 tool calls, numeric stress active, in-place buffer
+overwrite and weight perturbation both prove recompute, correct on four
+off-deck shapes). Archive:
+`20260724_221725_codex_gpt-5.6-sol_01_dequant_gemv`.
+
+Two things this pins down:
+
+- The deck is **solvable as specified** — a small model scoring zero is a
+  capability signal, not a broken problem.
+- The 1800s cap **binds even a frontier model**: codex hit it mid-optimization
+  (exit 124) and was still climbing at 0.09 of peak. Mini's ceiling is
+  therefore "best kernel in 30 minutes", not "best possible kernel". That is
+  the intended bench identity, but headline numbers must be described that way
+  and never compared against an unlimited-time deck like Hard.
 
 ## Calibration debts (must clear before the deck freezes)
 
@@ -140,3 +162,13 @@ through five agent harnesses at two weight precisions:
 - 03 TAU=1e-3 must be validated against a real sort-free fp32 kernel's
   boundary noise (especially under `flat_logits`).
 - Freeze 03's `eager_ms` anchor per shape on the canonical node at publication.
+- **Dead-code language evidence.** Framework detection is static, so it cannot
+  tell a live kernel from an unused one. The labeller now emits a compound
+  label (`cuda_wmma+triton`) instead of crowning the highest-priority match,
+  which makes the ambiguity visible — but on the CUDA-gated problems (03/04) a
+  hand-rolled pure-PyTorch solution carrying a dead `load_inline` block would
+  still satisfy `require_cuda_evidence`. On 04 the forbidden list (SDPA,
+  flash_attn, flashinfer, xformers) blocks the fast version of that cheat, so
+  the residue is a correct-but-slow cell mislabelled as CUDA. Before freeze,
+  make the evidence check runtime-based (did an extension actually compile /
+  did a `.cu` get built during the session) rather than regex-only.
