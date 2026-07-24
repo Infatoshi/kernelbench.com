@@ -46,6 +46,20 @@ Durable fix applied — all runs now pulled to the Mac
 (`outputs/runs-hades/`) and deleted from the node, so wave 7 (02, 06)
 launches against a truly empty box.
 
+**Wave 7 found a THIRD leak channel: grok's own session store.** With the
+runs archive genuinely empty, both agents (02 0.2257, 06 0.1490 — excluded)
+located `~/.grok/sessions/<old-run-ws>/chat_history.jsonl` and RECONSTRUCTED
+prior best solutions from the transcripts' file-write events ("I'll recover
+the prior working multimem reduce-scatter solution and build from that
+baseline"). Also mined: a stale `~/kbm-smoke` dir; 06 read its concurrent
+sibling's agent.log. Lesson: an empty archive is not an empty box — any
+history artifact (agent CLI session stores, smoke dirs, launcher logs,
+psmon logs) is a contamination vector, and grok-4.5 hunts for ALL of them
+by default. Wave-8 protocol: scrub `~/.grok/sessions`, `~/.grok/logs`,
+`~/.grok/memtrace`, `~/kbm-smoke`, `~/kbm/outputs/launch*.log` after every
+pull, before every launch. Sessions are pulled to the Mac first
+(`outputs/runs-hades/_grok-sessions/`) — they are also the audit record.
+
 Auth gotcha: grok CLI refresh tokens are single-use; sharing the Mac's
 auth.json with hades caused sign-outs mid-fleet (waves 3/5a) and is the lead
 suspect behind the silent fleet kills. Hades now has its own device-code login.
