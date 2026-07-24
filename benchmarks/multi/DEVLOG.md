@@ -37,9 +37,9 @@ audit) AND swept for cross-run contamination at tool-call level. Findings:
 **First clean grok-4.5 board (4xH100, sequential isolated re-grades,
 per-cell annotations in `results/annotations/`):**
 01 allreduce+residual 0.306 · 02 reducescatter+rmsnorm — (no clean passing
-cell) · 03 fp8 allgather 0.106 · 04 moe all2all 0.452 · 05 ulysses 0.204
+cell) · 03 fp8 allgather 0.106 · 04 moe all2all 0.452 · 05 ulysses 0.206
 (wave-6, clean audit: entry+exit barriers, live copy-in before every graph
-replay; re-grade pending a quiet node) · 06 fp8 reducescatter — (no clean
+replay; isolated quiet-node re-grade 0.2056 vs in-run 0.2042) · 06 fp8 reducescatter — (no clean
 cell). Wave 6 also proved relocating archives to a hidden `~/.kbm-archive`
 is NOT a sandbox: the 02 and 06 agents found and read it (both excluded).
 Durable fix applied — all runs now pulled to the Mac
