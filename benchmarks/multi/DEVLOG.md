@@ -46,6 +46,17 @@ Durable fix applied — all runs now pulled to the Mac
 (`outputs/runs-hades/`) and deleted from the node, so wave 7 (02, 06)
 launches against a truly empty box.
 
+**Wave 8 completed the board (2026-07-24).** Under the full-scrub protocol
+both open cells came back clean (audited, sequentially re-graded on the
+quiet node): 02 = 0.2179 (in-run 0.1849 was sibling-contended — the two
+wave-8 agents contended with each other, re-grade recovered 18%),
+06 = 0.1029. **Final clean grok-4.5 board: 01 0.306 · 02 0.218 · 03 0.106 ·
+04 0.452 · 05 0.206 · 06 0.103.** Instructive: the clean 02/06 numbers are
+LOWER than the excluded contaminated cells (0.233/0.149) — the "gains" in
+waves 4-7 were transcript-mined iteration, not capability. Wave-8 agents
+still ran the same archaeology probes (find solution.py, ls ~/.grok/sessions)
+— intent is constant; only supply was cut.
+
 **Wave 7 found a THIRD leak channel: grok's own session store.** With the
 runs archive genuinely empty, both agents (02 0.2257, 06 0.1490 — excluded)
 located `~/.grok/sessions/<old-run-ws>/chat_history.jsonl` and RECONSTRUCTED
