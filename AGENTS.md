@@ -18,10 +18,11 @@ treat it as source of truth. Deploys go out from the Mac (`kb deploy`).
 
 ## The active benches — know which one you're writing to
 
-There are **three** single-GPU active benches (Hard, Mega, CUDA), plus Multi
-(WIP multi-GPU) and the v3 archive. Hard / Mega / CUDA share the same harness,
-run archive, and roofline machinery — only the deck, language rules, entry
-command, and wall-clock budget differ:
+There are **three** single-GPU active benches (Hard, Mega, CUDA), plus Mini
+(WIP small-model bench, below), Multi (WIP multi-GPU), and the v3 archive.
+Hard / Mega / CUDA share the same harness, run archive, and roofline
+machinery — only the deck, language rules, entry command, and wall-clock
+budget differ:
 
 | | `benchmarks/hard/` | `benchmarks/mega/` | `benchmarks/cuda/` |
 | --- | --- | --- | --- |
@@ -40,6 +41,22 @@ reuse hard's harness/archive/roofline machinery.
 (`01_rl_grid_ppo` was removed from the mega deck 2026-07-21 — the CUDA bench's
 craftax problem covers that skill; do not re-add, same rule as hard's
 `04_kahan_softmax`.)
+
+**KernelBench-Mini (`benchmarks/mini/`, WIP small-model bench, 2026-07-23):**
+ranks **sub-200B open-weight models** on a fresh 4-problem deck
+(`problems-h100/`: `01_dequant_gemv` group-96 int4 gated GEMV with a
+deliberately LOOSE vibe-check prompt, `02_segmented_decay_scan` reset-mask
+scan, `03_topp_mask` sort-free CUDA-only exact-graded ms-anchored,
+`04_flash_attention` CUDA-only causal flash forward). Unlike every other
+bench: **capped** 30-min sessions (`BUDGET_SECONDS=1800`), **5 repeats** per
+(model, harness, problem) cell (pass rate k/5 + best-of-5), harness pairing
+opencode vs `*-claude` per model, canonical GPU = **Lambda H100 SXM5**
+(hardware key `H100_SXM` — SXM peaks, not the PCIe `H100` entry). Drive with
+`cd benchmarks/mini && ./scripts/sweep_mini.sh <harness> <model>` (one
+column = 4 problems x 5 repeats; one invocation per model). Inference for
+API-less models is served from anvil's PRO 6000, never the eval GPU. Deck is
+unpublished — keep it out of public posts until it debuts. See
+`benchmarks/mini/SPEC.md` + `DEVLOG.md` (calibration debts before freeze).
 
 **KernelBench-CUDA language gate:** `src/eval/cuda_language.py` hard-fails
 Triton (`@triton.jit`, `triton.language`), kernel DSLs (CuteDSL, TileLang,
@@ -65,6 +82,7 @@ benchmarks/hard/           KernelBench-Hard eval — the per-op deck
   problems-rtxpro6000/         the deck — per-GPU sets: -rtxpro6000 (default, RTX PRO 6000), -h100, -b200 (RTX 3090 removed from the suite 2026-07-21)
 benchmarks/mega/           KernelBench-Mega eval — megakernel deck (single problems/; reuses hard's machinery)
 benchmarks/cuda/           KernelBench-CUDA eval — CUDA-only deck (Triton/DSL fail); /cuda
+benchmarks/mini/           KernelBench-Mini eval — small-model deck, capped+5-repeat, Lambda H100 SXM (WIP); /mini
 benchmarks/multi/          KernelBench-Multi eval — 4×H100 NVLink (WIP); /multi
 benchmarks/v3/             offline eval archive only (not on the website; keeps its own AGENTS.md)
 environments/              Prime Intellect `verifiers` mirrors (kernel_hard / kernel_mega / kernel_v3)
