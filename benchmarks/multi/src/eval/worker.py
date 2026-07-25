@@ -56,6 +56,40 @@ def _max_reduce(value: float, device: torch.device) -> float:
     return float(t.item())
 
 
+def _device_gate(meta: dict, device: torch.device, rank: int, world: int) -> str | None:
+    """Record which GPUs actually ran, and refuse to time on the wrong SKU.
+
+    A timing artifact that does not say what hardware produced it cannot be
+    audited after the fact — a cell that wandered onto the wrong device is
+    undetectable from the artifact alone (AGENTS.md, 2026-07-25). Multi is less
+    exposed than the single-GPU benches (it needs all `world_size` devices, and
+    every H100 in the node is the same SKU), but "right by luck" is not a
+    property worth relying on for a frozen board, and a heterogeneous or
+    undersized node must never produce a graded number.
+
+    Set KBM_ALLOW_DEVICE_MISMATCH=1 only for deliberate off-SKU experiments.
+    """
+    name = torch.cuda.get_device_name(device)
+    names = [None] * world
+    dist.all_gather_object(names, name)
+    if rank == 0:
+        uniq = sorted(set(names))
+        print(f"device: {name} x{world} (visible={torch.cuda.device_count()}, "
+              f"distinct={'|'.join(uniq)})", flush=True)
+    if os.environ.get("KBM_ALLOW_DEVICE_MISMATCH") == "1":
+        return None
+    if len(set(names)) != 1:
+        return f"heterogeneous ranks: {sorted(set(names))} — a mixed-SKU node must not be graded"
+    # hardware key is e.g. "H100x4"; the SKU token is everything before the xN.
+    key = str(meta.get("hardware", ["H100x4"])[0])
+    sku = key.split("x")[0]
+    if sku.lower() not in name.lower().replace(" ", ""):
+        return (f"device {name!r} does not match the problem's hardware key {key!r}. "
+                "Grading against the wrong SKU is meaningless; set "
+                "KBM_ALLOW_DEVICE_MISMATCH=1 only for deliberate off-SKU runs.")
+    return None
+
+
 def _set_shape(reference, shape: dict) -> None:
     for k, v in shape.items():
         setattr(reference, k, v)
@@ -191,6 +225,12 @@ def run_benchmark(reference, shapes, solution, meta, device, rank, world, mode="
                 flush=True,
             )
         return 1
+    if device.type == "cuda":
+        err = _device_gate(meta, device, rank, world)
+        if err:
+            if rank == 0:
+                print(f"FAIL: {err}", flush=True)
+            return 1
     warmup = int(os.environ.get("KBM_WARMUP", meta.get("num_warmup", 500)))
     iters = int(os.environ.get("KBM_ITERS", meta.get("num_perf_trials", 100)))
     use_cuda = device.type == "cuda"

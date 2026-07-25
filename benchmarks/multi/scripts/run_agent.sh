@@ -28,12 +28,15 @@ BENCH_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 DECK="$BENCH_ROOT/problems-h100x4"
 [ -d "$DECK/$PROBLEM" ] || { echo "unknown problem: $PROBLEM" >&2; exit 2; }
 
-LOCK_DIR="${KBM_GPU_LOCK_DIR:-$HOME/kbm/outputs/gpu_lock}"
+# Every artifact stays in-repo under benchmarks/multi/outputs/ on EVERY machine
+# (AGENTS.md, 2026-07-25) — archives outside the repo are invisible to publish /
+# contamination / re-grade tooling, which is a correctness rule, not tidiness.
+LOCK_DIR="${KBM_GPU_LOCK_DIR:-$BENCH_ROOT/outputs/gpu_lock}"
 mkdir -p "$LOCK_DIR"
 LOCKFILE="$LOCK_DIR/gpu.lock"
 
 RUN_ID="$(date +%Y%m%d_%H%M%S)_${HARNESS}_${MODEL//\//-}_${PROBLEM}"
-RUN_DIR="$HOME/kbm/outputs/runs/$RUN_ID"
+RUN_DIR="$BENCH_ROOT/outputs/runs/$RUN_ID"
 WS="$RUN_DIR/ws"
 PROBLEM_DIR="$WS/problems-h100x4/$PROBLEM"
 mkdir -p "$WS/problems-h100x4" "$RUN_DIR/bin"
