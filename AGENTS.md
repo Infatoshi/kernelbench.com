@@ -196,9 +196,14 @@ kb lambda ssh <name> [cmd...]
   skin): `zai-claude` (GLM via api.z.ai/api/anthropic), `minimax-claude`,
   `kimi-claude` (Kimi via api.moonshot.ai/anthropic, model `kimi-k2.7-code`),
   `deepseek-claude` (DeepSeek via api.deepseek.com/anthropic, model
-  `deepseek-v4-pro` or `deepseek-v4-flash`), `qwen-claude` (Qwen via DashScope
-  Model Studio Intl, dashscope-intl.aliyuncs.com/apps/anthropic, model
-  `qwen3-max` — needs DASHSCOPE_API_KEY, which we do not have yet),
+  `deepseek-v4-pro` or `deepseek-v4-flash`), `qwen-claude` (Qwen via the
+  **token-plan MaaS** endpoint
+  token-plan.ap-southeast-1.maas.aliyuncs.com/apps/anthropic with
+  **QWEN_API_KEY** — this is the paid Qwen coding-plan route and is where
+  `qwen3.8-max-preview` lives; verified 2026-07-19, re-verified 2026-07-24.
+  DASHSCOPE_API_KEY + `QWEN_ANTHROPIC_BASE_URL=https://dashscope-intl.aliyuncs.com/apps/anthropic`
+  still reaches Model Studio for `qwen3-max`. Note Qwen 3.8 is **not on
+  OpenRouter** — its newest Qwen is `qwen3.7-max`),
   `longcat-claude` (Meituan LongCat-2.0 via api.longcat.chat/anthropic).
   These mirror each other; to add one, copy the `kimi-claude` branch in
   `scripts/run_hard.sh`. Rationale: opencode is a strong harness but its

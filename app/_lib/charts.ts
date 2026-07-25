@@ -15,6 +15,8 @@ const REPO_ROOT = process.cwd()
 // a published row (see AGENTS.md "Publishing results" → site charts).
 export const MODEL_NAMES: Record<string, string> = {
   "claude-opus-4-8": "Claude Opus 4.8",
+  "claude-opus-5": "Claude Opus 5",
+  "anthropic/claude-opus-5": "Claude Opus 5",
   "claude-fable-5": "Claude Fable 5",
   "anthropic/claude-fable-5": "Claude Fable 5",
   "claude-sonnet-5": "Claude Sonnet 5",
@@ -157,6 +159,8 @@ function markFrontier(points: EffPoint[]): EffPoint[] {
 // Same fallback rule as MODEL_NAMES — never drop a published model silently.
 const SHORT_NAMES: Record<string, string> = {
   "claude-opus-4-8": "Opus 4.8",
+  "claude-opus-5": "Opus 5",
+  "anthropic/claude-opus-5": "Opus 5",
   "claude-fable-5": "Fable 5",
   "anthropic/claude-fable-5": "Fable 5",
   "claude-sonnet-5": "Sonnet 5",

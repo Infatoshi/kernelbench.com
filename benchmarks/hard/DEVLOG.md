@@ -4,6 +4,47 @@ A running record of decisions, dead ends, and lessons. Newest entries on top. Th
 
 ---
 
+## 2026-07-24 — GPU-lock pipeline deadlock (cost 71 min of the Opus 5 sweep)
+
+During the first Claude Opus 5 hard sweep, the whole box went idle for 71
+minutes with six live sessions: load 0.16, GPU 0%, three finished cells stuck
+at `Running check.py...` and two agents unable to touch the GPU.
+
+Cause: **both stages of an agent shell pipeline are PATH-wrapped.** The
+03_paged_attention agent ran
+
+```
+nvcc ... -Xptxas=-v -c pa2.cu 2>&1 | python3 -c "<parse regs/spills>" | sort | head -70
+```
+
+`nvcc` and `python3` are both wrapped by `gpu-lock-exec`, and pipeline stages
+start *simultaneously*. The wrapper's same-run fast path (exec without locking
+when `owner_file` names a live PID from this `RUN_DIR`) is a **race**: `nvcc`
+read `owner_file` and missed, `python3` then won the lock and wrote it, and
+`nvcc` fell into the unbounded `flock -x 9` fallback. From there `nvcc` waited
+on a lock held by its own pipeline partner, while that partner blocked reading
+`nvcc`'s stdout. Neither side could ever proceed, and the unbounded acquire
+meant it never self-healed. `KBH_GPU_LOCK_HELD=1` reentrancy does not help —
+it only covers parent→child, not sibling pipeline stages.
+
+Fix: replace the unbounded `flock -x 9` with a `flock -x -w 5` retry loop that
+**re-reads `owner_file` between attempts** and execs through when the holder is
+a live same-run PID. Logs `reentrant_after_wait`. Applied to hard, cuda, and
+mega (identical wrapper in all three).
+
+Verified by reproducing the race directly: hold the lock for 30s from the same
+`RUN_DIR`, delete `owner_file` so the waiter's fast path misses, restore it 3s
+later. Old behaviour blocks the full ~28s; patched waiter execs through in 5s
+with `reentrant_after_wait` in the lock log.
+
+Operational lesson: **idle box + non-empty run set is a deadlock signature, not
+progress.** A stalled sweep looks identical to a thinking agent from the
+outside — check `load`, GPU util, and `gpu.lock.owner` together, and treat a
+lock owner that holds while the machine is idle as stuck until proven
+otherwise.
+
+---
+
 ## 2026-07-20 - Lambda Cloud $10k + worker lifecycle
 
 Zach/Lambda sponsored **$10k** Cloud credits for Hard/Mega/CUDA/Multi (H100,

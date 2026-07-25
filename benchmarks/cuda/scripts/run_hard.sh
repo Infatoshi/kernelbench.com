@@ -291,7 +291,24 @@ fi
             exit 124
         fi
     else
-        flock -x 9
+        # Bounded retry loop, not an unbounded `flock -x 9`. Both stages of an
+        # agent pipeline like `nvcc ... | python3 ...` are PATH-wrapped, and they
+        # start simultaneously: the second stage can win the lock AFTER the
+        # same-run owner_file check above already read a miss, leaving the first
+        # stage blocked forever on a lock its own pipeline holds while that
+        # holder blocks reading the first stage's stdout. Re-check same-run
+        # ownership between attempts so the reentrant case self-heals.
+        # (Cost 71 min of a 6-cell Opus 5 sweep on 2026-07-24.)
+        until flock -x -w 5 9; do
+            if [ -f "$owner_file" ]; then
+                IFS=$'\t' read -r owner_pid owner_run_dir < "$owner_file" || true
+                if [ "${owner_run_dir:-}" = "${RUN_DIR:-}" ] && kill -0 "${owner_pid:-}" 2>/dev/null; then
+                    printf '%s reentrant_after_wait pid=%s cmd=%s owner=%s\n' \
+                        "$(date -Is)" "$$" "$name" "${owner_pid:-}" >&3
+                    exec "$real" "$@"
+                fi
+            fi
+        done
     fi
     start="$(date +%s)"
     printf '%s\t%s\n' "$$" "${RUN_DIR:-}" > "$owner_file"
@@ -1292,7 +1309,11 @@ echo "Problem:    $PROBLEM_NAME"
 echo "Source:     $SOURCE_PROBLEM_DIR"
 echo "Workspace:  $PROBLEM_DIR"
 echo "Archive:    $RUN_DIR"
-echo "Budget:     unlimited (no wall-clock cap)"
+if [ "$BUDGET_SECONDS" -eq 0 ]; then
+    echo "Budget:     unlimited (no wall-clock cap)"
+else
+    echo "Budget:     ${BUDGET_SECONDS}s"
+fi
 echo "========================================"
 
 START_TIME=$(date +%s)
@@ -1593,8 +1614,10 @@ case "$HARNESS" in
         fi
         ;;
 
-    or-fable|openrouter-fable)
-        # Claude Code → OpenRouter Anthropic-compatible API for Claude Fable 5.
+    or-fable|openrouter-fable|or-opus|openrouter-opus)
+        # Claude Code → OpenRouter Anthropic-compatible API for Anthropic models
+        # (Claude Fable 5, Claude Opus 5). Same Claude Code binary/settings as the
+        # native `claude` harness; only auth + billing differ.
         # Requires OPENROUTER_API_KEY. See hard/scripts/run_hard.sh for notes.
         if [ -z "${OPENROUTER_API_KEY:-}" ]; then
             echo "OPENROUTER_API_KEY is required for or-fable" >&2
@@ -1604,11 +1627,20 @@ case "$HARNESS" in
             fable|fable-5|claude-fable|claude-fable-5|anthropic/claude-fable-5)
                 OR_FABLE_MODEL="anthropic/claude-fable-5"
                 ;;
+            opus|opus-5|claude-opus-5|anthropic/claude-opus-5)
+                OR_FABLE_MODEL="anthropic/claude-opus-5"
+                ;;
             *)
                 OR_FABLE_MODEL="$MODEL"
                 ;;
         esac
         OR_FABLE_BASE_URL="${OR_FABLE_BASE_URL:-https://openrouter.ai/api}"
+        # Effort is forwarded (Opus convention is --effort max); callers that
+        # pass no effort keep the previous no-flag behaviour.
+        OR_FABLE_EFFORT_ARG=()
+        if [ -n "$REASONING_EFFORT" ]; then
+            OR_FABLE_EFFORT_ARG=(--effort "$REASONING_EFFORT")
+        fi
         if [ "$KBH_AGENT_CONTAINER" = "1" ]; then
             CLAUDE_CONTAINER_ENV_NAMES=(
                 ANTHROPIC_BASE_URL API_TIMEOUT_MS
@@ -1631,7 +1663,7 @@ case "$HARNESS" in
                 export ANTHROPIC_DEFAULT_HAIKU_MODEL="$OR_FABLE_MODEL" && \
                 export ANTHROPIC_DEFAULT_SONNET_MODEL="$OR_FABLE_MODEL" && \
                 export ANTHROPIC_DEFAULT_OPUS_MODEL="$OR_FABLE_MODEL" && \
-                run_claude_container "" "$OR_FABLE_MODEL" 0 ) \
+                run_claude_container "$REASONING_EFFORT" "$OR_FABLE_MODEL" 0 ) \
                 > "$LOG_FILE" 2> "$STDERR_FILE" || HARNESS_EXIT=$?
             CLAUDE_CONTAINER_ENV_NAMES=()
             CLAUDE_CONTAINER_EXTRA_CLAUDE_ARGS=()
@@ -1655,6 +1687,7 @@ case "$HARNESS" in
                 --output-format stream-json \
                 --settings "$CLAUDE_KBH_SETTINGS" \
                 --model "$OR_FABLE_MODEL" \
+                ${OR_FABLE_EFFORT_ARG[@]+"${OR_FABLE_EFFORT_ARG[@]}"} \
                 --disallowedTools ExitPlanMode EnterPlanMode AskUserQuestion \
                 --add-dir "$PROBLEM_DIR" \
                 -p "$PROMPT" ) \
@@ -2112,7 +2145,7 @@ case "$HARNESS" in
 
     *)
         echo "Unknown harness: $HARNESS" >&2
-        echo "Supported: claude, zai-claude, minimax-claude, kimi-claude, kinetic-claude, or-fable, longcat-claude, hy3, deepseek-claude, qwen-claude, ccr-claude, codex, kimi, droid, gemini, cursor, grok, opencode, opencode-nemotron, nvcf-nemotron" >&2
+        echo "Supported: claude, zai-claude, minimax-claude, kimi-claude, kinetic-claude, or-fable, or-opus, longcat-claude, hy3, deepseek-claude, qwen-claude, ccr-claude, codex, kimi, droid, gemini, cursor, grok, opencode, opencode-nemotron, nvcf-nemotron" >&2
         exit 1
         ;;
 esac
