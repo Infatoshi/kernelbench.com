@@ -582,6 +582,20 @@ Most likely causes:
 
 ## Hard-won gotchas
 
+- **EVERY KernelBench artifact stays inside this repo, in its correct
+  subfolder — on EVERY machine (Mac, anvil, Lambda/Brev workers).** Never write
+  sweep scripts, run archives, GPU lock dirs, or logs to `$HOME` or `/tmp`.
+  Run archives -> `benchmarks/<bench>/outputs/runs/`; scripts -> `scripts/` or
+  `benchmarks/<bench>/scripts/`; GPU locks -> the per-bench default under
+  `benchmarks/<bench>/outputs/gpu_lock/`, or an in-repo path when you need one
+  machine-wide lock across hard/cuda/mega. Agent session scratch belongs in the
+  session scratchpad, never the user's home. This is strict, not stylistic:
+  besides cluttering the box, an archive stranded outside the repo is invisible
+  to `kb publish`, `kb contamination`, and re-grades. A stray
+  `anvil:~/kb-remote-archives/` found 2026-07-25 turned out to hold the ONLY
+  local copy of 33 already-published leaderboard cells. If you launch a remote
+  worker, point its lock/log/archive paths at in-repo locations and `kb lambda
+  pull` its archives back into `outputs/runs/` before teardown.
 - **Commit email MUST be `elliot@arledge.net`** or Vercel silently fails the
   build verification. The repo sets it locally; new clones must `git config
   user.email elliot@arledge.net`.
