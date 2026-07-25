@@ -19,6 +19,13 @@
 #   KBH_REGRADE_GPU=0            GPU index to grade on (default 0)
 #   KBH_REGRADE_ALLOW_BUSY=1     skip the idle-GPU precondition (debug only)
 #   KBH_REGRADE_DRY_RUN=1        show what would run, touch nothing
+#   KBH_REGRADE_DECK=<dir>       canonical deck root to restore template files
+#                                from, e.g. problems-h100. Grading against the
+#                                deck rather than whatever the workspace holds
+#                                means a corrected problem.yaml (hardware key,
+#                                tolerances) applies on re-grade, and any agent
+#                                edit to the graded surface that survived the
+#                                in-session guard is reverted and reported.
 #
 # Writes into each result.json, preserving the contended originals:
 #   peak_fraction / correct / check_* / benchmark_*   <- clean values
@@ -100,6 +107,24 @@ for RUN_DIR in "$@"; do
 
     if [ "$DRY" = "1" ]; then
         echo "    [dry-run] would grade in $PROBLEM_DIR"; continue
+    fi
+
+    # Restore the graded surface from the canonical deck. Anything that differs
+    # is either a deck correction made since the run (which SHOULD apply) or an
+    # agent edit that outlived the in-session guard (which must not stand);
+    # either way the re-grade must score against the deck, so report and replace.
+    if [ -n "${KBH_REGRADE_DECK:-}" ]; then
+        SRC_DECK="$REPO_ROOT/$KBH_REGRADE_DECK/$PROBLEM"
+        if [ -d "$SRC_DECK" ]; then
+            for t in reference.py sota.py shapes.py problem.yaml check.py benchmark.py PROMPT.txt; do
+                if [ -f "$SRC_DECK/$t" ] && ! cmp -s "$SRC_DECK/$t" "$PROBLEM_DIR/$t"; then
+                    echo "    restoring $t from $KBH_REGRADE_DECK (workspace copy differed)"
+                    cp "$SRC_DECK/$t" "$PROBLEM_DIR/$t"
+                fi
+            done
+        else
+            echo "    WARN: KBH_REGRADE_DECK set but $SRC_DECK missing; grading workspace as-is" >&2
+        fi
     fi
 
     # run_hard.sh clears non-template files from the workspace after archiving,
