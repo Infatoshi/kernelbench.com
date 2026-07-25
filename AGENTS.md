@@ -596,6 +596,36 @@ Most likely causes:
   local copy of 33 already-published leaderboard cells. If you launch a remote
   worker, point its lock/log/archive paths at in-repo locations and `kb lambda
   pull` its archives back into `outputs/runs/` before teardown.
+- **The harness does NOT pin a GPU, and `result.json` does NOT record which GPU
+  ran (2026-07-25).** `run_hard.sh` sets `CUDA_VISIBLE_DEVICES` nowhere, so on a
+  multi-GPU box an agent sees every device. On anvil that means GPU0 (RTX PRO
+  6000, sm_120) **and** GPU1 (RTX 3090, sm_86). Default torch device is `cuda:0`
+  = the PRO 6000, so the common case is right **by luck, not by construction** —
+  an agent that writes `cuda:1`, or iterates devices, silently benchmarks on the
+  wrong SKU. And because `result.json` carries only `peak_fraction` /
+  `gpu_queue_mode` and no device name, **a cell that wandered onto the wrong GPU
+  cannot be detected after the fact from the artifact.** A 3090 number graded
+  against the PRO 6000 roofline is meaningless.
+  Until this is fixed, the mandatory sequential isolated re-grade is what makes
+  published numbers trustworthy: **pin `CUDA_VISIBLE_DEVICES=0` (or the intended
+  device) when re-grading**, so every published figure is provably from the
+  right SKU regardless of what the agent session did. Single-GPU rented workers
+  (Lambda H100 PCIe, etc.) are unaffected.
+  Worth closing before the next wave: have `benchmark.py` record
+  `torch.cuda.get_device_name()` + the resolved hardware key into `result.json`,
+  and export an explicit `CUDA_VISIBLE_DEVICES` from `run_hard.sh`.
+- **A rented worker can pass `nvcc` checks and still be unable to run torch.**
+  Lambda's stock image ships driver 570 and **no NVIDIA CUDA apt repo**, so
+  `apt-get install cuda-toolkit-13-0` returns rc=100 (package not found) while
+  the driver install succeeds from Lambda's own archive — a node then has a
+  driver but no `/usr/local/cuda-13.0`, or a toolkit but a 570 driver too old
+  for the cu130 wheel. Both failures are SILENT. Add the repo first
+  (`cuda-keyring_1.1-1_all.deb` from
+  `developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/`), install
+  `cuda-toolkit-13-0` + `nvidia-driver-595`, then **reboot**. Gate every launch
+  on an actual `torch.cuda.is_available()` probe, not on `nvcc` existing —
+  checking for nvcc alone will happily start a full sweep on a box where torch
+  reports `False`, burning provider tokens on cells that die at first compile.
 - **Commit email MUST be `elliot@arledge.net`** or Vercel silently fails the
   build verification. The repo sets it locally; new clones must `git config
   user.email elliot@arledge.net`.
