@@ -87,7 +87,10 @@ if [ -n "\$pat" ]; then
         [ "\$pid" = "\$\$" ] && continue
         [ -r /proc/\$pid/cmdline ] || continue     # exited between pgrep and read
         cmd=\$(tr '\0' ' ' < /proc/\$pid/cmdline 2>/dev/null)
-        echo "\$cmd" | grep -qE "$PROTECTED" && hit="\$hit \$pid"
+        # -i matters: the GPU-resident workers are named VLLM::Worker_TPn in
+        # UPPERCASE (that is the name an agent sees in nvidia-smi and would
+        # target), while the serve parents are lowercase.
+        echo "\$cmd" | grep -qiE "$PROTECTED" && hit="\$hit \$pid"
     done
     if [ -n "\$hit" ]; then
         echo "$tool refused: '\$pat' matches another tenant's job on this shared node (PIDs:\$hit)." >&2
