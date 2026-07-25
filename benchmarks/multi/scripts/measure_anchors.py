@@ -89,12 +89,38 @@ def measure(problem_dir: Path) -> list[float]:
 
 
 def main() -> int:
+    args = [a for a in sys.argv[1:] if not a.startswith("--")]
+    repeats = int(os.environ.get("KBM_ANCHOR_REPEATS", "5"))
     preflight_quiet_node()
-    targets = [Path(a).resolve() for a in sys.argv[1:]] or _speedup_problems()
+    targets = [Path(a).resolve() for a in args] or _speedup_problems()
     for d in targets:
-        times = measure(d)
-        print(f"anchor_ms: [{', '.join(f'{t:.4f}' for t in times)}]   # {d.name}")
-    print("\nPaste each line into the matching problem.yaml, then commit. "
+        # Median of N passes, not a single shot. Latency-bound shapes are not
+        # jittery per-iteration (100 timed iters already average that out) — they
+        # vary run to RUN, from NCCL channel setup and CPU-side syncs, so a
+        # bigger iter count does not help and only more processes do. Measured
+        # 2026-07-25: 09's 128-token shape spans 28% across five passes while its
+        # 8192-token shape spans 1.6%. A single shot there would bias every
+        # future speedup on that shape by up to ~15%.
+        passes = [measure(d) for _ in range(repeats)]
+        n = len(passes[0])
+        if any(len(p) != n for p in passes):
+            raise SystemExit(f"inconsistent shape count across passes for {d.name}")
+        med, spreads = [], []
+        for i in range(n):
+            col = sorted(p[i] for p in passes)
+            mid = col[len(col) // 2] if len(col) % 2 else 0.5 * (col[len(col) // 2 - 1] + col[len(col) // 2])
+            med.append(mid)
+            spreads.append((col[-1] - col[0]) / col[0] if col[0] > 0 else 0.0)
+        print(f"anchor_ms: [{', '.join(f'{t:.4f}' for t in med)}]   # {d.name} "
+              f"(median of {repeats})")
+        print(f"#   per-shape spread over {repeats} passes: "
+              f"{', '.join(f'{s * 100:.1f}%' for s in spreads)}")
+        for i, s in enumerate(spreads):
+            if s > 0.10:
+                print(f"#   NOTE shape {i} spread {s * 100:.0f}% — latency-bound; the "
+                      "median is the honest anchor but expect that much noise in "
+                      "solution timings on this shape too.")
+    print("\nPaste each anchor_ms line into the matching problem.yaml, then commit. "
           "Anchors are FROZEN once published.")
     return 0
 
