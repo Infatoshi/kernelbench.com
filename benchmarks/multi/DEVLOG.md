@@ -2,6 +2,87 @@
 
 Newest first. SPEC.md holds the methodology; this holds the journey.
 
+## 2026-07-25 — deck revision: 6 pure-comm problems → 4, half of them fused
+
+The first clean board (below) exposed a design problem the board itself could not
+show: the six problems spanned four collectives but only ~3.5 independent skills.
+An all-reduce IS a reduce-scatter plus an all-gather, so 01/02/03 were one family;
+02/06 were both reduce-scatter; 04/05 were both all-to-all. Four of the six
+epilogues were free — RMSNorm after a reduce-scatter is entirely local (each rank
+already owns whole rows), and the wave-8 audit shows it riding along in shared
+memory of a kernel the agent had to write anyway. Every pure-comm problem with a
+light epilogue converges on the same kernel shape (publish to symmetric memory,
+barrier, pull, done), which is why they read as sweep problems.
+
+Cost made it worse: with the mandatory sequential re-grade, problem count is
+close to linear in wall-clock on a node that bills by the hour, and every extra
+run is another audit and another archive entry for a later agent to mine.
+
+**Kept exactly one pure primitive and moved the rest to where comm and compute
+interleave**, which is where the field's hand-tuned kernels actually live:
+
+- `01_allreduce_residual` unchanged (busbw-graded).
+- `07_gemm_allreduce_overlap` — TP row-parallel GEMM whose all-reduce should be
+  hidden behind the MMA pipeline (async-TP / Flux territory). Shapes chosen so
+  gemm_ms and comm_ms are within ~1.5×, where overlap is worth real time.
+- `08_ring_attention_cp` — causal context-parallel attention: ring the K/V,
+  accumulate with an online softmax, and deal with the 1:2:3:4 causal load
+  imbalance that a lockstep ring turns into rank-3-gates-everything. This is the
+  honest version of what the retired `05_ulysses_all2all` gestured at (Ulysses
+  explicitly removed the attention math, which was the interesting part).
+- `09_moe_ep_dispatch_combine` — DeepEP-shaped: data-dependent unbalanced routing,
+  metadata round trip on the critical path, permutation fused into the transfer,
+  fp8 dispatch leg / bf16 combine leg.
+
+Retired 02/03/05 (subsumed) and 04/06 (superseded by 09). Numbers are not reused.
+
+**Two anti-cheats, both verified adversarially before freezing** (the old 04's
+zero-comm hole was found by reading, not by testing — this time the exploit was
+written and run):
+
+- 07: the weight shards are rank-distinct by construction, so
+  `sum_r(x_r @ W_r) != (sum_r x_r) @ W`. An adversarial solution that all-reduces
+  the smaller activation first and does one local GEMM fails at max_rel 22.
+- 09: the expert is NOT a per-token map — its output for a token depends on the
+  neighbouring token in the expert's canonical `(src_rank, src_index)` batch
+  order, in full width, so no gathered-weights local shortcut reproduces it. A
+  zero-communication solution fails at max_rel 2.0. (Any per-token elementwise
+  expert is algebraically avoidable at bench scale, because nothing stops a rank
+  from replicating every expert weight — real EP exists only because the weights
+  do not fit. The cross-token dependency is what restores the constraint, and it
+  must be full-width: a scalar or low-rank dependency can be recovered with a
+  tiny all-reduce.) fp8 on the dispatch leg is likewise forced rather than
+  suggested: the reference quantizes per-token, so a bf16-dispatch solution
+  misses the oracle by the full quantization error.
+
+**New metric: `speedup`.** 07/08/09 fuse compute with comm, so no single
+collective convention describes their bytes and a busbw fraction would be
+uninterpretable. They are graded on geomean speedup vs a frozen production anchor
+(`sota.py`, timed once via the new `--mode anchor`, pinned as `anchor_ms`). 01
+keeps busbw. The tradeoff is inherent: a problem legible enough for a clean
+bus-bandwidth fraction has nothing in it but comm.
+
+**08's tolerance was calibrated, not guessed** (`scripts/numerics_probe_attention.py`).
+The first NCCL validation had the anchor failing its own oracle on 2 of 8.4M
+elements — near-zero outputs where honest bf16 error (2.3e-4) just exceeded the
+abs floor (atol·rms = 1.6e-4). Probe results: worst honest variant needs atol
+0.0281 (one-shot bf16 SDPA, and a ring with bf16 accumulate); dropping the last
+KV chunk needs 2.04–6.85; skipping the online-softmax rescale needs 4.45 at the
+large stress scale (it is nearly error-free on homogeneous nominal data, which is
+also why it buys no time — numeric stress is what catches it). Gate set at
+`[0.1, 0.025]`.
+
+**Anchor measurement is now guarded.** The first anchor pass was taken while a
+co-tenant vLLM held 70 GB on GPU0 — violating the quiet-node rule written in that
+script's own docstring — and was discarded. `measure_anchors.py` now refuses to
+run when any GPU shows >2 GB resident (`KBM_ALLOW_BUSY=1` to override). A
+contended anchor is worse than a contended re-grade: it is frozen, and it divides
+every future speedup on that problem.
+
+All three new oracles validated on gloo/cpu and then against an independent NCCL
+implementation at full shapes (the anchor reproduces the oracle exactly on 09,
+which is the real check on the canonical-order design).
+
 ## 2026-07-24 — contamination sweep, first clean grok-4.5 board, formula fix
 
 Five grok-4.5 waves ran on hades (waves 1/2 killed externally — see below; wave 3

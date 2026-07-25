@@ -89,7 +89,12 @@ compares per-rank outputs within per-dtype tolerance. A single mismatch on any
 rank, seed, or shape fails. NaN/inf is an automatic fail.
 
 - Tolerances (tighter than hard, because loose tol enables rank hacks): fp32
-  `1e-4`; bf16/fp16 `5e-3`; fp8 `5e-2`.
+  `1e-4`; bf16/fp16 `5e-3`; fp8 `5e-2`. Per-problem overrides accept either a
+  scalar or `[atol, rtol]`, and are **calibrated by probe, never guessed** —
+  `numerics_probe.py` for the reduction decks, `numerics_probe_attention.py` for
+  `08` (honest bf16 attention needs `atol` 0.0281 where the reductions need
+  0.025; the gate is set at 0.1, 3.6× over honest noise and 20× under the
+  cheapest cheat).
 - 5 RNG trials per shape (rank-distinct each trial).
 - `strict=True` state-dict load — missing params fail (kills identity kernels).
 - Numeric stress: rescale inputs small/large and rerun (defeats zero-output /
@@ -130,18 +135,56 @@ paths named by reputation only: NVSHMEM, CUDA symmetric memory / one-shot &
 two-shot all-reduce, ParallelKittens, distributed CUTLASS. No busbw numbers, no
 recipes, no "you are being evaluated" framing.
 
-## The deck (6, comms-dominated)
+## The deck (4)
 
-| NN | name | collective | what's fused |
-| -- | ---- | ---------- | ------------ |
-| 01 | `allreduce_residual` | all-reduce | + residual add (TP output) |
-| 02 | `reducescatter_rmsnorm` | reduce-scatter | + RMSNorm epilogue (SP) |
-| 03 | `allgather_fp8` | all-gather | + on-the-fly fp8 dequant |
-| 04 | `moe_all2all` | all-to-all | expert-parallel dispatch+combine (permutation) |
-| 05 | `ulysses_all2all` | all-to-all | seq↔head repartition primitive (no attention math) |
-| 06 | `fp8_reducescatter_grad` | reduce-scatter | fp8 gradient compression |
+Revised 2026-07-25 from six pure-comm problems to four. The original six spanned
+four collectives but only about 3.5 independent skills: an all-reduce *is* a
+reduce-scatter plus an all-gather, so `01`/`02`/`03` were one family; `02`/`06`
+were both reduce-scatter; `04`/`05` were both all-to-all; and four of the six
+epilogues were pass-throughs (RMSNorm after a reduce-scatter is entirely local —
+each rank already owns whole rows, so it rides along in registers of a kernel the
+agent had to write anyway). Every pure-comm problem with a light epilogue
+converges on one kernel shape — publish to symmetric memory, barrier, pull — which
+is why they read as sweep problems and could not discriminate between models.
 
-All busbw-graded, all forbid their bare collective.
+The replacement principle: **keep exactly one pure-comm primitive, and spend the
+rest of the deck where comm and compute genuinely interleave and there is a
+scheduling decision.** That is where the field's hand-tuned production kernels
+live (async-TP / Flux, DeepEP, ring / context-parallel attention).
+
+| NN | name | metric | what is actually under test |
+| -- | ---- | ------ | --------------------------- |
+| 01 | `allreduce_residual` | busbw | the pure primitive: one-shot vs two-shot, small-message latency regime |
+| 07 | `gemm_allreduce_overlap` | speedup | tile-granular overlap of a TP GEMM with its all-reduce |
+| 08 | `ring_attention_cp` | speedup | ring KV exchange + online softmax, plus causal load balancing |
+| 09 | `moe_ep_dispatch_combine` | speedup | irregular EP routing, permutation fused into the transfer, fp8 dispatch leg |
+
+Retired: `02_reducescatter_rmsnorm`, `03_allgather_fp8`, `05_ulysses_all2all`
+(subsumed), `04_moe_all2all` and `06_fp8_reducescatter_grad` (superseded by `09`,
+which folds the fp8-on-the-wire skill into the leg where it is load-bearing).
+Numbers are never reused; `04`'s published cells do not carry over because `09`'s
+semantics and metric differ.
+
+All four forbid the c10d collective surface. Local compute may use any library
+(cuBLAS/CUTLASS/SDPA/flash-attn) — the *movement* is what is graded.
+
+## Two metrics, and why
+
+`problem.yaml` declares `metric:`.
+
+- **`busbw`** (01 only) — achieved NVLink bus bandwidth over the 450 GB/s
+  roofline. Legible and absolute, but only meaningful when the collective's
+  bandwidth factor describes the whole of the work.
+- **`speedup`** (07/08/09) — geomean speedup over a **frozen production anchor**
+  in `sota.py`, measured once on the canonical node via `--mode anchor` and pinned
+  as `anchor_ms` in `problem.yaml`. Frozen at deck publication, so a new best
+  never re-grades historical cells (same rule as the CUDA bench's ms headline).
+
+The tradeoff is inherent, not incidental: a problem legible enough for a clean
+bus-bandwidth fraction is a problem with nothing in it but comm, and those are
+exactly the ones that stopped discriminating. Anchors must be measured on a quiet
+node — `scripts/measure_anchors.py` refuses on a node with another CUDA tenant,
+because a contended anchor permanently biases an entire column.
 
 ## Harness / execution model
 

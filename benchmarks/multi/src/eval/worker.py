@@ -156,14 +156,41 @@ def run_check(reference, shapes, solution, meta, device, rank, world, snap=None)
     return int(any_fail)
 
 
-def run_benchmark(reference, shapes, solution, meta, device, rank, world):
+def run_benchmark(reference, shapes, solution, meta, device, rank, world, mode="benchmark"):
+    """Time the model and report the problem's headline metric.
+
+    Two metrics, declared per problem as `metric:` in problem.yaml:
+
+    * `busbw` (default) — achieved NVLink bus bandwidth as a fraction of the
+      450 GB/s roofline. Only meaningful for a PURE-COMM problem, where the
+      collective's NCCL bandwidth factor is the whole of the work.
+    * `speedup` — geomean speedup versus a FROZEN production anchor
+      (`anchor_ms`, one entry per shape, measured once via `--mode anchor` and
+      pinned in problem.yaml). Used where the kernel fuses comm WITH compute,
+      so no single collective convention describes the bytes and a bus-bandwidth
+      fraction would be uninterpretable. Frozen at deck publication, so a new
+      best never re-grades historical cells (same rule as the CUDA bench).
+
+    `mode="anchor"` times the same way but reports raw ms, for freezing.
+    """
     from src.eval.busbw import busbw_gb_s, eval_formula, geomean, peak_fraction
     from src.hardware import get as get_hw
 
+    metric = "anchor" if mode == "anchor" else meta.get("metric", "busbw")
     hw = get_hw(meta.get("hardware", ["H100x4"])[0])
     peak_busbw = hw.peak_nvlink_busbw_gb_s
     dtype_bytes = int(meta.get("dtype_bytes", 2))
-    busbw_formula = meta["busbw_bytes_formula"]
+    busbw_formula = meta.get("busbw_bytes_formula")
+    anchor_ms = meta.get("anchor_ms") or []
+    if metric == "speedup" and len(anchor_ms) != len(shapes.SHAPES):
+        if rank == 0:
+            print(
+                f"FAIL: metric=speedup needs anchor_ms with {len(shapes.SHAPES)} "
+                f"entries in problem.yaml (got {len(anchor_ms)}). "
+                "Measure with: uv run python scripts/measure_anchors.py <problem_dir>",
+                flush=True,
+            )
+        return 1
     warmup = int(os.environ.get("KBM_WARMUP", meta.get("num_warmup", 500)))
     iters = int(os.environ.get("KBM_ITERS", meta.get("num_perf_trials", 100)))
     use_cuda = device.type == "cuda"
@@ -201,28 +228,44 @@ def run_benchmark(reference, shapes, solution, meta, device, rank, world):
 
         ms = _max_reduce(ms_local, device)  # slowest rank gates the collective
         if rank == 0:
-            fvars = dict(shape)
-            fvars.update(world_size=world, dtype_bytes=dtype_bytes)
-            busbw_bytes = eval_formula(busbw_formula, fvars)
-            achieved = busbw_gb_s(busbw_bytes, ms)
-            frac = peak_fraction(achieved, peak_busbw)
-            fractions.append(frac)
-            print(
-                f"shape={shape_idx} variant=solution busbw={achieved:.2f} "
-                f"ms={ms:.4f} peak_fraction={frac:.4f}",
-                flush=True,
-            )
+            if metric == "anchor":
+                print(f"shape={shape_idx} variant=anchor ms={ms:.4f}", flush=True)
+            elif metric == "speedup":
+                anchor = float(anchor_ms[shape_idx])
+                sp = anchor / ms if ms > 0 else 0.0
+                fractions.append(sp)
+                print(
+                    f"shape={shape_idx} variant=solution ms={ms:.4f} "
+                    f"anchor_ms={anchor:.4f} speedup={sp:.4f}",
+                    flush=True,
+                )
+            else:
+                fvars = dict(shape)
+                fvars.update(world_size=world, dtype_bytes=dtype_bytes)
+                busbw_bytes = eval_formula(busbw_formula, fvars)
+                achieved = busbw_gb_s(busbw_bytes, ms)
+                frac = peak_fraction(achieved, peak_busbw)
+                fractions.append(frac)
+                print(
+                    f"shape={shape_idx} variant=solution busbw={achieved:.2f} "
+                    f"ms={ms:.4f} peak_fraction={frac:.4f}",
+                    flush=True,
+                )
 
-    if rank == 0:
+    if rank == 0 and metric != "anchor":
         g = geomean(fractions)
-        print(f"peak_fraction: {g:.4f}", flush=True)
-        print(f"RESULT: {'OK' if g >= 0.1 else 'LOW'}", flush=True)
+        if metric == "speedup":
+            print(f"speedup: {g:.4f}", flush=True)
+            print(f"RESULT: {'OK' if g >= 1.0 else 'LOW'}", flush=True)
+        else:
+            print(f"peak_fraction: {g:.4f}", flush=True)
+            print(f"RESULT: {'OK' if g >= 0.1 else 'LOW'}", flush=True)
     return 0
 
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--mode", required=True, choices=["check", "benchmark"])
+    ap.add_argument("--mode", required=True, choices=["check", "benchmark", "anchor"])
     ap.add_argument("--problem-dir", required=True)
     args = ap.parse_args()
 
@@ -233,7 +276,11 @@ def main():
     import shapes  # noqa: E402
 
     snap = oracle_snapshot(reference)  # BEFORE solution import: it can patch
-    import solution  # noqa: E402
+    if args.mode == "anchor":
+        # Freeze the production baseline: time sota.py, never the agent's file.
+        import sota as solution  # noqa: E402
+    else:
+        import solution  # noqa: E402
 
     meta = yaml.safe_load((problem_dir / "problem.yaml").read_text())
 
@@ -249,7 +296,9 @@ def main():
         if args.mode == "check":
             rc = run_check(reference, shapes, solution, meta, device, rank, world, snap)
         else:
-            rc = run_benchmark(reference, shapes, solution, meta, device, rank, world)
+            rc = run_benchmark(
+                reference, shapes, solution, meta, device, rank, world, args.mode
+            )
     finally:
         dist.barrier()
         dist.destroy_process_group()

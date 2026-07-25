@@ -74,3 +74,8 @@ def run_check(problem_dir: Path) -> int:
 
 def run_benchmark(problem_dir: Path) -> int:
     return _run("benchmark", Path(problem_dir).resolve())
+
+
+def run_anchor(problem_dir: Path) -> int:
+    """Time sota.py (the frozen production baseline) instead of solution.py."""
+    return _run("anchor", Path(problem_dir).resolve())
