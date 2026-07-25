@@ -67,7 +67,10 @@ require_idle_gpu() {
     local waited=0
     while true; do
         local busy
-        busy=$(nvidia-smi -i "$GPU" --query-compute-apps=pid --format=csv,noheader 2>/dev/null | grep -c . || echo 0)
+        # grep -c prints 0 AND exits 1 when nothing matches, so a `|| echo 0`
+        # fallback would append a SECOND zero and break the integer test below.
+        busy=$(nvidia-smi -i "$GPU" --query-compute-apps=pid --format=csv,noheader 2>/dev/null | grep -c .)
+        busy=${busy:-0}
         if [ "$busy" -eq 0 ]; then
             [ "$waited" -gt 0 ] && echo "    GPU $GPU idle after ${waited}s"
             return 0
