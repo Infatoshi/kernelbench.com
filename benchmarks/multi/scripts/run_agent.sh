@@ -95,26 +95,51 @@ for tool in pkill killall; do
     [ -n "$real" ] || continue
     cat > "$RUN_DIR/bin/$tool" <<GUARD
 #!/usr/bin/env bash
+# Signal flag (default TERM); -f and friends are pkill-only and must not reach kill.
+sig=""
 pat=""
-for a in "\$@"; do case "\$a" in -*) ;; *) pat="\$a" ;; esac; done
-if [ -n "\$pat" ]; then
-    hit=""
-    for pid in \$(pgrep -f -- "\$pat" 2>/dev/null); do
-        [ "\$pid" = "\$\$" ] && continue
-        [ -r /proc/\$pid/cmdline ] || continue     # exited between pgrep and read
-        cmd=\$(tr '\0' ' ' < /proc/\$pid/cmdline 2>/dev/null)
-        # -i matters: the GPU-resident workers are named VLLM::Worker_TPn in
-        # UPPERCASE (that is the name an agent sees in nvidia-smi and would
-        # target), while the serve parents are lowercase.
-        echo "\$cmd" | grep -qiE "$PROTECTED" && hit="\$hit \$pid"
-    done
-    if [ -n "\$hit" ]; then
-        echo "$tool refused: '\$pat' matches another tenant's job on this shared node (PIDs:\$hit)." >&2
-        echo "Never kill processes you did not start. Target your own PIDs explicitly." >&2
-        exit 1
-    fi
+for a in "\$@"; do
+    case "\$a" in
+        -[0-9]*|-[A-Z]*) sig="\$a" ;;
+        -*) ;;
+        *) pat="\$a" ;;
+    esac
+done
+[ -n "\$pat" ] || exec "$real" "\$@"
+
+# This run's own ancestry: the agent session process, run_agent.sh, the wave
+# driver. The agent's prompt is passed in argv, and every PROMPT.txt contains the
+# word "torchrun", so a perfectly reasonable \`pkill -f torchrun\` matches the
+# AGENT'S OWN process and the session commits suicide (exit 137). Seen twice on
+# 2026-07-25. Ancestors are excluded from the kill, not refused, so cleaning up
+# hung children still works.
+ancestors=" "
+p=\$\$
+while [ "\$p" -gt 1 ] 2>/dev/null; do
+    ancestors="\$ancestors\$p "
+    p=\$(awk '{print \$4}' /proc/\$p/stat 2>/dev/null) || break
+    [ -n "\$p" ] || break
+done
+
+hit=""
+targets=""
+for pid in \$(pgrep -f -- "\$pat" 2>/dev/null); do
+    [ "\$pid" = "\$\$" ] && continue
+    case "\$ancestors" in *" \$pid "*) continue ;; esac
+    [ -r /proc/\$pid/cmdline ] || continue     # exited between pgrep and read
+    cmd=\$(tr '\0' ' ' < /proc/\$pid/cmdline 2>/dev/null)
+    # -i matters: the GPU-resident workers are named VLLM::Worker_TPn in
+    # UPPERCASE (that is the name an agent sees in nvidia-smi and would
+    # target), while the serve parents are lowercase.
+    if echo "\$cmd" | grep -qiE "$PROTECTED"; then hit="\$hit \$pid"; else targets="\$targets \$pid"; fi
+done
+if [ -n "\$hit" ]; then
+    echo "$tool refused: '\$pat' matches another tenant's job on this shared node (PIDs:\$hit)." >&2
+    echo "Never kill processes you did not start. Target your own PIDs explicitly." >&2
+    exit 1
 fi
-exec "$real" "\$@"
+[ -n "\$targets" ] || exit 1                   # nothing matched, as pkill would
+kill \$sig \$targets 2>/dev/null
 GUARD
     chmod +x "$RUN_DIR/bin/$tool"
 done
@@ -169,12 +194,28 @@ if [ "${KBM_SKIP_GRADE:-0}" != "1" ]; then
     if [ -f "$PROBLEM_DIR/solution.py" ]; then
         ( cd "$PROBLEM_DIR" && PATH="$RUN_DIR/bin:$PATH" python3 check.py ) \
             > "$RUN_DIR/check.log" 2>&1 || true
-        ( cd "$PROBLEM_DIR" && PATH="$RUN_DIR/bin:$PATH" python3 benchmark.py ) \
-            > "$RUN_DIR/benchmark.log" 2>&1 || true
+        # Read the VERDICT, not the last line. `tail -1` silently reported a
+        # torchrun traceback separator as the check result on 2026-07-25, and the
+        # cell went on to publish a speedup for a solution that failed
+        # correctness. A grade must never be inferred from whatever text happened
+        # to land last.
+        if grep -qE "^PASS" "$RUN_DIR/check.log"; then
+            CHECK_STATUS=PASS
+        else
+            CHECK_STATUS=FAIL
+        fi
         {
-            echo "check: $(tail -1 "$RUN_DIR/check.log")"
-            # 01 prints peak_fraction (busbw metric); 07/08/09 print speedup.
-            grep -E "peak_fraction:|speedup:|RESULT:" "$RUN_DIR/benchmark.log" || true
+            echo "check: $CHECK_STATUS"
+            if [ "$CHECK_STATUS" = "PASS" ]; then
+                ( cd "$PROBLEM_DIR" && PATH="$RUN_DIR/bin:$PATH" python3 benchmark.py ) \
+                    > "$RUN_DIR/benchmark.log" 2>&1 || true
+                # 01 prints peak_fraction (busbw metric); 07/08/09 print speedup.
+                grep -E "^device:|peak_fraction:|speedup:|RESULT:" "$RUN_DIR/benchmark.log" || true
+            else
+                # No headline at all for an incorrect solution — not even a
+                # labelled one, so nothing downstream can scrape a number here.
+                echo "RESULT: INVALID_CHECK_FAILED"
+            fi
         } | tee -a "$RUN_DIR/meta.log"
     else
         echo "no_solution" | tee -a "$RUN_DIR/meta.log"
