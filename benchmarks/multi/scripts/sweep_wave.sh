@@ -36,6 +36,21 @@ else
     for d in "$DECK"/*/; do PROBLEMS+=("$(basename "$d")"); done
 fi
 
+# Preflight ONCE, before spending a quiet-node window. run_agent.sh also checks,
+# but catching it here fails the wave in one clear line instead of burning every
+# problem in the deck on the same missing binary.
+case ":$PATH:" in *":$HOME/.local/bin:"*) ;; *) PATH="$HOME/.local/bin:$PATH" ;; esac
+export PATH
+case "$HARNESS" in
+    grok)       PREFLIGHT_BIN=grok ;;
+    zai-claude) PREFLIGHT_BIN=claude ;;
+    *)          PREFLIGHT_BIN="$HARNESS" ;;
+esac
+command -v "$PREFLIGHT_BIN" >/dev/null 2>&1 || {
+    echo "[sweep_wave] STOP: harness CLI '$PREFLIGHT_BIN' not on PATH — aborting wave" >&2
+    exit 3
+}
+
 TS="$(date +%Y%m%d_%H%M%S)"
 LOGDIR="$BENCH_ROOT/outputs/launch"
 mkdir -p "$LOGDIR"

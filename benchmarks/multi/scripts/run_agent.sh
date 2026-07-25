@@ -28,6 +28,22 @@ BENCH_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 DECK="$BENCH_ROOT/problems-h100x4"
 [ -d "$DECK/$PROBLEM" ] || { echo "unknown problem: $PROBLEM" >&2; exit 2; }
 
+# Agent CLIs live in ~/.local/bin, which a detached / non-interactive shell does
+# not get from the profile. Without this a whole wave exits 127 in seconds and
+# records four silent `no_solution` rows that look like model failures. Put it on
+# PATH, then fail LOUDLY if the harness binary still is not there. (2026-07-25)
+case ":$PATH:" in *":$HOME/.local/bin:"*) ;; *) PATH="$HOME/.local/bin:$PATH" ;; esac
+export PATH
+case "$HARNESS" in
+    grok)        HARNESS_BIN=grok ;;
+    zai-claude)  HARNESS_BIN=claude ;;
+    *)           HARNESS_BIN="$HARNESS" ;;
+esac
+command -v "$HARNESS_BIN" >/dev/null 2>&1 || {
+    echo "STOP: harness CLI '$HARNESS_BIN' not found on PATH ($PATH)" >&2
+    exit 3
+}
+
 # Every artifact stays in-repo under benchmarks/multi/outputs/ on EVERY machine
 # (AGENTS.md, 2026-07-25) — archives outside the repo are invisible to publish /
 # contamination / re-grade tooling, which is a correctness rule, not tidiness.
