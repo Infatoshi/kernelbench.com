@@ -1649,6 +1649,7 @@ case "$HARNESS" in
                 ANTHROPIC_MODEL
                 ANTHROPIC_DEFAULT_HAIKU_MODEL ANTHROPIC_DEFAULT_SONNET_MODEL
                 ANTHROPIC_DEFAULT_OPUS_MODEL
+                ENABLE_PROMPT_CACHING_1H
             )
             CLAUDE_CONTAINER_EXTRA_CLAUDE_ARGS=(--disallowedTools ExitPlanMode EnterPlanMode AskUserQuestion)
             ( export ANTHROPIC_AUTH_TOKEN="$OPENROUTER_API_KEY" && \
@@ -1656,6 +1657,7 @@ case "$HARNESS" in
                 export ANTHROPIC_API_KEY= && \
                 export ANTHROPIC_BASE_URL="$OR_FABLE_BASE_URL" && \
                 export API_TIMEOUT_MS="${API_TIMEOUT_MS:-3000000}" && \
+                export ENABLE_PROMPT_CACHING_1H="${ENABLE_PROMPT_CACHING_1H:-1}" && \
                 export CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS="${CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS:-1}" && \
                 export CLAUDE_CODE_MAX_RETRIES="${CLAUDE_CODE_MAX_RETRIES:-1000000}" && \
                 export CLAUDE_CODE_MAX_OUTPUT_TOKENS="${CLAUDE_CODE_MAX_OUTPUT_TOKENS:-128000}" && \
@@ -1674,6 +1676,7 @@ case "$HARNESS" in
             export ANTHROPIC_API_KEY= && \
             export ANTHROPIC_BASE_URL="$OR_FABLE_BASE_URL" && \
             export API_TIMEOUT_MS="${API_TIMEOUT_MS:-3000000}" && \
+            export ENABLE_PROMPT_CACHING_1H="${ENABLE_PROMPT_CACHING_1H:-1}" && \
             export CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS="${CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS:-1}" && \
             export CLAUDE_CODE_MAX_RETRIES="${CLAUDE_CODE_MAX_RETRIES:-1000000}" && \
             export CLAUDE_CODE_MAX_OUTPUT_TOKENS="${CLAUDE_CODE_MAX_OUTPUT_TOKENS:-128000}" && \

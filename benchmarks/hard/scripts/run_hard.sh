@@ -1670,6 +1670,15 @@ case "$HARNESS" in
         #   unset ANTHROPIC_API_KEY / CLAUDE_CODE_OAUTH_TOKEN
         #   --model anthropic/claude-fable-5
         #   CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS=1
+        #
+        # ENABLE_PROMPT_CACHING_1H: Claude Code only requests the 1-hour cache
+        # TTL on subscription auth; on API-key auth (this route) it defaults to
+        # 5 minutes. A kernel session stalls far longer than that on its own
+        # grading -- check.py alone measured 319-530s, before compiles and GPU
+        # lock waits -- so the 5m cache expires mid-session and the next turn
+        # re-writes the whole prefix. A 1h write costs 2x input vs 1.25x, so it
+        # pays for itself after ~1.6 avoided re-writes; the 2026-07-24 Opus 5
+        # sweep wrote ~3.3x the theoretical-minimum cache tokens.
         if [ -z "${OPENROUTER_API_KEY:-}" ]; then
             echo "OPENROUTER_API_KEY is required for or-fable" >&2
             exit 1
@@ -1708,6 +1717,7 @@ case "$HARNESS" in
                 export ANTHROPIC_API_KEY= && \
                 export ANTHROPIC_BASE_URL="$OR_FABLE_BASE_URL" && \
                 export API_TIMEOUT_MS="${API_TIMEOUT_MS:-3000000}" && \
+                export ENABLE_PROMPT_CACHING_1H="${ENABLE_PROMPT_CACHING_1H:-1}" && \
                 export CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS="${CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS:-1}" && \
                 export CLAUDE_CODE_MAX_RETRIES="${CLAUDE_CODE_MAX_RETRIES:-1000000}" && \
                 export CLAUDE_CODE_MAX_OUTPUT_TOKENS="${CLAUDE_CODE_MAX_OUTPUT_TOKENS:-128000}" && \
@@ -1726,6 +1736,7 @@ case "$HARNESS" in
             export ANTHROPIC_API_KEY= && \
             export ANTHROPIC_BASE_URL="$OR_FABLE_BASE_URL" && \
             export API_TIMEOUT_MS="${API_TIMEOUT_MS:-3000000}" && \
+            export ENABLE_PROMPT_CACHING_1H="${ENABLE_PROMPT_CACHING_1H:-1}" && \
             export CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS="${CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS:-1}" && \
             export CLAUDE_CODE_MAX_RETRIES="${CLAUDE_CODE_MAX_RETRIES:-1000000}" && \
             export CLAUDE_CODE_MAX_OUTPUT_TOKENS="${CLAUDE_CODE_MAX_OUTPUT_TOKENS:-128000}" && \
