@@ -133,9 +133,18 @@ export const DEFAULT_GPU = "h100"
  *  belong to this board (data paths for it are un-namespaced). */
 export const CANONICAL_GPU = "rtxpro6000"
 
-/** Homepage / deck GPU tabs: H100 → RTX PRO 6000 → B200. */
+/**
+ * Homepage / deck GPU tabs: H100 → RTX PRO 6000 → B200.
+ *
+ * Labels name the exact part, never a bare family name. "H100" alone is
+ * ambiguous in a way that changes the numbers: the PCIe part is HBM2e at
+ * 2.0 TB/s while SXM5 is HBM3 at 3.35 TB/s, so the same kernel scores
+ * ~1.64x differently against the roofline. These boards are graded on the
+ * PCIe part, and the label has to say so. Keep in sync with GPU_LABELS in
+ * scripts/build_model_index.py.
+ */
 export const HOME_GPU_TABS: { key: string; label: string }[] = [
-  { key: "h100", label: "H100" },
+  { key: "h100", label: "H100 PCIe" },
   { key: "rtxpro6000", label: "RTX PRO 6000" },
   { key: "b200", label: "B200" },
 ]
