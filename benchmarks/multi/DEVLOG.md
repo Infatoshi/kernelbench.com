@@ -83,6 +83,29 @@ All three new oracles validated on gloo/cpu and then against an independent NCCL
 implementation at full shapes (the anchor reproduces the oracle exactly on 09,
 which is the real check on the canonical-order design).
 
+**08's anchor was handicapped, which would have inflated every score on it.** The
+first draft passed the causal mask to SDPA as a dense bool `attn_mask` over the
+full gathered context. That is not a slow *baseline*, it is a *mistake*: a dense
+`attn_mask` forces SDPA off the fused kernel onto the score-materializing path
+(for `seq_local=2048, heads=32` the score tensor alone is ~1 GB). Anchoring
+against it would have paid every model a 1.3-2.3x speedup for avoiding an error
+nobody ships, on top of whatever its ring actually earned.
+
+The same mask expressed as **bottom-right causal over the sliced K/V** is exactly
+equivalent and stays fused: rank r owns queries `[r*sl, (r+1)*sl)` and sees keys
+`[0, (r+1)*sl)`, so `kv_len - q_len = r*sl` and the bottom-right convention gives
+`q_i attends k_j for j <= i + r*sl` — the CP mask, unmaterialized. A probe on the
+canonical node confirmed both properties at once: `atol_min` vs the fp32 oracle is
+identical to 4 decimals on all four shapes (same math), and it runs 1.79x / 1.92x /
+1.30x / 2.29x faster. `sota.py` now uses `causal_lower_right`; the mask form stays
+in `reference.py`, where it is the correctness oracle and is never timed.
+
+Worth stating as a rule, because it generalizes past this problem: **an anchor
+must be the fast honest implementation, not merely a correct one.** A frozen
+denominator with an avoidable inefficiency in it silently converts "the model
+avoided a beginner mistake" into "the model wrote a good kernel," and the
+resulting column looks strong for the entire life of the deck.
+
 **The forbidden-op tripwire had a hole the new deck would have walked into.** It
 grepped `solution.py` only. That was survivable when `sota.py` was a stub, but
 07/08/09 each ship a `sota.py` that is a complete working NCCL implementation of
