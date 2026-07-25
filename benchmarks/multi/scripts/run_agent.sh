@@ -59,6 +59,47 @@ WRAP
     chmod +x "$RUN_DIR/bin/$tool"
 done
 
+# Per-run rendezvous port. A single fixed default (29571) meant concurrent
+# sessions collided on bind, and agents reasonably resorted to `fuser -k
+# 29571/tcp` — killing a sibling's grading run to free "their" port. Derive a
+# stable per-run port instead so no two sessions ever contend. (2026-07-25)
+PORT_OFFSET=$(( $(echo "$RUN_ID" | cksum | cut -d' ' -f1) % 400 ))
+export KBM_MASTER_PORT=$(( 29600 + PORT_OFFSET ))
+
+# Co-tenant kill guard. Agents legitimately clean up their own hung torchrun, so
+# this must NOT block self-cleanup — an earlier version keyed on "any match
+# outside my session id" and false-fired on transient shells (including an
+# operator's own `pgrep -af torchrun` monitoring command), which would derail a
+# session. What actually needs protecting is another tenant's running job, so the
+# guard refuses only when a matched process is one of theirs. Sibling KernelBench
+# sessions are handled by running the wave sequentially (sweep_wave.sh), not here.
+PROTECTED="${KBM_PROTECTED_PROCS:-vllm|sglang|trtllm|nanbeige|laguna|dspark|demon/harness}"
+for tool in pkill killall; do
+    real="$(command -v "$tool" 2>/dev/null || true)"
+    [ -n "$real" ] || continue
+    cat > "$RUN_DIR/bin/$tool" <<GUARD
+#!/usr/bin/env bash
+pat=""
+for a in "\$@"; do case "\$a" in -*) ;; *) pat="\$a" ;; esac; done
+if [ -n "\$pat" ]; then
+    hit=""
+    for pid in \$(pgrep -f -- "\$pat" 2>/dev/null); do
+        [ "\$pid" = "\$\$" ] && continue
+        [ -r /proc/\$pid/cmdline ] || continue     # exited between pgrep and read
+        cmd=\$(tr '\0' ' ' < /proc/\$pid/cmdline 2>/dev/null)
+        echo "\$cmd" | grep -qE "$PROTECTED" && hit="\$hit \$pid"
+    done
+    if [ -n "\$hit" ]; then
+        echo "$tool refused: '\$pat' matches another tenant's job on this shared node (PIDs:\$hit)." >&2
+        echo "Never kill processes you did not start. Target your own PIDs explicitly." >&2
+        exit 1
+    fi
+fi
+exec "$real" "\$@"
+GUARD
+    chmod +x "$RUN_DIR/bin/$tool"
+done
+
 PROMPT="$(cat "$PROBLEM_DIR/PROMPT.txt")"
 BUDGET="${BUDGET_SECONDS:-0}"
 TIMEOUT_CMD=()
