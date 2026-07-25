@@ -2,8 +2,10 @@
 
 Machine location: canonical monorepo on the Mac at
 `~/dev/sites/kernelbench.com/benchmarks/mini`. Deck development smokes run on
-anvil's RTX PRO 6000; **the canonical graded GPU is a Lambda H100 SXM5**
-(`gpu_1x_h100_sxm5`), provisioned per sweep via `kb lambda` and torn down after.
+anvil's RTX PRO 6000; **the canonical graded GPU is an H100 SXM** (hardware key
+`H100_SXM`). Any node with that part qualifies: currently the rented **athena**
+(2x H100 80GB HBM3), otherwise a Lambda `gpu_1x_h100_sxm5` provisioned per sweep
+via `kb lambda` and torn down after.
 
 ## Thesis
 
@@ -32,8 +34,8 @@ Three deltas define Mini against Hard:
 
 ## Architecture
 
-- **Eval GPU:** one Lambda H100 SXM5 per sweep. Sessions overlap at moderate
-  concurrency; GPU commands serialize through `outputs/gpu.lock`.
+- **Eval GPU:** an H100 SXM node per sweep. Sessions overlap at moderate
+  concurrency; GPU commands serialize through a per-GPU lock dir.
 - **Inference:** provider APIs where they exist; models without an API are
   served from anvil's RTX PRO 6000 (96 GB, vLLM, OpenAI-compatible) — never on
   the eval GPU, so kernel timings stay clean.
@@ -77,7 +79,7 @@ Numeric stress cases per problem (`src/eval/numeric_stress.py`), `kb lint`
 tripwire, **manual solution+trace audit per published cell** (annotation YAML),
 contamination tripwire before publish, template-mutation guard. 03's exact
 oracle band and 02's linear-in-x semantics shrink the tolerance-gaming surface
-by design. A fresh Lambda node per sweep also shrinks cross-run contamination:
+by design. A fresh eval node per sweep also shrinks cross-run contamination:
 the archive on the node holds only that sweep's runs.
 
 Audit note for 03: the launch-overhead regime plus an exact output makes
@@ -109,8 +111,13 @@ through five agent harnesses at two weight precisions:
   - bf16: `~/dev/liquidai/LFM2.5-2.6B-Agent`, served-model-name
     `lfm25-agent-bf16`
   - NVFP4A16: `~/dev/liquidai/LFM2.5-2.6B-Agent-NVFP4A16`, served-model-name
-    `lfm25-agent-nvfp4` — must launch via the patched `serve_nvfp4.py`
-    entrypoint (plain `vllm serve` breaks the fused w13 weight names)
+    `lfm25-agent-nvfp4` — must launch via `scripts/serve_nvfp4.py`, not plain
+    `vllm serve`. vLLM's `Lfm2Model` maps `.w1`/`.w3` onto the fused `.w13`
+    for unfused checkpoints; this one is already fused, so the rewrite fires on
+    the `.w1` inside `.w13` and dies with "no module or parameter named
+    ...`w133`". The entrypoint drops those two rules (keeping qkv stacking) and
+    hands off to vLLM's CLI. Verified on anvil 2026-07-24: startup completes and
+    generation is coherent, so the weights load rather than loading as garbage.
   - Serve with `--max-model-len 128000` (not the throughput runbook's 8192):
     hermes hard-requires >=64k context and its compression loop crashed the
     session at 65536 ("max compression attempts reached"); at 128000 it runs
@@ -128,11 +135,16 @@ through five agent harnesses at two weight precisions:
 - Full matrix: 2 precisions x 5 harnesses x 4 problems x 5 repeats =
   200 sessions. Precision is encoded in the served model name, so every run
   archive self-describes its weight format.
-- The eval GPU (Lambda H100) never hosts inference; agents on the eval node
-  reach the anvil server via a reverse tunnel. The node is **ares**
-  (`ssh ares`, 2x H100 80GB HBM3 = the SXM part the deck declares); anvil runs
-  `~/.kbmini/tunnel_ares.sh`, which forwards **8765** (vLLM) and **3456**
-  (ccr-rust) into ares and retries on drop.
+- The eval GPU never hosts inference; agents on the eval node reach the anvil
+  server via a reverse tunnel. The node is **athena** (`ssh athena`, 2x H100
+  80GB HBM3 = the SXM part the deck declares); anvil runs
+  `~/.kbmini/tunnel_athena.sh`, which forwards **8765** (vLLM) and **3456**
+  (ccr-rust) into athena and retries on drop.
+- Launch a precision's full matrix with `./scripts/launch_matrix.sh <served
+  model name>` (`KBMINI_GPUS="0 1"`): one worker per harness column, round-robin
+  across GPUs, each GPU its own `KBH_GPU_LOCK_DIR`. Those in-run timings are
+  contended by construction — re-grade with `scripts/regrade_sequential.sh`
+  before any published number.
 
 ## Deck calibration anchor (01_dequant_gemv)
 
