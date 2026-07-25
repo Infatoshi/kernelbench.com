@@ -2,6 +2,64 @@
 
 Newest first. SPEC.md holds the methodology; this holds the journey.
 
+## 2026-07-25 — first wave on the new deck killed itself; sessions now run sequentially
+
+Launched four grok-4.5 sessions concurrently (01/07/08/09) at 08:57 UTC on a
+quiet hades. Three died at 09:28:00, 09:28:10 and 09:28:19 with exit 137, and the
+fourth finished but could not be graded. Nothing external did it — the wave
+killed itself, and the mechanism is worth writing down because the harness looked
+correct right up until it wasn't.
+
+**The chain.** The node-wide GPU lock serializes GPU *commands*. It does not
+partition GPU *memory*, and a session holds its allocations across lock windows,
+so four concurrent sessions meant four resident sets and the node hit CUDA OOM
+(`NVRM: ... NV_ERR_NO_MEMORY`, 09:25-09:26; host RAM was never touched — 13 GB of
+885 used). An agent then looked at `nvidia-smi`, saw "processes holding almost
+full GPU memory (74GB each)", and concluded — correctly, from where it sat — that
+they were leaked from hung kernels. Its cleanup was `pkill -f 'torchrun'` and
+`pkill -f 'worker.py'`. Those patterns match every *sibling* session, so it killed
+the other two runs and itself. Its own trace records the confusion in real time:
+"pkill might have killed the shell", "pkill killed my process maybe?".
+
+The survivor (09) then failed grading with `EADDRINUSE` on port 29571, because
+every session used the same hardcoded rendezvous port — which is also why agents
+had been running `fuser -k 29571/tcp`, i.e. killing each other's grading runs to
+claim a port. Two independent shared-resource bugs feeding the same fire.
+
+**The co-tenant was not hit.** Worth checking rather than assuming, since the box
+is shared: every pattern used was torch-scoped (`worker.py`, `torchrun`,
+`torch.distributed.run`, `test_ar.py`, `torchrun.*29612`) and none can match
+`vllm serve` or `VLLM::EngineCore`. Verified against the grok session store, which
+is the only place the actual bash commands survive — `agent.log` from
+`--output-format streaming-json` carries thoughts and text but no tool calls.
+
+**Fixes.** Sequential execution (`scripts/sweep_wave.sh`) is the real one: it
+removes the memory contention, the sibling kills and the port fight at once, and
+it makes in-run flywheel timings trustworthy instead of contended. Per-run
+rendezvous ports. And a `pkill`/`killall` wrapper that refuses patterns matching
+another tenant's job.
+
+Building that wrapper took two wrong versions, both caught by testing rather than
+by reasoning about it:
+
+1. Keyed on "refuse if a match is outside my session id". It refused *legitimate
+   self-cleanup*, because `pgrep -f` also matches any shell whose command line
+   contains the pattern — including an operator's own `pgrep -af torchrun`
+   monitoring command. A guard that blocks an agent from cleaning up its own hung
+   torchrun is worse than no guard.
+2. Case-sensitive `grep -E "vllm|..."`. The processes actually holding the GPUs
+   are named `VLLM::Worker_TP0..3` in UPPERCASE — precisely the name an agent
+   reads out of `nvidia-smi` and would target — so all four slipped through while
+   only the lowercase `vllm serve` parents matched. `grep -qiE` now, verified
+   against the live PIDs.
+
+The wave's numbers (01 `peak_fraction` 0.2614, 07 `speedup` 1.0261, 08 1.2817)
+are recorded in `results/annotations/20260725_wave_parallel_INVALID.yaml` and are
+**not results** — killed mid-flywheel under contention. 01 landing at 0.2614
+against its earlier clean 0.3057 is the signature of a truncated session, and a
+useful reminder that a contaminated wave can look like a plausible regression
+rather than like an error.
+
 ## 2026-07-25 — deck revision: 6 pure-comm problems → 4, half of them fused
 
 The first clean board (below) exposed a design problem the board itself could not

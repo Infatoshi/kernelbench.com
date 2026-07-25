@@ -194,12 +194,30 @@ because a contended anchor permanently biases an entire column.
 ## Harness / execution model
 
 On-node agent flywheel on the rented 4×H100 (KBH-faithful: implement → profile
-with `nsys`/`ncu` → benchmark → iterate). Cost is bounded by: prebaked image,
-a node-wide 4-GPU lock so concurrent agents stay busy on API latency, a hard
-per-cell wall-clock budget (the metered analog of hard's unlimited time), a
+with `nsys`/`ncu` → benchmark → iterate). Cost is bounded by: prebaked image, a
+hard per-cell wall-clock budget (the metered analog of hard's unlimited time), a
 <2-min fail-fast preflight (deps + 4-GPU all-reduce + NVLink topo/busbw sanity),
 continuous artifact streaming, and a watchdog auto-teardown. See README for the
 Brev run flow.
+
+**Sessions run SEQUENTIALLY — one agent on the node at a time**
+(`scripts/sweep_wave.sh`). This bench cannot borrow hard's "run sessions
+concurrently so they overlap on API latency" trick, and the reason is structural
+rather than incidental. On a single-GPU bench a session's GPU work is one command
+at a time, so a lock around GPU commands is a complete answer. Here every session
+wants all four GPUs and holds device memory ACROSS its lock windows, so a
+command-level lock does not partition memory: N concurrent sessions means N sets
+of resident allocations, and the node OOMs. What follows is worse than a slow
+run — an agent that sees foreign processes holding tens of GB correctly concludes
+they are leaked and kills them by pattern (`pkill -f torchrun`), which matches
+every sibling session. That is not hypothetical; it destroyed the first wave on
+this deck (DEVLOG 2026-07-25).
+
+Two supporting rules follow from the same incident: every run gets its own
+rendezvous port (a shared one made agents `fuser -k` each other's grading runs),
+and `pkill`/`killall` are wrapped to refuse patterns that match another tenant's
+job on a shared node. Waves start behind `scripts/wait_quiet.sh`, which requires
+a sustained idle window rather than a single lucky sample of `nvidia-smi`.
 
 ## Local validation (free, single-GPU)
 
