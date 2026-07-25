@@ -83,6 +83,21 @@ All three new oracles validated on gloo/cpu and then against an independent NCCL
 implementation at full shapes (the anchor reproduces the oracle exactly on 09,
 which is the real check on the canonical-order design).
 
+**The forbidden-op tripwire had a hole the new deck would have walked into.** It
+grepped `solution.py` only. That was survivable when `sota.py` was a stub, but
+07/08/09 each ship a `sota.py` that is a complete working NCCL implementation of
+the problem, copied into the agent's workspace — so `from sota import Model` was a
+two-word solution that passed the grep and scored exactly 1.0 speedup, and a
+`comm.py` helper holding the bare `dist.all_reduce` passed just as easily. The
+scan now covers every agent-authored `.py` in the workspace (immutable benchmark
+files excluded, since `sota.py` legitimately calls what the agent may not) and
+treats importing `sota`/`reference` as its own failure. Verified against four
+cases: anchor re-export, collective hidden in a helper, bare collective in
+`solution.py` (all three caught, each naming the offending file), and an honest
+`batch_isend_irecv` ring in a helper module (passes — P2P is not on the forbidden
+list). All four prompts now state that the restriction follows imports, so an
+honest agent is not blindsided by it.
+
 ## 2026-07-24 — contamination sweep, first clean grok-4.5 board, formula fix
 
 Five grok-4.5 waves ran on hades (waves 1/2 killed externally — see below; wave 3

@@ -112,7 +112,12 @@ Multi-GPU adds hacks that only exist with >1 rank. Each has an automatic gate:
 - **Bare collective call** (the `torch._scaled_mm` analog of this bench). Just
   calling `torch.distributed.all_reduce` defeats the purpose. → per-problem
   `forbidden` list grepped in `check.py`; the movement must be implemented with
-  fine-grained NVLink primitives.
+  fine-grained NVLink primitives. The grep scans **every agent-authored `.py` in
+  the workspace**, not just `solution.py` — a helper module is reachable from the
+  solution, so it is part of it — and importing `sota` or `reference` is itself a
+  fail. Both matter now that three problems ship a `sota.py` that is a complete
+  working NCCL implementation: `from sota import Model` would otherwise pass a
+  solution.py-only grep and score exactly 1.0 speedup.
 
 Plus everything inherited from hard: contamination guard, `kb lint` tripwire, and
 the **mandatory manual + subagent audit** of every published cell. For any

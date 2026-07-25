@@ -110,7 +110,8 @@ if [ "${KBM_SKIP_GRADE:-0}" != "1" ]; then
             > "$RUN_DIR/benchmark.log" 2>&1 || true
         {
             echo "check: $(tail -1 "$RUN_DIR/check.log")"
-            grep -E "peak_fraction:|RESULT:" "$RUN_DIR/benchmark.log" || true
+            # 01 prints peak_fraction (busbw metric); 07/08/09 print speedup.
+            grep -E "peak_fraction:|speedup:|RESULT:" "$RUN_DIR/benchmark.log" || true
         } | tee -a "$RUN_DIR/meta.log"
     else
         echo "no_solution" | tee -a "$RUN_DIR/meta.log"

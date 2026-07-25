@@ -25,16 +25,46 @@ def _world_size(meta: dict) -> int:
     return int(os.environ.get("KBM_WORLD_SIZE", meta.get("world_size", 4)))
 
 
+# Files the agent may not modify and that the tripwire must not scan (scanning
+# them would fail every problem — sota.py and the worker's oracle path legitimately
+# call the collectives the agent is forbidden from calling).
+IMMUTABLE = {"reference.py", "check.py", "benchmark.py", "shapes.py", "sota.py"}
+
+# Importing the anchor or the oracle re-exports a forbidden implementation without
+# the forbidden text ever appearing in solution.py. `from sota import Model` alone
+# would pass a solution.py-only grep and score exactly 1.0 speedup.
+_IMPORT_RE = re.compile(r"^\s*(?:from|import)\s+(?:\.*)(sota|reference)\b", re.M)
+
+
+def _agent_sources(problem_dir: Path) -> list[Path]:
+    """solution.py plus every other agent-authored .py in the workspace.
+
+    A helper module is reachable from solution.py, so it is part of the solution:
+    scanning only solution.py lets `comm.py` hold the bare collective.
+    """
+    out = []
+    for p in sorted(problem_dir.rglob("*.py")):
+        if "__pycache__" in p.parts or p.name in IMMUTABLE:
+            continue
+        out.append(p)
+    return out
+
+
 def _forbidden_check(problem_dir: Path, meta: dict) -> str | None:
     if os.environ.get("KBM_SKIP_FORBIDDEN") == "1":
         return None
     sol = problem_dir / "solution.py"
     if not sol.exists():
         return "no solution.py"
-    src = sol.read_text()
-    for pat in meta.get("forbidden", []):
-        if re.search(re.escape(pat), src):
-            return f"forbidden op used: {pat}"
+    for path in _agent_sources(problem_dir):
+        src = path.read_text(errors="replace")
+        where = "" if path.name == "solution.py" else f" in {path.relative_to(problem_dir)}"
+        m = _IMPORT_RE.search(src)
+        if m:
+            return f"solution imports the {m.group(1)} implementation{where}"
+        for pat in meta.get("forbidden", []):
+            if re.search(re.escape(pat), src):
+                return f"forbidden op used: {pat}{where}"
     return None
 
 
