@@ -227,6 +227,14 @@ done
 # Agent reasoning and file editing can happen in parallel. CUDA-facing work
 # should be serialized so agent-internal check.py/benchmark.py/profiling runs
 # do not contaminate each other's timing or Torch extension builds.
+# Non-login ssh shells do not source ~/.bashrc, so a remote-launched sweep can
+# land here with an empty PATH entry for uv. Failing here silently looks like a
+# finished session in the sweep log; say so instead.
+export PATH="$HOME/.local/bin:$HOME/.bun/bin:$PATH"
+if ! command -v uv >/dev/null 2>&1; then
+    echo "STOP: uv not found on PATH ($PATH). Install uv or fix PATH; this is not an agent failure." >&2
+    exit 3
+fi
 REAL_UV="$(command -v uv)"
 REAL_PYTHON="$(command -v python3 || command -v python)"
 REAL_NVIDIA_SMI="$(command -v nvidia-smi || true)"

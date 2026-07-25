@@ -406,7 +406,11 @@ echo "Problem:    $PROBLEM_NAME"
 echo "Source:     $SOURCE_PROBLEM_DIR"
 echo "Workspace:  $PROBLEM_DIR"
 echo "Archive:    $RUN_DIR"
-echo "Budget:     ${BUDGET_SECONDS}s"
+if [ "$BUDGET_SECONDS" -eq 0 ]; then
+    echo "Budget:     unlimited (no wall-clock cap)"
+else
+    echo "Budget:     ${BUDGET_SECONDS}s"
+fi
 echo "========================================"
 
 START_TIME=$(date +%s)
@@ -508,6 +512,50 @@ case "$HARNESS" in
                 --output-format stream-json \
                 --settings "$CLAUDE_KBH_SETTINGS" \
                 --model "$MINIMAX_CLAUDE_ALIAS" \
+                --disallowedTools ExitPlanMode EnterPlanMode AskUserQuestion \
+                --add-dir "$PROBLEM_DIR" \
+                -p "$PROMPT" ) \
+            > "$LOG_FILE" 2> "$STDERR_FILE" || HARNESS_EXIT=$?
+        ;;
+
+    qwen-claude)
+        # Claude Code routed to Alibaba's Anthropic-compatible endpoint. Default
+        # is the token-plan (ap-southeast-1 MaaS) route with QWEN_API_KEY, where
+        # qwen3.8-max-preview lives. Mirrors the hard bench's branch.
+        #
+        # Concurrency: this endpoint serves ~1 in-flight request per key. At 2
+        # concurrent it drops roughly half, at 3 it drops nearly all, and it
+        # signals overload by resetting the connection rather than returning
+        # HTTP 429 (measured 2026-07-24). One agent session only ever has one
+        # request outstanding, so run Qwen sessions strictly one at a time.
+        QWEN_CLAUDE_KEY="${QWEN_API_KEY:-${DASHSCOPE_API_KEY:-}}"
+        if [ -z "$QWEN_CLAUDE_KEY" ]; then
+            echo "QWEN_API_KEY (or DASHSCOPE_API_KEY) is required for qwen-claude" >&2
+            exit 1
+        fi
+        QWEN_CLAUDE_ALIAS="${QWEN_CLAUDE_ALIAS:-opus}"
+        QWEN_CLAUDE_HAIKU_MODEL="${QWEN_CLAUDE_HAIKU_MODEL:-$MODEL}"
+        ( cd "$PROBLEM_DIR" && \
+            export ANTHROPIC_AUTH_TOKEN="$QWEN_CLAUDE_KEY" && \
+            export ANTHROPIC_BASE_URL="${QWEN_ANTHROPIC_BASE_URL:-https://token-plan.ap-southeast-1.maas.aliyuncs.com/apps/anthropic}" && \
+            export API_TIMEOUT_MS="${API_TIMEOUT_MS:-3000000}" && \
+            export CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC="${CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC:-1}" && \
+            export CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS="${CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS:-1}" && \
+            export CLAUDE_CODE_MAX_RETRIES="${CLAUDE_CODE_MAX_RETRIES:-1000000}" && \
+            export CLAUDE_CODE_MAX_OUTPUT_TOKENS="${CLAUDE_CODE_MAX_OUTPUT_TOKENS:-128000}" && \
+            export ANTHROPIC_MODEL="$MODEL" && \
+            export ANTHROPIC_DEFAULT_HAIKU_MODEL="$QWEN_CLAUDE_HAIKU_MODEL" && \
+            export ANTHROPIC_DEFAULT_SONNET_MODEL="$MODEL" && \
+            export ANTHROPIC_DEFAULT_OPUS_MODEL="$MODEL" && \
+            export ENABLE_TOOL_SEARCH="${ENABLE_TOOL_SEARCH:-false}" && \
+            export CLAUDE_CODE_EFFORT_LEVEL="${CLAUDE_CODE_EFFORT_LEVEL:-max}" && \
+            export CLAUDE_CODE_SUBAGENT_MODEL="$MODEL" && \
+            "${KBH_SBX[@]}" timeout "$BUDGET_SECONDS" claude \
+                --dangerously-skip-permissions \
+                --print --verbose \
+                --output-format stream-json \
+                --settings "$CLAUDE_KBH_SETTINGS" \
+                --model "$QWEN_CLAUDE_ALIAS" \
                 --disallowedTools ExitPlanMode EnterPlanMode AskUserQuestion \
                 --add-dir "$PROBLEM_DIR" \
                 -p "$PROMPT" ) \
@@ -1051,7 +1099,7 @@ JSON
 
     *)
         echo "Unknown harness: $HARNESS" >&2
-        echo "Supported: claude, zai-claude, minimax-claude, kimi-claude, kinetic-claude, or-fable, or-opus, longcat-claude, hy3, deepseek-claude, ccr-claude, codex, kimi, droid, gemini, cursor, grok, opencode, tinker, inkling, opencode-inkling" >&2
+        echo "Supported: claude, zai-claude, minimax-claude, kimi-claude, kinetic-claude, qwen-claude, or-fable, or-opus, longcat-claude, hy3, deepseek-claude, ccr-claude, codex, kimi, droid, gemini, cursor, grok, opencode, tinker, inkling, opencode-inkling" >&2
         exit 1
         ;;
 esac
