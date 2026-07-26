@@ -91,6 +91,10 @@ PASS=0; FAIL=0; SKIP=0
 
 for RUN_DIR in "$@"; do
     RUN_DIR="${RUN_DIR%/}"
+    # Canonicalize: TMPDIR/cache paths are exported from RUN_DIR, and nvcc
+    # resolves a relative TMPDIR against the workspace cwd, not ours --
+    # "nvcc fatal: Could not open output file .../tmp/tmpxft_*" (2026-07-26).
+    RUN_DIR="$(cd "$RUN_DIR" 2>/dev/null && pwd)" || { echo "  SKIP: cannot resolve $RUN_DIR"; SKIP=$((SKIP+1)); continue; }
     RID="$(basename "$RUN_DIR")"
 
     if [ ! -f "$RUN_DIR/result.json" ]; then
