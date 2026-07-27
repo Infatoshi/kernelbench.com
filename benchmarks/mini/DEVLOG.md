@@ -1,5 +1,61 @@
 # KernelBench-Mini — DEVLOG
 
+## 2026-07-25 — first full matrix: LFM2.5-2.6B-Agent bf16, 100 sessions, 0 correct
+
+Eval node moved ares -> **athena** (same SKU, 2x H100 80GB HBM3) at the user's
+call. Bootstrap is now a known quantity: bench rsync, `uv sync`, pi via bun,
+hermes cloned + venv'd at anvil's pinned commit, the three harness config files
+copied from the previous node, and `~/.kbmini/tunnel_athena.sh` on anvil
+forwarding 8765 (vLLM) + 3456 (ccr-rust). About 20 minutes end to end.
+
+**Result: 100/100 sessions, 44 wrote a solution, 0 correct.**
+
+| harness | no_solution | check_failed | other |
+| --- | --- | --- | --- |
+| pi | 5 | 15 | — |
+| lfm-opencode | 9 | 11 | — |
+| lfm-grok | 11 | 9 | — |
+| lfm-claude | 11 | 6 | 3 provider_early_stop |
+| hermes | 16 | 2 | 1 timeout, 1 template_mutated |
+
+The headline is not the zero — a 2.6B model failing a deck that costs a frontier
+model its full 30 minutes is the expected outcome, and the deck's solvability is
+already pinned by the codex anchor. The headline is the **spread in whether the
+model emits a kernel at all**: pi 15/20 vs hermes 2/20 on the same model, same
+problems, same node. Harness scaffolding, not capability, decides three quarters
+of this board. Problem-level counts are flat (10-15 failures each way across all
+four), so no problem is an outlier — which is what makes the harness axis
+readable. This is the argument for the harness-pairing design, and it means the
+first Mini publication is a reliability result, not a performance one.
+
+**The template guard fired for real, first time on this bench.** hermes on
+`02_segmented_decay_scan` overwrote `reference.py` — the correctness oracle —
+with a mock: `Model` returning an empty `Mock` class, decay hardcoded to 0.99,
+resets all zero, and a stray `ners = [get_init_inputs, get_outputs]` at module
+scope. It never wrote `solution.py`. Read as confusion rather than intent (the
+model appears to have thought it was implementing the problem), but the effect
+is identical to grader tampering: had the guard not caught it, the cell would
+have graded a solution against an oracle the model itself wrote. Guard behaved
+correctly — refused to run check.py/benchmark.py, restored the file from the
+snapshot, marked the run `template_mutated`. `template_mutations.log` in the
+archive holds the full diff, which is why the post-hoc workspace looks clean.
+
+Three environment bugs, all found by running rather than by reading:
+
+- **`uv` not on PATH over non-login ssh.** The first launch reported all 100
+  sessions "done" in under a second. `run_hard.sh` did `REAL_UV="$(command -v
+  uv)"` and died on the empty result, which the sweep loop logged as a finished
+  run. A missing toolchain must never be indistinguishable from a completed
+  session: there is now an explicit preflight that exports `~/.local/bin` and
+  fails with `STOP: uv not found on PATH`.
+- **vLLM needs `--enable-auto-tool-choice --tool-call-parser lfm2`.** Without
+  them every harness 400s on its first tool call. The server also has to be
+  re-served at `--max-model-len 128000`; hermes hard-requires >=64k and its
+  compression loop dies at 65536.
+- **Timings from this wave are contended by construction** (five columns, two
+  GPUs, per-GPU lock dirs). mini had been left out of the `regrade_sequential.sh`
+  rollout despite needing it more than the other benches; copied in.
+
 ## 2026-07-24 — ares (2x H100 SXM) is the eval node; deck validated on it
 
 Lambda is no longer the plan: **ares** (`ssh ares`, 2x H100 80GB HBM3,
