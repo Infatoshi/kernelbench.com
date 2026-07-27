@@ -69,7 +69,16 @@ require_idle_gpu() {
         local busy
         # grep -c prints 0 AND exits 1 when nothing matches, so a `|| echo 0`
         # fallback would append a SECOND zero and break the integer test below.
-        busy=$(nvidia-smi -i "$GPU" --query-compute-apps=pid --format=csv,noheader 2>/dev/null | grep -c .)
+        # timeout guard: on a wedged driver nvidia-smi never returns, and an
+        # ungated call here hung a full 11-cell chain for a day (2026-07-26,
+        # node e). A hung probe must fail loudly, not sleep forever.
+        smi_out=$(timeout 15 nvidia-smi -i "$GPU" --query-compute-apps=pid --format=csv,noheader 2>/dev/null)
+        smi_rc=$?
+        if [ "$smi_rc" -eq 124 ]; then
+            echo "FATAL: nvidia-smi timed out -- GPU/driver wedged; reboot the box" >&2
+            exit 3
+        fi
+        busy=$(printf '%s' "$smi_out" | grep -c .)
         busy=${busy:-0}
         if [ "$busy" -eq 0 ]; then
             [ "$waited" -gt 0 ] && echo "    GPU $GPU idle after ${waited}s"
