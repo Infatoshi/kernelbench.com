@@ -792,3 +792,11 @@ optional. They are what makes a post read as signal, not slop.
   delete the drafts and PNGs** so the repo stays clean — labs are using this
   bench seriously and a tree full of one-off post scratch reads as noise. Never
   delete the `.py` generators; regenerate charts by re-running them.
+
+## Harness gotchas (folded from the retired kbh-harness skill, 2026-07-25)
+
+- zsh: quote model strings containing `[]` or `:` (`uv run kbh run claude 'model[x]' 01_fp8_gemm`) - unquoted fails glob expansion.
+- Codex binary: the harness needs `~/.local/node-*/bin/codex`; the shell alias `codex` (Rust binary) does not expand in non-interactive scripts.
+- `KBH_DISABLE_AGENT_CUDA=1` during the agent phase - no CUDA in the agent subprocess.
+- Benchmark ordering: time variant=solution FIRST; `KBH_BENCHMARK_BASELINES=1` is opt-in for baseline runs.
+- Legacy anvil-local sweeps used `KBH_GPU_LOCK` + `gpu-lock-exec` + overnight-compute; current sweeps run on Lambda/Brev and do not need it.

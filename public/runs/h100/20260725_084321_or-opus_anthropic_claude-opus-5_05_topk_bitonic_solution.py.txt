@@ -1,0 +1,936 @@
+"""Custom fused top-k kernel (CUDA C++ via load_inline).
+
+Algorithm
+---------
+One kernel launch total.  grid = (BPR, batch); each block owns a contiguous
+segment of one row.
+
+Values are mapped to order-preserving uint32 keys
+    u = (bits & 0x80000000) ? ~bits : (bits | 0x80000000)
+so that unsigned integer order == float order.  A candidate is the 64-bit
+pack  (u << 32) | index, which sorts by value then index in one compare.
+
+Phase 1 (every block): the segment's keys are loaded straight into RPT
+registers per thread and never leave them.  An *interval select* then narrows
+[lo, hi] onto the KP-th largest key: each pass histograms the 256 bins of the
+current interval, warp-suffix-scans them to find the boundary bin, and
+recurses into it.  The starting interval is not the whole key range but
+[T, M], where M is the block max and T is the smallest of BT/W group maxima --
+with BT/W >= KP groups, T is a provable lower bound on the KP-th largest, and
+seeding the select with it makes the first pass' bins ~1000x finer, so one
+pass is normally enough.  Survivors are compacted with two atomic counters.
+
+Phase 2 (last block per row, found with __threadfence() + an atomic ticket -
+no grid sync, no second launch): re-reads the row's shipped candidates, runs
+the *same* select over them (seeded by the max of the blocks' thresholds), and
+sorts.  A multi-block row ships all CAP survivors unsorted, since phase 2 only
+needs the union of the shipped sets to contain the row's top KP -- that skips
+phase 1's sort and lets CAP exceed KP, which keeps the select to one pass.
+When BPR == 1 phase 1's survivors are already the row's top KP and phase 2 is
+skipped entirely.
+
+Sorting CAP keys is a rank-and-scatter, not a network: the packed keys are
+unique (the index is in the low bits), so counting how many are greater gives
+each key its slot outright, one __ballot_sync per CAP/32 registers.
+
+Dispatch
+--------
+(RPT, CAP, BT) is a template triple, so the host picks a segmentation per
+shape: BPR = ceil(n / (RPT*BT)) blocks per row.  Known shapes carry a frozen
+shortlist (_TABLE); anything else falls back to the full candidate list.
+Either way the winner is decided by measurement at build time (_tune).
+
+The measured quantity on this machine is dominated by CPU launch cost
+(~3.3 us/launch over a ~5.4 us event-pair floor), so the host path is stripped
+down: pre-allocated outputs, a cached result tuple, `__call__ = forward`, and
+CUDA graph replay (guarded by an input-pointer check with a normal-launch
+fallback).  All work is enqueued on the caller's current torch stream.
+"""
+
+import os
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# ---------------------------------------------------------------------------
+# CUDA
+# ---------------------------------------------------------------------------
+
+_CUDA = r'''
+#include <cuda_runtime.h>
+#include <stdint.h>
+
+__device__ __forceinline__ uint32_t fl(uint32_t b) {
+  return (b & 0x80000000u) ? ~b : (b | 0x80000000u);
+}
+__device__ __forceinline__ float ufl(uint32_t u) {
+  uint32_t b = (u & 0x80000000u) ? (u & 0x7fffffffu) : ~u;
+  return __uint_as_float(b);
+}
+
+// State of a partially-narrowed select.  The threshold is known to lie in the
+// key interval [lo, hi]; each pass splits that interval into 256 bins and keeps
+// the one the threshold falls in, so the interval shrinks 256-fold per pass.
+//   above   = keys already known to be > hi   (all certainly in the top KP)
+//   need    = KP - above  slots still owed, to be taken from [lo, hi]
+//   sortall = the survivors are few enough that they all fit the sort buffer
+struct Sel { uint32_t lo, hi; int above, need; bool sortall; };
+
+// Boundary bin of a completed 256-bin histogram: the highest bin whose suffix
+// sum still covers `need`.  Returns that bin's count and the count above it.
+template<int BT>
+__device__ __forceinline__ void hscan(
+    const uint32_t* __restrict__ hist, uint32_t* s_suf, uint32_t* s_wtot,
+    uint32_t* s_mask, int need, uint32_t& o_b, uint32_t& o_hb, uint32_t& o_hi)
+{
+  const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+  uint32_t c = 0u;                    // the scan is 256 bins wide whatever BT
+  if (BT == 256 || tid < 256) {
+    c = hist[tid];
+    #pragma unroll
+    for (int d = 1; d < 32; d <<= 1) {
+      uint32_t v = __shfl_down_sync(0xffffffffu, c, d);
+      if (lane + d < 32) c += v;
+    }
+    if (lane == 0) s_wtot[warp] = c;
+  }
+  __syncthreads();
+
+  if (BT == 256 || tid < 256) {
+    uint32_t S = c;
+    #pragma unroll
+    for (int w = 0; w < 8; ++w) if (w > warp) S += s_wtot[w];
+    s_suf[tid] = S;
+    uint32_t m = __ballot_sync(0xffffffffu, S >= (uint32_t)need);
+    if (lane == 0) s_mask[warp] = m;
+  }
+  __syncthreads();
+
+  uint32_t b = 0;
+  #pragma unroll
+  for (int w = 0; w < 8; ++w) {
+    uint32_t mm = s_mask[w];
+    if (mm) b = (uint32_t)((w << 5) + (31 - __clz((int)mm)));
+  }
+  o_b = b; o_hb = hist[b]; o_hi = s_suf[b] - hist[b];
+}
+
+// Narrow [lo, hi] until at most CAP keys remain at or above the threshold (one
+// bitonic sort then finishes the job), or until the interval is a single key
+// value (exact ties).  Bin width is (hi-lo)/256 rounded up to a power of two,
+// so a caller that starts from a tight interval normally needs ONE pass; a
+// caller that starts from the whole key range degenerates to a byte-at-a-time
+// radix select, which for iid data is two.
+// The CALLER owns the first clear of hist: it has a barrier of its own to hide
+// it under (the one that publishes lo0/hi0), so the common one-pass select needs
+// no clear-and-publish at all.
+#define TK_SEL_BODY(ACCUM)                                                    \
+  const int tid = threadIdx.x;                                                \
+  Sel z; z.lo = lo0; z.hi = hi0; z.above = 0; z.need = KP; z.sortall = false;  \
+  bool zeroed = true;                                                         \
+  for (;;) {                                                                  \
+    const uint32_t span = z.hi - z.lo;                                        \
+    const int sh = (span < 256u) ? 0 : (24 - __clz((int)span));               \
+    if (!zeroed) {                                                            \
+      if (BT == 256 || tid < 256) hist[tid] = 0u;                              \
+      __syncthreads();                                                        \
+    }                                                                         \
+    zeroed = false;                                                           \
+    ACCUM                                                                     \
+    __syncthreads();                                                          \
+    uint32_t bb, hb, hgt;                                                     \
+    hscan<BT>(hist, s_suf, s_wtot, s_mask, z.need, bb, hb, hgt);              \
+    z.above += (int)hgt; z.need -= (int)hgt;                                  \
+    z.lo += bb << sh;                                                         \
+    z.hi = z.lo + ((1u << sh) - 1u);                                          \
+    if (z.above + (int)hb <= CAP) { z.sortall = true; break; }                \
+    if (sh == 0) break;                                                       \
+    __syncthreads();                                                          \
+  }                                                                           \
+  return z;
+
+template<int RPT, int CAP, int BT>
+__device__ __forceinline__ Sel sel_reg(
+    const uint32_t* r, int KP, uint32_t lo0, uint32_t hi0, uint32_t* hist,
+    uint32_t* s_suf, uint32_t* s_wtot, uint32_t* s_mask)
+{
+  TK_SEL_BODY(
+    _Pragma("unroll")
+    for (int j = 0; j < RPT; ++j) {
+      const uint32_t u = r[j];
+      if (u >= z.lo && u <= z.hi) atomicAdd(&hist[(u - z.lo) >> sh], 1u);
+    })
+}
+
+template<int CAP, int BT>
+__device__ __forceinline__ Sel sel_sh(
+    const uint32_t* __restrict__ s_u, int nslot, int KP, uint32_t lo0,
+    uint32_t hi0, uint32_t* hist, uint32_t* s_suf, uint32_t* s_wtot,
+    uint32_t* s_mask)
+{
+  TK_SEL_BODY(
+    for (int i = tid; i < nslot; i += BT) {
+      const uint32_t u = s_u[i];
+      if (u >= z.lo && u <= z.hi) atomicAdd(&hist[(u - z.lo) >> sh], 1u);
+    })
+}
+
+// Bitonic sort of R*32 packed keys held in registers of one warp, ascending.
+// Element p = r*32 + lane.
+template<int R>
+__device__ __forceinline__ void warp_sort_asc(unsigned long long* s) {
+  const int lane = threadIdx.x & 31;
+  const int N = R * 32;
+  unsigned long long a[R];
+  #pragma unroll
+  for (int r = 0; r < R; ++r) a[r] = s[r * 32 + lane];
+  #pragma unroll
+  for (int size = 2; size <= N; size <<= 1) {
+    #pragma unroll
+    for (int stride = size >> 1; stride > 0; stride >>= 1) {
+      #pragma unroll
+      for (int r = 0; r < R; ++r) {
+        const int p = r * 32 + lane;
+        const bool up = ((p & size) == 0);
+        if (stride >= 32) {
+          const int rp = r ^ (stride >> 5);
+          if (rp > r) {
+            unsigned long long xx = a[r], yy = a[rp];
+            if ((xx > yy) == up) { a[r] = yy; a[rp] = xx; }
+          }
+        } else {
+          unsigned long long yy = __shfl_xor_sync(0xffffffffu, a[r], stride);
+          const bool low = ((p & stride) == 0);
+          a[r] = (up == low) ? (a[r] < yy ? a[r] : yy) : (a[r] > yy ? a[r] : yy);
+        }
+      }
+    }
+  }
+  #pragma unroll
+  for (int r = 0; r < R; ++r) s[r * 32 + lane] = a[r];
+}
+
+// Sort the CAP packed keys of s_buf into s_srt by rank-and-scatter.  Every key
+// is unique (its element index occupies the low 32 bits), so counting how many
+// keys are greater gives each one its final slot outright.  Each lane keeps
+// CAP/32 of the keys in registers, and a warp ranks one key with one ballot per
+// register -- so the whole permutation costs CAP/(BT/32) rounds of a ballot,
+// against a bitonic network's 15-21 serial shuffle stages in a single warp.
+// Reads and writes go to different buffers, so no barrier is needed inside.
+template<int CAP, int BT>
+__device__ __forceinline__ void rank_sort(const unsigned long long* s_buf,
+                                          unsigned long long* s_srt) {
+  const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+  const int NW = BT / 32, NR = CAP / 32, NE = (CAP + NW - 1) / NW;
+  unsigned long long c[NR];
+  #pragma unroll
+  for (int p = 0; p < NR; ++p) c[p] = s_buf[p * 32 + lane];
+  #pragma unroll
+  for (int q = 0; q < NE; ++q) {
+    const int e = warp + q * NW;                     // warp-uniform: no ballot
+    if (e < CAP) {                                   // ever splits a warp
+      const unsigned long long mine = s_buf[e];
+      int rank = 0;
+      #pragma unroll
+      for (int p = 0; p < NR; ++p)
+        rank += __popc(__ballot_sync(0xffffffffu, c[p] > mine));
+      if (lane == 0) s_srt[CAP - 1 - rank] = mine;
+    }
+  }
+}
+
+template<int RPT, int CAP, int BT>
+__global__ __launch_bounds__(BT) void topk_kernel(
+    const float* __restrict__ x, float* __restrict__ ov, long long* __restrict__ oi,
+    unsigned long long* __restrict__ scratch, unsigned int* __restrict__ ctr,
+    int n, int k, int KP, int BPR, int NC, int NSLOT, int W)
+{
+  extern __shared__ __align__(16) unsigned char smem[];
+  unsigned long long* s_buf = (unsigned long long*)smem;   // CAP  survivors
+  unsigned long long* s_srt = s_buf + CAP;                 // CAP  sorted
+  uint32_t* s_u    = (uint32_t*)(s_srt + CAP);             // NSLOT (phase 2)
+  uint32_t* s_ix   = s_u + NSLOT;                          // NSLOT (phase 2)
+  uint32_t* hist   = s_ix + NSLOT;                         // 256
+  uint32_t* s_suf  = hist + 256;                           // 256
+  uint32_t* s_wtot = s_suf + 256;                          // 8
+  uint32_t* s_mask = s_wtot + 8;                           // 8
+  uint32_t* s_misc = s_mask + 8;                           // 8
+
+  const int tid = threadIdx.x;
+  const int row = blockIdx.y, bx = blockIdx.x;
+  // Phase 2 only needs the UNION of the shipped sets to contain the row's top
+  // KP, so a block may ship any superset of its own top KP in any order: all
+  // CAP survivors, unsorted.  That buys two things -- phase 1 never sorts, and
+  // CAP can exceed KP, which is what lets the select stop after one pass (with
+  // CAP == KP its stop test "above + hb <= CAP" can only fire on the knife edge
+  // above + hb == KP, so a second pass was the common case).
+  const int SEG = RPT * BT;
+  const int base = bx * SEG;
+  const int seg  = (bx == BPR - 1) ? (n - base) : SEG;
+  const float* __restrict__ xp = x + (long long)row * (long long)n + base;
+
+  // ---------------- phase 1: segment -> KP candidates ----------------
+  // Keys live in registers for the whole select; the tail block pads with 0,
+  // which can never be selected because every real key is >= 1.
+  // Everything shared that the select and the compaction need cleared is
+  // cleared before the loads are even issued, so the barrier that publishes the
+  // bounds publishes all of it: no pass of the select and no compaction pays
+  // for a clear (or a barrier) of its own.  s_misc[5..6] are the bound slots.
+  if (tid < 256) hist[tid] = 0u;
+  for (int i = tid; i < CAP; i += BT) s_buf[i] = 0ull;
+  if (tid < 8) s_misc[tid] = (tid == 5) ? 0xFFFFFFFFu : 0u;
+
+  uint32_t r[RPT];
+  if (seg == SEG) {
+    #pragma unroll
+    for (int j = 0; j < RPT; ++j) r[j] = fl(__float_as_uint(xp[tid + j * BT]));
+  } else {
+    #pragma unroll
+    for (int j = 0; j < RPT; ++j) {
+      const int i = tid + j * BT;
+      r[j] = (i < seg) ? fl(__float_as_uint(xp[i])) : 0u;
+    }
+  }
+
+  // ---- starting interval for the select ----
+  // Split the block's threads into BT/W groups of W and let T be the smallest
+  // of the group maxima.  Every group max is a distinct key >= T and there are
+  // BT/W >= KP of them, so the KP-th largest key of the segment is >= T; M is
+  // the block max.  Handing the select the interval [T, M] instead of the whole
+  // key range makes its bins ~1000x finer, which is what turns two passes into
+  // one.  The per-key work is a register max that hides under the loads.
+  uint32_t T = 0u, M = 0xFFFFFFFFu;
+  if (W) {
+    uint32_t m = r[0];
+    #pragma unroll
+    for (int j = 1; j < RPT; ++j) m = m > r[j] ? m : r[j];
+    for (int d = 1; d < W; d <<= 1) {
+      const uint32_t o = __shfl_xor_sync(0xffffffffu, m, d);
+      m = m > o ? m : o;
+    }
+    __syncthreads();
+    if ((tid & (W - 1)) == 0) {
+      atomicMin(&s_misc[5], m);
+      atomicMax(&s_misc[6], m);
+    }
+    __syncthreads();
+    T = s_misc[5] > 1u ? s_misc[5] : 1u;   // 1: the tail block's 0 padding
+    M = s_misc[6] > T ? s_misc[6] : T;     // a group of pure padding gives T=1
+  } else {
+    __syncthreads();                       // no bounds, but still publish the clears
+  }
+
+  Sel z = sel_reg<RPT, CAP, BT>(r, KP, T, M, hist, s_suf, s_wtot, s_mask);
+
+  if (z.sortall) {
+    #pragma unroll
+    for (int j = 0; j < RPT; ++j) {
+      const uint32_t u = r[j];
+      if (u >= z.lo) {
+        const uint32_t p = atomicAdd(&s_misc[0], 1u);
+        const int i = tid + j * BT;
+        if (p < (uint32_t)CAP)
+          s_buf[p] = ((unsigned long long)u << 32) | (unsigned)(base + (i < seg ? i : 0));
+      }
+    }
+  } else {
+    #pragma unroll
+    for (int j = 0; j < RPT; ++j) {
+      const uint32_t u = r[j];
+      const int i = tid + j * BT;
+      const unsigned long long key =
+          ((unsigned long long)u << 32) | (unsigned)(base + (i < seg ? i : 0));
+      if (u > z.lo) {
+        const uint32_t p = atomicAdd(&s_misc[0], 1u);
+        if (p < (uint32_t)KP) s_buf[p] = key;
+      } else if (u == z.lo) {
+        const uint32_t p = atomicAdd(&s_misc[1], 1u);
+        if (p < (uint32_t)z.need) s_buf[z.above + p] = key;
+      }
+    }
+  }
+  __syncthreads();
+  if (BPR == 1) { rank_sort<CAP, BT>(s_buf, s_srt); __syncthreads(); }
+
+  // ---------------- cross-block handshake ----------------
+  if (BPR > 1) {
+    unsigned long long* dst = scratch + (long long)row * NC + (long long)bx * CAP;
+    for (int i = tid; i < CAP; i += BT) dst[i] = s_buf[i];
+    // z.lo has at least KP of this block's keys at or above it, so the largest
+    // z.lo over the blocks is a lower bound on the KP-th largest of the row --
+    // the same quality of bound as the sorted candidates would give, but it
+    // costs one atomic instead of ordering the candidates first.
+    if (tid == 0) {
+      atomicMax(&ctr[row * 4 + 1], z.lo);
+      atomicMax(&ctr[row * 4 + 2], M);
+    }
+    __threadfence();
+    __syncthreads();
+    if (tid == 0) {
+      volatile unsigned int* vctr = (volatile unsigned int*)ctr;
+      unsigned int old = atomicAdd(&ctr[row * 4], 1u);
+      unsigned int last = (old == (unsigned)(BPR - 1)) ? 1u : 0u;
+      if (last) {                       // race-free: all BPR blocks have ticked
+        vctr[row * 4] = 0u;
+        s_misc[3] = vctr[row * 4 + 1];
+        s_misc[4] = vctr[row * 4 + 2];
+        vctr[row * 4 + 1] = 0u;
+        vctr[row * 4 + 2] = 0u;
+      }
+      s_misc[2] = last;
+    }
+    __syncthreads();
+    if (s_misc[2] == 0u) return;
+
+    // ---------------- phase 2: BPR*KP candidates -> top KP ----------------
+    const volatile unsigned long long* src =
+        (const volatile unsigned long long*)(scratch + (long long)row * NC);
+    const uint32_t T2 = s_misc[3] > 1u ? s_misc[3] : 1u;
+    const uint32_t M2 = s_misc[4] > T2 ? s_misc[4] : T2;
+    for (int i = tid; i < NC; i += BT) {
+      unsigned long long key = src[i];
+      s_u[i]  = (uint32_t)(key >> 32);
+      s_ix[i] = (uint32_t)key;
+    }
+    if (tid < 256) hist[tid] = 0u;                 // ditto: this phase's clears
+    for (int i = tid; i < CAP; i += BT) s_buf[i] = 0ull;
+    if (tid < 2) s_misc[tid] = 0u;
+    __syncthreads();
+
+    z = sel_sh<CAP, BT>(s_u, NC, KP, T2, M2, hist, s_suf, s_wtot, s_mask);
+
+    if (z.sortall) {
+      for (int i = tid; i < NC; i += BT) {
+        const uint32_t u = s_u[i];
+        if (u >= z.lo) {
+          const uint32_t p = atomicAdd(&s_misc[0], 1u);
+          if (p < (uint32_t)CAP) s_buf[p] = ((unsigned long long)u << 32) | s_ix[i];
+        }
+      }
+    } else {
+      for (int i = tid; i < NC; i += BT) {
+        const uint32_t u = s_u[i];
+        const unsigned long long key = ((unsigned long long)u << 32) | s_ix[i];
+        if (u > z.lo) {
+          const uint32_t p = atomicAdd(&s_misc[0], 1u);
+          if (p < (uint32_t)KP) s_buf[p] = key;
+        } else if (u == z.lo) {
+          const uint32_t p = atomicAdd(&s_misc[1], 1u);
+          if (p < (uint32_t)z.need) s_buf[z.above + p] = key;
+        }
+      }
+    }
+    __syncthreads();
+    rank_sort<CAP, BT>(s_buf, s_srt);
+    __syncthreads();
+  }
+
+  // ---------------- emit top k (descending) ----------------
+  for (int j = tid; j < k; j += BT) {
+    unsigned long long key = s_srt[CAP - 1 - j];
+    ov[(long long)row * k + j] = ufl((uint32_t)(key >> 32));
+    oi[(long long)row * k + j] = (long long)(uint32_t)key;
+  }
+}
+
+// ---------------------------------------------------------------------------
+
+struct TKCfg { int n, k, KP, RPT, CAP, BT, BPR, NC, NSLOT, W, batch;
+               size_t shmem; };
+
+template<int RPT, int CAP, int BT>
+static void tk_go(bool attr_only, const void* x, void* v, void* i, void* scratch,
+                  void* ctr, const TKCfg& c, cudaStream_t st) {
+  if (attr_only) {
+    if (c.shmem > 48 * 1024)
+      cudaFuncSetAttribute(topk_kernel<RPT, CAP, BT>,
+                           cudaFuncAttributeMaxDynamicSharedMemorySize, (int)c.shmem);
+    return;
+  }
+  topk_kernel<RPT, CAP, BT><<<dim3(c.BPR, c.batch), BT, c.shmem, st>>>(
+      (const float*)x, (float*)v, (long long*)i,
+      (unsigned long long*)scratch, (unsigned int*)ctr,
+      c.n, c.k, c.KP, c.BPR, c.NC, c.NSLOT, c.W);
+}
+
+// (RPT, CAP) are compile time; KP rides along as a plain argument.
+// Returns false when the host asked for an (RPT, CAP) that was never
+// instantiated -- the caller MUST treat that as an error.  An earlier version
+// fell off the end of this switch instead, which launched nothing at all and
+// was invisible: the output buffers kept their previous (plausible) contents
+// and the autotuner happily ranked the do-nothing config fastest.
+#define TK_CAPS(RPT, BT)                                                      \
+  switch (c.CAP) {                                                            \
+    case  32: tk_go<RPT,  32, BT>(a, x, v, i, s, ct, c, st); return true;      \
+    case  64: tk_go<RPT,  64, BT>(a, x, v, i, s, ct, c, st); return true;      \
+    case 128: tk_go<RPT, 128, BT>(a, x, v, i, s, ct, c, st); return true;      \
+    default:  return false;                                                   \
+  }
+
+bool tk_dispatch(bool a, const void* x, void* v, void* i, void* s, void* ct,
+                 const TKCfg& c, cudaStream_t st) {
+  if (c.CAP > 128) {                 // k > 128: correctness fallback, one shape
+    if (c.CAP != 256 || c.RPT != 8 || c.BT != 256) return false;
+    tk_go<8, 256, 256>(a, x, v, i, s, ct, c, st);
+    return true;
+  }
+  // keep in sync with _BTRPT in python
+  if (c.BT == 256) switch (c.RPT) {
+    case  4: TK_CAPS( 4, 256)
+    case  5: TK_CAPS( 5, 256)
+    case  6: TK_CAPS( 6, 256)
+    case  8: TK_CAPS( 8, 256)
+    case 10: TK_CAPS(10, 256)
+    case 12: TK_CAPS(12, 256)
+    case 16: TK_CAPS(16, 256)
+    case 20: TK_CAPS(20, 256)
+    case 24: TK_CAPS(24, 256)
+    case 32: TK_CAPS(32, 256)
+    case 40: TK_CAPS(40, 256)
+    case 48: TK_CAPS(48, 256)
+    case 56: TK_CAPS(56, 256)
+    case 64: TK_CAPS(64, 256)
+    default: return false;
+  }
+  if (c.BT == 512) switch (c.RPT) {
+    case  4: TK_CAPS( 4, 512)
+    case  8: TK_CAPS( 8, 512)
+    case 12: TK_CAPS(12, 512)
+    case 16: TK_CAPS(16, 512)
+    case 24: TK_CAPS(24, 512)
+    case 32: TK_CAPS(32, 512)
+    default: return false;
+  }
+  if (c.BT == 1024) switch (c.RPT) {
+    case  2: TK_CAPS( 2, 1024)
+    case  4: TK_CAPS( 4, 1024)
+    case  6: TK_CAPS( 6, 1024)
+    case  8: TK_CAPS( 8, 1024)
+    case 12: TK_CAPS(12, 1024)
+    case 16: TK_CAPS(16, 1024)
+    default: return false;
+  }
+  return false;
+}
+'''
+
+_CPP = r'''
+#include <torch/extension.h>
+#include <c10/cuda/CUDAStream.h>
+#include <cuda_runtime.h>
+
+struct TKCfg { int n, k, KP, RPT, CAP, BT, BPR, NC, NSLOT, W, batch;
+               size_t shmem; };
+bool tk_dispatch(bool attr_only, const void* x, void* v, void* i, void* scratch,
+                 void* ctr, const TKCfg& c, cudaStream_t st);
+
+namespace {
+
+struct Plan {
+  TKCfg c;
+  void *vp, *ip, *sp, *cp;
+  torch::Tensor v, i, scratch, ctr;
+  py::object result;
+
+  Plan(torch::Tensor v_, torch::Tensor i_, torch::Tensor s_, torch::Tensor c_,
+       int n, int k, int KP, int RPT, int CAP, int BT, int BPR, int NC,
+       int NSLOT, int W, int batch, int64_t shmem)
+      : v(v_), i(i_), scratch(s_), ctr(c_) {
+    c.n = n; c.k = k; c.KP = KP; c.RPT = RPT; c.CAP = CAP; c.BT = BT;
+    c.BPR = BPR; c.NC = NC; c.NSLOT = NSLOT; c.W = W; c.batch = batch;
+    c.shmem = (size_t)shmem;
+    vp = v.data_ptr(); ip = i.data_ptr();
+    sp = scratch.numel() ? scratch.data_ptr() : nullptr;
+    cp = ctr.numel() ? ctr.data_ptr() : nullptr;
+    result = py::make_tuple(v, i);
+    TORCH_CHECK(tk_dispatch(true, nullptr, nullptr, nullptr, nullptr, nullptr,
+                            c, nullptr),
+                "topk: no kernel instantiated for RPT=", RPT, " CAP=", CAP,
+                " BT=", BT);
+  }
+
+  // launches on the caller's current stream (capturable by torch.cuda.graph)
+  void launch(const torch::Tensor& x) {
+    TORCH_CHECK(tk_dispatch(false, x.data_ptr(), vp, ip, sp, cp, c,
+                            at::cuda::getCurrentCUDAStream()),
+                "topk: no kernel instantiated for RPT=", c.RPT,
+                " CAP=", c.CAP, " BT=", c.BT);
+  }
+  py::object call(const torch::Tensor& x) {
+    launch(x);
+    return result;
+  }
+  py::object res() { return result; }
+};
+
+}  // namespace
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+  py::class_<Plan>(m, "Plan")
+      .def(py::init<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
+                    int, int, int, int, int, int, int, int, int, int, int,
+                    int64_t>())
+      .def("launch", &Plan::launch)
+      .def("call", &Plan::call)
+      .def("res", &Plan::res);
+}
+'''
+
+
+# ---------------------------------------------------------------------------
+# host-side configuration
+# ---------------------------------------------------------------------------
+
+_NSM = 132          # H100 PCIe
+# Phase-2 candidate cap.  Raising it past 4096 only unlocks configs that split
+# a row into more, smaller segments; measured on shape0 (n=131072, k=64) every
+# one of those loses by 1.5-3 us -- the single phase-2 block grows faster than
+# the extra phase-1 parallelism pays back.
+_MAX_NC = 4096
+_KEEP = 10          # candidates that survive the autotuner's screening round
+# Registers of keys per thread; SEG = RPT*BT elements per block.  The large
+# values exist so that a whole row can fit in ONE block: BPR==1 skips the
+# cross-block handoff entirely (threadfence + ticket + a single block merging
+# every other block's candidates), and for every row count that already fills
+# the machine that handoff's serial latency costs more than the extra
+# parallelism buys -- n=16384 x 32 rows measures 1.6-1.9 us worse at BPR>=2.
+# RPT=64 is 64 regs/thread of keys at BT=256, still 4 blocks/SM.
+_RPTS = (4, 5, 6, 8, 10, 12, 16, 20, 24, 32, 40, 48, 56, 64)
+_CAPS = (32, 64, 128)                          # ditto (256 = k>128 fallback)
+# Threads per block.  A block owns one segment, so with batch=1 and n=131072
+# only BPR = 32-64 blocks exist at all: at BT=256 that is 8 warps on each of 32
+# SMs (12.5% occupancy, 100 SMs idle) and the select is latency- not
+# throughput-bound.  Wider blocks are the only way to fill an SM when the row
+# count is small, so BT joins (rpt, cap) as a tuned dimension.  Keep in sync
+# with tk_dispatch.
+_BTRPT = ((256, _RPTS),
+          (512, (4, 8, 12, 16, 24, 32)),
+          (1024, (2, 4, 6, 8, 12, 16)))
+
+# Frozen (rpt, cap, bt) shortlists, best first, keyed by (batch, n, k).
+#
+# _tune has to be cheap enough to run at build time, and its verdict over ~75
+# candidates lands inside this machine's run-to-run drift: two byte-identical
+# modules tuned in the same process picked different configs on 3 of 5 shapes,
+# and the loser cost 1-2% of the geomean -- more than any code change measured
+# here.  So the ranking is done offline instead (scratch/csweep.py: 8 screening
+# then 60 paired iterations per candidate) and only the survivors are kept.
+# _tune still races them, because the top few are usually a statistical tie and
+# the local machine gets the last word; it just can no longer pick a loser.
+_TABLE = {
+    (1, 131072, 64): ((8, 64, 512), (4, 128, 1024), (8, 128, 1024)),
+    (64, 8192, 8):   ((16, 32, 1024), (8, 32, 1024), (32, 64, 512)),
+    (32, 16384, 32): ((16, 64, 1024), (32, 64, 512), (16, 128, 1024)),
+    (16, 12000, 16): ((12, 32, 1024), (12, 64, 1024), (6, 32, 256)),
+    (128, 4096, 1):  ((16, 32, 256), (8, 32, 512), (8, 64, 512)),
+}
+# force a single (rpt, cap) candidate, keyed by (batch, n, k) -- skips autotune
+_OVERRIDE = {}
+_TUNE = os.environ.get("TOPK_TUNE", "1") != "0"
+_USE_TABLE = os.environ.get("TOPK_TABLE", "1") != "0"
+
+
+def _wsz(bt, KP):
+    """Threads per bound group: the largest power of two <= min(32, BT/KP).
+
+    BT/W groups each hand the select one witness key >= T, and BT/W >= KP is
+    what makes T a valid lower bound on the KP-th largest.  Wider groups mean a
+    tighter T (a narrower starting interval); 32 is the shuffle-group limit.
+    0 disables the bound -- KP too large for KP groups to exist.
+    """
+    if KP < 1 or KP > bt // 2:
+        return 0
+    w, lim = 1, min(32, bt // KP)
+    while w * 2 <= lim:
+        w *= 2
+    return w
+
+
+def _cands(batch, n, k):
+    """Every viable (rpt, cap) config, cheapest-looking first."""
+    KP = k
+    if k > 128:                      # correctness fallback: one instantiation
+        caps, rpts = (256,), (8,)
+    else:
+        caps = tuple(c for c in _CAPS if c >= KP)
+        rpts = _RPTS
+    bts = _BTRPT if k <= 128 else ((256, (8,)),)
+    ov = _OVERRIDE.get((batch, n, k))
+    if ov is not None:
+        rpts, caps = (ov[0],), (ov[1],)
+        if len(ov) > 2:
+            bts = ((ov[2], (ov[0],)),)
+    out = []
+    for bt, btrpts in bts:
+        for rpt in (r for r in btrpts if r in rpts):
+            SEG = bt * rpt
+            BPR = max(1, (n + SEG - 1) // SEG)
+            W = _wsz(bt, KP)
+            total = BPR * batch
+            waves = (total + _NSM - 1) // _NSM
+            # single-phase first (no cross-block merge at all), then one full
+            # wave, then fewer phase-2 candidates.  Only the default when
+            # autotuning is unavailable -- _tune re-ranks these by measurement.
+            score = (8.0 if BPR > 1 else 0.0) + (waves - 1) * 4.0 \
+                + abs(1.0 - total / float(min(_NSM * waves, _NSM)))
+            for cap in caps:
+                # a multi-block row ships all CAP survivors, not just KP
+                NC = BPR * cap
+                if NC > _MAX_NC:
+                    continue
+                NSLOT = NC if BPR > 1 else 0
+                shmem = cap * 16 + 2 * NSLOT * 4 + 256 * 4 + 256 * 4 + 3 * 8 * 4
+                if shmem > 200 * 1024:
+                    continue
+                # smallest viable CAP first: a wider CAP both sorts more keys
+                # and ships more of them, and cap=128 measures ~1 us worse than
+                # cap=64 at k=64 for the same segmentation.
+                out.append((score, NC, cap, rpt, bt,
+                            dict(n=n, k=k, KP=KP, RPT=rpt, CAP=cap, BT=bt,
+                                 SEG=SEG, BPR=BPR, NC=NC, NSLOT=NSLOT, W=W,
+                                 batch=batch, shmem=shmem)))
+    assert out, f"no config for n={n} k={k}"
+    out.sort(key=lambda t: t[:5])
+    out = [t[5] for t in out]
+    tab = _TABLE.get((batch, n, k)) if (_USE_TABLE and ov is None) else None
+    if tab:                          # measured shortlist wins over the heuristic
+        rank = {t: j for j, t in enumerate(tab)}
+        short = sorted((c for c in out
+                        if (c["RPT"], c["CAP"], c["BT"]) in rank),
+                       key=lambda c: rank[(c["RPT"], c["CAP"], c["BT"])])
+        if short:
+            return short
+    return out
+
+
+def _cfg(batch, n, k):
+    return _cands(batch, n, k)[0]
+
+
+# ---------------------------------------------------------------------------
+# extension build (cached across shapes)
+# ---------------------------------------------------------------------------
+
+_EXT = None
+
+
+def _ext():
+    global _EXT
+    if _EXT is None:
+        inc = []
+        try:
+            import pybind11
+            inc.append(pybind11.get_include())
+        except Exception:
+            pass
+        _EXT = load_inline(
+            name="topk_bitonic_ext",
+            cpp_sources=_CPP,
+            cuda_sources=_CUDA,
+            extra_include_paths=inc,
+            extra_cflags=["-O3"],
+            extra_cuda_cflags=["-O3", "--use_fast_math", "-lineinfo",
+                               "-gencode", "arch=compute_90,code=sm_90"],
+            verbose=False,
+        )
+    return _EXT
+
+
+# ---------------------------------------------------------------------------
+# Model
+# ---------------------------------------------------------------------------
+
+class Model(nn.Module):
+    """Top-k over the last dim of a 2D tensor (custom CUDA kernel)."""
+
+    def __init__(self, batch: int, n: int, k: int):
+        super().__init__()
+        self.batch, self.n, self.k = batch, n, k
+        self.register_buffer("_dummy", torch.zeros(1))
+        self._cands = _cands(batch, n, k)
+        self._cfg = self._cands[0]
+        self._plan = None
+        self._graphs = {}
+        self._out = None
+        self._fx = None          # tensor the fast path is bound to (identity)
+        self._frep = None        # its graph-replay thunk
+        self._use_graph = os.environ.get("TOPK_NO_GRAPH", "0") != "1"
+
+    # -- lazy device-side setup (buffers must follow x's device) ------------
+    def _build(self, x):
+        dev = x.device
+        cands = self._cands
+        v = torch.empty(self.batch, self.k, dtype=torch.float32, device=dev)
+        i = torch.empty(self.batch, self.k, dtype=torch.int64, device=dev)
+        nc = max(c["NC"] for c in cands)
+        scratch = torch.empty(self.batch * nc, dtype=torch.int64, device=dev)
+        ctr = torch.zeros(4 * self.batch, dtype=torch.int32,
+                          device=dev)
+        self._keep = (v, i, scratch, ctr)
+        P = _ext().Plan
+        plans = [P(v, i, scratch, ctr, c["n"], c["k"], c["KP"], c["RPT"], c["CAP"],
+                   c["BT"], c["BPR"], c["NC"], c["NSLOT"], c["W"], c["batch"],
+                   c["shmem"])
+                 for c in cands]
+        self._out = plans[0].res()
+        pick, graph = 0, None
+        if len(plans) > 1 and _TUNE and x.is_cuda and self._use_graph:
+            try:
+                pick, graph = self._tune(plans, x)
+            except Exception:
+                pick, graph = 0, None
+        self._cfg = cands[pick]
+        self._plan = plans[pick]
+        self._launch = self._plan.launch
+        self._call = self._plan.call
+        if graph is not None:              # winner's graph is already captured
+            self._graphs[x.data_ptr()] = (graph, graph.replay, x)
+
+    # -- build-time autotune over the (rpt, cap) candidate list -------------
+    # Timed exactly the way the scorer times it: cold L2, one event pair around
+    # one graph replay -- the same submission path forward() will use, because
+    # ranking candidates through a cheaper path mis-ranks them (a direct launch
+    # costs ~3 us more than a replay and does not penalise configs equally).
+    # Runs once, on the first call, on the caller's real input.
+    def _tune(self, plans, x, iters=15):
+        flush = torch.empty(32 * 1024 * 1024, dtype=torch.float32, device=x.device)
+        gs, keep = [], []
+        for j, p in enumerate(plans):
+            try:                          # a candidate that will not capture
+                gs.append(self._grab(p.launch, x))   # is simply not a candidate
+                keep.append(j)
+            except Exception:
+                pass
+        if not gs:
+            raise RuntimeError("no candidate captured")
+        fns = [g.replay for g in gs]
+        for f in fns:
+            f()
+        torch.cuda.synchronize()
+
+        # round-robin so that clock ramp / drift biases every candidate equally
+        def race(idx, iters):
+            ts = [[] for _ in idx]
+            for _ in range(iters):
+                for jj, j in enumerate(idx):
+                    flush.zero_()
+                    torch.cuda.synchronize()
+                    s = torch.cuda.Event(enable_timing=True)
+                    e = torch.cuda.Event(enable_timing=True)
+                    s.record()
+                    fns[j]()
+                    e.record()
+                    torch.cuda.synchronize()
+                    ts[jj].append(s.elapsed_time(e))
+            for t in ts:
+                t.sort()
+            return sorted((t[len(t) // 2], j) for t, j in zip(ts, idx))
+
+        # Two stages: a cheap screen over every candidate, then a long re-race of
+        # the survivors.  Candidate medians here sit within this machine's
+        # run-to-run drift (~0.3 us peak), so a single 15-iteration pass over 75
+        # candidates picks partly by luck; screening first spends 4x the
+        # iterations where they decide something, for fewer launches overall.
+        idx, scr = list(range(len(fns))), []
+        if len(idx) > 3 * _KEEP:
+            scr = race(idx, max(4, iters // 3))
+            idx = [j for _, j in scr[:_KEEP]]
+            iters *= 3
+        elif len(idx) <= 4:
+            iters = max(iters, 45)     # a frozen shortlist: spend it all here
+        med = race(idx, iters)
+        self._tuned = sorted([(t, keep[j]) for t, j in med] +
+                             [(t, keep[j]) for t, j in scr if j not in idx])
+        del flush
+        j = min(med)[1]
+        return keep[j], gs[j]
+
+    # capture one launch into a graph (warm it on a side stream first, so no
+    # first-touch driver work lands inside the capture)
+    def _grab(self, launch, x):
+        g = torch.cuda.CUDAGraph()
+        s = torch.cuda.Stream()
+        s.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(s):
+            for _ in range(3):
+                launch(x)
+        torch.cuda.current_stream().wait_stream(s)
+        with torch.cuda.graph(g):
+            launch(x)
+        # A capture that recorded nothing replays as a no-op, and that failure
+        # is invisible from the outside: the caller still receives the output
+        # buffers, which the warmup above just filled with the right answer for
+        # THIS x, and an autotuner would clock it as free.  So prove the replay
+        # writes: poison the values and require them gone.
+        v = self._out[0]
+        v.fill_(float("nan"))
+        g.replay()
+        torch.cuda.synchronize()
+        if bool(v.isnan().all()):
+            raise RuntimeError("CUDA graph capture recorded no work")
+        return g
+
+    def _capture(self, x):
+        g = self._grab(self._launch, x)
+        e = (g, g.replay, x)
+        self._graphs[x.data_ptr()] = e
+        return e
+
+    # Hot path.  Measured time here is ~95% fixed cost (GPU wake-up + one graph
+    # launch), so the python side is stripped to the bone: once a tensor has a
+    # captured graph, `self.__class__` is swapped for a one-off subclass whose
+    # __call__ closes over the replay thunk and the result tuple as *default
+    # arguments*.  Every name in the hot body is then a LOAD_FAST -- no
+    # attribute lookups, no bound-method creation, one python frame.
+    def _install(self, x, rep):
+        def __call__(y, _x=x, _rep=rep, _out=self._out, _slow=self._slow):
+            if y is _x:
+                _rep()
+                return _out
+            return _slow(y)
+        cls = type(self)
+        if not cls.__dict__.get("_FAST"):      # one throwaway class per instance,
+            cls = type("ModelFast", (cls,), {"_FAST": True})   # rebound in place
+            self.__class__ = cls               # afterwards, never re-derived
+        cls.__call__ = staticmethod(__call__)
+
+    def forward(self, x):
+        return self._slow(x)
+
+    def _slow(self, x):
+        if self._plan is None:
+            self._build(x)
+        if self._use_graph and x.is_cuda:
+            e = self._graphs.get(x.data_ptr())
+            if e is None and len(self._graphs) < 16:
+                try:
+                    e = self._capture(x)
+                except Exception:
+                    self._use_graph = False
+                    e = None
+            if e is not None:
+                if e[2] is x:
+                    self._install(x, e[1])
+                e[1]()
+                return self._out
+        return self._call(x)
+
+    __call__ = forward
+
+
+# ---------------------------------------------------------------------------
+# harness shims
+# ---------------------------------------------------------------------------
+
+batch = 64
+n = 8192
+k = 8
+
+
+def get_inputs():
+    x = torch.randn(batch, n, dtype=torch.float32)
+    return [x]
+
+
+def get_init_inputs():
+    return [batch, n, k]

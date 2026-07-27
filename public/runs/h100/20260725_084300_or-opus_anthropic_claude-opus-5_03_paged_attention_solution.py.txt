@@ -1,0 +1,1129 @@
+"""Paged-attention decode for H100 PCIe (SM90, HBM2e), custom CUDA via load_inline.
+
+Design
+------
+Flash-decoding (split-KV) with a fused-in-register online softmax, plus a small
+cross-split combine kernel.
+
+  grid = (splits, batch * num_kv_heads)
+
+One CTA owns one (batch, kv_head, page-range).  Because the KV layout packs
+[K|V] in the last dim, a single 512 B-per-token gather brings in both halves, and
+because of GQA one such gather feeds all G = num_heads/num_kv_heads query heads
+that share the kv head -- so the KV cache is read exactly once (the roofline
+bytes) no matter how wide the group is.
+
+The warp is parameterised by LPT ("lanes per token"), which is the lever that
+made this fast:
+
+  T    = 32 / LPT     lane-groups per warp
+  E    = D / LPT      fp32 output accumulators each lane holds per head
+  CH   = E / 8        16 B chunks a lane loads per (token, head)
+  TT   = token-parallel lane-groups   (TT <= T)
+  HS   = T / TT       head blocks per warp
+  HPG  = G / HS       query heads per lane-group
+  STEP = TT * NT      tokens a warp consumes per iteration
+
+A lane holds HPG*E output accumulators, HPG*CH*4 Q registers and NT*CH*8 KV
+registers, so LPT trades registers against LPT-1 extra shuffles per (token,head)
+dot product.  LPT=8 (E=16) with TT=2 measured best on every shape here: it keeps
+a full 32-lane LDG.128 covering 512 B of *unique* KV while staying inside the
+register budget that lets several CTAs stay resident.
+
+Other things that matter, in rough order of measured effect:
+  * `__ldcs` (ld.global.nc.cs, evict-first) on the KV stream: it is read exactly
+    once, so keeping it out of L2's LRU is worth 8-12% on the short shapes.
+  * NT>1 (several tokens in flight per warp) is what fills the memory pipeline;
+    raising CTA count instead measured *worse*.
+  * TT*NT <= page_size, so one block-table lookup serves a whole warp iteration.
+  * No load predication.  Out-of-range slots exist only inside the last page of
+    a sequence, that page is always allocated and holds finite values, and the
+    score for those lanes is set to -INFINITY, so exp2f gives exactly 0 and the
+    contribution vanishes.  Predicating the loads instead costs ~4%.
+  * Softmax is done in the log2 domain (qscale folds in log2(e)) so the inner
+    loop uses exp2f, which is a single hardware instruction (MUFU.EX2).
+
+CUDA-graph replay
+-----------------
+The two launches cost ~9 us of launch + inter-kernel gap out of ~23 us on the
+smallest shape, so the op self-captures into a CUDA graph keyed on the exact
+(pointer, shape, stride, dtype) identity of its four inputs, and replays it when
+that key repeats.  Any change re-captures; tensor *contents* are read fresh by
+the kernel on every replay, so only identity has to be keyed.  Nested capture is
+detected and skipped, and any capture failure falls back to eager launches.  Set
+PA_DECODE_NO_GRAPH=1 to disable.
+"""
+from __future__ import annotations
+
+import functools
+import math
+import os
+import threading
+
+import torch
+import torch.nn as nn
+from torch.nn.modules import module as _nnmod
+
+# nn.Module.__call__ consults these four process-wide dicts on every call.  They
+# are mutated in place by register_module_forward_hook() & friends, so holding a
+# reference is enough to see later registrations; see Model.__call__.
+_GLOBAL_HOOKS = (_nnmod._global_forward_hooks, _nnmod._global_forward_pre_hooks,
+                 _nnmod._global_backward_hooks, _nnmod._global_backward_pre_hooks)
+
+# --- Shape knobs (overridden by check.py / benchmark.py from shapes.py) ----
+BATCH = 8
+NUM_HEADS = 32
+NUM_KV_HEADS = 8
+HEAD_DIM = 128
+SEQ_LEN = 1024
+PAGE_SIZE = 16
+
+# ---------------------------------------------------------------- CUDA source
+
+_CUDA_SRC = r"""
+#include <ATen/cuda/CUDAContext.h>
+#include <c10/cuda/CUDAGuard.h>
+#include <cuda_bf16.h>
+#include <vector>
+
+typedef __nv_bfloat16 bf16;
+typedef __nv_bfloat162 bf162;
+
+struct alignas(16) V8 { bf162 v[4]; };            // 8 bf16 = 16 B
+struct alignas(8) BF4 { bf162 v[2]; };            // 4 bf16 = 8 B (one output chunk)
+
+__device__ __forceinline__ V8 ldcs16(const void* p) {
+  V8 o;
+  *reinterpret_cast<int4*>(&o) = __ldcs(reinterpret_cast<const int4*>(p));
+  return o;
+}
+
+// --------------------------------------------------------------- main kernel
+// PF=1 stages the next iteration's KV in a second register set and issues those
+// loads before consuming the current one, so a warp always has a batch of LDGs
+// in flight (with PF=0 it has none while it computes).  Costs NT*CH*8 more
+// registers, which is why NT is retuned per shape alongside it.
+template <int D, int G, int LPT, int TT, int NT, int NW, int PF>
+__global__ __launch_bounds__(32 * NW) void pa_main(
+    const bf16* __restrict__ Q,       // (B, Hq, D)
+    const bf16* __restrict__ KV,      // (NB, PAGE, Hkv, 2D)  last dim = [K|V]
+    const int* __restrict__ BT,       // (B, btstride)
+    const int* __restrict__ SL,       // (B)
+    float* __restrict__ OP,           // (B, Hq, splits, D)   partial numerators
+    float2* __restrict__ ML,          // (B, Hq, splits)      (max, denom)
+    int* __restrict__ CNT,            // (B*Hkv)  split arrival counters
+    bf16* __restrict__ OUT,           // (B, Hq, D)
+    int Hkv, int btstride, int splits, int lp, float qscale)
+{
+  constexpr int T    = 32 / LPT;
+  constexpr int E    = D / LPT;
+  constexpr int CH   = E / 8;
+  constexpr int HS   = T / TT;
+  constexpr int HPG  = G / HS;
+  constexpr int STEP = TT * NT;
+  static_assert(E % 8 == 0 && T % TT == 0 && G % HS == 0, "bad (D,G,LPT,TT)");
+
+  const int lane = threadIdx.x & 31;
+  const int warp = threadIdx.x >> 5;
+  const int li = lane & (LPT - 1);        // which 8-element chunk group in D
+  const int gi = lane / LPT;              // lane-group
+  const int ti = gi & (TT - 1);           // token slot inside the group
+  const int hb = gi / TT;                 // head block
+
+  // bkh is x and the split is y, not the other way round.  Blocks dispatch with
+  // x fastest, and one page's Hkv heads live side by side in a single
+  // 2*Hkv*D*2-byte row that no single CTA reads more than 1/Hkv of; the row is
+  // only covered if its Hkv readers are dispatched together.  This ordering
+  // makes them consecutive.  The other way round, consecutive blocks are
+  // consecutive splits of one (b,kh) -- pages `splits` apart, sharing nothing --
+  // and the CTAs that do share a row are `splits` apart.  Bit-identical output,
+  // worth 3.9% on shape 4 (1 KB rows, 4 readers) and 0.9% on shape 2.
+  const int sp  = blockIdx.y;
+  const int bkh = blockIdx.x;
+  const int b   = bkh / Hkv;
+  const int kh  = bkh - b * Hkv;
+  const int Hq  = Hkv * G;
+
+  const int PAGE   = 1 << lp;
+  const int* btb   = BT + (long long)b * btstride;
+
+  // Splits take chunks of NW*STEP tokens round-robin rather than one contiguous
+  // range each, so the first block-table index is a function of blockIdx alone:
+  // btb[] and SL[b] then issue as two independent loads instead of the chain
+  // SL -> BT -> KV, which put a whole memory latency in front of every CTA.  The
+  // clamp uses btstride (an argument) for that same reason -- it only has to keep
+  // the speculative address in bounds, since a CTA with t0s >= L runs 0
+  // iterations and never looks at pg0.  Load balance improves too: the ragged
+  // tail is one chunk instead of a whole `per`-page block.
+  const int t0s    = sp * (NW * STEP) + warp * STEP;
+  const int stride = splits * (NW * STEP);
+  const int pg0    = btb[min(t0s >> lp, btstride - 1)];
+  const int L      = SL[b];
+  const int te     = L;
+  const int npages = (L + PAGE - 1) >> lp;
+
+  float O[HPG][E];
+  float M[HPG], Ls[HPG];
+#pragma unroll
+  for (int j = 0; j < HPG; ++j) {
+#pragma unroll
+    for (int e = 0; e < E; ++e) O[j][e] = 0.f;
+    M[j] = -1e30f;
+    Ls[j] = 0.f;
+  }
+
+  V8 qr[HPG][CH];
+  {
+    const bf16* qp = Q + ((long long)b * Hq + kh * G + hb * HPG) * D + 8 * li;
+#pragma unroll
+    for (int j = 0; j < HPG; ++j)
+#pragma unroll
+      for (int c = 0; c < CH; ++c)
+        qr[j][c] = *reinterpret_cast<const V8*>(qp + j * D + c * 8 * LPT);
+  }
+
+  const long long rowe = (long long)Hkv * 2 * D;      // bf16 per token row
+  const bf16* kvb = KV + kh * 2 * D;
+
+  // one block-table lookup per warp iteration: STEP divides PAGE and every t is
+  // a multiple of STEP, so the whole iteration lives inside one page.  The index
+  // is clamped so PF>=2 can fetch an entry for an iteration that never runs.
+  auto pgof = [&] (int t) {
+    const int i = t >> lp;
+    return btb[i < npages ? i : npages - 1];
+  };
+  auto load = [&] (int t, int pg, V8 (&kk)[NT][CH], V8 (&vv)[NT][CH]) {
+    const bf16* rowp = kvb + (long long)pg * (PAGE * rowe)
+                     + ((t & (PAGE - 1)) + ti) * rowe + 8 * li;
+#pragma unroll
+    for (int n = 0; n < NT; ++n) {
+      const bf16* r = rowp + (long long)(n * TT) * rowe;
+#pragma unroll
+      for (int c = 0; c < CH; ++c) {
+        kk[n][c] = ldcs16(r + c * 8 * LPT);
+        vv[n][c] = ldcs16(r + D + c * 8 * LPT);
+      }
+    }
+  };
+
+  auto consume = [&] (int t0, const V8 (&kk)[NT][CH], const V8 (&vv)[NT][CH]) {
+    float s2[NT][HPG];
+#pragma unroll
+    for (int n = 0; n < NT; ++n) {
+      const bool okn = (t0 + n * TT + ti) < te;
+#pragma unroll
+      for (int j = 0; j < HPG; ++j) {
+        bf162 a0 = __float2bfloat162_rn(0.f), a1 = __float2bfloat162_rn(0.f);
+#pragma unroll
+        for (int c = 0; c < CH; ++c) {
+          a0 = __hfma2(qr[j][c].v[0], kk[n][c].v[0], a0);
+          a1 = __hfma2(qr[j][c].v[1], kk[n][c].v[1], a1);
+          a0 = __hfma2(qr[j][c].v[2], kk[n][c].v[2], a0);
+          a1 = __hfma2(qr[j][c].v[3], kk[n][c].v[3], a1);
+        }
+        float d = (__low2float(a0) + __high2float(a0)) + (__low2float(a1) + __high2float(a1));
+#pragma unroll
+        for (int m = 1; m < LPT; m <<= 1) d += __shfl_xor_sync(0xffffffffu, d, m);
+        s2[n][j] = okn ? d * qscale : -INFINITY;     // -inf => exp2f gives 0
+      }
+    }
+
+    float pp[NT][HPG];
+#pragma unroll
+    for (int j = 0; j < HPG; ++j) {
+      float mt = s2[0][j];
+#pragma unroll
+      for (int n = 1; n < NT; ++n) mt = fmaxf(mt, s2[n][j]);
+      const float mn = fmaxf(M[j], mt);
+      const float alpha = exp2f(M[j] - mn);
+      M[j] = mn;
+      Ls[j] *= alpha;
+#pragma unroll
+      for (int e = 0; e < E; ++e) O[j][e] *= alpha;
+      float lacc = 0.f;
+#pragma unroll
+      for (int n = 0; n < NT; ++n) {
+        pp[n][j] = exp2f(s2[n][j] - mn);
+        lacc += pp[n][j];
+      }
+      Ls[j] += lacc;
+    }
+
+    // A bf16 -> fp32 conversion is one instruction per value, and with PF<2 it
+    // is repeated for every head in the group; hoisting it out of the head loop
+    // removes (HPG-1)*NT*E instructions per iteration, which is 21% of them at
+    // HPG=4.  The dead kk[] registers cover vf[], so this is register-neutral.
+#pragma unroll
+    for (int n = 0; n < NT; ++n) {
+      if constexpr (PF >= 2) {
+        float vf[E];
+#pragma unroll
+        for (int c = 0; c < CH; ++c)
+#pragma unroll
+          for (int u = 0; u < 4; ++u) {
+            vf[c * 8 + u * 2 + 0] = __low2float(vv[n][c].v[u]);
+            vf[c * 8 + u * 2 + 1] = __high2float(vv[n][c].v[u]);
+          }
+#pragma unroll
+        for (int j = 0; j < HPG; ++j)
+#pragma unroll
+          for (int e = 0; e < E; ++e) O[j][e] += pp[n][j] * vf[e];
+      } else {
+#pragma unroll
+        for (int j = 0; j < HPG; ++j)
+#pragma unroll
+          for (int c = 0; c < CH; ++c)
+#pragma unroll
+            for (int u = 0; u < 4; ++u) {
+              O[j][c * 8 + u * 2 + 0] += pp[n][j] * __low2float(vv[n][c].v[u]);
+              O[j][c * 8 + u * 2 + 1] += pp[n][j] * __high2float(vv[n][c].v[u]);
+            }
+      }
+    }
+  };
+
+  if constexpr (PF == 0) {
+    for (int t = t0s; t < te; t += stride) {
+      V8 kk[NT][CH], vv[NT][CH];
+      load(t, pgof(t), kk, vv);
+      consume(t, kk, vv);
+    }
+  } else if constexpr (PF >= 4) {
+    // cp.async staging, PF-2 slots deep.  An LDG holds its destination registers
+    // for the whole memory latency, so the bytes one thread can keep in flight
+    // are capped at NT*CH*32 -- and at the 2 CTAs/SM that shape 1's grid
+    // granularity forces, that measured 1680 GB/s on this exact 512B-of-4096B
+    // gather (scratch/exp_perm.py) against 1845 for a 2-slot cp.async pipeline
+    // (scratch/exp_async.py).  cp.async retires into shared memory instead, so a
+    // second batch in flight costs NT*CH*32 bytes of shared per thread rather
+    // than that many registers, and PF=3 showed registers have none to spare.
+    //
+    // No barrier anywhere below: a thread stages only the 16B chunks it will
+    // itself consume, and cp.async.wait_group is per-thread, so warps still run
+    // at their own pace exactly as they do with the register pipeline.
+    constexpr int NST = PF - 2;                 // staging slots
+    constexpr int ND = NT * CH * 2;             // V8 staged per thread per slot
+    constexpr int NTHR = 32 * NW;
+    extern __shared__ V8 smv[];                 // aliases sm[] in the epilogue
+    const unsigned sb = (unsigned)__cvta_generic_to_shared(smv + threadIdx.x);
+
+    auto aload = [&] (int t, int pg, int slot) {
+      const bf16* rowp = kvb + (long long)pg * (PAGE * rowe)
+                       + ((t & (PAGE - 1)) + ti) * rowe + 8 * li;
+      unsigned d = sb + (unsigned)(slot * ND * NTHR * 16);
+#pragma unroll
+      for (int n = 0; n < NT; ++n) {
+        const bf16* r = rowp + (long long)(n * TT) * rowe;
+#pragma unroll
+        for (int c = 0; c < CH; ++c) {
+          asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::
+                       "r"(d), "l"(r + c * 8 * LPT));
+          asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::
+                       "r"(d + NTHR * 16), "l"(r + D + c * 8 * LPT));
+          d += 2u * NTHR * 16;
+        }
+      }
+    };
+    // Slot-major, then chunk-major, then thread: a warp reading one chunk index
+    // touches 32 consecutive 16B cells, which is the one layout LDS.128 can
+    // service without bank conflicts (thread-major would put every lane in the
+    // same four banks).
+    auto sread = [&] (int slot, V8 (&kk)[NT][CH], V8 (&vv)[NT][CH]) {
+      const V8* s = smv + threadIdx.x + slot * (ND * NTHR);
+#pragma unroll
+      for (int n = 0; n < NT; ++n)
+#pragma unroll
+        for (int c = 0; c < CH; ++c) {
+          kk[n][c] = s[(n * CH + c) * 2 * NTHR];
+          vv[n][c] = s[((n * CH + c) * 2 + 1) * NTHR];
+        }
+    };
+
+    const int nit = t0s < te ? (te - t0s + stride - 1) / stride : 0;
+    if (nit > 0) {
+      int tf = t0s, pgf = pg0, fill = 0, slot = 0, t = t0s;
+#pragma unroll
+      for (int s = 0; s < NST - 1; ++s) {       // prime NST-1 slots
+        aload(tf, pgf, s);
+        asm volatile("cp.async.commit_group;\n" ::: "memory");
+        tf += stride;
+        pgf = pgof(tf);
+        ++fill;
+      }
+      for (int i = 0; i < nit; ++i) {
+        aload(tf, pgf, fill);                   // clamped: may never be consumed
+        asm volatile("cp.async.commit_group;\n" ::: "memory");
+        tf += stride;
+        pgf = pgof(tf);
+        fill = fill + 1 == NST ? 0 : fill + 1;
+        asm volatile("cp.async.wait_group %0;\n" ::"n"(NST - 1) : "memory");
+        V8 kk[NT][CH], vv[NT][CH];
+        sread(slot, kk, vv);
+        slot = slot + 1 == NST ? 0 : slot + 1;
+        consume(t, kk, vv);
+        t += stride;
+      }
+      // the speculative aload of a never-consumed slot is still in flight
+      asm volatile("cp.async.wait_all;\n" ::: "memory");
+    }
+    // sm[] is about to be reused for the warp-combine buffers, and nit depends on
+    // `warp`, so this barrier has to sit outside the branch every warp took.
+    __syncthreads();
+  } else if constexpr (PF == 3) {
+    // Distance-2 pipeline.  PF==2 has exactly one batch of LDGs outstanding
+    // while a consume runs, and one consume is only ~430ns of issue at 12
+    // warps/SM -- less than loaded HBM latency, so every consume ends up
+    // waiting.  Two batches in flight costs NT*CH*8 more registers, which is
+    // free on any shape whose CTA count is already below 3/SM.
+    const int nit = t0s < te ? (te - t0s + stride - 1) / stride : 0;
+    V8 kA[NT][CH], vA[NT][CH], kB[NT][CH], vB[NT][CH], kC[NT][CH], vC[NT][CH];
+    int t = t0s;
+    if (nit > 0) {
+      int p0 = pg0, p1 = pgof(t + stride), p2 = pgof(t + 2 * stride);
+      load(t, p0, kA, vA);
+      if (nit > 1) load(t + stride, p1, kB, vB);
+      for (int i = 0; i < nit; i += 3) {
+        if (i + 2 < nit) load(t + 2 * stride, p2, kC, vC);
+        p0 = pgof(t + 3 * stride);
+        consume(t, kA, vA);
+        t += stride;
+        if (i + 1 >= nit) break;
+        if (i + 3 < nit) load(t + 2 * stride, p0, kA, vA);
+        p1 = pgof(t + 3 * stride);
+        consume(t, kB, vB);
+        t += stride;
+        if (i + 2 >= nit) break;
+        if (i + 4 < nit) load(t + 2 * stride, p1, kB, vB);
+        p2 = pgof(t + 3 * stride);
+        consume(t, kC, vC);
+        t += stride;
+      }
+    }
+  } else {
+    // Ping-pong buffers, unrolled by hand: indexing one kv[2][NT][CH] array by
+    // (i & 1) puts it in local memory even under `#pragma unroll 2` (measured:
+    // 128-768 B stack frames), so each buffer has to be a distinct name.
+    const int nit = t0s < te ? (te - t0s + stride - 1) / stride : 0;
+    V8 kA[NT][CH], vA[NT][CH], kB[NT][CH], vB[NT][CH];
+    int t = t0s;
+    if (nit > 0) {
+      // PF>=2 keeps the block-table entry a phase ahead as well.  With PF==1
+      // every load() begins by waiting on btb[], and the KV addresses depend on
+      // it, so that latency sits in front of each batch of LDGs.
+      int pgn = pg0, pgf = 0;              // already in flight from the prologue
+      if constexpr (PF >= 2) pgf = pgof(t + stride);
+      load(t, pgn, kA, vA);
+      for (int i = 0; i < nit; i += 2) {
+        if constexpr (PF >= 2) { pgn = pgof(t + 2 * stride); }
+        else { pgf = pgof(t + stride); }
+        if (i + 1 < nit) load(t + stride, pgf, kB, vB);
+        consume(t, kA, vA);
+        if (i + 1 >= nit) break;
+        t += stride;
+        if constexpr (PF >= 2) { pgf = pgof(t + 2 * stride); }
+        else { pgn = pgof(t + stride); }
+        if (i + 2 < nit) load(t + stride, pgn, kA, vA);
+        consume(t, kB, vB);
+        t += stride;
+      }
+    }
+  }
+
+  // merge the TT token-parallel lane-groups (butterfly over the group bits)
+#pragma unroll
+  for (int d = LPT; d < LPT * TT; d <<= 1) {
+#pragma unroll
+    for (int j = 0; j < HPG; ++j) {
+      const float mp = __shfl_xor_sync(0xffffffffu, M[j], d);
+      const float lq = __shfl_xor_sync(0xffffffffu, Ls[j], d);
+      const float mn = fmaxf(M[j], mp);
+      const float a = exp2f(M[j] - mn), ap = exp2f(mp - mn);
+      M[j] = mn;
+      Ls[j] = Ls[j] * a + lq * ap;
+#pragma unroll
+      for (int e = 0; e < E; ++e) {
+        const float op = __shfl_xor_sync(0xffffffffu, O[j][e], d);
+        O[j][e] = O[j][e] * a + op * ap;
+      }
+    }
+  }
+
+  // ------ combine the NW warps through shared memory, write one partial/split
+  extern __shared__ float sm[];
+  float* sO = sm;                        // [NW][G][D]
+  float* sM = sO + NW * G * D;           // [NW][G]
+  float* sL = sM + NW * G;               // [NW][G]
+  float* sS = sL + NW * G;               // [NW][G]
+  float* sD = sS + NW * G;               // [G]    merged denominator
+  __shared__ int s_last;
+  if (ti == 0) {
+#pragma unroll
+    for (int j = 0; j < HPG; ++j) {
+      const int h = hb * HPG + j;
+      float* dst = sO + (warp * G + h) * D + 8 * li;
+#pragma unroll
+      for (int c = 0; c < CH; ++c) {
+        *reinterpret_cast<float4*>(dst + c * 8 * LPT) =
+            make_float4(O[j][c * 8 + 0], O[j][c * 8 + 1], O[j][c * 8 + 2], O[j][c * 8 + 3]);
+        *reinterpret_cast<float4*>(dst + c * 8 * LPT + 4) =
+            make_float4(O[j][c * 8 + 4], O[j][c * 8 + 5], O[j][c * 8 + 6], O[j][c * 8 + 7]);
+      }
+      if (li == 0) { sM[warp * G + h] = M[j]; sL[warp * G + h] = Ls[j]; }
+    }
+  }
+  __syncthreads();
+
+  // Only G threads run this, so it is pure latency, not throughput: unrolled,
+  // the NW shared loads of each pass issue together instead of forming a
+  // dependent chain.  Worth 0.1-0.2 us of the epilogue on the split shapes.
+  if (threadIdx.x < G) {
+    const int h = threadIdx.x;
+    float mall = -1e30f;
+#pragma unroll
+    for (int w = 0; w < NW; ++w) mall = fmaxf(mall, sM[w * G + h]);
+    float den = 0.f;
+#pragma unroll
+    for (int w = 0; w < NW; ++w) {
+      const float s = exp2f(sM[w * G + h] - mall);
+      sS[w * G + h] = s;
+      den += sL[w * G + h] * s;
+    }
+    sD[h] = den;
+    if (splits > 1) ML[((long long)b * Hq + kh * G + h) * splits + sp] = make_float2(mall, den);
+  }
+  __syncthreads();
+
+  // Everything below works in float4 lanes: c indexes a 4-element chunk of one
+  // head's D, so a warp covers 128 contiguous floats per access.
+  constexpr int DV = D / 4, NVEC = G * DV, NTH = 32 * NW;
+  const long long obase = ((long long)b * Hq + kh * G) * D;
+  auto warps4 = [&] (int c) {            // reduce the NW warp partials for chunk c
+    const int h = c / DV, j = c - h * DV;
+    float4 a = make_float4(0.f, 0.f, 0.f, 0.f);
+#pragma unroll
+    for (int w = 0; w < NW; ++w) {
+      const float4 v = *reinterpret_cast<const float4*>(sO + (w * G + h) * D + j * 4);
+      const float s = sS[w * G + h];
+      a.x = fmaf(v.x, s, a.x); a.y = fmaf(v.y, s, a.y);
+      a.z = fmaf(v.z, s, a.z); a.w = fmaf(v.w, s, a.w);
+    }
+    return a;
+  };
+  auto st_out = [&] (int c, float4 a, float den) {
+    const float r = den > 0.f ? 1.f / den : 0.f;
+    BF4 o;
+    o.v[0] = __floats2bfloat162_rn(a.x * r, a.y * r);
+    o.v[1] = __floats2bfloat162_rn(a.z * r, a.w * r);
+    *reinterpret_cast<BF4*>(OUT + obase + c * 4) = o;
+  };
+
+  if (splits == 1) {                     // nothing to reduce across: write bf16
+    for (int c = threadIdx.x; c < NVEC; c += NTH) st_out(c, warps4(c), sD[c / DV]);
+    return;
+  }
+
+  for (int c = threadIdx.x; c < NVEC; c += NTH) {
+    const int h = c / DV, j = c - h * DV;
+    *reinterpret_cast<float4*>(
+        OP + (((long long)b * Hq + kh * G + h) * splits + sp) * D + j * 4) = warps4(c);
+  }
+
+  // ------ last split of this (b, kv head) reduces the group in place.  Saves a
+  // second kernel: the launch gap alone measured 1.4 us, and the reduction now
+  // overlaps whatever other groups are still streaming.  No spin -- the CTA that
+  // takes ticket splits-1 is by construction after every other CTA's release.
+  //
+  // The arrival atomic carries that release itself instead of a separate
+  // __threadfence: the barrier below puts every thread's partial write into
+  // thread 0's happens-before set, and a cumulative release at .gpu scope
+  // publishes all of them.  Measured 0.24 us cheaper on shapes 0 and 4.
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    int old;
+    asm volatile("atom.add.acq_rel.gpu.u32 %0, [%1], 1;"
+                 : "=r"(old) : "l"(CNT + bkh) : "memory");
+    s_last = (old == splits - 1);
+    if (s_last) CNT[bkh] = 0;            // next launch starts from zero again
+  }
+  __syncthreads();
+  if (!s_last) return;
+
+  // sO is dead past the barrier above, so the scale table lives there.  Getting
+  // the (max, denom) pass out of the per-element loop matters: it turns splits
+  // dependent float2 loads per output into one broadcast read of shared memory.
+  float* sSc = sO;                       // [G][splits]  per-split rescale
+  float* sLn = sSc + G * splits;         // [G][splits]  per-split denominator
+  float* sDn = sLn + G * splits;         // [G]          merged denominator
+
+  // Two global round trips happen below -- the ML read and the OP read -- and
+  // only the *value* of the first feeds the second; the OP addresses do not
+  // depend on it at all.  Written in source order they serialize, so the first
+  // SPF splits are issued here instead, ahead of the ML read they would
+  // otherwise queue behind.  Worth 4.4% of the whole kernel on shape 4 and
+  // ~1.3% on shapes 0 and 2.  SPF=8 measured best: 6 is too shallow to cover the
+  // latency and 10 costs enough registers to show up in the main loop.
+  constexpr int NPT = (NVEC + NTH - 1) / NTH;
+  constexpr int SPF = 8;
+  const float4* op4 = reinterpret_cast<const float4*>(
+      OP + ((long long)b * Hq + kh * G) * splits * D);
+  float4 pre[NPT][SPF];
+#pragma unroll
+  for (int k = 0; k < NPT; ++k) {
+    const int c = threadIdx.x + k * NTH;
+    if (NVEC % NTH != 0 && c >= NVEC) break;
+    const int h = c / DV, j = c - h * DV;
+#pragma unroll
+    for (int s = 0; s < SPF; ++s)
+      if (s < splits) pre[k][s] = op4[(h * splits + s) * DV + j];
+  }
+
+  if (threadIdx.x < G) {
+    const int h = threadIdx.x;
+    const float2* ml = ML + ((long long)b * Hq + kh * G + h) * splits;
+    float mall = -1e30f;
+#pragma unroll 4
+    for (int s = 0; s < splits; ++s) {
+      const float2 v = ml[s];
+      sSc[h * splits + s] = v.x;
+      sLn[h * splits + s] = v.y;
+      mall = fmaxf(mall, v.x);
+    }
+    float den = 0.f;
+#pragma unroll 4
+    for (int s = 0; s < splits; ++s) {
+      const float sc = exp2f(sSc[h * splits + s] - mall);
+      sSc[h * splits + s] = sc;
+      den += sLn[h * splits + s] * sc;
+    }
+    sDn[h] = den;
+  }
+  __syncthreads();
+
+  // Only nbkh CTAs reach here, so the reduction lives or dies on how many loads
+  // each thread keeps in flight: accumulate across splits into NPT float4s so
+  // every load in an unrolled step is independent.  One float per thread per
+  // split (the obvious loop) measured 9.5 us on shape 2; this measures ~1.
+  float4 acc[NPT];
+#pragma unroll
+  for (int k = 0; k < NPT; ++k) acc[k] = make_float4(0.f, 0.f, 0.f, 0.f);
+#pragma unroll
+  for (int k = 0; k < NPT; ++k) {
+    const int c = threadIdx.x + k * NTH;
+    if (NVEC % NTH != 0 && c >= NVEC) break;
+    const int h = c / DV, j = c - h * DV;
+#pragma unroll
+    for (int s = 0; s < SPF; ++s) {         // already in flight since before ML
+      if (s >= splits) break;
+      const float sc = sSc[h * splits + s];
+      acc[k].x = fmaf(pre[k][s].x, sc, acc[k].x);
+      acc[k].y = fmaf(pre[k][s].y, sc, acc[k].y);
+      acc[k].z = fmaf(pre[k][s].z, sc, acc[k].z);
+      acc[k].w = fmaf(pre[k][s].w, sc, acc[k].w);
+    }
+#pragma unroll 4
+    for (int s = SPF; s < splits; ++s) {    // deeper splits: latency is covered
+      const float4 v = op4[(h * splits + s) * DV + j];
+      const float sc = sSc[h * splits + s];
+      acc[k].x = fmaf(v.x, sc, acc[k].x); acc[k].y = fmaf(v.y, sc, acc[k].y);
+      acc[k].z = fmaf(v.z, sc, acc[k].z); acc[k].w = fmaf(v.w, sc, acc[k].w);
+    }
+  }
+#pragma unroll
+  for (int k = 0; k < NPT; ++k) {
+    const int c = threadIdx.x + k * NTH;
+    if (NVEC % NTH != 0 && c >= NVEC) break;
+    st_out(c, acc[k], sDn[c / DV]);
+  }
+}
+
+// ------------------------------------------------------------------ dispatch
+template <int D, int G, int LPT, int TT>
+struct CfgOK {
+  static constexpr int T = 32 / LPT, E = D / LPT, HS = T / TT;
+  static constexpr bool value = (E >= 8) && (E % 8 == 0) && (T >= TT) && (T % TT == 0)
+                             && (G % HS == 0) && ((G / HS) * E <= 80);
+};
+
+// PF>=4 stages KV in shared memory, so the allocation is the larger of the
+// epilogue's combine buffers and (PF-2) slots of NT*CH*2 16B cells per thread.
+template <int D, int G, int LPT, int TT, int NT, int NW, int PF>
+struct Smem {
+  static constexpr int comb = (NW * G * D + 3 * NW * G + G) * (int)sizeof(float);
+  static constexpr int stage =
+      PF >= 4 ? (PF - 2) * (NT * ((D / LPT) / 8) * 2) * (32 * NW) * 16 : 0;
+  static constexpr int value = comb > stage ? comb : stage;
+};
+
+// Anything past 48 KB has to be opted into per kernel.  Done once behind a
+// function-local static: the launch path is ~1 us of CPU and a driver call on
+// every replay-capture would show up in it.
+template <int D, int G, int LPT, int TT, int NT, int NW, int PF>
+static void arm_smem()
+{
+  static const bool armed = cudaFuncSetAttribute(
+      (const void*)pa_main<D, G, LPT, TT, NT, NW, PF>,
+      cudaFuncAttributeMaxDynamicSharedMemorySize,
+      Smem<D, G, LPT, TT, NT, NW, PF>::value) == cudaSuccess;
+  (void)armed;
+}
+
+#define TRY(D_, G_, LPT_, TT_, NT_, NW_, PF_)                                       \
+  if (!done && D == D_ && G == G_ && lpt == LPT_ && tt == TT_ && nt == NT_          \
+      && nw == NW_ && pf == PF_) {                                                  \
+    if constexpr (CfgOK<D_, G_, LPT_, TT_>::value) {                               \
+      constexpr int smem = Smem<D_, G_, LPT_, TT_, NT_, NW_, PF_>::value;           \
+      if constexpr (smem > 32768)                                                  \
+        arm_smem<D_, G_, LPT_, TT_, NT_, NW_, PF_>();                              \
+      pa_main<D_, G_, LPT_, TT_, NT_, NW_, PF_><<<grid, 32 * NW_, smem, st>>>(       \
+          qp, kvp, btp, slp, opp, mlp, cntp, outp, Hkv, btstride, splits, lp,        \
+          qscale);                                                                  \
+      done = true;                                                                 \
+    }                                                                              \
+  }
+
+// Everything a launch needs, resolved once.  The timed window is ~6 us of CPU
+// on top of the kernel, so the per-call path is kept to one pybind argument:
+// unpacking six tensors and nine scalars costs more than the launch itself.
+struct Prepared {
+  const bf16* qp; const bf16* kvp; const int* btp; const int* slp;
+  float* opp; float2* mlp; int* cntp; bf16* outp;
+  int B, Hq, D, G, Hkv, btstride, splits, lp, dev;
+  float qscale;
+  int lpt, tt, nt, nw, pf;
+};
+static std::vector<Prepared> g_prep;
+
+static void pa_launch(const Prepared& p)
+{
+  const int B = p.B, Hq = p.Hq, D = p.D, G = p.G;
+  const int Hkv = p.Hkv, btstride = p.btstride, splits = p.splits, lp = p.lp;
+  const int lpt = p.lpt, tt = p.tt, nt = p.nt, nw = p.nw, pf = p.pf;
+  const bf16* qp = p.qp;
+  const bf16* kvp = p.kvp;
+  const int* btp = p.btp;
+  const int* slp = p.slp;
+  float* opp = p.opp;
+  float2* mlp = p.mlp;
+  int* cntp = p.cntp;
+  bf16* outp = p.outp;
+  const float qscale = p.qscale;
+  const at::cuda::OptionalCUDAGuard guard(
+      at::Device(at::kCUDA, (c10::DeviceIndex)p.dev));
+  auto st = at::cuda::getCurrentCUDAStream(p.dev);
+  dim3 grid((unsigned)(B * Hkv), (unsigned)splits);   // x fastest: see pa_main
+
+  bool done = false;
+  // the TRY() list is generated from _INSTS, so the two cannot drift
+  @TRY_LINES@
+  TORCH_CHECK(done, "no kernel for D=", D, " G=", G, " lpt=", lpt, " tt=", tt,
+              " nt=", nt, " nw=", nw, " pf=", pf);
+}
+
+// `out` is passed in, never allocated here: an at::empty costs ~3.5 us of CPU
+// time that would land inside the timed window, and an allocation inside a
+// CUDA-graph capture would tie the graph to a private memory pool.
+static Prepared pa_prepare(torch::Tensor query, torch::Tensor kv_cache,
+                           torch::Tensor block_table, torch::Tensor seq_lens,
+                           torch::Tensor ws, torch::Tensor out, int64_t Hkv,
+                           int64_t splits, int64_t lp, double scale, int64_t lpt,
+                           int64_t tt, int64_t nt, int64_t nw, int64_t pf)
+{
+  Prepared p;
+  p.B = query.size(0); p.Hq = query.size(1); p.D = query.size(2);
+  p.G = p.Hq / (int)Hkv;
+  p.Hkv = (int)Hkv; p.splits = (int)splits; p.lp = (int)lp;
+  p.lpt = (int)lpt; p.tt = (int)tt; p.nt = (int)nt; p.nw = (int)nw; p.pf = (int)pf;
+  p.dev = (int)query.device().index();
+  p.qp = (const bf16*)query.data_ptr();
+  p.kvp = (const bf16*)kv_cache.data_ptr();
+  p.btp = (const int*)block_table.data_ptr();
+  p.slp = (const int*)seq_lens.data_ptr();
+  p.outp = (bf16*)out.data_ptr();
+  p.opp = (float*)ws.data_ptr();
+  p.mlp = (float2*)(p.opp + (long long)p.B * p.Hq * splits * p.D);
+  p.cntp = (int*)(p.mlp + (long long)p.B * p.Hq * splits);
+  p.btstride = (int)block_table.stride(0);
+  p.qscale = (float)(scale * 1.4426950408889634);   // fold in log2(e)
+
+  // STEP must divide PAGE, not merely fit: chunk starts are multiples of STEP,
+  // so this is what keeps a warp's STEP tokens inside the page it looked up.
+  TORCH_CHECK(tt * nt <= (1 << lp) && ((1 << lp) % (tt * nt)) == 0,
+              "TT*NT must divide the page size");
+  TORCH_CHECK(2 * splits + 1 <= nw * p.D, "scale table must fit in the shared O buffer");
+  TORCH_CHECK(ws.numel() >= (long long)p.B * p.Hq * splits * (p.D + 2) + p.B * Hkv,
+              "workspace too small");
+  return p;
+}
+
+void paged_attn(torch::Tensor query, torch::Tensor kv_cache,
+                torch::Tensor block_table, torch::Tensor seq_lens,
+                torch::Tensor ws, torch::Tensor out, int64_t Hkv, int64_t splits,
+                int64_t lp, double scale, int64_t lpt, int64_t tt, int64_t nt,
+                int64_t nw, int64_t pf)
+{
+  pa_launch(pa_prepare(query, kv_cache, block_table, seq_lens, ws, out, Hkv,
+                       splits, lp, scale, lpt, tt, nt, nw, pf));
+}
+
+// Resolve once, launch by handle.  Callers must keep the tensors alive.
+int64_t paged_attn_prepare(torch::Tensor query, torch::Tensor kv_cache,
+                           torch::Tensor block_table, torch::Tensor seq_lens,
+                           torch::Tensor ws, torch::Tensor out, int64_t Hkv,
+                           int64_t splits, int64_t lp, double scale, int64_t lpt,
+                           int64_t tt, int64_t nt, int64_t nw, int64_t pf)
+{
+  g_prep.push_back(pa_prepare(query, kv_cache, block_table, seq_lens, ws, out,
+                              Hkv, splits, lp, scale, lpt, tt, nt, nw, pf));
+  return (int64_t)g_prep.size() - 1;
+}
+
+void paged_attn_run(int64_t h)
+{
+  pa_launch(g_prep[(size_t)h]);
+}
+"""
+
+_CPP_SRC = r"""
+void paged_attn(torch::Tensor query, torch::Tensor kv_cache,
+                torch::Tensor block_table, torch::Tensor seq_lens,
+                torch::Tensor ws, torch::Tensor out, int64_t Hkv, int64_t splits,
+                int64_t lp, double scale, int64_t lpt, int64_t tt, int64_t nt,
+                int64_t nw, int64_t pf);
+int64_t paged_attn_prepare(torch::Tensor query, torch::Tensor kv_cache,
+                           torch::Tensor block_table, torch::Tensor seq_lens,
+                           torch::Tensor ws, torch::Tensor out, int64_t Hkv,
+                           int64_t splits, int64_t lp, double scale, int64_t lpt,
+                           int64_t tt, int64_t nt, int64_t nw, int64_t pf);
+void paged_attn_run(int64_t h);
+"""
+
+# --------------------------------------------------------- instantiation table
+# (D, G, lpt, tt, nt, nw, pf) in dispatch-preference order per (D, G).  These
+# are the only kernels compiled, and _INST below is derived from this same list.
+# PA_INSTS="d,g,lpt,tt,nt,nw,pf;..." replaces it (used by the tuning scripts).
+_INSTS = [
+    # (D, G) combinations the benchmark shapes need.  nt=2/pf=2 costs the same
+    # ~165 registers as nt=4/pf=0 (so the same 3 CTAs/SM) but keeps a batch of
+    # LDGs in flight across the compute.  pf=2 measured best on all 5 shapes and
+    # is register-neutral against pf=1, so nothing selects pf<2 any more.
+    (128, 4, 8, 2, 2, 4, 2),
+    (128, 4, 8, 2, 4, 4, 2),
+    (128, 4, 8, 2, 1, 4, 2),
+    (128, 8, 8, 2, 2, 4, 2),
+    (128, 8, 8, 1, 2, 4, 2),
+    (128, 8, 8, 1, 4, 4, 2),
+    (64, 4, 8, 2, 4, 4, 2),
+    (64, 4, 8, 2, 2, 4, 2),
+    (64, 4, 8, 2, 1, 4, 2),
+    # generic fallbacks for other (D, G)
+    (128, 1, 8, 4, 2, 4, 2),
+    (128, 2, 8, 2, 2, 4, 2),
+    (128, 16, 8, 1, 2, 4, 2),
+    (64, 1, 8, 4, 2, 4, 2),
+    (64, 2, 8, 2, 2, 4, 2),
+    (64, 8, 8, 1, 2, 4, 2),
+    (64, 16, 8, 1, 2, 4, 2),
+]
+
+_env_insts = os.environ.get("PA_INSTS")
+if _env_insts:
+    _INSTS = [tuple(int(x) for x in grp.split(","))
+              for grp in _env_insts.split(";") if grp.strip()]
+
+
+def _try_lines(insts):
+    return "\n  ".join("TRY(%d, %d, %d, %d, %d, %d, %d)" % t for t in insts)
+
+# ------------------------------------------------------------- lazy extension
+
+_EXT = None
+_EXT_TRIED = False
+_EXT_LOCK = threading.Lock()
+
+
+def _ext():
+    """Build (once) and return the extension, or None if it cannot be built."""
+    global _EXT, _EXT_TRIED
+    if _EXT is not None or _EXT_TRIED:
+        return _EXT
+    with _EXT_LOCK:
+        if _EXT is not None or _EXT_TRIED:
+            return _EXT
+        _EXT_TRIED = True
+        try:
+            from torch.utils.cpp_extension import load_inline
+
+            os.environ.setdefault("TORCH_CUDA_ARCH_LIST", "9.0a")
+            flags = ["-O3", "--use_fast_math", "-arch=sm_90a"]
+            src = _CUDA_SRC.replace("@TRY_LINES@", _try_lines(_INSTS))
+            kwargs = dict(
+                name=os.environ.get("PA_EXT_NAME", "pa_decode_sm90"),
+                cpp_sources=_CPP_SRC,
+                cuda_sources=src,
+                functions=["paged_attn", "paged_attn_prepare", "paged_attn_run"],
+                extra_cuda_cflags=flags,
+                verbose=False,
+            )
+            try:
+                import pybind11
+
+                kwargs["extra_include_paths"] = [pybind11.get_include()]
+            except Exception:
+                pass
+            _EXT = load_inline(**kwargs)
+        except Exception as exc:  # pragma: no cover - build failure fallback
+            print(f"[paged_attn] CUDA build failed ({type(exc).__name__}: {exc}); "
+                  f"using the PyTorch fallback path")
+            _EXT = None
+    return _EXT
+
+
+# --------------------------------------------------------------- config table
+# (lpt, tt, nt, nw, pf, target_ctas) chosen by an interleaved sweep of the whole
+# (ctas x lpt x tt x nt x nw x pf) grid on this GPU, per shape.
+_TUNED = {
+    # (B, Hq, Hkv, D, L, P)
+    (8, 32, 8, 128, 1024, 16): (8, 2, 2, 4, 2, 256),
+    (32, 32, 8, 128, 2048, 16): (8, 2, 2, 4, 2, 256),
+    (4, 64, 8, 128, 4096, 16): (8, 1, 4, 4, 2, 224),
+    (16, 32, 8, 128, 1535, 16): (8, 2, 4, 4, 2, 128),
+    (8, 16, 4, 64, 2000, 16): (8, 2, 4, 4, 2, 256),
+}
+
+# {(D, G): [(lpt, tt, nt, nw, pf), ...]} in preference order, derived from the
+# instantiation list so a config can never be selected without being compiled.
+_INST = {}
+for _t in _INSTS:
+    _INST.setdefault(_t[:2], []).append(_t[2:])
+
+
+def _splits_for(npages, nbkh, target):
+    s = max(1, min(npages, round(target / max(1, nbkh))))
+    per = (npages + s - 1) // s
+    return max(1, (npages + per - 1) // per)
+
+
+def _pick(B, Hq, Hkv, D, L, P):
+    """Return (lpt, tt, nt, nw, pf, splits) or None when no kernel applies."""
+    G = Hq // Hkv
+    npages = (L + P - 1) // P
+    cands = _INST.get((D, G))
+    if cands is None:
+        return None
+    def ok(cfg):                           # STEP must divide the page size
+        step = cfg[1] * cfg[2]
+        return step <= P and P % step == 0
+    tuned = _TUNED.get((B, Hq, Hkv, D, L, P))
+    if tuned is not None:
+        cfg, target = tuned[:5], tuned[5]
+        if cfg in cands and ok(cfg):
+            return cfg + (_splits_for(npages, B * Hkv, target),)
+    for cfg in cands:
+        if ok(cfg):
+            return cfg + (_splits_for(npages, B * Hkv, 256),)
+    return None
+
+
+# --------------------------------------------------------------------- module
+
+
+class Model(nn.Module):
+    """Single-query paged attention decode (same interface as reference.Model)."""
+
+    def __init__(self, batch: int, num_heads: int, num_kv_heads: int, head_dim: int,
+                 seq_len: int, page_size: int):
+        super().__init__()
+        assert num_heads % num_kv_heads == 0, "num_heads must be a multiple of num_kv_heads (GQA)"
+        self.batch = batch
+        self.num_heads = num_heads
+        self.num_kv_heads = num_kv_heads
+        self.head_dim = head_dim
+        self.seq_len = seq_len
+        self.page_size = page_size
+        self.group_size = num_heads // num_kv_heads
+        self.scale = 1.0 / math.sqrt(head_dim)
+        self.register_buffer("_dummy", torch.zeros(1, dtype=torch.bfloat16), persistent=False)
+
+        self._ws = None
+        self._cnt_at = None
+        self._out = None
+        self._plan = None      # (key, step, out, hooks, sl, graph, args)
+        # graph replay | prepared handle | plain 15-argument call
+        self._launch = os.environ.get("PA_DECODE_LAUNCH", "graph")
+        if os.environ.get("PA_DECODE_NO_GRAPH", "0") in ("1", "true", "yes"):
+            self._launch = "prepared"
+
+    # ------------------------------------------------------------- internals
+    def _buffers_for(self, B, Hq, D, splits, device, dtype):
+        # partials, then (max, denom), then one arrival counter per (b, kv head).
+        # The counters must start at zero; the kernel's last-arriving CTA resets
+        # them, so a zeroed allocation stays valid for every later launch.
+        n = B * Hq * splits * (D + 2) + B * self.num_kv_heads
+        ws = self._ws
+        if ws is None or ws.numel() < n or ws.device != device:
+            ws = torch.zeros(n, dtype=torch.float32, device=device)
+            self._ws = ws
+            self._cnt_at = None
+            self._plan = None                 # old capture pointed at the old ws
+        cnt_at = (B * Hq * splits * (D + 2), n)
+        if self._cnt_at != cnt_at:            # a new `splits` moves the counters
+            ws[cnt_at[0]:cnt_at[1]].zero_()   # onto what used to be partials
+            self._cnt_at = cnt_at
+        out = self._out
+        if (out is None or out.shape != (B, Hq, D) or out.device != device
+                or out.dtype != dtype):
+            out = torch.empty((B, Hq, D), dtype=dtype, device=device)
+            self._out = out
+            self._plan = None
+        return ws, out
+
+    def _capture(self, run):
+        s = torch.cuda.Stream()
+        s.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(s):
+            run()
+            run()
+        torch.cuda.current_stream().wait_stream(s)
+        g = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g):
+            run()
+        return g
+
+    def _fallback(self, query, kv_cache, block_table, seq_lens):
+        """Pure-PyTorch oracle path; only used if the CUDA build is unavailable."""
+        B, H, D = query.shape
+        Hkv = self.num_kv_heads
+        G = H // Hkv
+        P = kv_cache.shape[1]
+        out = torch.empty(B, H, D, dtype=query.dtype, device=query.device)
+        for b in range(B):
+            L = int(seq_lens[b].item())
+            npages = (L + P - 1) // P
+            kv = kv_cache.index_select(0, block_table[b, :npages].long())
+            kv = kv.reshape(npages * P, Hkv, 2 * D)[:L]
+            k = kv[..., :D].repeat_interleave(G, dim=1).float()
+            v = kv[..., D:].repeat_interleave(G, dim=1).float()
+            s = torch.einsum("hd,lhd->hl", query[b].float(), k) * self.scale
+            p = torch.softmax(s, dim=-1)
+            out[b] = torch.einsum("hl,lhd->hd", p, v).to(query.dtype)
+        return out
+
+    # ---------------------------------------------------------------- forward
+    def __call__(self, *args):
+        # nn.Module.__call__ is two Python frames and ~1.5 us of hook
+        # bookkeeping before forward() even starts, and the caller records its
+        # start event on an empty queue -- so that CPU time is measured as if it
+        # were GPU time.  Go straight to the replay when the plan is warm and
+        # nothing that __call__ manages is actually in use; otherwise defer to
+        # nn.Module so hooks, tracing and non-tensor callers behave normally.
+        #
+        # `args == plan[0]` is an identity guard, not a value comparison:
+        # CPython's PyObject_RichCompareBool short-circuits on identity, so four
+        # identical tensors never reach Tensor.__eq__, and one C-level tuple
+        # compare costs 460ns less than four Python `is` tests plus eight dict
+        # truthiness checks (scratch/exp_guard.py) -- 2% of the s4 window, since
+        # this runs inside the timed region.  A caller passing a *different*
+        # tensor does reach __eq__, which yields a tensor whose bool() raises,
+        # hence the except.  bool() only fails to raise if every mismatching
+        # element is a 1-element tensor, which the trailing `is` on seq_lens
+        # rules out for the one such argument.
+        plan = self._plan
+        if plan is not None:
+            try:
+                if args == plan[0] and args[3] is plan[4] and not any(plan[3]):
+                    plan[1]()      # graph replay, or a bound eager launch
+                    return plan[2]
+            except Exception:
+                pass
+        return super().__call__(*args)
+
+    def forward(self, query: torch.Tensor, kv_cache: torch.Tensor,
+                block_table: torch.Tensor, seq_lens: torch.Tensor) -> torch.Tensor:
+        # Fast path again, for callers that reach forward() directly (or that
+        # went through nn.Module.__call__ because a hook was registered).  Plain
+        # `is` here: this path is off the measured one, so it can afford to skip
+        # the Tensor.__eq__ detour entirely.
+        plan = self._plan
+        if plan is not None:
+            k = plan[0]
+            if (query is k[0] and kv_cache is k[1] and block_table is k[2]
+                    and seq_lens is k[3]):
+                plan[1]()
+                return plan[2]
+        return self._slow(query, kv_cache, block_table, seq_lens)
+
+    def _slow(self, query, kv_cache, block_table, seq_lens):
+        ext = _ext()
+        if (ext is None or not query.is_cuda or query.dtype != torch.bfloat16
+                or query.dim() != 3 or kv_cache.dim() != 4):
+            return self._fallback(query, kv_cache, block_table, seq_lens)
+
+        B, Hq, D = query.shape
+        Hkv, P = kv_cache.shape[2], kv_cache.shape[1]
+        cfg = _pick(B, Hq, Hkv, D, self.seq_len, P)
+        if cfg is None or P < 2 or (P & (P - 1)) != 0 or kv_cache.shape[3] != 2 * D:
+            return self._fallback(query, kv_cache, block_table, seq_lens)
+
+        q = query.contiguous()
+        kv = kv_cache.contiguous()
+        bt = block_table if block_table.dtype == torch.int32 else block_table.int()
+        sl = seq_lens if seq_lens.dtype == torch.int32 else seq_lens.int()
+        bt = bt if bt.stride(1) == 1 else bt.contiguous()
+        sl = sl.contiguous()
+        lpt, tt, nt, nw, pf, splits = cfg
+        # allocated outside any capture, so replay writes into buffers the
+        # caching allocator will not hand to anyone else
+        ws, out = self._buffers_for(B, Hq, D, splits, query.device, query.dtype)
+        args = (q, kv, bt, sl, ws, out, Hkv, splits, P.bit_length() - 1,
+                self.scale, lpt, tt, nt, nw, pf)
+        run = lambda: ext.paged_attn(*args)
+
+        g = None
+        if self._launch == "graph" and not torch.cuda.is_current_stream_capturing():
+            try:
+                g = self._capture(run)
+            except Exception:
+                self._launch = "prepared"
+                g = None
+        if g is not None:
+            g.replay()
+            # bind the C++ method, not torch.cuda.CUDAGraph.replay, which is a
+            # Python wrapper whose super() call costs ~0.5 us of the measurement
+            step = torch._C._CUDAGraph.replay.__get__(g)
+        elif self._launch != "eager":
+            # one pybind argument instead of fifteen; the pointers live in C++
+            step = functools.partial(ext.paged_attn_run, ext.paged_attn_prepare(*args))
+            step()
+        else:
+            run()
+            step = run
+        # keep references to the inputs and to everything the launch points at:
+        # both the capture and the prepared handle hold raw addresses, so those
+        # tensors must outlive them.  Identity of the four inputs is what
+        # validates the fast path.  The hook dicts go in by reference:
+        # register_forward_hook() mutates them in place, so a registration made
+        # after the plan was built is still seen (as for _GLOBAL_HOOKS above).
+        self._plan = ((query, kv_cache, block_table, seq_lens), step, out,
+                      (self._forward_pre_hooks, self._forward_hooks,
+                       self._backward_pre_hooks, self._backward_hooks)
+                      + _GLOBAL_HOOKS,
+                      seq_lens, g, args)
+        return out
+
+
+def get_inputs():
+    """Same random paged inputs as reference.get_inputs()."""
+    B, H, Hkv, D, L, P = BATCH, NUM_HEADS, NUM_KV_HEADS, HEAD_DIM, SEQ_LEN, PAGE_SIZE
+    pages_per_seq = (L + P - 1) // P
+    total_pages = max(B * pages_per_seq + 8, 64)
+
+    query = torch.randn(B, H, D, dtype=torch.bfloat16) * 0.1
+    kv_cache = torch.randn(total_pages, P, Hkv, 2 * D, dtype=torch.bfloat16) * 0.1
+    perm = torch.randperm(total_pages)[: B * pages_per_seq].reshape(B, pages_per_seq).int()
+    block_table = perm.contiguous()
+    seq_lens = torch.full((B,), L, dtype=torch.int32)
+    return [query, kv_cache, block_table, seq_lens]
+
+
+def get_init_inputs():
+    return [BATCH, NUM_HEADS, NUM_KV_HEADS, HEAD_DIM, SEQ_LEN, PAGE_SIZE]
