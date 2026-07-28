@@ -49,29 +49,34 @@ function FlagMark({ row }: { row: BarRow }) {
   )
 }
 
-function tierKey(row: BarRow): string {
-  return `${row.passed}/${row.total}`
+// Per-problem correctness pips: one dot per deck problem, filled = that many
+// problems passed the correctness check. Reads at a glance without the
+// "3/6" fraction; the words live in the tooltip and on the model page.
+function CorrectnessPips({ row }: { row: BarRow }) {
+  if (row.total <= 1) return null
+  return (
+    <span
+      className="mbar-pips"
+      title={`${row.passed} of ${row.total} problems pass the correctness check`}
+      aria-label={`${row.passed} of ${row.total} problems pass the correctness check`}
+    >
+      {Array.from({ length: row.total }, (_, i) => (
+        <span key={i} className={i < row.passed ? "mbar-pip mbar-pip-on" : "mbar-pip"} />
+      ))}
+    </span>
+  )
 }
 
 export function ModelBars({ view }: { view: BarView }) {
   const max = view.maxValue || 1
   const fmtTick = (t: number) =>
     view.bench === "mega" ? `${(max * t).toFixed(1)}x` : `${Math.round(max * t * 100)}%`
-  let lastTier: string | null = null
   return (
     <div className="mbar" role="figure" aria-label={view.axis}>
       {view.rows.map((row, ri) => {
-        const tier = tierKey(row)
-        const showTier = tier !== lastTier
-        lastTier = tier
         const pct = Math.max(1.2, Math.min(100, (row.value / max) * 100))
         return (
           <div key={row.slug}>
-            {showTier && (
-              <p className="mbar-tier">
-                {row.passed >= row.total ? `full pass · ${tier}` : `${tier} passed`}
-              </p>
-            )}
             <Link href={`/models/${row.slug}`} className="mbar-row no-underline">
               <span className="mbar-label">
                 <span className="mbar-name-line">
@@ -95,11 +100,7 @@ export function ModelBars({ view }: { view: BarView }) {
               </span>
               <span className="mbar-right">
                 <span className="mbar-val tabular">{row.display}</span>
-                <span
-                  className={`status-pill ${row.passed >= row.total ? "status-pill-good" : "status-pill-muted"}`}
-                >
-                  {row.passed}/{row.total}
-                </span>
+                <CorrectnessPips row={row} />
               </span>
             </Link>
           </div>

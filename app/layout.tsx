@@ -2,6 +2,7 @@ import type { Metadata } from "next"
 import { JetBrains_Mono } from "next/font/google"
 import { SiteBrand } from "@/app/_components/site-brand"
 import "./globals.css"
+import { ContactLink } from "./_components/contact-link"
 
 const mono = JetBrains_Mono({
   subsets: ["latin"],
@@ -72,7 +73,7 @@ function Footer() {
         <span className="site-footer-line">
           built by <a href="https://elliotarledge.com">elliot arledge</a>
           {" · "}
-          <a href="mailto:elliot@arledge.net">elliot@arledge.net</a>
+          <ContactLink />
           {" · "}
           <a href="https://github.com/Infatoshi/kernelbench.com">source</a>
         </span>

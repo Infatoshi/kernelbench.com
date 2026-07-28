@@ -281,6 +281,25 @@ function DeckPanel({ deck }: { deck: HomeDeck }) {
   const active = deck.byGpu && deck.byGpu[gpu] ? gpu : deck.defaultGpu
   const view = deck.byGpu?.[active] ?? null
   const best = useMemo(() => (view ? bestByProblem(view) : new Map<string, number>()), [view])
+  // Rank rows by performance, not correctness tiers: mean share-of-best over
+  // the deck with non-passing cells worth 0 -- the same quantity the bars
+  // draw, so the visual order and the bar lengths always agree. Correctness
+  // still shows per-row as pips and per-cell as the fail-state chips.
+  const rankedRows = useMemo(() => {
+    if (!view) return []
+    const perf = (row: (typeof view.rows)[number]) => {
+      let sum = 0
+      for (const c of row.chips) {
+        const b = best.get(c.problem)
+        if (c.kind === "pass" && c.score != null && b) sum += c.score / b
+      }
+      return sum / Math.max(view.problems.length, 1)
+    }
+    return [...view.rows]
+      .map((row) => ({ row, perf: perf(row) }))
+      .sort((a, b) => b.perf - a.perf || a.row.name.localeCompare(b.row.name))
+      .map((x) => x.row)
+  }, [view, best])
 
   if (!deck.byGpu) {
     return (
@@ -300,7 +319,6 @@ function DeckPanel({ deck }: { deck: HomeDeck }) {
   if (!view) return null
   const nCols = Math.max(view.problems.length, 1)
   const multiProblem = nCols > 1
-  let lastTier: string | null = null
 
   const selectGpu = (key: string) => {
     setGpu(key)
@@ -354,13 +372,9 @@ function DeckPanel({ deck }: { deck: HomeDeck }) {
           <span className="hd-head-score" aria-hidden />
         </div>
 
-        {view.rows.map((row, rowIdx) => {
-          const tier = `${row.passed}/${row.total}`
-          const showTier = tier !== lastTier
-          lastTier = tier
+        {rankedRows.map((row, rowIdx) => {
           return (
             <div key={row.slug} className="hd-row-block">
-              {showTier && <div className="hd-tier">{tier}</div>}
               <div className="hd-row">
                 <span className="hd-model">
                   <LabMark row={row} />
@@ -380,10 +394,22 @@ function DeckPanel({ deck }: { deck: HomeDeck }) {
                     )
                   })}
                 </div>
-                <span className="hd-pass tabular">
-                  {row.passed}
-                  <span className="hd-pass-den">/{row.total}</span>
-                </span>
+                {row.total > 1 ? (
+                  <span
+                    className="hd-pips"
+                    title={`${row.passed} of ${row.total} problems pass the correctness check`}
+                    aria-label={`${row.passed} of ${row.total} problems pass the correctness check`}
+                  >
+                    {Array.from({ length: row.total }, (_, i) => (
+                      <span
+                        key={i}
+                        className={i < row.passed ? "hd-pip hd-pip-on" : "hd-pip"}
+                      />
+                    ))}
+                  </span>
+                ) : (
+                  <span className="hd-pass tabular" aria-hidden />
+                )}
               </div>
             </div>
           )

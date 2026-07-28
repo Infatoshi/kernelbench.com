@@ -394,6 +394,7 @@ function chipFromCell(
   prob: string,
   c: ModelCell | undefined,
   gpuKey: string,
+  bench?: Bench,
 ): ProblemChip {
   const short = shortProblem(prob)
   const links = {
@@ -417,7 +418,10 @@ function chipFromCell(
   const outcome = c.outcome
   const kind = kindFromOutcome(outcome, c)
   if (kind === "pass" && c.score != null) {
-    const isSpeedup = c.score > 1.5
+    // Mega scores ARE speedups regardless of magnitude -- the old >1.5
+    // magnitude guess rendered a 1.38x mega cell as "138" (percent-points
+    // path). Fall back to the heuristic only when the bench is unknown.
+    const isSpeedup = bench === "mega" || (bench == null && c.score > 1.5)
     const label = isSpeedup
       ? c.score >= 10
         ? c.score.toFixed(0)
@@ -482,7 +486,7 @@ export function reportCardForBench(
     const model = index.models.find((m) => m.slug === row.slug)!
     const block = model.benches[bench]!
     const view: GpuBlock = gpu ? block.gpus[gpu]! : block
-    const chips = deck.map((p) => chipFromCell(p, view.cells[p], gpu ?? CANONICAL_GPU))
+    const chips = deck.map((p) => chipFromCell(p, view.cells[p], gpu ?? CANONICAL_GPU, bench))
     // Pass counts from the visible deck only (mega: exclude hold-outs).
     const passed = chips.filter((c) => c.kind === "pass").length
     const total = deck.length
@@ -711,6 +715,11 @@ export function barsForBench(
       brand: brandFor(row.lab, row.slug),
     })
   }
+  // Pure performance order. Correctness is already priced into the value
+  // (mean over the shared deck with fails = 0), so a partial-pass model
+  // cannot outrank a full-pass one it didn't beat; pass state renders as
+  // per-problem pips on the row instead of a rank tier.
+  rows.sort((a, b) => b.value - a.value || a.slug.localeCompare(b.slug))
   const maxValue = Math.max(0, ...rows.map((r) => r.value))
   const axis =
     bench === "mega"
