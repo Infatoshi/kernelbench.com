@@ -189,6 +189,25 @@ kb lambda ssh <name> [cmd...]
   provider's Anthropic-compatible endpoint) and add the row. Not a one-liner.
 - Before a GPU sweep: `nvidia-smi` (the box is shared).
 
+## Model rosters — which models each bench allows (`benchmarks/<bench>/roster.yaml`)
+
+Eligibility is per-bench and **machine-readable**, not convention (2026-07-28):
+
+| bench | policy | gate |
+| --- | --- | --- |
+| hard / mega / cuda | `open` — any model | none |
+| **multi** | `frontier_only` | **launch** (`sweep_wave.sh` refuses off-roster before any GPU time) |
+| mini | `sub_200b_open_weight` | advisory (enforce at publish when mini debuts) |
+
+The reason multi is closed is **GPU-hours, not prestige**: one multi session
+occupies FOUR H100s for an unlimited-wall-clock run, so a model that flails for
+40 minutes costs 4x the same flail on a single-GPU bench. The open benches
+deliberately do **not** enumerate a model list — the published field is whatever
+`results/leaderboard.json` holds, and a duplicate list would only go stale.
+
+Override with `KBM_ALLOW_OFF_ROSTER=1` for an exploratory cell; it is archived
+but **not publishable** until the row is added to `roster.yaml`.
+
 ## Harnesses (run via `uv run kbh run <harness> <model> <problem> [effort]`)
 
 - Native CLIs: `claude`, `codex`, `cursor`, `gemini`, `grok`, `opencode`.
