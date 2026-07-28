@@ -35,9 +35,11 @@ DECK="$BENCH_ROOT/problems-h100x4"
 case ":$PATH:" in *":$HOME/.local/bin:"*) ;; *) PATH="$HOME/.local/bin:$PATH" ;; esac
 export PATH
 case "$HARNESS" in
-    grok)        HARNESS_BIN=grok ;;
-    zai-claude)  HARNESS_BIN=claude ;;
-    *)           HARNESS_BIN="$HARNESS" ;;
+    grok)                 HARNESS_BIN=grok ;;
+    claude)               HARNESS_BIN=claude ;;
+    codex)                HARNESS_BIN=codex ;;
+    *-claude)             HARNESS_BIN=claude ;;   # zai / kimi / deepseek routes
+    *)                    HARNESS_BIN="$HARNESS" ;;
 esac
 command -v "$HARNESS_BIN" >/dev/null 2>&1 || {
     echo "STOP: harness CLI '$HARNESS_BIN' not found on PATH ($PATH)" >&2
@@ -144,6 +146,55 @@ GUARD
     chmod +x "$RUN_DIR/bin/$tool"
 done
 
+# Claude Code pointed at a provider's Anthropic-compatible endpoint. zai / kimi /
+# deepseek differ only in key, base URL and model id, so they share one body —
+# four near-identical 25-line blocks is how the hard harness drifted out of sync
+# with itself. Args mirror hard's branches (2026-07-28).
+#
+# The key is exported INSIDE this function, never passed as `env KEY=... claude`,
+# because argv is world-readable via /proc — the agent under test can read it.
+run_claude_route() {
+    local token="$1" base="$2" alias="${3:-opus}"
+    ( cd "$PROBLEM_DIR" \
+        && export ANTHROPIC_AUTH_TOKEN="$token" \
+        && export ANTHROPIC_BASE_URL="$base" \
+        && export ANTHROPIC_MODEL="$MODEL" \
+        && export ANTHROPIC_DEFAULT_HAIKU_MODEL="$MODEL" \
+        && export ANTHROPIC_DEFAULT_SONNET_MODEL="$MODEL" \
+        && export ANTHROPIC_DEFAULT_OPUS_MODEL="$MODEL" \
+        && export API_TIMEOUT_MS="${API_TIMEOUT_MS:-3000000}" \
+        && export CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS=1 \
+        && export CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC="${CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC:-1}" \
+        && export CLAUDE_CODE_MAX_RETRIES="${CLAUDE_CODE_MAX_RETRIES:-100}" \
+        && export CLAUDE_CODE_MAX_OUTPUT_TOKENS="${CLAUDE_CODE_MAX_OUTPUT_TOKENS:-128000}" \
+        && PATH="$RUN_DIR/bin:$PATH" "${TIMEOUT_CMD[@]}" claude \
+            --dangerously-skip-permissions --print --verbose \
+            --output-format stream-json \
+            --settings '{"fastMode":false,"alwaysThinkingEnabled":true}' \
+            --model "$alias" \
+            --disallowedTools ExitPlanMode EnterPlanMode AskUserQuestion \
+            -p "$PROMPT" )
+}
+
+# Fail before burning a session on a missing key, with the name the operator
+# needs to fix rather than a provider 401 buried in agent.err.
+require_key() {
+    [ -n "${2:-}" ] || { echo "STOP: harness '$HARNESS' needs \$$1 in ~/.kbm_env" >&2; exit 3; }
+}
+
+# Keys live in ~/.kbm_env (chmod 600), never in the repo and never in argv.
+# Sourcing a missing file under `set -e` aborts with a bare "No such file",
+# which reads like a code bug rather than "this worker was never provisioned".
+load_keys() {
+    [ -f "$HOME/.kbm_env" ] || {
+        echo "STOP: ~/.kbm_env not found on $(hostname) — worker has no API keys." >&2
+        echo "Ship it with: ssh <worker> 'cat > ~/.kbm_env && chmod 600 ~/.kbm_env' < local_keys" >&2
+        exit 3
+    }
+    # shellcheck disable=SC1090
+    . "$HOME/.kbm_env"
+}
+
 PROMPT="$(cat "$PROBLEM_DIR/PROMPT.txt")"
 BUDGET="${BUDGET_SECONDS:-0}"
 TIMEOUT_CMD=()
@@ -167,22 +218,63 @@ case "$HARNESS" in
             > "$RUN_DIR/agent.log" 2> "$RUN_DIR/agent.err" || HARNESS_EXIT=$?
         ;;
     zai-claude)
-        # shellcheck disable=SC1090
-        . "$HOME/.kbm_env"
-        export ANTHROPIC_AUTH_TOKEN="$ZAI_API_KEY"
-        export ANTHROPIC_BASE_URL="https://api.z.ai/api/anthropic"
-        export ANTHROPIC_MODEL="$MODEL" ANTHROPIC_DEFAULT_HAIKU_MODEL="$MODEL"
-        export ANTHROPIC_DEFAULT_SONNET_MODEL="$MODEL" ANTHROPIC_DEFAULT_OPUS_MODEL="$MODEL"
-        export CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS=1 API_TIMEOUT_MS=3000000
-        export CLAUDE_CODE_MAX_RETRIES=100 CLAUDE_CODE_MAX_OUTPUT_TOKENS=128000
+        load_keys
+        require_key ZAI_API_KEY "${ZAI_API_KEY:-}"
+        run_claude_route "$ZAI_API_KEY" "https://api.z.ai/api/anthropic" \
+            > "$RUN_DIR/agent.log" 2> "$RUN_DIR/agent.err" || HARNESS_EXIT=$?
+        ;;
+    kimi-claude)
+        # Moonshot's Anthropic skin. Kimi K3 (model id `kimi-k3`, released
+        # 2026-07-16) forces thinking mode, which alwaysThinkingEnabled already
+        # satisfies.
+        load_keys
+        require_key KIMI_API_KEY "${KIMI_API_KEY:-}"
+        run_claude_route "$KIMI_API_KEY" \
+            "${KIMI_ANTHROPIC_BASE_URL:-https://api.moonshot.ai/anthropic}" \
+            > "$RUN_DIR/agent.log" 2> "$RUN_DIR/agent.err" || HARNESS_EXIT=$?
+        ;;
+    deepseek-claude)
+        load_keys
+        require_key DEEPSEEK_API_KEY "${DEEPSEEK_API_KEY:-}"
+        run_claude_route "$DEEPSEEK_API_KEY" "https://api.deepseek.com/anthropic" \
+            > "$RUN_DIR/agent.log" 2> "$RUN_DIR/agent.err" || HARNESS_EXIT=$?
+        ;;
+    claude)
+        # Native Anthropic (Opus 5). --effort max is what the hard Opus matrix
+        # uses; a run at a lower tier or with fastMode on is NOT comparable.
+        EFFORT_ARG=()
+        [ -n "$EFFORT" ] && EFFORT_ARG=(--effort "$EFFORT")
         ( cd "$PROBLEM_DIR" && PATH="$RUN_DIR/bin:$PATH" "${TIMEOUT_CMD[@]}" claude \
             --dangerously-skip-permissions --print --verbose \
             --output-format stream-json \
             --settings '{"fastMode":false,"alwaysThinkingEnabled":true}' \
-            --model opus \
+            --model "$MODEL" \
+            "${EFFORT_ARG[@]}" \
             --disallowedTools ExitPlanMode EnterPlanMode AskUserQuestion \
             -p "$PROMPT" ) \
             > "$RUN_DIR/agent.log" 2> "$RUN_DIR/agent.err" || HARNESS_EXIT=$?
+        ;;
+    codex)
+        # </dev/null is REQUIRED: `codex exec` blocks forever waiting on stdin
+        # in a detached shell, which looks exactly like a model thinking.
+        EFFORT_ARG=()
+        [ -n "$EFFORT" ] && EFFORT_ARG=(-c "model_reasoning_effort=\"$EFFORT\"")
+        PATH="$RUN_DIR/bin:$PATH" "${TIMEOUT_CMD[@]}" codex exec \
+            -m "$MODEL" \
+            "${EFFORT_ARG[@]}" \
+            --dangerously-bypass-approvals-and-sandbox \
+            --skip-git-repo-check \
+            -C "$PROBLEM_DIR" \
+            "$PROMPT" \
+            < /dev/null > "$RUN_DIR/agent.log" 2> "$RUN_DIR/agent.err" || HARNESS_EXIT=$?
+        # Archive the rich session JSONL by session id. Do NOT pick the newest
+        # file — codex touches old sessions when scanning its thread DB.
+        CODEX_SID=$(grep -h -oP 'session id: \K[0-9a-f-]+' \
+            "$RUN_DIR/agent.err" "$RUN_DIR/agent.log" 2>/dev/null | head -1)
+        if [ -n "$CODEX_SID" ]; then
+            CODEX_SESS=$(find "$HOME/.codex/sessions" -name "*${CODEX_SID}*.jsonl" 2>/dev/null | head -1)
+            [ -n "$CODEX_SESS" ] && cp "$CODEX_SESS" "$RUN_DIR/codex_session.jsonl"
+        fi
         ;;
     *)
         echo "unknown harness: $HARNESS" >&2; exit 2 ;;

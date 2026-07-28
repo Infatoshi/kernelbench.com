@@ -43,9 +43,29 @@ case ":$PATH:" in *":$HOME/.local/bin:"*) ;; *) PATH="$HOME/.local/bin:$PATH" ;;
 export PATH
 case "$HARNESS" in
     grok)       PREFLIGHT_BIN=grok ;;
-    zai-claude) PREFLIGHT_BIN=claude ;;
+    codex)      PREFLIGHT_BIN=codex ;;
+    claude)     PREFLIGHT_BIN=claude ;;
+    *-claude)   PREFLIGHT_BIN=claude ;;   # zai / kimi / deepseek routes
     *)          PREFLIGHT_BIN="$HARNESS" ;;
 esac
+
+# Roster gate, BEFORE the binary check: an off-roster model should be rejected on
+# policy whether or not its CLI happens to be installed. Multi is frontier-only
+# because a session occupies four H100s for an unlimited run; see roster.yaml for
+# the rationale. Checked at LAUNCH rather than at publish so an off-roster model
+# costs zero GPU-hours instead of a wasted wave.
+ROSTER="$BENCH_ROOT/roster.yaml"
+if [ -f "$ROSTER" ] && [ "${KBM_ALLOW_OFF_ROSTER:-0}" != "1" ]; then
+    if ! grep -qE "^[[:space:]]*-[[:space:]]*id:[[:space:]]*${MODEL}[[:space:]]*$" "$ROSTER"; then
+        echo "[sweep_wave] STOP: '$MODEL' is not on the multi roster." >&2
+        echo "[sweep_wave] On-roster models:" >&2
+        grep -E "^[[:space:]]*-[[:space:]]*id:" "$ROSTER" | sed 's/.*id:[[:space:]]*/  /' >&2
+        echo "[sweep_wave] Add it to roster.yaml, or set KBM_ALLOW_OFF_ROSTER=1 to" >&2
+        echo "[sweep_wave] run it exploratorily (archived, but NOT publishable)." >&2
+        exit 4
+    fi
+fi
+
 command -v "$PREFLIGHT_BIN" >/dev/null 2>&1 || {
     echo "[sweep_wave] STOP: harness CLI '$PREFLIGHT_BIN' not on PATH — aborting wave" >&2
     exit 3
