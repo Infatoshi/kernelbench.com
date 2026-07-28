@@ -24,8 +24,14 @@ PUB = REPO / "public" / "runs"
 BOARDS = [
     ("hard", "h100", "results/leaderboard.h100.json", ["outputs/runs-h100"]),
     ("hard", "b200", "results/leaderboard.b200.json", ["outputs/runs-b200"]),
+    ("cuda", "h100", "results/leaderboard.h100.json", ["outputs/runs-h100"]),
     ("cuda", "b200", "results/leaderboard.b200.json", ["outputs/runs-b200"]),
 ]
+
+import sys  # noqa: E402
+
+sys.path.insert(0, str(REPO / "scripts"))
+from kernel_sidecars import augment  # noqa: E402
 
 
 def _redactor():
@@ -73,7 +79,8 @@ def main() -> None:
             for runs_rel in runs_rels:
                 sp = bench_dir / runs_rel / rid / "solution.py"
                 if sp.is_file():
-                    (out_dir / f"{rid}_solution.py.txt").write_text(red(sp.read_text()))
+                    txt = augment(sp.read_text(), sp.parent)
+                    (out_dir / f"{rid}_solution.py.txt").write_text(red(txt))
                     n += 1
                     break
         print(f"  [{bench}/{gpu}] wrote {n}/{len(rids)} board solutions -> public/runs/{gpu}/")

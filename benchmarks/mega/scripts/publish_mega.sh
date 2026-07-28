@@ -27,8 +27,20 @@ for d in "$RUNS"/*_02_kimi_linear_decode; do
       n=$((n+1))
     fi
   fi
-  # solution code for the page to link
-  [ -f "$d/solution.py" ] && cp "$d/solution.py" "$PUB_CODE/$rid.solution.py.txt"
+  # solution code for the page to link -- inline any kernel sidecar the
+  # solution loads (import kernels / mega_impl etc.), else the page shows
+  # only host glue. Redaction step 1b below still covers the output.
+  if [ -f "$d/solution.py" ]; then
+    RUN_D="$d" OUT_F="$PUB_CODE/$rid.solution.py.txt" uv run python - <<'PY'
+import os, sys
+sys.path.insert(0, os.path.join(os.path.dirname(os.getcwd()), "..", "scripts"))
+sys.path.insert(0, os.path.abspath(os.path.join(os.getcwd(), "../..", "scripts")))
+from kernel_sidecars import augment
+d = os.environ["RUN_D"]
+txt = open(os.path.join(d, "solution.py")).read()
+open(os.environ["OUT_F"], "w").write(augment(txt, d))
+PY
+  fi
 done
 echo "  generated/updated $n viewers -> $PUB_RUNS"
 

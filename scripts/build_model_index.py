@@ -46,6 +46,7 @@ TRACE_DATASETS = {
 # Pretty names keyed by canonical slug. Keep in sync with MODEL_NAMES in
 # app/_lib/charts.ts (that map is keyed by raw chart ids; this one by slug).
 MODEL_NAMES = {
+    "claude-opus-5": "Claude Opus 5",
     "claude-opus-4-8": "Claude Opus 4.8",
     "claude-opus-4-7": "Claude Opus 4.7",
     "claude-opus-4-6": "Claude Opus 4.6",

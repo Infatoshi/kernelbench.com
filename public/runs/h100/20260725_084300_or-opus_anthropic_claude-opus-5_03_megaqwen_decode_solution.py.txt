@@ -1,0 +1,1165 @@
+"""Fused multi-layer decode megakernel for Qwen3-0.6B geometry (SM90 / H100 PCIe).
+
+Real CUDA (nvcc -> .so, loaded with ctypes; no ninja / pybind11 needed).
+
+One cooperative persistent kernel runs *all* decode steps for a chunk: it loops
+steps and layers internally and synchronises with a hand-rolled grid barrier
+(~1.0 us at 114 blocks x 256 threads, vs ~2.7 us for cooperative_groups
+grid.sync on this part).  That removes per-step / per-op launch overhead and
+keeps the residual stream resident in shared memory.
+
+Per layer the chain is  RMSNorm -> QKV -> Q/K RMSNorm -> RoPE -> causal GQA over
+the KV cache -> O -> residual -> RMSNorm -> SwiGLU -> down -> residual, matching
+reference.py numerics (bf16 weights/cache, fp32 math, bf16 rounding at the same
+places).
+
+Design notes
+------------
+* Every matvec splits *output rows* across blocks and the *reduction axis*
+  across the 8 warps of a block, so the activation slice each warp needs lives
+  in registers (loaded once) instead of being re-read from shared per row.
+* Attention is flash-decoding style with a flat (kv_head x position) work split
+  so all 114 SMs get equal work at every context length; 16 lanes cooperate on
+  one position (one 128-bit load covers a whole 128-dim K row per half warp) and
+  both q heads sharing a kv head reuse the same K/V bytes.
+* softmax needs no cross-block max pass: |q| and |k| are bounded by
+  sqrt(head_dim)*max|norm_weight| after RMSNorm (RoPE is a rotation), so a
+  *static* offset C makes exp(s-C) in [exp(-2C), 1].  Partial numerators /
+  denominators are combined with plain fp32 atomics, which costs one grid
+  barrier less than a two-pass softmax.
+* The bf16 noise vectors that the reference draws from a CPU generator are
+  produced in geometrically growing chunks so CPU RNG overlaps GPU execution.
+"""
+
+from __future__ import annotations
+
+import ctypes
+import hashlib
+import math
+import os
+import subprocess
+import sys
+import tempfile
+
+import torch
+import torch.nn as nn
+
+OP_TYPE = "megaqwen_decode"
+SUPPORTED_PRECISIONS = ["bf16"]
+
+HIDDEN = 1024
+INTERMEDIATE = 3072
+NUM_Q = 16
+NUM_KV = 8
+HEAD_DIM = 128
+NUM_LAYERS = 4
+EPS = 1e-6
+
+# ---------------------------------------------------------------------------
+# CUDA source
+# ---------------------------------------------------------------------------
+
+CUDA_SRC = r"""
+#include <cuda_runtime.h>
+#include <cuda_bf16.h>
+#include <cstdint>
+
+#define HID    1024
+#define INTER  3072
+#define NQH    16
+#define NKVH   8
+#define HD     128
+#define HDH    64
+#define QKVR   4096
+#define NT     256
+#define NW     8
+#define PARTS  64
+#define EPSV   1e-6f
+#define ATT_SCALE 0.08838834764831845f
+#define PFON 1
+/* Each KV byte is read by exactly one block, once per step, so it wants an
+   evict-first line in L2 -- otherwise the KV stream (up to 2.1 GB/step at 128k ctx)
+   flushes the weights that pfrows just pulled in.  1 = ld.global.cs. */
+#define KVCS 1
+#if KVCS
+#define KVLD __ldcs
+#else
+#define KVLD __ldcg
+#endif
+
+typedef __nv_bfloat16 bf16;
+
+/* packed weight offsets inside one layer (element counts) */
+#define OFF_QKV 0LL
+#define OFF_O   4194304LL          /* + 4096*1024        */
+#define OFF_GU  6291456LL          /* + 1024*2048        */
+#define OFF_D   12582912LL         /* + 3072*2*1024      */
+#define WSTRIDE 15728640LL         /* + 1024*3072        */
+
+/* per layer norm weights (fp32) */
+#define NSTRIDE 2304
+#define NOFF_IN 0
+#define NOFF_PO 1024
+#define NOFF_Q  2048
+#define NOFF_K  2176
+
+/* fp32 scratch offsets */
+#define SC_QKV  0
+#define SC_ANUM 4096
+#define SC_ADEN 6144
+#define SC_OOUT 6160
+#define SC_ACT  7184
+#define SC_DOUT 10256
+
+struct KP {
+    const bf16*  W;
+    const float* NRM;
+    bf16*        KC;
+    bf16*        VC;
+    const float* INVF;
+    const bf16*  NOISE;
+    const bf16*  HIN;
+    bf16*        HOUT;
+    float*       SCR;
+    unsigned*    BAR;
+    long long    kv_lstride;
+    int nl;
+    int max_seq;
+    int pos0;
+    int nsteps;
+    int nb;
+    int bar_slot;
+    float ac;
+};
+
+__device__ __forceinline__ void unpack4(unsigned a, unsigned b, float* o) {
+    __nv_bfloat162 x = *reinterpret_cast<__nv_bfloat162*>(&a);
+    __nv_bfloat162 y = *reinterpret_cast<__nv_bfloat162*>(&b);
+    float2 f0 = __bfloat1622float2(x);
+    float2 f1 = __bfloat1622float2(y);
+    o[0] = f0.x; o[1] = f0.y; o[2] = f1.x; o[3] = f1.y;
+}
+
+__device__ __forceinline__ void unpack8(const uint4& v, float* o) {
+    unpack4(v.x, v.y, o);
+    unpack4(v.z, v.w, o + 4);
+}
+
+__device__ __forceinline__ float wred(float v) {
+#pragma unroll
+    for (int m = 16; m >= 1; m >>= 1) v += __shfl_xor_sync(0xffffffffu, v, m);
+    return v;
+}
+
+/* grid barrier: release via threadfence, one arriving thread per block */
+__device__ __forceinline__ void gbar(unsigned* ctr, unsigned target) {
+    __threadfence();
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        atomicAdd(ctr, 1u);
+        unsigned v;
+        do {
+            asm volatile("ld.global.relaxed.gpu.u32 %0,[%1];" : "=r"(v) : "l"(ctr) : "memory");
+        } while (v < target);
+    }
+    __syncthreads();
+}
+
+/* Pull rows [r0,r1) of a K-wide bf16 matrix into L2.  Issued just before a grid
+   barrier: the barrier costs ~1.7 us during which DRAM would otherwise be idle, and
+   the next stage's weights do not depend on anything the barrier is waiting for, so
+   the fetch is free.  One instruction per PFEL elements. */
+#define PFEL 128
+#define PFKV 64          /* KV prefetch granularity in elements (0 = off) */
+#define PFKVN 1          /* stage B rounds to pull into L2 before the barrier */
+#define BFLD 1           /* stage B: issue round 0's K/V before the q/k/v prologue */
+template <int EL>
+__device__ __forceinline__ void pfrows(const bf16* Wb, int r0, int r1, int K, int tid) {
+#if PFON
+    const bf16* p = Wb + (long long)r0 * K;
+    const int n = (int)(((long long)(r1 - r0) * K) / EL);
+    for (int i = tid; i < n; i += NT)
+        asm volatile("prefetch.global.L2 [%0];" :: "l"(p + (long long)i * EL));
+#endif
+}
+
+/* split n rows (n even) into row pairs and hand block `blk` a contiguous run */
+__device__ __forceinline__ void rsplit(int n, int nb, int blk, int& r0, int& r1) {
+    const int pr = n >> 1;
+    const int q = pr / nb;
+    const int rem = pr - q * nb;
+    const int p0 = blk * q + (blk < rem ? blk : rem);
+    const int p1 = p0 + q + (blk < rem ? 1 : 0);
+    r0 = p0 << 1;
+    r1 = p1 << 1;
+}
+
+/* ---- matvec: out[r] = sum_k W[r*K+k]*A[k], rows [r0,r1) on this block (r1-r0 even).
+   warp w owns k in [w*K/NW, (w+1)*K/NW); that slice of A sits in `areg` (8*NIT floats,
+   8 per lane).  16 lanes cover one row, so one LDG.128 feeds two rows and one 4-step
+   shuffle tree reduces both.  NIT = K/(NW*128).
+
+   Enough loads must be in flight to cover DRAM latency (~10 KB/SM); a row pair only
+   carries 16*NIT bytes per thread, so rows are grouped.  RG > 0: groups of RG rows,
+   double buffered, so the next group is in flight while the current one is reduced.
+   RG < 0: every row pair issued up front (-RG = max pairs per block) -- for stages
+   whose whole per-block slice fits in registers. */
+template <int K, int NIT, int RG>
+__device__ __forceinline__ void mv(const bf16* __restrict__ Wb, const float* areg,
+                                   int r0, int r1, int warp, int lane, float* s_part) {
+    constexpr int NP = RG > 0 ? RG / 2 : -RG;
+    const int sub = lane & 15;
+    const bf16* wp = Wb + (long long)(lane >> 4) * K
+                   + (long long)warp * (K / NW) + 8 * sub;
+    float* dst = s_part + warp * PARTS + (lane >> 4) - r0;
+
+    auto LDR = [&](uint4* d, int r) {
+#pragma unroll
+        for (int i = 0; i < NIT; ++i)
+            d[i] = __ldcg(reinterpret_cast<const uint4*>(wp + (long long)r * K + i * 128));
+    };
+    auto ROW = [&](const uint4* d, int r) {
+        float acc = 0.f;
+#pragma unroll
+        for (int i = 0; i < NIT; ++i) {
+            float f[8];
+            unpack8(d[i], f);
+#pragma unroll
+            for (int e = 0; e < 8; ++e) acc = fmaf(f[e], areg[8 * i + e], acc);
+        }
+#pragma unroll
+        for (int m = 1; m < 16; m <<= 1) acc += __shfl_xor_sync(0xffffffffu, acc, m);
+        if (sub == 0) dst[r] = acc;
+    };
+    auto LD = [&](uint4 d[NP][NIT], int r) {
+#pragma unroll
+        for (int t = 0; t < NP; ++t) LDR(d[t], r + 2 * t);
+    };
+    auto CP = [&](const uint4 d[NP][NIT], int r) {
+#pragma unroll
+        for (int t = 0; t < NP; ++t) ROW(d[t], r + 2 * t);
+    };
+
+    if constexpr (RG < 0) {
+        /* whole slice in flight at once; predicated because the last block is short */
+        uint4 A[NP][NIT];
+#pragma unroll
+        for (int t = 0; t < NP; ++t) if (r0 + 2 * t < r1) LDR(A[t], r0 + 2 * t);
+#pragma unroll
+        for (int t = 0; t < NP; ++t) if (r0 + 2 * t < r1) ROW(A[t], r0 + 2 * t);
+    } else {
+        /* Groups are always full RG rows: the last one starts at r1-RG, overlapping
+           its predecessor.  ROW *stores* to s_part, so redoing a row is harmless, and
+           the re-read is <1% of the matrix -- much cheaper than either a predicated
+           pipeline or a scalar tail (both cost registers ptxas then spills).
+           If RG exceeds a block's row count the group runs past r1: those rows are
+           still inside the weight buffer (matrices are packed back to back and
+           _ROW_PAD covers the last one) and their s_part slots, up to PARTS, are
+           never read back. */
+        const int rl = r1 - RG > r0 ? r1 - RG : r0;
+        uint4 A[NP][NIT], B[NP][NIT];
+        int r = r0;
+        LD(A, r);
+        for (;;) {
+            if (r >= rl) { CP(A, r); break; }
+            int rn = r + RG < rl ? r + RG : rl;
+            LD(B, rn);
+            CP(A, r);
+            r = rn;
+            if (r >= rl) { CP(B, r); break; }
+            rn = r + RG < rl ? r + RG : rl;
+            LD(A, rn);
+            CP(B, r);
+            r = rn;
+        }
+    }
+}
+
+template <int K, int NIT>
+__device__ __forceinline__ void areg_shared(const float* s_a, int warp, int lane, float* areg) {
+    const int base = warp * (K / NW) + 8 * (lane & 15);
+#pragma unroll
+    for (int i = 0; i < NIT; ++i) {
+        float4 v0 = *reinterpret_cast<const float4*>(s_a + base + i * 128);
+        float4 v1 = *reinterpret_cast<const float4*>(s_a + base + i * 128 + 4);
+        areg[8 * i + 0] = v0.x; areg[8 * i + 1] = v0.y;
+        areg[8 * i + 2] = v0.z; areg[8 * i + 3] = v0.w;
+        areg[8 * i + 4] = v1.x; areg[8 * i + 5] = v1.y;
+        areg[8 * i + 6] = v1.z; areg[8 * i + 7] = v1.w;
+    }
+}
+
+template <int K, int NIT>
+__device__ __forceinline__ void areg_global(const float* g_a, int warp, int lane, float* areg) {
+    const int base = warp * (K / NW) + 8 * (lane & 15);
+#pragma unroll
+    for (int i = 0; i < NIT; ++i) {
+        float4 v0 = __ldcg(reinterpret_cast<const float4*>(g_a + base + i * 128));
+        float4 v1 = __ldcg(reinterpret_cast<const float4*>(g_a + base + i * 128 + 4));
+        areg[8 * i + 0] = v0.x; areg[8 * i + 1] = v0.y;
+        areg[8 * i + 2] = v0.z; areg[8 * i + 3] = v0.w;
+        areg[8 * i + 4] = v1.x; areg[8 * i + 5] = v1.y;
+        areg[8 * i + 6] = v1.z; areg[8 * i + 7] = v1.w;
+    }
+}
+
+extern "C" __global__ __launch_bounds__(NT, 1) void megadecode(KP p) {
+    const int tid  = threadIdx.x;
+    const int lane = tid & 31;
+    const int warp = tid >> 5;
+    const int blk  = blockIdx.x;
+    const int nb   = p.nb;
+
+    __shared__ float s_x[HID];
+    __shared__ float s_hn[HID];
+    __shared__ float s_h1[HID];
+    __shared__ float s_part[NW * PARTS];
+    __shared__ float s_qk[4 * HD];
+    __shared__ float s_acc[NW * 2 * HD];
+    __shared__ float s_r[NW];
+    __shared__ float s_den[NW * 2];
+    __shared__ float s_cs[2 * (HD / 2)];       /* RoPE cos then sin for this step */
+    __shared__ int s_map[4];                   /* stage B: h, lo, hiM, own */
+
+    unsigned* ctr = p.BAR + p.bar_slot;
+    unsigned bar = 0;
+    float* scr = p.SCR;
+
+    for (int k = tid; k < HID; k += NT) s_x[k] = __bfloat162float(p.HIN[k]);
+    __syncthreads();
+
+    for (int st = 0; st < p.nsteps; ++st) {
+        const int pos = p.pos0 + st;
+        const int L = pos + 1;
+
+        /* x_t = bf16( 0.5*noise + 0.5*h ), plus this step's RoPE table.
+           pos reaches 131k, so sinf/cosf take the Payne-Hanek path (slow, and it
+           needs a stack frame); the angles depend only on pos, so compute them once
+           per step here instead of in 3 warps x nl layers inside stage B. */
+        {
+            const bf16* nz = p.NOISE + (size_t)st * HID;
+            for (int k = tid; k < HID; k += NT) {
+                float v = 0.5f * __bfloat162float(nz[k]) + 0.5f * s_x[k];
+                s_x[k] = __bfloat162float(__float2bfloat16(v));
+            }
+            if (tid < HD / 2) {
+                float sv, cv;
+                sincosf((float)pos * p.INVF[tid], &sv, &cv);
+                s_cs[tid] = cv; s_cs[HD / 2 + tid] = sv;
+            }
+            /* Stage B's (head, position range) map for this block.  Each block serves
+               exactly one kv head: a flat (head x position) split lets a block straddle
+               a head boundary, which costs it a second pass over the whole prologue/
+               epilogue and leaves every other block sitting in the next grid barrier;
+               here heads get nb/NKVH or that +1 blocks instead, so per-block position
+               counts differ by under 2%.  It depends only on L, so it is built once per
+               step -- in shared memory, since holding it in registers across the layer
+               loop costs 17 of them for stage A/C/D/E to work around. */
+            if (tid == NT - 1) {
+                const int bh = nb / NKVH, rm = nb - bh * NKVH, cut = rm * (bh + 1);
+                int h, bi, nbh;
+                if (blk < cut) { nbh = bh + 1; h = blk / nbh; bi = blk - h * nbh; }
+                else { const int b2 = blk - cut; nbh = bh; h = rm + b2 / nbh;
+                       bi = b2 - (h - rm) * nbh; }
+                const int qq = L / nbh, rr = L - qq * nbh;
+                const int lo = bi * qq + (bi < rr ? bi : rr);
+                const int hi = lo + qq + (bi < rr ? 1 : 0);
+                const int own = (hi == L && hi > lo) ? 1 : 0;
+                s_map[0] = h; s_map[1] = lo; s_map[2] = hi - own; s_map[3] = own;
+            }
+            __syncthreads();
+        }
+
+        for (int ly = 0; ly < p.nl; ++ly) {
+            const bf16* Wl = p.W + (long long)ly * WSTRIDE;
+            const float* Nl = p.NRM + (long long)ly * NSTRIDE;
+            bf16* KCl = p.KC + (long long)ly * p.kv_lstride;
+            bf16* VCl = p.VC + (long long)ly * p.kv_lstride;
+
+            /* ---------------- stage A: input RMSNorm + QKV ---------------- */
+            {
+                float ss = 0.f;
+                if (ly == 0) {
+                    for (int k = tid; k < HID; k += NT) { float v = s_x[k]; ss += v * v; }
+                } else {   /* previous layer's residual, still only in scratch */
+                    for (int k = tid; k < HID; k += NT) {
+                        float v = __ldcg(scr + SC_DOUT + k);
+                        s_x[k] = v;
+                        ss += v * v;
+                    }
+                }
+                ss = wred(ss);
+                if (lane == 0) s_r[warp] = ss;
+                __syncthreads();
+                float tot = 0.f;
+#pragma unroll
+                for (int w = 0; w < NW; ++w) tot += s_r[w];
+                float sc = rsqrtf(tot * (1.0f / HID) + EPSV);
+                for (int k = tid; k < HID; k += NT) s_hn[k] = s_x[k] * sc * Nl[NOFF_IN + k];
+                for (int k = tid; k < NQH * HD; k += NT) scr[SC_ANUM + k] = 0.f;
+                if (tid < NQH) scr[SC_ADEN + tid] = 0.f;
+                __syncthreads();
+
+                float areg[8];
+                areg_shared<HID, 1>(s_hn, warp, lane, areg);
+                int r0, r1;
+                rsplit(QKVR, nb, blk, r0, r1);
+                mv<HID, 1, 18>(Wl + OFF_QKV, areg, r0, r1, warp, lane, s_part);
+                __syncthreads();
+                for (int t = tid; t < r1 - r0; t += NT) {
+                    float s = 0.f;
+#pragma unroll
+                    for (int w = 0; w < NW; ++w) s += s_part[w * PARTS + t];
+                    scr[SC_QKV + r0 + t] = s;
+                }
+            }
+            /* Stage B's first K/V round depends on nothing stage A produces (only on
+               pos), so pull it into L2 while the barrier runs.  Without this the first
+               CPKV pays full DRAM latency, which at ctx 2k is a third of a round. */
+#if PFKV
+            { const int h = s_map[0], lo = s_map[1], hiM = s_map[2];
+              const int p1 = (lo + PFKVN * NW * 8 < hiM) ? lo + PFKVN * NW * 8 : hiM;
+              pfrows<PFKV>(KCl + (size_t)h * p.max_seq * HD, lo, p1, HD, tid);
+              pfrows<PFKV>(VCl + (size_t)h * p.max_seq * HD, lo, p1, HD, tid); }
+#endif
+            bar += nb; gbar(ctr, bar);
+
+            /* ---------------- stage B: GQA attention ---------------------- */
+            {
+                const int h = s_map[0], lo = s_map[1], hiM = s_map[2], own = s_map[3];
+                const int pj = lane >> 4;
+                const int dj = (lane & 15) * 8;
+                {
+                    const bf16* kb = KCl + (size_t)h * p.max_seq * HD + dj;
+                    const bf16* vb = VCl + (size_t)h * p.max_seq * HD + dj;
+                    /* Round r+1's K/V are issued before round r's math, so the ~700ns
+                       DRAM latency overlaps compute rather than stalling between
+                       rounds.  At short contexts a block only gets 2-3 rounds, so an
+                       un-pipelined loop is pure latency there. */
+                    auto LDKV = [&](uint4* kk, uint4* vv, int b) {
+                        int ls[4];
+#pragma unroll
+                        for (int u = 0; u < 4; ++u) {
+                            const int l = b + u * 2 + pj;
+                            ls[u] = (l < hiM) ? l : lo;
+                        }
+#pragma unroll
+                        for (int u = 0; u < 4; ++u)
+                            kk[u] = KVLD(reinterpret_cast<const uint4*>(kb + (size_t)ls[u] * HD));
+#pragma unroll
+                        for (int u = 0; u < 4; ++u)
+                            vv[u] = KVLD(reinterpret_cast<const uint4*>(vb + (size_t)ls[u] * HD));
+                    };
+                    const int stp = NW * 8;
+                    int base = lo + warp * 8;
+                    const bool act = base < hiM;
+                    uint4 kA[4], vA[4], kB[4], vB[4];
+
+                    /* Round 0's K/V depend only on (h, lo) -- nothing the prologue below
+                       produces -- and the slot this step writes is excluded from
+                       [lo,hiM), so issue the fetch first and let the prologue's dependent
+                       chain (load q from scratch, warp-reduce, rsqrt, RoPE, shared store,
+                       syncthreads) run underneath it instead of after it. */
+#if BFLD
+                    if (act) LDKV(kA, vA, base);
+#endif
+
+                    /* q (heads 2h, 2h+1) and, if we own the last slot, k/v */
+                    if (warp < 2 || (own && warp < 4)) {
+                        const float* raw;
+                        const float* nw = nullptr;
+                        int rope = 1;
+                        if (warp < 2) { raw = scr + SC_QKV + (2 * h + warp) * HD; nw = Nl + NOFF_Q; }
+                        else if (warp == 2) { raw = scr + SC_QKV + 2048 + h * HD; nw = Nl + NOFF_K; }
+                        else { raw = scr + SC_QKV + 3072 + h * HD; rope = 0; }
+
+                        float v[4];
+#pragma unroll
+                        for (int i = 0; i < 4; ++i) v[i] = __ldcg(raw + lane + 32 * i);
+                        float o[4];
+                        if (nw) {
+                            float ss = 0.f;
+#pragma unroll
+                            for (int i = 0; i < 4; ++i) ss += v[i] * v[i];
+                            ss = wred(ss);
+                            float sc = rsqrtf(ss * (1.0f / HD) + EPSV);
+#pragma unroll
+                            for (int i = 0; i < 4; ++i) o[i] = v[i] * sc * nw[lane + 32 * i];
+                        } else {
+#pragma unroll
+                            for (int i = 0; i < 4; ++i) o[i] = v[i];
+                        }
+                        float* dst = s_qk + warp * HD;
+                        if (rope) {
+                            float c0 = s_cs[lane], n0 = s_cs[HD / 2 + lane];
+                            float c1 = s_cs[lane + 32], n1 = s_cs[HD / 2 + lane + 32];
+                            float r0 = o[0] * c0 - o[2] * n0;
+                            float r2 = o[0] * n0 + o[2] * c0;
+                            float r1 = o[1] * c1 - o[3] * n1;
+                            float r3 = o[1] * n1 + o[3] * c1;
+                            o[0] = r0; o[1] = r1; o[2] = r2; o[3] = r3;
+                        }
+                        if (warp >= 2) {
+                            bf16* cache = (warp == 2 ? KCl : VCl) + (size_t)h * p.max_seq * HD
+                                          + (size_t)pos * HD;
+#pragma unroll
+                            for (int i = 0; i < 4; ++i) {
+                                bf16 b = __float2bfloat16(o[i]);
+                                cache[lane + 32 * i] = b;
+                                o[i] = __bfloat162float(b);
+                            }
+                        }
+#pragma unroll
+                        for (int i = 0; i < 4; ++i) dst[lane + 32 * i] = o[i];
+                    }
+                    __syncthreads();
+
+                    float q0[8], q1[8];
+                    {
+                        const float4* a0 = reinterpret_cast<const float4*>(s_qk + dj);
+                        const float4* a1 = reinterpret_cast<const float4*>(s_qk + HD + dj);
+                        float4 u0 = a0[0], u1 = a0[1], w0 = a1[0], w1 = a1[1];
+                        q0[0]=u0.x; q0[1]=u0.y; q0[2]=u0.z; q0[3]=u0.w;
+                        q0[4]=u1.x; q0[5]=u1.y; q0[6]=u1.z; q0[7]=u1.w;
+                        q1[0]=w0.x; q1[1]=w0.y; q1[2]=w0.z; q1[3]=w0.w;
+                        q1[4]=w1.x; q1[5]=w1.y; q1[6]=w1.z; q1[7]=w1.w;
+                    }
+                    float ac0[8] = {0.f,0.f,0.f,0.f,0.f,0.f,0.f,0.f};
+                    float ac1[8] = {0.f,0.f,0.f,0.f,0.f,0.f,0.f,0.f};
+                    float den0 = 0.f, den1 = 0.f;
+                    const float C = p.ac;
+
+                    auto CPKV = [&](const uint4* kk, const uint4* vv, int b) {
+#pragma unroll
+                        for (int u = 0; u < 4; ++u) {
+                            const bool ok = (b + u * 2 + pj) < hiM;
+                            float kf[8];
+                            unpack8(kk[u], kf);
+                            float s0 = 0.f, s1 = 0.f;
+#pragma unroll
+                            for (int d = 0; d < 8; ++d) {
+                                s0 = fmaf(kf[d], q0[d], s0);
+                                s1 = fmaf(kf[d], q1[d], s1);
+                            }
+#pragma unroll
+                            for (int m = 1; m < 16; m <<= 1) {
+                                s0 += __shfl_xor_sync(0xffffffffu, s0, m);
+                                s1 += __shfl_xor_sync(0xffffffffu, s1, m);
+                            }
+                            float e0 = ok ? __expf(s0 * ATT_SCALE - C) : 0.f;
+                            float e1 = ok ? __expf(s1 * ATT_SCALE - C) : 0.f;
+                            float vf[8];
+                            unpack8(vv[u], vf);
+#pragma unroll
+                            for (int d = 0; d < 8; ++d) {
+                                ac0[d] = fmaf(e0, vf[d], ac0[d]);
+                                ac1[d] = fmaf(e1, vf[d], ac1[d]);
+                            }
+                            if (dj == 0) { den0 += e0; den1 += e1; }
+                        }
+                    };
+                    if (act) {
+#if !BFLD
+                        LDKV(kA, vA, base);
+#endif
+                        for (;;) {
+                            int bn = base + stp;
+                            if (bn < hiM) LDKV(kB, vB, bn);
+                            CPKV(kA, vA, base);
+                            base = bn;
+                            if (base >= hiM) break;
+                            bn = base + stp;
+                            if (bn < hiM) LDKV(kA, vA, bn);
+                            CPKV(kB, vB, base);
+                            base = bn;
+                            if (base >= hiM) break;
+                        }
+                    }
+
+                    if (own && warp == 0) {
+                        float kf[8], vf[8];
+                        const float4* kp = reinterpret_cast<const float4*>(s_qk + 2 * HD + dj);
+                        const float4* vp = reinterpret_cast<const float4*>(s_qk + 3 * HD + dj);
+                        float4 a = kp[0], b = kp[1], c = vp[0], d2 = vp[1];
+                        kf[0]=a.x; kf[1]=a.y; kf[2]=a.z; kf[3]=a.w;
+                        kf[4]=b.x; kf[5]=b.y; kf[6]=b.z; kf[7]=b.w;
+                        vf[0]=c.x; vf[1]=c.y; vf[2]=c.z; vf[3]=c.w;
+                        vf[4]=d2.x; vf[5]=d2.y; vf[6]=d2.z; vf[7]=d2.w;
+                        float s0 = 0.f, s1 = 0.f;
+#pragma unroll
+                        for (int d = 0; d < 8; ++d) {
+                            s0 = fmaf(kf[d], q0[d], s0);
+                            s1 = fmaf(kf[d], q1[d], s1);
+                        }
+#pragma unroll
+                        for (int m = 1; m < 16; m <<= 1) {
+                            s0 += __shfl_xor_sync(0xffffffffu, s0, m);
+                            s1 += __shfl_xor_sync(0xffffffffu, s1, m);
+                        }
+                        float e0 = __expf(s0 * ATT_SCALE - C);
+                        float e1 = __expf(s1 * ATT_SCALE - C);
+                        if (pj == 0) {
+#pragma unroll
+                            for (int d = 0; d < 8; ++d) {
+                                ac0[d] = fmaf(e0, vf[d], ac0[d]);
+                                ac1[d] = fmaf(e1, vf[d], ac1[d]);
+                            }
+                            if (dj == 0) { den0 += e0; den1 += e1; }
+                        }
+                    }
+
+#pragma unroll
+                    for (int d = 0; d < 8; ++d) {
+                        ac0[d] += __shfl_xor_sync(0xffffffffu, ac0[d], 16);
+                        ac1[d] += __shfl_xor_sync(0xffffffffu, ac1[d], 16);
+                    }
+                    den0 += __shfl_xor_sync(0xffffffffu, den0, 16);
+                    den1 += __shfl_xor_sync(0xffffffffu, den1, 16);
+                    if (pj == 0) {
+                        float* d0 = s_acc + warp * (2 * HD) + dj;
+#pragma unroll
+                        for (int d = 0; d < 8; ++d) { d0[d] = ac0[d]; d0[HD + d] = ac1[d]; }
+                    }
+                    if (lane == 0) { s_den[warp * 2] = den0; s_den[warp * 2 + 1] = den1; }
+                    __syncthreads();
+                    if (tid < 2 * HD) {
+                        float s = 0.f;
+#pragma unroll
+                        for (int w = 0; w < NW; ++w) s += s_acc[w * (2 * HD) + tid];
+                        atomicAdd(scr + SC_ANUM + (2 * h + (tid >> 7)) * HD + (tid & 127), s);
+                    }
+                    if (tid < 2) {
+                        float s = 0.f;
+#pragma unroll
+                        for (int w = 0; w < NW; ++w) s += s_den[w * 2 + tid];
+                        atomicAdd(scr + SC_ADEN + 2 * h + tid, s);
+                    }
+                    __syncthreads();
+                }
+            }
+            { int a0, a1; rsplit(HID, nb, blk, a0, a1);
+              pfrows<PFEL>(Wl + OFF_O, a0, a1, 2048, tid); }
+            bar += nb; gbar(ctr, bar);
+
+            /* ---------------- stage C: O projection ---------------------- */
+            {
+                float areg[16];
+#pragma unroll
+                for (int i = 0; i < 2; ++i) {
+                    const int d0 = warp * 256 + i * 128 + 8 * (lane & 15);
+                    float4 n0 = __ldcg(reinterpret_cast<const float4*>(scr + SC_ANUM + d0));
+                    float4 n1 = __ldcg(reinterpret_cast<const float4*>(scr + SC_ANUM + d0 + 4));
+                    float rd = 1.f / __ldcg(scr + SC_ADEN + (warp * 2 + i));
+                    areg[8 * i + 0] = n0.x * rd; areg[8 * i + 1] = n0.y * rd;
+                    areg[8 * i + 2] = n0.z * rd; areg[8 * i + 3] = n0.w * rd;
+                    areg[8 * i + 4] = n1.x * rd; areg[8 * i + 5] = n1.y * rd;
+                    areg[8 * i + 6] = n1.z * rd; areg[8 * i + 7] = n1.w * rd;
+                }
+                int r0, r1;
+                rsplit(HID, nb, blk, r0, r1);
+                mv<2048, 2, 10>(Wl + OFF_O, areg, r0, r1, warp, lane, s_part);
+                __syncthreads();
+                for (int t = tid; t < r1 - r0; t += NT) {
+                    float s = 0.f;
+#pragma unroll
+                    for (int w = 0; w < NW; ++w) s += s_part[w * PARTS + t];
+                    scr[SC_OOUT + r0 + t] = s;
+                }
+            }
+            { int a0, a1; rsplit(2 * INTER, nb, blk, a0, a1);
+              pfrows<PFEL>(Wl + OFF_GU, a0, a1, HID, tid); }
+            bar += nb; gbar(ctr, bar);
+
+            /* ---------------- stage D: residual, RMSNorm, gate/up -------- */
+            {
+                float ss = 0.f;
+                for (int k = tid; k < HID; k += NT) {
+                    float v = s_x[k] + __ldcg(scr + SC_OOUT + k);
+                    s_h1[k] = v;
+                    ss += v * v;
+                }
+                ss = wred(ss);
+                if (lane == 0) s_r[warp] = ss;
+                __syncthreads();
+                float tot = 0.f;
+#pragma unroll
+                for (int w = 0; w < NW; ++w) tot += s_r[w];
+                float sc = rsqrtf(tot * (1.0f / HID) + EPSV);
+                for (int k = tid; k < HID; k += NT) s_hn[k] = s_h1[k] * sc * Nl[NOFF_PO + k];
+                __syncthreads();
+
+                float areg[8];
+                areg_shared<HID, 1>(s_hn, warp, lane, areg);
+                int g0, g1;
+                rsplit(2 * INTER, nb, blk, g0, g1);
+                const int i0 = g0 >> 1, i1 = g1 >> 1;
+                mv<HID, 1, 18>(Wl + OFF_GU, areg, g0, g1, warp, lane, s_part);
+                __syncthreads();
+                for (int t = tid; t < i1 - i0; t += NT) {
+                    float gg = 0.f, uu = 0.f;
+#pragma unroll
+                    for (int w = 0; w < NW; ++w) {
+                        gg += s_part[w * PARTS + 2 * t];
+                        uu += s_part[w * PARTS + 2 * t + 1];
+                    }
+                    scr[SC_ACT + i0 + t] = (gg / (1.f + expf(-gg))) * uu;
+                }
+            }
+            { int a0, a1; rsplit(HID, nb, blk, a0, a1);
+              pfrows<PFEL>(Wl + OFF_D, a0, a1, INTER, tid); }
+            bar += nb; gbar(ctr, bar);
+
+            /* ---------------- stage E: down projection + residual -------- */
+            {
+                float areg[24];
+                areg_global<INTER, 3>(scr + SC_ACT, warp, lane, areg);
+                int r0, r1;
+                rsplit(HID, nb, blk, r0, r1);
+                mv<INTER, 3, 6>(Wl + OFF_D, areg, r0, r1, warp, lane, s_part);
+                __syncthreads();
+                for (int t = tid; t < r1 - r0; t += NT) {
+                    float s = 0.f;
+#pragma unroll
+                    for (int w = 0; w < NW; ++w) s += s_part[w * PARTS + t];
+                    int k = r0 + t;
+                    scr[SC_DOUT + k] = __bfloat162float(__float2bfloat16(s_h1[k] + s));
+                }
+            }
+            { int a0, a1; rsplit(QKVR, nb, blk, a0, a1);   /* next layer's stage A */
+              const bf16* Wn = p.W + (long long)(ly + 1 == p.nl ? 0 : ly + 1) * WSTRIDE;
+              pfrows<PFEL>(Wn + OFF_QKV, a0, a1, HID, tid); }
+            bar += nb; gbar(ctr, bar);
+        }
+
+        for (int k = tid; k < HID; k += NT) s_x[k] = __ldcg(scr + SC_DOUT + k);
+    }
+
+    if (blk == 0) {
+        for (int k = tid; k < HID; k += NT) p.HOUT[k] = __float2bfloat16(s_x[k]);
+        if (tid == 0) p.BAR[1 - p.bar_slot] = 0u;
+    }
+}
+
+extern "C" {
+
+int md_config(int* nb, int* nthreads) {
+    int dev = 0;
+    cudaGetDevice(&dev);
+    int nsm = 0;
+    cudaDeviceGetAttribute(&nsm, cudaDevAttrMultiProcessorCount, dev);
+    int per = 0;
+    cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per, (void*)megadecode, NT, 0);
+    if (per < 1) return -1;
+    *nb = nsm;
+    *nthreads = NT;
+    return 0;
+}
+
+/* Keep a slice of the weight buffer resident in L2 across decode steps.
+   The weights are re-read every step (126 MB per step for 4 layers) and L2 is 50 MB,
+   so a plain LRU scan hits ~never.  A fractional access window pins `ratio` of the
+   lines in the window and marks the rest streaming, which turns into an
+   (almost exactly) `ratio` hit rate on all four matvecs.  Bytes are capped at the
+   device's max window size.  Idempotent; cheap enough to call once per chunk. */
+int md_l2pin(const void* base, size_t nbytes, float ratio, void* stream) {
+    int dev = 0;
+    cudaGetDevice(&dev);
+    int maxwin = 0, maxpin = 0;
+    cudaDeviceGetAttribute(&maxwin, cudaDevAttrMaxAccessPolicyWindowSize, dev);
+    cudaDeviceGetAttribute(&maxpin, cudaDevAttrMaxPersistingL2CacheSize, dev);
+    if (maxwin <= 0 || maxpin <= 0) return -1;
+    if (nbytes > (size_t)maxwin) nbytes = (size_t)maxwin;
+    if (ratio <= 0.f) {   /* clear: an empty window is normal LRU, not all-streaming */
+        cudaStreamAttrValue z = {};
+        cudaStreamSetAttribute((cudaStream_t)stream, cudaStreamAttributeAccessPolicyWindow, &z);
+        return (int)cudaDeviceSetLimit(cudaLimitPersistingL2CacheSize, 0);
+    }
+    size_t want = (size_t)(ratio * (float)nbytes);
+    if (want > (size_t)maxpin) want = (size_t)maxpin;
+    cudaError_t e = cudaDeviceSetLimit(cudaLimitPersistingL2CacheSize, want);
+    if (e != cudaSuccess) return (int)e;
+    cudaStreamAttrValue v = {};
+    v.accessPolicyWindow.base_ptr = const_cast<void*>(base);
+    v.accessPolicyWindow.num_bytes = nbytes;
+    v.accessPolicyWindow.hitRatio = ratio > 1.f ? 1.f : ratio;
+    v.accessPolicyWindow.hitProp = cudaAccessPropertyPersisting;
+    v.accessPolicyWindow.missProp = cudaAccessPropertyStreaming;
+    e = cudaStreamSetAttribute((cudaStream_t)stream, cudaStreamAttributeAccessPolicyWindow,
+                               &v);
+    return (int)e;
+}
+
+int md_launch(const void* W, const void* NRM, void* KC, void* VC, const void* INVF,
+              const void* NOISE, const void* HIN, void* HOUT, void* SCR, void* BAR,
+              long long kv_lstride, int nl, int max_seq, int pos0, int nsteps,
+              int nb, int bar_slot, float ac, void* stream) {
+    KP p;
+    p.W = (const bf16*)W;
+    p.NRM = (const float*)NRM;
+    p.KC = (bf16*)KC;
+    p.VC = (bf16*)VC;
+    p.INVF = (const float*)INVF;
+    p.NOISE = (const bf16*)NOISE;
+    p.HIN = (const bf16*)HIN;
+    p.HOUT = (bf16*)HOUT;
+    p.SCR = (float*)SCR;
+    p.BAR = (unsigned*)BAR;
+    p.kv_lstride = kv_lstride;
+    p.nl = nl;
+    p.max_seq = max_seq;
+    p.pos0 = pos0;
+    p.nsteps = nsteps;
+    p.nb = nb;
+    p.bar_slot = bar_slot;
+    p.ac = ac;
+    void* args[] = {&p};
+    cudaError_t e = cudaLaunchCooperativeKernel((void*)megadecode, dim3(nb), dim3(NT),
+                                                args, 0, (cudaStream_t)stream);
+    return (int)e;
+}
+
+}
+"""
+
+# ---------------------------------------------------------------------------
+# build / load
+# ---------------------------------------------------------------------------
+
+
+def _nvcc() -> str:
+    for c in (os.environ.get("CUDA_NVCC"), "nvcc",
+              "/usr/local/cuda/bin/nvcc", "/usr/local/cuda-13.0/bin/nvcc",
+              "/usr/local/cuda-12.8/bin/nvcc"):
+        if not c:
+            continue
+        if os.path.sep in c:
+            if os.path.exists(c):
+                return c
+        else:
+            from shutil import which
+            w = which(c)
+            if w:
+                return w
+    raise RuntimeError("nvcc not found")
+
+
+_LIB = None
+
+
+def _lib():
+    global _LIB
+    if _LIB is not None:
+        return _LIB
+    cap = torch.cuda.get_device_capability(0)
+    arch = f"sm_{cap[0]}{cap[1]}"
+    if cap == (9, 0):
+        arch = "sm_90a"
+    key = hashlib.sha256((CUDA_SRC + arch).encode()).hexdigest()[:16]
+    cands = [os.path.join(os.path.dirname(os.path.abspath(__file__)), "_megaqwen_build"),
+             os.path.join(tempfile.gettempdir(), "megaqwen_build")]
+    last = None
+    for cache in cands:
+        try:
+            os.makedirs(cache, exist_ok=True)
+            so = os.path.join(cache, f"md_{key}.so")
+            if not os.path.exists(so):
+                cu = os.path.join(cache, f"md_{key}.cu")
+                with open(cu, "w") as f:
+                    f.write(CUDA_SRC)
+                tmp = so + f".{os.getpid()}.tmp"
+                cmd = [_nvcc(), "-O3", f"-arch={arch}", "-std=c++17", "--shared",
+                       "-Xcompiler", "-fPIC", "-Xptxas", "-v", cu, "-o", tmp]
+                r = subprocess.run(cmd, capture_output=True, text=True)
+                if r.returncode != 0:
+                    raise RuntimeError("nvcc failed:\n" + r.stdout + "\n" + r.stderr)
+                os.replace(tmp, so)
+            lib = ctypes.CDLL(so)
+            lib.md_config.restype = ctypes.c_int
+            lib.md_config.argtypes = [ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_int)]
+            lib.md_launch.restype = ctypes.c_int
+            lib.md_launch.argtypes = [ctypes.c_void_p] * 10 + [
+                ctypes.c_longlong, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                ctypes.c_int, ctypes.c_int, ctypes.c_float, ctypes.c_void_p]
+            lib.md_l2pin.restype = ctypes.c_int
+            lib.md_l2pin.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_float,
+                                     ctypes.c_void_p]
+            _LIB = lib
+            return _LIB
+        except Exception as exc:  # try next cache dir
+            last = exc
+    raise RuntimeError(f"could not build CUDA extension: {last}")
+
+
+# element counts inside the packed weight buffer (must match the CUDA #defines)
+_OFF_QKV = 0
+_OFF_O = 4096 * HIDDEN
+_OFF_GU = _OFF_O + HIDDEN * (NUM_Q * HEAD_DIM)
+_OFF_D = _OFF_GU + INTERMEDIATE * 2 * HIDDEN
+_WSTRIDE = _OFF_D + HIDDEN * INTERMEDIATE
+_NSTRIDE = 2 * HIDDEN + 2 * HEAD_DIM
+_SCRATCH = 11280
+_ROW_PAD = 8 * INTERMEDIATE
+
+_NOISE_CAP = 16384          # steps of noise buffered on host/device
+# Fraction of the weight buffer to keep pinned in L2 between steps (0 disables).  The
+# 126 MB of weights are re-read every step and L2 is 50 MB, so pinning a quarter of them
+# buys ~1.1% at ctx 2k-8k.  Past _L2_MAXCTX the KV stream (16 KB per position per step)
+# is several times the weights, and stealing L2 from it costs ~0.3% instead -- measured
+# 129.8 vs 131.4 us at 2k and 394.2 vs 395.5 us at 32k.
+_L2_RATIO = float(os.environ.get("MD_L2_RATIO", "0.25"))
+_L2_MAXCTX = int(os.environ.get("MD_L2_MAXCTX", "16384"))
+_HOST_CHUNK_MAX = 16384
+
+
+# ---------------------------------------------------------------------------
+# model
+# ---------------------------------------------------------------------------
+
+
+class Block(nn.Module):
+    """Same parameters (names, shapes, dtypes) as reference.Block."""
+
+    def __init__(self):
+        super().__init__()
+        H, I, D = HIDDEN, INTERMEDIATE, HEAD_DIM
+        self.input_ln = nn.Parameter(torch.ones(H, dtype=torch.bfloat16))
+        self.q_proj = nn.Parameter(torch.empty(NUM_Q * D, H, dtype=torch.bfloat16))
+        self.k_proj = nn.Parameter(torch.empty(NUM_KV * D, H, dtype=torch.bfloat16))
+        self.v_proj = nn.Parameter(torch.empty(NUM_KV * D, H, dtype=torch.bfloat16))
+        self.q_norm = nn.Parameter(torch.ones(D, dtype=torch.bfloat16))
+        self.k_norm = nn.Parameter(torch.ones(D, dtype=torch.bfloat16))
+        self.o_proj = nn.Parameter(torch.empty(H, NUM_Q * D, dtype=torch.bfloat16))
+        self.post_ln = nn.Parameter(torch.ones(H, dtype=torch.bfloat16))
+        self.gate_proj = nn.Parameter(torch.empty(I, H, dtype=torch.bfloat16))
+        self.up_proj = nn.Parameter(torch.empty(I, H, dtype=torch.bfloat16))
+        self.down_proj = nn.Parameter(torch.empty(H, I, dtype=torch.bfloat16))
+        for p in self.parameters():
+            if p.dim() >= 2:
+                nn.init.normal_(p, std=0.02)
+
+
+class Model(nn.Module):
+    def __init__(self, num_layers: int = NUM_LAYERS, max_seq: int = 131072):
+        super().__init__()
+        self.num_layers = num_layers
+        self.max_seq = max_seq
+        self.blocks = nn.ModuleList([Block() for _ in range(num_layers)])
+        self._ready = False
+        self._buf = {}
+
+    # invalidate packed copies when weights change
+    def load_state_dict(self, *a, **kw):
+        self._ready = False
+        return super().load_state_dict(*a, **kw)
+
+    def _to_dev(self):
+        return next(self.parameters()).device
+
+    # ---- packing -----------------------------------------------------------
+    def prepare(self):
+        if self._ready:
+            return
+        dev = self._to_dev()
+        if dev.type != "cuda":
+            raise RuntimeError("solution.Model requires CUDA")
+        lib = _lib()
+        nb = ctypes.c_int(0)
+        nt = ctypes.c_int(0)
+        if lib.md_config(ctypes.byref(nb), ctypes.byref(nt)) != 0:
+            raise RuntimeError("megadecode: cooperative occupancy check failed")
+        self._nb = nb.value
+        nl = self.num_layers
+
+        W = torch.empty(nl * _WSTRIDE + _ROW_PAD, dtype=torch.bfloat16, device=dev)
+        N = torch.empty(nl * _NSTRIDE, dtype=torch.float32, device=dev)
+        for i, b in enumerate(self.blocks):
+            base = i * _WSTRIDE
+            qkv = torch.cat([b.q_proj, b.k_proj, b.v_proj], dim=0)
+            W[base + _OFF_QKV: base + _OFF_QKV + qkv.numel()].copy_(qkv.reshape(-1))
+            W[base + _OFF_O: base + _OFF_O + b.o_proj.numel()].copy_(b.o_proj.reshape(-1))
+            gu = torch.stack([b.gate_proj, b.up_proj], dim=1).reshape(-1)
+            W[base + _OFF_GU: base + _OFF_GU + gu.numel()].copy_(gu)
+            W[base + _OFF_D: base + _OFF_D + b.down_proj.numel()].copy_(b.down_proj.reshape(-1))
+            nb_ = i * _NSTRIDE
+            N[nb_: nb_ + HIDDEN].copy_(b.input_ln.float())
+            N[nb_ + HIDDEN: nb_ + 2 * HIDDEN].copy_(b.post_ln.float())
+            N[nb_ + 2 * HIDDEN: nb_ + 2 * HIDDEN + HEAD_DIM].copy_(b.q_norm.float())
+            N[nb_ + 2 * HIDDEN + HEAD_DIM: nb_ + _NSTRIDE].copy_(b.k_norm.float())
+        W[nl * _WSTRIDE:].zero_()
+
+        # softmax offset: |score| <= sqrt(D)*max|q_norm|*max|k_norm|
+        bound = 0.0
+        for b in self.blocks:
+            bound = max(bound,
+                        math.sqrt(HEAD_DIM)
+                        * float(b.q_norm.float().abs().max())
+                        * float(b.k_norm.float().abs().max()))
+        if not (bound < 40.0):
+            raise RuntimeError(
+                f"attention score bound {bound:.1f} too large for the single-pass "
+                "softmax path (needs a cross-block max reduction)")
+
+        half = HEAD_DIM // 2
+        invf = 1.0 / (10000 ** (torch.arange(0, half, device=dev, dtype=torch.float32) / half))
+
+        kv_lstride = NUM_KV * self.max_seq * HEAD_DIM
+        kc = torch.zeros(nl * kv_lstride, dtype=torch.bfloat16, device=dev)
+        vc = torch.zeros(nl * kv_lstride, dtype=torch.bfloat16, device=dev)
+
+        self._W, self._N, self._invf = W, N, invf
+        self._kc, self._vc = kc, vc
+        self._kv_lstride = kv_lstride
+        self._ac = float(bound)
+        self._scr = torch.zeros(_SCRATCH, dtype=torch.float32, device=dev)
+        self._bar = torch.zeros(2, dtype=torch.int32, device=dev)
+        self._bar_slot = 0
+        self._l2s, self._l2r = None, None
+        self._hw = [torch.empty(HIDDEN, dtype=torch.bfloat16, device=dev) for _ in range(2)]
+        self.k_caches = [kc[i * kv_lstride:(i + 1) * kv_lstride].view(
+            NUM_KV, self.max_seq, HEAD_DIM) for i in range(nl)]
+        self.v_caches = [vc[i * kv_lstride:(i + 1) * kv_lstride].view(
+            NUM_KV, self.max_seq, HEAD_DIM) for i in range(nl)]
+        self._pin = None
+        self._dnz = None
+        self._noff = 0
+        self._ready = True
+
+    def _noise_bufs(self, cap):
+        if self._pin is None or self._pin.shape[0] < cap:
+            # A pending H2D copy holds no reference to the old pinned tensor, so it
+            # must not be freed while the DMA is still reading it.
+            if self._pin is not None:
+                torch.cuda.synchronize()
+            cap = max(cap, 1024)
+            self._pin = torch.empty(cap, HIDDEN, dtype=torch.bfloat16, pin_memory=True)
+            self._dnz = torch.empty(cap, HIDDEN, dtype=torch.bfloat16, device=self._to_dev())
+            self._noff = 0
+        return self._pin, self._dnz
+
+    # ---- the timed path ----------------------------------------------------
+    def _steps(self, hin, pos0, n, gen):
+        dev = self._to_dev()
+        out = torch.empty(HIDDEN, dtype=torch.bfloat16, device=dev)
+        if n <= 0:
+            out.copy_(hin)
+            return out
+        lib = _lib()
+        stream = ctypes.c_void_p(torch.cuda.current_stream().cuda_stream)
+        ratio = _L2_RATIO if pos0 + n <= _L2_MAXCTX else 0.0
+        if (self._l2s, self._l2r) != (stream.value, ratio):
+            lib.md_l2pin(ctypes.c_void_p(self._W.data_ptr()),
+                         ctypes.c_size_t(self._W.numel() * 2),
+                         ctypes.c_float(ratio), stream)
+            self._l2s, self._l2r = stream.value, ratio
+
+        cap = min(n, _NOISE_CAP)
+        pin, dnz = self._noise_bufs(cap)
+        ring = pin.shape[0]
+
+        sizes = []
+        rem, c = n, 1
+        while rem > 0:
+            s = min(c, rem, _HOST_CHUNK_MAX)
+            sizes.append(s)
+            rem -= s
+            c = min(c * 2, _HOST_CHUNK_MAX)
+
+        cur_in = hin
+        # The noise ring carries over between calls: host-side normal_() into pinned
+        # memory is NOT stream ordered, so restarting at 0 here would let this call
+        # overwrite bytes whose H2D copy (queued behind the previous call's kernels)
+        # has not run yet -- a silent wrong-noise race that only shows up when the GPU
+        # is running far behind the host.
+        off = self._noff
+        done = 0
+        for idx, c in enumerate(sizes):
+            if off + c > ring:
+                torch.cuda.synchronize()
+                off = 0
+            pin[off:off + c].normal_(generator=gen)
+            dnz[off:off + c].copy_(pin[off:off + c], non_blocking=True)
+            last = (done + c == n)
+            hout = out if last else self._hw[idx & 1]
+            rc = lib.md_launch(
+                ctypes.c_void_p(self._W.data_ptr()), ctypes.c_void_p(self._N.data_ptr()),
+                ctypes.c_void_p(self._kc.data_ptr()), ctypes.c_void_p(self._vc.data_ptr()),
+                ctypes.c_void_p(self._invf.data_ptr()),
+                ctypes.c_void_p(dnz[off].data_ptr()),
+                ctypes.c_void_p(cur_in.data_ptr()), ctypes.c_void_p(hout.data_ptr()),
+                ctypes.c_void_p(self._scr.data_ptr()), ctypes.c_void_p(self._bar.data_ptr()),
+                ctypes.c_longlong(self._kv_lstride), ctypes.c_int(self.num_layers),
+                ctypes.c_int(self.max_seq), ctypes.c_int(pos0 + done), ctypes.c_int(c),
+                ctypes.c_int(self._nb), ctypes.c_int(self._bar_slot),
+                ctypes.c_float(self._ac), stream)
+            if rc != 0:
+                raise RuntimeError(f"megadecode launch failed: cudaError={rc}")
+            self._bar_slot ^= 1
+            cur_in = hout
+            off += c
+            done += c
+        self._noff = off
+        return out
+
+
+# ---------------------------------------------------------------------------
+# public protocol
+# ---------------------------------------------------------------------------
+
+
+def empty_caches(num_layers: int, max_seq: int, device, dtype=torch.bfloat16):
+    k = [torch.zeros(NUM_KV, max_seq, HEAD_DIM, device=device, dtype=dtype)
+         for _ in range(num_layers)]
+    v = [torch.zeros(NUM_KV, max_seq, HEAD_DIM, device=device, dtype=dtype)
+         for _ in range(num_layers)]
+    return k, v
+
+
+@torch.no_grad()
+def prefill(model: Model, ctx_len: int, seed: int, device=None):
+    """Build a KV cache of length ctx_len.  Not timed."""
+    device = device or next(model.parameters()).device
+    model = model.to(device).eval()
+    assert ctx_len <= model.max_seq
+    model.prepare()
+    g = torch.Generator(device="cpu")
+    g.manual_seed(seed)
+    h = torch.randn(HIDDEN, generator=g, dtype=torch.bfloat16).to(device)
+    gn = torch.Generator(device="cpu")
+    gn.manual_seed(seed + 1)
+    h = model._steps(h, 0, ctx_len, gn)
+    return h, model.k_caches, model.v_caches
+
+
+@torch.no_grad()
+def decode_steps(model: Model, hidden, k_caches, v_caches, start_pos: int,
+                 n_steps: int, seed: int):
+    """Run n_steps decode steps starting at start_pos.  Timed."""
+    model.prepare()
+    gn = torch.Generator(device="cpu")
+    gn.manual_seed(seed + 2)
+    h = model._steps(hidden, start_pos, n_steps, gn)
+    return h, k_caches, v_caches
+
+
+@torch.no_grad()
+def run(ctx_len: int, n_decode: int, seed: int, model: Model | None = None,
+        max_seq: int | None = None) -> dict:
+    device = torch.device("cuda:0")
+    max_seq = max_seq or max(ctx_len + n_decode, 512)
+    if model is None:
+        model = Model(NUM_LAYERS, max_seq)
+    elif getattr(model, "max_seq", 0) < ctx_len + n_decode:
+        raise ValueError(f"model.max_seq={getattr(model, 'max_seq', None)} too small")
+    model = model.to(device).eval()
+    h, k_caches, v_caches = prefill(model, ctx_len, seed, device=device)
+    h, k_caches, v_caches = decode_steps(model, h, k_caches, v_caches,
+                                         start_pos=ctx_len, n_steps=n_decode, seed=seed)
+    return {"last_hidden": h.detach(), "ctx_len": ctx_len, "decode_steps": n_decode}
+
+
+def get_init_inputs():
+    return [NUM_LAYERS, 131072]
+
+
+def get_inputs():
+    return []

@@ -1,0 +1,1099 @@
+"""DeepSeek-NSA style sparse attention, fused CUDA kernels for H100 (SM90).
+
+Semantics (identical to reference.nsa_attend):
+  keys are split in blocks of 64; per query t the block importance is the mean of
+  q.k/sqrt(D) over the causal keys of the block; the top-8 blocks are unioned with
+  a 64-token sliding window; softmax runs over that key set only.
+
+Implementation
+  1. nsa_pack      K and V are rewritten once into mma fragment order, so every
+                   later operand load is a single fully coalesced 128B line that
+                   goes from L2 straight to registers (no smem staging, no
+                   barriers in the attention sweep).  While K's block sits in
+                   shared memory the kernel also emits its column sums, split
+                   into 3 bf16 terms (hi+mid+lo ~ 24 mantissa bits) so the block
+                   scores can be obtained exactly from bf16 tensor cores.
+  2. nsa_select    block importance + top-8 selection.  Importance of a full
+                   block is  scale * q . Ksum / 64  (linearity: O(S*nb*D) instead
+                   of O(S^2*D)); only the diagonal block needs real per-key
+                   scores, which are produced by one 64x64 mma tile plus a causal
+                   prefix sum.  Blocks are visited in *descending* index with a
+                   strict '>' insertion, which reproduces the reference's
+                   sort((imp, bi), reverse=True) tie-break exactly.
+  3. nsa_attn      fused gather + online sparse softmax.  One CTA owns a pool of
+                   P consecutive queries; Q and the running softmax state stay in
+                   shared memory for the whole pool.  The pool's (query, block)
+                   pairs are compacted into a shared CSR by block (counting sort),
+                   with the sliding window expressed as two band entries so one
+                   uniform loop covers window + selected blocks; the resulting
+                   (block, query-tile) pairs form a flat work list that the warps
+                   pull from round-robin.  Each warp keeps a *private* online
+                   softmax state (m, l, o) for all P queries, so accumulation is a
+                   plain shared-memory read-modify-write of __half2 pairs rather
+                   than a red.shared.add (~93 clk each on SM90); the W partial
+                   states are merged exactly in the epilogue with
+                   m = max m_w,  l = sum l_w 2^(m_w-m),  o = sum o_w 2^(m_w-m).
+                   QK and PV both run on mma.sync.m16n8k16 with the QK accumulator
+                   fragments feeding the PV operand in place.
+
+Only bf16 inputs of shape (B,H,S,D) with D in {64,128} take the CUDA path; a
+PyTorch fallback covers anything else.
+"""
+
+import ctypes
+import hashlib
+import math
+import os
+import subprocess
+import threading
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+# ---------------------------------------------------------------------------
+# CUDA source
+# ---------------------------------------------------------------------------
+
+_CUDA_SRC = r"""
+#include <cuda_bf16.h>
+#include <cuda_fp16.h>
+#include <cuda_runtime.h>
+#include <cstdint>
+
+typedef __nv_bfloat16 bf16;
+
+#define BSZ    64
+#define TOPN   8
+#define TM     32
+#define FULLM  0xffffffffu
+#define MASKV  (-1e35f)
+#define MINIT  (-1e30f)
+#define LOG2EF 1.4426950408889634f
+#define NCHSEL 32   /* blocks scored per chunk in nsa_select */
+
+/* ---------------- ptx helpers ---------------- */
+__device__ __forceinline__ uint32_t sptr(const void *p) {
+  return static_cast<uint32_t>(__cvta_generic_to_shared(p));
+}
+__device__ __forceinline__ float ex2(float x) {
+  float r;
+  asm("ex2.approx.f32 %0, %1;" : "=f"(r) : "f"(x));
+  return r;
+}
+/* 16B chunk index inside a row-major tile row, xor-swizzled for conflict free
+   ldmatrix on 8 consecutive (or 8 distinct-mod-8) rows. */
+__device__ __forceinline__ int swz(int row, int chunk) { return chunk ^ (row & 7); }
+
+__device__ __forceinline__ void cpa16(uint32_t dst, const void *src, bool pred) {
+  asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" ::"r"(dst), "l"(src),
+               "r"(pred ? 16 : 0)
+               : "memory");
+}
+#define CP_COMMIT() asm volatile("cp.async.commit_group;\n" ::)
+#define CP_WAIT(N) asm volatile("cp.async.wait_group %0;\n" ::"n"(N))
+
+__device__ __forceinline__ void ldm4(uint32_t a, uint32_t *r) {
+  asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+               : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3])
+               : "r"(a));
+}
+__device__ __forceinline__ void ldm4t(uint32_t a, uint32_t *r) {
+  asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+               : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3])
+               : "r"(a));
+}
+__device__ __forceinline__ void mma1688(float *d, const uint32_t *a, const uint32_t *b) {
+  asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
+               "{%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%0,%1,%2,%3};\n"
+               : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
+               : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
+}
+__device__ __forceinline__ uint32_t pk2(float lo, float hi) {
+  return __byte_perm(__bfloat16_as_ushort(__float2bfloat16_rn(lo)),
+                     __bfloat16_as_ushort(__float2bfloat16_rn(hi)), 0x5410);
+}
+
+/* ================= kernel 1: importance + top-8 selection ================= */
+template <int DD>
+__device__ __forceinline__ void ins8(float *tv, int *ti, float v, int b) {
+  if (!(v > tv[7])) return;
+  int p = 0;
+#pragma unroll
+  for (int s = 0; s < 8; s++) p += (tv[s] >= v) ? 1 : 0;
+#pragma unroll
+  for (int s = 7; s >= 1; s--) {
+    if (s > p) {
+      tv[s] = tv[s - 1];
+      ti[s] = ti[s - 1];
+    }
+  }
+#pragma unroll
+  for (int s = 0; s < 8; s++) {
+    if (s == p) {
+      tv[s] = v;
+      ti[s] = b;
+    }
+  }
+}
+
+template <int DD>
+__global__ __launch_bounds__(128) void nsa_select(const bf16 *__restrict__ qg,
+                                                  const bf16 *__restrict__ kg,
+                                                  const bf16 *__restrict__ ks3,
+                                                  short *__restrict__ selg,
+                                                  unsigned char *__restrict__ pflg, int S, int nb,
+                                                  float scale) {
+  constexpr int NCH = DD / 8;
+  constexpr int TSZ = 64 * DD;                                  /* halves per 64xDD tile */
+  constexpr int KSZ = (64 * DD > 3 * NCHSEL * DD) ? 64 * DD : 3 * NCHSEL * DD;
+  extern __shared__ __align__(16) bf16 smem[];
+  bf16 *qs = smem;              /* 64 x DD swizzled */
+  bf16 *kt = qs + TSZ;          /* 64 x DD  (diag K)  |  3 x NCHSEL x DD (ksum) */
+  float *dsc = (float *)(kt + KSZ);   /* 64 x 65 */
+  float *ic = dsc + 64 * 65;          /* 64 x (NCHSEL+1) */
+
+  const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
+  const int qb = blockIdx.x, bh = blockIdx.y;
+  const int q0 = qb * BSZ;
+  const int nqv = min(BSZ, S - q0);
+
+  const int arow = (lane & 7) + 8 * ((lane >> 3) & 1);
+  const int akc = (lane >> 4) & 1;
+  const int brow = (lane & 7) + 8 * ((lane >> 4) & 1);
+  const int bkc = (lane >> 3) & 1;
+  const int gr = lane >> 2, gc = lane & 3;
+
+  /* --- stage Q tile and the diagonal K block --- */
+  for (int i = tid; i < 64 * NCH; i += 128) {
+    int r = i / NCH, c = i - r * NCH;
+    bool ok = (q0 + r) < S;
+    cpa16(sptr(qs + (size_t)r * DD + swz(r, c) * 8), qg + ((size_t)bh * S + q0 + r) * DD + c * 8,
+          ok);
+    cpa16(sptr(kt + (size_t)r * DD + swz(r, c) * 8), kg + ((size_t)bh * S + q0 + r) * DD + c * 8,
+          ok);
+  }
+  CP_COMMIT();
+  CP_WAIT(0);
+  __syncthreads();
+
+  /* --- diagonal block: real scores --- */
+  {
+    float sc[8][4];
+#pragma unroll
+    for (int n = 0; n < 8; n++)
+#pragma unroll
+      for (int e = 0; e < 4; e++) sc[n][e] = 0.f;
+#pragma unroll 1
+    for (int ks = 0; ks < DD / 16; ks++) {
+      uint32_t af[4];
+      int r = warp * 16 + arow;
+      ldm4(sptr(qs + (size_t)r * DD + swz(r, 2 * ks + akc) * 8), af);
+#pragma unroll
+      for (int np = 0; np < 4; np++) {
+        int nr = np * 16 + brow;
+        uint32_t bfr[4];
+        ldm4(sptr(kt + (size_t)nr * DD + swz(nr, 2 * ks + bkc) * 8), bfr);
+        mma1688(sc[np * 2 + 0], af, &bfr[0]);
+        mma1688(sc[np * 2 + 1], af, &bfr[2]);
+      }
+    }
+#pragma unroll
+    for (int n = 0; n < 8; n++) {
+      dsc[(warp * 16 + gr) * 65 + n * 8 + 2 * gc + 0] = sc[n][0];
+      dsc[(warp * 16 + gr) * 65 + n * 8 + 2 * gc + 1] = sc[n][1];
+      dsc[(warp * 16 + gr + 8) * 65 + n * 8 + 2 * gc + 0] = sc[n][2];
+      dsc[(warp * 16 + gr + 8) * 65 + n * 8 + 2 * gc + 1] = sc[n][3];
+    }
+  }
+  __syncthreads();
+
+  float tv[8];
+  int ti[8];
+#pragma unroll
+  for (int s = 0; s < 8; s++) {
+    tv[s] = -3e38f;
+    ti[s] = -1;
+  }
+  /* Two threads per query row.  The insertion chain is a ~40 op serial
+     dependency per candidate, so it is latency bound rather than work bound:
+     splitting the candidates over two threads halves the chain and puts the
+     other two warps to work.  Each thread still visits its candidates in
+     descending block order, so equal importances keep favouring the larger
+     block index exactly like the reference's sort((imp, bi), reverse=True). */
+  const int myq = tid & 63, myh = tid >> 6;
+  if (myh == 0) {
+    float acc = 0.f;
+    const float *row = dsc + myq * 65;
+    for (int j = 0; j <= myq; j++) acc += row[j];
+    ins8<DD>(tv, ti, acc * scale / (float)(myq + 1), qb);
+  }
+
+  /* --- remaining blocks, in descending chunks --- */
+  for (int cb = (qb - 1) / NCHSEL; cb >= 0 && qb > 0; cb--) {
+    int b0 = cb * NCHSEL, b1 = min(qb, b0 + NCHSEL);
+    int nrow = b1 - b0;
+    __syncthreads();
+    for (int i = tid; i < 3 * NCHSEL * NCH; i += 128) {
+      int pl = i / (NCHSEL * NCH);
+      int rem = i - pl * NCHSEL * NCH;
+      int r = rem / NCH, c = rem - r * NCH;
+      size_t plane = (size_t)gridDim.y * nb * DD;
+      cpa16(sptr(kt + ((size_t)pl * NCHSEL + r) * DD + swz(r, c) * 8),
+            ks3 + pl * plane + ((size_t)bh * nb + b0 + r) * DD + c * 8, r < nrow);
+    }
+    CP_COMMIT();
+    CP_WAIT(0);
+    __syncthreads();
+    {
+      float sc[4][4];
+#pragma unroll
+      for (int n = 0; n < 4; n++)
+#pragma unroll
+        for (int e = 0; e < 4; e++) sc[n][e] = 0.f;
+#pragma unroll 1
+      for (int pl = 0; pl < 3; pl++) {
+#pragma unroll 1
+        for (int ks = 0; ks < DD / 16; ks++) {
+          uint32_t af[4];
+          int r = warp * 16 + arow;
+          ldm4(sptr(qs + (size_t)r * DD + swz(r, 2 * ks + akc) * 8), af);
+#pragma unroll
+          for (int np = 0; np < 2; np++) {
+            int nr = np * 16 + brow;
+            uint32_t bfr[4];
+            ldm4(sptr(kt + ((size_t)pl * NCHSEL + nr) * DD + swz(nr, 2 * ks + bkc) * 8), bfr);
+            mma1688(sc[np * 2 + 0], af, &bfr[0]);
+            mma1688(sc[np * 2 + 1], af, &bfr[2]);
+          }
+        }
+      }
+      const float f = scale * (1.f / 64.f);
+#pragma unroll
+      for (int n = 0; n < 4; n++) {
+        ic[(warp * 16 + gr) * (NCHSEL + 1) + n * 8 + 2 * gc + 0] = sc[n][0] * f;
+        ic[(warp * 16 + gr) * (NCHSEL + 1) + n * 8 + 2 * gc + 1] = sc[n][1] * f;
+        ic[(warp * 16 + gr + 8) * (NCHSEL + 1) + n * 8 + 2 * gc + 0] = sc[n][2] * f;
+        ic[(warp * 16 + gr + 8) * (NCHSEL + 1) + n * 8 + 2 * gc + 1] = sc[n][3] * f;
+      }
+    }
+    __syncthreads();
+    {
+      const float *row = ic + myq * (NCHSEL + 1);
+      for (int c = nrow - 1 - myh; c >= 0; c -= 2) ins8<DD>(tv, ti, row[c], b0 + c);
+    }
+  }
+
+  /* merge the pair: max(a[s], b[7-s]) for s in 0..7 is exactly the top 8 of the
+     union of two descending 8-lists (bitonic half cleaner), and comparing
+     (imp, block) keeps the reference tie break.  dsc is dead by now. */
+  float *mv = dsc;
+  int *mi = (int *)(dsc + 64 * 9);
+  __syncthreads();
+  if (myh == 1) {
+#pragma unroll
+    for (int s = 0; s < 8; s++) {
+      mv[myq * 9 + s] = tv[s];
+      mi[myq * 9 + s] = ti[s];
+    }
+  }
+  __syncthreads();
+
+  if (myq < nqv && myh == 0) {
+#pragma unroll
+    for (int s = 0; s < 8; s++) {
+      const float bv = mv[myq * 9 + 7 - s];
+      const int bb = mi[myq * 9 + 7 - s];
+      const bool ta = (tv[s] > bv) || (tv[s] == bv && ti[s] > bb);
+      tv[s] = ta ? tv[s] : bv;
+      ti[s] = ta ? ti[s] : bb;
+    }
+    short out[TOPN];
+    int no = 0;
+    unsigned char pf = 0;
+#pragma unroll
+    for (int s = 0; s < 8; s++) {
+      int b = ti[s];
+      if (b < 0 || b == qb) continue;
+      if (b == qb - 1) {
+        pf = 1;
+        continue;
+      }
+      out[no++] = (short)b;
+    }
+    while (no < TOPN) out[no++] = -1;
+    *(int4 *)(selg + ((size_t)bh * S + q0 + myq) * TOPN) = *(const int4 *)out;
+    pflg[(size_t)bh * S + q0 + myq] = pf;
+  }
+}
+
+/* ---- shared-memory reductions and a monotone float->u32 key for atomic max ---- */
+__device__ __forceinline__ unsigned int fenc(float f) {
+  unsigned int u = __float_as_uint(f);
+  return (u & 0x80000000u) ? ~u : (u | 0x80000000u);
+}
+__device__ __forceinline__ float fdec(unsigned int e) {
+  return __uint_as_float((e & 0x80000000u) ? (e & 0x7fffffffu) : ~e);
+}
+__device__ __forceinline__ void redmax(unsigned int *p, unsigned int v) {
+  asm volatile("red.shared.max.u32 [%0], %1;\n" ::"r"(sptr(p)), "r"(v) : "memory");
+}
+__device__ __forceinline__ void redadd(float *p, float v) {
+  asm volatile("red.shared.add.f32 [%0], %1;\n" ::"r"(sptr(p)), "f"(v) : "memory");
+}
+
+/* ================= kernel 3: repack K and V into mma fragment order =================
+   Reading fragments straight out of a row-major tensor costs eight cache lines per
+   instruction, because one register holds 4 bytes from each of eight different rows.
+   Laying the operands out exactly as the mma wants them - register major, lane
+   contiguous - turns every fragment load into one 128B line, so the attention kernel
+   can stream K and V from L2 with no shared-memory staging and no barriers at all.
+   Unit u holds the four registers of one (16 key x 16 dim) tile, 128 words each.  */
+template <int DD>
+__global__ __launch_bounds__(256) void nsa_pack(const bf16 *__restrict__ kg,
+                                               const bf16 *__restrict__ vg,
+                                               uint32_t *__restrict__ kfg,
+                                               uint32_t *__restrict__ vfg,
+                                               bf16 *__restrict__ ks3, int *__restrict__ ctr,
+                                               int S, int nb) {
+  constexpr int NCH = DD / 8;
+  constexpr int NDG = DD / 16;
+  __shared__ __align__(16) bf16 t[64 * DD];
+  const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+  const int bi = blockIdx.x, bh = blockIdx.y;
+  const int s0 = bi * 64;
+  const size_t bofs = (size_t)(bh * nb + bi) * NDG * 512;
+  /* arm the attention kernel's CTA counter here rather than from a memset node:
+     the kernel boundary already orders it, and one fewer node is ~3us of graph
+     replay on the short shapes. */
+  if (tid == 0 && bi == 0 && bh == 0) *ctr = 0;
+
+#pragma unroll 1
+  for (int kv = 0; kv < 2; kv++) {
+    const bf16 *src = kv ? vg : kg;
+    if (kv) __syncthreads();
+    for (int i = tid; i < 64 * NCH; i += 256) {
+      int r = i / NCH, c = i - r * NCH;
+      uint4 val = make_uint4(0, 0, 0, 0);
+      if (s0 + r < S) val = *(const uint4 *)(src + ((size_t)bh * S + s0 + r) * DD + c * 8);
+      *(uint4 *)(t + (size_t)r * DD + swz(r, c) * 8) = val;
+    }
+    __syncthreads();
+    /* K's block column sums, taken from the copy that is already in smem: the
+       same numbers a separate ksum kernel would produce (identical 4 way partial
+       order), for the price of one smem pass instead of a second read of all of
+       K plus a kernel launch.  ks3 is 3 planes (hi, mid, lo) of (BH, nb, D) bf16,
+       an exact 24 bit split of the fp32 sum, so that q . Ksum can be evaluated on
+       bf16 tensor cores in nsa_select. */
+    if (kv == 0) {
+      const int n = min(64, S - s0);
+      for (int d = tid; d < DD; d += 256) {
+        const bf16 *tp = t + (d & 7);
+        float a0 = 0.f, a1 = 0.f, a2 = 0.f, a3 = 0.f;
+        int r = 0;
+        for (; r + 4 <= n; r += 4) {
+          a0 += __bfloat162float(tp[(r + 0) * DD + swz(r + 0, d >> 3) * 8]);
+          a1 += __bfloat162float(tp[(r + 1) * DD + swz(r + 1, d >> 3) * 8]);
+          a2 += __bfloat162float(tp[(r + 2) * DD + swz(r + 2, d >> 3) * 8]);
+          a3 += __bfloat162float(tp[(r + 3) * DD + swz(r + 3, d >> 3) * 8]);
+        }
+        for (; r < n; r++) a0 += __bfloat162float(tp[r * DD + swz(r, d >> 3) * 8]);
+        const float sm = (a0 + a1) + (a2 + a3);
+        const bf16 hi = __float2bfloat16_rn(sm);
+        const float e1 = sm - __bfloat162float(hi);
+        const bf16 md = __float2bfloat16_rn(e1);
+        const bf16 lo = __float2bfloat16_rn(e1 - __bfloat162float(md));
+        const size_t plane = (size_t)gridDim.y * nb * DD;
+        const size_t off = ((size_t)bh * nb + bi) * DD + d;
+        ks3[off] = hi;
+        ks3[plane + off] = md;
+        ks3[2 * plane + off] = lo;
+      }
+    }
+    for (int u = warp; u < NDG * 4; u += 8) {
+      uint32_t fr[4];
+      if (kv == 0) { /* K: B operand of Q@K^T, unit = (ks, key group) */
+        int ks_ = u >> 2, np = u & 3;
+        int nr = np * 16 + (lane & 7) + 8 * ((lane >> 4) & 1);
+        ldm4(sptr(t + (size_t)nr * DD + swz(nr, 2 * ks_ + ((lane >> 3) & 1)) * 8), fr);
+      } else { /* V: B operand of P@V, transposed, unit = (dim group, ks) */
+        int npg = u >> 2, ks_ = u & 3;
+        int vr = ks_ * 16 + (lane & 7) + 8 * ((lane >> 3) & 1);
+        int vc = npg * 2 + ((lane >> 4) & 1);
+        ldm4t(sptr(t + (size_t)vr * DD + swz(vr, vc) * 8), fr);
+      }
+      uint32_t *o = (kv ? vfg : kfg) + bofs + (size_t)u * 128 + lane;
+      o[0] = fr[0];
+      o[32] = fr[1];
+      o[64] = fr[2];
+      o[96] = fr[3];
+    }
+  }
+}
+
+/* ================= kernel 3: fused sparse attention =================
+   One flat work list of (key block, 32 query tile) items, which the CTA's warps pull
+   round robin: a pool whose blocks collect wildly different numbers of queries still
+   keeps every warp busy, and no barrier is needed anywhere in the sweep.
+   Each warp keeps its OWN online softmax state (max, sum, output) for every query in
+   the pool.  That is what makes the accumulate a plain read-modify-write instead of a
+   shared-memory atomic - measured at ~80 cycles apiece, 85% of the previous kernel -
+   and the NW partial states are merged with the usual rescaling identity in the
+   epilogue, which is exact.  The output state is fp16 pairs: p <= 1 always, so the
+   partial sums cannot overflow, and it halves both footprint and accumulate traffic. */
+template <int DD, int PQ, int NW>
+__global__ __launch_bounds__(NW * 32, 1) void nsa_attn(
+    const bf16 *__restrict__ qg, const uint32_t *__restrict__ kfg,
+    const uint32_t *__restrict__ vfg, bf16 *__restrict__ og, const short *__restrict__ selg,
+    const unsigned char *__restrict__ pflg, int *__restrict__ ctr, int S, int nb, int BH, int npp,
+    float scale) {
+  constexpr int NCH = DD / 8;
+  constexpr int NDG = DD / 16;
+  constexpr int PR = PQ + 8;
+  constexpr int ASTH = DD / 2 + 1; /* half2 words per output row, == 1 mod 32 */
+  constexpr int NT = NW * 32;
+  constexpr float NEG = -1e30f;
+
+  extern __shared__ __align__(16) bf16 smem[];
+  bf16 *qs = smem;                                           /* PR x DD    swizzled */
+  __half2 *accw = (__half2 *)(qs + (size_t)PR * DD);         /* NW x PR x ASTH      */
+  float *mxw = (float *)(accw + (size_t)NW * PR * ASTH);     /* NW x PR   running max */
+  float *lsw = mxw + (size_t)NW * PR;                        /* NW x PR   running sum */
+  unsigned short *csr = (unsigned short *)(lsw + (size_t)NW * PR);
+  int *cnt = (int *)(csr + PQ * (TOPN + 2));
+  int *cur = cnt + nb + 1;
+  int *work = cur + nb + 1;
+
+  __shared__ int s_idx, s_nw;
+  const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
+  const int arow = (lane & 7) + 8 * ((lane >> 3) & 1);
+  const int akc = (lane >> 4) & 1;
+  const int gr = lane >> 2, gc = lane & 3;
+  const float SL = scale * LOG2EF;
+  const int npool = BH * npp;
+  __half2 *const accp = accw + (size_t)warp * PR * ASTH;
+  float *const mxp = mxw + (size_t)warp * PR;
+  float *const lsp = lsw + (size_t)warp * PR;
+
+  for (;;) {
+    if (tid == 0) s_idx = atomicAdd(ctr, 1);
+    __syncthreads();
+    const int idx = s_idx;
+    if (idx >= npool) break;
+    const int bh = idx % BH;
+    const int pp = npp - 1 - idx / BH; /* big pools first: better tail balance */
+    const int q0 = pp * PQ;
+    const int nq = min(PQ, S - q0);
+    const int nbc = ((q0 + nq - 1) >> 6) + 1;
+    const uint32_t *kbh = kfg + (size_t)bh * nb * NDG * 512 + lane;
+    const uint32_t *vbh = vfg + (size_t)bh * nb * NDG * 512 + lane;
+
+    /* ---- reset the per warp softmax states, stage Q ---- */
+    for (int i = tid; i < NW * PR * ASTH; i += NT) ((float *)accw)[i] = 0.f;
+    for (int i = tid; i < NW * PR; i += NT) {
+      mxw[i] = NEG;
+      lsw[i] = 0.f;
+    }
+    for (int i = tid; i < 8 * NCH; i += NT) {
+      int r = PQ + i / NCH, c = i % NCH;
+      *(uint4 *)(qs + (size_t)r * DD + c * 8) = make_uint4(0, 0, 0, 0);
+    }
+    for (int i = tid; i <= nbc; i += NT) cnt[i] = 0;
+    for (int i = tid; i < PQ * NCH; i += NT) {
+      int r = i / NCH, c = i - r * NCH;
+      cpa16(sptr(qs + (size_t)r * DD + swz(r, c) * 8),
+            qg + ((size_t)bh * S + q0 + r) * DD + c * 8, (q0 + r) < S);
+    }
+    CP_COMMIT();
+    __syncthreads();
+
+    /* ---- CSR by block: count ---- */
+    for (int lq = tid; lq < nq; lq += NT) {
+      int t = q0 + lq, bt = t >> 6;
+      atomicAdd(&cnt[bt], 1);
+      if (bt) atomicAdd(&cnt[bt - 1], 1);
+      int4 raw = *(const int4 *)(selg + ((size_t)bh * S + t) * TOPN);
+      const short *sp = (const short *)&raw;
+#pragma unroll
+      for (int s = 0; s < TOPN; s++)
+        if (sp[s] >= 0) atomicAdd(&cnt[sp[s]], 1);
+    }
+    __syncthreads();
+    /* ---- scan, and flatten (block, tile) into one work list ---- */
+    if (warp == 0) {
+      int tot = 0, nw = 0;
+      for (int base = 0; base < nbc; base += 32) {
+        int i = base + lane;
+        int c = (i < nbc) ? cnt[i] : 0;
+        int nt = (c + TM - 1) / TM;
+        int s = c, ts = nt;
+#pragma unroll
+        for (int d = 1; d < 32; d <<= 1) {
+          int y = __shfl_up_sync(FULLM, s, d);
+          int y2 = __shfl_up_sync(FULLM, ts, d);
+          if (lane >= (unsigned)d) {
+            s += y;
+            ts += y2;
+          }
+        }
+        if (i < nbc) {
+          cnt[i] = s - c + tot;
+          cur[i] = s - c + tot;
+          int w0 = nw + ts - nt;
+          for (int u = 0; u < nt; u++) work[w0 + u] = (i << 6) | u;
+        }
+        tot += __shfl_sync(FULLM, s, 31);
+        nw += __shfl_sync(FULLM, ts, 31);
+      }
+      if (lane == 0) {
+        cnt[nbc] = tot;
+        s_nw = nw;
+      }
+    }
+    __syncthreads();
+    /* ---- CSR scatter (band entries carry the "window covers whole block" bit) ---- */
+    for (int lq = tid; lq < nq; lq += NT) {
+      int t = q0 + lq, bt = t >> 6;
+      csr[atomicAdd(&cur[bt], 1)] = (unsigned short)lq;
+      if (bt) {
+        unsigned short e = (unsigned short)lq | (pflg[(size_t)bh * S + t] ? 0x8000u : 0u);
+        csr[atomicAdd(&cur[bt - 1], 1)] = e;
+      }
+      int4 raw = *(const int4 *)(selg + ((size_t)bh * S + t) * TOPN);
+      const short *sp = (const short *)&raw;
+#pragma unroll
+      for (int s = 0; s < TOPN; s++)
+        if (sp[s] >= 0) csr[atomicAdd(&cur[sp[s]], 1)] = (unsigned short)lq;
+    }
+    CP_WAIT(0);
+    __syncthreads();
+    const int nwk = s_nw;
+
+    /* ================= the sweep ================= */
+    for (int it = warp; it < nwk; it += NW) {
+      const int w = work[it];
+      const int bi = w >> 6;
+      const int ce = cnt[bi + 1];
+      const int base = cnt[bi] + (w & 63) * TM;
+
+      int lqA[2], lqC[2][2];
+      bool fl[2][2];
+#pragma unroll
+      for (int m = 0; m < 2; m++) {
+        int p = base + m * 16 + arow;
+        lqA[m] = (p < ce) ? (csr[p] & 0x7FFF) : PQ;
+#pragma unroll
+        for (int h = 0; h < 2; h++) {
+          int p2 = base + m * 16 + gr + 8 * h;
+          unsigned short e = (p2 < ce) ? csr[p2] : (unsigned short)PQ;
+          lqC[m][h] = e & 0x7FFF;
+          fl[m][h] = (e & 0x8000) != 0;
+        }
+      }
+
+      const uint32_t *kfp = kbh + (size_t)bi * NDG * 512;
+      float sc[2][8][4];
+#pragma unroll
+      for (int m = 0; m < 2; m++)
+#pragma unroll
+        for (int n = 0; n < 8; n++)
+#pragma unroll
+          for (int e = 0; e < 4; e++) sc[m][n][e] = 0.f;
+#pragma unroll
+      for (int ks_ = 0; ks_ < NDG; ks_++) {
+        uint32_t af[2][4];
+#pragma unroll
+        for (int m = 0; m < 2; m++) {
+          int r = lqA[m];
+          ldm4(sptr(qs + (size_t)r * DD + swz(r, 2 * ks_ + akc) * 8), af[m]);
+        }
+#pragma unroll
+        for (int np = 0; np < 4; np++) {
+          const uint32_t *p = kfp + (ks_ * 4 + np) * 128;
+          uint32_t bfr[4] = {__ldg(p), __ldg(p + 32), __ldg(p + 64), __ldg(p + 96)};
+#pragma unroll
+          for (int m = 0; m < 2; m++) {
+            mma1688(sc[m][np * 2 + 0], af[m], &bfr[0]);
+            mma1688(sc[m][np * 2 + 1], af[m], &bfr[2]);
+          }
+        }
+      }
+
+      bool needm = false;
+#pragma unroll
+      for (int m = 0; m < 2; m++)
+#pragma unroll
+        for (int h = 0; h < 2; h++) {
+          int lq = lqC[m][h];
+          if (lq < nq) needm |= ((bi + 1) >= ((q0 + lq) >> 6));
+        }
+      if (__any_sync(FULLM, needm)) {
+#pragma unroll
+        for (int m = 0; m < 2; m++) {
+          int jlo[2], jhi[2];
+#pragma unroll
+          for (int h = 0; h < 2; h++) {
+            int lq = lqC[m][h];
+            int jl = 0, jh = 63;
+            if (lq < nq) {
+              int t = q0 + lq, bt = t >> 6, r = t & 63;
+              if (bi == bt) jh = r;
+              else if (bi == bt - 1) jl = fl[m][h] ? 0 : (r + 1);
+            }
+            jlo[h] = jl;
+            jhi[h] = jh;
+          }
+#pragma unroll
+          for (int n = 0; n < 8; n++) {
+            int j0 = n * 8 + 2 * gc;
+            sc[m][n][0] = (j0 >= jlo[0] && j0 <= jhi[0]) ? sc[m][n][0] : MASKV;
+            sc[m][n][1] = (j0 + 1 >= jlo[0] && j0 + 1 <= jhi[0]) ? sc[m][n][1] : MASKV;
+            sc[m][n][2] = (j0 >= jlo[1] && j0 <= jhi[1]) ? sc[m][n][2] : MASKV;
+            sc[m][n][3] = (j0 + 1 >= jlo[1] && j0 + 1 <= jhi[1]) ? sc[m][n][3] : MASKV;
+          }
+        }
+      }
+
+      /* ---- online softmax against this warp's own running max ---- */
+      float alp[2][2];
+#pragma unroll
+      for (int m = 0; m < 2; m++)
+#pragma unroll
+        for (int h = 0; h < 2; h++) {
+          const int lq = lqC[m][h];
+          float tm = MASKV;
+#pragma unroll
+          for (int n = 0; n < 8; n++) tm = fmaxf(tm, fmaxf(sc[m][n][2 * h], sc[m][n][2 * h + 1]));
+          tm = fmaxf(tm, __shfl_xor_sync(FULLM, tm, 1));
+          tm = fmaxf(tm, __shfl_xor_sync(FULLM, tm, 2));
+          const float mo = mxp[lq];
+          const float mn = fmaxf(mo, tm * SL);
+          const float al = ex2(mo - mn);
+          alp[m][h] = al;
+          float rs = 0.f;
+#pragma unroll
+          for (int n = 0; n < 8; n++) {
+            float p0 = ex2(__fmaf_rn(sc[m][n][2 * h], SL, -mn));
+            float p1 = ex2(__fmaf_rn(sc[m][n][2 * h + 1], SL, -mn));
+            sc[m][n][2 * h] = p0;
+            sc[m][n][2 * h + 1] = p1;
+            rs += p0 + p1;
+          }
+          rs += __shfl_xor_sync(FULLM, rs, 1);
+          rs += __shfl_xor_sync(FULLM, rs, 2);
+          if (gc == 0) {
+            mxp[lq] = mn;
+            lsp[lq] = __fmaf_rn(lsp[lq], al, rs);
+          }
+        }
+
+      /* ---- P @ V, 64 dims at a time, straight into this warp's own rows ---- */
+#pragma unroll 1
+      for (int dh = 0; dh < NCH / 8; dh++) {
+        const uint32_t *vfp = vbh + (size_t)bi * NDG * 512 + dh * 4 * 512;
+        float ac[2][8][4];
+#pragma unroll
+        for (int m = 0; m < 2; m++)
+#pragma unroll
+          for (int n = 0; n < 8; n++)
+#pragma unroll
+            for (int e = 0; e < 4; e++) ac[m][n][e] = 0.f;
+#pragma unroll
+        for (int ks_ = 0; ks_ < 4; ks_++) {
+          uint32_t pfr[2][4];
+#pragma unroll
+          for (int m = 0; m < 2; m++) {
+            pfr[m][0] = pk2(sc[m][2 * ks_][0], sc[m][2 * ks_][1]);
+            pfr[m][1] = pk2(sc[m][2 * ks_][2], sc[m][2 * ks_][3]);
+            pfr[m][2] = pk2(sc[m][2 * ks_ + 1][0], sc[m][2 * ks_ + 1][1]);
+            pfr[m][3] = pk2(sc[m][2 * ks_ + 1][2], sc[m][2 * ks_ + 1][3]);
+          }
+#pragma unroll
+          for (int np = 0; np < 4; np++) {
+            const uint32_t *p = vfp + (np * 4 + ks_) * 128;
+            uint32_t vf[4] = {__ldg(p), __ldg(p + 32), __ldg(p + 64), __ldg(p + 96)};
+#pragma unroll
+            for (int m = 0; m < 2; m++) {
+              mma1688(ac[m][np * 2 + 0], pfr[m], &vf[0]);
+              mma1688(ac[m][np * 2 + 1], pfr[m], &vf[2]);
+            }
+          }
+        }
+#pragma unroll
+        for (int m = 0; m < 2; m++)
+#pragma unroll
+          for (int h = 0; h < 2; h++) {
+            __half2 *ap = accp + (size_t)lqC[m][h] * ASTH + dh * 32 + gc;
+            const __half2 al = __float2half2_rn(alp[m][h]);
+#pragma unroll
+            for (int dt = 0; dt < 8; dt++)
+              ap[dt * 4] = __hfma2(ap[dt * 4], al,
+                                   __floats2half2_rn(ac[m][dt][2 * h], ac[m][dt][2 * h + 1]));
+          }
+      }
+    }
+    __syncthreads();
+
+    /* ---- merge the NW partial softmax states and write out ---- */
+    for (int i = tid; i < nq * NCH; i += NT) {
+      int r = i / NCH, c = i - r * NCH;
+      float mr = NEG;
+#pragma unroll 1
+      for (int w = 0; w < NW; w++) mr = fmaxf(mr, mxw[(size_t)w * PR + r]);
+      float l = 0.f, ov[8];
+#pragma unroll
+      for (int u = 0; u < 8; u++) ov[u] = 0.f;
+#pragma unroll 1
+      for (int w = 0; w < NW; w++) {
+        float sw = ex2(mxw[(size_t)w * PR + r] - mr);
+        l = __fmaf_rn(lsw[(size_t)w * PR + r], sw, l);
+        const __half2 *ap = accw + (size_t)w * PR * ASTH + (size_t)r * ASTH + c * 4;
+#pragma unroll
+        for (int u = 0; u < 4; u++) {
+          float2 f = __half22float2(ap[u]);
+          ov[2 * u] = __fmaf_rn(f.x, sw, ov[2 * u]);
+          ov[2 * u + 1] = __fmaf_rn(f.y, sw, ov[2 * u + 1]);
+        }
+      }
+      float g = (l > 0.f) ? __frcp_rn(l) : 0.f;
+      uint32_t o[4];
+#pragma unroll
+      for (int u = 0; u < 4; u++) o[u] = pk2(ov[2 * u] * g, ov[2 * u + 1] * g);
+      *(uint4 *)(og + ((size_t)bh * S + q0 + r) * DD + c * 8) =
+          make_uint4(o[0], o[1], o[2], o[3]);
+    }
+    __syncthreads();
+  }
+}
+
+/* ================= host launcher ================= */
+template <int DD, int PQ, int NW>
+static size_t attn_smem(int nb) {
+  size_t s = (size_t)2 * (PQ + 8) * DD;                            /* qs        */
+  s += (size_t)4 * NW * (PQ + 8) * (DD / 2 + 1);                   /* accw      */
+  s += (size_t)8 * NW * (PQ + 8);                                  /* mxw, lsw  */
+  s += (size_t)2 * PQ * (TOPN + 2);                                /* csr       */
+  s += (size_t)4 * (2 * (nb + 1) + nb + PQ * (TOPN + 2) / TM + 4); /* cnt, cur, work */
+  return s;
+}
+
+/* the smem opt-in is host state, not stream work: doing it once per (shape,config)
+   keeps it out of the per-call path and out of cuda graph captures. */
+#define ATTN_LAUNCH(DD, PQ, NW)                                                                 \
+  do {                                                                                          \
+    size_t sm = attn_smem<DD, PQ, NW>(nb);                                                      \
+    int npp = (S + (PQ)-1) / (PQ);                                                              \
+    int grid = min(npp * BH, nsm);                                                              \
+    static size_t smset = 0;                                                                    \
+    if (smset != sm) {                                                                          \
+      cudaFuncSetAttribute(nsa_attn<DD, PQ, NW>, cudaFuncAttributeMaxDynamicSharedMemorySize,    \
+                           (int)sm);                                                            \
+      smset = sm;                                                                               \
+    }                                                                                           \
+    nsa_attn<DD, PQ, NW><<<grid, (NW)*32, sm, str>>>((const bf16 *)q, kf, vf, (bf16 *)o, sel,   \
+                                                     pfl, ctr, S, nb, BH, npp, scale);          \
+  } while (0)
+
+extern "C" void nsa_ws_layout(int B, int H, int S, int D, long long *out) {
+  long long BH = (long long)B * H, nb = (S + 63) / 64;
+  long long o0 = 0; /* ks3 */
+  long long s0 = 3 * BH * nb * D * 2;
+  long long o1 = (o0 + s0 + 255) & ~255LL; /* sel */
+  long long s1 = BH * S * TOPN * 2;
+  long long o2 = (o1 + s1 + 255) & ~255LL; /* pfl */
+  long long s2 = BH * S;
+  long long o3 = (o2 + s2 + 255) & ~255LL;  /* ctr */
+  long long o4 = (o3 + 256 + 255) & ~255LL; /* kf */
+  long long s4 = BH * nb * D * 128;
+  long long o5 = (o4 + s4 + 255) & ~255LL; /* vf */
+  out[0] = o0;
+  out[1] = o1;
+  out[2] = o2;
+  out[3] = o3;
+  out[4] = o4;
+  out[5] = o5;
+  out[6] = o5 + s4; /* total */
+}
+
+extern "C" int nsa_forward(const void *q, const void *k, const void *v, void *o, void *ws, int B,
+                           int H, int S, int D, int pq_ovr, void *stream) {
+  cudaStream_t str = (cudaStream_t)stream;
+  const int BH = B * H, nb = (S + 63) / 64;
+  const float scale = 1.f / sqrtf((float)D);
+  long long lay[8];
+  nsa_ws_layout(B, H, S, D, lay);
+  bf16 *ks3 = (bf16 *)((char *)ws + lay[0]);
+  short *sel = (short *)((char *)ws + lay[1]);
+  unsigned char *pfl = (unsigned char *)((char *)ws + lay[2]);
+  int *ctr = (int *)((char *)ws + lay[3]);
+  uint32_t *kf = (uint32_t *)((char *)ws + lay[4]);
+  uint32_t *vf = (uint32_t *)((char *)ws + lay[5]);
+
+  static int nsm = 0;
+  if (!nsm) {
+    int dev = 0;
+    cudaGetDevice(&dev);
+    cudaDeviceGetAttribute(&nsm, cudaDevAttrMultiProcessorCount, dev);
+  }
+  if (D == 64) {
+    nsa_pack<64><<<dim3(nb, BH), 256, 0, str>>>((const bf16 *)k, (const bf16 *)v, kf, vf, ks3,
+                                                    ctr, S, nb);
+    size_t sm = 2 * (64 * 64 + 3 * NCHSEL * 64) + 64 * 65 * 4 + 64 * (NCHSEL + 1) * 4;
+    static bool once = false;
+    if (!once) {
+      cudaFuncSetAttribute(nsa_select<64>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)sm);
+      once = true;
+    }
+    nsa_select<64><<<dim3(nb, BH), 128, sm, str>>>((const bf16 *)q, (const bf16 *)k, ks3, sel, pfl,
+                                                   S, nb, scale);
+  } else {
+    nsa_pack<128><<<dim3(nb, BH), 256, 0, str>>>((const bf16 *)k, (const bf16 *)v, kf, vf, ks3,
+                                                    ctr, S, nb);
+    size_t sm = 2 * (64 * 128 + 3 * NCHSEL * 128) + 64 * 65 * 4 + 64 * (NCHSEL + 1) * 4;
+    static bool once = false;
+    if (!once) {
+      cudaFuncSetAttribute(nsa_select<128>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)sm);
+      once = true;
+    }
+    nsa_select<128><<<dim3(nb, BH), 128, sm, str>>>((const bf16 *)q, (const bf16 *)k, ks3, sel,
+                                                    pfl, S, nb, scale);
+  }
+
+  int nwo = pq_ovr / 1000; /* 0 = pick, else warps per CTA */
+  int pq = pq_ovr % 1000;
+  /* 160 queries per pool is the largest pool whose per-warp accumulator state
+     still fits in 227KB of smem at 8 warps (D=64) / 4 warps (D=128).  Bigger
+     pools make each block's query list longer, so fewer of the 32-row mma tiles
+     are half empty: measured fill 49% at PQ=128 vs 63% at PQ=160, worth 7-9% on
+     the long shapes.  Drop back to 128 when 160 would leave a mostly empty
+     final pool (S=1024 divides 128 exactly but wastes 9% of a 160 pool). */
+  if (pq <= 0) pq = ((S + 159) / 160 * 160 - S) * 16 > S ? 128 : 160;
+  if (D == 64) {
+    if (pq >= 256) ATTN_LAUNCH(64, 256, 4);
+    else if (pq >= 192) ATTN_LAUNCH(64, 192, 4);
+    else if (pq >= 160) {
+      if (nwo == 4) ATTN_LAUNCH(64, 160, 4);
+      else ATTN_LAUNCH(64, 160, 8);
+    } else if (pq >= 128) {
+      if (nwo == 4) ATTN_LAUNCH(64, 128, 4);
+      else ATTN_LAUNCH(64, 128, 8);
+    } else ATTN_LAUNCH(64, 64, 8);
+  } else if (D == 128) {
+    if (pq >= 160) ATTN_LAUNCH(128, 160, 4);
+    else if (pq >= 128) ATTN_LAUNCH(128, 128, 4);
+    else ATTN_LAUNCH(128, 64, 8);
+  } else {
+    return 100;
+  }
+  return (int)cudaGetLastError();
+}
+"""
+
+# ---------------------------------------------------------------------------
+# build / load
+# ---------------------------------------------------------------------------
+
+_LOCK = threading.Lock()
+_LIB = None
+
+
+def _find_nvcc():
+    for c in (
+        os.path.join(os.environ.get("CUDA_HOME", "/usr/local/cuda"), "bin", "nvcc"),
+        "/usr/local/cuda/bin/nvcc",
+        "/usr/local/cuda-13.0/bin/nvcc",
+        "/usr/local/cuda-12.9/bin/nvcc",
+    ):
+        if os.path.exists(c):
+            return c
+    from shutil import which
+
+    return which("nvcc")
+
+
+def _build():
+    key = hashlib.sha256(_CUDA_SRC.encode()).hexdigest()[:16]
+    root = (
+        os.environ.get("NSA_BUILD_DIR")
+        or os.environ.get("TORCH_EXTENSIONS_DIR")
+        or os.path.join(os.path.expanduser("~"), ".cache", "nsa_cuda")
+    )
+    bdir = os.path.join(root, "nsa_" + key)
+    so = os.path.join(bdir, "libnsa.so")
+    if not os.path.exists(so):
+        os.makedirs(bdir, exist_ok=True)
+        cu = os.path.join(bdir, "nsa.cu")
+        with open(cu, "w") as f:
+            f.write(_CUDA_SRC)
+        nvcc = _find_nvcc()
+        if nvcc is None:
+            raise RuntimeError("nvcc not found")
+        tmp = so + ".%d.tmp" % os.getpid()
+        cmd = [
+            nvcc, "-O3", "-std=c++17", "-arch=sm_90a", "-lineinfo",
+            "-Xptxas", "-O3", "--shared", "-Xcompiler", "-fPIC", "--cudart", "shared",
+            "-o", tmp, cu,
+        ]
+        r = subprocess.run(cmd, capture_output=True, text=True)
+        if r.returncode != 0:
+            raise RuntimeError("nvcc failed:\n" + r.stdout[-4000:] + "\n" + r.stderr[-8000:])
+        os.replace(tmp, so)
+    lib = ctypes.CDLL(so)
+    lib.nsa_forward.restype = ctypes.c_int
+    lib.nsa_forward.argtypes = [ctypes.c_void_p] * 5 + [ctypes.c_int] * 5 + [ctypes.c_void_p]
+    lib.nsa_ws_layout.restype = None
+    lib.nsa_ws_layout.argtypes = [ctypes.c_int] * 4 + [ctypes.c_void_p]
+    return lib
+
+
+def _lib():
+    global _LIB
+    if _LIB is None:
+        with _LOCK:
+            if _LIB is None:
+                _LIB = _build()
+    return _LIB
+
+
+_WS = {}
+
+
+def _ws(B, H, S, D, dev):
+    lib = _lib()
+    key = (B, H, S, D, dev.index)
+    w = _WS.get(key)
+    if w is None:
+        lay = (ctypes.c_longlong * 8)()
+        lib.nsa_ws_layout(B, H, S, D, ctypes.byref(lay))
+        w = torch.empty(int(lay[6]), dtype=torch.uint8, device=dev)
+        _WS[key] = w
+    return w
+
+
+_PQ_OVR = int(os.environ.get("NSA_PQ", "0"))
+
+# The whole pipeline is four kernels plus a 4-byte memset behind a ctypes call,
+# which costs ~40us of CPU per invocation -- a third of the runtime on the short
+# shapes.  Replaying a captured graph instead costs ~8us.  Every buffer address is
+# part of the cache key, so a replay is only ever used for the exact tensors it was
+# captured with (the graph reads whatever those buffers hold at replay time, which
+# is the same contract as launching the kernels directly).  Address churn is
+# self-limiting: after _MAX_CAP captures for one shape we stop trying and keep
+# launching directly.
+_GRAPHS = {}
+_CAPS = {}
+_GRAPH_ON = os.environ.get("NSA_GRAPH", "1") != "0"
+_MAX_GRAPHS = 64
+_MAX_CAP = 4
+
+
+def _launch(lib, q, k, v, o, ws, B, H, S, D):
+    rc = lib.nsa_forward(
+        q.data_ptr(), k.data_ptr(), v.data_ptr(), o.data_ptr(), ws.data_ptr(),
+        B, H, S, D, _PQ_OVR, ctypes.c_void_p(torch.cuda.current_stream().cuda_stream),
+    )
+    if rc != 0:
+        raise RuntimeError("nsa_forward failed rc=%d" % rc)
+
+
+def nsa_cuda(q, k, v):
+    B, H, S, D = q.shape
+    lib = _lib()
+    q = q.contiguous()
+    k = k.contiguous()
+    v = v.contiguous()
+    o = torch.empty_like(q)
+    ws = _ws(B, H, S, D, q.device)
+    if not _GRAPH_ON:
+        _launch(lib, q, k, v, o, ws, B, H, S, D)
+        return o
+    key = (q.data_ptr(), k.data_ptr(), v.data_ptr(), o.data_ptr(), ws.data_ptr(),
+           B, H, S, D, _PQ_OVR, q.device.index)
+    g = _GRAPHS.get(key)
+    if g is not None:
+        g.replay()
+        return o
+    _launch(lib, q, k, v, o, ws, B, H, S, D)  # this call's own result
+    shp = (B, H, S, D, q.device.index)
+    n = _CAPS.get(shp, 0)
+    if n >= _MAX_CAP or len(_GRAPHS) >= _MAX_GRAPHS:
+        return o
+    _CAPS[shp] = n + 1
+    try:
+        gr = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(gr):  # records the launches, does not run them
+            _launch(lib, q, k, v, o, ws, B, H, S, D)
+        _GRAPHS[key] = gr
+    except Exception:
+        _CAPS[shp] = _MAX_CAP  # capture unavailable here; never retry
+    return o
+
+
+# ---------------------------------------------------------------------------
+# reference-equivalent fallback (no SDPA), for shapes the kernel does not cover
+# ---------------------------------------------------------------------------
+
+
+def nsa_fallback(q, k, v, bs=64, topn=8, win=64, chunk=128):
+    B, H, S, D = q.shape
+    dev = q.device
+    scale = 1.0 / math.sqrt(D)
+    nb = (S + bs - 1) // bs
+    pad = nb * bs - S
+    qf, kf, vf = q.float(), k.float(), v.float()
+    out = torch.empty(B, H, S, D, dtype=torch.float32, device=dev)
+    ar = torch.arange(S, device=dev)
+    arb = torch.arange(nb, device=dev)
+    for t0 in range(0, S, chunk):
+        t1 = min(t0 + chunk, S)
+        tt = ar[t0:t1]
+        T = t1 - t0
+        sc = torch.einsum("bhtd,bhsd->bhts", qf[:, :, t0:t1], kf) * scale
+        causal = ar[None, :] <= tt[:, None]
+        scm = sc.masked_fill(~causal, 0.0)
+        if pad:
+            scm = F.pad(scm, (0, pad))
+        bsum = scm.view(B, H, T, nb, bs).sum(-1)
+        cnt = (tt[:, None] + 1 - arb[None, :] * bs).clamp(0, bs)
+        imp = (bsum / cnt.clamp(min=1).float()).masked_fill((cnt == 0)[None, None], -1e9)
+        order = imp.flip(-1).argsort(dim=-1, descending=True, stable=True)
+        sel = (nb - 1) - order[..., :topn]
+        bmask = torch.zeros(B, H, T, nb, dtype=torch.bool, device=dev)
+        bmask.scatter_(-1, sel, True)
+        keep = (bmask.repeat_interleave(bs, dim=-1)[..., :S] & causal[None, None]) | (
+            (ar[None, :] >= (tt[:, None] + 1 - win)) & causal
+        )[None, None]
+        p = torch.softmax(sc.masked_fill(~keep, float("-inf")), dim=-1)
+        out[:, :, t0:t1] = torch.einsum("bhts,bhsd->bhtd", p, vf)
+    return out
+
+
+class Model(nn.Module):
+    def __init__(self, batch_size, num_heads, seq_len, head_dim,
+                 block_size=64, top_n_blocks=8, sliding_window=64):
+        super().__init__()
+        self.batch_size = batch_size
+        self.num_heads = num_heads
+        self.seq_len = seq_len
+        self.head_dim = head_dim
+        self.block_size = block_size
+        self.top_n_blocks = top_n_blocks
+        self.sliding_window = sliding_window
+        self.register_buffer("_dummy", torch.zeros(1, dtype=torch.bfloat16))
+
+    def forward(self, q, k, v):
+        ok = (
+            q.is_cuda
+            and q.dtype == torch.bfloat16
+            and q.shape[-1] in (64, 128)
+            and q.dim() == 4
+            and q.shape == k.shape == v.shape
+            and self.block_size == 64
+            and self.top_n_blocks == 8
+            and self.sliding_window == 64
+        )
+        if ok:
+            return nsa_cuda(q, k, v)
+        return nsa_fallback(
+            q, k, v, bs=self.block_size, topn=self.top_n_blocks, win=self.sliding_window
+        ).to(torch.bfloat16)
