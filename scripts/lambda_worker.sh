@@ -5,7 +5,8 @@
 #   lambda_worker.sh list                         instance types + capacity
 #   lambda_worker.sh ls                           running instances
 #   lambda_worker.sh up <name> [type] [region]    launch (default gpu_1x_h100_sxm5)
-#   lambda_worker.sh sync <name>                  rsync thin hard bench -> name:kb-hard/
+#   lambda_worker.sh sync <name>                  rsync thin bench -> name:kb-<bench>/
+#      (bench selected by KB_LAMBDA_BENCH, default hard; `multi` also ships ~/.kbm_env)
 #   lambda_worker.sh bootstrap <name> [--agents]  uv + torch; --agents adds CLIs + auth
 #   lambda_worker.sh run <name> <harness> <model> <problem> [effort]
 #   lambda_worker.sh regrade <name> <run_id> [runs_dir]
@@ -22,7 +23,14 @@
 #      (default problems-h100), KBH_HARDWARE (default H100) for regrade.
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")/.." && pwd)"
-HARD="$HERE/benchmarks/hard"
+# Which bench this worker serves. Default `hard` keeps every existing invocation
+# byte-identical; KB_LAMBDA_BENCH=multi targets the 4xH100 deck, which has its
+# own entry script and problem root. (2026-07-28)
+BENCH="${KB_LAMBDA_BENCH:-hard}"
+BENCH_DIR="$HERE/benchmarks/$BENCH"
+REMOTE_DIR="kb-$BENCH"
+HARD="$BENCH_DIR"          # legacy name, still used by `regrade`
+[ -d "$BENCH_DIR" ] || { echo "ERROR: unknown bench '$BENCH'" >&2; exit 1; }
 API="${LAMBDA_API_BASE:-https://cloud.lambda.ai/api/v1}"
 STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/kernelbench-lambda"
 mkdir -p "$STATE_DIR"
@@ -44,7 +52,10 @@ CMD="${1:?usage: lambda_worker.sh <list|ls|up|sync|bootstrap|run|regrade|pull|do
 shift || true
 
 ENV_ALLOWLIST='KIMI_API_KEY|MOONSHOT_API_KEY|ZAI_API_KEY|MINIMAX_API_KEY|DEEPSEEK_API_KEY|LONGCAT_API_KEY|TENCENT_API_KEY|DASHSCOPE_API_KEY|QWEN_API_KEY|OPENROUTER_API_KEY|OPENAI_API_KEY|GEMINI_API_KEY|ANTHROPIC_API_KEY|CLAUDE_CODE_OAUTH_TOKEN'
-PROBLEMS_ROOT="${KB_LAMBDA_PROBLEMS_ROOT:-problems-h100}"
+case "$BENCH" in
+  multi) PROBLEMS_ROOT="${KB_LAMBDA_PROBLEMS_ROOT:-problems-h100x4}" ;;
+  *)     PROBLEMS_ROOT="${KB_LAMBDA_PROBLEMS_ROOT:-problems-h100}" ;;
+esac
 # Lambda's launch API rejects requests with more than one ssh key
 # ("Invalid number of SSH keys", observed 2026-07-21), so the default is the
 # single key for whichever control plane is running this script. The other
@@ -233,15 +244,22 @@ case "$CMD" in
     NAME="${1:?name required}"
     ensure_reachable "$NAME"
     IP="$(instance_ip "$NAME")"
-    echo "[sync] thin hard bench -> ${SSH_USER}@${IP}:kb-hard/"
+    echo "[sync] thin $BENCH bench -> ${SSH_USER}@${IP}:$REMOTE_DIR/"
     rsync -az -e "ssh -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=$STATE_DIR/known_hosts -o BatchMode=yes" \
       --exclude outputs --exclude __pycache__ --exclude '.venv' --exclude '*.pyc' \
       --exclude .git --exclude 'docs/refs' \
-      "$HARD/" "${SSH_USER}@${IP}:kb-hard/"
+      "$BENCH_DIR/" "${SSH_USER}@${IP}:$REMOTE_DIR/"
     TMPENV="$(mktemp)"
     grep -E "^(export )?($ENV_ALLOWLIST)=" "$HOME/.env_vars" >"$TMPENV" || true
     rsync -az -e "ssh -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=$STATE_DIR/known_hosts -o BatchMode=yes" \
       "$TMPENV" "${SSH_USER}@${IP}:.env_vars"
+    if [ "$BENCH" = multi ]; then
+      # run_agent.sh sources ~/.kbm_env. Keys go over stdin-ish (rsync of a temp
+      # file), never in argv, and land chmod 600.
+      rsync -az -e "ssh -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=$STATE_DIR/known_hosts -o BatchMode=yes" \
+        "$TMPENV" "${SSH_USER}@${IP}:.kbm_env"
+      ssh_to "$NAME" 'chmod 600 ~/.kbm_env ~/.env_vars'
+    fi
     rm -f "$TMPENV"
     ;;
 
@@ -255,7 +273,7 @@ case "$CMD" in
     ssh_to "$NAME" 'command -v uv >/dev/null 2>&1 || curl -LsSf https://astral.sh/uv/install.sh | sh'
     # Prefer cu128 for driver compatibility (same as brev workers); override with KB_LAMBDA_TORCH_INDEX.
     TORCH_INDEX="${KB_LAMBDA_TORCH_INDEX:-https://download.pytorch.org/whl/cu128}"
-    ssh_to "$NAME" "cd ~/kb-hard && if ! grep -q pytorch-cu128 pyproject.toml 2>/dev/null; then cat >> pyproject.toml <<'TOML'
+    ssh_to "$NAME" "cd ~/$REMOTE_DIR && if ! grep -q pytorch-cu128 pyproject.toml 2>/dev/null; then cat >> pyproject.toml <<'TOML'
 
 [[tool.uv.index]]
 name = \"pytorch-cu128\"
@@ -278,18 +296,30 @@ rm -f uv.lock; fi; export PATH=\"\$HOME/.local/bin:\$PATH\"; uv sync"
       rsync -az -e "ssh -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=$STATE_DIR/known_hosts -o BatchMode=yes" \
         ~/.claude/.credentials.json "${SSH_USER}@${IP}:.claude/.credentials.json" 2>/dev/null || true
     fi
-    ssh_to "$NAME" 'export PATH="$HOME/.local/bin:$PATH"; cd ~/kb-hard && uv run python -c "import torch;print(\"torch\",torch.__version__,\"cuda\",torch.cuda.is_available(),torch.cuda.get_device_name(0) if torch.cuda.is_available() else None)"'
+    ssh_to "$NAME" 'export PATH="$HOME/.local/bin:$PATH"; cd ~/'"$REMOTE_DIR"' && uv run python -c "import torch;print(\"torch\",torch.__version__,\"cuda\",torch.cuda.is_available(),torch.cuda.get_device_name(0) if torch.cuda.is_available() else None)"'
     ;;
 
   run)
     NAME="${1:?name}"; HARNESS="${2:?harness}"; MODEL="${3:?model}"; PROBLEM="${4:?problem}"; EFFORT="${5:-}"
     ensure_reachable "$NAME"
-    echo "[run] detached: $HARNESS $MODEL $PROBLEMS_ROOT/$PROBLEM $EFFORT"
-    ssh_to "$NAME" "cd ~/kb-hard && nohup env KBH_AGENT_CONTAINER=0 BUDGET_SECONDS=0 ./scripts/run_hard.sh $HARNESS $MODEL $PROBLEMS_ROOT/$PROBLEM $EFFORT > ~/kb_run.log 2>&1 & echo launched PID \$!"
+    if [ "$BENCH" = multi ]; then
+      # Multi takes a BARE problem name (not a path) and must run SEQUENTIALLY —
+      # sweep_wave.sh, never parallel sessions: four concurrent agents on one
+      # 4-GPU fabric OOM'"'"'d the node and pkill-ed each other on 2026-07-25.
+      echo "[run] detached (sequential): $HARNESS $MODEL $PROBLEM $EFFORT"
+      ssh_to "$NAME" "cd ~/$REMOTE_DIR && nohup env BUDGET_SECONDS=0 ./scripts/sweep_wave.sh $HARNESS $MODEL ${EFFORT:-high} $PROBLEM > ~/kb_run.log 2>&1 & echo launched PID \$!"
+    else
+      echo "[run] detached: $HARNESS $MODEL $PROBLEMS_ROOT/$PROBLEM $EFFORT"
+      ssh_to "$NAME" "cd ~/$REMOTE_DIR && nohup env KBH_AGENT_CONTAINER=0 BUDGET_SECONDS=0 ./scripts/run_hard.sh $HARNESS $MODEL $PROBLEMS_ROOT/$PROBLEM $EFFORT > ~/kb_run.log 2>&1 & echo launched PID \$!"
+    fi
     echo "Poll:  lambda_worker.sh ssh $NAME 'tail -20 ~/kb_run.log'"
     ;;
 
   regrade)
+    # Multi grades differently (torchrun, 4 ranks, its own frozen anchors), so it
+    # has scripts/regrade.py in-bench. Refuse rather than silently grade against
+    # the hard workspace.
+    [ "$BENCH" = multi ] && { echo "ERROR: use benchmarks/multi/scripts/regrade.py on the worker for multi" >&2; exit 2; }
     NAME="${1:?name}"; RID="${2:?run_id}"; RUNS_DIR="${3:-$HARD/outputs/runs-h100}"
     SRC="$RUNS_DIR/$RID"
     [ -f "$SRC/solution.py" ] || {
@@ -315,12 +345,12 @@ rm -f uv.lock; fi; export PATH=\"\$HOME/.local/bin:\$PATH\"; uv sync"
     NAME="${1:?name}"
     ensure_reachable "$NAME"
     IP="$(instance_ip "$NAME")"
-    DEST="$HARD/outputs/runs-lambda-$NAME"
+    DEST="$BENCH_DIR/outputs/runs-lambda-$NAME"
     mkdir -p "$DEST"
-    echo "[pull] ${IP}:kb-hard/outputs/runs/ -> $DEST"
+    echo "[pull] ${IP}:$REMOTE_DIR/outputs/runs/ -> $DEST"
     rsync -az -e "ssh -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=$STATE_DIR/known_hosts -o BatchMode=yes" \
       --exclude '.venv' --exclude 'cache' --exclude 'tmp' --exclude 'container_uv_cache' \
-      "${SSH_USER}@${IP}:kb-hard/outputs/runs/" "$DEST/"
+      "${SSH_USER}@${IP}:$REMOTE_DIR/outputs/runs/" "$DEST/"
     ;;
 
   down)
