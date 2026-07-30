@@ -22,26 +22,19 @@ Usage (same args as `vllm`):
 import sys
 
 from vllm.model_executor.models.lfm2 import Lfm2Model
-from vllm.model_executor.models.utils import WeightsMapper
 
-_orig = Lfm2Model.hf_to_vllm_mapper
-_stacked = {
-    k: v for k, v in _orig.orig_to_new_stacked.items() if k not in (".w1", ".w3")
-}
-if len(_stacked) == len(_orig.orig_to_new_stacked):
+# Mutate the mapper's stacked-rule dict in place rather than constructing a new
+# WeightsMapper: its keyword fields get renamed across vLLM versions
+# (orig_to_new_renamings vs orig_to_new_renaming), and the dict itself is what
+# weight loading consults.
+_stacked = Lfm2Model.hf_to_vllm_mapper.orig_to_new_stacked
+_dropped = [k for k in (".w1", ".w3") if _stacked.pop(k, None) is not None]
+if not _dropped:
     print(
         "serve_nvfp4: WARNING: no .w1/.w3 stacked rules found; vLLM may have "
         "fixed this upstream. Verify the patch is still needed.",
         file=sys.stderr,
     )
-Lfm2Model.hf_to_vllm_mapper = WeightsMapper(
-    orig_to_new_renamings=_orig.orig_to_new_renamings,
-    orig_to_new_regex=_orig.orig_to_new_regex,
-    orig_to_new_substr=_orig.orig_to_new_substr,
-    orig_to_new_stacked=_stacked,
-    orig_to_new_prefix=_orig.orig_to_new_prefix,
-    orig_to_new_suffix=_orig.orig_to_new_suffix,
-)
 
 from vllm.entrypoints.cli.main import main  # noqa: E402
 

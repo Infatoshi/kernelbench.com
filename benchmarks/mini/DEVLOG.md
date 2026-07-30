@@ -1,5 +1,43 @@
 # KernelBench-Mini — DEVLOG
 
+## 2026-07-29 — self-contained kbmini node: serving moved onto the eval box
+
+Athena (and the whole lease fleet) died mid-campaign with the anvil tunnel as a
+single point of failure, and anvil itself lost GPU1 to a GSP wedge. The user's
+call: the bench must not depend on anvil at all, and every graded number must
+come from one consistent GPU. New architecture, one Lambda `gpu_1x_h100_sxm5`
+(`kbmini`) does everything:
+
+- **vLLM serves the model on the eval H100 itself** (localhost:8765, 35% GPU
+  mem), ccr-rust on 3456 for `lfm-claude`. Same ports the old tunnel used, so
+  zero harness config changes. In-run GPU contention between serving and
+  check/benchmark is acceptable BECAUSE published numbers only ever come from
+  the sequential re-grade, which runs with the server stopped. This supersedes
+  the 07-23 "inference never on the eval GPU" rule — that rule now applies to
+  the re-grade, not the agent phase.
+- ccr-rust's source is deleted everywhere (anvil binary only survives; built
+  against glibc 2.43, node has 2.35). It runs under anvil's shipped loader:
+  `ld-linux-x86-64.so.2 --library-path ~/.kbmini/ccrlibs ccr-rust`. Rebuild
+  properly if ccr ever needs changes.
+- Lambda image gotcha: no `ninja` — vLLM's KV-cache init shells out to it and
+  the engine core dies with FileNotFoundError. `apt install ninja-build`.
+- vLLM API drift: `WeightsMapper(orig_to_new_renamings=...)` kwarg no longer
+  exists (renamed singular). `serve_nvfp4.py` now pops `.w1`/`.w3` from
+  `orig_to_new_stacked` in place instead of constructing a new mapper.
+- 10-min rsync pullback to the Mac runs for the whole campaign (athena lesson:
+  a dead node must cost <=10 min of artifacts, and the pullback must exclude
+  per-run `.venv`/caches — mirroring them once filled the Mac disk).
+
+**bf16 rerun on kbmini (local serving, 20-worker split): 100/100, 43 wrote a
+solution, 0 correct** — closely reproducing the lost athena wave (44/0) on a
+different node, different serving locality, and 4x the worker concurrency.
+The reliability spread is the stable result. One shift: lfm-claude wrote 11
+gradeable solutions vs 6 on athena, its provider_early_stops gone — those were
+tunnel/ccr artifacts, not model behavior. The 07-28 tunnel-served NVFP4 wave is
+superseded by a local-serving rerun (same 20-worker layout as bf16) so the
+precision comparison shares serving latency; the old wave stays archived,
+trace/debug only.
+
 ## 2026-07-25 — first full matrix: LFM2.5-2.6B-Agent bf16, 100 sessions, 0 correct
 
 Eval node moved ares -> **athena** (same SKU, 2x H100 80GB HBM3) at the user's
