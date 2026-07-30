@@ -60,7 +60,10 @@ require_idle_gpu() {
     local waited=0
     while true; do
         local busy
-        busy=$(nvidia-smi -i "$GPU" --query-compute-apps=pid --format=csv,noheader 2>/dev/null | grep -c . || echo 0)
+        local smi_out
+        smi_out=$(nvidia-smi -i "$GPU" --query-compute-apps=pid --format=csv,noheader 2>/dev/null)
+        busy=$(printf '%s' "$smi_out" | grep -c .)
+        busy=${busy:-0}
         if [ "$busy" -eq 0 ]; then
             [ "$waited" -gt 0 ] && echo "    GPU $GPU idle after ${waited}s"
             return 0

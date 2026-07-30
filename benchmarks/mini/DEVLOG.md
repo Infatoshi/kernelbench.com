@@ -32,11 +32,29 @@ come from one consistent GPU. New architecture, one Lambda `gpu_1x_h100_sxm5`
 solution, 0 correct** — closely reproducing the lost athena wave (44/0) on a
 different node, different serving locality, and 4x the worker concurrency.
 The reliability spread is the stable result. One shift: lfm-claude wrote 11
-gradeable solutions vs 6 on athena, its provider_early_stops gone — those were
-tunnel/ccr artifacts, not model behavior. The 07-28 tunnel-served NVFP4 wave is
-superseded by a local-serving rerun (same 20-worker layout as bf16) so the
-precision comparison shares serving latency; the old wave stays archived,
-trace/debug only.
+gradeable solutions vs 6 on athena, with only 1 provider_early_stop. The 07-28
+tunnel-served NVFP4 wave is superseded by a local-serving rerun (same 20-worker
+layout as bf16) so the precision comparison shares serving latency; the old
+wave stays archived, trace/debug only.
+
+**NVFP4 rerun (local serving): 100/100, 37 solutions, 0 correct.** The
+precision comparison under identical serving/layout: bf16 43 solutions vs
+NVFP4 37; per-harness emission shifts (bf16 -> nvfp4): lfm-claude 11 -> 4,
+lfm-opencode 14 -> 7, hermes 2 -> 6, pi 12 -> 16, grok 4 -> 4. lfm-claude kept
+8 provider_early_stops on NVFP4 with the tunnel gone (bf16 local: 1), so early
+stops are NOT purely transport artifacts — the quantized model plausibly emits
+short/empty responses the ccr route reports as early stop; worth a trace read
+before any publication.
+
+**Sequential isolated re-grade (server stopped, GPU at 0 MiB): all 80
+solution-bearing cells re-checked, 0 correct, 80 failed** — verdicts identical
+to the contended in-run grades, and every failure is deterministic (16 no-CUDA-
+evidence, 13+ syntax/truncation, 6 forbidden torch.sort, 2 state-dict/numeric),
+i.e. none of the wave's failures were serving-contention artifacts. No
+template mutations in either local wave. Found and fixed en route: mini's
+regrade_sequential.sh carried the pre-fix `grep -c . || echo 0` idle-GPU probe
+(emits "0\n0" on an idle GPU, integer-test error, gate loops forever) — ported
+hard's fixed form.
 
 ## 2026-07-25 — first full matrix: LFM2.5-2.6B-Agent bf16, 100 sessions, 0 correct
 
