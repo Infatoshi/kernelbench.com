@@ -45,6 +45,7 @@ case "$HARNESS" in
     grok)       PREFLIGHT_BIN=grok ;;
     codex)      PREFLIGHT_BIN=codex ;;
     claude)     PREFLIGHT_BIN=claude ;;
+    opencode-or) PREFLIGHT_BIN=opencode ;; # OpenRouter via opencode
     *-claude)   PREFLIGHT_BIN=claude ;;   # zai / kimi / deepseek routes
     *)          PREFLIGHT_BIN="$HARNESS" ;;
 esac

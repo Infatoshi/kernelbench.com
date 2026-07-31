@@ -53,7 +53,12 @@ def problem_of(run_dir: Path) -> str | None:
     if not ws.is_dir():
         return None
     subs = [d for d in ws.iterdir() if d.is_dir()]
-    return subs[0].name if len(subs) == 1 else None
+    if len(subs) == 1:
+        return subs[0].name
+    # agents sometimes leave scratch dirs beside the problem dir; the run id
+    # ends with the problem name, so use that to disambiguate
+    named = [d for d in subs if run_dir.name.endswith(d.name)]
+    return named[0].name if len(named) == 1 else None
 
 
 def build_workspace(run_dir: Path, problem: str) -> Path | None:

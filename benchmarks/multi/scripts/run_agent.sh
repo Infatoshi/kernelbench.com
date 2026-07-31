@@ -38,6 +38,7 @@ case "$HARNESS" in
     grok)                 HARNESS_BIN=grok ;;
     claude)               HARNESS_BIN=claude ;;
     codex)                HARNESS_BIN=codex ;;
+    opencode-or)          HARNESS_BIN=opencode ;; # OpenRouter via opencode (OpenAI-compatible)
     *-claude)             HARNESS_BIN=claude ;;   # zai / kimi / deepseek routes
     *)                    HARNESS_BIN="$HARNESS" ;;
 esac
@@ -276,15 +277,79 @@ case "$HARNESS" in
             [ -n "$CODEX_SESS" ] && cp "$CODEX_SESS" "$RUN_DIR/codex_session.jsonl"
         fi
         ;;
+    opencode-or)
+        # OpenRouter via opencode's OpenAI-compatible adapter — the fallback
+        # when a provider's own endpoint is down (e.g. kimi-k3 after the
+        # Moonshot key died, 2026-07-30). $MODEL is the OpenRouter id
+        # (`moonshotai/kimi-k3`). Provider is pinned via KBM_OR_PROVIDER
+        # (default "Moonshot AI") with allow_fallbacks=false, mirroring the
+        # hard bench's nemotron discipline: one serving stack per column.
+        # Known caveat: this adapter stalls intermittently (~1/3 of hard
+        # sessions) — treat a silent no-token session as retryable infra.
+        # EFFORT is ignored on this route (no effort control in the adapter).
+        load_keys
+        require_key OPENROUTER_API_KEY "${OPENROUTER_API_KEY:-}"
+        OC_HOME="$RUN_DIR/opencode_config"
+        mkdir -p "$OC_HOME/opencode"
+        chmod 700 "$OC_HOME"
+        cat > "$OC_HOME/opencode/opencode.json" <<JSON
+{
+  "\$schema": "https://opencode.ai/config.json",
+  "permission": { "external_directory": "deny" },
+  "provider": {
+    "openrouter-pinned": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "OpenRouter (pinned provider)",
+      "options": {
+        "baseURL": "https://openrouter.ai/api/v1",
+        "apiKey": "${OPENROUTER_API_KEY}",
+        "headers": {
+          "HTTP-Referer": "https://kernelbench.com",
+          "X-Title": "KernelBench-Multi"
+        },
+        "extraBody": {
+          "provider": {
+            "order": ["${KBM_OR_PROVIDER:-Moonshot AI}"],
+            "allow_fallbacks": false
+          }
+        }
+      },
+      "models": {
+        "${MODEL}": {
+          "name": "${MODEL} via OpenRouter",
+          "limit": { "context": ${KBM_OR_CONTEXT:-262144}, "output": 32000 },
+          "tools": true
+        }
+      }
+    }
+  }
+}
+JSON
+        ( cd "$PROBLEM_DIR" && PATH="$RUN_DIR/bin:$PATH" \
+            XDG_CONFIG_HOME="$OC_HOME" "${TIMEOUT_CMD[@]}" opencode run \
+            --pure --format json -m "openrouter-pinned/$MODEL" "$PROMPT" \
+            < /dev/null ) \
+            > "$RUN_DIR/agent.log" 2> "$RUN_DIR/agent.err" || HARNESS_EXIT=$?
+        ;;
     *)
         echo "unknown harness: $HARNESS" >&2; exit 2 ;;
 esac
 echo "[run_agent] agent exit=$HARNESS_EXIT" | tee -a "$RUN_DIR/meta.log"
 
 # --- grade (serialized through the same lock via wrappers) -------------------
+# GRADE ON THE BENCH VENV, not bare `python3`. The bin/ wrappers resolve
+# `python3` at creation time to /usr/bin/python3, and Lambda images ship a
+# SYSTEM torch (cu12.x) there — so a bare python3 grades on a different
+# torch/CUDA stack than the venv the anchors and re-grades use. Found
+# 2026-07-30: opus-5's 07 ext (nvcc 12.8, links libcublas.so.12) passed the
+# in-run grade on system torch but hard-fails under the venv's torch cu130
+# (cublas-13 handle into cublas-12 = CUBLAS_STATUS_NOT_INITIALIZED). One
+# stack everywhere: the venv python, still routed through the lock wrapper.
+GRADE_PY="$BENCH_ROOT/.venv/bin/python"
+[ -x "$GRADE_PY" ] || GRADE_PY=python3
 if [ "${KBM_SKIP_GRADE:-0}" != "1" ]; then
     if [ -f "$PROBLEM_DIR/solution.py" ]; then
-        ( cd "$PROBLEM_DIR" && PATH="$RUN_DIR/bin:$PATH" python3 check.py ) \
+        ( cd "$PROBLEM_DIR" && PATH="$RUN_DIR/bin:$PATH" "$GRADE_PY" check.py ) \
             > "$RUN_DIR/check.log" 2>&1 || true
         # Read the VERDICT, not the last line. `tail -1` silently reported a
         # torchrun traceback separator as the check result on 2026-07-25, and the
@@ -299,7 +364,7 @@ if [ "${KBM_SKIP_GRADE:-0}" != "1" ]; then
         {
             echo "check: $CHECK_STATUS"
             if [ "$CHECK_STATUS" = "PASS" ]; then
-                ( cd "$PROBLEM_DIR" && PATH="$RUN_DIR/bin:$PATH" python3 benchmark.py ) \
+                ( cd "$PROBLEM_DIR" && PATH="$RUN_DIR/bin:$PATH" "$GRADE_PY" benchmark.py ) \
                     > "$RUN_DIR/benchmark.log" 2>&1 || true
                 # 01 prints peak_fraction (busbw metric); 07/08/09 print speedup.
                 grep -E "^device:|peak_fraction:|speedup:|RESULT:" "$RUN_DIR/benchmark.log" || true
