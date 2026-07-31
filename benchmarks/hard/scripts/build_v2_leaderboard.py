@@ -22,6 +22,12 @@ from src.hardware import get as get_hw  # noqa: E402
 # Per-GPU target selects the published hardware block. Default RTX_PRO_6000
 # preserves the original Blackwell leaderboard; set KBH_HARDWARE=H100 on the
 # H100 box so the generated block reports Hopper specs.
+try:  # instrument version, recorded truthfully at publish time
+    from importlib.metadata import version as _pkg_version
+    _TORCH_VERSION = _pkg_version("torch")
+except Exception:
+    _TORCH_VERSION = "unknown"
+
 _hw = get_hw(os.environ.get("KBH_HARDWARE", "RTX_PRO_6000"))
 PROBLEMS = ["01_fp8_gemm","02_kda_cutlass","03_paged_attention",
             "05_topk_bitonic","06_sonic_moe_swiglu","07_w4a16_gemm"]
@@ -91,8 +97,10 @@ for rj in glob.glob(str(RUNS_DIR/"2026*/result.json")):
     rid = os.path.basename(os.path.dirname(rj))
     if rid[:8] < V2_EPOCH: continue
     if PUBLISHED and rid not in PUBLISHED: continue
-    try: r = json.load(open(rj))
-    except: continue
+    try:
+        r = json.load(open(rj))
+    except Exception:
+        continue
     prob = None
     for p in PROBLEMS:
         if rid.endswith(p): prob = p
@@ -142,7 +150,8 @@ def best_cell(runs):
             hacked.append(c)
         else:
             valid.append(c)
-    keyf = lambda c: (c["peak_fraction"] if c["peak_fraction"] is not None else -1)
+    def keyf(c):
+        return c["peak_fraction"] if c["peak_fraction"] is not None else -1
     if valid:
         return max(valid, key=keyf)
     if hacked:
@@ -218,7 +227,7 @@ for p in PROBLEMS:
 out = {
     "schema_version": 2,
     "environment": "v2_containerized",
-    "environment_notes": "KBH_AGENT_CONTAINER=1, parallel sessions, per-command GPU lock, nvcc 13.2, torch 2.11+cu130; 6-problem deck",
+    "environment_notes": f"KBH_AGENT_CONTAINER=1, parallel sessions, per-command GPU lock, torch {_TORCH_VERSION}; 6-problem deck",
     "hardware": {"name":_hw.name,"sm":_hw.sm,"vram_gb":_hw.vram_gb,"peak_bandwidth_gb_s":_hw.peak_bandwidth_gb_s},
     "problems": PROBLEMS,
     "models": sorted(models, key=lambda m: -m["valid_pass_count"]),

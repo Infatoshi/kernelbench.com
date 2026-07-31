@@ -310,7 +310,24 @@ fi
             exit 124
         fi
     else
-        flock -x 9
+        # Bounded retry loop, not an unbounded `flock -x 9`. Both stages of an
+        # agent pipeline like `nvcc ... | python3 ...` are PATH-wrapped, and they
+        # start simultaneously: the second stage can win the lock AFTER the
+        # same-run owner_file check above already read a miss, leaving the first
+        # stage blocked forever on a lock its own pipeline holds while that
+        # holder blocks reading the first stage's stdout. Re-check same-run
+        # ownership between attempts so the reentrant case self-heals.
+        # (Cost 71 min of a 6-cell Opus 5 sweep on 2026-07-24.)
+        until flock -x -w 5 9; do
+            if [ -f "$owner_file" ]; then
+                IFS=$'\t' read -r owner_pid owner_run_dir < "$owner_file" || true
+                if [ "${owner_run_dir:-}" = "${RUN_DIR:-}" ] && kill -0 "${owner_pid:-}" 2>/dev/null; then
+                    printf '%s reentrant_after_wait pid=%s cmd=%s owner=%s\n' \
+                        "$(date -Is)" "$$" "$name" "${owner_pid:-}" >&3
+                    exec "$real" "$@"
+                fi
+            fi
+        done
     fi
     start="$(date +%s)"
     printf '%s\t%s\n' "$$" "${RUN_DIR:-}" > "$owner_file"

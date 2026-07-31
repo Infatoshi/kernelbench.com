@@ -76,10 +76,12 @@ def report(run_id: str):
         sols = list(d.glob("repo/problems/*/solution.py"))
         sol = sols[0] if sols else None
     if not sol or not sol.exists():
-        print(f"  {run_id}: no solution.py"); return 0
+        print(f"  {run_id}: no solution.py")
+        return 0
     has_kernel, hits = lint_one(sol)
     if not hits:
-        print(f"  CLEAN  {run_id}  (authored kernel: {has_kernel})"); return 0
+        print(f"  CLEAN  {run_id}  (authored kernel: {has_kernel})")
+        return 0
     print(f"  FLAGGED {run_id}  (authored kernel: {has_kernel})")
     for sev, label, line, snip, why in hits:
         print(f"      [{sev}] {label} @L{line}: {snip!r}  — {why}")
@@ -87,7 +89,8 @@ def report(run_id: str):
 
 def main(argv):
     if not argv:
-        print(__doc__); return 2
+        print(__doc__)
+        return 2
     if argv[0] == "--all":
         # Lint the LIVE published board (what the site serves), not a stale copy.
         lb_path = ROOT / "results/leaderboard.json"

@@ -22,18 +22,30 @@ from src.hardware import get as get_hw  # noqa: E402
 # Per-GPU target selects the published hardware block. Default RTX_PRO_6000
 # preserves the original Blackwell leaderboard; set KBH_HARDWARE=H100 on the
 # H100 box so the generated block reports Hopper specs.
+try:  # instrument version, recorded truthfully at publish time
+    from importlib.metadata import version as _pkg_version
+    _TORCH_VERSION = _pkg_version("torch")
+except Exception:
+    _TORCH_VERSION = "unknown"
+
 _hw = get_hw(os.environ.get("KBH_HARDWARE", "RTX_PRO_6000"))
 PROBLEMS = ["01_glm52_fused_moe","02_deepseek_nsa","03_megaqwen_decode","04_grid_mingru_sps"]
 
 # run_id -> (verdict, summary)
 ann = {}
+# run_ids whose manual audit explicitly cleared contamination (annotation
+# `contamination: clean`) even though the overall verdict is not `clean`
+# (e.g. a reward_hack cell published flagged). Overrides the regex tripwire.
+ann_contam_clean: set[str] = set()
 for f in glob.glob(str(ROOT/"results/annotations/*.yaml")):
     txt = open(f).read()
     rid = re.search(r"run_id:\s*(\S+)", txt)
-    ver = re.search(r"verdict:\s*(\S+)", txt)
+    ver = re.search(r"^verdict:\s*(\S+)", txt, re.M)
     summ = re.search(r'summary:\s*"(.*)"', txt, re.S)
     if rid and ver:
         ann[rid.group(1)] = (ver.group(1), (summ.group(1) if summ else "")[:400])
+        if re.search(r"^contamination:\s*clean\b", txt, re.M):
+            ann_contam_clean.add(rid.group(1))
 
 # collect v2 runs: every run dated 2026-06-10 or later (v2 containerized era).
 # Date-gated instead of an enumerated list so new sweep dates are picked up
@@ -71,8 +83,10 @@ for rj in glob.glob(str(RUNS_DIR/"2026*/result.json")):
     rid = os.path.basename(os.path.dirname(rj))
     if rid[:8] < V2_EPOCH: continue
     if PUBLISHED and rid not in PUBLISHED: continue
-    try: r = json.load(open(rj))
-    except: continue
+    try:
+        r = json.load(open(rj))
+    except Exception:
+        continue
     prob = None
     for p in PROBLEMS:
         if rid.endswith(p): prob = p
@@ -93,7 +107,7 @@ for rj in glob.glob(str(RUNS_DIR/"2026*/result.json")):
         # output. A manual audit (results/annotations/, which includes a
         # contamination read of the transcript) marked `clean` overrides it;
         # anything unaudited or non-clean stays excluded.
-        if ann.get(rid, (None, None))[0] == "clean":
+        if ann.get(rid, (None, None))[0] == "clean" or rid in ann_contam_clean:
             print(f"  tripwire overridden (manual audit clean): {rid}", file=sys.stderr)
         else:
             print(f"  EXCLUDED (contaminated, read other archive): {rid}", file=sys.stderr)
@@ -122,7 +136,8 @@ def best_cell(runs):
             hacked.append(c)
         else:
             valid.append(c)
-    keyf = lambda c: (c["peak_fraction"] if c["peak_fraction"] is not None else -1)
+    def keyf(c):
+        return c["peak_fraction"] if c["peak_fraction"] is not None else -1
     if valid:
         return max(valid, key=keyf)
     if hacked:
@@ -199,7 +214,7 @@ for p in PROBLEMS:
 out = {
     "schema_version": 2,
     "environment": "v2_containerized",
-    "environment_notes": "KBH_AGENT_CONTAINER=1, parallel sessions, per-command GPU lock, nvcc 13.2, torch 2.11+cu130; 4-problem CUDA-only deck (language gate: Triton/DSL fail)",
+    "environment_notes": f"KBH_AGENT_CONTAINER=1, parallel sessions, per-command GPU lock, torch {_TORCH_VERSION}; 4-problem CUDA-only deck (language gate: Triton/DSL fail)",
     "hardware": {"name":_hw.name,"sm":_hw.sm,"vram_gb":_hw.vram_gb,"peak_bandwidth_gb_s":_hw.peak_bandwidth_gb_s},
     "problems": PROBLEMS,
     "models": sorted(models, key=lambda m: -m["valid_pass_count"]),

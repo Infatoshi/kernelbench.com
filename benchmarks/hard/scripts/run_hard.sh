@@ -1710,6 +1710,7 @@ case "$HARNESS" in
                 ANTHROPIC_MODEL
                 ANTHROPIC_DEFAULT_HAIKU_MODEL ANTHROPIC_DEFAULT_SONNET_MODEL
                 ANTHROPIC_DEFAULT_OPUS_MODEL
+                ENABLE_PROMPT_CACHING_1H
             )
             CLAUDE_CONTAINER_EXTRA_CLAUDE_ARGS=(--disallowedTools ExitPlanMode EnterPlanMode AskUserQuestion)
             ( export ANTHROPIC_AUTH_TOKEN="$OPENROUTER_API_KEY" && \

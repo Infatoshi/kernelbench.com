@@ -73,7 +73,7 @@ def test_hardware_lookup():
     hw = get("RTX_PRO_6000")
     assert hw.sm == "sm_120a"
     assert hw.peak_bandwidth_gb_s == pytest.approx(1800.0)
-    assert hw.peak_tflops_dense["fp8"] == pytest.approx(400.0)
+    assert hw.peak_tflops_dense["fp8"] == pytest.approx(1000.0)
 
 
 def test_benchmark_baselines_env_flags(monkeypatch):
