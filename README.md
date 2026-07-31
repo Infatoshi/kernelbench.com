@@ -1,61 +1,44 @@
-# kernelbench.com
+# KernelBench
 
-GPU kernel engineering benchmarks for autonomous LLM coding agents.
+Frontier coding agents write GPU kernels. Each session is one autonomous
+agent, graded against a roofline (or ms/speedup) ceiling, then reward-hack
+audited before anything is published. Live: [kernelbench.com](https://kernelbench.com).
 
-This is the canonical monorepo: it ships both the public website and the benchmark suites it visualizes. The website reads benchmark data straight from `benchmarks/*/results/` at build time — what's on disk is what's on the site.
+This monorepo is the website **and** the evals. GPU sessions launch to
+Lambda / Brev (or another remote worker). Operator workflow: `AGENTS.md`.
+Methodology and history: each bench's `SPEC.md` and `DEVLOG.md`.
 
-## Layout
+## Benches
 
-```
-.
-├── app/                    Next.js website (app/_lib/data.ts reads benchmark data at build time)
-├── public/                 Website static assets
-├── media/                  Tracked chart generators (kbh_theme.py + make_*.py + generate_dark_plots.py)
-├── benchmarks/
-│   ├── hard/             Latest (2026-04). Single Blackwell, 6 problems, 10 models. Live on /hard.
-│   │   ├── SPEC.md         Design + methodology.
-│   │   ├── DEVLOG.md       Decisions, dead ends, lessons.
-│   │   ├── LEADERBOARD.md  Human-readable cross-model grid + rubric-leak footnotes.
-│   │   ├── results/
-│   │   │   ├── leaderboard.json    Schema-versioned, machine-readable (drives the site).
-│   │   │   └── annotations/        Per-cell YAML commentary (clean / rubric_leak / etc.).
-│   │   ├── problems/       Problem definitions (reference.py, check.py, benchmark.py, …).
-│   │   ├── src/            Eval infrastructure (timing, correctness, hardware ceilings).
-│   │   ├── scripts/        Sweep orchestration.
-│   │   └── tests/
-│   ├── mega/              Megakernel bench. Live on /mega.
-│   ├── cuda/              CUDA-only deck. Live on /cuda.
-│   └── v3/                 Offline eval archive only (not on the website).
-├── environments/           Prime Intellect `verifiers` mirrors of the benches (kernel_hard / kernel_mega / kernel_v3).
-├── AGENTS.md               Single operator guide for the whole repo + both active benches (CLAUDE.md → symlink).
-└── README.md               (this file)
-```
+| bench | path | what | site |
+| --- | --- | --- | --- |
+| **hard** | `benchmarks/hard/` | per-op kernels (CUDA or Triton), roofline-graded | [/hard](https://kernelbench.com/hard) |
+| **mega** | `benchmarks/mega/` | full fused megakernels | [/mega](https://kernelbench.com/mega) |
+| **cuda** | `benchmarks/cuda/` | CUDA-only writing deck (Triton/DSL fail) | [/cuda](https://kernelbench.com/cuda) |
+| **mini** | `benchmarks/mini/` | small-model (<200B) deck, capped + 5-repeat (WIP) | unpublished |
+| **multi** | `benchmarks/multi/` | 4×H100 NVLink multi-GPU (WIP, frontier roster) | unpublished |
+| **v3** | `benchmarks/v3/` | offline archive (separate harness) | not on site |
 
-Doc convention: agent instructions for the website and both active benches (hard + mega) are consolidated into one top-level `AGENTS.md` (`CLAUDE.md` is a symlink to it), so Claude Code and Codex read the same file and there's no confusion about which bench you're editing. Per-bench `README.md` (humans), `SPEC.md` (design), `DEVLOG.md` (running record), and `LEADERBOARD.md` (grid) stay in each bench dir; only the `benchmarks/v3/` archive keeps its own `AGENTS.md`. The website surfaces the visualization-ready slice (leaderboard, per-problem ceilings, annotations); the benchmark subdirs hold the full machinery so the work can be reproduced or extended.
+Hard / mega / cuda share harness machinery and run unlimited wall-clock
+(`BUDGET_SECONDS=0`). Mini is capped; multi is sequential on a 4-GPU node.
 
-## How the site reads data
+## Website (local)
 
-`app/_lib/data.ts` reads `benchmarks/hard/results/leaderboard.json` and the YAML annotations directly from the filesystem at build time. No network fetch, no HTTP cache — Next.js bakes the data into the page during `next build`. To update what the site shows: change the file under `benchmarks/`, push, Vercel rebuilds.
-
-## Live benches
-
-| bench | page |
-| --- | --- |
-| **hard** | [/hard](https://kernelbench.com/hard) |
-| **mega** | [/mega](https://kernelbench.com/mega) |
-| **cuda** | [/cuda](https://kernelbench.com/cuda) |
-
-## Running the website locally
+Next.js 16 + Tailwind. Package manager is **bun** (`bun.lock`):
 
 ```bash
-npm install
-npm run dev
+bun install
+bun dev          # http://localhost:3000
+bun run build
 ```
 
-## Deploying
+Site data is baked at build time from `benchmarks/*/results/`
+(`app/_lib/data.ts`). Publish/deploy: `kb publish` then `kb deploy` — see
+`AGENTS.md`.
 
-Vercel native GitHub integration. Every push to `master` auto-deploys. No CI workflow required.
+## Docs map
 
-## Source / mirrors
-
-This monorepo is the canonical home for the website and active benches.
+- `AGENTS.md` — sweeps, harnesses, Lambda/Brev, publish, audits
+- `benchmarks/<bench>/SPEC.md` — methodology
+- `benchmarks/<bench>/DEVLOG.md` — design history
+- `benchmarks/<bench>/README.md` — short human entry for that deck

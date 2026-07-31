@@ -4,7 +4,7 @@
 `CLAUDE.md` and `.cursorrules` are symlinks to it — so Claude Code
 (`CLAUDE.md`), Cursor (`.cursorrules` / `AGENTS.md`), Codex, and any other CLI
 (`AGENTS.md`) all read this exact file. Everything you need to work on the
-website **and** both active benches lives here; there are no per-bench
+website **and** all active benches lives here; there are no per-bench
 `AGENTS.md` / `CLAUDE.md` / `.cursorrules` files anymore (the lone exception is
 the `benchmarks/v3/` archive, which keeps its own).
 
@@ -39,8 +39,8 @@ command. When in doubt, check the deck — `01_fp8_gemm` is hard,
 `02_kimi_linear_decode` is mega, `01_glm52_fused_moe` is cuda. Mega and CUDA
 reuse hard's harness/archive/roofline machinery.
 (`01_rl_grid_ppo` was removed from the mega deck 2026-07-21 — the CUDA bench's
-craftax problem covers that skill; do not re-add, same rule as hard's
-`04_kahan_softmax`.)
+`04_grid_mingru_sps` (craftax-style grid env) covers that skill; do not re-add,
+same rule as hard's `04_kahan_softmax`.)
 
 **KernelBench-Mini (`benchmarks/mini/`, WIP small-model bench, 2026-07-23):**
 ranks **sub-200B open-weight models** on a fresh 4-problem deck
@@ -54,7 +54,9 @@ opencode vs `*-claude` per model, canonical GPU = **Lambda H100 SXM5**
 (hardware key `H100_SXM` — SXM peaks, not the PCIe `H100` entry). Drive with
 `cd benchmarks/mini && ./scripts/sweep_mini.sh <harness> <model>` (one
 column = 4 problems x 5 repeats; one invocation per model). Inference for
-API-less models is served from anvil's PRO 6000, never the eval GPU. Deck is
+API-less models is vLLM co-hosted on the eval H100 itself (localhost:8765,
+35% GPU mem) since 2026-07-29; the "never the eval GPU" rule now applies to
+the re-grade phase only (see mini DEVLOG). Deck is
 unpublished — keep it out of public posts until it debuts. See
 `benchmarks/mini/SPEC.md` + `DEVLOG.md` (calibration debts before freeze).
 
@@ -62,7 +64,7 @@ unpublished — keep it out of public posts until it debuts. See
 Triton (`@triton.jit`, `triton.language`), kernel DSLs (CuteDSL, TileLang,
 ThunderKittens Python), and pure PyTorch op chains with no CUDA evidence
 (`load_inline` / `__global__` / `.cu` / PTX / CUTLASS C++). Sidecars:
-`cuda_language.json`, `framework.txt`. Fusion on `03_grid_mingru_sps` is
+`cuda_language.json`, `framework.txt`. Fusion on `04_grid_mingru_sps` is
 optional (SPS metric). See `benchmarks/cuda/SPEC.md` + `DEVLOG.md`.
 
 `benchmarks/v3/` is the **archive** (RTX 3090 / H100 / B200, a separate harness
@@ -77,7 +79,7 @@ app/ public/              the website (Next.js 16, Tailwind v4)
 benchmarks/hard/           KernelBench-Hard eval — the per-op deck
   results/leaderboard.json     /hard reads this (v2 site-shaped data)
   results/annotations/*.yaml   per-cell reward-hack / clean verdicts
-  outputs/runs/                run archives (gitignored; ~186G)
+  outputs/runs/                run archives (gitignored; tens of GB)
   scripts/ src/                eval code
   problems-rtxpro6000/         the deck — per-GPU sets: -rtxpro6000 (default, RTX PRO 6000), -h100, -b200 (RTX 3090 removed from the suite 2026-07-21)
 benchmarks/mega/           KernelBench-Mega eval — megakernel deck (single problems/; reuses hard's machinery)
@@ -122,9 +124,12 @@ kb deploy "bench kimi k2.7"               # publish + commit + push (Vercel auto
 # missing pretty names fall back to the raw slug. See "Site charts after a new
 # model lands" under Hard-won gotchas.
 ```
-Other commands: `kb run <harness> <model> <problem>` (one problem), `kb dev`
-(preview at localhost:3000), `kb build`, `kb audit <run_id>`,
-`kb contamination <hard|mega|v3>`, `kb traces-to-hf`, `kb brev ...`,
+Other commands: `kb run <harness> <model> <problem>` (one problem; hard bench
+only — takes a BARE problem name and prepends `$KBH_PROBLEMS_ROOT`, default
+`problems-rtxpro6000`), `kb dev` (preview at localhost:3000), `kb build`,
+`kb audit <run_id>`, `kb lint <run_id|--all>`,
+`kb contamination <hard|mega|cuda|v3>`, `kb traces-to-hf`,
+`kb push-runs <hard|mega|cuda> [--board h100|b200]`, `kb brev ...`,
 `kb lambda ...`, `kb help`. The CLI is the `kbtool/` uv package
 (`kbtool/kb/cli.py`); `bin/kb` is a thin shim that runs it via `uv run`
 (symlinked to ~/.local/bin/kb). Install standalone with `uv tool install
@@ -145,8 +150,9 @@ in the console: [Settings → Billing → Credits](https://cloud.lambda.ai/setti
   anvil `~/.env_vars` in sync.
 - **SSH keys registered on the account:** `macbook` (Mac
   `~/.ssh/id_ed25519.pub`) and `anvil` (anvil
-  `~/.ssh/id_ed25519.pub`). `lambda_worker.sh up` attaches **both** so either
-  control plane can log in.
+  `~/.ssh/id_ed25519.pub`). `lambda_worker.sh up` attaches ONE key — the
+  current host's, by hostname (Lambda's launch API rejects more than one,
+  observed 2026-07-21). Override with `KB_LAMBDA_SSH_KEYS`.
 - **Operator CLI** (curl/API; no brew required on anvil):
 
 ```
@@ -157,6 +163,7 @@ kb lambda sync <name>                  # thin hard bench + allowlisted keys
 kb lambda bootstrap <name> [--agents]  # uv + torch; --agents = agent CLIs
 kb lambda run <name> <harness> <model> <problem> [effort]
 kb lambda pull <name>                  # -> benchmarks/hard/outputs/runs-lambda-<name>/
+kb lambda regrade <name> <run_id> [runs_dir]   # sequential isolated re-grade on the node
 kb lambda down <name>                  # terminate + poll until gone
 kb lambda ssh <name> [cmd...]
 ```
@@ -164,7 +171,9 @@ kb lambda ssh <name> [cmd...]
   Or `./scripts/lambda_worker.sh ...` from the repo root. Env overrides:
   `KB_LAMBDA_TYPE`, `KB_LAMBDA_REGION`, `KB_LAMBDA_SSH_KEYS` (default: the
   current host's key — Lambda's launch API rejects more than one key),
-  `KB_LAMBDA_PROBLEMS_ROOT` (default `problems-h100`).
+  `KB_LAMBDA_PROBLEMS_ROOT` (default `problems-h100`; `problems-h100x4` when
+  `KB_LAMBDA_BENCH=multi`), `KB_LAMBDA_BENCH` (default `hard` — set `multi`,
+  `cuda`, `mega` to point the worker at another bench).
 - **Always `kb lambda down` when done** — idle nodes bill against the $10k.
   Confirm with `kb lambda ls` empty for that name.
 - Optional Mac-only community CLI: `brew install strand-ai/tap/lambda-cli`
@@ -209,6 +218,13 @@ Override with `KBM_ALLOW_OFF_ROSTER=1` for an exploratory cell; it is archived
 but **not publishable** until the row is added to `roster.yaml`.
 
 ## Harnesses (run via `uv run kbh run <harness> <model> <problem> [effort]`)
+
+**Full reference: `docs/HARNESSES.md`** — one row per case branch across all
+five runners (transport, required key, which benches have it). The env-var
+reference is `docs/ENV.md` (every `KB_`/`KBH_`/`KBM_`/`KBMINI_` var, with the
+publish-affecting ones flagged). Both are enforced by
+`kbtool/tests/test_repo_consistency.py` — if you add a harness branch or a new
+env var, the test fails until the doc row exists. Highlights only below.
 
 - Native CLIs: `claude`, `codex`, `cursor`, `gemini`, `grok`, `opencode`.
 - Claude-Code-routed providers (most reliable when the vendor has an Anthropic
@@ -287,18 +303,18 @@ benchmarks/<bench>/
 │       ├── PROMPT.txt         human-voice query sent to the agent under test
 │       └── solution.py        agent output (gitignored)
 ├── src/
-│   ├── harness/               claude.py, codex.py, kimi.py, ccr_router.py
-│   ├── eval/                  correctness.py, numeric_stress.py, roofline.py, shapes.py, report.py
-│   ├── hardware/              rtx_pro_6000.py, m4_max.py — peak lookup
-│   └── sandbox/               local.py, metal.py
+│   ├── kbh/                   the `kbh` CLI (what `uv run kbh run` invokes)
+│   ├── harness/               classification.py (failure/usage classification)
+│   ├── eval/                  correctness.py, numeric_stress.py, roofline.py, shapes.py, timing.py, report.py
+│   ├── hardware/              rtx_pro_6000.py, h100.py, h100_sxm.py, b200.py, m4_max.py — peak lookup
+│   └── viewer/                transcript parsers + HTML rendering
 ├── scripts/
 │   ├── run_hard.sh            fire one (harness, model, problem)
 │   ├── sweep.sh               full active matrix
 │   ├── setup_problem.py       install SOTA deps for a problem
 │   ├── roofline_plot.py       post-hoc plot from run artifacts
 │   └── patch_torch.sh         torch 2.11 inductor CSE typing hotfix
-├── outputs/runs/              per-run archival (gitignored)
-└── docs/                      design notes, reward-hack case studies
+└── outputs/runs/              per-run archival (gitignored)
 ```
 
 ### Adding a new problem
@@ -652,7 +668,7 @@ Most likely causes:
   (site data) and the redacted `public/runs/*_solution.py.txt` kernels from the
   archives. `kb publish` does it; don't hand-edit the leaderboard. Full agent
   transcripts live on HuggingFace (`kernelbench-<bench>-traces`); push them with
-  `kb push-runs <hard|mega>` (or `kb publish --push`). The site links each run
+  `kb push-runs <hard|mega|cuda>` (or `kb publish --push`). The site links each run
   to its HF trace — it no longer self-hosts `*.html` viewers.
 - **Site charts after a new model lands (part of every publish).** Homepage
   bars/scatters read live leaderboard + `public/data/mega/results.csv`, and
@@ -696,8 +712,9 @@ Most likely causes:
   bash + absolute paths, so they can read the shared `outputs/runs/` archive —
   every prior winning solution — and reverse-engineer a known answer instead of
   writing their own kernel. This is NOT what `kb lint` checks (lint only scans a
-  single solution.py). Run `kb contamination <hard|mega|v3>
-  [--published benchmarks/<bench>/results/leaderboard.json]` before
+  single solution.py). Run `kb contamination <hard|mega|cuda|v3>
+  [--published benchmarks/<bench>/results/leaderboard.json]` (mega has no
+  leaderboard.json — its published set is `public/data/mega/results.csv`) before
   publishing; both leaderboard builders now auto-EXCLUDE any run whose agent
   transcript references another run's archive. Audit on 2026-06-19 found
   mega-published 7/24 contaminated (the glm-5.2 17.4x / MiniMax 16.5x "beat opus"
@@ -816,6 +833,5 @@ optional. They are what makes a post read as signal, not slop.
 
 - zsh: quote model strings containing `[]` or `:` (`uv run kbh run claude 'model[x]' 01_fp8_gemm`) - unquoted fails glob expansion.
 - Codex binary: the harness needs `~/.local/node-*/bin/codex`; the shell alias `codex` (Rust binary) does not expand in non-interactive scripts.
-- `KBH_DISABLE_AGENT_CUDA=1` during the agent phase - no CUDA in the agent subprocess.
 - Benchmark ordering: time variant=solution FIRST; `KBH_BENCHMARK_BASELINES=1` is opt-in for baseline runs.
 - Legacy anvil-local sweeps used `KBH_GPU_LOCK` + `gpu-lock-exec` + overnight-compute; current sweeps run on Lambda/Brev and do not need it.
