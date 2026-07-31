@@ -13,9 +13,17 @@ set -uo pipefail
 NAME="${1:?usage: brev_teardown.sh <instance-name>}"
 BREV="${BREV:-brev}"
 
-listed() { "$BREV" ls 2>/dev/null | awk '{print $1}' | grep -qx "$NAME"; }
+# listing() must DISTINGUISH "brev ls worked and the instance is absent" from
+# "brev ls itself failed" (expired auth, network, missing CLI). Treating a
+# failed listing as absence reports a successful teardown of a still-billing
+# instance — the exact failure this script exists to prevent.
+listing() { "$BREV" ls 2>/dev/null; }
 
-if ! listed; then
+if ! OUT="$(listing)"; then
+  echo "brev_teardown: ERROR: 'brev ls' failed — cannot confirm state of '$NAME' (billing may continue!)" >&2
+  exit 1
+fi
+if ! grep -qx "$NAME" <<<"$(awk '{print $1}' <<<"$OUT")"; then
   echo "brev_teardown: no instance named '$NAME' in brev ls — nothing to do"
   exit 0
 fi
@@ -35,11 +43,16 @@ EOF
     ;;
 esac
 
-# Deletion is async; poll until the instance drops out of brev ls.
-for _ in 1 2 3 4 5 6 7 8 9 10 11 12; do
-  if ! listed; then
-    echo "TEARDOWN OK: '$NAME' no longer in brev ls"
-    exit 0
+# Deletion is async; poll until a SUCCESSFUL listing no longer shows the
+# instance. A failed `brev ls` mid-poll is retried, never counted as gone.
+for _ in $(seq 1 24); do
+  if OUT="$(listing)"; then
+    if ! grep -qx "$NAME" <<<"$(awk '{print $1}' <<<"$OUT")"; then
+      echo "TEARDOWN OK: '$NAME' no longer in brev ls"
+      exit 0
+    fi
+  else
+    echo "brev_teardown: WARN: 'brev ls' failed, retrying" >&2
   fi
   sleep 10
 done

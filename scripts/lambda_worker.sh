@@ -29,7 +29,6 @@ HERE="$(cd "$(dirname "$0")/.." && pwd)"
 BENCH="${KB_LAMBDA_BENCH:-hard}"
 BENCH_DIR="$HERE/benchmarks/$BENCH"
 REMOTE_DIR="kb-$BENCH"
-HARD="$BENCH_DIR"          # legacy name, still used by `regrade`
 [ -d "$BENCH_DIR" ] || { echo "ERROR: unknown bench '$BENCH'" >&2; exit 1; }
 API="${LAMBDA_API_BASE:-https://cloud.lambda.ai/api/v1}"
 STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/kernelbench-lambda"
@@ -70,7 +69,7 @@ SSH_USER="${KB_LAMBDA_SSH_USER:-ubuntu}"
 api() {
   local method="$1" path="$2"
   shift 2
-  curl -sS -X "$method" "${API}${path}" \
+  curl -sSf -X "$method" "${API}${path}" \
     -H "Authorization: Bearer ${API_KEY}" \
     -H "Content-Type: application/json" \
     -H "User-Agent: kernelbench-lambda-worker" \
@@ -110,11 +109,12 @@ instance_id() {
 
 ssh_base() {
   local ip="$1"
+  shift
   SSH_AUTH_SOCK= ssh -o StrictHostKeyChecking=accept-new \
     -o UserKnownHostsFile="$STATE_DIR/known_hosts" \
     -o ConnectTimeout=15 \
     -o BatchMode=yes \
-    "${SSH_USER}@${ip}"
+    "${SSH_USER}@${ip}" "$@"
 }
 
 ensure_reachable() {
@@ -168,9 +168,11 @@ pick_region() {
 
 # --- commands ---
 
+# Every subcommand resolves instances via jq -- gate once, up front.
+require_jq
+
 case "$CMD" in
   list)
-    require_jq
     api GET /instance-types | jq -r '
       (.data // {}) | to_entries[]
       | .key as $k
@@ -184,7 +186,6 @@ case "$CMD" in
     ;;
 
   ls | running)
-    require_jq
     api GET /instances | jq -r '
       (.data // [])
       | if length==0 then "No running instances" else
@@ -194,7 +195,6 @@ case "$CMD" in
     ;;
 
   up)
-    require_jq
     NAME="${1:?name required}"
     TYPE="${2:-${KB_LAMBDA_TYPE:-gpu_1x_h100_sxm5}}"
     REGION_ARG="${3:-${KB_LAMBDA_REGION:-}}"
@@ -310,7 +310,7 @@ rm -f uv.lock; fi; export PATH=\"\$HOME/.local/bin:\$PATH\"; uv sync"
       ssh_to "$NAME" "cd ~/$REMOTE_DIR && nohup env BUDGET_SECONDS=0 ./scripts/sweep_wave.sh $HARNESS $MODEL ${EFFORT:-high} $PROBLEM > ~/kb_run.log 2>&1 & echo launched PID \$!"
     else
       echo "[run] detached: $HARNESS $MODEL $PROBLEMS_ROOT/$PROBLEM $EFFORT"
-      ssh_to "$NAME" "cd ~/$REMOTE_DIR && nohup env KBH_AGENT_CONTAINER=0 BUDGET_SECONDS=0 ./scripts/run_hard.sh $HARNESS $MODEL $PROBLEMS_ROOT/$PROBLEM $EFFORT > ~/kb_run.log 2>&1 & echo launched PID \$!"
+      ssh_to "$NAME" "export PATH=\"\$HOME/.local/bin:\$PATH\"; cd ~/$REMOTE_DIR && setsid nohup env KBH_AGENT_CONTAINER=0 BUDGET_SECONDS=0 ./scripts/run_hard.sh $HARNESS $MODEL $PROBLEMS_ROOT/$PROBLEM $EFFORT > ~/kb_run.log 2>&1 < /dev/null & echo launched PID \$!"
     fi
     echo "Poll:  lambda_worker.sh ssh $NAME 'tail -20 ~/kb_run.log'"
     ;;
@@ -320,7 +320,7 @@ rm -f uv.lock; fi; export PATH=\"\$HOME/.local/bin:\$PATH\"; uv sync"
     # has scripts/regrade.py in-bench. Refuse rather than silently grade against
     # the hard workspace.
     [ "$BENCH" = multi ] && { echo "ERROR: use benchmarks/multi/scripts/regrade.py on the worker for multi" >&2; exit 2; }
-    NAME="${1:?name}"; RID="${2:?run_id}"; RUNS_DIR="${3:-$HARD/outputs/runs-h100}"
+    NAME="${1:?name}"; RID="${2:?run_id}"; RUNS_DIR="${3:-$BENCH_DIR/outputs/runs-h100}"
     SRC="$RUNS_DIR/$RID"
     [ -f "$SRC/solution.py" ] || {
       echo "no solution.py in $SRC" >&2
@@ -330,12 +330,12 @@ rm -f uv.lock; fi; export PATH=\"\$HOME/.local/bin:\$PATH\"; uv sync"
     ensure_reachable "$NAME"
     IP="$(instance_ip "$NAME")"
     echo "[regrade] $RID -> $PROBLEMS_ROOT/$PROBLEM"
-    ssh_to "$NAME" "mkdir -p ~/kb-regrade/$RID && cp -r ~/kb-hard/$PROBLEMS_ROOT/$PROBLEM/. ~/kb-regrade/$RID/"
+    ssh_to "$NAME" "mkdir -p ~/kb-regrade/$RID && cp -r ~/$REMOTE_DIR/$PROBLEMS_ROOT/$PROBLEM/. ~/kb-regrade/$RID/"
     rsync -az -e "ssh -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=$STATE_DIR/known_hosts -o BatchMode=yes" \
       "$SRC/solution.py" "${SSH_USER}@${IP}:kb-regrade/$RID/solution.py"
     ssh_to "$NAME" "export PATH=\"\$HOME/.local/bin:\$PATH\"; cd ~/kb-regrade/$RID \
-      && echo '--- check.py ---' && uv run --project ~/kb-hard python check.py \
-      && echo '--- benchmark.py ---' && env KBH_HARDWARE=${KBH_HARDWARE:-H100} uv run --project ~/kb-hard python benchmark.py"
+      && echo '--- check.py ---' && uv run --project ~/$REMOTE_DIR python check.py \
+      && echo '--- benchmark.py ---' && env KBH_HARDWARE=${KBH_HARDWARE:-H100} uv run --project ~/$REMOTE_DIR python benchmark.py"
     rsync -az -e "ssh -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=$STATE_DIR/known_hosts -o BatchMode=yes" \
       "${SSH_USER}@${IP}:kb-regrade/$RID/result.json" "$SRC/result.regrade.json" 2>/dev/null \
       && echo "  -> $SRC/result.regrade.json" || echo "  (benchmark printed to stdout only)"
@@ -354,7 +354,6 @@ rm -f uv.lock; fi; export PATH=\"\$HOME/.local/bin:\$PATH\"; uv sync"
     ;;
 
   down)
-    require_jq
     NAME="${1:?name}"
     ID="$(instance_id "$NAME" || true)"
     if [ -z "${ID:-}" ]; then
@@ -365,10 +364,18 @@ rm -f uv.lock; fi; export PATH=\"\$HOME/.local/bin:\$PATH\"; uv sync"
     RESP="$(api POST /instance-operations/terminate -d "$(jq -n --arg id "$ID" '{instance_ids:[$id]}')")"
     echo "$RESP" | jq . 2>/dev/null || echo "$RESP"
     for _ in $(seq 1 60); do
-      if [ -z "$(instance_by_name "$NAME" || true)" ]; then
-        rm -f "$STATE_DIR/${NAME}.ip"
-        echo "TEARDOWN OK: '$NAME' gone"
-        exit 0
+      # A failed listing (network/auth blip) must NOT read as "instance gone" --
+      # api() now exits non-zero on HTTP errors, and we only trust a listing
+      # that actually succeeded.
+      if LISTING="$(api GET /instances)"; then
+        STILL="$(jq -c --arg n "$NAME" '(.data // []) | map(select(.name == $n)) | .[0] // empty' <<<"$LISTING")"
+        if [ -z "$STILL" ]; then
+          rm -f "$STATE_DIR/${NAME}.ip"
+          echo "TEARDOWN OK: '$NAME' gone"
+          exit 0
+        fi
+      else
+        echo "[down] WARN: listing failed, retrying (cannot confirm teardown yet)" >&2
       fi
       sleep 5
     done
