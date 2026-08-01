@@ -79,6 +79,14 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         self._forward(None)
 
+    def do_HEAD(self):
+        # Claude Code >= 2.1.x preflights the base URL with HEAD /api/hello and
+        # aborts the whole session on a non-2xx; answer locally rather than
+        # forwarding (upstream path mapping 404s it).
+        self.send_response(200)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
 
 def main() -> int:
     port = int(sys.argv[1])  # 0 = OS-assigned; the bound URL is printed below
