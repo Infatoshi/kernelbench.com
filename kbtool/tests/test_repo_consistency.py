@@ -73,8 +73,12 @@ def test_all_shell_scripts_parse():
 
 def _harness_case_labels() -> set[str]:
     labels: set[str] = set()
-    runners = [REPO / "benchmarks" / b / "scripts/run_hard.sh" for b in BENCHES]
-    runners.append(REPO / "benchmarks/multi/scripts/run_agent.sh")
+    # hard/cuda/mini dispatch from the shared runner; mega and multi keep forks.
+    runners = [
+        REPO / "scripts/lib/run_harness.sh",
+        REPO / "benchmarks/mega/scripts/run_hard.sh",
+        REPO / "benchmarks/multi/scripts/run_agent.sh",
+    ]
     # PATH-wrapper / plumbing case labels that are not harnesses.
     not_harnesses = {"uv", "python", "python3", "nvidia-smi", "ncu", "nsys", "nvcc"}
     for rn in runners:
@@ -133,7 +137,27 @@ def test_teardown_scripts_cannot_false_succeed():
 
 def test_gpu_lock_bounded_retry_everywhere():
     """The unbounded `flock -x 9` deadlock cost 71 min of an Opus 5 sweep; the
-    bounded-retry fix must exist in every single-GPU runner."""
+    bounded-retry fix must exist in the shared single-GPU runner."""
+    text = (REPO / "scripts/lib/run_harness.sh").read_text()
+    assert "until flock -x -w 5 9; do" in text, "bounded flock retry missing from shared runner"
+
+
+def test_bench_wrappers_are_thin_and_use_shared_runner():
+    """hard/cuda/mini run_hard.sh are identity-pinning wrappers over
+    scripts/lib/run_harness.sh. Logic creeping back into a wrapper is the
+    fork-drift failure mode this structure exists to kill (mini's fork shipped
+    a KERNELBENCH-CUDA banner and a stale or-fable branch)."""
     for b in ("hard", "cuda", "mini"):
-        text = (REPO / "benchmarks" / b / "scripts/run_hard.sh").read_text()
-        assert "until flock -x -w 5 9; do" in text, f"{b}: bounded flock retry missing"
+        p = REPO / "benchmarks" / b / "scripts/run_hard.sh"
+        text = p.read_text()
+        assert "scripts/lib/run_harness.sh" in text, f"{b}: wrapper does not exec the shared runner"
+        assert "KB_BENCH_DIR" in text and "KB_BENCH_BANNER" in text, f"{b}: wrapper missing identity pins"
+        assert 'case "$HARNESS"' not in text, f"{b}: harness dispatch leaked back into the wrapper"
+        assert len(text.splitlines()) < 30, f"{b}: wrapper no longer thin ({len(text.splitlines())} lines)"
+
+
+def test_lambda_sync_ships_shared_runner_lib():
+    """kb lambda sync copies one bench dir to the node; the wrapper's fallback
+    path (bench-local scripts/lib/) only works if sync ships the lib there."""
+    text = (REPO / "scripts/lambda_worker.sh").read_text()
+    assert 'scripts/lib/' in text, "lambda_worker sync no longer ships scripts/lib to workers"

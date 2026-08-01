@@ -1,7 +1,11 @@
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+# run_hard.sh is a thin identity wrapper since 2026-07-31; the harness logic
+# these tests assert on lives in the shared runner at the monorepo root.
 RUN_HARD = ROOT / "scripts" / "run_hard.sh"
+if "scripts/lib/run_harness.sh" in RUN_HARD.read_text():
+    RUN_HARD = ROOT.parents[1] / "scripts" / "lib" / "run_harness.sh"
 LAUNCH_PARALLEL = ROOT / "scripts" / "launch_parallel_sweep.sh"
 SWEEP = ROOT / "scripts" / "sweep.sh"
 RUN_BASELINES = ROOT / "scripts" / "run_baselines.sh"
@@ -228,7 +232,7 @@ def test_nvcf_nemotron_uses_local_proxy_and_archive_config() -> None:
     assert 'env XDG_CONFIG_HOME="$NVCF_OPENCODE_CONFIG_HOME"' in block
     assert '-m "nvcf-nemotron/$MODEL"' in block
     assert "opencode run --pure --format json" in block
-    assert "droid|kimi|opencode|opencode-nemotron|nvcf-nemotron|hy3|hy3-claude)" in script
+    assert "droid|kimi|opencode|opencode-nemotron|nvcf-nemotron|hy3|hy3-claude|tinker|inkling|lfm-opencode|hermes|pi)" in script
 
 
 def test_parallel_launcher_keeps_run_hard_jobs_waitable() -> None:

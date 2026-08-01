@@ -309,7 +309,7 @@ benchmarks/<bench>/
 │   ├── hardware/              rtx_pro_6000.py, h100.py, h100_sxm.py, b200.py, m4_max.py — peak lookup
 │   └── viewer/                transcript parsers + HTML rendering
 ├── scripts/
-│   ├── run_hard.sh            fire one (harness, model, problem)
+│   ├── run_hard.sh            fire one (harness, model, problem) — for hard/cuda/mini this is a THIN WRAPPER over the shared runner `scripts/lib/run_harness.sh` at the monorepo root (edit the lib, not the wrapper; mega keeps a deliberate fork with its bwrap sandbox)
 │   ├── sweep.sh               full active matrix
 │   ├── setup_problem.py       install SOTA deps for a problem
 │   ├── roofline_plot.py       post-hoc plot from run artifacts

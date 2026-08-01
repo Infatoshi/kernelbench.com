@@ -249,6 +249,11 @@ case "$CMD" in
       --exclude outputs --exclude __pycache__ --exclude '.venv' --exclude '*.pyc' \
       --exclude .git --exclude 'docs/refs' \
       "$BENCH_DIR/" "${SSH_USER}@${IP}:$REMOTE_DIR/"
+    # The single-GPU benches' run_hard.sh is a thin wrapper over the shared
+    # runner at <monorepo>/scripts/lib/; a thin-synced node has no monorepo
+    # root, so ship the lib INTO the bench dir (wrapper falls back to it).
+    rsync -az -e "ssh -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=$STATE_DIR/known_hosts -o BatchMode=yes" \
+      "$HERE/scripts/lib/" "${SSH_USER}@${IP}:$REMOTE_DIR/scripts/lib/"
     TMPENV="$(mktemp)"
     grep -E "^(export )?($ENV_ALLOWLIST)=" "$HOME/.env_vars" >"$TMPENV" || true
     rsync -az -e "ssh -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=$STATE_DIR/known_hosts -o BatchMode=yes" \

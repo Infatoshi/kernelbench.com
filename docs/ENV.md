@@ -20,6 +20,9 @@ The following variables can change the meaning, comparability, publishability, o
 | Var | Read by (paths) | Default | What it changes | Notes |
 | --- | --- | --- | --- | --- |
 | `KB_ALLOW_LOCAL` | `kbtool/kb/cli.py` | unset / `0` | Lets `kb run` and `kb sweep` proceed on the local host when the normal remote-worker guard would refuse. | Safety override; value must be `1`. |
+| `KB_BENCH_BANNER` | `scripts/lib/run_harness.sh` | `KERNELBENCH RUN` | Banner line printed at session start. | Pinned by each bench's `run_hard.sh` wrapper; not user-set. |
+| `KB_BENCH_DIR` | `scripts/lib/run_harness.sh` | required | Bench root (outputs/, problems, src/) the shared runner operates in. | Pinned by each bench's `run_hard.sh` wrapper; the lib refuses to run without it. |
+| `KB_BUDGET_SECONDS_DEFAULT` | `scripts/lib/run_harness.sh` | `0` (unlimited) | Bench-identity wall-clock cap default (mini pins `1800`). | Pinned by the wrapper. Per-run override remains `KBH_BUDGET_SECONDS_OVERRIDE` (see Danger). |
 | `KB_BREV_PROBLEMS_ROOT` | `scripts/brev_worker.sh` | `problems-h100` | Selects the problem tree synced to and run on a Brev worker. | Deck identity affects comparability. |
 | `KB_BREV_TYPE` | `scripts/brev_worker.sh` | `hyperstack_H100` | Selects the Brev instance type for `up` when no positional type is supplied. | Can change cost and hardware. |
 | `KB_GUARD_RESERVE` | `scripts/openrouter_guard.sh` | `130` USD | Sets the minimum OpenRouter balance required before starting another guarded cell. | Cost-control threshold. |

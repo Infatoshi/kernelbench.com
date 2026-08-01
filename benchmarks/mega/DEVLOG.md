@@ -1,5 +1,16 @@
 # DEVLOG
 
+## 2026-07-31 - run_hard.sh stays a deliberate fork of the shared runner
+
+hard/cuda/mini's run_hard.sh were unified into thin wrappers over
+`scripts/lib/run_harness.sh` (monorepo root). Mega deliberately keeps its own
+fork: it carries the bwrap anti-contamination sandbox (KBH_SANDBOX — hides run
+archives, results/, DEVLOG, public/ solutions, and ~/.claude memory from the
+agent) and the legacy anvil machine-wide gpu-lock-exec machinery, neither of
+which the shared runner has yet. If the sandbox is ever ported into the shared
+runner, fold mega in and delete this fork; until then, harness fixes land in
+the lib and must be ported here by hand when relevant.
+
 A running record of decisions, dead ends, and lessons. Newest entries on top. This is not a changelog (the git log is) — it's the why behind the shape of the project.
 
 ---
