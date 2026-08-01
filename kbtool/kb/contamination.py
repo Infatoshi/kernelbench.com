@@ -1,4 +1,4 @@
-"""Cross-run contamination audit for KernelBench runs (hard or mega).
+"""Cross-run contamination audit for KernelBench runs (any bench).
 
 The harness does NOT sandbox the agent filesystem: an agent has bash + absolute
 paths, so it can read the shared `outputs/runs/` archive -- every prior winning
@@ -145,14 +145,14 @@ def run(argv: list[str] | None = None, repo_root: Path | None = None) -> int:
     ap = argparse.ArgumentParser(prog="kb contamination")
     ap.add_argument(
         "runs",
-        help="path to an outputs/runs directory, or a bench name (hard|mega|cuda|v3)",
+        help="path to an outputs/runs directory, or a bench name (hard|mega|cuda|mini|multi|v3)",
     )
     ap.add_argument("--published", help="leaderboard.json to flag contaminated PUBLISHED cells")
     args = ap.parse_args(argv)
 
     runs = Path(args.runs)
     # Convenience: accept a bench name and resolve against the repo.
-    if repo_root is not None and not runs.exists() and args.runs in ("hard", "mega", "cuda", "v3"):
+    if repo_root is not None and not runs.exists() and args.runs in ("hard", "mega", "cuda", "mini", "multi", "v3"):
         runs = repo_root / "benchmarks" / args.runs / "outputs" / "runs"
     if not runs.is_dir():
         print(f"no such runs dir: {runs}")

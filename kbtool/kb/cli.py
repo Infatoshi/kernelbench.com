@@ -22,15 +22,18 @@ from pathlib import Path
 USAGE = """\
 kb — KernelBench operator CLI   (repo: {root})
 
-  kb sweep <harness> <model> [effort]          full deck sweep, parallel containers, unlimited time
-  kb run <harness> <model> <problem> [effort]  one problem (problem = e.g. 05_topk_bitonic)
-  kb publish [bench]                            rebuild leaderboard + viewers from archives (default: hard; benches: hard|mega|cuda)
+Bench selection: every command targets ONE bench — default hard. Pick another
+with `kb -b <bench> ...` (or KB_BENCH=cuda). Benches: hard cuda mini mega multi.
+
+  kb [-b bench] sweep <harness> <model> [effort]   full deck sweep, parallel containers (hard|cuda|mini; mega/multi have their own drivers)
+  kb [-b bench] run <harness> <model> <problem> [effort]  one problem (problem = e.g. 05_topk_bitonic)
+  kb publish [bench]                            rebuild leaderboard + viewers from archives (hard|cuda|mini|mega)
   kb deploy [message]                           publish, commit, push -> Vercel deploys
   kb dev                                        preview site locally (localhost:3000)
   kb build                                      next build
-  kb audit <run_id>                             print a run's result + annotation verdict
-  kb lint <run_id|--all>                        static reward-hack tripwire (scans solution.py)
-  kb contamination <hard|mega|cuda|v3|path> [--published <lb.json>]   cross-run contamination audit
+  kb [-b bench] audit <run_id>                  print a run's result + annotation verdict
+  kb [-b bench] lint <run_id|--all>             static reward-hack tripwire (scans solution.py)
+  kb contamination <hard|mega|cuda|mini|multi|v3|path> [--published <lb.json>]   cross-run contamination audit
   kb traces-to-hf <out_dir> [run_dirs...]       convert run transcripts to HF agent-trace JSONL
   kb push-runs <hard|mega|cuda> [--board h100|b200] [--dataset R] [--dry-run]   convert published runs' traces and push to HF (per-GPU hard/cuda boards upload under <board>/)
   kb brev <up|sync|bootstrap|run|regrade|pull|down> <instance> [...]   Brev GPU worker lifecycle (scripts/brev_worker.sh)
@@ -133,6 +136,18 @@ def _exec(cmd: list[str], cwd: Path | None = None, env: dict | None = None) -> i
     os.execvp(cmd[0], cmd)
 
 
+# Benches the generic commands know about. mega/multi keep their own sweep
+# drivers (benchmarks/mega/scripts/sweep.sh, benchmarks/multi/scripts/
+# sweep_wave.sh) — `kb sweep`/`kb run` refuse them with a pointer instead of
+# guessing at their argument shapes.
+SWEEPABLE = ("hard", "cuda", "mini")
+DEFAULT_PROBLEMS_ROOT = {
+    "hard": "problems-rtxpro6000",
+    "cuda": "problems-rtxpro6000",
+    "mini": "problems-h100",
+}
+
+
 def _bench_dir(root: Path, bench: str) -> Path:
     d = root / "benchmarks" / bench
     if not d.is_dir():
@@ -140,36 +155,43 @@ def _bench_dir(root: Path, bench: str) -> Path:
     return d
 
 
-def cmd_sweep(root: Path, args: list[str]) -> int:
+def cmd_sweep(root: Path, args: list[str], bench: str = "hard") -> int:
+    if bench not in SWEEPABLE:
+        sys.exit(f"kb sweep: '{bench}' has its own driver — see benchmarks/{bench}/scripts/ "
+                 "(mega: sweep.sh, multi: sweep_wave.sh)")
     _require_local_gpu()
     harness = args[0] if args else ""
     model = args[1] if len(args) > 1 else ""
     preflight_key(harness, model)
-    return _exec([str(_bench_dir(root, "hard") / "scripts" / "sweep_deck.sh"), *args])
+    return _exec([str(_bench_dir(root, bench) / "scripts" / "sweep_deck.sh"), *args])
 
 
-def cmd_run(root: Path, args: list[str]) -> int:
+def cmd_run(root: Path, args: list[str], bench: str = "hard") -> int:
     if len(args) < 3:
-        sys.exit("usage: kb run <harness> <model> <problem> [effort]")
+        sys.exit("usage: kb [-b bench] run <harness> <model> <problem> [effort]")
+    if bench not in SWEEPABLE:
+        sys.exit(f"kb run: '{bench}' has its own driver — see benchmarks/{bench}/scripts/")
     _require_local_gpu()
     h, m, p = args[0], args[1], args[2]
     effort = args[3:] if len(args) > 3 else []
     preflight_key(h, m)
-    hard = _bench_dir(root, "hard")
-    problems_root = os.environ.get("KBH_PROBLEMS_ROOT", "problems-rtxpro6000")
+    bdir = _bench_dir(root, bench)
+    problems_root = os.environ.get("KBH_PROBLEMS_ROOT", DEFAULT_PROBLEMS_ROOT[bench])
     env = {**os.environ, "KBH_AGENT_CONTAINER": "1"}
-    os.chdir(hard)
+    os.chdir(bdir)
     os.environ.update(env)
     os.execvp("uv", ["uv", "run", "kbh", "run", h, m, f"{problems_root}/{p}", *effort])
 
 
-def cmd_publish(root: Path, args: list[str]) -> int:
+def cmd_publish(root: Path, args: list[str], bench: str = "hard") -> int:
     push = "--push" in args
     args = [a for a in args if a != "--push"]
-    bench = args[0] if args else "hard"
-    script = {"hard": "publish_v2.sh", "mega": "publish_mega.sh", "cuda": "publish_v2.sh"}.get(bench)
+    if args:  # positional bench (kb publish mega) wins over -b
+        bench = args[0]
+    script = {"hard": "publish_v2.sh", "cuda": "publish_v2.sh", "mini": "publish_v2.sh",
+              "mega": "publish_mega.sh"}.get(bench)
     if not script:
-        sys.exit(f"kb publish: no publish script for bench '{bench}' (hard|mega|cuda)")
+        sys.exit(f"kb publish: no publish script for bench '{bench}' (hard|cuda|mini|mega)")
     pub = _bench_dir(root, bench) / "scripts" / script
     subprocess.run([str(pub)], check=True)
     # Run detail must be rebuilt BEFORE the model index: build_model_index.py
@@ -271,7 +293,7 @@ def _check_rid_collisions(
     return rids
 
 
-def cmd_push_runs(root: Path, args: list[str]) -> int:
+def cmd_push_runs(root: Path, args: list[str], bench: str = "hard") -> int:
     dry = "--dry-run" in args
     args = [a for a in args if a != "--dry-run"]
     dataset = None
@@ -284,7 +306,8 @@ def cmd_push_runs(root: Path, args: list[str]) -> int:
         i = args.index("--board")
         board = args[i + 1]
         del args[i:i + 2]
-    bench = args[0] if args else "hard"
+    if args:  # positional bench wins over -b
+        bench = args[0]
     if bench not in ("hard", "mega", "cuda"):
         sys.exit("kb push-runs: only hard|mega|cuda have trace datasets (v3 is archived)")
     if board and bench not in ("hard", "cuda"):
@@ -350,7 +373,7 @@ def cmd_push_runs(root: Path, args: list[str]) -> int:
     return 0
 
 
-def cmd_deploy(root: Path, args: list[str]) -> int:
+def cmd_deploy(root: Path, args: list[str], bench: str = "hard") -> int:
     msg = args[0] if args else "publish kernelbench results"
     subprocess.run([str(_bench_dir(root, "hard") / "scripts" / "publish_v2.sh")], check=True)
     subprocess.run([str(_bench_dir(root, "cuda") / "scripts" / "publish_v2.sh")], check=True)
@@ -380,55 +403,58 @@ def _js_runner() -> str:
     return "npm"
 
 
-def cmd_dev(root: Path, args: list[str]) -> int:
+def cmd_dev(root: Path, args: list[str], bench: str = "hard") -> int:
     return _exec([_js_runner(), "run", "dev"], cwd=root)
 
 
-def cmd_build(root: Path, args: list[str]) -> int:
+def cmd_build(root: Path, args: list[str], bench: str = "hard") -> int:
     return _exec([_js_runner(), "run", "build"], cwd=root)
 
 
-def cmd_audit(root: Path, args: list[str]) -> int:
+def cmd_audit(root: Path, args: list[str], bench: str = "hard") -> int:
     if not args:
-        sys.exit("usage: kb audit <run_id>")
+        sys.exit("usage: kb [-b bench] audit <run_id>")
     rid = args[0]
-    hard = _bench_dir(root, "hard")
-    d = hard / "outputs" / "runs" / rid
+    bdir = _bench_dir(root, bench)
+    d = bdir / "outputs" / "runs" / rid
     if not d.is_dir():
         sys.exit(f"no such run: {rid}")
     r = json.loads((d / "result.json").read_text())
     keys = ("harness", "model", "correct", "peak_fraction", "template_mutated", "failure_reason")
     print({k: r.get(k) for k in keys})
-    ann = hard / "results" / "annotations" / f"{rid}.yaml"
+    ann = bdir / "results" / "annotations" / f"{rid}.yaml"
     if ann.exists():
         print("--- annotation ---")
         print(ann.read_text())
     return 0
 
 
-def cmd_lint(root: Path, args: list[str]) -> int:
-    script = _bench_dir(root, "hard") / "scripts" / "reward_hack_lint.py"
+def cmd_lint(root: Path, args: list[str], bench: str = "hard") -> int:
+    # mega/multi have no local lint copy; hard's scanner works on any run dir.
+    b = bench if (root / "benchmarks" / bench / "scripts" / "reward_hack_lint.py").exists() else "hard"
+    script = _bench_dir(root, b) / "scripts" / "reward_hack_lint.py"
     return _exec(["python3", str(script), *args])
 
 
-def cmd_contamination(root: Path, args: list[str]) -> int:
+def cmd_contamination(root: Path, args: list[str], bench: str = "hard") -> int:
     from kb import contamination
     return contamination.run(args, repo_root=root)
 
 
-def cmd_brev(root: Path, args: list[str]) -> int:
+def cmd_brev(root: Path, args: list[str], bench: str = "hard") -> int:
     """Brev worker lifecycle: kb brev <up|sync|bootstrap|run|regrade|pull|down> ..."""
     return _exec([str(root / "scripts" / "brev_worker.sh"), *args])
 
 
-def cmd_lambda(root: Path, args: list[str]) -> int:
+def cmd_lambda(root: Path, args: list[str], bench: str = "hard") -> int:
     """Lambda Cloud worker: kb lambda <list|ls|up|sync|bootstrap|run|regrade|pull|down|ssh> ..."""
     return _exec([str(root / "scripts" / "lambda_worker.sh"), *args])
 
 
-def cmd_traces_to_hf(root: Path, args: list[str]) -> int:
-    script = _bench_dir(root, "hard") / "scripts" / "traces_to_hf.py"
-    os.chdir(_bench_dir(root, "hard"))
+def cmd_traces_to_hf(root: Path, args: list[str], bench: str = "hard") -> int:
+    b = bench if (root / "benchmarks" / bench / "scripts" / "traces_to_hf.py").exists() else "hard"
+    script = _bench_dir(root, b) / "scripts" / "traces_to_hf.py"
+    os.chdir(_bench_dir(root, b))
     os.execvp("uv", ["uv", "run", "python", str(script), *args])
 
 
@@ -449,8 +475,30 @@ _COMMANDS = {
 }
 
 
+def _pop_bench(argv: list[str]) -> str:
+    """Consume -b/--bench wherever it appears; KB_BENCH is the env fallback;
+    hard is the default."""
+    bench = os.environ.get("KB_BENCH", "hard")
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a in ("-b", "--bench"):
+            if i + 1 >= len(argv):
+                sys.exit("kb: -b/--bench needs a value (hard|cuda|mini|mega|multi)")
+            bench = argv[i + 1]
+            del argv[i:i + 2]
+            continue
+        if a.startswith("--bench="):
+            bench = a.split("=", 1)[1]
+            del argv[i]
+            continue
+        i += 1
+    return bench
+
+
 def main(argv: list[str] | None = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
+    bench = _pop_bench(argv)
     cmd = argv[0] if argv else "help"
     rest = argv[1:]
     if cmd in ("help", "-h", "--help"):
@@ -461,7 +509,10 @@ def main(argv: list[str] | None = None) -> int:
         sys.stderr.write(f"unknown command: {cmd}\n\n")
         print(USAGE.format(root=repo_root()))
         return 2
-    return fn(repo_root(), rest)
+    root = repo_root()
+    if bench != "hard" and not (root / "benchmarks" / bench).is_dir():
+        sys.exit(f"kb: no such bench: {bench} (hard|cuda|mini|mega|multi)")
+    return fn(root, rest, bench)
 
 
 if __name__ == "__main__":

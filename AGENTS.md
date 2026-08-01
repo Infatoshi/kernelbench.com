@@ -135,8 +135,13 @@ only — takes a BARE problem name and prepends `$KBH_PROBLEMS_ROOT`, default
 (symlinked to ~/.local/bin/kb). Install standalone with `uv tool install
 ./kbtool`. The GPU-coupled sweep orchestration stays as bench-local shell
 (`benchmarks/<bench>/scripts/*.sh`); the CLI shells out to it. The `kb` CLI
-targets the **hard** bench; for **mega** drive `./scripts/run_hard.sh` /
-`./scripts/sweep.sh` from inside `benchmarks/mega/` (or `kb publish mega`).
+defaults to the **hard** bench; select another with `kb -b <cuda|mini> ...`
+(or `KB_BENCH=cuda`) — works for `run`, `sweep`, `audit`, `lint`,
+`traces-to-hf`. `kb publish <hard|cuda|mini|mega>` and
+`kb contamination <bench>` take the bench positionally. **mega** and **multi**
+keep their own sweep drivers (`benchmarks/mega/scripts/sweep.sh`,
+`benchmarks/multi/scripts/sweep_wave.sh`); `kb sweep`/`kb run` refuse them
+with a pointer.
 
 ### Lambda Cloud workers (sponsored $10k credits, 2026-07)
 

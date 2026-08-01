@@ -20,6 +20,7 @@ The following variables can change the meaning, comparability, publishability, o
 | Var | Read by (paths) | Default | What it changes | Notes |
 | --- | --- | --- | --- | --- |
 | `KB_ALLOW_LOCAL` | `kbtool/kb/cli.py` | unset / `0` | Lets `kb run` and `kb sweep` proceed on the local host when the normal remote-worker guard would refuse. | Safety override; value must be `1`. |
+| `KB_BENCH` | `kbtool/kb/cli.py` | `hard` | Default bench for `kb` commands when no `-b/--bench` flag is passed. | Flag wins over env. Benches: hard, cuda, mini, mega, multi. |
 | `KB_BENCH_BANNER` | `scripts/lib/run_harness.sh` | `KERNELBENCH RUN` | Banner line printed at session start. | Pinned by each bench's `run_hard.sh` wrapper; not user-set. |
 | `KB_BENCH_DIR` | `scripts/lib/run_harness.sh` | required | Bench root (outputs/, problems, src/) the shared runner operates in. | Pinned by each bench's `run_hard.sh` wrapper; the lib refuses to run without it. |
 | `KB_BUDGET_SECONDS_DEFAULT` | `scripts/lib/run_harness.sh` | `0` (unlimited) | Bench-identity wall-clock cap default (mini pins `1800`). | Pinned by the wrapper. Per-run override remains `KBH_BUDGET_SECONDS_OVERRIDE` (see Danger). |
