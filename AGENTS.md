@@ -567,6 +567,15 @@ enable it in broad preflight/sweeps with `KBH_USE_MINIMAX_M3_CLAUDE=1`.
 - `outputs/runs/<ts>_..../solution.py` — final agent-written kernel
 - `outputs/runs/<ts>_..../roofline.png` — visual: peak line, eager/compile/SOTA/solution points per shape
 
+**Thin archives (standing, 2026-08-01).** Per-run `repo/.venv` is **not** kept
+after scoring. The harness and regrade scripts strip every `.venv` under the
+run dir once check/benchmark finish (`scripts/lib/strip_run_venv.sh`). Recreate
+with `uv run` from the archived `uv.lock` if you need a local env. Lambda/Brev
+`pull` already `--exclude '.venv'`. Opt out for debugging:
+`KBH_KEEP_RUN_VENV=1`. One-shot reclaim of old fat archives:
+`scripts/lib/strip_run_venv.sh --tree benchmarks/<bench>/outputs` (and
+`rescue/`).
+
 **Headline metric rule (standing, 2026-07-15).** Where a roofline ceiling is
 structurally unreadable (launch-overhead-bound, e.g. topk's ~0.02 ceiling, or
 dense-equivalent FLOPs a correct sparse kernel never executes, e.g. cuda

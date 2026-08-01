@@ -1330,6 +1330,8 @@ for f in "$PROBLEM_DIR"/*; do
     base="$(basename "$f")"
     [[ "$base" == "." || "$base" == ".." ]] && continue
     [[ "$base" == "solution.py" ]] && continue
+    # Never archive a per-run venv into scratch (multi-GB CUDA wheels).
+    [[ "$base" == ".venv" ]] && continue
     if ! is_template "$base"; then
         mkdir -p "$SCRATCH_DIR"
         cp -r "$f" "$SCRATCH_DIR/"
@@ -1347,6 +1349,12 @@ for f in "$PROBLEM_DIR"/*; do
     fi
 done
 shopt -u nullglob dotglob
+
+# Drop per-run .venv after scoring. Reproducible from uv.lock via `uv run`
+# (regrade recreates it). Opt out: KBH_KEEP_RUN_VENV=1.
+# shellcheck source=../../../scripts/lib/strip_run_venv.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)/scripts/lib/strip_run_venv.sh"
+strip_run_venv "$RUN_DIR"
 
 STATUS="ERR"
 if $CORRECT; then

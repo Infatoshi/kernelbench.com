@@ -97,11 +97,16 @@ RUN_ID="$(basename "$RUN_DIR")"
 RUN_GROUP="${KBH_RUN_GROUP:-}"
 NVCF_PROXY_PID=""
 NVCF_PROXY_BASE_URL=""
+OR_PROVIDER_PROXY_PID=""
 
 cleanup() {
     if [ -n "${NVCF_PROXY_PID:-}" ] && kill -0 "$NVCF_PROXY_PID" 2>/dev/null; then
         kill "$NVCF_PROXY_PID" 2>/dev/null || true
         wait "$NVCF_PROXY_PID" 2>/dev/null || true
+    fi
+    if [ -n "${OR_PROVIDER_PROXY_PID:-}" ] && kill -0 "$OR_PROVIDER_PROXY_PID" 2>/dev/null; then
+        kill "$OR_PROVIDER_PROXY_PID" 2>/dev/null || true
+        wait "$OR_PROVIDER_PROXY_PID" 2>/dev/null || true
     fi
 }
 trap cleanup EXIT
@@ -1803,6 +1808,44 @@ case "$HARNESS" in
                 ;;
         esac
         OR_FABLE_BASE_URL="${OR_FABLE_BASE_URL:-https://openrouter.ai/api}"
+        # KBH_OR_PROVIDER pins an OpenRouter provider (e.g. novita) for this
+        # run. Claude Code cannot send OpenRouter's `provider` routing field,
+        # but /api/v1/messages honors it (verified 2026-08-01: order +
+        # allow_fallbacks=false served the pinned host, BYOK bypassed), so a
+        # local body-rewriting proxy injects it. Host mode only: inside the
+        # agent container 127.0.0.1 is not the host.
+        if [ -n "${KBH_OR_PROVIDER:-}" ]; then
+            if [ "$KBH_AGENT_CONTAINER" = "1" ]; then
+                echo "STOP: KBH_OR_PROVIDER needs host mode (KBH_AGENT_CONTAINER=0); the container cannot reach the localhost proxy" >&2
+                exit 1
+            fi
+            OR_PROXY_SCRIPT="$REPO_ROOT/../../scripts/lib/or_provider_proxy.py"
+            [ -f "$OR_PROXY_SCRIPT" ] || OR_PROXY_SCRIPT="$REPO_ROOT/scripts/lib/or_provider_proxy.py"
+            if [ ! -f "$OR_PROXY_SCRIPT" ]; then
+                echo "STOP: or_provider_proxy.py not found (monorepo or bench-local scripts/lib)" >&2
+                exit 1
+            fi
+            OR_PROXY_LOG="$RUN_DIR/or_provider_proxy.log"
+            OR_PROXY_UPSTREAM="$OR_FABLE_BASE_URL" python3 "$OR_PROXY_SCRIPT" 0 "$KBH_OR_PROVIDER" \
+                > /dev/null 2> "$OR_PROXY_LOG" &
+            OR_PROVIDER_PROXY_PID=$!
+            OR_PROXY_URL=""
+            for _ in $(seq 1 100); do
+                if ! kill -0 "$OR_PROVIDER_PROXY_PID" 2>/dev/null; then
+                    echo "or-provider proxy exited before startup; see $OR_PROXY_LOG" >&2
+                    exit 1
+                fi
+                OR_PROXY_URL="$(grep -oE 'http://127\.0\.0\.1:[0-9]+' "$OR_PROXY_LOG" | tail -1 || true)"
+                [ -n "$OR_PROXY_URL" ] && break
+                sleep 0.1
+            done
+            if [ -z "$OR_PROXY_URL" ]; then
+                echo "Timed out waiting for or-provider proxy; see $OR_PROXY_LOG" >&2
+                exit 1
+            fi
+            OR_FABLE_BASE_URL="$OR_PROXY_URL"
+            echo "or-fable: OpenRouter provider pinned to '$KBH_OR_PROVIDER' via $OR_PROXY_URL"
+        fi
         # Effort is forwarded (Opus convention is --effort max); callers that
         # pass no effort keep the previous no-flag behaviour.
         OR_FABLE_EFFORT_ARG=()
@@ -2711,6 +2754,8 @@ for f in "$PROBLEM_DIR"/*; do
     base="$(basename "$f")"
     [[ "$base" == "." || "$base" == ".." ]] && continue
     [[ "$base" == "solution.py" ]] && continue
+    # Never archive a per-run venv into scratch (multi-GB CUDA wheels).
+    [[ "$base" == ".venv" ]] && continue
     if ! is_template "$base"; then
         mkdir -p "$SCRATCH_DIR"
         cp -r "$f" "$SCRATCH_DIR/"
@@ -2728,6 +2773,12 @@ for f in "$PROBLEM_DIR"/*; do
     fi
 done
 shopt -u nullglob dotglob
+
+# Drop per-run .venv after scoring. Reproducible from uv.lock via `uv run`
+# (regrade recreates it). Opt out: KBH_KEEP_RUN_VENV=1.
+# shellcheck source=scripts/lib/strip_run_venv.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/strip_run_venv.sh"
+strip_run_venv "$RUN_DIR"
 
 STATUS="ERR"
 if $CORRECT; then

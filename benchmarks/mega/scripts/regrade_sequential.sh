@@ -245,6 +245,11 @@ if isinstance(old, (int, float)) and isinstance(new, (int, float)) and old:
 print("    correct=%s  peak %s -> %s%s" % (r["correct"], old, new, delta))
 PY
 
+    # uv run recreates repo/.venv during regrade; drop it again so archives stay thin.
+    # shellcheck source=../../../scripts/lib/strip_run_venv.sh
+    . "$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)/scripts/lib/strip_run_venv.sh"
+    strip_run_venv "$RUN_DIR"
+
     if [ "$CORRECT" = "true" ]; then PASS=$((PASS+1)); else FAIL=$((FAIL+1)); fi
 done
 

@@ -11,6 +11,7 @@ The following variables can change the meaning, comparability, publishability, o
 - Regrading: the `KBH_REGRADE_ALLOW_BUSY`, `KBH_REGRADE_DECK`, `KBH_REGRADE_DRY_RUN`, and `KBH_REGRADE_GPU` family controls which GPU and deck are used and whether contention checks or writes occur. `KBH_REGRADE_ALLOW_BUSY=1` can make timings unpublishable.
 - Correctness: `KBH_NUMERIC_STRESS=0` removes the single-GPU numeric-stress cases. `KBM_NUMERIC_STRESS=0`, `KBM_SKIP_FORBIDDEN=1`, and `KBM_SKIP_GRADE=1` similarly weaken or omit Multi validation. These are debugging controls, never official-run settings.
 - Cloud cost and target: `KB_LAMBDA_BENCH` changes which bench is copied to and run on a Lambda instance. `KB_LAMBDA_TYPE` and `KB_LAMBDA_REGION` affect the billed instance. Always terminate the instance after use.
+- Provider identity: `KBH_OR_PROVIDER` changes which OpenRouter host serves an or-fable session (and moves billing off BYOK). Different hosts can serve different quantizations; record the pin with the run.
 - Local execution: `KB_ALLOW_LOCAL=1` bypasses the `kb` CLI's remote-worker safety gate.
 - Multi hardware: `KBM_ALLOW_DEVICE_MISMATCH=1` permits grading on a heterogeneous or wrong-SKU fabric. `KBM_BACKEND`, `KBM_DEVICE`, and `KBM_WORLD_SIZE` also change the execution topology.
 - Multi measurement: `KBM_ALLOW_BUSY`, `KBM_TRIALS`, `KBM_WARMUP`, `KBM_ITERS`, and `KBM_ANCHOR_REPEATS` change contention safeguards or sampling. `KBM_ALLOW_OFF_ROSTER=1` creates an exploratory, non-publishable cell.
@@ -78,6 +79,7 @@ The following variables can change the meaning, comparability, publishability, o
 | `KBH_HARDWARE_LABEL` | `benchmarks/{hard,cuda,mini}/scripts/run_baselines.sh` | `RTX_PRO_6000_BLACKWELL_SM120` | Labels generated baseline records with a hardware identity. | Label only; it does not move work to that GPU. |
 | `KBH_HARNESS_CONCURRENCY` | `benchmarks/{hard,cuda,mini,mega}/scripts/{launch_parallel_sweep,launch_infra_retries}.sh` | `2` | Caps concurrent sessions per harness/provider worker. | Provider-load control; GPU commands still use the lock. |
 | `KBH_INKLING_CONTINUES` | `benchmarks/mega/scripts/run_hard.sh` | `KBH_TINKER_CONTINUES`, else `30` | Caps automatic same-session continuation turns for Mega's OpenRouter Inkling route. | Agent-protocol setting. |
+| `KBH_KEEP_RUN_VENV` | `scripts/lib/strip_run_venv.sh` (sourced by `scripts/lib/run_harness.sh`, `benchmarks/mega/scripts/run_hard.sh`, and `benchmarks/{hard,cuda,mini,mega}/scripts/regrade_sequential.sh`) | unset / `0` | When `1`, skips deleting per-run `repo/.venv` after scoring/regrade. | Default strips venvs (reproducible from `uv.lock`). Debug only; leaving them on can fill local disk. |
 | `KBH_MIN_USEFUL_OUTPUT_TOKENS` | `benchmarks/{hard,cuda,mini,mega}/scripts/run_hard.sh` | `5000` | Sets the token threshold below which a no-solution run is classified as provider early-stop/retryable. | Classification only; does not cap output. |
 | `KBH_NUMERIC_STRESS` | `benchmarks/{hard,cuda,mini,mega}/src/eval/numeric_stress.py` | `1` | Disables extra numeric-stress correctness cases when `0`, `false`, or `no`. | Never disable for official runs. |
 | `KBH_OPENCODE_BIN` | `benchmarks/{hard,cuda,mini}/scripts/probe_opencode_multistep.sh` | `~/.opencode/bin/opencode` | Selects the OpenCode executable for the multistep probe. | Probe only. |
@@ -93,6 +95,7 @@ The following variables can change the meaning, comparability, publishability, o
 | `KBH_PREFLIGHT_PROMPT` | `benchmarks/{hard,cuda,mini,mega}/scripts/preflight_harnesses.sh` | exact sentinel-reply prompt | Replaces the tiny prompt sent to every preflight route. | The result still must contain the sentinel. |
 | `KBH_PREFLIGHT_TIMEOUT_SECONDS` | same | `120` | Sets the basic per-route preflight timeout. | Preflight only. |
 | `KBH_PROBE_PROBLEM` | `benchmarks/{hard,cuda,mini}/scripts/probe_opencode_multistep.sh` | `05_topk_bitonic` | Selects the problem used by the OpenCode multistep probe. | Probe only. |
+| `KBH_OR_PROVIDER` | `scripts/lib/run_harness.sh` | unset | or-fable only: pins the OpenRouter provider (e.g. `novita`) for the whole session via a local body-rewriting proxy (`scripts/lib/or_provider_proxy.py`, upstream override `OR_PROXY_UPSTREAM`). | Provider identity affects comparability — record it with the run. Pinning a non-DeepSeek host also bypasses BYOK, so billing moves to OpenRouter credits. Host mode only (refuses `KBH_AGENT_CONTAINER=1`). |
 | `KBH_PROBLEMS` | `benchmarks/{hard,cuda,mini,mega}/scripts/launch_parallel_sweep.sh` | bench-specific problem list | Replaces the problem list for a parallel sweep. | Mega defaults to `problems/02_kimi_linear_decode`; copied single-GPU launchers carry their own literal defaults. |
 | `KBH_PROBLEMS_ROOT` | `kbtool/kb/cli.py`; `benchmarks/{hard,cuda,mini}/scripts/{sweep_deck,resweep_deck}.sh` | `problems-rtxpro6000` | Selects the deck root prefixed by CLI/deck sweep commands. | Must match the intended GPU; callers passing a full path can bypass this helper. |
 | `KBH_PUBLISHED_MANIFEST` | `benchmarks/{hard,cuda,mini}/scripts/build_v2_leaderboard.py` | `results/published_runs.json` | Selects the allowlist of run IDs used for leaderboard construction; empty disables it. | Changes which cells can be published. |
@@ -114,6 +117,7 @@ The following variables can change the meaning, comparability, publishability, o
 | `KBH_USE_NVCF_NEMOTRON` | `benchmarks/{hard,cuda,mini}/scripts/{sweep,launch_parallel_sweep,preflight_harnesses}.sh` | `0` | Adds the NVIDIA NVCF Nemotron route. | Changes matrix coverage and provider billing. |
 | `KBH_USE_OPENCODE_ZAI` | `benchmarks/{hard,cuda,mini}/scripts/{launch_parallel_sweep,preflight_harnesses}.sh` | `0` | Adds the diagnostic OpenCode-to-Z.ai row. | Disabled because that adapter has stalled on reasoning streams. |
 | `KBH_USE_OPENROUTER_NEMOTRON` | `benchmarks/{hard,cuda,mini}/scripts/{sweep,launch_parallel_sweep,preflight_harnesses}.sh` | `0` | Adds the OpenRouter/DeepInfra-pinned Nemotron row. | Changes matrix coverage and provider billing. |
+
 
 ## `KBM_` Multi
 
