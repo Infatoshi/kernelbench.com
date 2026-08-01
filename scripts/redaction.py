@@ -68,7 +68,11 @@ def _candidate_secret_values() -> list[str]:
             if len(value) >= 6:
                 values.append(value)
 
-    return sorted(set(values), key=len, reverse=True)
+    # All-digit values are config knobs (timeouts, context windows, ports),
+    # never credentials; blind-replacing them corrupts numeric JSON fields
+    # (GROK_DEBUG_CONTEXT_WINDOW=300000 turned every `"timeout": 300000` into
+    # invalid `"timeout": REDACTED` and broke the HF trace converter).
+    return sorted({v for v in values if not v.isdigit()}, key=len, reverse=True)
 
 
 SECRET_VALUES = _candidate_secret_values()
