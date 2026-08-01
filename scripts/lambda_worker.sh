@@ -148,6 +148,22 @@ ssh_to() {
   ssh_base "$ip" "$@"
 }
 
+# For fire-and-forget remote launches: the detached remote job can keep the ssh
+# channel open past the "launched PID" line (observed 2026-08-01), so bound the
+# local wait instead of blocking on channel close.
+ssh_to_detached() {
+  local name="$1"
+  shift
+  ssh_to "$name" "$@" </dev/null &
+  local pid=$! i
+  for i in $(seq 1 30); do
+    kill -0 "$pid" 2>/dev/null || { wait "$pid" 2>/dev/null; return 0; }
+    sleep 1
+  done
+  echo "[run] ssh channel still open after 30s; remote job is detached — closing local side"
+  kill "$pid" 2>/dev/null || true
+}
+
 pick_region() {
   local type="$1" preferred="${2:-}"
   if [ -n "$preferred" ]; then
@@ -312,14 +328,14 @@ rm -f uv.lock; fi; export PATH=\"\$HOME/.local/bin:\$PATH\"; uv sync"
       # sweep_wave.sh, never parallel sessions: four concurrent agents on one
       # 4-GPU fabric OOM'"'"'d the node and pkill-ed each other on 2026-07-25.
       echo "[run] detached (sequential): $HARNESS $MODEL $PROBLEM $EFFORT"
-      ssh_to "$NAME" "cd ~/$REMOTE_DIR && nohup env BUDGET_SECONDS=0 ./scripts/sweep_wave.sh $HARNESS $MODEL ${EFFORT:-high} $PROBLEM > ~/kb_run.log 2>&1 & echo launched PID \$!"
+      ssh_to_detached "$NAME" "cd ~/$REMOTE_DIR && mkdir -p outputs && nohup env BUDGET_SECONDS=0 ./scripts/sweep_wave.sh $HARNESS $MODEL ${EFFORT:-high} $PROBLEM > outputs/kb_run_${HARNESS}_${PROBLEM}.log 2>&1 < /dev/null & echo launched PID \$!"
     else
       echo "[run] detached: $HARNESS $MODEL $PROBLEMS_ROOT/$PROBLEM $EFFORT"
       # KB_LAMBDA_RUN_ENV: extra VAR=VALUE pairs injected into the run's env
       # (e.g. "KBH_OR_PROVIDER=novita KBH_BUDGET_SECONDS_OVERRIDE=900").
       # Logs stay inside the synced bench dir (never $HOME — see AGENTS.md).
       RUN_LOG="outputs/kb_run_${HARNESS}_${PROBLEM}.log"
-      ssh_to "$NAME" "export PATH=\"\$HOME/.local/bin:\$PATH\"; cd ~/$REMOTE_DIR && mkdir -p outputs && setsid nohup env KBH_AGENT_CONTAINER=0 BUDGET_SECONDS=0 ${KB_LAMBDA_RUN_ENV:-} ./scripts/run_hard.sh $HARNESS $MODEL $PROBLEMS_ROOT/$PROBLEM $EFFORT > $RUN_LOG 2>&1 < /dev/null & echo launched PID \$!"
+      ssh_to_detached "$NAME" "export PATH=\"\$HOME/.local/bin:\$PATH\"; cd ~/$REMOTE_DIR && mkdir -p outputs && setsid nohup env KBH_AGENT_CONTAINER=0 BUDGET_SECONDS=0 ${KB_LAMBDA_RUN_ENV:-} ./scripts/run_hard.sh $HARNESS $MODEL $PROBLEMS_ROOT/$PROBLEM $EFFORT > $RUN_LOG 2>&1 < /dev/null & echo launched PID \$!"
     fi
     echo "Poll:  lambda_worker.sh ssh $NAME 'tail -20 ~/$REMOTE_DIR/${RUN_LOG:-outputs/kb_run_*.log}'"
     ;;
