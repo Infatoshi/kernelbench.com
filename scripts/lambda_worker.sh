@@ -315,9 +315,13 @@ rm -f uv.lock; fi; export PATH=\"\$HOME/.local/bin:\$PATH\"; uv sync"
       ssh_to "$NAME" "cd ~/$REMOTE_DIR && nohup env BUDGET_SECONDS=0 ./scripts/sweep_wave.sh $HARNESS $MODEL ${EFFORT:-high} $PROBLEM > ~/kb_run.log 2>&1 & echo launched PID \$!"
     else
       echo "[run] detached: $HARNESS $MODEL $PROBLEMS_ROOT/$PROBLEM $EFFORT"
-      ssh_to "$NAME" "export PATH=\"\$HOME/.local/bin:\$PATH\"; cd ~/$REMOTE_DIR && setsid nohup env KBH_AGENT_CONTAINER=0 BUDGET_SECONDS=0 ./scripts/run_hard.sh $HARNESS $MODEL $PROBLEMS_ROOT/$PROBLEM $EFFORT > ~/kb_run.log 2>&1 < /dev/null & echo launched PID \$!"
+      # KB_LAMBDA_RUN_ENV: extra VAR=VALUE pairs injected into the run's env
+      # (e.g. "KBH_OR_PROVIDER=novita KBH_BUDGET_SECONDS_OVERRIDE=900").
+      # Logs stay inside the synced bench dir (never $HOME — see AGENTS.md).
+      RUN_LOG="outputs/kb_run_${HARNESS}_${PROBLEM}.log"
+      ssh_to "$NAME" "export PATH=\"\$HOME/.local/bin:\$PATH\"; cd ~/$REMOTE_DIR && mkdir -p outputs && setsid nohup env KBH_AGENT_CONTAINER=0 BUDGET_SECONDS=0 ${KB_LAMBDA_RUN_ENV:-} ./scripts/run_hard.sh $HARNESS $MODEL $PROBLEMS_ROOT/$PROBLEM $EFFORT > $RUN_LOG 2>&1 < /dev/null & echo launched PID \$!"
     fi
-    echo "Poll:  lambda_worker.sh ssh $NAME 'tail -20 ~/kb_run.log'"
+    echo "Poll:  lambda_worker.sh ssh $NAME 'tail -20 ~/$REMOTE_DIR/${RUN_LOG:-outputs/kb_run_*.log}'"
     ;;
 
   regrade)
