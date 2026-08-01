@@ -168,6 +168,16 @@ def test_bench_wrappers_are_thin_and_use_shared_runner():
         assert len(text.splitlines()) < 30, f"{b}: wrapper no longer thin ({len(text.splitlines())} lines)"
 
 
+def test_lambda_sync_preserves_torch_index_patch():
+    """Re-syncing a bootstrapped node once shipped the Mac's cu130 uv.lock over
+    the node's cu128-patched one; every later graded env build then died with
+    driver-too-old at check time (2026-08-01)."""
+    text = (REPO / "scripts/lambda_worker.sh").read_text()
+    assert "preserving node torch-index patch" in text, (
+        "lambda sync no longer guards the bootstrapped pyproject/uv.lock torch-index patch"
+    )
+
+
 def test_lambda_sync_ships_shared_runner_lib():
     """kb lambda sync copies one bench dir to the node; the wrapper's fallback
     path (bench-local scripts/lib/) only works if sync ships the lib there."""

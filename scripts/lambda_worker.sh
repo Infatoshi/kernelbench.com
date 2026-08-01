@@ -261,9 +261,18 @@ case "$CMD" in
     ensure_reachable "$NAME"
     IP="$(instance_ip "$NAME")"
     echo "[sync] thin $BENCH bench -> ${SSH_USER}@${IP}:$REMOTE_DIR/"
+    # A bootstrapped node's pyproject.toml/uv.lock carry the torch-index patch
+    # (cu128 on Lambda's 570-driver era images); shipping the Mac's cu130 lock
+    # over them breaks every later graded env build (driver-too-old at check
+    # time, found 2026-08-01). Preserve them once the patch marker is present.
+    SYNC_EXCLUDES=(--exclude outputs --exclude __pycache__ --exclude '.venv' --exclude '*.pyc'
+      --exclude .git --exclude 'docs/refs')
+    if ssh_to "$NAME" "grep -q pytorch-cu128 $REMOTE_DIR/pyproject.toml" 2>/dev/null; then
+      echo "[sync] preserving node torch-index patch (pyproject.toml/uv.lock not shipped)"
+      SYNC_EXCLUDES+=(--exclude /pyproject.toml --exclude /uv.lock)
+    fi
     rsync -az -e "ssh -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=$STATE_DIR/known_hosts -o BatchMode=yes" \
-      --exclude outputs --exclude __pycache__ --exclude '.venv' --exclude '*.pyc' \
-      --exclude .git --exclude 'docs/refs' \
+      "${SYNC_EXCLUDES[@]}" \
       "$BENCH_DIR/" "${SSH_USER}@${IP}:$REMOTE_DIR/"
     # The single-GPU benches' run_hard.sh is a thin wrapper over the shared
     # runner at <monorepo>/scripts/lib/; a thin-synced node has no monorepo
