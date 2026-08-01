@@ -142,6 +142,18 @@ def test_gpu_lock_bounded_retry_everywhere():
     assert "until flock -x -w 5 9; do" in text, "bounded flock retry missing from shared runner"
 
 
+def test_or_proxy_launch_bypasses_gpu_lock_wrapper():
+    """The or-provider proxy is a CPU-only daemon; launched via the $RUN_DIR/bin
+    python3 wrapper it inherits the flock fd and holds outputs/gpu.lock for its
+    whole life, starving every later run (2026-08-01)."""
+    text = (REPO / "scripts/lib/run_harness.sh").read_text()
+    m = re.search(r'\n\s*OR_PROXY_UPSTREAM=[^\n]*', text)
+    assert m, "or-provider proxy launch line not found"
+    assert '"$OR_PROXY_PYTHON"' in m.group(0), (
+        "proxy launch must use the wrapper-bypassing $OR_PROXY_PYTHON, not bare python3"
+    )
+
+
 def test_bench_wrappers_are_thin_and_use_shared_runner():
     """hard/cuda/mini run_hard.sh are identity-pinning wrappers over
     scripts/lib/run_harness.sh. Logic creeping back into a wrapper is the

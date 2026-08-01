@@ -1826,7 +1826,14 @@ case "$HARNESS" in
                 exit 1
             fi
             OR_PROXY_LOG="$RUN_DIR/or_provider_proxy.log"
-            OR_PROXY_UPSTREAM="$OR_FABLE_BASE_URL" python3 "$OR_PROXY_SCRIPT" 0 "$KBH_OR_PROVIDER" \
+            # Launch with the REAL python3, never the $RUN_DIR/bin GPU-lock
+            # wrapper: a daemon exec'd through the wrapper inherits the lock fd
+            # and holds outputs/gpu.lock for its whole life, deadlocking every
+            # later run (observed 2026-08-01: smoke proxy starved the next 6
+            # runs' proxy startups into timeout).
+            OR_PROXY_CLEAN_PATH="$(printf '%s' "$PATH" | tr ':' '\n' | grep -vx "$RUN_DIR/bin" | paste -sd: -)"
+            OR_PROXY_PYTHON="$(PATH="$OR_PROXY_CLEAN_PATH" command -v python3 || echo /usr/bin/python3)"
+            OR_PROXY_UPSTREAM="$OR_FABLE_BASE_URL" "$OR_PROXY_PYTHON" "$OR_PROXY_SCRIPT" 0 "$KBH_OR_PROVIDER" \
                 > /dev/null 2> "$OR_PROXY_LOG" &
             OR_PROVIDER_PROXY_PID=$!
             OR_PROXY_URL=""
