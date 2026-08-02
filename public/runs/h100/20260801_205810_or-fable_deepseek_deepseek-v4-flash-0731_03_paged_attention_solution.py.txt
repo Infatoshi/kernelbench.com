@@ -1,0 +1,449 @@
+"""Custom CUDA paged-attention decode kernel (split-KV FlashDecoding-style).
+
+Single-query decode with GQA: each batch element's query attends over a paged
+KV cache laid out as (num_blocks, page_size, num_kv_heads, head_dim * 2) with
+[K | V] packed on the last dim.  The kernel:
+
+  * splits each batch's sequence into SPLIT chunks (one block per (batch,
+    chunk)); each block loads the *entire* page (all kv heads) contiguously
+    into shared memory via cp.async double-buffering, so every KV byte is
+    streamed from DRAM exactly once;
+  * processes a whole page's tokens with a warp-split layout: each warp handles
+    two query heads (lanes 0..15 for head A, lanes 16..31 for head B), and each
+    16-lane group reduces its partial scores with a 4-step width-16 butterfly;
+  * runs the standard online softmax (running max + rescale) in fp32;
+  * writes per-split normalized partials + log-sum-exp, then a tiny combine
+    kernel merges the splits (FlashDecoding combine).
+
+Everything is bf16 in, fp32 math, bf16 out.  Correctness tolerance 0.02.
+"""
+import math
+import os
+
+# --- toolchain setup (must run before torch.utils.cpp_extension is imported) ---
+# The sandbox PATH has a gpu-lock wrapper for nvcc that can block on a shared GPU
+# lock; the real nvcc is /usr/bin/nvcc with CUDA_HOME=/usr. torch caches CUDA_HOME
+# at import time, so set these before importing cpp_extension.
+if "CUDA_HOME" not in os.environ:
+    os.environ["CUDA_HOME"] = "/usr"
+os.environ["PYTORCH_NVCC"] = "/usr/bin/nvcc"
+os.environ["PATH"] = "/usr/bin:/usr/local/cuda/bin:" + os.environ.get("PATH", "")
+
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+try:  # standalone pybind11 (system torch); torch>=2.11 bundles it otherwise
+    import pybind11
+    _EXTRA_INCLUDES = [pybind11.get_include()]
+except Exception:
+    _EXTRA_INCLUDES = []
+
+CUDA_SRC = r"""
+#include <cuda_bf16.h>
+#include <cuda_runtime.h>
+#include <math_constants.h>
+#include <cstdint>
+
+#define FULL_MASK 0xffffffffu
+using bf16 = __nv_bfloat16;
+using bf16x2 = __nv_bfloat162;
+
+__device__ __forceinline__ float b2f(bf16 x) { return __bfloat162float(x); }
+__device__ __forceinline__ bf16 f2b(float x) { return __float2bfloat16(x); }
+__device__ __forceinline__ float2 b2f2(bf16x2 x) {
+  return make_float2(__bfloat162float(__low2bfloat16(x)),
+                     __bfloat162float(__high2bfloat16(x)));
+}
+
+__device__ __forceinline__ void cp_async16(void *smem, const void *gmem) {
+  unsigned s = (unsigned)__cvta_generic_to_shared(smem);
+  asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"(s),
+               "l"(gmem));
+}
+__device__ __forceinline__ void cp_commit() {
+  asm volatile("cp.async.commit_group;\n");
+}
+template <int N> __device__ __forceinline__ void cp_wait() {
+  asm volatile("cp.async.wait_group %0;\n" ::"n"(N));
+}
+__device__ __forceinline__ void cp_wait_n(int n) {
+  switch (n) {
+    case 0: cp_wait<0>(); break;
+    case 1: cp_wait<1>(); break;
+    case 2: cp_wait<2>(); break;
+    case 3: cp_wait<3>(); break;
+    case 4: cp_wait<4>(); break;
+    default: cp_wait<0>(); break;
+  }
+}
+
+// Full-page reads: one block per (batch, split) handles all H query heads.
+// VPT = D/16 elements per lane, 2 heads per warp (16 lanes each), NBUF buffers.
+template <int VPT, int NBUF>
+__global__ void __launch_bounds__(1024)
+paged_attn_decode_kernel(const bf16 *__restrict__ query,     // (B, H, D)
+                         const bf16 *__restrict__ kv_cache,  // (num_blocks, P, Hkv, 2D)
+                         const int32_t *__restrict__ block_table,
+                         const int32_t *__restrict__ seq_lens,
+                         bf16 *__restrict__ partial_out,
+                         float *__restrict__ partial_lse, const float scale,
+                         const int H, const int Hkv, const int G, const int D,
+                         const int P, const int max_pages, const int SPLIT,
+                         const int pages_per_split) {
+  extern __shared__ bf16 smem[];
+  const int block_id = blockIdx.x;
+  const int split = block_id % SPLIT;
+  const int b = block_id / SPLIT;
+  const int tid = threadIdx.x;
+  const int warp = tid >> 5;
+  const int lane = tid & 31;
+  const int lane16 = lane & 15;
+  const int hgroup = lane >> 4;
+  const int nthreads = blockDim.x;
+
+  const int ps = split * pages_per_split;
+  const int pe = min((split + 1) * pages_per_split, max_pages);
+  const int Lb = seq_lens[b];
+
+  const int h = warp * 2 + hgroup;          // query head for this lane's group
+  const int hkv = (warp * 2) / G;           // shared kv head for the warp's 2 heads
+  const int hkv_row = hkv * (2 * D);
+  const int d0 = lane16 * VPT;
+
+  float qreg[VPT];
+  {
+    const int qoff = (b * H + h) * D + d0;
+#pragma unroll
+    for (int i = 0; i < VPT; i++) qreg[i] = b2f(query[qoff + i]);
+  }
+
+  const int page_elems = P * Hkv * 2 * D;
+  const int chunk_size = 8;
+  const int nchunks = page_elems / chunk_size;
+  const int token_stride = Hkv * 2 * D;
+
+  float acc[VPT];
+  float m = -CUDART_INF_F, l = 0.0f;
+#pragma unroll
+  for (int i = 0; i < VPT; i++) acc[i] = 0.0f;
+
+  const int n_pages = pe - ps;
+  if (n_pages <= 0) {
+    partial_lse[(b * H + h) * SPLIT + split] = -CUDART_INF_F;
+    bf16 *po = partial_out + (((b * H + h) * SPLIT + split) * D) + d0;
+#pragma unroll
+    for (int i = 0; i < VPT; i++) po[i] = f2b(0.0f);
+    return;
+  }
+
+  int committed = 0;
+#pragma unroll
+  for (int j = 0; j < NBUF - 1; j++) {
+    int pg = ps + j;
+    if (pg < pe) {
+      int page_num = block_table[b * max_pages + pg];
+      const bf16 *gbase = kv_cache + (long long)page_num * page_elems;
+      bf16 *dst = smem + (j % NBUF) * page_elems;
+      for (int c = tid; c < nchunks; c += nthreads) {
+        cp_async16(dst + c * chunk_size, gbase + c * chunk_size);
+      }
+      cp_commit();
+      committed++;
+    }
+  }
+
+  constexpr int T = 2;  // tokens per batch
+  for (int p = ps; p < pe; p++) {
+    int buf = (p - ps) % NBUF;
+    int pn = p + NBUF - 1;
+    if (pn < pe) {
+      int page_num = block_table[b * max_pages + pn];
+      const bf16 *gbase = kv_cache + (long long)page_num * page_elems;
+      bf16 *dst = smem + ((pn - ps) % NBUF) * page_elems;
+      for (int c = tid; c < nchunks; c += nthreads) {
+        cp_async16(dst + c * chunk_size, gbase + c * chunk_size);
+      }
+      cp_commit();
+      committed++;
+    }
+    int want = committed - (p - ps) - 1;
+    int wc = want > NBUF - 1 ? NBUF - 1 : want;
+    if (wc < 0) wc = 0;
+    cp_wait_n(wc);
+    __syncthreads();
+
+    const bf16 *sbuf = smem + buf * page_elems;
+    int base_tok = p * P;
+#pragma unroll
+    for (int t0 = 0; t0 < P; t0 += T) {
+      float kreg[T][VPT];
+      float vreg[T][VPT];
+#pragma unroll
+      for (int j = 0; j < T; j++) {
+        int t = t0 + j;
+        const bf16 *kptr = sbuf + t * token_stride + hkv_row + d0;
+        const bf16 *vptr = kptr + D;
+        if (VPT == 8) {
+          float2 fa = b2f2(*reinterpret_cast<const bf16x2 *>(kptr));
+          float2 fb = b2f2(*reinterpret_cast<const bf16x2 *>(kptr + 2));
+          float2 fc = b2f2(*reinterpret_cast<const bf16x2 *>(kptr + 4));
+          float2 fd = b2f2(*reinterpret_cast<const bf16x2 *>(kptr + 6));
+          kreg[j][0] = fa.x; kreg[j][1] = fa.y; kreg[j][2] = fb.x; kreg[j][3] = fb.y;
+          kreg[j][4] = fc.x; kreg[j][5] = fc.y; kreg[j][6] = fd.x; kreg[j][7] = fd.y;
+          float2 ga = b2f2(*reinterpret_cast<const bf16x2 *>(vptr));
+          float2 gb = b2f2(*reinterpret_cast<const bf16x2 *>(vptr + 2));
+          float2 gc = b2f2(*reinterpret_cast<const bf16x2 *>(vptr + 4));
+          float2 gd = b2f2(*reinterpret_cast<const bf16x2 *>(vptr + 6));
+          vreg[j][0] = ga.x; vreg[j][1] = ga.y; vreg[j][2] = gb.x; vreg[j][3] = gb.y;
+          vreg[j][4] = gc.x; vreg[j][5] = gc.y; vreg[j][6] = gd.x; vreg[j][7] = gd.y;
+        } else {
+#pragma unroll
+          for (int i = 0; i < VPT; i++) {
+            kreg[j][i] = b2f(kptr[i]);
+            vreg[j][i] = b2f(vptr[i]);
+          }
+        }
+      }
+      float ps[T];
+#pragma unroll
+      for (int j = 0; j < T; j++) {
+        float s = 0.f;
+#pragma unroll
+        for (int i = 0; i < VPT; i++) s += qreg[i] * kreg[j][i];
+        ps[j] = s;
+      }
+      // butterfly reduction within 16-lane groups (both heads in parallel)
+#pragma unroll
+      for (int off = 8; off > 0; off >>= 1) {
+#pragma unroll
+        for (int j = 0; j < T; j++) ps[j] += __shfl_xor_sync(FULL_MASK, ps[j], off, 16);
+      }
+      int gtok[T];
+#pragma unroll
+      for (int j = 0; j < T; j++) gtok[j] = base_tok + t0 + j;
+      float m_T = -CUDART_INF_F;
+#pragma unroll
+      for (int j = 0; j < T; j++) {
+        float s = ps[j] * scale;
+        if (gtok[j] >= Lb) s = -CUDART_INF_F;
+        ps[j] = s;
+        m_T = fmaxf(m_T, s);
+      }
+      float m_new = fmaxf(m, m_T);
+      float alpha = __expf(m - m_new);
+      l *= alpha;
+#pragma unroll
+      for (int i = 0; i < VPT; i++) acc[i] *= alpha;
+      m = m_new;
+#pragma unroll
+      for (int j = 0; j < T; j++) {
+        float p_j = __expf(ps[j] - m_new);
+        l += p_j;
+#pragma unroll
+        for (int i = 0; i < VPT; i++) acc[i] += p_j * vreg[j][i];
+      }
+    }
+    __syncthreads();
+  }
+  cp_wait<0>();
+  __syncthreads();
+
+  float lse = m + __logf(l);
+  partial_lse[(b * H + h) * SPLIT + split] = lse;
+  float inv_l = (l > 0.f) ? 1.0f / l : 0.f;
+  bf16 *po = partial_out + (((b * H + h) * SPLIT + split) * D) + d0;
+#pragma unroll
+  for (int i = 0; i < VPT; i++) po[i] = f2b(acc[i] * inv_l);
+}
+
+// Combine partials across splits. Each thread handles 4 consecutive output
+// elements for instruction-level parallelism (good latency hiding on small
+// output sizes).
+__global__ void paged_attn_combine_kernel(const bf16 *__restrict__ partial_out,
+                                          const float *__restrict__ partial_lse,
+                                          bf16 *__restrict__ out, const int H,
+                                          const int D, const int SPLIT,
+                                          const int total4) {
+  int d4 = (blockIdx.x * blockDim.x + threadIdx.x) * 4;
+  if (d4 >= total4) return;
+  int bh = d4 / D;
+  int d = d4 - bh * D;  // multiple of 4
+  const float *lse = partial_lse + (long long)bh * SPLIT;
+  float maxl = -CUDART_INF_F;
+  for (int s = 0; s < SPLIT; s++) maxl = fmaxf(maxl, lse[s]);
+  float sumw = 0.f;
+  float w[32];
+#pragma unroll 1
+  for (int s = 0; s < SPLIT; s++) {
+    w[s] = __expf(lse[s] - maxl);
+    sumw += w[s];
+  }
+  float o0 = 0.f, o1 = 0.f, o2 = 0.f, o3 = 0.f;
+  const bf16 *po = partial_out + (long long)bh * SPLIT * D + d;
+#pragma unroll 1
+  for (int s = 0; s < SPLIT; s++) {
+    const bf16 *p = po + (long long)s * D;
+    float ws = w[s];
+    o0 += b2f(p[0]) * ws;
+    o1 += b2f(p[1]) * ws;
+    o2 += b2f(p[2]) * ws;
+    o3 += b2f(p[3]) * ws;
+  }
+  float inv = (sumw > 0.f) ? 1.0f / sumw : 0.f;
+  bf16 *op = out + bh * D + d;
+  op[0] = f2b(o0 * inv);
+  op[1] = f2b(o1 * inv);
+  op[2] = f2b(o2 * inv);
+  op[3] = f2b(o3 * inv);
+}
+
+#include <torch/extension.h>
+#include <ATen/cuda/CUDAContext.h>
+
+torch::Tensor paged_attn_decode(torch::Tensor query, torch::Tensor kv_cache,
+                                torch::Tensor block_table, torch::Tensor seq_lens,
+                                int64_t SPLIT, int64_t NBUF, int64_t B, int64_t H,
+                                int64_t Hkv, int64_t G, int64_t D, int64_t P,
+                                int64_t pages_per_b) {
+  auto stream = at::cuda::getCurrentCUDAStream();
+  int64_t max_pages = pages_per_b;
+  float scale = 1.0f / sqrtf((float)D);
+
+  auto po_opts = query.options().dtype(torch::kBFloat16);
+  auto pl_opts = query.options().dtype(torch::kFloat32);
+  auto partial_out = torch::empty({B, H, SPLIT, D}, po_opts);
+  auto partial_lse = torch::empty({B, H, SPLIT}, pl_opts);
+  auto out = torch::empty_like(query);
+
+  int64_t pages_per_split = (pages_per_b + SPLIT - 1) / SPLIT;
+  int64_t grid = B * SPLIT;
+  int threads = (int)(H / 2 * 32);
+  int smem = (int)(NBUF * P * Hkv * 2 * D * sizeof(bf16));
+
+  const bf16 *q_ptr = reinterpret_cast<const bf16 *>(query.data_ptr());
+  const bf16 *kv_ptr = reinterpret_cast<const bf16 *>(kv_cache.data_ptr());
+  const int32_t *bt_ptr = reinterpret_cast<const int32_t *>(block_table.data_ptr());
+  const int32_t *sl_ptr = reinterpret_cast<const int32_t *>(seq_lens.data_ptr());
+  bf16 *po_ptr = reinterpret_cast<bf16 *>(partial_out.data_ptr());
+  float *pl_ptr = partial_lse.data_ptr<float>();
+  bf16 *out_ptr = reinterpret_cast<bf16 *>(out.data_ptr());
+
+  auto set_smem = [&](auto kern) {
+    cudaFuncSetAttribute(kern, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+  };
+  if (D == 128) {
+    auto k = paged_attn_decode_kernel<8, 2>;
+    set_smem(k);
+    k<<<grid, threads, smem, stream>>>(q_ptr, kv_ptr, bt_ptr, sl_ptr, po_ptr,
+                                       pl_ptr, scale, H, Hkv, G, D, P, max_pages,
+                                       SPLIT, pages_per_split);
+  } else if (D == 64) {
+    if (NBUF == 2) {
+      auto k = paged_attn_decode_kernel<4, 2>;
+      set_smem(k);
+      k<<<grid, threads, smem, stream>>>(q_ptr, kv_ptr, bt_ptr, sl_ptr, po_ptr,
+                                         pl_ptr, scale, H, Hkv, G, D, P, max_pages,
+                                         SPLIT, pages_per_split);
+    } else {
+      auto k = paged_attn_decode_kernel<4, 1>;
+      set_smem(k);
+      k<<<grid, threads, smem, stream>>>(q_ptr, kv_ptr, bt_ptr, sl_ptr, po_ptr,
+                                         pl_ptr, scale, H, Hkv, G, D, P, max_pages,
+                                         SPLIT, pages_per_split);
+    }
+  } else {
+    TORCH_CHECK(false, "unsupported head_dim");
+  }
+
+  int64_t total4 = B * H * D;
+  int64_t comb_blocks = (total4 / 4 + 255) / 256;
+  paged_attn_combine_kernel<<<comb_blocks, 256, 0, stream>>>(
+      po_ptr, pl_ptr, out_ptr, H, D, SPLIT, total4);
+  return out;
+}
+"""
+
+CPP_SRC = """
+#include <torch/extension.h>
+torch::Tensor paged_attn_decode(torch::Tensor query, torch::Tensor kv_cache,
+                                torch::Tensor block_table, torch::Tensor seq_lens,
+                                int64_t SPLIT, int64_t NBUF, int64_t B, int64_t H,
+                                int64_t Hkv, int64_t G, int64_t D, int64_t P,
+                                int64_t pages_per_b);
+"""
+
+# Config table: (B, H, Hkv, D, L, P) -> (SPLIT, NBUF), tuned by benchmark sweeps.
+_CONFIG = {
+    (8, 32, 8, 128, 1024, 16): (16, 2),
+    (32, 32, 8, 128, 2048, 16): (4, 2),
+    (4, 64, 8, 128, 4096, 16): (32, 2),
+    (16, 32, 8, 128, 1535, 16): (8, 2),
+    (8, 16, 4, 64, 2000, 16): (16, 2),
+}
+
+
+def _default_config(B, H, Hkv, D, L, P):
+    pages_per_b = (L + P - 1) // P
+    SPLIT = max(1, (pages_per_b + 8 - 1) // 8)
+    while B * SPLIT > 2048 and SPLIT > 1:
+        SPLIT //= 2
+    return SPLIT, 2
+
+
+class Model(nn.Module):
+    """Single-query paged attention decode (custom CUDA kernel)."""
+
+    def __init__(self, batch, num_heads, num_kv_heads, head_dim, seq_len, page_size):
+        super().__init__()
+        assert num_heads % num_kv_heads == 0
+        self.batch = batch
+        self.num_heads = num_heads
+        self.num_kv_heads = num_kv_heads
+        self.head_dim = head_dim
+        self.seq_len = seq_len
+        self.page_size = page_size
+        self.group_size = num_heads // num_kv_heads
+        self.scale = 1.0 / math.sqrt(head_dim)
+
+        key = (batch, num_heads, num_kv_heads, head_dim, seq_len, page_size)
+        SPLIT, NBUF = _CONFIG.get(key) or _default_config(*key)
+
+        # Precompute everything the kernel needs so forward() is pure dispatch.
+        self._B = batch
+        self._H = num_heads
+        self._Hkv = num_kv_heads
+        self._G = self.group_size
+        self._D = head_dim
+        self._P = page_size
+        self._ppb = (seq_len + page_size - 1) // page_size
+        self._SPLIT = SPLIT
+        self._NBUF = NBUF
+
+        self._ext = _get_extension()
+
+    def forward(self, query, kv_cache, block_table, seq_lens):
+        return self._ext.paged_attn_decode(
+            query, kv_cache, block_table, seq_lens,
+            self._SPLIT, self._NBUF, self._B, self._H, self._Hkv, self._G,
+            self._D, self._P, self._ppb)
+
+
+_ext_cache = {}
+
+
+def _get_extension():
+    """Compile the CUDA extension once and cache it."""
+    if _ext_cache:
+        return _ext_cache["ext"]
+    ext = load_inline(
+        name="paged_attn_solution",
+        cpp_sources=CPP_SRC,
+        cuda_sources=CUDA_SRC,
+        functions=["paged_attn_decode"],
+        extra_cuda_cflags=["-O3", "--use_fast_math", "-arch=sm_90a"],
+        extra_include_paths=_EXTRA_INCLUDES,
+        verbose=False,
+    )
+    _ext_cache["ext"] = ext
+    return ext

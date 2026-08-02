@@ -1,0 +1,639 @@
+"""Custom top-k kernel for H100 (SM90).
+
+Strategy:
+  * Tile reduction with a shared-memory bitonic sorting network (compile-time
+    indices -> no local-memory spills, no data-dependent shared loads). Each
+    block reduces a tile of one row to its top-k partial.
+  * Hierarchical merge kernels combine partials into the final top-k.
+  * All buffers are pre-allocated by the Model and reused across calls; the
+    final kernel writes int64 indices directly, so the timed path is just the
+    kernels (no per-call torch allocations, no post-copy).
+
+The input is read exactly once from HBM with vectorized float4 loads.
+"""
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+_CUDA_SRC = r"""
+#include <torch/extension.h>
+#include <ATen/cuda/CUDAContext.h>
+#include <cuda_runtime.h>
+#include <cstdint>
+#include <cfloat>
+
+#define DEV_INF (3.402823466e+38f)
+
+// ---------------------------------------------------------------------------
+// Register bitonic sort (descending) over N elements, N power of two.
+// ---------------------------------------------------------------------------
+template <int N>
+__device__ __forceinline__ void bitonic_sort_desc(float* rv, uint32_t* ri) {
+#pragma unroll
+    for (int size = 2; size <= N; size <<= 1) {
+#pragma unroll
+        for (int stride = size >> 1; stride > 0; stride >>= 1) {
+#pragma unroll
+            for (int i = 0; i < N; i++) {
+                int l = i ^ stride;
+                if (l > i) {
+                    bool up = (i & size) == 0;
+                    bool swap = up ? (rv[i] < rv[l]) : (rv[i] > rv[l]);
+                    if (swap) {
+                        float tv = rv[i]; rv[i] = rv[l]; rv[l] = tv;
+                        uint32_t ti = ri[i]; ri[i] = ri[l]; ri[l] = ti;
+                    }
+                }
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Warp-synchronous bitonic sort (descending) of 32*L elements. Lane l owns
+// global indices [l*L, l*L+L) in rval[0..L), ridx[0..L). Cross-lane
+// compare-exchanges use __shfl_xor_sync; intra-lane are register ops.
+// ---------------------------------------------------------------------------
+template <int L>
+__device__ __forceinline__ void warp_bitonic_sort_desc(float* rval, uint32_t* ridx) {
+    const int lane = threadIdx.x & 31;
+    constexpr int N = 32 * L;
+    for (int size = 2; size <= N; size <<= 1) {
+        for (int stride = size >> 1; stride >= 1; stride >>= 1) {
+            if (stride < L) {
+                // intra-lane register compare-exchange
+#pragma unroll
+                for (int pos = 0; pos < L; pos++) {
+                    const int pos2 = pos ^ stride;
+                    if (pos2 > pos) {
+                        const int i = lane * L + pos;
+                        const bool up = (i & size) == 0;
+                        const float va = rval[pos];
+                        const float vb = rval[pos2];
+                        if (up ? (va < vb) : (va > vb)) {
+                            rval[pos] = vb; rval[pos2] = va;
+                            const uint32_t ia = ridx[pos], ib = ridx[pos2];
+                            ridx[pos] = ib; ridx[pos2] = ia;
+                        }
+                    }
+                }
+            } else {
+                // cross-lane shuffle compare-exchange
+                const int dist = stride / L;
+#pragma unroll
+                for (int pos = 0; pos < L; pos++) {
+                    const int i = lane * L + pos;
+                    const int j = i ^ stride;
+                    const float pval = __shfl_xor_sync(0xffffffffu, rval[pos], dist);
+                    const uint32_t pidx = __shfl_xor_sync(0xffffffffu, ridx[pos], dist);
+                    const bool i_low = i < j;
+                    const float low_v = i_low ? rval[pos] : pval;
+                    const float high_v = i_low ? pval : rval[pos];
+                    const uint32_t low_i = i_low ? ridx[pos] : pidx;
+                    const uint32_t high_i = i_low ? pidx : ridx[pos];
+                    const bool up = (i & size) == 0;
+                    const bool swap = up ? (low_v < high_v) : (low_v > high_v);
+                    if (swap) {
+                        rval[pos] = i_low ? high_v : low_v;
+                        ridx[pos] = i_low ? high_i : low_i;
+                    }
+                }
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Chunked shared-memory merge tree: num_lists lists of size list_size (each
+// sorted desc) -> top-K. Each thread handles a contiguous chunk of one merge
+// node: one binary search to locate its chunk's start split, then a linear
+// two-pointer merge for the chunk. Double-buffered in shared memory.
+// ---------------------------------------------------------------------------
+template <int K, int THREADS, bool OUT64>
+__device__ __forceinline__ void merge_tree_chunked(
+    float* s_val, uint32_t* s_idx, int num_lists, int list_size,
+    float* s_tmp_val, uint32_t* s_tmp_idx,
+    float* out_val, void* out_idx, long long out_off)
+{
+    const int tid = threadIdx.x;
+    float* rv = s_val;
+    uint32_t* ri = s_idx;
+    float* wv = s_tmp_val;
+    uint32_t* wi = s_tmp_idx;
+
+    while (num_lists > 1) {
+        const int new_lists = num_lists >> 1;
+        const int out_size = (2 * list_size < K) ? (2 * list_size) : K;
+        const int nodes = new_lists;
+        int tpn = THREADS / nodes;
+        if (tpn < 1) tpn = 1;
+        const int node = tid / tpn;
+        if (node < nodes) {
+            const int chunk_idx = tid % tpn;
+            const int chunk = (out_size + tpn - 1) / tpn;
+            const int pos_start = chunk_idx * chunk;
+            int pos_end = pos_start + chunk;
+            if (pos_end > out_size) pos_end = out_size;
+            if (pos_start < out_size) {
+                const int abase = 2 * node * list_size;
+                const int bbase = abase + list_size;
+                const int r = pos_start;
+                int lo = (r > list_size) ? (r - list_size) : 0;
+                int hi = (r < list_size) ? r : list_size;
+                while (lo < hi) {
+                    const int mid = (lo + hi) >> 1;
+                    const int j = r - mid;
+                    if (mid < list_size && j > 0 && rv[abase + mid] > rv[bbase + j - 1]) {
+                        lo = mid + 1;
+                    } else {
+                        hi = mid;
+                    }
+                }
+                int ia = lo;
+                int ib = r - ia;
+                for (int p = pos_start; p < pos_end; p++) {
+                    const bool take_a = (ia < list_size) && (ib >= list_size || rv[abase + ia] >= rv[bbase + ib]);
+                    if (take_a) {
+                        wv[node * out_size + p] = rv[abase + ia];
+                        wi[node * out_size + p] = ri[abase + ia];
+                        ia++;
+                    } else {
+                        wv[node * out_size + p] = rv[bbase + ib];
+                        wi[node * out_size + p] = ri[bbase + ib];
+                        ib++;
+                    }
+                }
+            }
+        }
+        __syncthreads();
+        float* tv = rv; rv = wv; wv = tv;
+        uint32_t* ti = ri; ri = wi; wi = ti;
+        num_lists = new_lists;
+        list_size = out_size;
+    }
+    if (tid < K) {
+        out_val[out_off + tid] = rv[tid];
+        if (OUT64) {
+            reinterpret_cast<int64_t*>(out_idx)[out_off + tid] = (int64_t)ri[tid];
+        } else {
+            reinterpret_cast<uint32_t*>(out_idx)[out_off + tid] = ri[tid];
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Unified reduce kernel.
+//   is_raw == 1 : src = x (row stride = src_row_stride). Each block
+//                 (blockIdx.x = tile) reduces [tile*seg_stride, +seg_stride).
+//   is_raw == 0 : src = partials (val, idx). Each block reduces its segment
+//                 [blockIdx.x*seg_stride, +seg_stride) clamped to seg_total.
+// Output: out_val[row, blockIdx.x*K ..) and indices (int64 if OUT64 else uint32).
+// ---------------------------------------------------------------------------
+template <int K, int THREADS, int VPT, bool OUT64>
+__global__ void __launch_bounds__(THREADS, 6)
+reduce_segment_kernel(
+    const float* __restrict__ src_val,
+    const uint32_t* __restrict__ src_idx,
+    long long src_row_stride,
+    long long seg_total,
+    int seg_stride,
+    int is_raw,
+    float* __restrict__ out_val,
+    void* __restrict__ out_idx,
+    long long out_row_stride)
+{
+    constexpr int NUM_WARPS = THREADS / 32;
+    const int tid = threadIdx.x;
+    const int lane = tid & 31;
+    const int warp = tid >> 5;
+    const int row = blockIdx.y;
+    const long long seg_begin = (long long)blockIdx.x * seg_stride;
+    long long seg_count = seg_total - seg_begin;
+    if (seg_count > seg_stride) seg_count = seg_stride;
+    const long long seg_end = seg_begin + seg_count;
+    const long long src_base = (long long)row * src_row_stride;
+
+    extern __shared__ float smem[];
+    float* s_val = smem;
+    uint32_t* s_idx = reinterpret_cast<uint32_t*>(s_val + NUM_WARPS * K);
+    float* s_tmp_val = s_val + 2 * NUM_WARPS * K;
+    uint32_t* s_tmp_idx = reinterpret_cast<uint32_t*>(s_val + 3 * NUM_WARPS * K);
+
+    // ---- Load VPT elements ----
+    constexpr int RV_SIZE = (VPT > K) ? VPT : K;   // holds VPT loads, grows to K
+    float rv[RV_SIZE];
+    uint32_t ri[RV_SIZE];
+    const long long base4 = seg_begin + (long long)tid * VPT;
+    if (is_raw) {
+        if (VPT == 2 && base4 + 1 < seg_end) {
+            const float2 v = *reinterpret_cast<const float2*>(src_val + src_base + base4);
+            rv[0] = v.x; rv[1] = v.y;
+            ri[0] = (uint32_t)base4; ri[1] = (uint32_t)(base4 + 1);
+        } else if (base4 + VPT - 1 < seg_end) {
+#pragma unroll
+            for (int j = 0; j < VPT; j += 4) {
+                const float4 v = *reinterpret_cast<const float4*>(src_val + src_base + base4 + j);
+                rv[j] = v.x; rv[j+1] = v.y; rv[j+2] = v.z; rv[j+3] = v.w;
+                const uint32_t b = (uint32_t)(base4 + j);
+                ri[j] = b; ri[j+1] = b+1; ri[j+2] = b+2; ri[j+3] = b+3;
+            }
+        } else {
+#pragma unroll
+            for (int j = 0; j < VPT; j++) {
+                const long long pos = base4 + j;
+                if (pos < seg_end) {
+                    rv[j] = src_val[src_base + pos];
+                    ri[j] = (uint32_t)pos;
+                } else {
+                    rv[j] = -DEV_INF;
+                    ri[j] = 0;
+                }
+            }
+        }
+    } else {
+        if (base4 + VPT - 1 < seg_end) {
+#pragma unroll
+            for (int j = 0; j < VPT; j++) {
+                const long long pos = base4 + j;
+                rv[j] = src_val[src_base + pos];
+                ri[j] = src_idx[src_base + pos];
+            }
+        } else {
+#pragma unroll
+            for (int j = 0; j < VPT; j++) {
+                const long long pos = base4 + j;
+                if (pos < seg_end) {
+                    rv[j] = src_val[src_base + pos];
+                    ri[j] = src_idx[src_base + pos];
+                } else {
+                    rv[j] = -DEV_INF;
+                    ri[j] = 0;
+                }
+            }
+        }
+    }
+
+    // ---- Warp bitonic sort (128 elements per warp) ----
+    warp_bitonic_sort_desc<VPT>(rv, ri);
+
+    // ---- Write each warp's top-K to shared ----
+    if (lane * VPT < K) {
+#pragma unroll
+        for (int j = 0; j < VPT; j++) {
+            const int g = lane * VPT + j;
+            if (g < K) {
+                s_val[warp * K + g] = rv[j];
+                s_idx[warp * K + g] = ri[j];
+            }
+        }
+    }
+    __syncthreads();
+
+    if (K <= 16) {
+        // ---- Block merge: warp 0 sorts the NUM_WARPS*K candidates ----
+        if (warp == 0) {
+            constexpr int BL = (NUM_WARPS * K + 31) / 32;   // elements per lane
+            float bv[BL];
+            uint32_t bi[BL];
+#pragma unroll
+            for (int j = 0; j < BL; j++) {
+                const int pos = lane * BL + j;
+                if (pos < NUM_WARPS * K) {
+                    bv[j] = s_val[pos];
+                    bi[j] = s_idx[pos];
+                } else {
+                    bv[j] = -DEV_INF;
+                    bi[j] = 0;
+                }
+            }
+            warp_bitonic_sort_desc<BL>(bv, bi);
+            const long long out_off = (long long)row * out_row_stride + (long long)blockIdx.x * K;
+            if (lane * BL < K) {
+#pragma unroll
+                for (int j = 0; j < BL; j++) {
+                    const int g = lane * BL + j;
+                    if (g < K) {
+                        out_val[out_off + g] = bv[j];
+                        if (OUT64) {
+                            reinterpret_cast<int64_t*>(out_idx)[out_off + g] = (int64_t)bi[j];
+                        } else {
+                            reinterpret_cast<uint32_t*>(out_idx)[out_off + g] = bi[j];
+                        }
+                    }
+                }
+            }
+        }
+    } else {
+        // ---- Block merge: shared merge tree ----
+        merge_tree_chunked<K, THREADS, OUT64>(s_val, s_idx, NUM_WARPS, K,
+                                              s_tmp_val, s_tmp_idx,
+                                              out_val, out_idx,
+                                              (long long)row * out_row_stride + (long long)blockIdx.x * K);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Template dispatch
+// ---------------------------------------------------------------------------
+template <int K, bool OUT64>
+void dispatch_reduce(
+    const float* src_val, const uint32_t* src_idx,
+    long long src_row_stride, long long seg_total, int seg_stride, int is_raw,
+    float* out_val, void* out_idx, long long out_row_stride,
+    int grid_x, int grid_y, int vpt, cudaStream_t stream)
+{
+    constexpr int THREADS = 256;
+    constexpr int NUM_WARPS = THREADS / 32;
+    if (vpt == 4) {
+        constexpr int VPT = 4;
+        size_t shmem = 4 * (size_t)NUM_WARPS * K * (sizeof(float) + sizeof(uint32_t));
+        dim3 grid(grid_x, grid_y);
+        reduce_segment_kernel<K, THREADS, VPT, OUT64><<<grid, THREADS, shmem, stream>>>(
+            src_val, src_idx, src_row_stride, seg_total, seg_stride, is_raw,
+            out_val, out_idx, out_row_stride);
+    } else if (vpt == 8) {
+        constexpr int VPT = 8;
+        size_t shmem = 4 * (size_t)NUM_WARPS * K * (sizeof(float) + sizeof(uint32_t));
+        dim3 grid(grid_x, grid_y);
+        reduce_segment_kernel<K, THREADS, VPT, OUT64><<<grid, THREADS, shmem, stream>>>(
+            src_val, src_idx, src_row_stride, seg_total, seg_stride, is_raw,
+            out_val, out_idx, out_row_stride);
+    } else if (vpt == 16) {
+        constexpr int VPT = 16;
+        size_t shmem = 4 * (size_t)NUM_WARPS * K * (sizeof(float) + sizeof(uint32_t));
+        dim3 grid(grid_x, grid_y);
+        reduce_segment_kernel<K, THREADS, VPT, OUT64><<<grid, THREADS, shmem, stream>>>(
+            src_val, src_idx, src_row_stride, seg_total, seg_stride, is_raw,
+            out_val, out_idx, out_row_stride);
+    }
+}
+
+static inline int next_pow2_int(int v) {
+    int p = 1;
+    while (p < v) p <<= 1;
+    return p;
+}
+
+// Pre-allocated buffers are passed in (allocation-free hot path).
+
+// ---------------------------------------------------------------------------
+// Dedicated argmax kernel (k == 1): one block per row. Each thread streams
+// its share of the row (interleaved for coalescing) and keeps the running
+// max; a warp shuffle + small shared reduction produces the row argmax.
+// ---------------------------------------------------------------------------
+template <int THREADS, int VPT>
+__global__ void __launch_bounds__(THREADS, 1)
+argmax_kernel(const float* __restrict__ x, long long n,
+              float* __restrict__ out_val, int64_t* __restrict__ out_idx)
+{
+    const int tid = threadIdx.x;
+    const int row = blockIdx.x;
+    const int lane = tid & 31;
+    const long long src_base = (long long)row * n;
+    float best = -DEV_INF;
+    uint32_t best_idx = 0;
+    for (int j = 0; j < VPT; j++) {
+        const long long pos = (long long)j * THREADS + tid;
+        if (pos < n) {
+            const float v = x[src_base + pos];
+            if (v > best) { best = v; best_idx = (uint32_t)pos; }
+        }
+    }
+#pragma unroll
+    for (int r = 0; r < 5; r++) {
+        const float pv = __shfl_xor_sync(0xffffffffu, best, 1 << r);
+        const uint32_t pi = __shfl_xor_sync(0xffffffffu, best_idx, 1 << r);
+        if (pv > best) { best = pv; best_idx = pi; }
+    }
+    __shared__ float s_best[THREADS / 32];
+    __shared__ uint32_t s_bidx[THREADS / 32];
+    if (lane == 0) { s_best[tid >> 5] = best; s_bidx[tid >> 5] = best_idx; }
+    __syncthreads();
+    if (tid < THREADS / 32) {
+        best = s_best[tid];
+        best_idx = s_bidx[tid];
+#pragma unroll
+        for (int r = 0; r < 5; r++) {
+            const float pv = __shfl_xor_sync(0xffffffffu, best, 1 << r);
+            const uint32_t pi = __shfl_xor_sync(0xffffffffu, best_idx, 1 << r);
+            if (pv > best) { best = pv; best_idx = pi; }
+        }
+        if (tid == 0) {
+            out_val[row] = best;
+            out_idx[row] = (int64_t)best_idx;
+        }
+    }
+}
+
+void topk_forward(
+    torch::Tensor x, int64_t k,
+    torch::Tensor values, torch::Tensor indices,
+    torch::Tensor part_val, torch::Tensor part_idx,
+    torch::Tensor part2_val, torch::Tensor part2_idx)
+{
+    auto xc = x.contiguous();
+    TORCH_CHECK(xc.dtype() == torch::kFloat32, "input must be fp32");
+    TORCH_CHECK(xc.dim() == 2, "input must be 2D");
+
+    const int64_t batch = xc.size(0);
+    const int64_t n = xc.size(1);
+    const int K = (int)k;
+    const int Kc = next_pow2_int(K);
+    TORCH_CHECK(Kc <= 64, "k too large (unsupported)");
+
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+
+    const int THREADS = 256;
+    const int VPT = 4;
+    const int TILE = THREADS * VPT;
+    const int ntiles = (int)((n + TILE - 1) / TILE);
+
+    const float* xp = xc.data_ptr<float>();
+    float* pv = part_val.data_ptr<float>();
+    uint32_t* pi = reinterpret_cast<uint32_t*>(part_idx.data_ptr<int32_t>());
+    float* final_val = values.data_ptr<float>();
+    void* final_idx = indices.data_ptr<int64_t>();
+
+    if (Kc == 1) {
+        // Dedicated argmax path: one block per row, writes final output directly.
+        const int VPT_A = (int)((n + THREADS - 1) / THREADS);
+        const int64_t* fidx64 = indices.data_ptr<int64_t>();
+        if (VPT_A <= 4) {
+            argmax_kernel<THREADS, 4><<<batch, THREADS, 0, stream>>>(xp, n, final_val, const_cast<int64_t*>(fidx64));
+        } else if (VPT_A <= 8) {
+            argmax_kernel<THREADS, 8><<<batch, THREADS, 0, stream>>>(xp, n, final_val, const_cast<int64_t*>(fidx64));
+        } else if (VPT_A <= 16) {
+            argmax_kernel<THREADS, 16><<<batch, THREADS, 0, stream>>>(xp, n, final_val, const_cast<int64_t*>(fidx64));
+        } else if (VPT_A <= 32) {
+            argmax_kernel<THREADS, 32><<<batch, THREADS, 0, stream>>>(xp, n, final_val, const_cast<int64_t*>(fidx64));
+        } else if (VPT_A <= 64) {
+            argmax_kernel<THREADS, 64><<<batch, THREADS, 0, stream>>>(xp, n, final_val, const_cast<int64_t*>(fidx64));
+        } else {
+            argmax_kernel<THREADS, 128><<<batch, THREADS, 0, stream>>>(xp, n, final_val, const_cast<int64_t*>(fidx64));
+        }
+        C10_CUDA_CHECK(cudaGetLastError());
+        return;
+    }
+
+    // ---- Kernel A: tile reduction ----
+    switch (Kc) {
+        case 1: dispatch_reduce<1, false>(xp, nullptr, n, n, TILE, 1, pv, pi, (long long)ntiles*Kc, ntiles, batch, VPT, stream); break;
+        case 2: dispatch_reduce<2, false>(xp, nullptr, n, n, TILE, 1, pv, pi, (long long)ntiles*Kc, ntiles, batch, VPT, stream); break;
+        case 4: dispatch_reduce<4, false>(xp, nullptr, n, n, TILE, 1, pv, pi, (long long)ntiles*Kc, ntiles, batch, VPT, stream); break;
+        case 8: dispatch_reduce<8, false>(xp, nullptr, n, n, TILE, 1, pv, pi, (long long)ntiles*Kc, ntiles, batch, VPT, stream); break;
+        case 16: dispatch_reduce<16, false>(xp, nullptr, n, n, TILE, 1, pv, pi, (long long)ntiles*Kc, ntiles, batch, VPT, stream); break;
+        case 32: dispatch_reduce<32, false>(xp, nullptr, n, n, TILE, 1, pv, pi, (long long)ntiles*Kc, ntiles, batch, VPT, stream); break;
+        case 64: dispatch_reduce<64, false>(xp, nullptr, n, n, TILE, 1, pv, pi, (long long)ntiles*Kc, ntiles, batch, VPT, stream); break;
+        default: TORCH_CHECK(false, "unsupported k");
+    }
+
+    // ---- Merge partials ----
+    const long long total_cand = (long long)ntiles * Kc;
+    const int CAND_CAP = 1024;
+    const int blocks_per_row = (int)((total_cand + CAND_CAP - 1) / CAND_CAP);
+
+    if (blocks_per_row == 1) {
+        switch (Kc) {
+            case 1: dispatch_reduce<1, true>(pv, pi, total_cand, total_cand, CAND_CAP, 0, final_val, final_idx, K, 1, batch, VPT, stream); break;
+            case 2: dispatch_reduce<2, true>(pv, pi, total_cand, total_cand, CAND_CAP, 0, final_val, final_idx, K, 1, batch, VPT, stream); break;
+            case 4: dispatch_reduce<4, true>(pv, pi, total_cand, total_cand, CAND_CAP, 0, final_val, final_idx, K, 1, batch, VPT, stream); break;
+            case 8: dispatch_reduce<8, true>(pv, pi, total_cand, total_cand, CAND_CAP, 0, final_val, final_idx, K, 1, batch, VPT, stream); break;
+            case 16: dispatch_reduce<16, true>(pv, pi, total_cand, total_cand, CAND_CAP, 0, final_val, final_idx, K, 1, batch, VPT, stream); break;
+            case 32: dispatch_reduce<32, true>(pv, pi, total_cand, total_cand, CAND_CAP, 0, final_val, final_idx, K, 1, batch, VPT, stream); break;
+            case 64: dispatch_reduce<64, true>(pv, pi, total_cand, total_cand, CAND_CAP, 0, final_val, final_idx, K, 1, batch, VPT, stream); break;
+            default: TORCH_CHECK(false, "unsupported k");
+        }
+    } else {
+        float* p2v = part2_val.data_ptr<float>();
+        uint32_t* p2i = reinterpret_cast<uint32_t*>(part2_idx.data_ptr<int32_t>());
+        switch (Kc) {
+            case 1: dispatch_reduce<1, false>(pv, pi, total_cand, total_cand, CAND_CAP, 0, p2v, p2i, (long long)blocks_per_row*Kc, blocks_per_row, batch, VPT, stream); break;
+            case 2: dispatch_reduce<2, false>(pv, pi, total_cand, total_cand, CAND_CAP, 0, p2v, p2i, (long long)blocks_per_row*Kc, blocks_per_row, batch, VPT, stream); break;
+            case 4: dispatch_reduce<4, false>(pv, pi, total_cand, total_cand, CAND_CAP, 0, p2v, p2i, (long long)blocks_per_row*Kc, blocks_per_row, batch, VPT, stream); break;
+            case 8: dispatch_reduce<8, false>(pv, pi, total_cand, total_cand, CAND_CAP, 0, p2v, p2i, (long long)blocks_per_row*Kc, blocks_per_row, batch, VPT, stream); break;
+            case 16: dispatch_reduce<16, false>(pv, pi, total_cand, total_cand, CAND_CAP, 0, p2v, p2i, (long long)blocks_per_row*Kc, blocks_per_row, batch, VPT, stream); break;
+            case 32: dispatch_reduce<32, false>(pv, pi, total_cand, total_cand, CAND_CAP, 0, p2v, p2i, (long long)blocks_per_row*Kc, blocks_per_row, batch, VPT, stream); break;
+            case 64: dispatch_reduce<64, false>(pv, pi, total_cand, total_cand, CAND_CAP, 0, p2v, p2i, (long long)blocks_per_row*Kc, blocks_per_row, batch, VPT, stream); break;
+            default: TORCH_CHECK(false, "unsupported k");
+        }
+        switch (Kc) {
+            case 1: dispatch_reduce<1, true>(p2v, p2i, (long long)blocks_per_row*Kc, (long long)blocks_per_row*Kc, blocks_per_row*Kc, 0, final_val, final_idx, K, 1, batch, VPT, stream); break;
+            case 2: dispatch_reduce<2, true>(p2v, p2i, (long long)blocks_per_row*Kc, (long long)blocks_per_row*Kc, blocks_per_row*Kc, 0, final_val, final_idx, K, 1, batch, VPT, stream); break;
+            case 4: dispatch_reduce<4, true>(p2v, p2i, (long long)blocks_per_row*Kc, (long long)blocks_per_row*Kc, blocks_per_row*Kc, 0, final_val, final_idx, K, 1, batch, VPT, stream); break;
+            case 8: dispatch_reduce<8, true>(p2v, p2i, (long long)blocks_per_row*Kc, (long long)blocks_per_row*Kc, blocks_per_row*Kc, 0, final_val, final_idx, K, 1, batch, VPT, stream); break;
+            case 16: dispatch_reduce<16, true>(p2v, p2i, (long long)blocks_per_row*Kc, (long long)blocks_per_row*Kc, blocks_per_row*Kc, 0, final_val, final_idx, K, 1, batch, VPT, stream); break;
+            case 32: dispatch_reduce<32, true>(p2v, p2i, (long long)blocks_per_row*Kc, (long long)blocks_per_row*Kc, blocks_per_row*Kc, 0, final_val, final_idx, K, 1, batch, VPT, stream); break;
+            case 64: dispatch_reduce<64, true>(p2v, p2i, (long long)blocks_per_row*Kc, (long long)blocks_per_row*Kc, blocks_per_row*Kc, 0, final_val, final_idx, K, 1, batch, VPT, stream); break;
+            default: TORCH_CHECK(false, "unsupported k");
+        }
+    }
+    C10_CUDA_CHECK(cudaGetLastError());
+}
+"""
+
+_CPP_SRC = r"""
+#include <torch/extension.h>
+void topk_forward(
+    torch::Tensor x, int64_t k,
+    torch::Tensor values, torch::Tensor indices,
+    torch::Tensor part_val, torch::Tensor part_idx,
+    torch::Tensor part2_val, torch::Tensor part2_idx);
+"""
+
+
+def _get_module():
+    return load_inline(
+        name="topk_bitonic_solution",
+        cpp_sources=_CPP_SRC,
+        cuda_sources=_CUDA_SRC,
+        functions=["topk_forward"],
+        extra_cuda_cflags=["-O3", "-std=c++17"],
+        verbose=False,
+    )
+
+
+_module = None
+
+
+def _ensure_module():
+    global _module
+    if _module is None:
+        _module = _get_module()
+    return _module
+
+
+class Model(nn.Module):
+    def __init__(self, batch: int, n: int, k: int):
+        super().__init__()
+        self.batch, self.n, self.k = batch, n, k
+        self.register_buffer("_dummy", torch.zeros(1))
+        self._mod = _ensure_module()
+        self._bufs = None
+        self._Kc = 1
+        while self._Kc < k:
+            self._Kc <<= 1
+        self._ntiles = (n + 256 * 4 - 1) // (256 * 4)
+        total_cand = self._ntiles * self._Kc
+        self._bpr = (total_cand + 1024 - 1) // 1024
+
+    def _allocate(self, device):
+        k = self._Kc
+        b = self.batch
+        n = self._ntiles * k
+        m = self._bpr * k
+        opts = dict(device=device)
+        self._bufs = (
+            torch.empty(b, n, **opts),                        # part_val
+            torch.empty(b, n, dtype=torch.int32, **opts),     # part_idx
+            torch.empty(b, m, **opts),                        # part2_val
+            torch.empty(b, m, dtype=torch.int32, **opts),     # part2_idx
+        )
+
+    def _run_kernels(self, x: torch.Tensor):
+        part_val, part_idx, part2_val, part2_idx = self._bufs
+        self._mod.topk_forward(
+            x, self.k,
+            self._values, self._indices,
+            part_val, part_idx,
+            part2_val, part2_idx,
+        )
+
+    def forward(self, x: torch.Tensor):
+        device = x.device
+        if self._bufs is None:
+            self._allocate(device)
+            self._values = torch.empty(self.batch, self.k, device=device)
+            self._indices = torch.empty(self.batch, self.k, dtype=torch.int64, device=device)
+        x = x.contiguous()
+        if getattr(self, "_graph", None) is not None and self._graph_x is x:
+            self._graph.replay()
+            return self._values, self._indices
+        # Capture a CUDA graph for this exact input tensor (replayed on
+        # subsequent calls with the same input, eliminating per-call launch
+        # overhead). Fall back to eager launch if capture is unavailable.
+        try:
+            torch.cuda.synchronize()
+            g = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(g):
+                self._run_kernels(x)
+            self._graph = g
+            self._graph_x = x
+            g.replay()   # execute the captured kernels once
+            return self._values, self._indices
+        except Exception:
+            self._run_kernels(x)
+            return self._values, self._indices
+
+
+batch = 64
+n = 8192
+k = 8
+
+
+def get_inputs():
+    x = torch.randn(batch, n, dtype=torch.float32)
+    return [x]
+
+
+def get_init_inputs():
+    return [batch, n, k]
