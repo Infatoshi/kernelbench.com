@@ -1,0 +1,336 @@
+"""Fused W4A16 GEMM (AWQ-style int4, group size 128) for RTX PRO 6000 (SM120).
+
+Two fused paths, both reading the packed uint8 weight stream (0.5 B/elem) and
+never materializing a dequantized weight matrix:
+
+  * M == 1 (decode, memory-bound): a SIMT GEMV written in CUDA (load_inline).
+    Each thread owns 4 consecutive columns and keeps the whole K-reduction in
+    registers (no cross-thread shuffles); the packed bytes are read as
+    vectorized uint32 loads. Split-K over the K dimension (SPLIT=32) provides
+    enough CTAs to saturate DRAM.
+
+  * M >= 16: a Triton GEMM with split-K and a fused unpack+dequant in the
+    K-loop (each K-tile is group-aligned so scale/zero are scalar loads applied
+    to the unpacked int4 tile before the bf16 MMA). Partials are reduced by a
+    tiny finalize kernel.
+"""
+from __future__ import annotations
+
+import os
+import shutil
+import sys
+
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+OP_TYPE = "gemm_w4a16"
+SUPPORTED_PRECISIONS = ["int4_bf16"]
+HARDWARE_REQUIRED = ["RTX_PRO_6000", "H100", "B200"]
+
+GROUP_SIZE = 128
+
+# --------------------------------------------------------------------------
+# CUDA SIMT GEMV for M == 1
+# --------------------------------------------------------------------------
+_GEMV_SRC = r"""
+#include <torch/extension.h>
+#include <ATen/cuda/CUDAContext.h>
+#include <c10/cuda/CUDAStream.h>
+#include <cuda_runtime.h>
+#include <cuda_bf16.h>
+#include <cstdint>
+
+#define DEV __device__ __forceinline__
+using bf16 = __nv_bfloat16;
+
+template <int BN, int COLS>
+__global__ void __launch_bounds__(BN / COLS)
+w4a16_gemv_kernel(
+    const bf16* __restrict__ x,
+    const uint8_t* __restrict__ w_q,
+    const bf16* __restrict__ scales,
+    const bf16* __restrict__ zeros,
+    float* __restrict__ out_part,     // (SPLIT, N) fp32 partials
+    int* __restrict__ counters,       // (N / BN,) per column-group counters
+    bf16* __restrict__ out,           // (N,) bf16 output
+    int N, int K, int GROUP, int SPLIT)
+{
+    constexpr int THREADS = BN / COLS;
+    int tid = threadIdx.x;
+    int group = blockIdx.x;                       // column group
+    int n0 = group * BN + tid * COLS;             // first column for this thread
+    int split = blockIdx.y;                       // K-slice
+    int ks = split * (K / SPLIT);
+    int ke = ks + (K / SPLIT);
+    int Kp = ke - ks;
+
+    float acc[COLS];
+    #pragma unroll
+    for (int c = 0; c < COLS; c++) acc[c] = 0.f;
+
+    extern __shared__ char smem[];
+    bf16* x_sh = (bf16*)smem;
+    for (int i = tid; i < Kp; i += THREADS) {
+        bf16 val = __float2bfloat16(0.f);
+        if (ks + i < K) val = x[ks + i];
+        x_sh[i] = val;
+    }
+    __syncthreads();
+
+    int n_groups = Kp / GROUP;
+    for (int gr = 0; gr < n_groups; gr++) {
+        int g = (ks / GROUP) + gr;
+        float sf[COLS], zf[COLS];
+        #pragma unroll
+        for (int c = 0; c < COLS; c++) {
+            sf[c] = __bfloat162float(scales[(size_t)g * N + n0 + c]);
+            zf[c] = __bfloat162float(zeros[(size_t)g * N + n0 + c]);
+        }
+        const bf16* xg = x_sh + gr * GROUP;
+        for (int kk = 0; kk < GROUP / 2; kk += 8) {
+            float xef[8], xof[8];
+            #pragma unroll
+            for (int u = 0; u < 8; u++) {
+                xef[u] = __bfloat162float(xg[2 * (kk + u)]);
+                xof[u] = __bfloat162float(xg[2 * (kk + u) + 1]);
+            }
+            const uint8_t* wptr = w_q + (size_t)(ks / 2 + gr * (GROUP / 2) + kk) * N + n0;
+            #pragma unroll
+            for (int u = 0; u < 8; u++) {
+                uint32_t w = *(const uint32_t*)(wptr + (size_t)u * N);
+                #pragma unroll
+                for (int c = 0; c < 4; c++) {
+                    uint8_t byte = (w >> (8 * c)) & 0xFF;
+                    float lo = (float)(byte & 0x0F);
+                    float hi = (float)(byte >> 4);
+                    acc[c] += xef[u] * (lo - zf[c]) * sf[c] + xof[u] * (hi - zf[c]) * sf[c];
+                }
+            }
+        }
+    }
+
+    // write partial (regular store, no atomics)
+    #pragma unroll
+    for (int c = 0; c < COLS; c++) out_part[(size_t)split * N + n0 + c] = acc[c];
+    __threadfence();
+    __syncthreads();
+    // last split of this column group reduces the partials and writes bf16 out
+    __shared__ bool is_last;
+    if (tid == 0) {
+        int old = atomicAdd(&counters[group], 1);
+        is_last = (old == SPLIT - 1);
+    }
+    __syncthreads();
+    if (is_last) {
+        __threadfence();
+        int base = group * BN;
+        for (int i = tid; i < BN; i += THREADS) {
+            float v = 0.f;
+            for (int s = 0; s < SPLIT; s++) v += out_part[(size_t)s * N + base + i];
+            out[base + i] = __float2bfloat16(v);
+        }
+        __syncthreads();
+        if (tid == 0) counters[group] = 0;
+    }
+}
+
+void gemm_simt(
+    torch::Tensor x, torch::Tensor w_q, torch::Tensor scales, torch::Tensor zeros,
+    torch::Tensor out, torch::Tensor out_part, torch::Tensor counters, int64_t SPLIT)
+{
+    int K = x.size(1), N = w_q.size(1);
+    const int GROUP = 128;
+    auto stream = at::cuda::getCurrentCUDAStream();
+    size_t smem = (size_t)(K / SPLIT) * sizeof(bf16);
+    auto run = [&](auto kernel, int BN, int COLS, int threads) {
+        dim3 grid(N / BN, SPLIT);
+        static bool attr_set = false;
+        if (!attr_set) {
+            cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem);
+            attr_set = true;
+        }
+        kernel<<<grid, threads, smem, stream>>>(
+            (const bf16*)x.data_ptr(), (const uint8_t*)w_q.data_ptr(),
+            (const bf16*)scales.data_ptr(), (const bf16*)zeros.data_ptr(),
+            (float*)out_part.data_ptr(), (int*)counters.data_ptr(),
+            (bf16*)out.data_ptr(), N, K, GROUP, (int)SPLIT);
+    };
+    if (N % 512 == 0) {
+        run(w4a16_gemv_kernel<512, 4>, 512, 4, 128);
+    } else if (N % 256 == 0) {
+        run(w4a16_gemv_kernel<256, 4>, 256, 4, 64);
+    } else {
+        run(w4a16_gemv_kernel<256, 4>, 256, 4, 64);
+    }
+}
+"""
+
+_GEMV = None
+
+
+def _build_gemv():
+    global _GEMV
+    if _GEMV is not None:
+        return _GEMV
+    try:
+        from torch.utils.cpp_extension import load_inline
+        # make sure ninja is findable (load_inline requires it)
+        venv_bin = os.path.dirname(sys.executable)
+        if shutil.which("ninja") is None and venv_bin:
+            os.environ["PATH"] = venv_bin + os.pathsep + os.environ.get("PATH", "")
+        _GEMV = load_inline(
+            name="w4a16_gemv",
+            cpp_sources=(
+                "void gemm_simt(torch::Tensor x, torch::Tensor w_q, torch::Tensor scales,"
+                " torch::Tensor zeros, torch::Tensor out, torch::Tensor out_part,"
+                " torch::Tensor counters, int64_t SPLIT);"
+            ),
+            cuda_sources=_GEMV_SRC,
+            functions=["gemm_simt"],
+            extra_cuda_cflags=["-O3", "-arch=sm_120a"],
+            verbose=False,
+        )
+    except Exception:
+        _GEMV = None
+    return _GEMV
+
+
+# --------------------------------------------------------------------------
+# Triton GEMM for M >= 16
+# --------------------------------------------------------------------------
+@triton.jit
+def w4a16_gemm_kernel(
+    x_ptr, w_ptr, s_ptr, z_ptr, part_ptr, out_ptr,
+    M, N, K,
+    BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr,
+    GROUP: tl.constexpr, SPLIT: tl.constexpr,
+):
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    pid_s = tl.program_id(2)
+
+    offs_m = pid_m * BM + tl.arange(0, BM)
+    offs_n = pid_n * BN + tl.arange(0, BN)
+
+    acc = tl.zeros((BM, BN), dtype=tl.float32)
+
+    Kp = K // SPLIT
+    k_start = pid_s * Kp
+    w32_ptr = w_ptr.to(tl.pointer_type(tl.uint32))
+    N4 = N // 4
+    offs_n4 = (pid_n * BN // 4) + tl.arange(0, BN // 4)
+    for k0 in range(k_start, k_start + Kp, BK):
+        offs_k = k0 + tl.arange(0, BK)
+        x = tl.load(x_ptr + offs_m[:, None] * K + offs_k[None, :],
+                    mask=(offs_m[:, None] < M) & (offs_k[None, :] < K), other=0.0)
+        offs_kh = (k0 // 2) + tl.arange(0, BK // 2)
+        w32 = tl.load(w32_ptr + offs_kh[:, None] * N4 + offs_n4[None, :])
+        b0 = (w32 & 0xFF)
+        b1 = (w32 >> 8) & 0xFF
+        b2 = (w32 >> 16) & 0xFF
+        b3 = (w32 >> 24) & 0xFF
+        # bytes (BK/2, BN): join order (b0,b2),(b1,b3) gives column-major byte order
+        w8 = tl.reshape(tl.join(tl.join(b0, b2), tl.join(b1, b3)), (BK // 2, BN))
+        lo = (w8 & 0x0F).to(tl.bfloat16)
+        hi = (w8 >> 4).to(tl.bfloat16)
+        # interleave along K: v[2i, n] = lo[i, n], v[2i+1, n] = hi[i, n]
+        v = tl.reshape(tl.permute(tl.join(lo, hi), (0, 2, 1)), (BK, BN))
+        g = k0 // GROUP
+        s = tl.load(s_ptr + g * N + offs_n, mask=offs_n < N, other=0.0)
+        z = tl.load(z_ptr + g * N + offs_n, mask=offs_n < N, other=0.0)
+        v = (v - z[None, :]) * s[None, :]
+        acc += tl.dot(x, v)
+    if SPLIT == 1:
+        tl.store(out_ptr + offs_m[:, None] * N + offs_n[None, :], acc.to(tl.bfloat16),
+                 mask=(offs_m[:, None] < M) & (offs_n[None, :] < N))
+    else:
+        tl.store(part_ptr + pid_s * (M * N) + offs_m[:, None] * N + offs_n[None, :], acc,
+                 mask=(offs_m[:, None] < M) & (offs_n[None, :] < N))
+
+
+@triton.jit
+def finalize_kernel(part_ptr, out_ptr, M, N, SPLIT: tl.constexpr, BLOCK: tl.constexpr):
+    pid = tl.program_id(0)
+    offs = pid * BLOCK + tl.arange(0, BLOCK)
+    acc = tl.zeros((BLOCK,), dtype=tl.float32)
+    for s in range(0, SPLIT):
+        acc += tl.load(part_ptr + s * (M * N) + offs, mask=offs < M * N, other=0.0)
+    tl.store(out_ptr + offs, acc.to(tl.bfloat16), mask=offs < M * N)
+
+
+def _pick_cfg(M: int, N: int) -> tuple:
+    if M <= 1:
+        return (4, 128, 16, 64, 4)  # fallback if GEMV unavailable
+    if M <= 16:
+        return (1, 128, 16, 64, 4)
+    if M <= 32:
+        return (1, 128, 32, 64, 4)
+    if M <= 64:
+        return (4, 64, 64, 128, 8)
+    return (4, 64, 64, 128, 8)
+
+
+class Model(nn.Module):
+    def __init__(self, M: int, N: int, K: int, group_size: int = GROUP_SIZE):
+        super().__init__()
+        self.M, self.N, self.K = M, N, K
+        self.group_size = group_size
+        n_groups = K // group_size
+        self.register_buffer("w_q", torch.empty(K // 2, N, dtype=torch.uint8))
+        self.register_buffer("scales", torch.empty(n_groups, N, dtype=torch.bfloat16))
+        self.register_buffer("zeros", torch.empty(n_groups, N, dtype=torch.bfloat16))
+        # non-persistent scratch for the M==1 fused-reduction GEMV
+        self.register_buffer("_part", torch.empty((32, 1, N), dtype=torch.float32), persistent=False)
+        self.register_buffer("_counters", torch.zeros((N + 511) // 512, dtype=torch.int32), persistent=False)
+        self.register_buffer("_out", torch.empty((M, N), dtype=torch.bfloat16), persistent=False)
+
+    def _forward_gemv(self, x: torch.Tensor) -> torch.Tensor:
+        gemv = _build_gemv()
+        SPLIT = 32
+        gemv.gemm_simt(x, self.w_q, self.scales, self.zeros, self._out,
+                       self._part, self._counters, SPLIT)
+        return self._out
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        M, N, K = x.shape[0], self.N, self.K
+        x = x.contiguous()
+        if M <= 1 and _build_gemv() is not None and N % 256 == 0 and K % 32 == 0:
+            return self._forward_gemv(x)
+        out = torch.empty((M, N), dtype=torch.bfloat16, device=x.device)
+        SPLIT, BK, BM, BN, nw = _pick_cfg(M, N)
+        grid = (triton.cdiv(M, BM), triton.cdiv(N, BN), SPLIT)
+        if SPLIT == 1:
+            w4a16_gemm_kernel[grid](
+                x, self.w_q, self.scales, self.zeros, None, out,
+                M, N, K,
+                BM=BM, BN=BN, BK=BK, GROUP=self.group_size, SPLIT=SPLIT,
+                num_warps=nw,
+            )
+        else:
+            part = torch.empty((SPLIT, M, N), dtype=torch.float32, device=x.device)
+            w4a16_gemm_kernel[grid](
+                x, self.w_q, self.scales, self.zeros, part, out,
+                M, N, K,
+                BM=BM, BN=BN, BK=BK, GROUP=self.group_size, SPLIT=SPLIT,
+                num_warps=nw,
+            )
+            finalize_kernel[(triton.cdiv(M * N, 8192),)](
+                part, out, M, N, SPLIT=SPLIT, BLOCK=8192,
+            )
+        return out
+
+
+M = 1
+N = 12288
+K = 4096
+
+
+def get_inputs():
+    x = torch.randn(M, K, dtype=torch.bfloat16)
+    return [x]
+
+
+def get_init_inputs():
+    return [M, N, K]
