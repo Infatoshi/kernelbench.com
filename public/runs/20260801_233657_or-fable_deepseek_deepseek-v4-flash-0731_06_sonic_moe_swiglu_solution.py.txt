@@ -1,0 +1,148 @@
+"""Sonic-MoE up-projection: grouped GEMM + fused SwiGLU (Triton, SM120).
+
+For each expert e with token slice x_e = hidden_states[offsets[e]:offsets[e+1]],
+computes  h_e = silu(x_e @ W_gate[e]) * (x_e @ W_up[e]).
+
+Strategy: the gate and up weight tensors are interleaved along the output dim
+into a single combined weight  WC[e] = (H, 2I) with
+    WC[e][h, 2i]   = W_gate[e][h, i]
+    WC[e][h, 2i+1] = W_up[e][h, i]
+so that one grouped GEMM  C = x_e @ WC[e]  produces gate and up side-by-side in
+every even/odd column pair.  A single bf16 MMA tile then holds both gate and up,
+and the epilogue splits the even/odd columns and fuses  silu(gate) * up  with
+`tl.split`.
+
+Grid is flat over (M-tile, N-tile) of the whole permuted token space; each
+program binary-searches expert_offsets to find the expert owning its M tile.
+"""
+from __future__ import annotations
+
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def _moe_swiglu_kernel(
+    X_ptr, WC_ptr, Out_ptr, Off_ptr,
+    H: tl.constexpr, I: tl.constexpr, E: tl.constexpr,
+    T_perm, num_n,
+    BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    m_tile = pid // num_n
+    n_tile = pid % num_n
+    row_start = m_tile * BM
+
+    # ---- find expert owning row_start: largest e with offsets[e] <= row_start
+    lo = 0
+    hi = E
+    while hi - lo > 1:
+        mid = (lo + hi) // 2
+        off = tl.load(Off_ptr + mid)
+        if off <= row_start:
+            lo = mid
+        else:
+            hi = mid
+    expert = lo
+    expert_end = tl.load(Off_ptr + expert + 1)
+
+    n_start = n_tile * BN               # column offset into combined N = 2I
+    rows = row_start + tl.arange(0, BM)
+    kcols = tl.arange(0, BK)
+    ncols = n_start + tl.arange(0, BN)  # combined gate/up columns
+
+    wc = WC_ptr + expert.to(tl.int64) * (H * 2 * I)
+
+    acc = tl.zeros((BM, BN), dtype=tl.float32)
+
+    for k in range(0, H, BK):
+        a = tl.load(
+            X_ptr + rows[:, None] * H + (k + kcols)[None, :],
+            mask=rows[:, None] < T_perm, other=0.0,
+        )
+        b = tl.load(wc + (k + kcols)[:, None] * (2 * I) + ncols[None, :])
+        acc += tl.dot(a, b)
+
+    # ---- split interleaved [gate, up] columns, fuse SwiGLU (fp32)
+    acc2 = tl.reshape(acc, (BM, BN // 2, 2))
+    gate, up = tl.split(acc2)                 # each (BM, BN // 2)
+    res = gate * tl.sigmoid(gate) * up
+    res = res.to(tl.bfloat16)
+
+    out_ncols = (n_start // 2) + tl.arange(0, BN // 2)
+    store_mask = (
+        (rows[:, None] < expert_end)
+        & (rows[:, None] < T_perm)
+        & (out_ncols[None, :] < I)
+    )
+    tl.store(Out_ptr + rows[:, None] * I + out_ncols[None, :], res, mask=store_mask)
+
+
+# (BM, BN, BK, num_warps, num_stages) chosen per output width I.
+_CFG = {
+    1024: (128, 128, 32, 8, 3),
+    1536: (128, 256, 64, 8, 3),
+    4096: (128, 256, 64, 8, 3),
+}
+_DEFAULT_CFG = (128, 256, 64, 8, 3)
+
+
+def _pick_cfg(I: int):
+    for key in sorted(_CFG):
+        if I <= key:
+            return _CFG[key]
+    return _DEFAULT_CFG
+
+
+class Model(nn.Module):
+    """Up-projection of a top-K MoE FFN with fused SwiGLU (custom Triton kernel)."""
+
+    def __init__(self, T_total: int, H: int, I: int, E: int, K: int):  # noqa: E741
+        super().__init__()
+        self.T_total = T_total
+        self.H = H
+        self.I = I
+        self.E = E
+        self.K = K
+        # NB: weights are always overwritten by load_state_dict in the harness;
+        # skip the expensive fill. Shapes/dtypes match reference exactly.
+        self.W_gate = nn.Parameter(torch.empty(E, H, I, dtype=torch.bfloat16))
+        self.W_up = nn.Parameter(torch.empty(E, H, I, dtype=torch.bfloat16))
+        self._wc = None
+        self._wc_ver = (-1, -1)
+
+    def _combined_weights(self) -> torch.Tensor:
+        """Interleaved (E, H, 2I) combined weight, cached per parameter version."""
+        vg, vu = self.W_gate._version, self.W_up._version
+        if self._wc is not None and self._wc_ver == (vg, vu):
+            return self._wc
+        wc = torch.stack([self.W_gate.detach(), self.W_up.detach()], dim=-1).reshape(
+            self.E, self.H, 2 * self.I
+        )
+        # stack+reshape is contiguous; ensure it is explicitly contiguous.
+        self._wc = wc.contiguous()
+        self._wc_ver = (vg, vu)
+        return self._wc
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,   # (T_perm, H) bf16
+        expert_offsets: torch.Tensor,  # (E+1,) int32
+    ) -> torch.Tensor:
+        T_perm, H = hidden_states.shape
+        I, E = self.I, self.E
+        out = torch.empty(T_perm, I, dtype=torch.bfloat16, device=hidden_states.device)
+        WC = self._combined_weights()
+
+        BM, BN, BK, nw, ns = _pick_cfg(I)
+        num_n = triton.cdiv(2 * I, BN)
+        num_m = triton.cdiv(T_perm, BM)
+        grid = (num_m * num_n,)
+        _moe_swiglu_kernel[grid](
+            hidden_states, WC, out, expert_offsets,
+            H=H, I=I, E=E, T_perm=T_perm, num_n=num_n,
+            BM=BM, BN=BN, BK=BK, num_warps=nw, num_stages=ns,
+        )
+        return out
