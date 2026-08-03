@@ -65,6 +65,10 @@ for rid in rids:
 print(f"  wrote {n} solution files")
 PY
 
+# Per-GPU board solutions share the canonical emitter with Hard. It covers
+# CUDA H100/B200 and namespaces them under public/runs/<gpu>/.
+uv run python ../hard/scripts/emit_board_solutions.py
+
 echo "[3b/3] redacting secrets from viewers (agents can echo env keys)"
 # Build sed rules from every ~/.env_vars value + token prefixes. Never printed.
 SEDF=$(mktemp)

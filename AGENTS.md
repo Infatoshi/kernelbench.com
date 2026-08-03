@@ -239,11 +239,11 @@ env var, the test fails until the doc row exists. Highlights only below.
   `deepseek-v4-pro` or `deepseek-v4-flash`), `qwen-claude` (Qwen via the
   **token-plan MaaS** endpoint
   token-plan.ap-southeast-1.maas.aliyuncs.com/apps/anthropic with
-  **QWEN_API_KEY** — this is the paid Qwen coding-plan route and is where
-  `qwen3.8-max-preview` lives; verified 2026-07-19, re-verified 2026-07-24.
-  DASHSCOPE_API_KEY + `QWEN_ANTHROPIC_BASE_URL=https://dashscope-intl.aliyuncs.com/apps/anthropic`
-  still reaches Model Studio for `qwen3-max`. Note Qwen 3.8 is **not on
-  OpenRouter** — its newest Qwen is `qwen3.7-max`),
+  **QWEN_API_KEY** — this is the paid Qwen coding-plan route and serves the
+  production `qwen3.8-max`; verified 2026-08-03. `DASHSCOPE_API_KEY` plus
+  `QWEN_ANTHROPIC_BASE_URL=https://dashscope-intl.aliyuncs.com/apps/anthropic`
+  reaches Model Studio pay-as-you-go. Qwen 3.8 Max is also on OpenRouter as
+  `qwen/qwen3.8-max`; run that route with `or-fable` at `xhigh` effort),
   `longcat-claude` (Meituan LongCat-2.0 via api.longcat.chat/anthropic).
   These mirror each other; to add one, copy the `kimi-claude` branch in
   `scripts/run_hard.sh`. Rationale: opencode is a strong harness but its

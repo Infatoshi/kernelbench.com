@@ -4,7 +4,7 @@
 # -> verified teardown. `kb brev ...` shells out here.
 #
 #   brev_worker.sh up <name> [type]             create instance (default hyperstack_H100) + wait + refresh ssh
-#   brev_worker.sh sync <name>                  rsync thin hard bench -> <name>:kb-hard/
+#   brev_worker.sh sync <name>                  rsync thin bench (KB_BREV_BENCH, default hard) -> <name>:kb-<bench>/
 #   brev_worker.sh bootstrap <name> [--agents]  uv + torch (cu128); --agents adds node + agent CLIs + auth
 #   brev_worker.sh run <name> <harness> <model> <problem> [effort]   detached agent session (problems root auto)
 #   brev_worker.sh regrade <name> <run_id> [runs_dir]   re-grade an archived solution.py: check.py then benchmark.py, sequentially
@@ -15,16 +15,23 @@
 #      KBH_HARDWARE (default H100) for roofline peaks on regrade.
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")/.." && pwd)"          # repo root
-HARD="$HERE/benchmarks/hard"
+# Bench selected by KB_BREV_BENCH (default hard) — mirrors KB_LAMBDA_BENCH.
+BENCH="${KB_BREV_BENCH:-hard}"
+BENCH_DIR="$HERE/benchmarks/$BENCH"
+REMOTE_DIR="kb-$BENCH"
+[ -d "$BENCH_DIR" ] || { echo "ERROR: unknown bench '$BENCH'" >&2; exit 1; }
 BREV="${BREV:-brev}"
 CMD="${1:?usage: brev_worker.sh <up|sync|bootstrap|run|regrade|pull|down> <name> ...}"
 NAME="${2:?instance name required}"
 shift 2
 S=(ssh -F "$HOME/.brev/ssh_config" -o StrictHostKeyChecking=no)
-PROBLEMS_ROOT="${KB_BREV_PROBLEMS_ROOT:-problems-h100}"
+case "$BENCH" in
+  mega) PROBLEMS_ROOT="${KB_BREV_PROBLEMS_ROOT:-problems}" ;;
+  *)    PROBLEMS_ROOT="${KB_BREV_PROBLEMS_ROOT:-problems-h100}" ;;
+esac
 
 # Keys a worker actually needs; never ship the whole ~/.env_vars.
-ENV_ALLOWLIST='KIMI_API_KEY|MOONSHOT_API_KEY|ZAI_API_KEY|MINIMAX_API_KEY|DEEPSEEK_API_KEY|LONGCAT_API_KEY|TENCENT_API_KEY|DASHSCOPE_API_KEY|OPENROUTER_API_KEY|OPENAI_API_KEY|GEMINI_API_KEY|ANTHROPIC_API_KEY|CLAUDE_CODE_OAUTH_TOKEN'
+ENV_ALLOWLIST='KIMI_API_KEY|MOONSHOT_API_KEY|ZAI_API_KEY|MINIMAX_API_KEY|DEEPSEEK_API_KEY|LONGCAT_API_KEY|TENCENT_API_KEY|DASHSCOPE_API_KEY|QWEN_API_KEY|OPENROUTER_API_KEY|OPENAI_API_KEY|GEMINI_API_KEY|ANTHROPIC_API_KEY|CLAUDE_CODE_OAUTH_TOKEN'
 
 ensure_reachable() {
   for _ in 1 2 3; do
@@ -57,12 +64,20 @@ case "$CMD" in
 
   sync)
     ensure_reachable
-    echo "[sync] thin hard bench -> $NAME:kb-hard/"
-    rsync -az -e "${S[*]}" \
-      --exclude outputs --exclude __pycache__ --exclude '.venv' --exclude '*.pyc' \
-      --exclude .git --exclude 'docs/refs' \
-      --exclude 'results/annotations' --exclude 'docs/*case_stud*' \
-      "$HARD/" "$NAME:kb-hard/"
+    echo "[sync] thin $BENCH bench -> $NAME:$REMOTE_DIR/"
+    SYNC_EXCLUDES=(--exclude outputs --exclude __pycache__ --exclude '.venv' --exclude '*.pyc'
+      --exclude .git --exclude 'docs/refs'
+      --exclude 'results/annotations' --exclude 'docs/*case_stud*')
+    # Preserve the node-side cu128 torch-index patch across re-syncs.
+    if "${S[@]}" "$NAME" "grep -q pytorch-cu128 $REMOTE_DIR/pyproject.toml" 2>/dev/null; then
+      echo "[sync] preserving node torch-index patch (pyproject.toml/uv.lock not shipped)"
+      SYNC_EXCLUDES+=(--exclude /pyproject.toml --exclude /uv.lock)
+    fi
+    rsync -az -e "${S[*]}" "${SYNC_EXCLUDES[@]}" "$BENCH_DIR/" "$NAME:$REMOTE_DIR/"
+    # Single-GPU benches' run_hard.sh wraps the shared runner at
+    # <monorepo>/scripts/lib/; ship the lib INTO the bench dir (wrapper falls
+    # back to it on thin-synced nodes).
+    rsync -az -e "${S[*]}" "$HERE/scripts/lib/" "$NAME:$REMOTE_DIR/scripts/lib/"
     TMPENV="$(mktemp)"
     grep -E "^(export )?($ENV_ALLOWLIST)=" ~/.env_vars > "$TMPENV" || true
     rsync -az -e "${S[*]}" "$TMPENV" "$NAME:.env_vars"
@@ -76,7 +91,7 @@ case "$CMD" in
     "${S[@]}" "$NAME" 'command -v uv >/dev/null 2>&1 || curl -LsSf https://astral.sh/uv/install.sh | sh'
     # cu128 torch: stock brev images ship R570-class drivers; the repo cu130
     # pin needs R580. Same override the mega cloud bootstrap uses.
-    "${S[@]}" "$NAME" 'cd ~/kb-hard && if ! grep -q pytorch-cu128 pyproject.toml; then cat >> pyproject.toml <<TOML
+    "${S[@]}" "$NAME" "cd ~/$REMOTE_DIR"' && if ! grep -q pytorch-cu128 pyproject.toml; then cat >> pyproject.toml <<TOML
 
 [[tool.uv.index]]
 name = "pytorch-cu128"
@@ -96,29 +111,29 @@ rm -f uv.lock; fi; export PATH="$HOME/.local/bin:$PATH"; uv sync'
       rsync -az -e "${S[*]}" ~/.codex/auth.json "$NAME:.codex/auth.json" 2>/dev/null || true
       rsync -az -e "${S[*]}" ~/.claude/.credentials.json "$NAME:.claude/.credentials.json" 2>/dev/null || true
     fi
-    "${S[@]}" "$NAME" 'export PATH="$HOME/.local/bin:$PATH"; cd ~/kb-hard && uv run python -c "import torch;print(\"torch\",torch.__version__,\"cuda\",torch.cuda.is_available(),torch.cuda.get_device_name(0))"'
+    "${S[@]}" "$NAME" 'export PATH="$HOME/.local/bin:$PATH"; cd ~/'"$REMOTE_DIR"' && uv run python -c "import torch;print(\"torch\",torch.__version__,\"cuda\",torch.cuda.is_available(),torch.cuda.get_device_name(0))"'
     ;;
 
   run)
     HARNESS="${1:?harness}"; MODEL="${2:?model}"; PROBLEM="${3:?problem}"; EFFORT="${4:-}"
     ensure_reachable
     echo "[run] detached: $HARNESS $MODEL $PROBLEMS_ROOT/$PROBLEM $EFFORT"
-    "${S[@]}" "$NAME" "cd ~/kb-hard && nohup env KBH_AGENT_CONTAINER=0 BUDGET_SECONDS=0 ./scripts/run_hard.sh $HARNESS $MODEL $PROBLEMS_ROOT/$PROBLEM $EFFORT > ~/kb_run.log 2>&1 & echo launched PID \$!"
-    echo "Poll:  ${S[*]} $NAME 'tail -20 ~/kb_run.log'"
+    "${S[@]}" "$NAME" "cd ~/$REMOTE_DIR && mkdir -p outputs && setsid nohup env KBH_AGENT_CONTAINER=0 BUDGET_SECONDS=0 ${KB_BREV_RUN_ENV:-} ./scripts/run_hard.sh $HARNESS $MODEL $PROBLEMS_ROOT/$PROBLEM $EFFORT > outputs/kb_run_\$(basename $PROBLEM).log 2>&1 < /dev/null & echo launched PID \$!"
+    echo "Poll:  ${S[*]} $NAME 'tail -20 ~/$REMOTE_DIR/outputs/kb_run_*.log'"
     ;;
 
   regrade)
-    RID="${1:?run_id}"; RUNS_DIR="${2:-$HARD/outputs/runs-h100}"
+    RID="${1:?run_id}"; RUNS_DIR="${2:-$BENCH_DIR/outputs/runs-h100}"
     SRC="$RUNS_DIR/$RID"
     [ -f "$SRC/solution.py" ] || { echo "no solution.py in $SRC" >&2; exit 1; }
     PROBLEM="$(sed -E 's/^[0-9]{8}_[0-9]{6}_.*_([0-9]{2}_[a-z0-9_]+)$/\1/' <<<"$RID")"
     ensure_reachable
     echo "[regrade] $RID -> $PROBLEMS_ROOT/$PROBLEM (sequential, no other GPU jobs)"
-    "${S[@]}" "$NAME" "mkdir -p ~/kb-regrade/$RID && cp -r ~/kb-hard/$PROBLEMS_ROOT/$PROBLEM/. ~/kb-regrade/$RID/"
+    "${S[@]}" "$NAME" "mkdir -p ~/kb-regrade/$RID && cp -r ~/$REMOTE_DIR/$PROBLEMS_ROOT/$PROBLEM/. ~/kb-regrade/$RID/"
     rsync -az -e "${S[*]}" "$SRC/solution.py" "$NAME:kb-regrade/$RID/solution.py"
     "${S[@]}" "$NAME" "export PATH=\"\$HOME/.local/bin:\$PATH\"; cd ~/kb-regrade/$RID \
-      && echo '--- check.py ---' && uv run --project ~/kb-hard python check.py \
-      && echo '--- benchmark.py ---' && env KBH_HARDWARE=${KBH_HARDWARE:-H100} uv run --project ~/kb-hard python benchmark.py"
+      && echo '--- check.py ---' && uv run --project ~/$REMOTE_DIR python check.py \
+      && echo '--- benchmark.py ---' && env KBH_HARDWARE=${KBH_HARDWARE:-H100} uv run --project ~/$REMOTE_DIR python benchmark.py"
     echo "[regrade] pull result.json (if written) back beside the archive:"
     rsync -az -e "${S[*]}" "$NAME:kb-regrade/$RID/result.json" "$SRC/result.regrade.json" 2>/dev/null \
       && echo "  -> $SRC/result.regrade.json" || echo "  (benchmark printed to stdout only)"
@@ -126,12 +141,12 @@ rm -f uv.lock; fi; export PATH="$HOME/.local/bin:$PATH"; uv sync'
 
   pull)
     ensure_reachable
-    DEST="$HARD/outputs/runs-brev-$NAME"
+    DEST="$BENCH_DIR/outputs/runs-brev-$NAME"
     mkdir -p "$DEST"
-    echo "[pull] $NAME:kb-hard/outputs/runs/ -> $DEST (thin)"
+    echo "[pull] $NAME:$REMOTE_DIR/outputs/runs/ -> $DEST (thin)"
     rsync -az -e "${S[*]}" \
       --exclude '.venv' --exclude 'cache' --exclude 'tmp' --exclude 'container_uv_cache' \
-      "$NAME:kb-hard/outputs/runs/" "$DEST/"
+      "$NAME:$REMOTE_DIR/outputs/runs/" "$DEST/"
     ;;
 
   down)

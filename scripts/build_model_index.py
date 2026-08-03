@@ -69,12 +69,14 @@ MODEL_NAMES = {
     "gemini-3.1-pro-preview": "Gemini 3.1 Pro",
     "deepseek-v4-pro": "DeepSeek V4 Pro",
     "deepseek-v4-flash": "DeepSeek V4 Flash",
+    "deepseek-v4-flash-0731": "DeepSeek V4 Flash (0731)",
     "longcat-2.0": "LongCat 2.0",
     "hy3": "Tencent Hy3",
     "qwen3.6-max-preview": "Qwen 3.6 Max Preview",
     "qwen3.6-plus": "Qwen 3.6 Plus",
     "qwen3.6-27b": "Qwen 3.6 27B",
     "qwen3.7-max": "Qwen 3.7 Max",
+    "qwen3.8-max": "Qwen 3.8 Max",
     "mimo-v2.5-pro": "MiMo V2.5 Pro",
     "minimax-m2.7": "MiniMax M2.7",
     "nemotron-3-ultra-550b-a55b": "Nemotron 3 Ultra",
@@ -221,8 +223,7 @@ def _merge_block(dst: dict, src: dict, *, keep_gpus: bool) -> None:
     the harness that contributed the most winning cells."""
     gpus = dst.get("gpus") if keep_gpus else None
     _merge_cells(dst.setdefault("cells", {}), src.get("cells") or {})
-    # Recount pass + majority harness among winning cells
-    winners: dict[str, int] = {}
+    # Recount passes among winning cells.
     npass = 0
     for cell in (dst.get("cells") or {}).values():
         if cell.get("valid"):

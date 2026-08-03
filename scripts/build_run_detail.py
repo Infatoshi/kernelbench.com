@@ -32,6 +32,7 @@ BOARDS = [
     ("hard", "results/leaderboard.h100.json", "h100", "problems-h100", "runs-h100"),
     ("hard", "results/leaderboard.b200.json", "b200", "problems-b200", "runs-b200"),
     ("cuda", "results/leaderboard.json", "rtxpro6000", "problems-rtxpro6000", "runs"),
+    ("cuda", "results/leaderboard.h100.json", "h100", "problems-h100", "runs-h100"),
     ("cuda", "results/leaderboard.b200.json", "b200", "problems-rtxpro6000", "runs-b200"),
 ]
 

@@ -519,15 +519,14 @@ case "$HARNESS" in
         ;;
 
     qwen-claude)
-        # Claude Code routed to Alibaba's Anthropic-compatible endpoint. Default
-        # is the token-plan (ap-southeast-1 MaaS) route with QWEN_API_KEY, where
-        # qwen3.8-max-preview lives. Mirrors the hard bench's branch.
+        # Claude Code routed to Alibaba's Anthropic-compatible endpoint.
+        # The token-plan (ap-southeast-1 MaaS) route with QWEN_API_KEY serves
+        # qwen3.8-max; verified 2026-08-03. Mirrors the shared runner branch.
         #
-        # Concurrency: this endpoint serves ~1 in-flight request per key. At 2
-        # concurrent it drops roughly half, at 3 it drops nearly all, and it
-        # signals overload by resetting the connection rather than returning
-        # HTTP 429 (measured 2026-07-24). One agent session only ever has one
-        # request outstanding, so run Qwen sessions strictly one at a time.
+        # Concurrency is plan-dependent. The current token-plan key completed
+        # two simultaneous qwen3.8-max Claude Code requests on 2026-08-03, so
+        # one session per GPU may run concurrently. Keep the two-GPU rollout at
+        # that width; higher concurrency has not been preflighted.
         QWEN_CLAUDE_KEY="${QWEN_API_KEY:-${DASHSCOPE_API_KEY:-}}"
         if [ -z "$QWEN_CLAUDE_KEY" ]; then
             echo "QWEN_API_KEY (or DASHSCOPE_API_KEY) is required for qwen-claude" >&2
@@ -543,12 +542,13 @@ case "$HARNESS" in
             export CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS="${CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS:-1}" && \
             export CLAUDE_CODE_MAX_RETRIES="${CLAUDE_CODE_MAX_RETRIES:-1000000}" && \
             export CLAUDE_CODE_MAX_OUTPUT_TOKENS="${CLAUDE_CODE_MAX_OUTPUT_TOKENS:-128000}" && \
+            export CLAUDE_CODE_MAX_CONTEXT_TOKENS="${CLAUDE_CODE_MAX_CONTEXT_TOKENS:-983616}" && \
             export ANTHROPIC_MODEL="$MODEL" && \
             export ANTHROPIC_DEFAULT_HAIKU_MODEL="$QWEN_CLAUDE_HAIKU_MODEL" && \
             export ANTHROPIC_DEFAULT_SONNET_MODEL="$MODEL" && \
             export ANTHROPIC_DEFAULT_OPUS_MODEL="$MODEL" && \
             export ENABLE_TOOL_SEARCH="${ENABLE_TOOL_SEARCH:-false}" && \
-            export CLAUDE_CODE_EFFORT_LEVEL="${CLAUDE_CODE_EFFORT_LEVEL:-max}" && \
+            export CLAUDE_CODE_EFFORT_LEVEL="${CLAUDE_CODE_EFFORT_LEVEL:-xhigh}" && \
             export CLAUDE_CODE_SUBAGENT_MODEL="$MODEL" && \
             "${KBH_SBX[@]}" timeout "$BUDGET_SECONDS" claude \
                 --dangerously-skip-permissions \
@@ -1352,8 +1352,13 @@ shopt -u nullglob dotglob
 
 # Drop per-run .venv after scoring. Reproducible from uv.lock via `uv run`
 # (regrade recreates it). Opt out: KBH_KEEP_RUN_VENV=1.
+# Thin workers receive the shared helper under this bench's scripts/lib.
+STRIP_HELPER="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)/scripts/lib/strip_run_venv.sh"
+if [ ! -f "$STRIP_HELPER" ]; then
+    STRIP_HELPER="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/strip_run_venv.sh"
+fi
 # shellcheck source=../../../scripts/lib/strip_run_venv.sh
-. "$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)/scripts/lib/strip_run_venv.sh"
+. "$STRIP_HELPER"
 strip_run_venv "$RUN_DIR"
 
 STATUS="ERR"

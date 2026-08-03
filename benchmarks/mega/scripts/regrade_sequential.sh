@@ -246,8 +246,13 @@ print("    correct=%s  peak %s -> %s%s" % (r["correct"], old, new, delta))
 PY
 
     # uv run recreates repo/.venv during regrade; drop it again so archives stay thin.
+    # Thin workers receive the shared helper under this bench's scripts/lib.
+    STRIP_HELPER="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)/scripts/lib/strip_run_venv.sh"
+    if [ ! -f "$STRIP_HELPER" ]; then
+        STRIP_HELPER="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/strip_run_venv.sh"
+    fi
     # shellcheck source=../../../scripts/lib/strip_run_venv.sh
-    . "$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)/scripts/lib/strip_run_venv.sh"
+    . "$STRIP_HELPER"
     strip_run_venv "$RUN_DIR"
 
     if [ "$CORRECT" = "true" ]; then PASS=$((PASS+1)); else FAIL=$((FAIL+1)); fi
