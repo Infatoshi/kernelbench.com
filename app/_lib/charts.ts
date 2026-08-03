@@ -36,6 +36,7 @@ export const MODEL_NAMES: Record<string, string> = {
   hy3: "Tencent Hy3",
   "tencent/hy3-preview": "Tencent Hy3",
   "qwen3.8-max-preview": "Qwen 3.8 Max (preview)",
+  "qwen/qwen3.8-max": "Qwen 3.8 Max",
 }
 
 function displayName(modelId: string): string {
@@ -181,6 +182,7 @@ const SHORT_NAMES: Record<string, string> = {
   hy3: "Hy3",
   "tencent/hy3-preview": "Hy3",
   "qwen3.8-max-preview": "Qwen 3.8",
+  "qwen/qwen3.8-max": "Qwen 3.8",
 }
 
 function shortName(modelId: string): string {

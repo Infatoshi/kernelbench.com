@@ -1,0 +1,532 @@
+"""GLM-5.2-class fused MoE layer (CUDA).
+
+Strategy:
+  - Shared expert runs on every token as two dense GEMMs with a fused SiLU*up
+    activation in between.
+  - Routed experts: tokens are bucketed per expert and processed as a padded
+    strided-batched GEMM (cuBLAS via a small C++ helper) so every used expert's
+    weights are streamed exactly once.  All GEMMs use bf16 inputs with fp32
+    accumulation *and* fp32 outputs (gate/up stay in fp32 until the activation),
+    matching the numeric floor of the reference's fp32 matmul pipeline.
+  - Custom CUDA kernels build the per-expert padded token buffer + slot
+    bookkeeping, apply the activation, and do the final weighted scatter-add
+    into the fp32 accumulator.
+"""
+from __future__ import annotations
+
+import importlib.util
+from pathlib import Path
+
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+_CUDA_SRC = r"""
+#include <torch/extension.h>
+#include <ATen/cuda/CUDAContext.h>
+#include <cuda_runtime.h>
+#include <cublas_v2.h>
+#include <cuda_bf16.h>
+#include <cstdint>
+
+#define DEVINLINE __device__ __forceinline__
+
+DEVINLINE float bf2f(__nv_bfloat16 h) { return __bfloat162float(h); }
+DEVINLINE __nv_bfloat16 f2bf(float f) { return __float2bfloat16(f); }
+
+// ---- batched GEMM: C = A @ B^T with bf16 in / fp32 out --------------------
+// A: (G, M, K) bf16, B: (G, N, K) bf16.  Returns (G, M, N) fp32 row-major.
+// Implemented as cuBLAS column-major C^T = B @ A^T, so the natural row-major
+// buffer of the transposed product IS the row-major (G, M, N) result.
+static cublasHandle_t get_handle() {
+    static cublasHandle_t h = nullptr;
+    if (!h) cublasCreate(&h);
+    return h;
+}
+
+torch::Tensor bmm_f32(torch::Tensor A, torch::Tensor B) {
+    TORCH_CHECK(A.dim() == 3 && B.dim() == 3 && A.size(0) == B.size(0));
+    int64_t G = A.size(0), M = A.size(1), K = A.size(2);
+    int64_t N = B.size(1);
+    auto C = torch::empty({G, N, M}, A.options().dtype(torch::kFloat32));
+    cublasHandle_t h = get_handle();
+    cublasSetStream(h, at::cuda::getCurrentCUDAStream());
+    float alpha = 1.0f, beta = 0.0f;
+    cublasGemmStridedBatchedEx(
+        h,
+        CUBLAS_OP_T, CUBLAS_OP_N,
+        (int)M, (int)N, (int)K,
+        &alpha,
+        A.data_ptr(), CUDA_R_16BF, (int)K, (int64_t)(M * K),
+        B.data_ptr(), CUDA_R_16BF, (int)K, (int64_t)(N * K),
+        &beta,
+        C.data_ptr(), CUDA_R_32F, (int)M, (int64_t)(M * N),
+        (int)G,
+        CUBLAS_COMPUTE_32F,
+        CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+    return C;
+}
+
+// ---- count routed-expert usage -------------------------------------------
+__global__ void count_experts_kernel(
+    const int64_t* __restrict__ expert_ids,   // (T, top_k)
+    int32_t* __restrict__ counts,             // (E) zeroed
+    int total, int top_k)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < total) {
+        int t = idx / top_k;
+        int k = idx - t * top_k;
+        int e = (int)expert_ids[(size_t)t * top_k + k];
+        atomicAdd(&counts[e], 1);
+    }
+}
+
+// ---- slot bookkeeping (routed) -------------------------------------------
+// Each (token, k) slot is assigned a contiguous position inside its expert's
+// block.  Writes slot_token / slot_row (indexed by slot, for the x gather)
+// and token_by_row / weight_by_row (indexed by g*M_pad + rank, for the
+// weighted scatter-add).
+__global__ void fill_slots_kernel(
+    const int64_t* __restrict__ expert_ids,       // (T, top_k)
+    const __nv_bfloat16* __restrict__ expert_weights,  // (T, top_k)
+    const int32_t* __restrict__ offsets,          // (E+1) exclusive starts
+    const int32_t* __restrict__ used_index,       // (E)
+    int32_t* __restrict__ cursor,                 // (E) zeroed
+    int32_t* __restrict__ slot_token,             // (S)
+    int32_t* __restrict__ slot_row,               // (S) = g*M_pad + rank
+    int32_t* __restrict__ token_by_row,           // (G*M_pad)
+    __nv_bfloat16* __restrict__ weight_by_row,    // (G*M_pad)
+    int total, int top_k, int M_pad)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < total) {
+        int t = idx / top_k;
+        int k = idx - t * top_k;
+        int e = (int)expert_ids[(size_t)t * top_k + k];
+        int rank = atomicAdd(&cursor[e], 1);
+        int slot = offsets[e] + rank;
+        int g = used_index[e];
+        int row = g * M_pad + rank;
+        slot_token[slot] = t;
+        slot_row[slot] = row;
+        token_by_row[row] = t;
+        weight_by_row[row] = expert_weights[(size_t)t * top_k + k];
+    }
+}
+
+// ---- gather x rows into the padded per-expert A matrix --------------------
+__global__ void fill_xpad_kernel(
+    const int32_t* __restrict__ slot_token,   // (S)
+    const int32_t* __restrict__ slot_row,     // (S)
+    const __nv_bfloat16* __restrict__ x,      // (T, H)
+    __nv_bfloat16* __restrict__ X_pad,        // (G*M_pad, H)
+    int S, int H, int nchunk)                 // nchunk = H/8
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = S * nchunk;
+    if (idx < total) {
+        int slot = idx / nchunk;
+        int c = (idx - slot * nchunk) * 8;
+        int t = slot_token[slot];
+        int row = slot_row[slot];
+        const __nv_bfloat16* src = x + (size_t)t * H + c;
+        __nv_bfloat16* dst = X_pad + (size_t)row * H + c;
+        *(uint4*)dst = *(const uint4*)src;
+    }
+}
+
+DEVINLINE void silu_mul_8_f32(
+    const float* __restrict__ cg,   // gate, 8 floats
+    const float* __restrict__ cu,   // up,   8 floats
+    __nv_bfloat16* __restrict__ h)
+{
+    __nv_bfloat162* h2 = (__nv_bfloat162*)h;
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        float g0 = cg[2 * j], g1 = cg[2 * j + 1];
+        float u0 = cu[2 * j], u1 = cu[2 * j + 1];
+        float s0 = 1.0f / (1.0f + expf(-g0));
+        float s1 = 1.0f / (1.0f + expf(-g1));
+        h2[j] = __floats2bfloat162_rn(g0 * s0 * u0, g1 * s1 * u1);
+    }
+}
+
+// ---- routed activation, reading the transposed GEMM output (G, 2I, M_pad) -
+// Each block loads a (m_tile x i_tile) tile of gate+up into shared memory
+// (coalesced along m), transposes, applies SiLU*up, and writes H1 coalesced
+// along i.  This avoids materializing a (G, M_pad, 2I) transposed copy.
+#define ACT_MT 64
+#define ACT_IT 32
+__global__ void silu_mul_routed_kernel(
+    const float* __restrict__ C1t,    // (G, 2I, M_pad) fp32
+    __nv_bfloat16* __restrict__ H1,   // (G, M_pad, I) bf16
+    const int32_t* __restrict__ counts,  // (G)
+    int G, int M_pad, int I)
+{
+    __shared__ float gsm[ACT_MT][ACT_IT + 1];
+    __shared__ float usm[ACT_MT][ACT_IT + 1];
+    int tid = threadIdx.x;
+    int g = blockIdx.z;
+    int mt0 = blockIdx.y * ACT_MT;
+    int it0 = blockIdx.x * ACT_IT;
+    if (mt0 >= counts[g]) return;
+    int m_lim = min(ACT_MT, counts[g] - mt0);
+    const float* base = C1t + ((size_t)g * (size_t)(2 * I) + it0) * M_pad + mt0;
+    for (int idx = tid; idx < ACT_IT * ACT_MT; idx += blockDim.x) {
+        int j = idx / ACT_MT;
+        int m = idx % ACT_MT;
+        if (m < m_lim) {
+            gsm[m][j] = base[j * M_pad + m];
+            usm[m][j] = base[(I + j) * M_pad + m];
+        }
+    }
+    __syncthreads();
+    for (int idx = tid; idx < ACT_IT * ACT_MT; idx += blockDim.x) {
+        int m = idx / ACT_IT;
+        int j = idx % ACT_IT;
+        if (m < m_lim) {
+            float g0 = gsm[m][j], u0 = usm[m][j];
+            float s = 1.0f / (1.0f + expf(-g0));
+            H1[((size_t)g * M_pad + mt0 + m) * I + it0 + j] = f2bf(g0 * s * u0);
+        }
+    }
+}
+
+// ---- shared activation: all rows valid -----------------------------------
+// C is (T, 2I) fp32, H out (T, I) bf16.
+__global__ void silu_mul_shared_kernel(
+    const float* __restrict__ C,      // (T, 2I) fp32
+    __nv_bfloat16* __restrict__ H,    // (T, I) bf16
+    int T, int I)
+{
+    int nchunk = I / 8;
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = T * nchunk;
+    if (idx < total) {
+        int t = idx / nchunk;
+        int c = (idx - t * nchunk) * 8;
+        const float* row = C + (size_t)t * (size_t)(2 * I);
+        __nv_bfloat16* hrow = H + (size_t)t * I;
+        silu_mul_8_f32(row + c, row + I + c, hrow + c);
+    }
+}
+
+// ---- weighted scatter-add of routed outputs into fp32 accumulator --------
+// Reads the transposed GEMM2 output C2t (G, H, M_pad) via a shared-memory
+// transpose so the C2t reads are coalesced and the atomic writes stay
+// coalesced along H.
+#define RED_MT 64
+#define RED_HT 64
+__global__ void reduce_add_kernel(
+    float* __restrict__ out_acc,                 // (T, H) fp32
+    const float* __restrict__ C2t,               // (G, H, M_pad) fp32
+    const int32_t* __restrict__ token_by_row,    // (G*M_pad)
+    const __nv_bfloat16* __restrict__ weight_by_row,  // (G*M_pad)
+    const int32_t* __restrict__ counts,          // (G)
+    int G, int H, int M_pad)
+{
+    __shared__ float sm[RED_HT][RED_MT + 1];
+    int tid = threadIdx.x;
+    int g = blockIdx.z;
+    int mt0 = blockIdx.y * RED_MT;
+    int ht0 = blockIdx.x * RED_HT;
+    if (mt0 >= counts[g]) return;
+    int m_lim = min(RED_MT, counts[g] - mt0);
+    const float* base = C2t + ((size_t)g * H + ht0) * M_pad + mt0;
+    for (int idx = tid; idx < RED_HT * RED_MT; idx += blockDim.x) {
+        int h = idx / RED_MT;
+        int m = idx % RED_MT;
+        if (m < m_lim) sm[h][m] = base[h * M_pad + m];
+    }
+    __syncthreads();
+    const int32_t* tk = token_by_row + g * M_pad + mt0;
+    const __nv_bfloat16* wt = weight_by_row + g * M_pad + mt0;
+    int nh4 = RED_HT / 4;
+    for (int idx = tid; idx < RED_MT * nh4; idx += blockDim.x) {
+        int m = idx / nh4;
+        int h4 = idx % nh4;
+        if (m < m_lim) {
+            int t = tk[m];
+            float w = bf2f(wt[m]);
+            float* dst = out_acc + (size_t)t * H + ht0 + h4 * 4;
+            float4 v = make_float4(sm[h4 * 4][m] * w, sm[h4 * 4 + 1][m] * w,
+                                   sm[h4 * 4 + 2][m] * w, sm[h4 * 4 + 3][m] * w);
+            atomicAdd((float4*)dst, v);
+        }
+    }
+}
+
+// ============================ host wrappers ================================
+
+void count_experts(torch::Tensor expert_ids, torch::Tensor counts,
+                   int64_t total, int64_t top_k) {
+    int block = 256;
+    int grid = (int)((total + block - 1) / block);
+    count_experts_kernel<<<grid, block>>>(
+        expert_ids.data_ptr<int64_t>(), counts.data_ptr<int32_t>(),
+        (int)total, (int)top_k);
+}
+
+void fill_slots(torch::Tensor expert_ids, torch::Tensor expert_weights,
+                torch::Tensor offsets, torch::Tensor used_index,
+                torch::Tensor cursor, torch::Tensor slot_token,
+                torch::Tensor slot_row, torch::Tensor token_by_row,
+                torch::Tensor weight_by_row,
+                int64_t total, int64_t top_k, int64_t M_pad) {
+    int block = 256;
+    int grid = (int)((total + block - 1) / block);
+    fill_slots_kernel<<<grid, block>>>(
+        expert_ids.data_ptr<int64_t>(),
+        reinterpret_cast<const __nv_bfloat16*>(expert_weights.data_ptr<at::BFloat16>()),
+        offsets.data_ptr<int32_t>(), used_index.data_ptr<int32_t>(),
+        cursor.data_ptr<int32_t>(), slot_token.data_ptr<int32_t>(),
+        slot_row.data_ptr<int32_t>(), token_by_row.data_ptr<int32_t>(),
+        reinterpret_cast<__nv_bfloat16*>(weight_by_row.data_ptr<at::BFloat16>()),
+        (int)total, (int)top_k, (int)M_pad);
+}
+
+void fill_xpad(torch::Tensor slot_token, torch::Tensor slot_row,
+               torch::Tensor x, torch::Tensor X_pad, int64_t S, int64_t H) {
+    int nchunk = (int)(H / 8);
+    int total = (int)(S * nchunk);
+    int block = 256;
+    int grid = (int)((total + block - 1) / block);
+    fill_xpad_kernel<<<grid, block>>>(
+        slot_token.data_ptr<int32_t>(), slot_row.data_ptr<int32_t>(),
+        reinterpret_cast<const __nv_bfloat16*>(x.data_ptr<at::BFloat16>()),
+        reinterpret_cast<__nv_bfloat16*>(X_pad.data_ptr<at::BFloat16>()),
+        (int)S, (int)H, nchunk);
+}
+
+void silu_mul_routed(torch::Tensor C, torch::Tensor H, torch::Tensor counts,
+                     int64_t G, int64_t M_pad, int64_t I) {
+    dim3 block(256);
+    dim3 grid((unsigned)((I + ACT_IT - 1) / ACT_IT),
+              (unsigned)((M_pad + ACT_MT - 1) / ACT_MT),
+              (unsigned)G);
+    silu_mul_routed_kernel<<<grid, block>>>(
+        C.data_ptr<float>(),
+        reinterpret_cast<__nv_bfloat16*>(H.data_ptr<at::BFloat16>()),
+        counts.data_ptr<int32_t>(), (int)G, (int)M_pad, (int)I);
+}
+
+void silu_mul_shared(torch::Tensor C, torch::Tensor H, int64_t T, int64_t I) {
+    int nchunk = (int)(I / 8);
+    int total = (int)(T * nchunk);
+    int block = 256;
+    int grid = (int)((total + block - 1) / block);
+    silu_mul_shared_kernel<<<grid, block>>>(
+        C.data_ptr<float>(),
+        reinterpret_cast<__nv_bfloat16*>(H.data_ptr<at::BFloat16>()),
+        (int)T, (int)I);
+}
+
+void reduce_add(torch::Tensor out_acc, torch::Tensor C2,
+                torch::Tensor token_by_row, torch::Tensor weight_by_row,
+                torch::Tensor counts, int64_t G, int64_t H, int64_t M_pad) {
+    dim3 block(256);
+    dim3 grid((unsigned)((H + RED_HT - 1) / RED_HT),
+              (unsigned)((M_pad + RED_MT - 1) / RED_MT),
+              (unsigned)G);
+    reduce_add_kernel<<<grid, block>>>(
+        out_acc.data_ptr<float>(), C2.data_ptr<float>(),
+        token_by_row.data_ptr<int32_t>(),
+        reinterpret_cast<const __nv_bfloat16*>(weight_by_row.data_ptr<at::BFloat16>()),
+        counts.data_ptr<int32_t>(), (int)G, (int)H, (int)M_pad);
+}
+"""
+
+_CPP_SRC = """
+torch::Tensor bmm_f32(torch::Tensor A, torch::Tensor B);
+void count_experts(torch::Tensor expert_ids, torch::Tensor counts,
+                   int64_t total, int64_t top_k);
+void fill_slots(torch::Tensor expert_ids, torch::Tensor expert_weights,
+                torch::Tensor offsets, torch::Tensor used_index,
+                torch::Tensor cursor, torch::Tensor slot_token,
+                torch::Tensor slot_row, torch::Tensor token_by_row,
+                torch::Tensor weight_by_row,
+                int64_t total, int64_t top_k, int64_t M_pad);
+void fill_xpad(torch::Tensor slot_token, torch::Tensor slot_row,
+               torch::Tensor x, torch::Tensor X_pad, int64_t S, int64_t H);
+void silu_mul_routed(torch::Tensor C, torch::Tensor H, torch::Tensor counts,
+                     int64_t G, int64_t M_pad, int64_t I);
+void silu_mul_shared(torch::Tensor C, torch::Tensor H, int64_t T, int64_t I);
+void reduce_add(torch::Tensor out_acc, torch::Tensor C2,
+                torch::Tensor token_by_row, torch::Tensor weight_by_row,
+                torch::Tensor counts, int64_t G, int64_t H, int64_t M_pad);
+"""
+
+_EXT = None
+_COMPILE_FAILED = False
+
+
+def _cuda_toolchain_paths():
+    """Return (extra_include_paths, extra_ldflags) for cuBLAS headers/libs.
+
+    Prefer system CUDA (resolved via CUDA_HOME); fall back to the nvidia pip
+    packages that ship with a torch CUDA wheel.
+    """
+    inc, ld = [], []
+    try:
+        for pkg in ("nvidia.cublas", "nvidia.cusparse", "nvidia.cusolver"):
+            spec = importlib.util.find_spec(pkg)
+            if spec is not None:
+                p = Path(spec.origin).parent / "include"
+                if p.is_dir():
+                    inc.append(str(p))
+        spec = importlib.util.find_spec("nvidia.cublas")
+        if spec is not None:
+            lib = Path(spec.origin).parent / "lib"
+            if lib.is_dir():
+                ld += [f"-L{lib}", "-lcublas"]
+    except Exception:
+        pass
+    return inc, ld
+
+
+def _get_ext():
+    global _EXT, _COMPILE_FAILED
+    if _EXT is None and not _COMPILE_FAILED:
+        try:
+            inc, ld = _cuda_toolchain_paths()
+            _EXT = load_inline(
+                name="glm52_fused_moe",
+                cpp_sources=_CPP_SRC,
+                cuda_sources=_CUDA_SRC,
+                functions=[
+                    "bmm_f32",
+                    "count_experts",
+                    "fill_slots",
+                    "fill_xpad",
+                    "silu_mul_routed",
+                    "silu_mul_shared",
+                    "reduce_add",
+                ],
+                extra_cuda_cflags=["-O3"],
+                extra_include_paths=inc,
+                extra_ldflags=ld,
+                verbose=False,
+            )
+        except Exception as e:  # pragma: no cover - fallback safety
+            print(f"[glm52_fused_moe] CUDA compile failed, using torch fallback: {e}")
+            _COMPILE_FAILED = True
+            _EXT = None
+    return _EXT
+
+
+class Model(nn.Module):
+    def __init__(self, T, E, top_k, n_shared, H, I):
+        super().__init__()
+        self.T, self.E, self.top_k = T, E, top_k
+        self.n_shared, self.H, self.I = n_shared, H, I
+        self.w1_routed = nn.Parameter(torch.empty(E, 2 * I, H, dtype=torch.bfloat16))
+        self.w2_routed = nn.Parameter(torch.empty(E, H, I, dtype=torch.bfloat16))
+        self.w1_shared = nn.Parameter(torch.empty(n_shared, 2 * I, H, dtype=torch.bfloat16))
+        self.w2_shared = nn.Parameter(torch.empty(n_shared, H, I, dtype=torch.bfloat16))
+        for p in self.parameters():
+            nn.init.normal_(p, std=0.02)
+
+    def forward(self, x, expert_ids, expert_weights):
+        ext = _get_ext()
+        if ext is None:
+            return self._forward_torch(x, expert_ids, expert_weights)
+        return self._forward_cuda(ext, x, expert_ids, expert_weights)
+
+    # ---------------------------------------------------------------- torch
+    def _forward_torch(self, x, expert_ids, expert_weights):
+        """Eager fallback (matches reference semantics) when CUDA is missing."""
+        T, H = x.shape
+        out = torch.zeros(T, H, device=x.device, dtype=torch.float32)
+        xf = x.float()
+        I = self.I
+        for s in range(self.n_shared):
+            w1 = self.w1_shared[s].float()
+            w2 = self.w2_shared[s].float()
+            gate = xf @ w1[:I].t()
+            up = xf @ w1[I:].t()
+            h = torch.nn.functional.silu(gate) * up
+            out = out + h @ w2.t()
+        wts = expert_weights.float()
+        for e in range(self.E):
+            mask = expert_ids == e
+            if not mask.any():
+                continue
+            token_idx, k_idx = mask.nonzero(as_tuple=True)
+            w1 = self.w1_routed[e].float()
+            w2 = self.w2_routed[e].float()
+            x_e = xf[token_idx]
+            gate = x_e @ w1[:I].t()
+            up = x_e @ w1[I:].t()
+            y = (torch.nn.functional.silu(gate) * up) @ w2.t()
+            out.index_add_(0, token_idx, y * wts[token_idx, k_idx].unsqueeze(1))
+        return out.to(torch.bfloat16)
+
+    # ----------------------------------------------------------------- cuda
+    def _forward_cuda(self, ext, x, expert_ids, expert_weights):
+        T, H = x.shape
+        E = self.E
+        top_k = self.top_k
+        I = self.I
+        dev = x.device
+        S = T * top_k
+
+        # ---- shared expert: two dense GEMMs + fused activation ----
+        out_acc = None
+        for s in range(self.n_shared):
+            # C = x @ w1_shared^T ; bmm_f32(A=x, B=w1) returns (1, 2I, T) = C^T
+            c1 = ext.bmm_f32(x.unsqueeze(0), self.w1_shared[s].unsqueeze(0))
+            c1 = c1.transpose(1, 2).contiguous().squeeze(0)   # (T, 2I) fp32
+            h1 = torch.empty(T, I, dtype=torch.bfloat16, device=dev)
+            ext.silu_mul_shared(c1, h1, T, I)
+            y = ext.bmm_f32(h1.unsqueeze(0), self.w2_shared[s].unsqueeze(0))
+            y = y.transpose(1, 2).contiguous().squeeze(0)      # (T, H) fp32
+            out_acc = y if out_acc is None else out_acc + y
+
+        # ---- routed: count -> scan -> used list (deterministic) ----
+        counts = torch.zeros(E, dtype=torch.int32, device=dev)
+        ext.count_experts(expert_ids, counts, S, top_k)
+        offsets = torch.zeros(E + 1, dtype=torch.int32, device=dev)
+        torch.cumsum(counts, 0, out=offsets.narrow(0, 1, E))
+        is_used = counts > 0
+        G = int(is_used.sum().item())
+        g = (torch.cumsum(is_used.to(torch.int32), 0) - is_used.to(torch.int32)).to(torch.int32)
+        used_index = torch.where(is_used, g, torch.full_like(g, -1))
+        used_e = torch.nonzero(is_used).flatten().to(torch.int64)
+        M_pad = int(((int(counts.max().item()) + 7) // 8) * 8)
+        M_pad = max(M_pad, 8)
+
+        if G == E:
+            W1 = self.w1_routed
+            W2 = self.w2_routed
+        else:
+            W1 = self.w1_routed.index_select(0, used_e)
+            W2 = self.w2_routed.index_select(0, used_e)
+
+        counts_used = counts.index_select(0, used_e).contiguous()
+
+        # ---- fill slots + gather x rows into padded per-expert A ----
+        cursor = torch.zeros(E, dtype=torch.int32, device=dev)
+        slot_token = torch.empty(S, dtype=torch.int32, device=dev)
+        slot_row = torch.empty(S, dtype=torch.int32, device=dev)
+        token_by_row = torch.empty(G * M_pad, dtype=torch.int32, device=dev)
+        weight_by_row = torch.empty(G * M_pad, dtype=torch.bfloat16, device=dev)
+        X_pad = torch.empty(G, M_pad, H, dtype=torch.bfloat16, device=dev)
+        ext.fill_slots(expert_ids, expert_weights, offsets, used_index, cursor,
+                       slot_token, slot_row, token_by_row, weight_by_row,
+                       S, top_k, M_pad)
+        ext.fill_xpad(slot_token, slot_row, x, X_pad, S, H)
+
+        # ---- GEMM1 (gate|up) + fused activation (reads transposed C1^T) ----
+        C1t = ext.bmm_f32(X_pad, W1)                             # (G, 2I, M_pad) fp32
+        H1 = torch.empty(G, M_pad, I, dtype=torch.bfloat16, device=dev)
+        ext.silu_mul_routed(C1t, H1, counts_used, G, M_pad, I)
+
+        # ---- GEMM2 (down): C2t = H1 @ W2^T, fp32 out ----
+        C2t = ext.bmm_f32(H1, W2)                                # (G, H, M_pad) fp32
+
+        # ---- weighted scatter-add (reads transposed C2^T) ----
+        ext.reduce_add(out_acc, C2t, token_by_row, weight_by_row,
+                       counts_used, G, H, M_pad)
+
+        return out_acc.to(torch.bfloat16)

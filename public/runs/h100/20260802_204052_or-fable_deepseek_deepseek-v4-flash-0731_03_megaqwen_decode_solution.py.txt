@@ -1,0 +1,762 @@
+"""Qwen3-0.6B-geometry multi-layer decode in CUDA (H100 / SM90).
+
+A persistent grid-wide barrier megakernel that fuses the entire 4-layer block
+stack for a whole batch of decode steps into a single launch. Per layer:
+RMSNorm -> QKV -> Q/K RMSNorm -> RoPE -> split flash-decoding GQA -> O -> residual
+-> RMSNorm -> SwiGLU -> down -> residual. KV cache is streamed from global
+memory; weights are read via __ldg (read-only/L2 path). A single atomic
+counter+sense grid barrier (one block per SM) replaces cooperative groups,
+cutting grid sync latency and launch overhead to ~1 barrier per phase.
+"""
+import ctypes
+import math
+
+import torch
+import torch.nn as nn
+
+from cuda.bindings import nvrtc, driver as drv
+
+# ----------------------------------------------------------------------------
+# Geometry (fixed, Qwen3-0.6B / MegaQwen)
+# ----------------------------------------------------------------------------
+HIDDEN = 1024
+INTERMEDIATE = 3072
+NUM_Q = 16
+NUM_KV = 8
+HEAD_DIM = 128
+NUM_LAYERS = 4
+EPS = 1e-6
+Q_SIZE = NUM_Q * HEAD_DIM
+KV_SIZE = NUM_KV * HEAD_DIM
+WNAMES = ["input_ln", "q_proj", "k_proj", "v_proj", "q_norm", "k_norm",
+          "o_proj", "post_ln", "gate_proj", "up_proj", "down_proj"]
+
+# ----------------------------------------------------------------------------
+# CUDA source (compiled once with NVRTC -> PTX -> JIT cubin)
+# ----------------------------------------------------------------------------
+CUDA_SRC = r'''
+#include <cuda_bf16.h>
+
+#define HIDDEN 1024
+#define INTERMEDIATE 3072
+#define NUM_Q 16
+#define NUM_KV 8
+#define HEAD_DIM 128
+#define Q_SIZE (NUM_Q * HEAD_DIM)
+#define KV_SIZE (NUM_KV * HEAD_DIM)
+#define TOTAL_QKV (Q_SIZE + KV_SIZE + KV_SIZE)
+#define EPS 1e-6f
+#define REP (NUM_Q / NUM_KV)
+
+
+__device__ __forceinline__ void grid_sync(int* count, unsigned int* sense, int nblk) {
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        __threadfence();
+        unsigned int s = *sense;
+        int prev = atomicAdd(count, 1);
+        if (prev == nblk - 1) {
+            *count = 0;
+            __threadfence();
+            *sense = s ^ 1u;
+        } else {
+            while (*(volatile unsigned int*)sense == s) {
+                __nanosleep(200);
+            }
+        }
+        __threadfence();
+    }
+    __syncthreads();
+}
+
+
+__device__ __forceinline__ float dot_ldg_bf16(const __nv_bfloat16* __restrict__ w,
+                                              const float* __restrict__ x, int n) {
+    float sum = 0.0f;
+    // n must be multiple of 8
+    const uint4* w4 = reinterpret_cast<const uint4*>(w);
+    #pragma unroll
+    for (int k = threadIdx.x & 31; k < n / 8; k += 32) {
+        uint4 v = __ldg(w4 + k);
+        const __nv_bfloat16* b = reinterpret_cast<const __nv_bfloat16*>(&v);
+        #pragma unroll
+        for (int j = 0; j < 8; j++) {
+            sum += __bfloat162float(b[j]) * x[k * 8 + j];
+        }
+    }
+    return sum;
+}
+
+#define BLOCK_SIZE 256
+#define NUM_WARPS (BLOCK_SIZE / 32)
+
+struct LayerWeights {
+    const __nv_bfloat16* input_ln;
+    const __nv_bfloat16* q_proj;
+    const __nv_bfloat16* k_proj;
+    const __nv_bfloat16* v_proj;
+    const __nv_bfloat16* q_norm;
+    const __nv_bfloat16* k_norm;
+    const __nv_bfloat16* o_proj;
+    const __nv_bfloat16* post_ln;
+    const __nv_bfloat16* gate_proj;
+    const __nv_bfloat16* up_proj;
+    const __nv_bfloat16* down_proj;
+};
+
+__device__ __forceinline__ float warp_reduce_sum(float v) {
+    #pragma unroll
+    for (int o = 16; o > 0; o >>= 1) v += __shfl_down_sync(0xffffffffu, v, o);
+    return v;
+}
+
+__device__ __forceinline__ float silu(float x) { return x / (1.0f + expf(-x)); }
+
+__device__ __forceinline__ void prefetch_range(const __nv_bfloat16* p, int n, int chunk_id, int num_chunks) {
+    int per = (n + num_chunks - 1) / num_chunks;
+    int s = chunk_id * per;
+    int e = min(s + per, n);
+    float acc = 0.0f;
+    for (int i = s + threadIdx.x; i < e; i += BLOCK_SIZE * 4) {
+        acc += __bfloat162float(__ldg(p + i));
+    }
+    __shared__ float s_dummy;
+    if (acc == 12345.6789f) s_dummy = acc;
+}
+
+// process one layer for one decode step
+__device__ __forceinline__ void process_layer(
+    const LayerWeights& w,
+    int* g_count, unsigned int* g_sense, int nblk,
+    __nv_bfloat16* __restrict__ k_cache,
+    __nv_bfloat16* __restrict__ v_cache,
+    const float* __restrict__ cos_table,
+    const float* __restrict__ sin_table,
+    const __nv_bfloat16* __restrict__ mix_in,   // if do_mix, the step input vector
+    int do_mix,
+    int pos, int max_seq,
+    float* __restrict__ g_q, float* __restrict__ g_k, float* __restrict__ g_v,
+    float* __restrict__ g_attn, float* __restrict__ g_act, float* __restrict__ g_mlp,
+    float* __restrict__ g_pm, float* __restrict__ g_pl, float* __restrict__ g_po,
+    __nv_bfloat16* __restrict__ h_buf,
+    int attn_chunks, int attn_blocks, float attn_scale)
+{
+    const int bid = blockIdx.x;
+    const int tid = threadIdx.x;
+    const int warp = tid >> 5;
+    const int lane = tid & 31;
+
+    __shared__ float s_norm[HIDDEN];
+    __shared__ float s_resid[HIDDEN];
+    __shared__ float s_red[NUM_WARPS];
+
+    // ---- Phase 1: RMSNorm (redundant) + optional input mixing ----
+    float local_ss = 0.0f;
+    for (int i = tid; i < HIDDEN; i += BLOCK_SIZE) {
+        float hval = __bfloat162float(h_buf[i]);
+        float v = hval;
+        if (do_mix) {
+            float xin = __bfloat162float(mix_in[i]);
+            v = __bfloat162float(__float2bfloat16(0.5f * xin + 0.5f * hval));
+        }
+        s_norm[i] = v;
+        s_resid[i] = v;
+        local_ss += v * v;
+    }
+    local_ss = warp_reduce_sum(local_ss);
+    if (lane == 0) s_red[warp] = local_ss;
+    __syncthreads();
+    float ss = (tid < NUM_WARPS) ? s_red[tid] : 0.0f;
+    if (warp == 0) ss = warp_reduce_sum(ss);
+    if (warp == 0 && lane == 0) s_red[0] = ss;
+    __syncthreads();
+    float rstd = rsqrtf(s_red[0] / (float)HIDDEN + EPS);
+    for (int i = tid; i < HIDDEN; i += BLOCK_SIZE) {
+        s_norm[i] = s_norm[i] * rstd * __bfloat162float(w.input_ln[i]);
+    }
+    __syncthreads();
+
+    // ---- Phase 2: QKV GEMV (rows split across blocks) ----
+    const int rows_per_block = (TOTAL_QKV + nblk - 1) / nblk;
+    int r0 = bid * rows_per_block;
+    int r1 = min(r0 + rows_per_block, TOTAL_QKV);
+    for (int m = r0 + warp; m < r1; m += NUM_WARPS) {
+        const __nv_bfloat16* wrow;
+        float* out;
+        if (m < Q_SIZE) { wrow = w.q_proj + m * HIDDEN; out = g_q + m; }
+        else if (m < Q_SIZE + KV_SIZE) { int oi = m - Q_SIZE; wrow = w.k_proj + oi * HIDDEN; out = g_k + oi; }
+        else { int oi = m - Q_SIZE - KV_SIZE; wrow = w.v_proj + oi * HIDDEN; out = g_v + oi; }
+        float sum = dot_ldg_bf16(wrow, s_norm, HIDDEN);
+        sum = warp_reduce_sum(sum);
+        if (lane == 0) *out = sum;
+    }
+    grid_sync(g_count, g_sense, nblk);
+
+    // ---- Phase 3: QK norm + RoPE + cache write ----
+    const float* cos_pos = cos_table + pos * (HEAD_DIM / 2);
+    const float* sin_pos = sin_table + pos * (HEAD_DIM / 2);
+    const int qh = bid;
+    if (qh < NUM_Q) {
+        float* qhp = g_q + qh * HEAD_DIM;
+        float ssq = 0.0f;
+        for (int i = lane; i < HEAD_DIM; i += 32) { float v = qhp[i]; ssq += v * v; }
+        ssq = warp_reduce_sum(ssq);
+        float scale = rsqrtf(ssq / (float)HEAD_DIM + EPS);
+        scale = __shfl_sync(0xffffffffu, scale, 0);
+        float qrot[HEAD_DIM / 32];
+        #pragma unroll
+        for (int i = lane, j = 0; i < HEAD_DIM; i += 32, j++) {
+            qrot[j] = qhp[i] * scale * __bfloat162float(w.q_norm[i]);
+        }
+        #pragma unroll
+        for (int i = lane, j = 0; i < HEAD_DIM; i += 32, j++) {
+            float val;
+            if (i < HEAD_DIM / 2) {
+                int pi = i + HEAD_DIM / 2;
+                float pair = __shfl_sync(0xffffffffu, qrot[pi / 32], pi % 32);
+                val = qrot[j] * cos_pos[i] - pair * sin_pos[i];
+            } else {
+                int pi = i - HEAD_DIM / 2;
+                float pair = __shfl_sync(0xffffffffu, qrot[pi / 32], pi % 32);
+                val = pair * sin_pos[pi] + qrot[j] * cos_pos[pi];
+            }
+            qhp[i] = val;
+        }
+    }
+    const int kvh = bid - NUM_Q;
+    if (kvh >= 0 && kvh < NUM_KV) {
+        float* kp = g_k + kvh * HEAD_DIM;
+        float* vp = g_v + kvh * HEAD_DIM;
+        __nv_bfloat16* kc = k_cache + kvh * max_seq * HEAD_DIM + pos * HEAD_DIM;
+        __nv_bfloat16* vc = v_cache + kvh * max_seq * HEAD_DIM + pos * HEAD_DIM;
+        float ssq = 0.0f;
+        for (int i = lane; i < HEAD_DIM; i += 32) { float v = kp[i]; ssq += v * v; }
+        ssq = warp_reduce_sum(ssq);
+        float scale = rsqrtf(ssq / (float)HEAD_DIM + EPS);
+        scale = __shfl_sync(0xffffffffu, scale, 0);
+        float krot[HEAD_DIM / 32];
+        #pragma unroll
+        for (int i = lane, j = 0; i < HEAD_DIM; i += 32, j++) {
+            krot[j] = kp[i] * scale * __bfloat162float(w.k_norm[i]);
+        }
+        #pragma unroll
+        for (int i = lane, j = 0; i < HEAD_DIM; i += 32, j++) {
+            float val;
+            if (i < HEAD_DIM / 2) {
+                int pi = i + HEAD_DIM / 2;
+                float pair = __shfl_sync(0xffffffffu, krot[pi / 32], pi % 32);
+                val = krot[j] * cos_pos[i] - pair * sin_pos[i];
+            } else {
+                int pi = i - HEAD_DIM / 2;
+                float pair = __shfl_sync(0xffffffffu, krot[pi / 32], pi % 32);
+                val = pair * sin_pos[pi] + krot[j] * cos_pos[pi];
+            }
+            kp[i] = val;
+            kc[i] = __float2bfloat16(val);
+            vc[i] = __float2bfloat16(vp[i]);
+        }
+    }
+    grid_sync(g_count, g_sense, nblk);
+
+    // ---- Phase 4: Attention (flash-decoding, kv-focused: each block reads a kv chunk once, computes both q heads) ----
+    const int clen = pos + 1;
+    const int num_chunks = attn_blocks / NUM_KV;
+    __shared__ float s_m[NUM_WARPS * 2], s_l[NUM_WARPS * 2];
+    __shared__ float s_a[NUM_WARPS * 2][HEAD_DIM];
+    if (bid < attn_blocks) {
+        const int kvh = bid % NUM_KV;       // kv head
+        const int ach = bid / NUM_KV;       // chunk
+        const int qh0 = 2 * kvh;            // two q heads
+        const int qh1 = 2 * kvh + 1;
+        const float* q0 = g_q + qh0 * HEAD_DIM;
+        const float* q1 = g_q + qh1 * HEAD_DIM;
+        const __nv_bfloat16* kc = k_cache + kvh * max_seq * HEAD_DIM;
+        const __nv_bfloat16* vc = v_cache + kvh * max_seq * HEAD_DIM;
+        int chunk_size = (clen + num_chunks - 1) / num_chunks;
+        int cs = ach * chunk_size;
+        int ce = min(cs + chunk_size, clen);
+        float m0 = -1e30f, l0 = 0.0f;
+        float m1 = -1e30f, l1 = 0.0f;
+        float acc0[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+        float acc1[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+        const int ATTN_BLK = 8;
+        for (int p0 = cs + warp; p0 < ce; p0 += NUM_WARPS * ATTN_BLK) {
+            uint2 kv[ATTN_BLK], vv[ATTN_BLK];
+            #pragma unroll
+            for (int j = 0; j < ATTN_BLK; j++) {
+                int p = p0 + j * NUM_WARPS;
+                if (p < ce) {
+                    kv[j] = __ldg(reinterpret_cast<const uint2*>(kc + p * HEAD_DIM) + lane);
+                    vv[j] = __ldg(reinterpret_cast<const uint2*>(vc + p * HEAD_DIM) + lane);
+                }
+            }
+            float sc0[ATTN_BLK], sc1[ATTN_BLK];
+            float mnew0 = m0, mnew1 = m1;
+            #pragma unroll
+            for (int j = 0; j < ATTN_BLK; j++) {
+                int p = p0 + j * NUM_WARPS;
+                if (p < ce) {
+                    const __nv_bfloat16* kb = reinterpret_cast<const __nv_bfloat16*>(&kv[j]);
+                    float s0 = 0.0f, s1 = 0.0f;
+                    #pragma unroll
+                    for (int i = 0; i < 4; i++) {
+                        float kbv = __bfloat162float(kb[i]);
+                        s0 += q0[lane * 4 + i] * kbv;
+                        s1 += q1[lane * 4 + i] * kbv;
+                    }
+                    sc0[j] = warp_reduce_sum(s0) * attn_scale;
+                    sc0[j] = __shfl_sync(0xffffffffu, sc0[j], 0);
+                    sc1[j] = warp_reduce_sum(s1) * attn_scale;
+                    sc1[j] = __shfl_sync(0xffffffffu, sc1[j], 0);
+                    mnew0 = fmaxf(mnew0, sc0[j]);
+                    mnew1 = fmaxf(mnew1, sc1[j]);
+                } else {
+                    sc0[j] = -1e30f;
+                    sc1[j] = -1e30f;
+                }
+            }
+            float alpha0 = __expf(m0 - mnew0);
+            float alpha1 = __expf(m1 - mnew1);
+            float lsum0 = 0.0f, lsum1 = 0.0f;
+            #pragma unroll
+            for (int j = 0; j < ATTN_BLK; j++) {
+                lsum0 += __expf(sc0[j] - mnew0);
+                lsum1 += __expf(sc1[j] - mnew1);
+            }
+            l0 = l0 * alpha0 + lsum0;
+            l1 = l1 * alpha1 + lsum1;
+            #pragma unroll
+            for (int i = 0; i < 4; i++) { acc0[i] *= alpha0; acc1[i] *= alpha1; }
+            #pragma unroll
+            for (int j = 0; j < ATTN_BLK; j++) {
+                int p = p0 + j * NUM_WARPS;
+                if (p < ce) {
+                    const __nv_bfloat16* vb = reinterpret_cast<const __nv_bfloat16*>(&vv[j]);
+                    float beta0 = __expf(sc0[j] - mnew0);
+                    float beta1 = __expf(sc1[j] - mnew1);
+                    #pragma unroll
+                    for (int i = 0; i < 4; i++) {
+                        float vbv = __bfloat162float(vb[i]);
+                        acc0[i] += beta0 * vbv;
+                        acc1[i] += beta1 * vbv;
+                    }
+                }
+            }
+            m0 = mnew0;
+            m1 = mnew1;
+        }
+        // combine warps within block for BOTH q heads
+        if (lane == 0) { s_m[warp] = m0; s_l[warp] = l0; s_m[NUM_WARPS + warp] = m1; s_l[NUM_WARPS + warp] = l1; }
+        #pragma unroll
+        for (int j = 0; j < 4; j++) { s_a[warp][lane * 4 + j] = acc0[j]; s_a[NUM_WARPS + warp][lane * 4 + j] = acc1[j]; }
+        __syncthreads();
+        if (warp == 0) {
+            float gm0 = s_m[0], gm1 = s_m[NUM_WARPS];
+            #pragma unroll
+            for (int ww = 1; ww < NUM_WARPS; ww++) { gm0 = fmaxf(gm0, s_m[ww]); gm1 = fmaxf(gm1, s_m[NUM_WARPS + ww]); }
+            float gl0 = 0.0f, gl1 = 0.0f;
+            float gacc0[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+            float gacc1[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+            #pragma unroll
+            for (int ww = 0; ww < NUM_WARPS; ww++) {
+                float a0 = __expf(s_m[ww] - gm0);
+                float a1 = __expf(s_m[NUM_WARPS + ww] - gm1);
+                gl0 += s_l[ww] * a0;
+                gl1 += s_l[NUM_WARPS + ww] * a1;
+                #pragma unroll
+                for (int j = 0; j < 4; j++) {
+                    gacc0[j] += s_a[ww][lane * 4 + j] * a0;
+                    gacc1[j] += s_a[NUM_WARPS + ww][lane * 4 + j] * a1;
+                }
+            }
+            const int pi0 = qh0 * num_chunks + ach;
+            const int pi1 = qh1 * num_chunks + ach;
+            g_pm[pi0] = gm0;
+            g_pl[pi0] = gl0;
+            g_pm[pi1] = gm1;
+            g_pl[pi1] = gl1;
+            #pragma unroll
+            for (int j = 0; j < 4; j++) {
+                g_po[pi0 * HEAD_DIM + lane * 4 + j] = gacc0[j];
+                g_po[pi1 * HEAD_DIM + lane * 4 + j] = gacc1[j];
+            }
+        }
+    } else {
+        // prefetch O/gate/up weights into L2
+        int pf = bid - attn_blocks;
+        int npf = nblk - attn_blocks;
+        prefetch_range(w.o_proj, Q_SIZE * HIDDEN, pf, npf);
+        prefetch_range(w.gate_proj, HIDDEN * INTERMEDIATE, pf, npf);
+        prefetch_range(w.up_proj, HIDDEN * INTERMEDIATE, pf, npf);
+    }
+    grid_sync(g_count, g_sense, nblk);
+
+    // ---- Phase 5: Combine partials (16 blocks, one per q head) ----
+    if (bid < NUM_Q) {
+        const int num_chunks = attn_blocks / NUM_KV;
+        float gm = -1e30f;
+        for (int c = 0; c < num_chunks; c++) {
+            int pb = bid * num_chunks + c;
+            gm = fmaxf(gm, g_pm[pb]);
+        }
+        float gl = 0.0f;
+        float gacc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+        for (int c = 0; c < num_chunks; c++) {
+            int pb = bid * num_chunks + c;
+            float a = __expf(g_pm[pb] - gm);
+            gl += g_pl[pb] * a;
+            const float* po = g_po + pb * HEAD_DIM;
+            #pragma unroll
+            for (int j = 0; j < 4; j++) gacc[j] += po[lane * 4 + j] * a;
+        }
+        float* out = g_attn + bid * HEAD_DIM;
+        #pragma unroll
+        for (int j = 0; j < 4; j++) out[lane * 4 + j] = gacc[j] / gl;
+    } else {
+        int pf = bid - NUM_Q;
+        int npf = nblk - NUM_Q;
+        prefetch_range(w.down_proj, HIDDEN * INTERMEDIATE, pf, npf);
+    }
+    grid_sync(g_count, g_sense, nblk);
+
+    // ---- Phase 6: O proj + residual ----
+    int hpb = (HIDDEN + nblk - 1) / nblk;
+    int h0 = bid * hpb;
+    int h1 = min(h0 + hpb, HIDDEN);
+    for (int m = h0 + warp; m < h1; m += NUM_WARPS) {
+        const __nv_bfloat16* orow = w.o_proj + m * Q_SIZE;
+        float sum = dot_ldg_bf16(orow, g_attn, Q_SIZE);
+        sum = warp_reduce_sum(sum);
+        if (lane == 0) g_act[m] = sum + s_resid[m];
+    }
+    grid_sync(g_count, g_sense, nblk);
+
+    // ---- Phase 7: post-RMSNorm (redundant) + gate/up ----
+    __shared__ float s_mlp[HIDDEN];
+    float l2 = 0.0f;
+    for (int i = tid; i < HIDDEN; i += BLOCK_SIZE) { float v = g_act[i]; s_mlp[i] = v; l2 += v * v; }
+    l2 = warp_reduce_sum(l2);
+    if (lane == 0) s_red[warp] = l2;
+    __syncthreads();
+    float ss2 = (tid < NUM_WARPS) ? s_red[tid] : 0.0f;
+    if (warp == 0) ss2 = warp_reduce_sum(ss2);
+    if (warp == 0 && lane == 0) s_red[0] = ss2;
+    __syncthreads();
+    float rstd2 = rsqrtf(s_red[0] / (float)HIDDEN + EPS);
+    for (int i = tid; i < HIDDEN; i += BLOCK_SIZE) {
+        s_mlp[i] = s_mlp[i] * rstd2 * __bfloat162float(w.post_ln[i]);
+    }
+    __syncthreads();
+    int ipb = (INTERMEDIATE + nblk - 1) / nblk;
+    int i0 = bid * ipb;
+    int i1 = min(i0 + ipb, INTERMEDIATE);
+    for (int m = i0 + warp; m < i1; m += NUM_WARPS) {
+        const __nv_bfloat16* grow = w.gate_proj + m * HIDDEN;
+        const __nv_bfloat16* urow = w.up_proj + m * HIDDEN;
+        float gsum = dot_ldg_bf16(grow, s_mlp, HIDDEN);
+        float usum = dot_ldg_bf16(urow, s_mlp, HIDDEN);
+        gsum = warp_reduce_sum(gsum);
+        usum = warp_reduce_sum(usum);
+        if (lane == 0) g_mlp[m] = silu(gsum) * usum;
+    }
+    grid_sync(g_count, g_sense, nblk);
+
+    // ---- Phase 8: down + residual ----
+    for (int m = h0 + warp; m < h1; m += NUM_WARPS) {
+        const __nv_bfloat16* drow = w.down_proj + m * INTERMEDIATE;
+        float sum = dot_ldg_bf16(drow, g_mlp, INTERMEDIATE);
+        sum = warp_reduce_sum(sum);
+        if (lane == 0) h_buf[m] = __float2bfloat16(sum + g_act[m]);
+    }
+    grid_sync(g_count, g_sense, nblk);
+}
+
+extern "C" __global__ void __launch_bounds__(BLOCK_SIZE, 2)
+decode_steps_kernel(
+    const __nv_bfloat16* __restrict__ inputs,
+    const __nv_bfloat16* __restrict__ h_init,
+    __nv_bfloat16* __restrict__ h_out,
+    const LayerWeights* __restrict__ layers,
+    const float* __restrict__ cos_table,
+    const float* __restrict__ sin_table,
+    __nv_bfloat16* __restrict__ k_cache,
+    __nv_bfloat16* __restrict__ v_cache,
+    float* __restrict__ g_q, float* __restrict__ g_k, float* __restrict__ g_v,
+    float* __restrict__ g_attn, float* __restrict__ g_act, float* __restrict__ g_mlp,
+    float* __restrict__ g_pm, float* __restrict__ g_pl, float* __restrict__ g_po,
+    __nv_bfloat16* __restrict__ h_buf,
+    int* g_count, unsigned int* g_sense,
+    int n_steps, int start_pos, int max_seq, int num_layers,
+    int attn_chunks, int attn_blocks, float attn_scale)
+{
+    const int tid = threadIdx.x;
+    const int nblk = gridDim.x;
+    const int layer_stride = NUM_KV * max_seq * HEAD_DIM;
+
+    for (int i = tid; i < HIDDEN; i += BLOCK_SIZE) h_buf[i] = h_init[i];
+    grid_sync(g_count, g_sense, nblk);
+
+    for (int step = 0; step < n_steps; step++) {
+        const int pos = start_pos + step;
+        const __nv_bfloat16* mix_in = inputs + step * HIDDEN;
+        for (int layer = 0; layer < num_layers; layer++) {
+            const LayerWeights& w = layers[layer];
+            __nv_bfloat16* lk = k_cache + layer * layer_stride;
+            __nv_bfloat16* lv = v_cache + layer * layer_stride;
+            process_layer(w, g_count, g_sense, gridDim.x, lk, lv, cos_table, sin_table,
+                          mix_in, (layer == 0) ? 1 : 0, pos, max_seq,
+                          g_q, g_k, g_v, g_attn, g_act, g_mlp,
+                          g_pm, g_pl, g_po, h_buf, attn_chunks, attn_blocks, attn_scale);
+        }
+    }
+    for (int i = tid; i < HIDDEN; i += BLOCK_SIZE) h_out[i] = h_buf[i];
+}
+
+'''
+
+_NVRTC_CACHE = {}
+_NVRTC_INCLUDE = None
+
+
+def _include_dir():
+    global _NVRTC_INCLUDE
+    if _NVRTC_INCLUDE is None:
+        import glob
+        import os
+        cands = []
+        try:
+            import nvidia.cuda_runtime as _cr
+            cands.append(os.path.join(os.path.dirname(_cr.__file__), "include"))
+        except Exception:
+            pass
+        cands += sorted(
+            glob.glob("/home/shadeform/**/nvidia/cuda_runtime/include", recursive=True)
+        )
+        for c in cands:
+            if c and os.path.exists(os.path.join(c, "cuda_bf16.h")):
+                _NVRTC_INCLUDE = c
+                break
+    return _NVRTC_INCLUDE
+
+
+def _get_kernel():
+    if "fn" in _NVRTC_CACHE:
+        return _NVRTC_CACHE["fn"]
+    src = CUDA_SRC.encode()
+    r, prog = nvrtc.nvrtcCreateProgram(src, b"megaqwen_decode.cu", 0, [], [])
+    assert r == 0, r
+    inc = _include_dir()
+    opts = [b"--gpu-architecture=compute_90", b"--std=c++17"]
+    if inc:
+        opts.append(("--include-path=" + inc).encode())
+    r = nvrtc.nvrtcCompileProgram(prog, len(opts), opts)[0]
+    if r != 0:
+        sz = nvrtc.nvrtcGetProgramLogSize(prog)[1]
+        buf = bytes(sz)
+        nvrtc.nvrtcGetProgramLog(prog, buf)
+        raise RuntimeError("NVRTC compile failed:\n" + buf.decode())
+    sz = nvrtc.nvrtcGetPTXSize(prog)[1]
+    ptx = bytes(sz)
+    nvrtc.nvrtcGetPTX(prog, ptx)
+    nvrtc.nvrtcDestroyProgram(prog)
+    torch.zeros(1, device="cuda")
+    r, mod = drv.cuModuleLoadData(ptx)
+    assert r == 0, r
+    r, fn = drv.cuModuleGetFunction(mod, b"decode_steps_kernel")
+    assert r == 0, r
+    _NVRTC_CACHE["fn"] = fn
+    return fn
+
+
+def _launch(fn, grid, block, args, shared=0):
+    cts = []
+    ptrs = []
+    for a in args:
+        if isinstance(a, ctypes.c_void_p):
+            c = a
+        elif isinstance(a, bool) or isinstance(a, int):
+            c = ctypes.c_int(a)
+        elif isinstance(a, float):
+            c = ctypes.c_float(a)
+        else:
+            c = ctypes.c_void_p(a)
+        cts.append(c)
+        ptrs.append(ctypes.c_void_p(ctypes.addressof(c)))
+    arr = (ctypes.c_void_p * len(ptrs))(*ptrs)
+    err = drv.cuLaunchKernel(
+        fn, grid[0], grid[1], grid[2], block[0], block[1], block[2],
+        shared, 0, arr, 0,
+    )
+    assert err[0] == 0, err
+
+
+def _ptr(t):
+    return ctypes.c_void_p(t.data_ptr())
+
+
+# ----------------------------------------------------------------------------
+# Model (same state_dict as reference.Model)
+# ----------------------------------------------------------------------------
+class Block(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.input_ln = nn.Parameter(torch.ones(HIDDEN, dtype=torch.bfloat16))
+        self.q_proj = nn.Parameter(torch.empty(NUM_Q * HEAD_DIM, HIDDEN, dtype=torch.bfloat16))
+        self.k_proj = nn.Parameter(torch.empty(NUM_KV * HEAD_DIM, HIDDEN, dtype=torch.bfloat16))
+        self.v_proj = nn.Parameter(torch.empty(NUM_KV * HEAD_DIM, HIDDEN, dtype=torch.bfloat16))
+        self.q_norm = nn.Parameter(torch.ones(HEAD_DIM, dtype=torch.bfloat16))
+        self.k_norm = nn.Parameter(torch.ones(HEAD_DIM, dtype=torch.bfloat16))
+        self.o_proj = nn.Parameter(torch.empty(HIDDEN, NUM_Q * HEAD_DIM, dtype=torch.bfloat16))
+        self.post_ln = nn.Parameter(torch.ones(HIDDEN, dtype=torch.bfloat16))
+        self.gate_proj = nn.Parameter(torch.empty(INTERMEDIATE, HIDDEN, dtype=torch.bfloat16))
+        self.up_proj = nn.Parameter(torch.empty(INTERMEDIATE, HIDDEN, dtype=torch.bfloat16))
+        self.down_proj = nn.Parameter(torch.empty(HIDDEN, INTERMEDIATE, dtype=torch.bfloat16))
+        for p in self.parameters():
+            if p is self.input_ln or p is self.post_ln or p is self.q_norm or p is self.k_norm:
+                continue
+            nn.init.normal_(p, std=0.02)
+
+
+class Model(nn.Module):
+    def __init__(self, num_layers: int = NUM_LAYERS, max_seq: int = 131072):
+        super().__init__()
+        self.num_layers = num_layers
+        self.max_seq = max_seq
+        self.blocks = nn.ModuleList([Block() for _ in range(num_layers)])
+        self._meta = None
+        self._tables = None
+
+    def _build_meta(self):
+        n = len(self.blocks)
+        meta = torch.empty(n, 11, dtype=torch.int64, device="cuda")
+        for i, blk in enumerate(self.blocks):
+            for j, name in enumerate(WNAMES):
+                meta[i, j] = getattr(blk, name).data_ptr()
+        self._meta = meta
+        return meta
+
+    def _get_meta(self):
+        if self._meta is None:
+            self._meta = self._build_meta()
+        return self._meta
+
+    def _get_tables(self):
+        if self._tables is None:
+            half = HEAD_DIM // 2
+            inv = 1.0 / (10000 ** (torch.arange(0, half, dtype=torch.float32) / half))
+            pos = torch.arange(0, self.max_seq, dtype=torch.float32)
+            freqs = torch.outer(pos, inv)
+            self._tables = (
+                freqs.cos().contiguous().cuda(),
+                freqs.sin().contiguous().cuda(),
+            )
+        return self._tables
+
+
+# ----------------------------------------------------------------------------
+# Scratch buffers (per call)
+# ----------------------------------------------------------------------------
+def _alloc_scratch(device="cuda"):
+    g_q = torch.empty(Q_SIZE, dtype=torch.float32, device=device)
+    g_k = torch.empty(KV_SIZE, dtype=torch.float32, device=device)
+    g_v = torch.empty(KV_SIZE, dtype=torch.float32, device=device)
+    g_attn = torch.empty(Q_SIZE, dtype=torch.float32, device=device)
+    g_act = torch.empty(HIDDEN, dtype=torch.float32, device=device)
+    g_mlp = torch.empty(INTERMEDIATE, dtype=torch.float32, device=device)
+    g_pm = torch.empty(1024, dtype=torch.float32, device=device)
+    g_pl = torch.empty(1024, dtype=torch.float32, device=device)
+    g_po = torch.empty(1024 * HEAD_DIM, dtype=torch.float32, device=device)
+    h_buf = torch.empty(HIDDEN, dtype=torch.bfloat16, device=device)
+    return g_q, g_k, g_v, g_attn, g_act, g_mlp, g_pm, g_pl, g_po, h_buf
+
+
+def _nblocks():
+    return torch.cuda.get_device_properties(0).multi_processor_count
+
+
+def _run_steps(model, h, inputs, k_cache, v_cache, start_pos, n_steps):
+    fn = _get_kernel()
+    meta = model._get_meta()
+    cos, sin = model._get_tables()
+    nblk = _nblocks() * 2
+    g_q, g_k, g_v, g_attn, g_act, g_mlp, g_pm, g_pl, g_po, h_buf = _alloc_scratch()
+    g_count = torch.zeros(1, dtype=torch.int32, device="cuda")
+    g_sense = torch.zeros(1, dtype=torch.int32, device="cuda")
+    h_out = torch.empty_like(h)
+    attn_blocks = (nblk // NUM_KV) * NUM_KV
+    attn_chunks = attn_blocks // NUM_Q
+    max_seq = model.max_seq
+    args = [
+        _ptr(inputs), _ptr(h), _ptr(h_out), _ptr(meta), _ptr(cos), _ptr(sin),
+        _ptr(k_cache), _ptr(v_cache),
+        _ptr(g_q), _ptr(g_k), _ptr(g_v), _ptr(g_attn), _ptr(g_act), _ptr(g_mlp),
+        _ptr(g_pm), _ptr(g_pl), _ptr(g_po), _ptr(h_buf),
+        _ptr(g_count), _ptr(g_sense),
+        n_steps, start_pos, max_seq, model.num_layers,
+        attn_chunks, attn_blocks, 1.0 / math.sqrt(HEAD_DIM),
+    ]
+    _launch(fn, (nblk, 1, 1), (256, 1, 1), args)
+    return h_out, k_cache, v_cache
+
+
+# ----------------------------------------------------------------------------
+# Public API
+# ----------------------------------------------------------------------------
+def empty_caches(num_layers, max_seq, device="cuda"):
+    shape = (num_layers, NUM_KV, max_seq, HEAD_DIM)
+    return (
+        torch.zeros(shape, dtype=torch.bfloat16, device=device),
+        torch.zeros(shape, dtype=torch.bfloat16, device=device),
+    )
+
+
+@torch.no_grad()
+def prefill(model, ctx_len, seed, device=None):
+    device = device or str(next(model.parameters()).device)
+    model = model.to(device).eval()
+    assert ctx_len <= model.max_seq
+    h = _seeded_hidden(seed, device)
+    k_caches, v_caches = empty_caches(model.num_layers, model.max_seq, device)
+    g = torch.Generator(device="cpu")
+    g.manual_seed(seed + 1)
+    CHUNK = 256
+    for c0 in range(0, ctx_len, CHUNK):
+        n = min(CHUNK, ctx_len - c0)
+        inputs = torch.randn(n, HIDDEN, generator=g, dtype=torch.bfloat16).to(device)
+        h, k_caches, v_caches = _run_steps(model, h, inputs, k_caches, v_caches, c0, n)
+    return h, k_caches, v_caches
+
+
+@torch.no_grad()
+def decode_steps(model, hidden, k_caches, v_caches, start_pos, n_steps, seed):
+    g = torch.Generator(device="cpu")
+    g.manual_seed(seed + 2)
+    inputs = torch.randn(n_steps, HIDDEN, generator=g, dtype=torch.bfloat16).to(hidden.device)
+    return _run_steps(model, hidden, inputs, k_caches, v_caches, start_pos, n_steps)
+
+
+def run(ctx_len, n_decode, seed, model=None, max_seq=None):
+    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    max_seq = max_seq or max(ctx_len + n_decode, 512)
+    if model is None:
+        model = Model(NUM_LAYERS, max_seq)
+    model = model.to(device).eval()
+    h, k_caches, v_caches = prefill(model, ctx_len, seed, device=device)
+    h, k_caches, v_caches = decode_steps(
+        model, h, k_caches, v_caches, start_pos=ctx_len, n_steps=n_decode, seed=seed
+    )
+    return {"last_hidden": h.detach()}
+
+
+def _seeded_hidden(seed, device):
+    g = torch.Generator(device="cpu")
+    g.manual_seed(seed)
+    return torch.randn(HIDDEN, generator=g, dtype=torch.bfloat16).to(device)
+
+
+def get_init_inputs():
+    return [NUM_LAYERS, 131072]
+
+
+def get_inputs():
+    return []
