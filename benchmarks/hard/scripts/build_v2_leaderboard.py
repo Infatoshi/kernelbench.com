@@ -112,7 +112,7 @@ for rj in glob.glob(str(RUNS_DIR/"2026*/result.json")):
     # transcript tripwire below cannot catch every case: grok streaming
     # transcripts carry no tool events or paths, so a run that copied another
     # archive's solution can pass the regex clean (2026-07-21 B200 incident).
-    if ann.get(rid, (None, None))[0] == "contaminated":
+    if ann.get(rid, (None, None))[0] in {"contaminated", "contamination"}:
         print(f"  EXCLUDED (manual audit verdict=contaminated): {rid}", file=sys.stderr)
         continue
     if _contaminated(run_dir, rid):

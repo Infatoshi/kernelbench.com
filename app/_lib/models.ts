@@ -439,12 +439,19 @@ function chipFromCell(
       ...links,
     }
   }
-  // Fail chips: short catalog label (wrong / build / slow / empty / …)
-  const label = (c.outcome_label || outcome || "fail").slice(0, 8)
+  // Audit verdicts outrank generic harness outcomes. A mathematically passing
+  // run can still be quarantined, so do not render its catalog fallback as
+  // an ordinary "fail".
+  const label =
+    kind === "hack"
+      ? "flag"
+      : (c.outcome_label || outcome || "fail").slice(0, 8)
   const title =
-    OUTCOME_TITLE[outcome || ""] ||
-    c.failure_reason ||
-    OUTCOME_TITLE.other
+    kind === "hack"
+      ? OUTCOME_TITLE.flagged
+      : OUTCOME_TITLE[outcome || ""] ||
+        c.failure_reason ||
+        OUTCOME_TITLE.other
   return {
     problem: prob,
     short,

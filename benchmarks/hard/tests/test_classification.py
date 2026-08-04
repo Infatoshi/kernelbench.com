@@ -104,3 +104,63 @@ def test_provider_detection_uses_stderr_for_plain_cli_errors(
     )
     assert result["failure_reason"] == "provider_insufficient_credits"
     assert result["retryable_infra_failure"] is False
+
+
+
+def test_terminal_tool_use_without_solution_is_retryable(tmp_path: Path) -> None:
+    transcript = tmp_path / "transcript.jsonl"
+    transcript.write_text(
+        json.dumps(
+            {
+                "is_error": False,
+                "num_turns": 30,
+                "stop_reason": "tool_use",
+                "usage": {"output_tokens": 58_760},
+            }
+        )
+    )
+
+    result = classify_run(
+        usage={"output_tokens": 58_760},
+        correct=False,
+        template_mutated=False,
+        has_solution=False,
+        session_complete=True,
+        harness_exit=0,
+        check_exit=None,
+        bench_exit=None,
+        log_file=transcript,
+        stderr_file=None,
+        minimum_useful_output_tokens=5_000,
+    )
+    assert result["failure_reason"] == "provider_early_stop"
+    assert result["retryable_infra_failure"] is True
+
+
+def test_provider_model_unavailable_is_retryable(tmp_path: Path) -> None:
+    transcript = tmp_path / "transcript.jsonl"
+    transcript.write_text(
+        json.dumps(
+            {
+                "type": "assistant",
+                "is_api_error_message": True,
+                "error": "model_not_found",
+            }
+        )
+    )
+
+    result = classify_run(
+        usage={"output_tokens": None},
+        correct=False,
+        template_mutated=False,
+        has_solution=False,
+        session_complete=True,
+        harness_exit=1,
+        check_exit=None,
+        bench_exit=None,
+        log_file=transcript,
+        stderr_file=None,
+        minimum_useful_output_tokens=5_000,
+    )
+    assert result["failure_reason"] == "provider_unavailable"
+    assert result["retryable_infra_failure"] is True

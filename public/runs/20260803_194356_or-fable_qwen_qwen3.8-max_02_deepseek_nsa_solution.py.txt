@@ -1,0 +1,589 @@
+"""CUDA sparse attention matching the bench-simplified NSA semantics.
+
+Design (single fused kernel per (batch*head, query-tile)):
+  1. Block importance for fully-causal blocks is linear in the keys:
+         mean_j (q . k_j) = q . mean_j(k_j)
+     so a small kernel precomputes block-mean keys M (fp32), and the fused
+     kernel scores full blocks with a skinny Q x M^T matmul (SIMT fp32).
+     Only each row's own (diagonal) block needs per-key partial scoring;
+     the CTA's diagonal key blocks are staged transposed into shared memory
+     once (overlaying the wave-slot region, which is unused until phase 4).
+  2. Top-8 selection per query row (ties -> higher block index, matching the
+     reference Python sort of (score, bi) descending).
+  3. Per-row key segments = selected blocks (causally clipped) plus the
+     sliding-window tokens not already covered by a selected block. Segments
+     are counting-sorted by block id into a pair list so phase 4 can consume
+     contiguous per-wave ranges without any per-wave scanning.
+  4. Sparse attention: waves of K/V blocks are staged cooperatively into
+     shared memory (K transposed for coalesced dots); each warp processes
+     (row, segment) pairs from the wave's range; rows map to warps by
+     row % WARPS so per-row online-softmax state stays warp-local.
+"""
+from __future__ import annotations
+
+import math
+import os
+
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+OP_TYPE = "deepseek_nsa"
+SUPPORTED_PRECISIONS = ["bf16"]
+HARDWARE_REQUIRED = ["RTX_PRO_6000"]
+
+B, H, S, D = 1, 16, 1024, 64
+BLOCK_SIZE = 64
+TOP_N_BLOCKS = 8
+SLIDING_WINDOW = 64
+
+_MAX_S = 10240  # block-index arrays are statically sized for S <= this
+
+_CUDA_SRC = r"""
+#include <torch/extension.h>
+#include <ATen/cuda/CUDAContext.h>
+#include <cuda_bf16.h>
+
+#define TOPN 8
+#define MAXSEG 10
+#define MAXNB 160
+#define NEG_INF (-INFINITY)
+
+// ---------------------------------------------------------------------------
+// Block-mean keys: MT[bh][d][b] = mean of K[bh][b*64 + j][d] over valid j.
+// ---------------------------------------------------------------------------
+template <int D>
+__global__ void block_means_kernel(const __nv_bfloat16* __restrict__ K,
+                                   float* __restrict__ MT, int S, int nb) {
+  int b = blockIdx.x;          // key block id
+  int bh = blockIdx.y;
+  int d = threadIdx.x;         // one thread per dim (D <= 128)
+  if (d >= D) return;
+  int s0 = b << 6;
+  int cnt = min(64, S - s0);
+  const __nv_bfloat16* kp = K + ((long)bh * S + s0) * D + d;
+  float acc = 0.f;
+  for (int j = 0; j < cnt; ++j) acc += __bfloat162float(kp[(long)j * D]);
+  MT[((long)bh * D + d) * nb + b] = acc / (float)cnt;
+}
+
+// better(a, b): strict ordering matching reference sort of (val, bi) desc.
+__device__ __forceinline__ bool better(float va, int ba, float vb, int bb) {
+  return va > vb || (va == vb && ba > bb);
+}
+
+// pair packing: row (7b) | block (8b) | lo_off (6b) | len-1 (6b)
+__device__ __forceinline__ unsigned int pack_pair(int row, int blk, int lo,
+                                                  int len) {
+  return (unsigned int)row | ((unsigned int)blk << 7) |
+         ((unsigned int)lo << 15) | ((unsigned int)(len - 1) << 21);
+}
+
+template <int D, int QT, int WB, int WARPS>
+__global__ void __launch_bounds__(WARPS * 32, 1)
+nsa_kernel(const __nv_bfloat16* __restrict__ Q,
+           const __nv_bfloat16* __restrict__ K,
+           const __nv_bfloat16* __restrict__ V,
+           const float* __restrict__ MT,
+           __nv_bfloat16* __restrict__ O, int S, int nb, float scale) {
+  constexpr int NT = WARPS * 32;
+  constexpr int RPW = QT / WARPS;  // rows per warp (state slots)
+  constexpr int LOGW = (WARPS == 8) ? 3 : 2;
+  constexpr int NDIAG = QT / 64 + 1;
+
+  int bh = blockIdx.y;
+  int q0 = blockIdx.x * QT;
+  int tid = threadIdx.x;
+  int warp = tid >> 5;
+  int lane = tid & 31;
+
+  extern __shared__ char smem_raw[];
+  // layout (mirrored in host smem_size())
+  __nv_bfloat16* q_s = (__nv_bfloat16*)smem_raw;                        // QT*D
+  unsigned short* idx_s = (unsigned short*)(smem_raw + QT * D * 2);     // QT*8
+  unsigned char* cnt_s = (unsigned char*)(idx_s + QT * TOPN);           // QT
+  unsigned char* seg_cnt = cnt_s + QT;                                  // QT
+  unsigned int* pairs = (unsigned int*)(seg_cnt + ((QT + 3) & ~3));     // QT*MAXSEG
+  unsigned short* blk_cnt = (unsigned short*)(pairs + QT * MAXSEG);     // MAXNB+1
+  unsigned short* blk_cur = blk_cnt + MAXNB + 1;                        // MAXNB
+  unsigned int* ubits = (unsigned int*)(blk_cur + MAXNB);               // MAXNB/32
+  unsigned short* ulist = (unsigned short*)(ubits + MAXNB / 32);        // MAXNB
+  short* bslot = (short*)(ulist + MAXNB);                               // MAXNB
+  unsigned short* wave_off = (unsigned short*)(bslot + MAXNB);          // MAXNB+1
+  int* n_union_p = (int*)(wave_off + MAXNB + 1);
+  // slots region: wave K/V blocks; ALSO hosts the staged diagonal blocks
+  // during phase 1 (waves only start after phase 3).
+  char* slots_base = (char*)n_union_p + 16;
+  constexpr int SLOT_BYTES = 2 * 64 * D * 2;
+  constexpr int DIAG_BYTES = NDIAG * 64 * D * 2;
+  static_assert(DIAG_BYTES <= WB * SLOT_BYTES, "diag overlay fits slots");
+
+  const long bhs = (long)bh * S;
+
+  // ---------------- Phase 0: load Q tile, zero counters, stage diag K ----
+  {
+    constexpr int ELEM8 = QT * D / 8;  // 16B chunks
+    for (int i = tid; i < ELEM8; i += NT) {
+      int row = (i * 8) / D;
+      int col = (i * 8) % D;
+      float4 z = make_float4(0.f, 0.f, 0.f, 0.f);
+      if (q0 + row < S) {
+        z = *(const float4*)(Q + (bhs + q0 + row) * D + col);
+      }
+      *(float4*)(q_s + row * D + col) = z;
+    }
+  }
+  for (int i = tid; i < MAXNB; i += NT) {
+    blk_cnt[i] = 0;
+    blk_cur[i] = 0;
+    if (i < MAXNB / 32) ubits[i] = 0;
+  }
+  // stage diagonal key blocks (transposed) covering [q0, q0+QT-1]
+  {
+    int bi0 = q0 >> 6;
+    int bi1 = min(nb - 1, (q0 + QT - 1) >> 6);
+    __nv_bfloat16* diag_s = (__nv_bfloat16*)slots_base;
+    for (int i = tid; i < NDIAG * 64 * D / 8; i += NT) {
+      int slot = i / (64 * D / 8);
+      int j = i % (64 * D / 8);
+      int b = bi0 + slot;
+      if (b > bi1) break;
+      int key = j / (D / 8);
+      int dc = (j % (D / 8)) * 8;
+      int gkey = (b << 6) + key;
+      uint4 z = make_uint4(0, 0, 0, 0);
+      if (gkey < S) z = __ldg((const uint4*)(K + (bhs + gkey) * D + dc));
+      const unsigned short* h = (const unsigned short*)&z;
+      __nv_bfloat16* dst = diag_s + slot * 64 * D;
+#pragma unroll
+      for (int x = 0; x < 8; ++x)
+        dst[(dc + x) * 64 + key] = *(__nv_bfloat16*)&h[x];
+    }
+  }
+  __syncthreads();
+
+  // ---------------- Phase 1: score full blocks + diagonal, top-8 select ----
+  {
+    const float* mt = MT + (long)bh * D * nb;
+    const __nv_bfloat16* diag_s = (const __nv_bfloat16*)slots_base;
+    int bi0 = q0 >> 6;
+    for (int rr = 0; rr < RPW; ++rr) {
+      int r = warp * RPW + rr;
+      int t = q0 + r;
+      if (t >= S) {
+        if (lane == 0) cnt_s[r] = 0;
+        continue;
+      }
+      int bi_t = t >> 6;
+
+      // full-block importance for blocks b = lane + 32*s
+      float cval[4];
+      int cb[4];
+      int nslot = 0;
+      for (int s = 0; s < 4; ++s) {
+        int b = lane + (s << 5);
+        if (b >= nb) break;
+        float acc = 0.f;
+        const float* mcol = mt + b;
+#pragma unroll
+        for (int d = 0; d < D; ++d) {
+          acc += __bfloat162float(q_s[r * D + d]) * __ldg(mcol + (long)d * nb);
+        }
+        cval[nslot] = (b < bi_t) ? acc * scale : NEG_INF;
+        cb[nslot] = b;
+        ++nslot;
+      }
+      // diagonal block: mean over keys s0..t (from staged transposed block)
+      float diag_val = NEG_INF;
+      int diag_b = bi_t;
+      {
+        int s0 = bi_t << 6;
+        int n = t - s0 + 1;
+        const __nv_bfloat16* kT = diag_s + (bi_t - bi0) * 64 * D;
+        float acc = 0.f;
+        for (int h = 0; h < 2; ++h) {
+          int key = h * 32 + lane;  // offset within block
+          float part = 0.f;
+          if (key < n) {
+#pragma unroll
+            for (int d = 0; d < D; ++d) {
+              part += __bfloat162float(q_s[r * D + d]) *
+                      __bfloat162float(kT[d * 64 + key]);
+            }
+          }
+          acc += part;
+        }
+#pragma unroll
+        for (int off = 16; off; off >>= 1)
+          acc += __shfl_xor_sync(0xffffffffu, acc, off);
+        diag_val = acc * scale / (float)n;
+      }
+
+      // iterative warp argmax over candidates (cval[], diag on lane 0)
+      int wcnt = 0;
+      float wval[TOPN];
+      int wb[TOPN];
+      for (int round = 0; round < TOPN; ++round) {
+        float lv = NEG_INF;
+        int lb = -1;
+        for (int s = 0; s < nslot; ++s) {
+          if (better(cval[s], cb[s], lv, lb)) { lv = cval[s]; lb = cb[s]; }
+        }
+        if (lane == 0 && better(diag_val, diag_b, lv, lb)) {
+          lv = diag_val; lb = diag_b;
+        }
+#pragma unroll
+        for (int off = 16; off; off >>= 1) {
+          float ov = __shfl_xor_sync(0xffffffffu, lv, off);
+          int ob = __shfl_xor_sync(0xffffffffu, lb, off);
+          if (better(ov, ob, lv, lb)) { lv = ov; lb = ob; }
+        }
+        if (lv == NEG_INF) break;
+        if (lane == 0) { wb[wcnt] = lb; }
+        ++wcnt;
+        for (int s = 0; s < nslot; ++s)
+          if (cb[s] == lb && cval[s] == lv) { cval[s] = NEG_INF; break; }
+        if (lane == 0 && diag_b == lb && diag_val == lv) diag_val = NEG_INF;
+      }
+      if (lane == 0) {
+        cnt_s[r] = (unsigned char)wcnt;
+        for (int s = 0; s < wcnt; ++s)
+          idx_s[r * TOPN + s] = (unsigned short)wb[s];
+      }
+    }
+  }
+  __syncthreads();
+
+  // ---------------- Phase 2: per-row segments -> block-sorted pair list --
+  // Segment list = selected blocks (causally clipped) + sliding-window
+  // tokens not covered by a selected block. Computed twice: once to count
+  // per block (prefix sums), once to scatter.
+#define BUILD_SEGS(OP)                                                       \
+  {                                                                          \
+    int cnt = cnt_s[r];                                                      \
+    bool sel_t = false, sel_prev = false;                                    \
+    for (int i = 0; i < cnt; ++i) {                                          \
+      int b = idx_s[r * TOPN + i];                                           \
+      int hi = min((b << 6) + 63, t);                                        \
+      OP(b, 0, hi - (b << 6) + 1);                                           \
+      if (b == bi_t) sel_t = true;                                           \
+      if (b == b_w0 && b_w0 != bi_t) sel_prev = true;                        \
+    }                                                                        \
+    if (b_w0 == bi_t) {                                                      \
+      if (!sel_t) OP(bi_t, w0 - (bi_t << 6), t - w0 + 1);                    \
+    } else {                                                                 \
+      if (!sel_prev) OP(b_w0, w0 - (b_w0 << 6), (bi_t << 6) - w0);           \
+      if (!sel_t) OP(bi_t, 0, t - (bi_t << 6) + 1);                          \
+    }                                                                        \
+  }
+
+#define COUNT_SEG(b, lo_off, len) atomicAdd(&blk_cnt[b], 1);
+  if (tid < QT) {
+    int r = tid;
+    int t = q0 + r;
+    if (t < S) {
+      int bi_t = t >> 6;
+      int w0 = max(0, t + 1 - 64);
+      int b_w0 = w0 >> 6;
+      BUILD_SEGS(COUNT_SEG)
+    }
+  }
+#undef COUNT_SEG
+  __syncthreads();
+  // exclusive prefix over block counts (single lane, nb <= 160)
+  if (tid == 0) {
+    unsigned int run = 0;
+    for (int b = 0; b < nb; ++b) {
+      unsigned int c = blk_cnt[b];
+      blk_cnt[b] = (unsigned short)run;
+      run += c;
+    }
+    blk_cnt[nb] = (unsigned short)run;
+  }
+  __syncthreads();
+#define SCATTER_SEG(b, lo_off, len)                                          \
+  {                                                                          \
+    unsigned int pos = blk_cnt[b] + atomicAdd(&blk_cur[b], 1);               \
+    pairs[pos] = pack_pair(r, b, lo_off, len);                               \
+    atomicOr(&ubits[b >> 5], 1u << (b & 31));                                \
+  }
+  if (tid < QT) {
+    int r = tid;
+    int t = q0 + r;
+    if (t < S) {
+      int bi_t = t >> 6;
+      int w0 = max(0, t + 1 - 64);
+      int b_w0 = w0 >> 6;
+      BUILD_SEGS(SCATTER_SEG)
+    }
+  }
+#undef SCATTER_SEG
+#undef BUILD_SEGS
+  __syncthreads();
+
+  // ---------------- Phase 3: compact union list + wave offsets ----------
+  if (warp == 0) {
+    for (int b = lane; b < nb; b += 32) bslot[b] = -1;
+    if (lane == 0) {
+      int n = 0;
+      for (int w = 0; w < (nb + 31) / 32; ++w) {
+        unsigned int word = ubits[w];
+        while (word) {
+          int bit = __ffs(word) - 1;
+          ulist[n++] = (unsigned short)(w * 32 + bit);
+          word &= word - 1;
+        }
+      }
+      *n_union_p = n;
+      int nw = (n + WB - 1) / WB;
+      for (int wv = 0; wv <= nw; ++wv) {
+        int gi = wv * WB;
+        wave_off[wv] = (unsigned short)(gi < n ? blk_cnt[ulist[gi]]
+                                               : blk_cnt[nb]);
+      }
+    }
+  }
+  __syncthreads();
+  int n_union = *n_union_p;
+  int num_waves = (n_union + WB - 1) / WB;
+
+  // ---------------- Phase 4: wave-based sparse attention ----------------
+  // row r's softmax state lives in warp (r % WARPS), slot (r / WARPS).
+  float m_run[RPW], l_run[RPW], o_acc[RPW][D / 32];
+#pragma unroll
+  for (int i = 0; i < RPW; ++i) {
+    m_run[i] = NEG_INF;
+    l_run[i] = 0.f;
+#pragma unroll
+    for (int x = 0; x < D / 32; ++x) o_acc[i][x] = 0.f;
+  }
+
+  for (int wv = 0; wv < num_waves; ++wv) {
+    // warp 0: update bslot map (clear previous wave, set current)
+    if (warp == 0) {
+      if (wv > 0) {
+        for (int s = lane; s < WB; s += 32) {
+          int pb = ulist[(wv - 1) * WB + s];
+          bslot[pb] = -1;
+        }
+      }
+      for (int s = lane; s < WB; s += 32) {
+        int gi = wv * WB + s;
+        if (gi < n_union) bslot[ulist[gi]] = (short)s;
+      }
+    }
+    // cooperative block loads into slots (2 chunks in flight per thread)
+    {
+      constexpr int CHUNKS = 64 * D / 8;  // 16B chunks per block matrix
+      constexpr int BATCH = 2;
+      for (int s = 0; s < WB; ++s) {
+        int gi = wv * WB + s;
+        if (gi >= n_union) break;
+        int ub = ulist[gi];
+        int key0 = ub << 6;
+        char* kT = slots_base + s * SLOT_BYTES;
+        __nv_bfloat16* kT_b = (__nv_bfloat16*)kT;
+        __nv_bfloat16* v_b = (__nv_bfloat16*)(kT + 64 * D * 2);
+        const __nv_bfloat16* Kg = K + (bhs + key0) * D;
+        const __nv_bfloat16* Vg = V + (bhs + key0) * D;
+        for (int i = tid; i < CHUNKS; i += NT * BATCH) {
+          uint4 kd[BATCH], vd[BATCH];
+          int key[BATCH], dc[BATCH];
+          bool ok[BATCH];
+#pragma unroll
+          for (int c = 0; c < BATCH; ++c) {
+            int ii = i + c * NT;
+            key[c] = ii / (D / 8);
+            dc[c] = (ii % (D / 8)) * 8;
+            ok[c] = (ii < CHUNKS) && (key0 + key[c] < S);
+            kd[c] = make_uint4(0, 0, 0, 0);
+            vd[c] = make_uint4(0, 0, 0, 0);
+            if (ok[c]) {
+              kd[c] = __ldg((const uint4*)(Kg + (long)key[c] * D + dc[c]));
+              vd[c] = __ldg((const uint4*)(Vg + (long)key[c] * D + dc[c]));
+            }
+          }
+#pragma unroll
+          for (int c = 0; c < BATCH; ++c) {
+            int ii = i + c * NT;
+            if (ii >= CHUNKS) continue;
+            *(uint4*)(v_b + key[c] * D + dc[c]) = vd[c];
+            const unsigned short* h = (const unsigned short*)&kd[c];
+#pragma unroll
+            for (int x = 0; x < 8; ++x)
+              kT_b[(dc[c] + x) * 64 + key[c]] = *(__nv_bfloat16*)&h[x];
+          }
+        }
+      }
+    }
+    __syncthreads();
+
+    // warps consume (row, seg) pairs of this wave
+    int p_begin = wave_off[wv];
+    int p_end = wave_off[wv + 1];
+    for (int p = p_begin + warp; p < p_end; p += WARPS) {
+      unsigned int pk = pairs[p];
+      int r = pk & 127;
+      int blk = (pk >> 7) & 255;
+      int lo_off = (pk >> 15) & 63;
+      int len = ((pk >> 21) & 63) + 1;
+      int slot = bslot[blk];
+      int rr = r >> LOGW;
+      const __nv_bfloat16* kT_b =
+          (__nv_bfloat16*)(slots_base + slot * SLOT_BYTES);
+      const __nv_bfloat16* v_b = kT_b + 64 * D;
+
+      for (int h = 0; h < 2; ++h) {
+        int koff = lo_off + h * 32 + lane;
+        bool kv = (h * 32 + lane) < len;
+        // score = q . k
+        float sc = 0.f;
+#pragma unroll
+        for (int d = 0; d < D; ++d) {
+          sc += __bfloat162float(q_s[r * D + d]) *
+                __bfloat162float(kT_b[d * 64 + (koff & 63)]);
+        }
+        if (!kv) sc = NEG_INF;
+        sc *= scale;
+        // block max
+        float mseg = sc;
+#pragma unroll
+        for (int off = 16; off; off >>= 1)
+          mseg = fmaxf(mseg, __shfl_xor_sync(0xffffffffu, mseg, off));
+        float m_new = fmaxf(m_run[rr], mseg);
+        float corr = (m_run[rr] == NEG_INF) ? 0.f
+                                            : __expf(m_run[rr] - m_new);
+        float pval = kv ? __expf(sc - m_new) : 0.f;
+        float psum = pval;
+#pragma unroll
+        for (int off = 16; off; off >>= 1)
+          psum += __shfl_xor_sync(0xffffffffu, psum, off);
+        l_run[rr] = l_run[rr] * corr + psum;
+        m_run[rr] = m_new;
+#pragma unroll
+        for (int x = 0; x < D / 32; ++x) o_acc[rr][x] *= corr;
+        // av: gather p_j from key-owner lanes
+        for (int src = 0; src < 32; ++src) {
+          float pj = __shfl_sync(0xffffffffu, pval, src);
+          int j = h * 32 + src;
+          if (j >= len) continue;
+          int key = lo_off + j;
+#pragma unroll
+          for (int x = 0; x < D / 32; ++x) {
+            int d = lane + x * 32;
+            o_acc[rr][x] += pj * __bfloat162float(v_b[key * D + d]);
+          }
+        }
+      }
+    }
+    __syncthreads();
+  }
+
+  // ---------------- Phase 5: epilogue ----------------
+  // warp w owns rows r = w + WARPS*rr
+  for (int rr = 0; rr < RPW; ++rr) {
+    int r = warp + (rr << LOGW);
+    int t = q0 + r;
+    if (t >= S) continue;
+    float inv = 1.f / l_run[rr];
+    __nv_bfloat16* orow = O + (bhs + t) * D;
+#pragma unroll
+    for (int x = 0; x < D / 32; ++x) {
+      orow[lane + x * 32] = __float2bfloat16(o_acc[rr][x] * inv);
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Host side
+// ---------------------------------------------------------------------------
+static int smem_size(int D, int QT, int WB) {
+  int pre = QT * D * 2 + QT * TOPN * 2 + 2 * QT + QT * MAXSEG * 4 +
+            (MAXNB + 1) * 2 + MAXNB * 2 + (MAXNB / 32) * 4 + MAXNB * 2 +
+            MAXNB * 2 + (MAXNB + 1) * 2 + 16;
+  int slots = WB * 2 * 64 * D * 2;  // diag staging overlays this region
+  return pre + slots;
+}
+
+template <int D, int QT, int WB, int WARPS>
+void launch(const torch::Tensor& q, const torch::Tensor& k,
+            const torch::Tensor& v, const torch::Tensor& mt,
+            torch::Tensor& o, int B, int H, int S, float scale,
+            cudaStream_t stream) {
+  int nb = (S + 63) / 64;
+  int BH = B * H;
+  int smem = smem_size(D, QT, WB);
+  auto kern = nsa_kernel<D, QT, WB, WARPS>;
+  static int configured_smem = -1;
+  if (configured_smem < smem) {
+    cudaFuncSetAttribute(kern, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                         smem);
+    configured_smem = smem;
+  }
+  dim3 grid((S + QT - 1) / QT, BH);
+  kern<<<grid, WARPS * 32, smem, stream>>>(
+      (const __nv_bfloat16*)q.data_ptr(), (const __nv_bfloat16*)k.data_ptr(),
+      (const __nv_bfloat16*)v.data_ptr(), (const float*)mt.data_ptr(),
+      (__nv_bfloat16*)o.data_ptr(), S, nb, scale);
+}
+
+torch::Tensor nsa_forward(torch::Tensor q, torch::Tensor k, torch::Tensor v) {
+  TORCH_CHECK(q.is_cuda() && k.is_cuda() && v.is_cuda());
+  TORCH_CHECK(q.dtype() == torch::kBFloat16);
+  int B = q.size(0), H = q.size(1), S = q.size(2), D = q.size(3);
+  TORCH_CHECK(S <= 10240, "S too large for static block tables");
+  auto o = torch::empty_like(q);
+  int nb = (S + 63) / 64;
+  auto mt = torch::empty({(long)B * H * D * nb}, q.options().dtype(torch::kFloat));
+  cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  float scale = 1.f / sqrtf((float)D);
+  int BH = B * H;
+
+  if (D == 64) {
+    block_means_kernel<64><<<dim3(nb, BH), 64, 0, stream>>>(
+        (const __nv_bfloat16*)k.data_ptr(), mt.data_ptr<float>(), S, nb);
+    launch<64, 128, 4, 8>(q, k, v, mt, o, B, H, S, scale, stream);
+  } else if (D == 128) {
+    block_means_kernel<128><<<dim3(nb, BH), 128, 0, stream>>>(
+        (const __nv_bfloat16*)k.data_ptr(), mt.data_ptr<float>(), S, nb);
+    launch<128, 64, 2, 4>(q, k, v, mt, o, B, H, S, scale, stream);
+  } else {
+    TORCH_CHECK(false, "unsupported head dim");
+  }
+  return o;
+}
+"""
+
+_ext = load_inline(
+    name="nsa_sparse_attn_v2",
+    cpp_sources="torch::Tensor nsa_forward(torch::Tensor q, torch::Tensor k, torch::Tensor v);",
+    cuda_sources=_CUDA_SRC,
+    functions=["nsa_forward"],
+    extra_cuda_cflags=[
+        "-O3",
+        "--use_fast_math",
+        "--generate-code=arch=compute_120a,code=sm_120a",
+    ],
+    verbose=False,
+)
+
+
+class Model(nn.Module):
+    def __init__(self, B: int, H: int, S: int, D: int):
+        super().__init__()
+        self.B, self.H, self.S, self.D = B, H, S, D
+        self.register_buffer("_dummy", torch.zeros(1, dtype=torch.bfloat16))
+
+    def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+        return _ext.nsa_forward(q, k, v)
+
+
+def get_init_inputs():
+    return [B, H, S, D]
+
+
+def get_inputs():
+    q = torch.randn(B, H, S, D, dtype=torch.bfloat16)
+    k = torch.randn(B, H, S, D, dtype=torch.bfloat16)
+    v = torch.randn(B, H, S, D, dtype=torch.bfloat16)
+    return [q, k, v]

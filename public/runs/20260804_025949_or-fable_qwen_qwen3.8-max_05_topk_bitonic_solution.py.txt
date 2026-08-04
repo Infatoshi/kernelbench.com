@@ -1,0 +1,544 @@
+"""Fast top-k over the last dim of a 2D fp32 tensor.
+
+Algorithm (single custom CUDA kernel per call, fully hand-rolled selection):
+  Phase A: each CTA reads one chunk of one row. Every thread sorts its small
+    slice in registers, then the block reduces all 256 sorted runs to the
+    chunk's top-k with a two-stage bitonic merge tree:
+      * warp-level merge (5 levels, __syncwarp, no block barriers)
+      * block-level merge of the 8 warp results (3 levels, __syncthreads)
+    This keeps the expensive whole-block barrier count low.
+  Phase B: a device-side per-row ticket (atomicAdd + __threadfence) finds the
+    last CTA of each row; that CTA merges the per-chunk candidate lists (same
+    two-stage tree) and writes the final sorted top-k. No second launch, no
+    host sync, no counter reset (ticket test is epoch-invariant).
+
+The launch is captured into a CUDA graph keyed on the input pointer so the
+steady-state per-call cost is one cheap graph replay.
+"""
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+_CUDA_SRC = r"""
+#include <cuda_runtime.h>
+#include <float.h>
+#include <ATen/cuda/CUDAContext.h>
+#include <torch/extension.h>
+
+#define TPB 256
+#define NEG_INF (-3.402823466e+38f)
+
+__device__ __forceinline__ void cex(float* sv, int* si, int a, int b) {
+    float va = sv[a], vb = sv[b];
+    if (vb > va) {
+        sv[a] = vb; sv[b] = va;
+        int ia = si[a], ib = si[b];
+        si[a] = ib; si[b] = ia;
+    }
+}
+
+// bitonic sorting network, descending, N a power of two (register arrays)
+template<int N>
+__device__ __forceinline__ void sort_desc(float* v, int* ix) {
+    #pragma unroll
+    for (int k = 2; k <= N; k <<= 1) {
+        #pragma unroll
+        for (int j = k >> 1; j > 0; j >>= 1) {
+            #pragma unroll
+            for (int i = 0; i < N; i++) {
+                int l = i ^ j;
+                if (l > i) {
+                    bool dir = ((i & k) == 0);
+                    if (dir ? (v[l] > v[i]) : (v[i] > v[l])) {
+                        float tv = v[i]; v[i] = v[l]; v[l] = tv;
+                        int ti = ix[i]; ix[i] = ix[l]; ix[l] = ti;
+                    }
+                }
+            }
+        }
+    }
+}
+
+template<int GROUP>
+__device__ __forceinline__ void group_sync() {
+    if (GROUP == 32) __syncwarp();
+    else __syncthreads();
+}
+
+// Merge-tree reduction. Reduces `nruns` sorted runs (each length R0, pitch C,
+// laid out at sv[0], sv[C], sv[2C], ...) to the top-K elements descending at
+// sv[0..K). GROUP controls participation/sync granularity (32=warp, 256=block).
+template<int GROUP>
+__device__ void merge_tree(float* sv, int* si, int K, int C, int R0, int nruns) {
+    int lane = threadIdx.x & (GROUP - 1);
+    int runlen = R0, stride = C, nr = nruns;
+    while (nr > 1) {
+        int pairs = nr >> 1;
+        int newstride = stride << 1;
+        int lg = __ffs(runlen) - 1;
+        int rmask = runlen - 1;
+        // Bring run B next to run A reversed so [A, rev(B)] is bitonic.
+        if (stride == runlen) {
+            int half = runlen >> 1;
+            if (half > 0) {
+                int hlg = __ffs(half) - 1, hmask = half - 1;
+                int total = pairs * half;
+                for (int e = lane; e < total; e += GROUP) {
+                    int p = e >> hlg, t = e & hmask;
+                    int o = p * newstride + runlen;
+                    int a = o + t, b = o + runlen - 1 - t;
+                    float tv = sv[a]; sv[a] = sv[b]; sv[b] = tv;
+                    int ti = si[a]; si[a] = si[b]; si[b] = ti;
+                }
+            }
+        } else {
+            int total = pairs * runlen;
+            for (int e = lane; e < total; e += GROUP) {
+                int p = e >> lg, t = e & rmask;
+                int o = p * newstride;
+                int src = o + stride + (runlen - 1 - t);
+                int dst = o + runlen + t;
+                sv[dst] = sv[src];
+                si[dst] = si[src];
+            }
+        }
+        group_sync<GROUP>();
+        // Bitonic merge of each 2*runlen region, descending.
+        for (int s = runlen, slg = lg; s > 0; s >>= 1, slg--) {
+            int smask = s - 1;
+            int total = pairs * runlen;
+            for (int e = lane; e < total; e += GROUP) {
+                int p = e >> lg, r = e & rmask;
+                int o = p * newstride;
+                int i = ((r >> slg) << (slg + 1)) | (r & smask);
+                cex(sv, si, o + i, o + i + s);
+            }
+            group_sync<GROUP>();
+        }
+        runlen = min(K, runlen * 2);
+        stride = newstride;
+        nr = pairs;
+    }
+}
+
+// Reduce 256 sorted runs (thread t's run at offset t*C, length R0) to top-K.
+// Two-stage: warp merge (no block barriers) then merge of 8 warp results.
+__device__ void block_topk_from_runs(float* sv, int* si, int K, int C, int R0) {
+    int w = threadIdx.x >> 5;
+    __syncwarp();
+    merge_tree<32>(sv + w * 32 * C, si + w * 32 * C, K, C, R0, 32);
+    __syncthreads();
+    int L = min(K, 32 * R0);
+    merge_tree<256>(sv, si, K, 32 * C, L, 8);
+}
+
+template<int TA, int TB>
+__global__ void __launch_bounds__(TPB)
+topk_kernel(const float* __restrict__ x, int n, int K, int P, int chunk,
+            float* __restrict__ cand_v, int* __restrict__ cand_i,
+            int* __restrict__ counters,
+            float* __restrict__ out_v, long long* __restrict__ out_i) {
+    extern __shared__ float smem[];
+    const int CA = min(K, TA);
+    const int CB = min(K, TB);
+    const int C = max(CA, CB);
+    float* sv = smem;                  // 256*C floats
+    int*   si = (int*)(smem + TPB * C);
+
+    const int row  = blockIdx.x / P;
+    const int cidx = blockIdx.x - row * P;
+    const int chunk_off = cidx * chunk;
+    const int len = min(chunk, n - chunk_off);
+    const long base = (long)row * n + chunk_off;
+
+    // ---- phase A: load TA elements, sort, reduce to chunk top-K
+    float tv[TA]; int ti[TA];
+    if ((len & 3) == 0) {
+        // vectorized float4 loads (chunk and row are 4-aligned)
+        const float4* x4 = reinterpret_cast<const float4*>(x);
+        const long base4 = base >> 2;
+        const int n4 = len >> 2;
+        #pragma unroll
+        for (int j = 0; j < TA / 4; j++) {
+            int f = threadIdx.x + j * TPB;
+            if (f < n4) {
+                float4 v = x4[base4 + f];
+                int e0 = 4 * f;
+                tv[4 * j + 0] = v.x; ti[4 * j + 0] = chunk_off + e0 + 0;
+                tv[4 * j + 1] = v.y; ti[4 * j + 1] = chunk_off + e0 + 1;
+                tv[4 * j + 2] = v.z; ti[4 * j + 2] = chunk_off + e0 + 2;
+                tv[4 * j + 3] = v.w; ti[4 * j + 3] = chunk_off + e0 + 3;
+            } else {
+                #pragma unroll
+                for (int c = 0; c < 4; c++) { tv[4 * j + c] = NEG_INF; ti[4 * j + c] = 0; }
+            }
+        }
+    } else {
+        #pragma unroll
+        for (int j = 0; j < TA; j++) {
+            int pos = threadIdx.x + j * TPB;
+            if (pos < len) { tv[j] = x[base + pos]; ti[j] = chunk_off + pos; }
+            else { tv[j] = NEG_INF; ti[j] = 0; }
+        }
+    }
+    sort_desc<TA>(tv, ti);
+    {
+        int off = threadIdx.x * C;
+        #pragma unroll
+        for (int m = 0; m < TA; m++) if (m < CA) { sv[off + m] = tv[m]; si[off + m] = ti[m]; }
+    }
+    block_topk_from_runs(sv, si, K, C, CA);
+
+    // ---- publish chunk candidates (or final result if single chunk per row)
+    if (P == 1) {
+        if (threadIdx.x < K) {
+            out_v[(long)row * K + threadIdx.x] = sv[threadIdx.x];
+            out_i[(long)row * K + threadIdx.x] = (long long)si[threadIdx.x];
+        }
+        return;
+    }
+    if (threadIdx.x < K) {
+        long co = ((long)row * P + cidx) * K + threadIdx.x;
+        cand_v[co] = sv[threadIdx.x];
+        cand_i[co] = si[threadIdx.x];
+    }
+    __threadfence();
+    __syncthreads();
+    __shared__ int last_flag;
+    if (threadIdx.x == 0) {
+        int old = atomicAdd(&counters[row], 1);
+        last_flag = ((old % P) == P - 1) ? 1 : 0;
+    }
+    __syncthreads();
+    if (!last_flag) return;
+    __threadfence();
+
+    // ---- phase B (last CTA of the row): merge P*K candidates to final top-K
+    const int M = P * K;
+    const long cb = (long)row * M;
+    float wv[TB]; int wi[TB];
+    #pragma unroll
+    for (int j = 0; j < TB; j++) {
+        int pos = threadIdx.x + j * TPB;
+        if (pos < M) { wv[j] = cand_v[cb + pos]; wi[j] = cand_i[cb + pos]; }
+        else { wv[j] = NEG_INF; wi[j] = 0; }
+    }
+    sort_desc<TB>(wv, wi);
+    {
+        int off = threadIdx.x * C;
+        #pragma unroll
+        for (int m = 0; m < TB; m++) if (m < CB) { sv[off + m] = wv[m]; si[off + m] = wi[m]; }
+    }
+    block_topk_from_runs(sv, si, K, C, CB);
+
+    if (threadIdx.x < K) {
+        out_v[(long)row * K + threadIdx.x] = sv[threadIdx.x];
+        out_i[(long)row * K + threadIdx.x] = (long long)si[threadIdx.x];
+    }
+}
+
+// ---- K=1 specialization: plain hierarchical argmax, no merge tree ----
+__device__ __forceinline__ void warp_reduce_max(float& v, int& i) {
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        float ov = __shfl_down_sync(0xffffffffu, v, off);
+        int oi = __shfl_down_sync(0xffffffffu, i, off);
+        if (ov > v) { v = ov; i = oi; }
+    }
+}
+
+__device__ void block_reduce_max(float& v, int& i, float* wv, int* wi) {
+    // guards reuse of wv/wi when this is called a second time by the last CTA
+    __syncthreads();
+    warp_reduce_max(v, i);
+    if ((threadIdx.x & 31) == 0) {
+        wv[threadIdx.x >> 5] = v;
+        wi[threadIdx.x >> 5] = i;
+    }
+    __syncthreads();
+    if (threadIdx.x < 32) {
+        int w = threadIdx.x;
+        v = (w < TPB / 32) ? wv[w] : NEG_INF;
+        i = (w < TPB / 32) ? wi[w] : 0;
+        #pragma unroll
+        for (int off = TPB / 64; off > 0; off >>= 1) {
+            float ov = __shfl_down_sync(0xffffffffu, v, off);
+            int oi = __shfl_down_sync(0xffffffffu, i, off);
+            if (ov > v) { v = ov; i = oi; }
+        }
+        if (threadIdx.x == 0) { wv[0] = v; wi[0] = i; }
+    }
+    __syncthreads();
+    v = wv[0];
+    i = wi[0];
+}
+
+template<int TA>
+__global__ void __launch_bounds__(TPB)
+argmax_kernel(const float* __restrict__ x, int n, int P, int chunk,
+              float* __restrict__ cand_v, int* __restrict__ cand_i,
+              int* __restrict__ counters,
+              float* __restrict__ out_v, long long* __restrict__ out_i) {
+    __shared__ float wv[TPB / 32];
+    __shared__ int wi[TPB / 32];
+    const int row  = blockIdx.x / P;
+    const int cidx = blockIdx.x - row * P;
+    const int chunk_off = cidx * chunk;
+    const int len = min(chunk, n - chunk_off);
+    const long base = (long)row * n + chunk_off;
+
+    float bv = NEG_INF; int bi = 0;
+    if ((len & 3) == 0) {
+        const float4* x4 = reinterpret_cast<const float4*>(x);
+        const long base4 = base >> 2;
+        const int n4 = len >> 2;
+        #pragma unroll
+        for (int j = 0; j < TA / 4; j++) {
+            int f = threadIdx.x + j * TPB;
+            if (f < n4) {
+                float4 v = x4[base4 + f];
+                int e0 = chunk_off + 4 * f;
+                if (v.x > bv) { bv = v.x; bi = e0 + 0; }
+                if (v.y > bv) { bv = v.y; bi = e0 + 1; }
+                if (v.z > bv) { bv = v.z; bi = e0 + 2; }
+                if (v.w > bv) { bv = v.w; bi = e0 + 3; }
+            }
+        }
+    } else {
+        #pragma unroll
+        for (int j = 0; j < TA; j++) {
+            int pos = threadIdx.x + j * TPB;
+            if (pos < len) {
+                float v = x[base + pos];
+                if (v > bv) { bv = v; bi = chunk_off + pos; }
+            }
+        }
+    }
+    block_reduce_max(bv, bi, wv, wi);
+
+    if (P == 1) {
+        if (threadIdx.x == 0) {
+            out_v[row] = bv;
+            out_i[row] = (long long)bi;
+        }
+        return;
+    }
+    if (threadIdx.x == 0) {
+        cand_v[(long)row * P + cidx] = bv;
+        cand_i[(long)row * P + cidx] = bi;
+    }
+    __threadfence();
+    __syncthreads();
+    __shared__ int last_flag;
+    if (threadIdx.x == 0) {
+        int old = atomicAdd(&counters[row], 1);
+        last_flag = ((old % P) == P - 1) ? 1 : 0;
+    }
+    __syncthreads();
+    if (!last_flag) return;
+    __threadfence();
+
+    float mv = NEG_INF; int mi = 0;
+    for (int pos = threadIdx.x; pos < P; pos += TPB) {
+        float v = cand_v[(long)row * P + pos];
+        int ii = cand_i[(long)row * P + pos];
+        if (v > mv) { mv = v; mi = ii; }
+    }
+    block_reduce_max(mv, mi, wv, wi);
+    if (threadIdx.x == 0) {
+        out_v[row] = mv;
+        out_i[row] = (long long)mi;
+    }
+}
+
+template<int TA, int TB>
+void launch_topk(const float* x, int batch, int n, int K, int P, int chunk,
+                 float* cand_v, int* cand_i, int* counters,
+                 float* out_v, long long* out_i, int smem_bytes,
+                 cudaStream_t stream) {
+    auto kern = topk_kernel<TA, TB>;
+    static int configured = 0;
+    if (!configured) {
+        cudaFuncSetAttribute(kern, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                             96 * 1024);
+        configured = 1;
+    }
+    dim3 grid((unsigned)(batch * P)), block(TPB);
+    kern<<<grid, block, smem_bytes, stream>>>(
+        x, n, K, P, chunk, cand_v, cand_i, counters, out_v, out_i);
+}
+
+template<int TA>
+void launch_argmax(const float* x, int batch, int n, int P, int chunk,
+                   float* cand_v, int* cand_i, int* counters,
+                   float* out_v, long long* out_i, cudaStream_t stream) {
+    dim3 grid((unsigned)(batch * P)), block(TPB);
+    argmax_kernel<TA><<<grid, block, 0, stream>>>(
+        x, n, P, chunk, cand_v, cand_i, counters, out_v, out_i);
+}
+
+void topk_launch(torch::Tensor x, torch::Tensor out_v, torch::Tensor out_i,
+                 torch::Tensor cand_v, torch::Tensor cand_i,
+                 torch::Tensor counters,
+                 int64_t batch, int64_t n, int64_t K, int64_t chunk,
+                 int64_t P, int64_t ta, int64_t tb, int64_t smem_bytes) {
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    const float* xp = x.data_ptr<float>();
+    float* cvp = cand_v.data_ptr<float>();
+    int* cip = cand_i.data_ptr<int>();
+    int* cp = counters.data_ptr<int>();
+    float* ovp = out_v.data_ptr<float>();
+    long long* oip = reinterpret_cast<long long*>(out_i.data_ptr<int64_t>());
+    int b = (int)batch, nn = (int)n, k = (int)K, ch = (int)chunk, p = (int)P;
+    int sm = (int)smem_bytes;
+    if (k == 1) {
+        if (ta == 4) { launch_argmax<4>(xp, b, nn, p, ch, cvp, cip, cp, ovp, oip, stream); return; }
+        if (ta == 8) { launch_argmax<8>(xp, b, nn, p, ch, cvp, cip, cp, ovp, oip, stream); return; }
+        if (ta == 16) { launch_argmax<16>(xp, b, nn, p, ch, cvp, cip, cp, ovp, oip, stream); return; }
+        TORCH_CHECK(false, "unsupported ta for k=1: ", ta);
+    }
+    #define DISPATCH(TA, TB) \
+        if (ta == TA && tb == TB) { \
+            launch_topk<TA, TB>(xp, b, nn, k, p, ch, cvp, cip, cp, ovp, oip, sm, stream); \
+            return; \
+        }
+    DISPATCH(4, 1)
+    DISPATCH(4, 2)
+    DISPATCH(4, 4)
+    DISPATCH(4, 8)
+    DISPATCH(4, 16)
+    DISPATCH(4, 32)
+    DISPATCH(8, 1)
+    DISPATCH(8, 2)
+    DISPATCH(8, 4)
+    DISPATCH(8, 8)
+    DISPATCH(8, 16)
+    DISPATCH(8, 32)
+    DISPATCH(16, 1)
+    DISPATCH(16, 2)
+    DISPATCH(16, 4)
+    DISPATCH(16, 8)
+    #undef DISPATCH
+    TORCH_CHECK(false, "unsupported (ta, tb) combination: ", ta, ", ", tb);
+}
+"""
+
+_CPP_SRC = [
+    "void topk_launch(torch::Tensor x, torch::Tensor out_v, torch::Tensor out_i, "
+    "torch::Tensor cand_v, torch::Tensor cand_i, torch::Tensor counters, "
+    "int64_t batch, int64_t n, int64_t K, int64_t chunk, int64_t P, "
+    "int64_t ta, int64_t tb, int64_t smem_bytes);"
+]
+
+_ext = load_inline(
+    name="topk_bitonic_ext_v5",
+    cpp_sources=_CPP_SRC,
+    cuda_sources=[_CUDA_SRC],
+    functions=["topk_launch"],
+    extra_cuda_cflags=["-O3", "--use_fast_math"],
+    verbose=False,
+)
+
+TPB_PY = 256
+
+
+def _next_pow2(v: int) -> int:
+    p = 1
+    while p < v:
+        p <<= 1
+    return p
+
+
+def _pick_config(batch: int, n: int, k: int):
+    """Return (chunk, P, ta, tb, smem_bytes)."""
+    tuned = {
+        (1, 131072, 64): 4096,
+        (64, 8192, 8): 4096,
+        (32, 16384, 32): 1024,
+        (16, 12000, 16): 1024,
+        (128, 4096, 1): 4096,
+    }
+    chunk = tuned.get((batch, n, k))
+    if chunk is None:
+        for cand in (1024, 2048):
+            Pc = (n + cand - 1) // cand
+            if batch * Pc >= 256 and Pc * k <= TPB_PY * 32:
+                chunk = cand
+                break
+        if chunk is None:
+            chunk = 2048 if n > 1024 else 1024
+    P = (n + chunk - 1) // chunk
+    ta = chunk // TPB_PY
+    M = P * k
+    tb = _next_pow2(max(1, (M + TPB_PY - 1) // TPB_PY))
+    if tb > 32:
+        raise RuntimeError(f"shape too large for phase B: P*k={M}")
+    C = max(min(k, ta), min(k, tb))
+    smem_bytes = TPB_PY * C * 8
+    return chunk, P, ta, tb, smem_bytes
+
+
+class Model(nn.Module):
+    """Top-k over the last dim of a 2D tensor (custom CUDA kernel)."""
+
+    def __init__(self, batch: int, n: int, k: int):
+        super().__init__()
+        self.batch, self.n, self.k = batch, n, k
+        self.register_buffer("_dummy", torch.zeros(1))
+
+        dev = torch.device("cuda")
+        chunk, P, ta, tb, smem = _pick_config(batch, n, k)
+        self.chunk, self.P, self.ta, self.tb, self.smem = chunk, P, ta, tb, smem
+
+        # plain attributes so state_dict stays == {"_dummy"}
+        self._cand_v = torch.empty(batch * P * k, dtype=torch.float32, device=dev)
+        self._cand_i = torch.empty(batch * P * k, dtype=torch.int32, device=dev)
+        self._counters = torch.zeros(batch, dtype=torch.int32, device=dev)
+        self._out_v = torch.empty(batch, k, dtype=torch.float32, device=dev)
+        self._out_i = torch.empty(batch, k, dtype=torch.int64, device=dev)
+        self._graphs = {}
+        self._last_key = -1
+        self._last_graph = None
+
+    def _launch(self, x: torch.Tensor):
+        _ext.topk_launch(
+            x, self._out_v, self._out_i,
+            self._cand_v, self._cand_i, self._counters,
+            self.batch, self.n, self.k, self.chunk, self.P,
+            self.ta, self.tb, self.smem,
+        )
+
+    def __call__(self, x: torch.Tensor):
+        key = x.data_ptr()
+        if key == self._last_key:
+            self._last_graph.replay()
+            return self._out_v, self._out_i
+        g = self._graphs.get(key)
+        if g is None:
+            self._launch(x)
+            torch.cuda.synchronize()
+            g = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(g):
+                self._launch(x)
+            self._graphs[key] = g
+        self._last_key = key
+        self._last_graph = g
+        g.replay()
+        return self._out_v, self._out_i
+
+    def forward(self, x: torch.Tensor):
+        return self.__call__(x)
+
+
+batch = 64
+n = 8192
+k = 8
+
+
+def get_inputs():
+    x = torch.randn(batch, n, dtype=torch.float32)
+    return [x]
+
+
+def get_init_inputs():
+    return [batch, n, k]

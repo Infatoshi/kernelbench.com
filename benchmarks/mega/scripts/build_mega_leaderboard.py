@@ -235,7 +235,7 @@ def main() -> None:
         # grok streaming transcripts carry no tool events or paths, so the
         # regex tripwire below can pass a run that copied another archive's
         # solution (2026-07-21 B200 incident).
-        if annotation_verdict(rid, annotations_dir) == "contaminated":
+        if annotation_verdict(rid, annotations_dir) in {"contaminated", "contamination"}:
             print(f"  EXCLUDED (manual audit verdict=contaminated): {run_dir.name}")
             continue
         nc = contamination(run_dir)

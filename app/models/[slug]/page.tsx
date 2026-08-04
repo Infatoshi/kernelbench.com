@@ -89,7 +89,9 @@ function CellCard({
     <div className="cell-card">
       <div className="cell-card-head">
         <span className="cell-card-problem">{problemLabel(probKey)}</span>
-        <span className={`status-pill ${pill}`}>{cell.correct ? "pass" : "fail"}</span>
+        <span className={`status-pill ${pill}`}>
+          {flagged ? "flag" : cell.correct ? "pass" : "fail"}
+        </span>
       </div>
       <div className="cell-card-metrics">
         {cell.score != null && (

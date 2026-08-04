@@ -20,6 +20,10 @@ PROVIDER_CREDIT_RE = re.compile(
 PROVIDER_RATE_RE = re.compile(
     r"rate[_ -]?limit|\b429\b|quota|resource_exhausted|session limit"
 )
+PROVIDER_UNAVAILABLE_RE = re.compile(
+    r"model_not_found|selected model .* may not exist|"
+    r"no endpoints? found|temporarily unavailable"
+)
 
 
 def classify_run(
@@ -44,6 +48,7 @@ def classify_run(
     provider_text = provider_signal_text(log_file, stderr_file).lower()
     insufficient_credits = bool(PROVIDER_CREDIT_RE.search(provider_text))
     rate_limited = bool(PROVIDER_RATE_RE.search(provider_text))
+    provider_unavailable = bool(PROVIDER_UNAVAILABLE_RE.search(provider_text))
     harness_exit = harness_exit or 0
 
     reason = "pass"
@@ -63,16 +68,21 @@ def classify_run(
     elif provider_failure_window and rate_limited:
         reason = "provider_rate_limited"
         retryable = True
+    elif provider_failure_window and provider_unavailable:
+        reason = "provider_unavailable"
+        retryable = True
     elif harness_exit == 124:
         reason = "timeout"
         retryable = not has_solution
     elif not session_complete:
         reason = "incomplete_session"
         retryable = True
-    elif (
-        not has_solution
-        and output_tokens is not None
-        and output_tokens < minimum_useful_output_tokens
+    elif not has_solution and (
+        _terminal_stop_reason(log_file) == "tool_use"
+        or (
+            output_tokens is not None
+            and output_tokens < minimum_useful_output_tokens
+        )
     ):
         reason = "provider_early_stop"
         retryable = True
@@ -137,6 +147,23 @@ def _transcript_error_text(path: str | Path | None, *, limit: int) -> str:
     if saw_json:
         return "\n".join(errors)
     return raw
+
+
+def _terminal_stop_reason(path: str | Path | None) -> str | None:
+    """Return the Claude CLI's terminal result reason, if present."""
+    raw = _read_tail(path, limit=200_000)
+    for line in reversed(raw.splitlines()):
+        try:
+            obj = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(obj, dict):
+            continue
+        if "num_turns" not in obj or "is_error" not in obj:
+            continue
+        reason = obj.get("stop_reason")
+        return reason if isinstance(reason, str) else None
+    return None
 
 
 def _is_provider_error_event(obj: dict[str, Any]) -> bool:

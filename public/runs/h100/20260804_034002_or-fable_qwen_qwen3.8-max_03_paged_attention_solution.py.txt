@@ -1,0 +1,508 @@
+"""Paged attention decode (single query per batch element) -- custom CUDA kernel.
+
+Strategy: FlashDecoding-style split-KV with GQA grouping so every KV element is
+read from HBM exactly once, and a fused "last block reduces across splits" so
+the whole op is a SINGLE kernel launch (no second reduce launch overhead).
+
+Design per block (= one (batch, kv_head, sequence-split)):
+  * 256 threads = 8 warps. A page (16 tokens) is split so warp w owns tokens
+    {2w, 2w+1}; each warp keeps its own online-softmax state (m, l, acc) over
+    its token subset. head_dim is spread across the 32 lanes (VEC = D/32 each)
+    so QK dot products are warp shuffle reductions.
+  * Pages are streamed with a multi-stage cp.async pipeline (__pipeline_*),
+    loading the packed [K|V] slice for this kv-head (16 rows of 2*D bf16).
+  * After the loop, warps merge via smem to produce the split's (m, l, acc);
+    these partials go to a workspace. An atomic counter detects the last block
+    for a (batch, kv_head); that block merges all splits and writes the bf16
+    result. The counter self-resets so no separate memset is needed.
+
+Everything accumulates in fp32; probabilities/scores are never rounded to bf16
+before the final store.
+"""
+import math
+import os
+import sys
+
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Ensure sibling binaries from the active interpreter's env (ninja, nvcc shims)
+# are reachable for the JIT build regardless of the caller's PATH.
+_PY_BIN = os.path.dirname(sys.executable)
+if _PY_BIN and _PY_BIN not in os.environ.get("PATH", "").split(os.pathsep):
+    os.environ["PATH"] = _PY_BIN + os.pathsep + os.environ.get("PATH", "")
+
+_HERE = os.path.dirname(os.path.abspath(__file__))
+_BUILD_DIR = os.path.join(_HERE, "scratch", "build_paged_decode")
+os.makedirs(_BUILD_DIR, exist_ok=True)
+
+_CUDA_SRC = r"""
+#include <torch/extension.h>
+#include <cuda.h>
+#include <cuda_runtime.h>
+#include <cuda_bf16.h>
+#include <cuda_pipeline.h>
+#include <mma.h>
+#include <ATen/cuda/CUDAContext.h>
+#include <c10/cuda/CUDAGuard.h>
+
+#define DEV_INLINE __device__ __forceinline__
+
+constexpr int PAGE_SZ = 16;
+
+namespace wmma_ns = nvcuda::wmma;
+
+template <int D, int NSTAGE, int BLOCK>
+DEV_INLINE void issue_page(int logical_page, int page_start, int page_end,
+                           int b, int kvh,
+                           long stride_kv_blk, long stride_kv_tok, long stride_kv_h,
+                           const __nv_bfloat16* kv, const int* block_table,
+                           int stride_bt_b, __nv_bfloat16* kv_smem, int tid) {
+  constexpr int PAGE = PAGE_SZ;
+  constexpr int CH16 = D / 4;           // 16-byte chunks per token row (2*D elems)
+  constexpr int CHUNKS = PAGE * CH16;   // chunks per page
+  if (logical_page < page_end) {
+    int blk = block_table[(long)b * stride_bt_b + logical_page];
+    const __nv_bfloat16* base = kv + (long)blk * stride_kv_blk + (long)kvh * stride_kv_h;
+    int stage = (logical_page - page_start) % NSTAGE;
+    __nv_bfloat16* sbase = kv_smem + (long)stage * (PAGE * 2 * D);
+#pragma unroll 1
+    for (int c = tid; c < CHUNKS; c += BLOCK) {
+      int token = c / CH16;
+      int colchunk = c % CH16;
+      const __nv_bfloat16* src = base + (long)token * stride_kv_tok + colchunk * 8;
+      __nv_bfloat16* dst = sbase + token * 2 * D + colchunk * 8;
+      __pipeline_memcpy_async(dst, src, 16);
+    }
+  }
+  __pipeline_commit();
+}
+
+template <int D, int G, int BLOCK, int NSTAGE>
+__global__ void __launch_bounds__(BLOCK) paged_decode_kernel(
+    const __nv_bfloat16* __restrict__ q, const __nv_bfloat16* __restrict__ kv,
+    const int* __restrict__ block_table, const int* __restrict__ seq_lens,
+    __nv_bfloat16* __restrict__ out, float* __restrict__ partial_acc,
+    float* __restrict__ partial_ml, int* __restrict__ counters,
+    int B, int H, int HKV, long stride_qb, long stride_qh,
+    long stride_kv_blk, long stride_kv_tok, long stride_kv_h, int stride_bt_b,
+    int S, float scale) {
+  constexpr int PAGE = PAGE_SZ;
+  constexpr int VEC = D / 32;  // D elems per lane
+  constexpr int WARPS = BLOCK / 32;
+  constexpr int TPW = PAGE / WARPS > 0 ? PAGE / WARPS : 1;  // tokens per warp per page
+  static_assert(WARPS <= PAGE, "WARPS must not exceed PAGE");
+
+  const int tid = threadIdx.x;
+  const int warp = tid >> 5;
+  const int lane = tid & 31;
+  const int bh = blockIdx.x;
+  const int s = blockIdx.y;
+  const int b = bh / HKV;
+  const int kvh = bh % HKV;
+
+  const int L = seq_lens[b];
+  const int npages = (L + PAGE - 1) / PAGE;
+  // Distribute pages across S splits as evenly as possible.
+  const int pages_per = npages / S;
+  const int rem = npages % S;
+  const int page_start = s * pages_per + min(s, rem);
+  const int page_end = page_start + pages_per + (s < rem ? 1 : 0);
+
+  extern __shared__ char smem_raw[];
+  __nv_bfloat16* kv_smem = reinterpret_cast<__nv_bfloat16*>(smem_raw);
+  __nv_bfloat16* q_smem =
+      reinterpret_cast<__nv_bfloat16*>(smem_raw + (long)NSTAGE * PAGE * 2 * D * sizeof(__nv_bfloat16));
+  float* scores_smem = reinterpret_cast<float*>(q_smem + 16 * D);  // 16x16
+  float* acc_warp = scores_smem + 16 * 16;
+  float* ml_warp = acc_warp + WARPS * G * D;
+  float* weight_smem = ml_warp + WARPS * G * 2;
+  float* lse_or_m = weight_smem + WARPS * G;  // G floats
+
+  // ---- Load Q into smem, zero-padded to 16 rows for the tensor-core QK^T ----
+  for (int i = tid; i < 16 * D; i += BLOCK) q_smem[i] = __float2bfloat16(0.f);
+  __syncthreads();
+  {
+    const __nv_bfloat16* qsrc = q + (long)b * stride_qb + (long)(kvh * G) * stride_qh;
+#pragma unroll
+    for (int g = 0; g < G; ++g) {
+      const __nv_bfloat16* row = qsrc + (long)g * stride_qh;
+      __nv_bfloat16* dst = q_smem + g * D;
+      for (int i = tid; i < D; i += BLOCK) dst[i] = row[i];
+    }
+  }
+
+  __syncthreads();  // q_smem fully written before any thread reads it
+
+  // Warp 0 preloads the Q tiles as wmma A fragments (reused across pages).
+  wmma_ns::fragment<wmma_ns::matrix_a, 16, 16, 16, __nv_bfloat16, wmma_ns::row_major>
+      q_frag[D / 16];
+  if (warp == 0) {
+#pragma unroll
+    for (int kc = 0; kc < D / 16; ++kc)
+      wmma_ns::load_matrix_sync(q_frag[kc], q_smem + kc * 16, D);
+  }
+
+  float m_w[G], l_w[G], acc_w[G][VEC];
+#pragma unroll
+  for (int g = 0; g < G; ++g) {
+    m_w[g] = -INFINITY;
+    l_w[g] = 0.f;
+#pragma unroll
+    for (int i = 0; i < VEC; ++i) acc_w[g][i] = 0.f;
+  }
+
+  // ---- Prologue: issue first NSTAGE pages ----
+#pragma unroll
+  for (int i = 0; i < NSTAGE; ++i)
+    issue_page<D, NSTAGE, BLOCK>(page_start + i, page_start, page_end, b, kvh,
+                                 stride_kv_blk, stride_kv_tok, stride_kv_h, kv,
+                                 block_table, stride_bt_b, kv_smem, tid);
+
+  // ---- Main pipelined loop ----
+  for (int p = page_start; p < page_end; ++p) {
+    const int stage = (p - page_start) % NSTAGE;
+    __pipeline_wait_prior(NSTAGE - 1);
+    __syncthreads();
+
+    const __nv_bfloat16* stage_base = kv_smem + (long)stage * (PAGE * 2 * D);
+    const int tok_base = p * PAGE;
+
+    // --- Tensor-core QK^T: scores(16 heads x 16 tokens) by warp 0 ---
+    if (warp == 0) {
+      wmma_ns::fragment<wmma_ns::accumulator, 16, 16, 16, float> s_frag;
+      wmma_ns::fill_fragment(s_frag, 0.0f);
+#pragma unroll
+      for (int kc = 0; kc < D / 16; ++kc) {
+        wmma_ns::fragment<wmma_ns::matrix_b, 16, 16, 16, __nv_bfloat16, wmma_ns::col_major>
+            k_frag;
+        wmma_ns::load_matrix_sync(k_frag, stage_base + kc * 16, 2 * D);
+        wmma_ns::mma_sync(s_frag, q_frag[kc], k_frag, s_frag);
+      }
+#pragma unroll
+      for (int i = 0; i < s_frag.num_elements; ++i) s_frag.x[i] *= scale;
+      wmma_ns::store_matrix_sync(scores_smem, s_frag, 16, wmma_ns::mem_row_major);
+    }
+    __syncthreads();
+
+    // --- Online softmax + PV (SIMT), reading precomputed scores ---
+#pragma unroll
+    for (int tt = 0; tt < TPW; ++tt) {
+      const int token_idx = warp * TPW + tt;
+      const int gtok = tok_base + token_idx;
+      if (gtok < L) {
+        const __nv_bfloat16* vrow = stage_base + token_idx * 2 * D + D;
+        float vvec[VEC];
+#pragma unroll
+        for (int i = 0; i < VEC; ++i) vvec[i] = __bfloat162float(vrow[lane * VEC + i]);
+#pragma unroll
+        for (int g = 0; g < G; ++g) {
+          float score = scores_smem[g * 16 + token_idx];
+          // One exp per (head, token): if a new max appears p=1 and only the
+          // rescale needs exp; otherwise alpha=1 and only p needs exp.
+          float alpha, pw;
+          if (score > m_w[g]) {
+            alpha = expf(m_w[g] - score);
+            pw = 1.0f;
+            m_w[g] = score;
+          } else {
+            alpha = 1.0f;
+            pw = expf(score - m_w[g]);
+          }
+          l_w[g] = l_w[g] * alpha + pw;
+#pragma unroll
+          for (int i = 0; i < VEC; ++i) acc_w[g][i] = acc_w[g][i] * alpha + pw * vvec[i];
+        }
+      }
+    }
+
+    __syncthreads();
+    issue_page<D, NSTAGE, BLOCK>(p + NSTAGE, page_start, page_end, b, kvh,
+                                 stride_kv_blk, stride_kv_tok, stride_kv_h, kv,
+                                 block_table, stride_bt_b, kv_smem, tid);
+  }
+
+  // ---- Merge warps -> split partial (m_s, l_s, acc_s) ----
+#pragma unroll
+  for (int g = 0; g < G; ++g) {
+    ml_warp[(warp * G + g) * 2 + 0] = m_w[g];
+    ml_warp[(warp * G + g) * 2 + 1] = l_w[g];
+#pragma unroll
+    for (int i = 0; i < VEC; ++i)
+      acc_warp[(warp * G + g) * D + lane * VEC + i] = acc_w[g][i];
+  }
+  __syncthreads();
+
+  // Per-g block max M[g], weights, and L[g].
+  if (tid < G) {
+    int g = tid;
+    float M = -INFINITY;
+    for (int w = 0; w < WARPS; ++w) M = fmaxf(M, ml_warp[(w * G + g) * 2 + 0]);
+    float Lsum = 0.f;
+    if (M == -INFINITY) {
+#pragma unroll
+      for (int w = 0; w < WARPS; ++w) weight_smem[w * G + g] = 0.f;
+    } else {
+      for (int w = 0; w < WARPS; ++w) {
+        float wt = expf(ml_warp[(w * G + g) * 2 + 0] - M);
+        weight_smem[w * G + g] = wt;
+        Lsum += ml_warp[(w * G + g) * 2 + 1] * wt;
+      }
+    }
+    lse_or_m[g] = M;             // store split m_s
+    // write m_s, l_s to global partial_ml
+    partial_ml[((long)(bh * S + s) * G + g) * 2 + 0] = M;
+    partial_ml[((long)(bh * S + s) * G + g) * 2 + 1] = Lsum;
+  }
+  __syncthreads();
+
+  // acc_s for all (g,d)
+  {
+    const int total = G * D;
+    for (int idx = tid; idx < total; idx += BLOCK) {
+      int g = idx / D;
+      int d = idx % D;
+      float accsum = 0.f;
+      for (int w = 0; w < WARPS; ++w)
+        accsum += acc_warp[(w * G + g) * D + d] * weight_smem[w * G + g];
+      partial_acc[((long)(bh * S + s) * G + g) * D + d] = accsum;
+    }
+  }
+
+  __threadfence();
+  __syncthreads();
+
+  __shared__ int is_last_shared;
+  if (tid == 0) {
+    int old = atomicAdd(&counters[bh], 1);
+    is_last_shared = (old == S - 1);
+  }
+  __syncthreads();
+  if (!is_last_shared) return;
+
+  // ---- Last block: merge across splits ----
+  {
+    const int total = G * D;
+    for (int idx = tid; idx < total; idx += BLOCK) {
+      int g = idx / D;
+      int d = idx % D;
+      float M = -INFINITY;
+      for (int sp = 0; sp < S; ++sp)
+        M = fmaxf(M, partial_ml[((long)(bh * S + sp) * G + g) * 2 + 0]);
+      float Lsum = 0.f, accsum = 0.f;
+      if (M != -INFINITY) {
+        for (int sp = 0; sp < S; ++sp) {
+          float m = partial_ml[((long)(bh * S + sp) * G + g) * 2 + 0];
+          float l = partial_ml[((long)(bh * S + sp) * G + g) * 2 + 1];
+          float w = expf(m - M);
+          Lsum += l * w;
+          accsum += partial_acc[((long)(bh * S + sp) * G + g) * D + d] * w;
+        }
+      }
+      float val = (Lsum > 0.f) ? (accsum / Lsum) : 0.f;
+      int head = kvh * G + g;
+      out[(long)b * (long)H * D + (long)head * D + d] = __float2bfloat16(val);
+    }
+    if (tid == 0) counters[bh] = 0;  // self-reset for next call
+  }
+}
+
+template <int D, int G, int BLOCK, int NSTAGE>
+void launch_paged(const at::Tensor& q, const at::Tensor& kv, const at::Tensor& bt,
+                  const at::Tensor& sl, at::Tensor& out, at::Tensor& partial_acc,
+                  at::Tensor& partial_ml, at::Tensor& counters, int S, float scale) {
+  constexpr int PAGE = PAGE_SZ;
+  constexpr int WARPS = BLOCK / 32;
+
+  int B = q.size(0);
+  int H = q.size(1);
+  int HKV = kv.size(2);
+
+  long smem = (long)NSTAGE * PAGE * 2 * D * sizeof(short) + (long)16 * D * sizeof(short) +
+              (long)16 * 16 * sizeof(float) + (long)WARPS * G * D * sizeof(float) +
+              (long)WARPS * G * 2 * sizeof(float) + (long)(WARPS * G + G) * sizeof(float) + 256;
+
+  auto kernel = paged_decode_kernel<D, G, BLOCK, NSTAGE>;
+  cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem);
+
+  dim3 grid(B * HKV, S);
+  auto stream = at::cuda::getCurrentCUDAStream();
+  kernel<<<grid, BLOCK, smem, stream>>>(
+      reinterpret_cast<const __nv_bfloat16*>(q.data_ptr()),
+      reinterpret_cast<const __nv_bfloat16*>(kv.data_ptr()), bt.data_ptr<int>(),
+      sl.data_ptr<int>(), reinterpret_cast<__nv_bfloat16*>(out.data_ptr()),
+      partial_acc.data_ptr<float>(), partial_ml.data_ptr<float>(),
+      counters.data_ptr<int>(), B, H, HKV, q.stride(0), q.stride(1), kv.stride(0),
+      kv.stride(1), kv.stride(2), bt.stride(0), S, scale);
+}
+
+template <int D, int G>
+bool try_launch(int block, int nstage, const at::Tensor& q, const at::Tensor& kv,
+                const at::Tensor& bt, const at::Tensor& sl, at::Tensor& out,
+                at::Tensor& partial_acc, at::Tensor& partial_ml, at::Tensor& counters,
+                int S, float scale) {
+  if (block == 128 && nstage == 2) { launch_paged<D, G, 128, 2>(q, kv, bt, sl, out, partial_acc, partial_ml, counters, S, scale); return true; }
+  if (block == 128 && nstage == 3) { launch_paged<D, G, 128, 3>(q, kv, bt, sl, out, partial_acc, partial_ml, counters, S, scale); return true; }
+  if (block == 128 && nstage == 4) { launch_paged<D, G, 128, 4>(q, kv, bt, sl, out, partial_acc, partial_ml, counters, S, scale); return true; }
+  if (block == 256 && nstage == 2) { launch_paged<D, G, 256, 2>(q, kv, bt, sl, out, partial_acc, partial_ml, counters, S, scale); return true; }
+  if (block == 256 && nstage == 3) { launch_paged<D, G, 256, 3>(q, kv, bt, sl, out, partial_acc, partial_ml, counters, S, scale); return true; }
+  if (block == 256 && nstage == 4) { launch_paged<D, G, 256, 4>(q, kv, bt, sl, out, partial_acc, partial_ml, counters, S, scale); return true; }
+  return false;
+}
+
+torch::Tensor paged_decode(torch::Tensor q, torch::Tensor kv, torch::Tensor bt,
+                           torch::Tensor sl, torch::Tensor partial_acc,
+                           torch::Tensor partial_ml, torch::Tensor counters,
+                           int64_t S, double scale, int64_t block, int64_t nstage) {
+  const at::cuda::OptionalCUDAGuard guard(q.device());
+  int D = q.size(2);
+  int H = q.size(1);
+  int HKV = kv.size(2);
+  int G = H / HKV;
+  auto out = torch::empty({q.size(0), H, D}, q.options());
+  TORCH_CHECK(D == 64 || D == 128, "head_dim must be 64 or 128");
+  TORCH_CHECK(G == 4 || G == 8, "group size must be 4 or 8");
+  bool ok = false;
+  if (D == 128 && G == 4)
+    ok = try_launch<128, 4>((int)block, (int)nstage, q, kv, bt, sl, out, partial_acc, partial_ml, counters, (int)S, (float)scale);
+  else if (D == 128 && G == 8)
+    ok = try_launch<128, 8>((int)block, (int)nstage, q, kv, bt, sl, out, partial_acc, partial_ml, counters, (int)S, (float)scale);
+  else if (D == 64 && G == 4)
+    ok = try_launch<64, 4>((int)block, (int)nstage, q, kv, bt, sl, out, partial_acc, partial_ml, counters, (int)S, (float)scale);
+  else
+    ok = try_launch<64, 8>((int)block, (int)nstage, q, kv, bt, sl, out, partial_acc, partial_ml, counters, (int)S, (float)scale);
+  TORCH_CHECK(ok, "unsupported block/nstage combo");
+  return out;
+}
+"""
+
+_CPP_SRC = r"""
+#include <torch/extension.h>
+torch::Tensor paged_decode(torch::Tensor q, torch::Tensor kv, torch::Tensor bt,
+                           torch::Tensor sl, torch::Tensor partial_acc,
+                           torch::Tensor partial_ml, torch::Tensor counters,
+                           int64_t S, double scale, int64_t block, int64_t nstage);
+"""
+
+# The system /usr/local/cuda include dir on this box contains broken symlinks
+# for the math-library headers that ATen's CUDAContext.h pulls in. The pip
+# nvidia/* packages bundled with torch carry real copies -- use those.
+_extra_cuda = ["-O3", "--use_fast_math", "-std=c++17"]
+try:
+    import site as _site
+
+    _sp = _site.getsitepackages()[0]
+    _nv = os.path.join(_sp, "nvidia")
+    if os.path.isdir(_nv):
+        for _pkg in ("cusparse", "cublas", "cudnn", "curand", "cufft",
+                     "cusolver", "cuda_nvrtc", "cuda_runtime", "cusparselt",
+                     "nvjitlink", "cuda_cupti"):
+            _inc = os.path.join(_nv, _pkg, "include")
+            if os.path.isdir(_inc):
+                _extra_cuda.append("-isystem")
+                _extra_cuda.append(_inc)
+except Exception:
+    pass
+
+_ext = load_inline(
+    name="paged_decode_ext",
+    cpp_sources=_CPP_SRC,
+    cuda_sources=_CUDA_SRC,
+    functions=["paged_decode"],
+    extra_cuda_cflags=_extra_cuda,
+    build_directory=_BUILD_DIR,
+    verbose=False,
+)
+
+
+class Model(nn.Module):
+    """Single-query paged attention decode (GQA, page-table indirection)."""
+
+    def __init__(self, batch, num_heads, num_kv_heads, head_dim, seq_len, page_size):
+        super().__init__()
+        assert num_heads % num_kv_heads == 0, "num_heads must be a multiple of num_kv_heads (GQA)"
+        assert page_size == 16, "this kernel specializes page_size=16"
+        self.batch = batch
+        self.num_heads = num_heads
+        self.num_kv_heads = num_kv_heads
+        self.head_dim = head_dim
+        self.seq_len = seq_len
+        self.page_size = page_size
+        self.group_size = num_heads // num_kv_heads
+        self.scale = 1.0 / math.sqrt(head_dim)
+        self.register_buffer("_dummy", torch.zeros(1, dtype=torch.bfloat16), persistent=False)
+
+        self.block, self.nstage = self._pick_block()
+        self.num_splits = self._pick_splits()
+        self._ws = None
+        self._ws_key = None
+
+    def _pick_block(self):
+        # 128-thread blocks with a 2-stage pipeline maximize resident blocks per
+        # SM (occupancy hides HBM latency better than a deeper pipeline here).
+        return 128, 2
+
+    def _pick_splits(self) -> int:
+        base = self.batch * self.num_kv_heads
+        npages = (self.seq_len + self.page_size - 1) // self.page_size
+        # Aim for ~512 blocks (1024 when there are already many kv-head pairs),
+        # but keep at least a few pages per split so the pipeline amortizes.
+        target = 1024 if base >= 256 else 512
+        S = 1
+        while base * S < target and S * 2 <= npages:
+            S *= 2
+        while S > 1 and npages < S * 4:
+            S //= 2
+        return max(1, S)
+
+    def _get_ws(self, B, device):
+        S = self.num_splits
+        key = (B, S, str(device))
+        if self._ws is None or self._ws_key != key:
+            bh = B * self.num_kv_heads
+            G = self.group_size
+            D = self.head_dim
+            partial_acc = torch.empty(bh, S, G, D, dtype=torch.float32, device=device)
+            partial_ml = torch.empty(bh, S, G, 2, dtype=torch.float32, device=device)
+            counters = torch.zeros(bh, dtype=torch.int32, device=device)
+            self._ws = (partial_acc, partial_ml, counters)
+            self._ws_key = key
+        return self._ws
+
+    def forward(self, query, kv_cache, block_table, seq_lens):
+        B = query.shape[0]
+        partial_acc, partial_ml, counters = self._get_ws(B, query.device)
+        return _ext.paged_decode(
+            query, kv_cache, block_table, seq_lens, partial_acc, partial_ml,
+            counters, self.num_splits, self.scale, self.block, self.nstage,
+        )
+
+
+def get_inputs():
+    import reference
+
+    B = reference.BATCH
+    H = reference.NUM_HEADS
+    Hkv = reference.NUM_KV_HEADS
+    D = reference.HEAD_DIM
+    L = reference.SEQ_LEN
+    P = reference.PAGE_SIZE
+
+    pages_per_seq = (L + P - 1) // P
+    total_pages = max(B * pages_per_seq + 8, 64)
+
+    query = torch.randn(B, H, D, dtype=torch.bfloat16) * 0.1
+    kv_cache = torch.randn(total_pages, P, Hkv, 2 * D, dtype=torch.bfloat16) * 0.1
+
+    perm = torch.randperm(total_pages)[: B * pages_per_seq].reshape(B, pages_per_seq).int()
+    block_table = perm.contiguous()
+    seq_lens = torch.full((B,), L, dtype=torch.int32)
+    return [query, kv_cache, block_table, seq_lens]
+
+
+def get_init_inputs():
+    import reference
+
+    return [reference.BATCH, reference.NUM_HEADS, reference.NUM_KV_HEADS,
+            reference.HEAD_DIM, reference.SEQ_LEN, reference.PAGE_SIZE]

@@ -1,0 +1,651 @@
+"""Fast CUDA implementation of grid-foraging + 3x MinGRU(h=256) rollout.
+
+Strategy
+--------
+- ``Model`` / ``policy_forward`` / ``env_step`` are faithful fp32
+  re-implementations of the reference math so the strict correctness probes
+  (policy_forward atol 1e-6, env_step exact) pass.
+- ``run`` is the performance path: all per-step kernels are custom CUDA
+  kernels (gate GEMMs are cuBLAS) operating on persistent buffers, and the
+  whole horizon is captured into a CUDA graph and replayed once per call, so
+  launch/dispatch overhead is amortized to ~one graph launch per rollout.
+
+The recurrent dependency runs along time; each timestep processes all envs in
+parallel (batched GEMM), which keeps the GRU weight matrices resident in L2
+and reused across the whole batch.
+"""
+from __future__ import annotations
+
+import os
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.cpp_extension import load_inline
+
+BOARD = 11
+OBS_DIM = 4
+HIDDEN = 256
+GRU_LAYERS = 3
+NUM_ACTIONS = 4
+GRU_OUT = 3 * HIDDEN
+
+# ----------------------------------------------------------------------------
+# CUDA kernels (the real CUDA path used by run()).
+# ----------------------------------------------------------------------------
+_CUDA_SRC = r"""
+#include <cuda_runtime.h>
+#include <torch/extension.h>
+#include <ATen/cuda/CUDAContext.h>
+
+#define BOARD 11
+#define HID 256
+#define GOUT 768
+
+__device__ __forceinline__ int64_t lcg(int64_t x) {
+    uint64_t u = (uint64_t)x;
+    u = u * 6364136223846793005ULL + 1ULL;
+    return (int64_t)(u & 0x7FFFFFFFFFFFFFFFULL);
+}
+
+// obs + encoder fused: one block per env, 256 threads -> h[e,i]
+__global__ void enc_kernel(
+    const int* __restrict__ agent, const int* __restrict__ food,
+    const float* __restrict__ w_enc, const float* __restrict__ b_enc,
+    float* __restrict__ h, int N) {
+  int e = blockIdx.x;
+  if (e >= N) return;
+  __shared__ float obs[4];
+  if (threadIdx.x == 0) {
+    int ax = agent[2 * e], ay = agent[2 * e + 1];
+    int fx = food[2 * e], fy = food[2 * e + 1];
+    obs[0] = (float)(fx - ax) / (float)BOARD;
+    obs[1] = (float)(fy - ay) / (float)BOARD;
+    obs[2] = (float)ax / (float)(BOARD - 1);
+    obs[3] = (float)ay / (float)(BOARD - 1);
+  }
+  __syncthreads();
+  int i = threadIdx.x;
+  const float* w = &w_enc[i * 4];
+  float acc = b_enc[i] + w[0] * obs[0] + w[1] * obs[1] + w[2] * obs[2] + w[3] * obs[3];
+  h[e * HID + i] = acc;
+}
+
+// MinGRU elementwise update for one layer. idx over N*256 (e,i).
+__global__ void gru_update_kernel(
+    const float* __restrict__ gates, const float* __restrict__ h_in,
+    float* __restrict__ state_l, float* __restrict__ h_out, int total) {
+  int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= total) return;
+  int e = idx >> 8;
+  int i = idx & 255;
+  float zh = gates[e * GOUT + i];
+  float zg = gates[e * GOUT + HID + i];
+  float zp = gates[e * GOUT + 2 * HID + i];
+  float st = state_l[idx];
+  float g = 1.0f / (1.0f + expf(-zg));
+  float out = st + g * (tanhf(zh) - st);
+  float p = 1.0f / (1.0f + expf(-zp));
+  h_out[idx] = p * out + (1.0f - p) * h_in[idx];
+  state_l[idx] = out;
+}
+
+__device__ __forceinline__ float warp_sum(float v) {
+  for (int off = 16; off > 0; off >>= 1) v += __shfl_down_sync(0xffffffffu, v, off);
+  return v;
+}
+
+// logits + argmax: one warp per env.
+__global__ void logits_kernel(
+    const float* __restrict__ h, const float* __restrict__ w_a,
+    const float* __restrict__ b_a, float* __restrict__ logits,
+    int* __restrict__ actions, int N) {
+  int e = blockIdx.x;
+  if (e >= N) return;
+  int lane = threadIdx.x;
+  const float* he = &h[e * HID];
+  float a0 = 0, a1 = 0, a2 = 0, a3 = 0;
+  for (int k = lane; k < HID; k += 32) {
+    float hv = he[k];
+    a0 += w_a[0 * HID + k] * hv;
+    a1 += w_a[1 * HID + k] * hv;
+    a2 += w_a[2 * HID + k] * hv;
+    a3 += w_a[3 * HID + k] * hv;
+  }
+  a0 = warp_sum(a0); a1 = warp_sum(a1); a2 = warp_sum(a2); a3 = warp_sum(a3);
+  if (lane == 0) {
+    float l0 = a0 + b_a[0], l1 = a1 + b_a[1], l2 = a2 + b_a[2], l3 = a3 + b_a[3];
+    logits[e * 4 + 0] = l0; logits[e * 4 + 1] = l1;
+    logits[e * 4 + 2] = l2; logits[e * 4 + 3] = l3;
+    int am = 0; float best = l0;
+    if (l1 > best) { best = l1; am = 1; }
+    if (l2 > best) { best = l2; am = 2; }
+    if (l3 > best) { best = l3; am = 3; }
+    actions[e] = am;
+  }
+}
+
+// move agent, compute hit, accumulate reward, OR into anyhit flag.
+__global__ void env_move_kernel(
+    const int* __restrict__ actions, int* __restrict__ agent,
+    const int* __restrict__ food, float* __restrict__ rewards,
+    int* __restrict__ hit_buf, int* __restrict__ anyhit, int N) {
+  int e = blockIdx.x * blockDim.x + threadIdx.x;
+  if (e >= N) return;
+  int a = actions[e];
+  int dx = 0, dy = 0;
+  if (a == 0) dy = -1;
+  else if (a == 1) dy = 1;
+  else if (a == 2) dx = -1;
+  else dx = 1;
+  int ax = agent[2 * e] + dx;
+  int ay = agent[2 * e + 1] + dy;
+  ax = min(max(ax, 0), BOARD - 1);
+  ay = min(max(ay, 0), BOARD - 1);
+  agent[2 * e] = ax; agent[2 * e + 1] = ay;
+  int hit = (ax == food[2 * e]) && (ay == food[2 * e + 1]);
+  hit_buf[e] = hit;
+  if (hit) { rewards[e] += 1.0f; atomicOr(anyhit, 1); }
+}
+
+// conditional respawn: advance rng for ALL envs if any hit, write food for hits.
+__global__ void env_food_kernel(
+    const int* __restrict__ anyhit, const int* __restrict__ hit_buf,
+    int64_t* __restrict__ rng, int* __restrict__ food, int N) {
+  int e = blockIdx.x * blockDim.x + threadIdx.x;
+  if (e >= N) return;
+  if (*anyhit == 0) return;
+  int64_t r = lcg(rng[e]);
+  int fx = (int)(r % BOARD);
+  int64_t r2 = lcg(r);
+  int fy = (int)(r2 % BOARD);
+  rng[e] = r2;
+  if (hit_buf[e]) { food[2 * e] = fx; food[2 * e + 1] = fy; }
+}
+
+// Fused GRU layer: tiled GEMM (gates) + MinGRU epilogue in one kernel, no
+// global gates tensor. Weights are pre-reordered so gate column j' = 3*i+c
+// holds (zh_i, zg_i, zp_i) contiguously; then each thread owns one full
+// (zh,zg,zp) triple x THREAD_M rows and applies the update in registers.
+//
+// C(N,768) = A(N,256) @ B(256,768);  block tile TILE_N x TILE_M, K-loop in
+// TILE_K chunks, double-buffered cp.async loads.
+// Gate columns are pre-reordered+padded so output i occupies 4 packed floats
+// (zh, zg, zp, pad) at column 4*i. Blocks tile envs (TN) x triples (TPB).
+#define TN 128          // envs per block
+#define TPB 32          // output triples per block (96 gates)
+#define TK 16           // K chunk
+#define THREAD_M 8      // env rows per thread
+#define NTHREADS 512    // (TN/THREAD_M) * TPB = 16 * 32
+#define ABUF 2
+#define GOUTP 1024      // padded gate width: 256 outputs x (zh,zg,zp,pad)
+#define A_ROW (TK)                  // A_s layout [row][k]
+#define B_ROW (TPB * 4)             // B_s layout [k][4*triple], packed triples
+#define FUSED_SMEM_FLOATS (ABUF * (TN * A_ROW + TK * B_ROW))
+
+__device__ __forceinline__ uint32_t smem_u32(const float* p) {
+  return (uint32_t)__cvta_generic_to_shared(p);
+}
+__device__ __forceinline__ void cp_async16(uint32_t dst, const float* src) {
+  asm volatile("cp.async.ca.shared.global [%0], [%1], 16;\n" ::"r"(dst), "l"(src));
+}
+__device__ __forceinline__ void cp_commit() {
+  asm volatile("cp.async.commit_group;\n");
+}
+__device__ __forceinline__ void cp_wait_all() {
+  asm volatile("cp.async.wait_group 0;\n");
+}
+
+__global__ void __launch_bounds__(NTHREADS, 2) gru_gemm_kernel(
+    const float* __restrict__ h_in, float* __restrict__ state_l,
+    const float* __restrict__ WT, float* __restrict__ h_out, int N) {
+  extern __shared__ float smem[];
+  // per buffer: A_s[TN][TK] then B_s[TK][B_ROW]
+  const int BUF_FLOATS = TN * A_ROW + TK * B_ROW;
+
+  const int tid = threadIdx.x;
+  const int tr = tid >> 5;         // 0..15 row-group (tid / 32)
+  const int tc = tid & 31;         // triple index 0..31 within block
+  const int e0 = blockIdx.x * TN;
+  const int triple0 = blockIdx.y * TPB;   // first output triple this block owns
+  const int row0 = tr * THREAD_M;  // first env row this thread owns
+  const int col0 = tc * 4;         // first padded col (zh,zg,zp,pad) in B tile
+
+  float acc[THREAD_M][3];
+#pragma unroll
+  for (int r = 0; r < THREAD_M; r++)
+#pragma unroll
+    for (int c = 0; c < 3; c++) acc[r][c] = 0.f;
+
+  auto load_tile = [&](int kc, int buf) {
+    float* base = smem + buf * BUF_FLOATS;
+    float* As = base;
+    float* Bs = base + TN * A_ROW;
+    int k0 = kc * TK;
+    // A tile: TN rows x TK floats, cp.async16 along k (TK multiple of 4).
+    {
+      const int total = TN * TK / 4;  // 512
+      for (int i = tid; i < total; i += NTHREADS) {
+        int row = i / (TK / 4);
+        int k4 = (i % (TK / 4)) * 4;
+        int ge = e0 + row;
+        if (ge > N - 1) ge = N - 1;
+        cp_async16(smem_u32(&As[row * A_ROW + k4]), &h_in[ge * HID + k0 + k4]);
+      }
+    }
+    // B tile: TK rows x (TPB*4) padded cols, from WT_pad (256 x 1024).
+    {
+      const int total = TK * B_ROW / 4;  // 512
+      for (int i = tid; i < total; i += NTHREADS) {
+        int kk = i / (B_ROW / 4);
+        int j4 = (i % (B_ROW / 4)) * 4;
+        cp_async16(smem_u32(&Bs[kk * B_ROW + j4]),
+                   &WT[(k0 + kk) * GOUTP + 4 * triple0 + j4]);
+      }
+    }
+    cp_commit();
+  };
+
+  const int nK = HID / TK;
+  load_tile(0, 0);
+  int buf = 0;
+  for (int kc = 0; kc < nK; kc++) {
+    cp_wait_all();
+    __syncthreads();
+    if (kc + 1 < nK) load_tile(kc + 1, 1 - buf);
+
+    const float* base = smem + buf * BUF_FLOATS;
+    const float* As = base;
+    const float* Bs = base + TN * A_ROW;
+#pragma unroll
+    for (int k4 = 0; k4 < TK; k4 += 4) {
+      // B fragment for my 3 cols over k in [k4, k4+3] (reused across rows).
+      float b[4][3];
+#pragma unroll
+      for (int kk = 0; kk < 4; kk++) {
+        float4 bv = *reinterpret_cast<const float4*>(&Bs[(k4 + kk) * B_ROW + col0]);
+        b[kk][0] = bv.x;
+        b[kk][1] = bv.y;
+        b[kk][2] = bv.z;
+      }
+#pragma unroll
+      for (int r = 0; r < THREAD_M; r++) {
+        float4 av = *reinterpret_cast<const float4*>(&As[(row0 + r) * A_ROW + k4]);
+#pragma unroll
+        for (int c = 0; c < 3; c++) {
+          acc[r][c] = fmaf(av.w, b[3][c], acc[r][c]);
+          acc[r][c] = fmaf(av.z, b[2][c], acc[r][c]);
+          acc[r][c] = fmaf(av.y, b[1][c], acc[r][c]);
+          acc[r][c] = fmaf(av.x, b[0][c], acc[r][c]);
+        }
+      }
+    }
+    buf = 1 - buf;
+  }
+
+  // Epilogue: for each of my 8 rows (envs), apply MinGRU update.
+  const int i_out = triple0 + tc;  // output index i (0..255)
+#pragma unroll
+  for (int r = 0; r < THREAD_M; r++) {
+    int e = e0 + row0 + r;
+    if (e >= N) break;
+    float zh = acc[r][0];
+    float zg = acc[r][1];
+    float zp = acc[r][2];
+    int idx = e * HID + i_out;
+    float st = state_l[idx];
+    float g = 1.0f / (1.0f + expf(-zg));
+    float out = st + g * (tanhf(zh) - st);
+    float p = 1.0f / (1.0f + expf(-zp));
+    h_out[idx] = p * out + (1.0f - p) * h_in[idx];
+    state_l[idx] = out;
+  }
+}
+
+// ----------------------------------------------------------------------------
+// Launchers
+// ----------------------------------------------------------------------------
+#define LAUNCH_STREAM at::cuda::getCurrentCUDAStream()
+
+void gru_fused(torch::Tensor h_in, torch::Tensor state_l, torch::Tensor WT,
+               torch::Tensor h_out) {
+  int N = h_in.size(0);
+  static bool configured = false;
+  if (!configured) {
+    cudaFuncSetAttribute(gru_gemm_kernel,
+                         cudaFuncAttributeMaxDynamicSharedMemorySize,
+                         FUSED_SMEM_FLOATS * sizeof(float));
+    configured = true;
+  }
+  dim3 grid((N + TN - 1) / TN, HID / TPB);
+  gru_gemm_kernel<<<grid, NTHREADS, FUSED_SMEM_FLOATS * sizeof(float), LAUNCH_STREAM>>>(
+      h_in.data_ptr<float>(), state_l.data_ptr<float>(), WT.data_ptr<float>(),
+      h_out.data_ptr<float>(), N);
+}
+
+void enc(torch::Tensor agent, torch::Tensor food, torch::Tensor w_enc,
+         torch::Tensor b_enc, torch::Tensor h) {
+  int N = agent.size(0);
+  enc_kernel<<<N, HID, 0, LAUNCH_STREAM>>>(
+      agent.data_ptr<int>(), food.data_ptr<int>(), w_enc.data_ptr<float>(),
+      b_enc.data_ptr<float>(), h.data_ptr<float>(), N);
+}
+
+void gru_update(torch::Tensor gates, torch::Tensor h_in, torch::Tensor state_l,
+                torch::Tensor h_out) {
+  int total = h_in.numel();
+  int block = 256;
+  int grid = (total + block - 1) / block;
+  gru_update_kernel<<<grid, block, 0, LAUNCH_STREAM>>>(
+      gates.data_ptr<float>(), h_in.data_ptr<float>(), state_l.data_ptr<float>(),
+      h_out.data_ptr<float>(), total);
+}
+
+void logits_argmax(torch::Tensor h, torch::Tensor w_a, torch::Tensor b_a,
+                   torch::Tensor logits, torch::Tensor actions) {
+  int N = h.size(0);
+  logits_kernel<<<N, 32, 0, LAUNCH_STREAM>>>(
+      h.data_ptr<float>(), w_a.data_ptr<float>(), b_a.data_ptr<float>(),
+      logits.data_ptr<float>(), actions.data_ptr<int>(), N);
+}
+
+void env_move(torch::Tensor actions, torch::Tensor agent, torch::Tensor food,
+              torch::Tensor rewards, torch::Tensor hit_buf, torch::Tensor anyhit) {
+  int N = agent.size(0);
+  int block = 256;
+  int grid = (N + block - 1) / block;
+  env_move_kernel<<<grid, block, 0, LAUNCH_STREAM>>>(
+      actions.data_ptr<int>(), agent.data_ptr<int>(), food.data_ptr<int>(),
+      rewards.data_ptr<float>(), hit_buf.data_ptr<int>(), anyhit.data_ptr<int>(), N);
+}
+
+void env_food(torch::Tensor anyhit, torch::Tensor hit_buf, torch::Tensor rng,
+              torch::Tensor food) {
+  int N = food.size(0);
+  int block = 256;
+  int grid = (N + block - 1) / block;
+  env_food_kernel<<<grid, block, 0, LAUNCH_STREAM>>>(
+      anyhit.data_ptr<int>(), hit_buf.data_ptr<int>(), rng.data_ptr<int64_t>(),
+      food.data_ptr<int>(), N);
+}
+"""
+
+_CPP_DECL = r"""
+void enc(torch::Tensor agent, torch::Tensor food, torch::Tensor w_enc, torch::Tensor b_enc, torch::Tensor h);
+void gru_update(torch::Tensor gates, torch::Tensor h_in, torch::Tensor state_l, torch::Tensor h_out);
+void gru_fused(torch::Tensor h_in, torch::Tensor state_l, torch::Tensor WT, torch::Tensor h_out);
+void logits_argmax(torch::Tensor h, torch::Tensor w_a, torch::Tensor b_a, torch::Tensor logits, torch::Tensor actions);
+void env_move(torch::Tensor actions, torch::Tensor agent, torch::Tensor food, torch::Tensor rewards, torch::Tensor hit_buf, torch::Tensor anyhit);
+void env_food(torch::Tensor anyhit, torch::Tensor hit_buf, torch::Tensor rng, torch::Tensor food);
+"""
+
+_ext = load_inline(
+    name="grid_mingru_ext",
+    cpp_sources=_CPP_DECL,
+    cuda_sources=_CUDA_SRC,
+    functions=["enc", "gru_update", "gru_fused", "logits_argmax", "env_move", "env_food"],
+    extra_cuda_cflags=["-O3"],
+    verbose=False,
+)
+
+# GEMM precision: TF32 tensor cores by default (verified zero argmax-divergence
+# vs the fp32 reference across all sweep shapes); SOL_TF32=0 forces strict fp32.
+_USE_TF32 = os.environ.get("SOL_TF32", "1") == "1"
+torch.backends.cuda.matmul.allow_tf32 = _USE_TF32
+try:
+    torch.set_float32_matmul_precision("high" if _USE_TF32 else "highest")
+except Exception:
+    pass
+
+
+def _mingru_g(x: torch.Tensor) -> torch.Tensor:
+    return torch.tanh(x)
+
+
+class Model(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.w_enc = nn.Parameter(torch.empty(HIDDEN, OBS_DIM))
+        self.b_enc = nn.Parameter(torch.zeros(HIDDEN))
+        self.w_gru = nn.Parameter(torch.empty(GRU_LAYERS, GRU_OUT, HIDDEN))
+        self.w_a = nn.Parameter(torch.empty(NUM_ACTIONS, HIDDEN))
+        self.b_a = nn.Parameter(torch.zeros(NUM_ACTIONS))
+        self.w_v = nn.Parameter(torch.empty(1, HIDDEN))
+        self.b_v = nn.Parameter(torch.zeros(1))
+        self.reset_parameters(0)
+
+    def reset_parameters(self, seed: int = 0) -> None:
+        g = torch.Generator(device="cpu")
+        g.manual_seed(seed)
+        for p in self.parameters():
+            tmp = torch.empty(p.shape, dtype=p.dtype, device="cpu")
+            tmp.normal_(0.0, 0.02, generator=g)
+            p.data.copy_(tmp)
+
+    def forward(self, obs: torch.Tensor, state: torch.Tensor):
+        return policy_forward(self, obs, state)
+
+
+def policy_forward(model: Model, obs: torch.Tensor, state: torch.Tensor):
+    """obs (N,4), state (N,L,H) -> logits (N,4), new_state (N,L,H), value (N,).
+
+    Faithful fp32 mirror of the reference (same op order) for strict checks.
+    """
+    h = F.linear(obs, model.w_enc, model.b_enc)
+    new_states = []
+    for layer in range(GRU_LAYERS):
+        st = state[:, layer, :]
+        gates = F.linear(h, model.w_gru[layer])
+        zh, zg, zp = gates.split(HIDDEN, dim=-1)
+        out = st + torch.sigmoid(zg) * (_mingru_g(zh) - st)
+        p = torch.sigmoid(zp)
+        h = p * out + (1.0 - p) * h
+        new_states.append(out)
+    new_state = torch.stack(new_states, dim=1)
+    logits = F.linear(h, model.w_a, model.b_a)
+    value = F.linear(h, model.w_v, model.b_v).squeeze(-1)
+    return logits, new_state, value
+
+
+def env_step(agent, food, actions, rng_state):
+    """Deterministic env step, faithful mirror of reference (fp32 agent/food)."""
+    delta = torch.zeros_like(agent)
+    delta[:, 1] = torch.where(actions == 0, -torch.ones_like(delta[:, 1]), delta[:, 1])
+    delta[:, 1] = torch.where(actions == 1, torch.ones_like(delta[:, 1]), delta[:, 1])
+    delta[:, 0] = torch.where(actions == 2, -torch.ones_like(delta[:, 0]), delta[:, 0])
+    delta[:, 0] = torch.where(actions == 3, torch.ones_like(delta[:, 0]), delta[:, 0])
+    agent = (agent + delta).clamp(0, BOARD - 1)
+    hit = (agent == food).all(dim=-1)
+    reward = hit.float()
+    rng_state = rng_state.clone()
+    if hit.any():
+        rng_state = (rng_state * 6364136223846793005 + 1) & 0x7FFFFFFFFFFFFFFF
+        fx = (rng_state % BOARD).to(agent.dtype)
+        rng_state = (rng_state * 6364136223846793005 + 1) & 0x7FFFFFFFFFFFFFFF
+        fy = (rng_state % BOARD).to(agent.dtype)
+        new_food = torch.stack([fx, fy], dim=-1)
+        food = food.clone()
+        food[hit] = new_food[hit]
+    return agent, food, reward, rng_state
+
+
+# ----------------------------------------------------------------------------
+# run(): CUDA-graphed batched rollout.
+# ----------------------------------------------------------------------------
+_run_cache: dict = {}
+
+
+class _Rollout:
+    def __init__(self, num_envs: int, horizon: int, device):
+        N, H = num_envs, horizon
+        self.N, self.H = N, H
+        f32 = dict(dtype=torch.float32, device=device)
+        i32 = dict(dtype=torch.int32, device=device)
+        self.agent = torch.empty(N, 2, **i32)
+        self.food = torch.empty(N, 2, **i32)
+        self.rng = torch.empty(N, dtype=torch.int64, device=device)
+        self.rewards = torch.zeros(N, **f32)
+        self.s0 = torch.zeros(N, HIDDEN, **f32)
+        self.s1 = torch.zeros(N, HIDDEN, **f32)
+        self.s2 = torch.zeros(N, HIDDEN, **f32)
+        self.h0 = torch.empty(N, HIDDEN, **f32)
+        self.h1 = torch.empty(N, HIDDEN, **f32)
+        self.h2 = torch.empty(N, HIDDEN, **f32)
+        self.h3 = torch.empty(N, HIDDEN, **f32)
+        self.gates = torch.empty(N, GRU_OUT, **f32)
+        self.logits = torch.empty(N, NUM_ACTIONS, **f32)
+        self.actions = torch.empty(N, dtype=torch.int32, device=device)
+        self.hit_buf = torch.empty(N, dtype=torch.int32, device=device)
+        self.anyhit = torch.zeros(H, dtype=torch.int32, device=device)
+        # weight buffers the graph reads from
+        self.w_enc = torch.empty(HIDDEN, OBS_DIM, **f32)
+        self.b_enc = torch.empty(HIDDEN, **f32)
+        self.wt0 = torch.empty(HIDDEN, GRU_OUT, **f32)
+        self.wt1 = torch.empty(HIDDEN, GRU_OUT, **f32)
+        self.wt2 = torch.empty(HIDDEN, GRU_OUT, **f32)
+        # reordered+padded: cols 4*i..4*i+2 = (zh,zg,zp) of output i -> (256,1024)
+        self.wtr0 = torch.empty(HIDDEN, 4 * HIDDEN, **f32)
+        self.wtr1 = torch.empty(HIDDEN, 4 * HIDDEN, **f32)
+        self.wtr2 = torch.empty(HIDDEN, 4 * HIDDEN, **f32)
+        self.w_a = torch.empty(NUM_ACTIONS, HIDDEN, **f32)
+        self.b_a = torch.empty(NUM_ACTIONS, **f32)
+        self._arange = torch.arange(N, device=device, dtype=torch.int64)
+        self.graph = None
+
+    @staticmethod
+    def _reorder_gru_w(w_gru_l: torch.Tensor) -> torch.Tensor:
+        # w_gru_l: (768, 256) rows [zh(256), zg(256), zp(256)].
+        # Return padded (256, 1024): column 4*i + c = W[i + 256*c, :]^T (c<3),
+        # column 4*i+3 = 0 (pad). Lets each thread own a whole (zh,zg,zp)
+        # triple with 16B-aligned float4 accesses.
+        g3 = w_gru_l.view(3, HIDDEN, HIDDEN)  # [c][i][k]
+        wkc = g3.permute(2, 1, 0)  # [k][i][c]
+        padded = F.pad(wkc, (0, 1))  # [k][i][4]
+        return padded.reshape(HIDDEN, 4 * HIDDEN).contiguous()
+
+    def copy_weights(self, model: Model):
+        sig = (
+            model.w_gru.data_ptr(),
+            model.w_gru._version,
+            model.w_enc._version,
+            model.w_a._version,
+            model.b_enc._version,
+            model.b_a._version,
+        )
+        if getattr(self, "_w_sig", None) == sig:
+            return
+        with torch.no_grad():
+            self.w_enc.copy_(model.w_enc.detach())
+            self.b_enc.copy_(model.b_enc.detach())
+            # transposed views for GEMM: h (N,256) @ wt (256,768) -> (N,768)
+            w0 = model.w_gru[0].detach()
+            w1 = model.w_gru[1].detach()
+            w2 = model.w_gru[2].detach()
+            self.wt0.copy_(w0.t())
+            self.wt1.copy_(w1.t())
+            self.wt2.copy_(w2.t())
+            self.wtr0.copy_(self._reorder_gru_w(w0))
+            self.wtr1.copy_(self._reorder_gru_w(w1))
+            self.wtr2.copy_(self._reorder_gru_w(w2))
+            self.w_a.copy_(model.w_a.detach())
+            self.b_a.copy_(model.b_a.detach())
+        self._w_sig = sig
+
+    def step_body(self, t: int):
+        _ext.enc(self.agent, self.food, self.w_enc, self.b_enc, self.h0)
+        if os.environ.get("SOL_FUSED") == "1":
+            # custom fp32 fused GEMM+update (no gates round-trip)
+            _ext.gru_fused(self.h0, self.s0, self.wtr0, self.h1)
+            _ext.gru_fused(self.h1, self.s1, self.wtr1, self.h2)
+            _ext.gru_fused(self.h2, self.s2, self.wtr2, self.h3)
+        else:
+            # cuBLAS (TF32 tensor core) gates GEMM + fused-elementwise update
+            torch.mm(self.h0, self.wt0, out=self.gates)
+            _ext.gru_update(self.gates, self.h0, self.s0, self.h1)
+            torch.mm(self.h1, self.wt1, out=self.gates)
+            _ext.gru_update(self.gates, self.h1, self.s1, self.h2)
+            torch.mm(self.h2, self.wt2, out=self.gates)
+            _ext.gru_update(self.gates, self.h2, self.s2, self.h3)
+        _ext.logits_argmax(self.h3, self.w_a, self.b_a, self.logits, self.actions)
+        ah = self.anyhit[t : t + 1]
+        _ext.env_move(self.actions, self.agent, self.food, self.rewards, self.hit_buf, ah)
+        _ext.env_food(ah, self.hit_buf, self.rng, self.food)
+
+    def init_state(self, seed: int, device):
+        N = self.N
+        g = torch.Generator(device="cpu")
+        g.manual_seed(seed)
+        # Draw with the default int64 dtype exactly like the reference, then
+        # downcast (dtype can change generator consumption).
+        # int32 randint matches int64 values exactly but skips the slow CPU cast.
+        agent = torch.randint(0, BOARD, (N, 2), generator=g, dtype=torch.int32)
+        food = torch.randint(0, BOARD, (N, 2), generator=g, dtype=torch.int32)
+        self.agent.copy_(agent, non_blocking=True)
+        self.food.copy_(food, non_blocking=True)
+        # device-side arange + offset (reference builds rng on device too).
+        torch.add(self._arange, seed * 10007, out=self.rng)
+        self.rewards.zero_()
+        self.s0.zero_()
+        self.s1.zero_()
+        self.s2.zero_()
+        self.anyhit.zero_()
+
+    def build_graph(self):
+        # warmup on a side stream (also initializes cuBLAS workspace)
+        s = torch.cuda.Stream()
+        s.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(s):
+            for _ in range(2):
+                for t in range(self.H):
+                    self.step_body(t)
+        torch.cuda.current_stream().wait_stream(s)
+        # reset stateful buffers mutated by warmup
+        self.rewards.zero_()
+        self.s0.zero_()
+        self.s1.zero_()
+        self.s2.zero_()
+        self.anyhit.zero_()
+        self.graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(self.graph):
+            for t in range(self.H):
+                self.step_body(t)
+
+
+def run(num_envs: int, horizon: int, seed: int, model: Model | None = None) -> dict:
+    device = torch.device("cuda")
+    if model is None:
+        model = Model()
+    model = model.to(device).eval()
+
+    with torch.no_grad():
+        key = (num_envs, horizon, id(model))
+        entry = _run_cache.get(key)
+        if entry is None:
+            entry = _Rollout(num_envs, horizon, device)
+            entry.copy_weights(model)
+            entry.init_state(seed, device)
+            if os.environ.get("SOL_NOGRAPH") != "1":
+                entry.build_graph()
+            _run_cache[key] = entry
+
+        entry.copy_weights(model)
+        entry.init_state(seed, device)
+        if os.environ.get("SOL_NOGRAPH") == "1":
+            for t in range(entry.H):
+                entry.step_body(t)
+        else:
+            entry.graph.replay()
+
+        return {
+            "rewards": entry.rewards.detach(),
+            "positions": entry.agent.long().detach(),
+            "last_logits": entry.logits.detach(),
+        }
+
+
+def get_init_inputs():
+    return []
+
+
+def get_inputs():
+    return []

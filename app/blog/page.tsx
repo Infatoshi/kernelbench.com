@@ -14,10 +14,25 @@ export default function BlogIndex() {
 
       <section className="space-y-4">
         <Link
-          href="/blog/hard"
+          href="/blog/qwen-3-8-max"
           className="block box p-6 no-underline hover:border-[var(--color-fg-bright)] transition-colors"
         >
           <div className="text-xs text-[var(--color-accent)] mb-2">[ latest ]</div>
+          <h2 className="text-xl font-bold text-[var(--color-fg-bright)] mb-2">
+            Qwen 3.8 Max: One Board Win, Six Clean Cells
+          </h2>
+          <p className="text-sm text-[var(--color-fg)] leading-relaxed">
+            Twenty-two Hard, CUDA, and Mega cells across RTX PRO 6000 and H100.
+            Six survived isolated regrading and manual audit. The writeup covers
+            the Sonic MoE win, the contaminated runs, two reward hacks, and the
+            stale KV-cache rubric leak behind the published score.
+          </p>
+        </Link>
+        <Link
+          href="/blog/hard"
+          className="block box p-6 no-underline hover:border-[var(--color-fg-bright)] transition-colors"
+        >
+          <div className="text-xs text-[var(--color-fg-muted)] mb-2">[ design notes ]</div>
           <h2 className="text-xl font-bold text-[var(--color-fg-bright)] mb-2">
             Hard: Eight Scored Problems, Frontier Models, Two Rubric Leaks
           </h2>
