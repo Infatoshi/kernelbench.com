@@ -4,7 +4,7 @@ import {
   reportCardForBench,
 } from "@/app/_lib/models"
 import { loadModelIndex } from "@/app/_lib/models.server"
-import { HomeDecks, type HomeDeck } from "@/app/_components/home-decks"
+import { HomeDecks, type HomeAttempt, type HomeDeck } from "@/app/_components/home-decks"
 
 const citationGraph = {
   "@context": "https://schema.org",
@@ -42,6 +42,41 @@ export default async function HomePage() {
       g.key === "rtxpro6000" ? undefined : g.key,
     )
   }
+
+  const megaAttemptsByGpu: Record<string, HomeAttempt[]> = {
+    rtxpro6000: [],
+    h100: [],
+    b200: [],
+  }
+  for (const model of modelIdx.models) {
+    if (
+      model.slug !== "deepseek-v4-flash-0731" &&
+      model.slug !== "qwen3.8-max"
+    ) {
+      continue
+    }
+    for (const outcome of model.benches.mega?.outcomes ?? []) {
+      const label = outcome.gpu?.toUpperCase() ?? ""
+      const gpu = label.includes("H100")
+        ? "h100"
+        : label.includes("B200")
+          ? "b200"
+          : "rtxpro6000"
+      megaAttemptsByGpu[gpu].push({
+        modelName: model.name,
+        modelSlug: model.slug,
+        gpu,
+        outcome,
+      })
+    }
+  }
+  for (const attempts of Object.values(megaAttemptsByGpu)) {
+    attempts.sort(
+      (a, b) =>
+        a.modelName.localeCompare(b.modelName) ||
+        a.outcome.run_id.localeCompare(b.outcome.run_id),
+    )
+  }
   const cudaReport = reportCardForBench(modelIdx, "cuda")
 
   const decks: HomeDeck[] = [
@@ -52,6 +87,7 @@ export default async function HomePage() {
       byGpu: megaByGpu,
       gpus: HOME_GPU_TABS,
       defaultGpu: DEFAULT_GPU,
+      attemptsByGpu: megaAttemptsByGpu,
     },
     {
       key: "cuda",

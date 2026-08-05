@@ -10,6 +10,7 @@ import {
   brandFor,
   problemLabel,
   visibleProblems,
+  type AuditOutcome,
   type Bench,
   type GpuBlock,
   type ModelCell,
@@ -18,6 +19,7 @@ import {
 } from "@/app/_lib/models"
 import { loadModelIndex } from "@/app/_lib/models.server"
 import { PageHead } from "@/app/_components/page-head"
+import { ModelStoryArticle, ModelStoryLead } from "@/app/_components/model-story"
 
 // One static page per published model (and per audited-but-unpublished model,
 // whose page carries the integrity record). Everything renders from
@@ -80,6 +82,7 @@ function CellCard({
     )
   }
   const flagged = FLAG_VERDICTS.has(cell.verdict)
+  const outcome = cell.outcome_label ?? cell.failure_reason?.replace(/_/g, " ")
   const pill = cell.correct
     ? flagged
       ? "status-pill-warn"
@@ -94,20 +97,26 @@ function CellCard({
         </span>
       </div>
       <div className="cell-card-metrics">
-        {cell.score != null && (
+        {bench !== "mega" && cell.score != null && (
           <span
             className={`cell-card-score tabular${cell.valid ? "" : " cell-card-score-dim"}`}
-            title={
-              bench === "mega"
-                ? "best speedup vs torch baseline"
-                : "peak fraction of roofline"
-            }
+            title="peak fraction of roofline"
           >
             {benchValue(bench, cell.score)}
           </span>
         )}
         <span className={auditChipClass(cell.verdict)}>{cell.verdict.replace(/_/g, " ")}</span>
       </div>
+      {bench === "mega" && (
+        <div className={`mega-result${cell.valid ? "" : " mega-result-invalid"}`}>
+          <span className="mega-result-value tabular">
+            {cell.valid && cell.score != null ? `${cell.score.toFixed(2)}x` : "no result"}
+          </span>
+          <span className="mega-result-label">
+            {cell.valid ? "full-model speedup vs torch" : outcome || "no publishable speedup"}
+          </span>
+        </div>
+      )}
       {(bench === "mega" && (cell.tok_s != null || cell.ctx)) || cell.elapsed_seconds != null ? (
         <div className="cell-card-sub tabular">
           {bench === "mega" && cell.tok_s != null && <span>{cell.tok_s} tok/s</span>}
@@ -122,6 +131,9 @@ function CellCard({
           {cell.elapsed_seconds != null && <span>session {fmtDur(cell.elapsed_seconds)}</span>}
         </div>
       ) : null}
+      {!cell.correct && outcome && bench !== "mega" && (
+        <p className="cell-card-cause">{outcome}</p>
+      )}
       <div className="cell-card-links">
         {cell.run_id && (
           <Link href={`/runs/${gpu}/${cell.run_id}`} className="link-chip">
@@ -163,17 +175,50 @@ function CellGrid({
   )
 }
 
-function FlagItem({ run_id, verdict, summary }: { run_id: string; verdict: string; summary: string }) {
-  const preview = summary.length > 150 ? `${summary.slice(0, 150).trimEnd()}…` : summary
+
+function AuditOutcomeCard({ outcome, bench }: { outcome: AuditOutcome; bench: Bench }) {
+  const gpu =
+    outcome.gpu?.toUpperCase().includes("H100")
+      ? "h100"
+      : outcome.gpu?.toUpperCase().includes("B200")
+        ? "b200"
+        : CANONICAL_GPU
+  const flagged = FLAG_VERDICTS.has(outcome.verdict)
+  const hardwareMismatch = outcome.board_eligible === false
+  const status = hardwareMismatch
+    ? "wrong GPU SKU"
+    : flagged
+      ? "excluded by audit"
+      : outcome.publish_grade
+        ? "publishable"
+        : outcome.correct === false
+          ? outcome.failure_reason?.replace(/_/g, " ") || "correctness failed"
+          : outcome.measurement_status?.replace(/_/g, " ") || "audit evidence"
+  const metric =
+    outcome.score == null
+      ? "no score"
+      : bench === "mega"
+        ? `${outcome.score.toFixed(2)}x`
+        : `${(outcome.score * 100).toFixed(2)}%`
   return (
-    <details className="flag-details">
-      <summary>
-        <span className={auditChipClass(verdict)}>{verdict.replace(/_/g, " ")}</span>
-        <span className="flag-item-run">{run_id}</span>
-        <span className="flag-preview">{preview}</span>
-      </summary>
-      <p className="flag-item-summary">{summary}</p>
-    </details>
+    <div className="mega-outcome-card">
+      <div className="mega-outcome-head">
+        <span className="mega-outcome-gpu">
+          {outcome.gpu ?? "unknown GPU"} · {outcome.problem ? problemLabel(outcome.problem) : "unknown problem"}
+        </span>
+        <span className={hardwareMismatch ? "audit-chip audit-chip-muted" : auditChipClass(outcome.verdict)}>
+          {hardwareMismatch ? "hardware mismatch" : outcome.verdict.replace(/_/g, " ")}
+        </span>
+      </div>
+      <div className="mega-outcome-result">
+        <strong>{metric}</strong>
+        <span>{status}</span>
+      </div>
+      {outcome.summary && <p>{outcome.summary}</p>}
+      <Link href={`/runs/${gpu}/${outcome.run_id}`} className="link-chip">
+        audited run
+      </Link>
+    </div>
   )
 }
 
@@ -204,6 +249,9 @@ function BenchPanel({
   const totalVisible = problems.length
   const full = totalVisible > 0 && passedVisible >= totalVisible
   const harness = [block.harness, block.effort].filter(Boolean).join(" · ")
+  const attempts = (block.outcomes ?? []).filter(
+    (outcome) => !block.harness || outcome.harness?.startsWith(block.harness),
+  )
   return (
     <section className="chart-panel board-panel">
       <div className="chart-panel-head">
@@ -243,12 +291,16 @@ function BenchPanel({
         </div>
       ))}
 
-      {block.flags.length > 0 && (
-        <div className="board-flags">
-          <p className="board-kicker">integrity flags</p>
-          <div className="flag-list">
-            {block.flags.map((f) => (
-              <FlagItem key={f.run_id} run_id={f.run_id} verdict={f.verdict} summary={f.summary} />
+      {attempts.length > 0 && (
+        <div className="mega-outcomes">
+          <p className="board-kicker">all audited {block.harness ?? "selected"} attempts</p>
+          <p className="mega-outcomes-note">
+            Every attempted cell stays visible, including correctness failures, hardware mismatches,
+            contaminated runs, and audit rejects. Only publishable results contribute to the board above.
+          </p>
+          <div className="mega-outcome-grid">
+            {attempts.map((outcome) => (
+              <AuditOutcomeCard key={outcome.run_id} outcome={outcome} bench={bench} />
             ))}
           </div>
         </div>
@@ -277,7 +329,7 @@ export default async function ModelPage({
   const { audited, flagged } = model.totals
 
   return (
-    <div className="space-y-6">
+    <div id="top" className="space-y-6">
       <PageHead
         kicker={`Model · ${model.lab}`}
         title={
@@ -342,6 +394,7 @@ export default async function ModelPage({
           </>
         }
       />
+      <ModelStoryLead slug={model.slug} />
 
       {benches.length > 0 && (
         <div className="chart-panel">
@@ -390,6 +443,7 @@ export default async function ModelPage({
       {benches.map((bench) => (
         <BenchPanel key={bench} bench={bench} model={model} idx={idx} />
       ))}
+      <ModelStoryArticle slug={model.slug} />
 
       {legacy && (
         <p className="model-legacy">

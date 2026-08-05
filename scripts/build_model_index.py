@@ -423,7 +423,8 @@ def annotation_files(ann_dir: Path) -> list[Path]:
 def regex_annotation(text: str) -> dict:
     """Last-resort extractor for YAMLs pyyaml rejects (verbatim field scrape)."""
     out: dict = {}
-    for k in ("run_id", "model", "verdict", "problem", "harness"):
+    for k in ("run_id", "model", "verdict", "problem", "harness", "effort", "gpu",
+              "failure_reason", "measurement_status"):
         m = re.search(rf"^{k}:\s*(.+?)\s*$", text, re.M)
         if m:
             out[k] = m.group(1).strip().strip('"').strip("'")
@@ -450,6 +451,16 @@ def model_from_run_id(run_id: str) -> str | None:
     return parts[1] if len(parts) == 2 and parts[1] else None
 
 
+def annotation_gpu_key(gpu: object) -> str | None:
+    """Map annotation hardware labels onto the site's board namespaces."""
+    label = str(gpu or "").upper()
+    if "H100" in label:
+        return "h100"
+    if "B200" in label:
+        return "b200"
+    return None
+
+
 def join_annotations(models: Models, bench: str, ann_dir: Path) -> tuple[list[str], int]:
     """Attach audit counts + flag lists. Returns (annotation-only slugs, n_files)."""
     files = [f for f in annotation_files(ann_dir) if f.exists()]
@@ -470,7 +481,12 @@ def join_annotations(models: Models, bench: str, ann_dir: Path) -> tuple[list[st
             continue
         verdict = (a.get("verdict") or "").strip()
         authentic = a.get("megakernel_authentic")
-        flagged = verdict in FLAG_VERDICTS or authentic is False
+        effective_verdict = (
+            verdict
+            if bench != "mega" or verdict in FLAG_VERDICTS or authentic is not False
+            else "megakernel_not_authentic"
+        )
+        flagged = effective_verdict in FLAG_VERDICTS
 
         entry = models.get(slug)
         bench_block = entry["benches"].get(bench)
@@ -481,6 +497,78 @@ def join_annotations(models: Models, bench: str, ann_dir: Path) -> tuple[list[st
                            "cells": {}, "gpus": {}}
             entry["benches"][bench] = bench_block
         bench_block["audited"] = bench_block.get("audited", 0) + 1
+        bench_block.setdefault("outcomes", []).append(
+            {
+                "run_id": run_id,
+                "problem": a.get("problem"),
+                "gpu": a.get("gpu"),
+                "harness": a.get("harness"),
+                "effort": a.get("effort"),
+                "correct": a.get("correct"),
+                "publish_grade": a.get("publish_grade"),
+                "board_eligible": a.get("board_eligible"),
+                "measurement_status": a.get("measurement_status"),
+                "verdict": effective_verdict or "unaudited",
+                "failure_reason": a.get("failure_reason"),
+                "score": a.get("peak_fraction"),
+                "summary": str(a.get("summary") or "").strip(),
+                "solution_url": (
+                    mega_solution_url(run_id)
+                    if bench == "mega"
+                    else solution_url(run_id, annotation_gpu_key(a.get("gpu")))
+                ),
+                "trace_url": trace_url(
+                    bench, run_id, annotation_gpu_key(a.get("gpu"))
+                ),
+            }
+        )
+        if bench == "mega":
+            # The Mega CSV contains only publishable scores. Preserve audited
+            # rejected/failed attempts as invalid cells so the public homepage
+            # still shows that the model ran on each GPU instead of silently
+            # dropping its lab logo and outcome from the board.
+            gpu_key = annotation_gpu_key(a.get("gpu"))
+            target = bench_block
+            if gpu_key:
+                target = bench_block.setdefault("gpus", {}).setdefault(
+                    gpu_key,
+                    {
+                        "label": None,
+                        "harness": a.get("harness"),
+                        "effort": a.get("effort"),
+                        "passed": 0,
+                        "total_problems": 1,
+                        "perf": None,
+                        "cells": {},
+                    },
+                )
+            target["total_problems"] = max(target.get("total_problems", 0), 1)
+            problem = a.get("problem") or "02_kimi_linear_decode"
+            failure_reason = a.get("failure_reason")
+            outcome = (
+                "timeout"
+                if "timeout" in str(failure_reason or "")
+                else "wrong"
+                if a.get("correct") is False
+                else "other"
+            )
+            target.setdefault("cells", {}).setdefault(
+                problem,
+                {
+                    "run_id": run_id,
+                    "correct": bool(a.get("correct")),
+                    "has_solution": True,
+                    "score": None,
+                    "verdict": effective_verdict or "unaudited",
+                    "valid": False,
+                    "outcome": outcome,
+                    "outcome_label": effective_verdict or verdict or failure_reason,
+                    "failure_reason": failure_reason,
+                    "framework": a.get("framework"),
+                    "solution_url": mega_solution_url(run_id),
+                    "trace_url": trace_url("mega", run_id, gpu_key),
+                },
+            )
         blocks = [bench_block, *bench_block.get("gpus", {}).values()]
         if flagged:
             eff = verdict if verdict in FLAG_VERDICTS else "megakernel_not_authentic"
@@ -530,20 +618,23 @@ def join_catalog(models: Models) -> None:
                     rid = cell.get("run_id")
                     src = by_run.get(rid) if rid else None
                     if not src:
-                        # synthesize pass/fail without archive detail
-                        if cell.get("valid"):
-                            cell["outcome"] = "pass"
-                            cell["outcome_label"] = legend.get("pass", "pass")
-                        else:
-                            cell["outcome"] = "other"
-                            cell["outcome_label"] = legend.get("other", "fail")
+                        # Synthesize pass/fail without archive detail. Audit-
+                        # derived cells may already carry a more precise public
+                        # outcome such as `bug` or `timeout_unverified`.
+                        fallback = "pass" if cell.get("valid") else "other"
+                        cell.setdefault("outcome", fallback)
+                        cell.setdefault(
+                            "outcome_label", legend.get(fallback, "pass" if fallback == "pass" else "fail")
+                        )
                         continue
-                    cell["outcome"] = src.get("outcome") or "other"
-                    cell["outcome_label"] = legend.get(
-                        cell["outcome"], src.get("outcome") or "fail"
+                    fallback = src.get("outcome") or "other"
+                    cell.setdefault("outcome", fallback)
+                    cell.setdefault(
+                        "outcome_label",
+                        legend.get(cell["outcome"], src.get("outcome") or "fail"),
                     )
                     if src.get("failure_reason") is not None:
-                        cell["failure_reason"] = src["failure_reason"]
+                        cell.setdefault("failure_reason", src["failure_reason"])
                     n += 1
     print(f"joined catalog outcomes into {n} cells")
 
@@ -639,6 +730,20 @@ def finalize(models: Models) -> dict:
             block["flags"] = block.get("flags", [])
             block["audited"] = block.get("audited", 0)
             block["flagged"] = len(block["flags"])
+            selected_valid = {
+                cell.get("run_id")
+                for view in [block, *block.get("gpus", {}).values()]
+                for cell in view.get("cells", {}).values()
+                if cell.get("run_id") and cell.get("valid")
+            }
+            for outcome in block.get("outcomes", []):
+                if outcome.get("board_eligible") is False:
+                    outcome["publish_grade"] = False
+                elif outcome.get("publish_grade") is None:
+                    outcome["publish_grade"] = outcome.get("run_id") in selected_valid
+            block["outcomes"] = sorted(
+                block.get("outcomes", []), key=lambda outcome: outcome["run_id"]
+            )
             total_audited += block["audited"]
             total_flagged += block["flagged"]
         e["totals"] = {"audited": total_audited, "flagged": total_flagged}

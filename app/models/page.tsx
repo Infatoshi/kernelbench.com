@@ -2,6 +2,7 @@ import Link from "next/link"
 import { brandFor, rowsForIndex } from "@/app/_lib/models"
 import { loadModelIndex } from "@/app/_lib/models.server"
 import { PageHead } from "@/app/_components/page-head"
+import { hasModelStory } from "@/app/_components/model-story"
 
 // The model directory: every model with published cells, ranked, each row
 // opening its per-model page (cells, audits, integrity record). The homepage
@@ -85,6 +86,9 @@ export default async function ModelsPage() {
                         {b.label} {b.value}
                       </span>
                     ))}
+                    {hasModelStory(row.slug) && (
+                      <span className="mroster-chip mroster-chip-story">trace story</span>
+                    )}
                   </span>
                   <span className="mbar-track mroster-track">
                     <span

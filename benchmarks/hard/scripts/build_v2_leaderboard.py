@@ -28,7 +28,18 @@ try:  # instrument version, recorded truthfully at publish time
 except Exception:
     _TORCH_VERSION = "unknown"
 
-_hw = get_hw(os.environ.get("KBH_HARDWARE", "RTX_PRO_6000"))
+_hardware_key = os.environ.get("KBH_HARDWARE", "RTX_PRO_6000").upper()
+_hw = get_hw(_hardware_key)
+def _gpu_sku_key(name):
+    """Normalize a recorded CUDA device name to a roofline hardware key."""
+    label = str(name or "").upper()
+    if "RTX PRO 6000" in label:
+        return "RTX_PRO_6000"
+    if "H100" in label:
+        return "H100_SXM" if "SXM" in label or "HBM3" in label else "H100" if "PCIE" in label else None
+    if "B200" in label:
+        return "B200"
+    return None
 PROBLEMS = ["01_fp8_gemm","02_kda_cutlass","03_paged_attention",
             "05_topk_bitonic","06_sonic_moe_swiglu","07_w4a16_gemm"]
 
@@ -38,6 +49,9 @@ ann = {}
 # `contamination: clean`) even though the overall verdict is not `clean`
 # (e.g. a reward_hack cell published flagged). Overrides the regex tripwire.
 ann_contam_clean: set[str] = set()
+# Runs measured on a different GPU SKU remain in the audit ledger but cannot
+# rank on this board (for example H100 SXM5 timings on the H100 PCIe deck).
+ann_board_ineligible: set[str] = set()
 for f in glob.glob(str(ROOT/"results/annotations/*.yaml")):
     txt = open(f).read()
     rid = re.search(r"run_id:\s*(\S+)", txt)
@@ -47,6 +61,8 @@ for f in glob.glob(str(ROOT/"results/annotations/*.yaml")):
         ann[rid.group(1)] = (ver.group(1), (summ.group(1) if summ else "")[:400])
         if re.search(r"^contamination:\s*clean\b", txt, re.M):
             ann_contam_clean.add(rid.group(1))
+        if re.search(r"^board_eligible:\s*false\b", txt, re.M):
+            ann_board_ineligible.add(rid.group(1))
 
 # collect v2 runs: every run dated 2026-06-10 or later (v2 containerized era).
 # Date-gated instead of an enumerated list so new sweep dates are picked up
@@ -101,6 +117,14 @@ for rj in glob.glob(str(RUNS_DIR/"2026*/result.json")):
         r = json.load(open(rj))
     except Exception:
         continue
+    actual_gpu_name = (r.get("regrade") or {}).get("gpu_name") or r.get("gpu_name")
+    actual_hardware_key = _gpu_sku_key(actual_gpu_name)
+    if actual_hardware_key and actual_hardware_key != _hardware_key:
+        print(
+            f"  EXCLUDED (GPU SKU {actual_hardware_key} != board {_hardware_key}): {rid}",
+            file=sys.stderr,
+        )
+        continue
     prob = None
     for p in PROBLEMS:
         if rid.endswith(p): prob = p
@@ -108,6 +132,9 @@ for rj in glob.glob(str(RUNS_DIR/"2026*/result.json")):
     h, m, e = r.get("harness"), r.get("model"), r.get("reasoning_effort") or ""
     if not h or not m: continue
     run_dir = os.path.dirname(rj)
+    if rid in ann_board_ineligible:
+        print(f"  EXCLUDED (annotation board_eligible=false): {rid}", file=sys.stderr)
+        continue
     # A manual audit verdict of `contaminated` excludes the run outright. The
     # transcript tripwire below cannot catch every case: grok streaming
     # transcripts carry no tool events or paths, so a run that copied another

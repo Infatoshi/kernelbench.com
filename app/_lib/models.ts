@@ -34,6 +34,24 @@ export interface FlagEntry {
   summary: string
 }
 
+export interface AuditOutcome {
+  run_id: string
+  problem: string | null
+  gpu: string | null
+  harness: string | null
+  effort: string | null
+  correct: boolean | null
+  publish_grade: boolean | null
+  board_eligible?: boolean | null
+  measurement_status: string | null
+  verdict: string
+  failure_reason: string | null
+  score: number | null
+  summary: string
+  solution_url: string | null
+  trace_url: string | null
+}
+
 export interface GpuBlock {
   label: string | null
   harness: string | null
@@ -48,6 +66,8 @@ export interface BenchBlock extends GpuBlock {
   audited: number
   flagged: number
   flags: FlagEntry[]
+  /** Every audited attempt, including incorrect, excluded, and timed-out candidates. */
+  outcomes?: AuditOutcome[]
   gpus: Record<string, GpuBlock>
 }
 
@@ -103,12 +123,12 @@ export const PROBLEM_LABELS: Record<string, string> = {
   "02_online_softmax": "Online Softmax",
 }
 
-/** Mega problems hidden from public UI. Empty since 2026-07-21:
- *  `01_rl_grid_ppo` was fully REMOVED from the deck (dropped at the CSV /
- *  models.json level — the CUDA bench's craftax problem covers that skill),
- *  so no presentation filter is needed anymore. Mega is the single
- *  Kimi-Linear megakernel cell. Keep the mechanism for future soft-hides. */
-export const MEGA_HIDDEN_PROBLEMS = new Set<string>([])
+/** Mega is the single Kimi-Linear megakernel cell. `01_rl_grid_ppo` was removed
+ * from the active deck on 2026-07-21, but old legacy snapshots still carry it.
+ * Keep those historical cells out of every current board and model aggregate. */
+export const MEGA_HIDDEN_PROBLEMS: Record<string, true> = {
+  "01_rl_grid_ppo": true,
+}
 
 export const FLAG_VERDICTS = new Set([
   "reward_hack",
@@ -442,10 +462,11 @@ function chipFromCell(
   // Audit verdicts outrank generic harness outcomes. A mathematically passing
   // run can still be quarantined, so do not render its catalog fallback as
   // an ordinary "fail".
+  const rawLabel = c.outcome_label || outcome || "fail"
   const label =
     kind === "hack"
       ? "flag"
-      : (c.outcome_label || outcome || "fail").slice(0, 8)
+      : rawLabel.replace(/_/g, " ").slice(0, 8).trimEnd()
   const title =
     kind === "hack"
       ? OUTCOME_TITLE.flagged
@@ -640,14 +661,14 @@ export interface BarView {
  *  as 0 in hard/cuda means — only PERF-style exclusions drop a problem. */
 function deckProblems(view: GpuBlock, bench: Bench): string[] {
   return Object.keys(view.cells).filter(
-    (prob) => !(bench === "mega" && MEGA_HIDDEN_PROBLEMS.has(prob)),
+    (prob) => !(bench === "mega" && prob in MEGA_HIDDEN_PROBLEMS),
   )
 }
 
 /** Public problem list for a bench (drops mega hold-outs). */
 export function visibleProblems(bench: Bench, problems: string[]): string[] {
   if (bench !== "mega") return problems
-  return problems.filter((p) => !MEGA_HIDDEN_PROBLEMS.has(p))
+  return problems.filter((p) => !(p in MEGA_HIDDEN_PROBLEMS))
 }
 
 /** Hard/CUDA: mean peak fraction over the full deck (invalid/missing = 0).
@@ -751,9 +772,9 @@ export function barsForBench(
 //
 // 2) MEGA performance chart:
 //      score_m = max(speedup) over the model's valid cells on the canonical
-//                board, EXCLUDING problems in MEGA_HIDDEN_PROBLEMS (empty
-//                since 2026-07-21 — 01_rl_grid_ppo was removed from the deck
-//                entirely; craftax on CUDA covers it). Each cell's
+//                board, EXCLUDING problems in MEGA_HIDDEN_PROBLEMS. The
+//                retired 01_rl_grid_ppo remains in old legacy snapshots only;
+//                craftax on CUDA covers that skill. Each cell's
 //                score is already the run's geomean decode speedup vs the
 //                optimized-PyTorch baseline across contexts; the model's best
 //                published head-to-head cell wins.

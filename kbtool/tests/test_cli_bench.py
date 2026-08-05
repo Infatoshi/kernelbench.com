@@ -70,3 +70,21 @@ def test_contamination_accepts_all_bench_names(tmp_path):
         runs.mkdir(parents=True, exist_ok=True)
         rc = contamination.run([bench], repo_root=tmp_path)
         assert rc == 0, bench
+
+
+def test_audited_run_ids_partition_hardware_namespaces(tmp_path):
+    annotations = tmp_path / "results" / "annotations"
+    annotations.mkdir(parents=True)
+    (annotations / "rtx.yaml").write_text(
+        "run_id: run-rtx\n"
+        "gpu: RTX_PRO_6000\n"
+    )
+    (annotations / "h100.yaml").write_text(
+        "run_id: run-h100\n"
+        "gpu: NVIDIA H100 PCIe (SM90)\n"
+    )
+    (annotations / "legacy.yaml").write_text("run_id: run-legacy\n")
+
+    assert cli._audited_run_ids(tmp_path, None) == ["run-legacy", "run-rtx"]
+    assert cli._audited_run_ids(tmp_path, "h100") == ["run-h100"]
+    assert cli._audited_run_ids(tmp_path, "b200") == []

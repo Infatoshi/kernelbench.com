@@ -11,6 +11,10 @@ import type { ModelIndex } from "./models"
 const REMOVED_MODEL_SLUGS = new Set([
   "gemini-3.1-pro-preview",
   "gemini-3.5-flash",
+  "claude-sonnet-5",
+  "composer-2.5-fast",
+  "deepseek-v4-pro",
+  "minimax-m2.7",
   // Superseded by gpt-5.6-sol
   "gpt-5.5",
   // Retired preview ids — canonical is `hy3` only

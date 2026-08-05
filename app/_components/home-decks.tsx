@@ -2,8 +2,8 @@
 
 import Link from "next/link"
 import { useEffect, useMemo, useState, type CSSProperties } from "react"
-import type { ProblemChip, ReportRow, ReportView } from "../_lib/models"
-import { problemLabel } from "../_lib/models"
+import type { AuditOutcome, ProblemChip, ReportRow, ReportView } from "../_lib/models"
+import { auditChipClass, benchValue, FLAG_VERDICTS, problemLabel } from "../_lib/models"
 
 // Homepage: stacked KernelBench sections. Each score is a mini bar vs the
 // best result on that problem (100% = winner).
@@ -13,6 +13,13 @@ import { problemLabel } from "../_lib/models"
 // No-run cells are blank (not red). Judged fails keep a short color label.
 // Every cell with a run is a link to its dedicated /runs/<gpu>/<rid> page.
 
+export interface HomeAttempt {
+  modelName: string
+  modelSlug: string
+  gpu: string
+  outcome: AuditOutcome
+}
+
 export interface HomeDeck {
   key: string
   title: string
@@ -20,6 +27,7 @@ export interface HomeDeck {
   byGpu: Record<string, ReportView> | null
   gpus: { key: string; label: string }[]
   defaultGpu: string
+  attemptsByGpu?: Record<string, HomeAttempt[]>
 }
 
 function bestByProblem(view: ReportView): Map<string, number> {
@@ -454,6 +462,47 @@ function DeckPanel({ deck }: { deck: HomeDeck }) {
           })}
         </div>
       )}
+
+      {deck.attemptsByGpu?.[active]?.length ? (
+        <div className="hd-attempt-ledger">
+          <div className="hd-attempt-ledger-head">
+            <div>
+              <p className="hd-attempt-kicker">DeepSeek V4 Flash + Qwen 3.8 Max</p>
+              <h3>Every audited Mega attempt</h3>
+            </div>
+            <span>{deck.attemptsByGpu[active].length} sessions</span>
+          </div>
+          <div className="hd-attempt-list">
+            {deck.attemptsByGpu[active].map(({ modelName, gpu: attemptGpu, outcome }) => {
+              const verdict = outcome.verdict || "unaudited"
+              const flagged = FLAG_VERDICTS.has(verdict)
+              const status = outcome.publish_grade
+                ? outcome.score != null
+                  ? benchValue("mega", outcome.score)
+                  : "publishable"
+                : flagged
+                  ? verdict.replaceAll("_", " ")
+                  : outcome.failure_reason?.replaceAll("_", " ") || verdict.replaceAll("_", " ")
+              return (
+                <Link
+                  key={`${attemptGpu}:${outcome.run_id}`}
+                  href={`/runs/${attemptGpu}/${outcome.run_id}`}
+                  className="hd-attempt-row"
+                >
+                  <span className="hd-attempt-model">{modelName}</span>
+                  <span>{outcome.problem ? problemLabel(outcome.problem) : "Kimi Linear Decode"}</span>
+                  <span className={auditChipClass(verdict)}>{status}</span>
+                  <span className="hd-attempt-run tabular">{outcome.run_id.slice(0, 15)}</span>
+                </Link>
+              )
+            })}
+          </div>
+          <p className="hd-attempt-note">
+            Attempt ledger, not a second leaderboard. Rejected and failed metrics remain visible
+            but never contribute to ranking.
+          </p>
+        </div>
+      ) : null}
     </section>
   )
 }

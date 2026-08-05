@@ -1,0 +1,254 @@
+"""Kimi-Linear W4A16 hybrid decode — single fused megakernel.
+
+The entire per-token forward (3 KDA layers + 1 MLA layer, each with a 64-expert
+MoE FFN, RMSNorm, residuals) runs in ONE cooperative CUDA kernel launched once
+per `step()`.  All int4 weights are streamed and dequantized inline; no bf16
+weight is ever materialized.
+"""
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+
+import torch
+import torch.nn as nn
+
+from kernels import build as kb
+
+GROUP_SIZE = 128
+EPS = 1.0e-6
+
+
+@dataclass(frozen=True)
+class Config:
+    hidden: int = 2304
+    kda_heads: int = 32
+    kda_head_dim: int = 128
+    short_conv: int = 4
+    mla_heads: int = 32
+    kv_lora: int = 512
+    qk_nope: int = 128
+    qk_rope: int = 64
+    v_head: int = 128
+    rope_theta: float = 10000.0
+    n_experts: int = 64
+    n_active: int = 8
+    n_shared: int = 1
+    moe_inter: int = 1024
+    routed_scaling: float = 2.446
+    group: int = 128
+    pattern: tuple = ("K", "K", "K", "M")
+    dtype: torch.dtype = field(default=torch.bfloat16)
+
+
+def build_config(shape: dict) -> Config:
+    return Config(n_experts=int(shape.get("n_experts", 64)))
+
+
+class QuantLinear(nn.Module):
+    def __init__(self, in_f: int, out_f: int, group: int = GROUP_SIZE):
+        super().__init__()
+        self.in_f, self.out_f, self.group = in_f, out_f, group
+        ng = in_f // group
+        self.register_buffer("w_q", torch.zeros(in_f // 2, out_f, dtype=torch.uint8))
+        self.register_buffer("scales", torch.zeros(ng, out_f, dtype=torch.bfloat16))
+        self.register_buffer("zeros", torch.zeros(ng, out_f, dtype=torch.bfloat16))
+
+
+class QuantExperts(nn.Module):
+    def __init__(self, n: int, in_f: int, out_f: int, group: int = GROUP_SIZE):
+        super().__init__()
+        self.n, self.in_f, self.out_f, self.group = n, in_f, out_f, group
+        ng = in_f // group
+        self.register_buffer("w_q", torch.zeros(n, in_f // 2, out_f, dtype=torch.uint8))
+        self.register_buffer("scales", torch.zeros(n, ng, out_f, dtype=torch.bfloat16))
+        self.register_buffer("zeros", torch.zeros(n, ng, out_f, dtype=torch.bfloat16))
+
+
+class KDA(nn.Module):
+    def __init__(self, cfg: Config):
+        super().__init__()
+        self.cfg = cfg
+        H, Dk, d = cfg.kda_heads, cfg.kda_head_dim, cfg.hidden
+        self.q_proj = QuantLinear(d, H * Dk)
+        self.k_proj = QuantLinear(d, H * Dk)
+        self.v_proj = QuantLinear(d, H * Dk)
+        self.g_proj = QuantLinear(d, H * Dk)
+        self.beta_proj = nn.Linear(d, H, bias=False, dtype=cfg.dtype)
+        self.conv_w = nn.Parameter(torch.empty(3, H * Dk, cfg.short_conv, dtype=cfg.dtype))
+        self.o_proj = QuantLinear(H * Dk, d)
+        self.scale = Dk ** -0.5
+
+
+class MLA(nn.Module):
+    def __init__(self, cfg: Config):
+        super().__init__()
+        self.cfg = cfg
+        H, d = cfg.mla_heads, cfg.hidden
+        self.q_proj = QuantLinear(d, H * (cfg.qk_nope + cfg.qk_rope))
+        self.kv_a = QuantLinear(d, cfg.kv_lora + cfg.qk_rope)
+        self.kv_b = QuantLinear(cfg.kv_lora, H * (cfg.qk_nope + cfg.v_head))
+        self.o_proj = QuantLinear(H * cfg.v_head, d)
+        self.scale = (cfg.qk_nope + cfg.qk_rope) ** -0.5
+
+
+class MoE(nn.Module):
+    def __init__(self, cfg: Config):
+        super().__init__()
+        self.cfg = cfg
+        d, m, E = cfg.hidden, cfg.moe_inter, cfg.n_experts
+        self.router = nn.Linear(d, E, bias=False, dtype=cfg.dtype)
+        self.gate = QuantExperts(E, d, m)
+        self.up = QuantExperts(E, d, m)
+        self.down = QuantExperts(E, m, d)
+        self.s_gate = QuantExperts(cfg.n_shared, d, m)
+        self.s_up = QuantExperts(cfg.n_shared, d, m)
+        self.s_down = QuantExperts(cfg.n_shared, m, d)
+
+
+class Block(nn.Module):
+    def __init__(self, cfg, kind):
+        super().__init__()
+        self.kind = kind
+        self.attn_norm = nn.Parameter(torch.ones(cfg.hidden, dtype=cfg.dtype))
+        self.moe_norm = nn.Parameter(torch.ones(cfg.hidden, dtype=cfg.dtype))
+        self.attn = KDA(cfg) if kind == "K" else MLA(cfg)
+        self.moe = MoE(cfg)
+
+
+class Model(nn.Module):
+    def __init__(self, cfg):
+        super().__init__()
+        self.cfg = cfg
+        self.blocks = nn.ModuleList(Block(cfg, k) for k in cfg.pattern)
+        self._ext = None
+        self._prepared = False
+        self._ptrs = None
+        self._ctx = -1
+        self._grid = 144
+
+    # ------------------------------------------------------------------ #
+    # preparation
+    # ------------------------------------------------------------------ #
+    def _prepare(self, state, hidden, ctx):
+        dev = hidden.device
+        self._ctx = ctx
+        qls = []
+        for l in range(3):
+            a = self.blocks[l].attn
+            qls += [a.q_proj, a.k_proj, a.v_proj, a.g_proj, a.o_proj]
+        a = self.blocks[3].attn
+        qls += [a.q_proj, a.kv_a, a.kv_b, a.o_proj]
+        assert len(qls) == 19
+
+        moe = [self.blocks[l].moe for l in range(4)]
+
+        # ---- MLA cache repointing (grow buffer) -----------------------
+        mla_state = state[3]
+        c_kv = mla_state["c_kv"]
+        k_rope = mla_state["k_rope"]
+        cap = ctx + 256
+        ckv_buf = torch.empty(cap, c_kv.shape[1], dtype=torch.bfloat16, device=dev)
+        kro_buf = torch.empty(cap, k_rope.shape[1], dtype=torch.bfloat16, device=dev)
+        ckv_buf[:ctx].copy_(c_kv)
+        kro_buf[:ctx].copy_(k_rope)
+        self._ckv_buf = ckv_buf
+        self._kro_buf = kro_buf
+
+        # ---- scratch ---------------------------------------------------
+        self._scratch = {
+            "qbuf": torch.zeros(4096, dtype=torch.float32, device=dev),
+            "kbuf": torch.zeros(4096, dtype=torch.float32, device=dev),
+            "vbuf": torch.zeros(4096, dtype=torch.float32, device=dev),
+            "gbuf": torch.zeros(4096, dtype=torch.float32, device=dev),
+            "obuf": torch.zeros(4096, dtype=torch.float32, device=dev),
+            "attn_out": torch.zeros(2304, dtype=torch.float32, device=dev),
+            "moe_out": torch.zeros(2304, dtype=torch.float32, device=dev),
+            "router_logits": torch.zeros(64, dtype=torch.float32, device=dev),
+            "h_gate": torch.zeros(9, 1024, dtype=torch.float32, device=dev),
+            "h_up": torch.zeros(9, 1024, dtype=torch.float32, device=dev),
+            "qbuf_mla": torch.zeros(6144, dtype=torch.float32, device=dev),
+            "kvabuf": torch.zeros(576, dtype=torch.float32, device=dev),
+            "q_abs": torch.zeros(32, 512, dtype=torch.float32, device=dev),
+            "p_abs": torch.zeros(32, 512, dtype=torch.float32, device=dev),
+            "Z": torch.zeros(32, dtype=torch.float32, device=dev),
+            "p_unnorm": torch.zeros(16384 + 512, 32, dtype=torch.float32, device=dev),
+        }
+
+        # ---- beta transpose --------------------------------------------
+        self._beta_t = [self.blocks[l].attn.beta_proj.weight.detach().t().contiguous()
+                        for l in range(3)]
+        beta_t = self._beta_t
+
+        # ---- build pointer list ----------------------------------------
+        P = []
+        for q in qls:
+            P.append(q.w_q.data_ptr())
+        for q in qls:
+            P.append(q.scales.data_ptr())
+        for q in qls:
+            P.append(q.zeros.data_ptr())
+        self._router_t = [moe[l].router.weight.detach().t().contiguous() for l in range(4)]
+        for l in range(4):
+            P.append(self._router_t[l].data_ptr())
+        # NOTE: append order must match _ORDER in kernels/build.py:
+        # per key (g,u,d,sg,su,sd): all wq (4 layers), then all s, then all z.
+        for key in ("gate", "up", "down", "s_gate", "s_up", "s_down"):
+            for l in range(4):
+                P.append(getattr(moe[l], key).w_q.data_ptr())
+            for l in range(4):
+                P.append(getattr(moe[l], key).scales.data_ptr())
+            for l in range(4):
+                P.append(getattr(moe[l], key).zeros.data_ptr())
+        for l in range(3):
+            P.append(beta_t[l].data_ptr())
+        for l in range(3):
+            P.append(self.blocks[l].attn.conv_w.data_ptr())
+        for l in range(4):
+            P.append(self.blocks[l].attn_norm.data_ptr())
+        for l in range(4):
+            P.append(self.blocks[l].moe_norm.data_ptr())
+        for l in range(3):
+            P.append(state[l]["S"].data_ptr())
+        for l in range(3):
+            P.append(state[l]["cq"].data_ptr())
+        for l in range(3):
+            P.append(state[l]["ck"].data_ptr())
+        for l in range(3):
+            P.append(state[l]["cv"].data_ptr())
+        P.append(ckv_buf.data_ptr())
+        P.append(kro_buf.data_ptr())
+        P.append(hidden.data_ptr())
+        for k in ("qbuf", "kbuf", "vbuf", "gbuf", "obuf", "attn_out", "moe_out",
+                  "router_logits", "h_gate", "h_up", "qbuf_mla", "kvabuf",
+                  "q_abs", "p_abs", "Z", "p_unnorm"):
+            P.append(self._scratch[k].data_ptr())
+        assert len(P) == 178, f"ptr count {len(P)}"
+
+        self._ptrs = P
+        self._ptrs_t = torch.tensor(P, dtype=torch.int64)
+        self._prepared = True
+        self._S_ptr = state[0]["S"].data_ptr()
+
+    # ------------------------------------------------------------------ #
+    # step
+    # ------------------------------------------------------------------ #
+    def step(self, hidden, state):
+        ctx = state[3]["c_kv"].shape[0]
+        if (not self._prepared) or (ctx != self._ctx) or \
+                (state[0]["S"].data_ptr() != self._S_ptr):
+            self._prepare(state, hidden, ctx)
+        # refresh dynamic pointers (hidden buffer; cache appended views)
+        P = self._ptrs
+        P[159] = self._ckv_buf.data_ptr()
+        P[160] = self._kro_buf.data_ptr()
+        P[161] = hidden.data_ptr()
+        self._ptrs_t = torch.tensor(P, dtype=torch.int64)
+
+        ext = kb.get_ext()
+        stream = torch.cuda.current_stream().cuda_stream
+        ext.run_step(self._ptrs_t, ctx, 28, self._grid, stream)
+
+        # publish appended cache views
+        state[3]["c_kv"] = self._ckv_buf[:ctx + 1]
+        state[3]["k_rope"] = self._kro_buf[:ctx + 1]
+        return hidden, state

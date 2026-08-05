@@ -7,6 +7,7 @@ import {
   CANONICAL_GPU,
   FLAG_VERDICTS,
   problemLabel,
+  type AuditOutcome,
   type Bench,
   type ModelCell,
 } from "@/app/_lib/models"
@@ -68,6 +69,7 @@ interface FoundCell {
   modelSlug: string
   harness: string | null
   cell: ModelCell
+  auditSummary?: string
 }
 
 async function findCell(gpu: string, rid: string): Promise<FoundCell | null> {
@@ -83,7 +85,11 @@ async function findCell(gpu: string, rid: string): Promise<FoundCell | null> {
       for (const { g, cells } of views) {
         if (g !== gpu) continue
         for (const [problem, cell] of Object.entries(cells)) {
-          if (cell.run_id === rid)
+          if (cell.run_id === rid) {
+            const audit = (block.outcomes ?? []).find(
+              (outcome) =>
+                outcome.run_id === rid && gpuForOutcome(outcome) === gpu,
+            )
             return {
               bench: bench as Bench,
               problem,
@@ -91,12 +97,49 @@ async function findCell(gpu: string, rid: string): Promise<FoundCell | null> {
               modelSlug: m.slug,
               harness: block.harness,
               cell,
+              auditSummary: audit?.summary,
             }
+          }
+        }
+      }
+      for (const outcome of block.outcomes ?? []) {
+        if (outcome.run_id !== rid || gpuForOutcome(outcome) !== gpu) continue
+        return {
+          bench: bench as Bench,
+          problem: outcome.problem ?? "unknown",
+          modelName: m.name,
+          modelSlug: m.slug,
+          harness: outcome.harness ?? block.harness,
+          auditSummary: outcome.summary,
+          cell: {
+            run_id: outcome.run_id,
+            correct: Boolean(outcome.correct),
+            has_solution: true,
+            score: outcome.score,
+            verdict: outcome.verdict,
+            valid: Boolean(outcome.publish_grade && outcome.correct && outcome.score != null),
+            outcome_label:
+              outcome.board_eligible === false
+                ? "hardware mismatch"
+                : outcome.failure_reason?.replace(/_/g, " ") ||
+                  outcome.measurement_status?.replace(/_/g, " ") ||
+                  outcome.verdict.replace(/_/g, " "),
+            failure_reason: outcome.failure_reason,
+            solution_url: outcome.solution_url,
+            trace_url: outcome.trace_url,
+          },
         }
       }
     }
   }
   return null
+}
+
+function gpuForOutcome(outcome: AuditOutcome): string {
+  const label = outcome.gpu?.toUpperCase() ?? ""
+  if (label.includes("H100")) return "h100"
+  if (label.includes("B200")) return "b200"
+  return CANONICAL_GPU
 }
 
 async function readPublic(rel: string): Promise<string | null> {
@@ -133,6 +176,13 @@ export async function generateStaticParams() {
           seen.add(key)
           params.push({ gpu: g, rid: cell.run_id })
         }
+      }
+      for (const outcome of block.outcomes ?? []) {
+        const g = gpuForOutcome(outcome)
+        const key = `${g}/${outcome.run_id}`
+        if (seen.has(key)) continue
+        seen.add(key)
+        params.push({ gpu: g, rid: outcome.run_id })
       }
     }
   }
@@ -262,7 +312,7 @@ export default async function RunPage({
   const { gpu, rid } = await params
   const found = await findCell(gpu, rid)
   if (!found) notFound()
-  const { bench, problem, modelName, modelSlug, harness, cell } = found
+  const { bench, problem, modelName, modelSlug, harness, cell, auditSummary } = found
 
   const detail = await loadDetail(gpu, rid)
   const solution = cell.solution_url
@@ -306,6 +356,7 @@ export default async function RunPage({
       {verdict === "clean" && (
         <p className="rdetail-muted">manually audited: clean</p>
       )}
+      {auditSummary && <p className="run-page-audit-summary">{auditSummary}</p>}
 
       <div className="rdetail-stats">
         {harness && <Stat label="harness" value={harness} />}

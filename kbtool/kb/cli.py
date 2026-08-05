@@ -14,6 +14,7 @@ from __future__ import annotations
 import csv
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -35,7 +36,7 @@ with `kb -b <bench> ...` (or KB_BENCH=cuda). Benches: hard cuda mini mega multi.
   kb [-b bench] lint <run_id|--all>             static reward-hack tripwire (scans solution.py)
   kb contamination <hard|mega|cuda|mini|multi|v3|path> [--published <lb.json>]   cross-run contamination audit
   kb traces-to-hf <out_dir> [run_dirs...]       convert run transcripts to HF agent-trace JSONL
-  kb push-runs <hard|mega|cuda> [--board h100|b200] [--dataset R] [--dry-run]   convert published runs' traces and push to HF (per-GPU hard/cuda boards upload under <board>/)
+  kb push-runs <hard|mega|cuda> [--board h100|b200] [--dataset R] [--dry-run]   convert published/audited runs' traces and push to HF (per-GPU uploads under <board>/)
   kb brev <up|sync|bootstrap|run|regrade|pull|down> <instance> [...]   Brev GPU worker lifecycle (scripts/brev_worker.sh)
   kb lambda <list|ls|up|sync|bootstrap|run|regrade|pull|down|ssh> [...]  Lambda Cloud worker (scripts/lambda_worker.sh; $10k Zach credits)
   kb help
@@ -258,6 +259,29 @@ def _mega_csv_run_ids(root: Path) -> list[str]:
     with f.open() as fh:
         return sorted({row["run_id"] for row in csv.DictReader(fh) if row.get("run_id")})
 
+def _audited_run_ids(bench_dir: Path, board: str | None) -> list[str]:
+    """Return manually audited runs for one hardware namespace.
+
+    Annotation hardware labels are authoritative. RTX PRO 6000 and missing
+    labels belong to the canonical flat namespace; H100/B200 live under their
+    board prefixes. This keeps rejected and failed attempts inspectable without
+    mixing two different GPU sessions that share a run-id shape.
+    """
+    selected: set[str] = set()
+    for annotation in sorted((bench_dir / "results" / "annotations").glob("*.yaml")):
+        text = annotation.read_text(errors="ignore")
+        run_id = re.search(r"^run_id:\s*(\S+)", text, re.MULTILINE)
+        if not run_id:
+            continue
+        gpu = re.search(r"^gpu:\s*(.+?)\s*$", text, re.MULTILINE)
+        label = (gpu.group(1) if gpu else "").strip("\"'").upper()
+        annotation_board = (
+            "h100" if "H100" in label else "b200" if "B200" in label else None
+        )
+        if annotation_board == board:
+            selected.add(run_id.group(1))
+    return sorted(selected)
+
 
 def _check_rid_collisions(
     root: Path, bench: str, rids: list[str], src_dir: str
@@ -310,27 +334,41 @@ def cmd_push_runs(root: Path, args: list[str], bench: str = "hard") -> int:
         bench = args[0]
     if bench not in ("hard", "mega", "cuda"):
         sys.exit("kb push-runs: only hard|mega|cuda have trace datasets (v3 is archived)")
-    if board and bench not in ("hard", "cuda"):
-        sys.exit("kb push-runs: --board only applies to hard|cuda (per-GPU boards)")
+    if board and bench not in ("hard", "mega", "cuda"):
+        sys.exit("kb push-runs: --board only applies to hard|mega|cuda")
     bench_dir = _bench_dir(root, bench)
     dataset = dataset or f"Infatoshi/kernelbench-{bench}-traces"
 
     if board:
-        # Per-GPU board: rids from leaderboard.<board>.json, archives from
-        # outputs/runs-<board>, uploaded under <board>/ on HF so they never
-        # clobber the canonical flat namespace.
-        lb = bench_dir / "results" / f"leaderboard.{board}.json"
-        if not lb.exists():
-            sys.exit(f"kb push-runs: no such board file {lb}")
-        data = json.loads(lb.read_text())
-        rids = sorted({c.get("run_id") for m in data.get("models", [])
-                       for c in m.get("results", {}).values() if c.get("run_id")})
         src_dir = f"runs-{board}"
+        if bench == "mega":
+            rids = _audited_run_ids(bench_dir, board)
+        else:
+            # Per-GPU Hard/CUDA board: ranked rows plus rejected/failed audited
+            # attempts, all uploaded under <board>/ to avoid run-id collisions.
+            lb = bench_dir / "results" / f"leaderboard.{board}.json"
+            if not lb.exists():
+                sys.exit(f"kb push-runs: no such board file {lb}")
+            data = json.loads(lb.read_text())
+            ranked = {
+                c.get("run_id")
+                for m in data.get("models", [])
+                for c in m.get("results", {}).values()
+                if c.get("run_id")
+            }
+            rids = sorted(ranked | set(_audited_run_ids(bench_dir, board)))
     else:
-        rids = _leaderboard_run_ids(bench_dir)
-        if not rids and bench == "mega":
-            rids = _mega_csv_run_ids(root)
         src_dir = "runs"
+        if bench == "mega":
+            rids = sorted(
+                set(_mega_csv_run_ids(root))
+                | set(_audited_run_ids(bench_dir, None))
+            )
+        else:
+            rids = sorted(
+                set(_leaderboard_run_ids(bench_dir))
+                | set(_audited_run_ids(bench_dir, None))
+            )
     if not rids:
         src = "public/data/mega/results.csv" if bench == "mega" else f"{bench}/results/leaderboard.json"
         sys.exit(f"kb push-runs: no run_ids in {src}")
@@ -346,7 +384,7 @@ def cmd_push_runs(root: Path, args: list[str], bench: str = "hard") -> int:
     conv = bench_dir / "scripts" / "traces_to_hf.py"
     if not conv.exists():
         conv = _bench_dir(root, "hard") / "scripts" / "traces_to_hf.py"
-    print(f"converting {len(rids)} published run traces -> {staging} ...")
+    print(f"converting {len(rids)} published/audited run traces -> {staging} ...")
     bench_env = {k: v for k, v in os.environ.items() if k != "VIRTUAL_ENV"}
     subprocess.run(
         ["uv", "run", "python", str(conv), str(staging),
