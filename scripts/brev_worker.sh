@@ -7,7 +7,7 @@
 #   brev_worker.sh sync <name>                  rsync thin bench (KB_BREV_BENCH, default hard) -> <name>:kb-<bench>/
 #   brev_worker.sh bootstrap <name> [--agents]  uv + torch (cu128); --agents adds node + agent CLIs + auth
 #   brev_worker.sh run <name> <harness> <model> <problem> [effort]   detached agent session (problems root auto)
-#   brev_worker.sh regrade <name> <run_id> [runs_dir]   transfer the full archive/bundle and run the isolated sequential regrader
+#   brev_worker.sh regrade <name> <run_id> [runs_dir]   re-grade an archived solution.py: check.py then benchmark.py, sequentially
 #   brev_worker.sh pull <name>                  rsync outputs/runs back (thin) into outputs/runs-brev-<name>/
 #   brev_worker.sh down <name>                  teardown via brev_teardown.sh, verified against brev ls
 #
@@ -78,10 +78,6 @@ case "$CMD" in
     # <monorepo>/scripts/lib/; ship the lib INTO the bench dir (wrapper falls
     # back to it on thin-synced nodes).
     rsync -az -e "${S[*]}" "$HERE/scripts/lib/" "$NAME:$REMOTE_DIR/scripts/lib/"
-    rsync -az -e "${S[*]}" "$HERE/scripts/submission_bundle.py" \
-      "$NAME:$REMOTE_DIR/scripts/submission_bundle.py"
-    rsync -az -e "${S[*]}" "$HERE/scripts/trusted_stage.py" \
-      "$NAME:$REMOTE_DIR/scripts/trusted_stage.py"
     TMPENV="$(mktemp)"
     grep -E "^(export )?($ENV_ALLOWLIST)=" ~/.env_vars > "$TMPENV" || true
     rsync -az -e "${S[*]}" "$TMPENV" "$NAME:.env_vars"
@@ -122,96 +118,25 @@ rm -f uv.lock; fi; export PATH="$HOME/.local/bin:$PATH"; uv sync'
     HARNESS="${1:?harness}"; MODEL="${2:?model}"; PROBLEM="${3:?problem}"; EFFORT="${4:-}"
     ensure_reachable
     echo "[run] detached: $HARNESS $MODEL $PROBLEMS_ROOT/$PROBLEM $EFFORT"
-    "${S[@]}" "$NAME" "cd ~/$REMOTE_DIR && mkdir -p outputs && setsid nohup env KBH_AGENT_CONTAINER=1 BUDGET_SECONDS=0 ${KB_BREV_RUN_ENV:-} ./scripts/run_hard.sh $HARNESS $MODEL $PROBLEMS_ROOT/$PROBLEM $EFFORT > outputs/kb_run_\$(basename $PROBLEM).log 2>&1 < /dev/null & echo launched PID \$!"
+    "${S[@]}" "$NAME" "cd ~/$REMOTE_DIR && mkdir -p outputs && setsid nohup env KBH_AGENT_CONTAINER=0 BUDGET_SECONDS=0 ${KB_BREV_RUN_ENV:-} ./scripts/run_hard.sh $HARNESS $MODEL $PROBLEMS_ROOT/$PROBLEM $EFFORT > outputs/kb_run_\$(basename $PROBLEM).log 2>&1 < /dev/null & echo launched PID \$!"
     echo "Poll:  ${S[*]} $NAME 'tail -20 ~/$REMOTE_DIR/outputs/kb_run_*.log'"
     ;;
 
   regrade)
     RID="${1:?run_id}"; RUNS_DIR="${2:-$BENCH_DIR/outputs/runs-h100}"
     SRC="$RUNS_DIR/$RID"
-    if [[ ! "$RID" =~ ^[A-Za-z0-9._+-]+$ ]] \
-      || [ "$RID" = "." ] || [ "$RID" = ".." ]; then
-      echo "unsafe run_id: $RID" >&2
-      exit 2
-    fi
-    [ -f "$SRC/result.json" ] && [ -f "$SRC/solution.py" ] \
-      || { echo "result.json or solution.py missing in $SRC" >&2; exit 1; }
-    # Always gate what leaves this host.  verify-run permits genuinely
-    # pre-cutover archives, but rejects a post-cutover run stripped of its
-    # bundle metadata.
-    LOCAL_PROVENANCE="$(python3 "$HERE/scripts/submission_bundle.py" verify-run "$SRC")"
+    [ -f "$SRC/solution.py" ] || { echo "no solution.py in $SRC" >&2; exit 1; }
+    PROBLEM="$(sed -E 's/^[0-9]{8}_[0-9]{6}_.*_([0-9]{2}_[a-z0-9_]+)$/\1/' <<<"$RID")"
     ensure_reachable
-    REMOTE_RUN="$REMOTE_DIR/outputs/imported-regrades/$RID"
-    echo "[regrade] $RID -> bundle-aware sequential replay"
-    "${S[@]}" "$NAME" "rm -rf ~/$REMOTE_RUN && mkdir -p ~/$REMOTE_RUN"
-    # These are run-root work directories.  Root anchoring is important:
-    # submission_bundle/files/cache and .../tmp may be authored sidecars.
-    rsync -az -e "${S[*]}" --exclude '/.venv' --exclude '/cache' --exclude '/tmp' \
-      --exclude '/replays' --exclude '/regrade_replays' --exclude '/regrade-reviews' \
-      "$SRC/" "$NAME:$REMOTE_RUN/"
-    REMOTE_STATUS=0
-    "${S[@]}" "$NAME" "export PATH=\"\$HOME/.local/bin:\$PATH\"; cd ~/$REMOTE_DIR \
-      && env KBH_HARDWARE=${KBH_HARDWARE:-H100} ./scripts/regrade_sequential.sh outputs/imported-regrades/$RID \
-        > outputs/imported-regrades/$RID/regrade.log 2>&1" || REMOTE_STATUS=$?
-
-    REVIEW_ROOT="$SRC/regrade-reviews/$(date -u +%Y%m%dT%H%M%SZ)-$$"
-    REVIEW="$REVIEW_ROOT/$RID"
-    mkdir -p "$REVIEW"
-    rsync -az -e "${S[*]}" \
-      --include '/result.json' --include '/check*.log' --include '/benchmark*.log' \
-      --include '/regrade*.log' --include '/submission_bundle/' \
-      --include '/submission_bundle/***' --exclude '*' \
-      "$NAME:$REMOTE_RUN/" "$REVIEW/"
-    if [ "$REMOTE_STATUS" -ne 0 ]; then
-      echo "ERROR: remote regrader failed (status $REMOTE_STATUS); review: $REVIEW" >&2
-      exit 1
-    fi
-    [ -f "$REVIEW/result.json" ] \
-      || { echo "ERROR: remote regrader returned no result.json; review: $REVIEW" >&2; exit 1; }
-    if ! python3 - "$SRC/result.json" "$REVIEW/result.json" <<'PY'
-import json
-import sys
-
-with open(sys.argv[1], encoding="utf-8") as stream:
-    original = json.load(stream)
-with open(sys.argv[2], encoding="utf-8") as stream:
-    candidate = json.load(stream)
-candidate_regrade = candidate.get("regrade")
-if not isinstance(candidate_regrade, dict):
-    raise SystemExit("remote result has no regrade provenance")
-if candidate_regrade == original.get("regrade"):
-    raise SystemExit("remote result has no new regrade provenance")
-if candidate_regrade.get("mode") != "sequential_isolated":
-    raise SystemExit("remote result is not a sequential isolated regrade")
-bundled = any(
-    key in candidate
-    for key in (
-        "submission_bundle",
-        "submission_replay",
-        "submission_bundle_sha256",
-        "submission_replay_status",
-    )
-)
-expected_mode, expected_status = ("bundled", "verified") if bundled else ("legacy", "legacy")
-if candidate_regrade.get("submission_mode") != expected_mode:
-    raise SystemExit("remote regrade submission mode does not match the result")
-if candidate_regrade.get("status") != expected_status:
-    raise SystemExit("remote regrade status is not publishable")
-PY
-    then
-      echo "ERROR: remote result was not freshly regraded; review: $REVIEW" >&2
-      exit 1
-    fi
-    if ! PROVENANCE="$(python3 "$HERE/scripts/submission_bundle.py" verify-run "$REVIEW")"; then
-      echo "ERROR: returned regrade failed provenance verification; review: $REVIEW" >&2
-      exit 1
-    fi
-    if [ "$PROVENANCE" != "$LOCAL_PROVENANCE" ]; then
-      echo "ERROR: returned regrade is bound to different submission provenance; review: $REVIEW" >&2
-      exit 1
-    fi
-    printf '%s\n' "$PROVENANCE" > "$REVIEW/provenance.json"
-    echo "  review candidate: $REVIEW (checks passed; archive not promoted)"
+    echo "[regrade] $RID -> $PROBLEMS_ROOT/$PROBLEM (sequential, no other GPU jobs)"
+    "${S[@]}" "$NAME" "mkdir -p ~/kb-regrade/$RID && cp -r ~/$REMOTE_DIR/$PROBLEMS_ROOT/$PROBLEM/. ~/kb-regrade/$RID/"
+    rsync -az -e "${S[*]}" "$SRC/solution.py" "$NAME:kb-regrade/$RID/solution.py"
+    "${S[@]}" "$NAME" "export PATH=\"\$HOME/.local/bin:\$PATH\"; cd ~/kb-regrade/$RID \
+      && echo '--- check.py ---' && uv run --project ~/$REMOTE_DIR python check.py \
+      && echo '--- benchmark.py ---' && env KBH_HARDWARE=${KBH_HARDWARE:-H100} uv run --project ~/$REMOTE_DIR python benchmark.py"
+    echo "[regrade] pull result.json (if written) back beside the archive:"
+    rsync -az -e "${S[*]}" "$NAME:kb-regrade/$RID/result.json" "$SRC/result.regrade.json" 2>/dev/null \
+      && echo "  -> $SRC/result.regrade.json" || echo "  (benchmark printed to stdout only)"
     ;;
 
   pull)

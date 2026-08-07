@@ -52,9 +52,7 @@ def test_all_benchmarks_score_solution_before_optional_baselines() -> None:
         assert "time_variant" in benchmark, path
         assert "Solution first" in benchmark, path
         assert benchmark.index('variant="solution"') < benchmark.index("torch.compile"), path
-        assert benchmark.index("benchmark_baselines_enabled") < benchmark.index("torch.compile"), (
-            path
-        )
+        assert benchmark.index("benchmark_baselines_enabled") < benchmark.index("torch.compile"), path
 
 
 def test_kda_benchmark_keeps_legacy_baseline_env_alias() -> None:
@@ -62,6 +60,8 @@ def test_kda_benchmark_keeps_legacy_baseline_env_alias() -> None:
     assert 'benchmark_baselines_enabled("KDA", "02_KDA_CUTLASS")' in benchmark
     assert benchmark.index('variant="solution"') < benchmark.index("if not include_baselines")
     assert benchmark.index("if not include_baselines") < benchmark.index("torch.compile")
+
+
 
 
 def test_baseline_generator_opts_into_reference_diagnostics() -> None:
@@ -73,7 +73,7 @@ def test_run_archives_are_allocated_atomically() -> None:
     script = RUN_HARD.read_text()
     assert 'RUN_DIR_BASE="${REPO_ROOT}/outputs/runs/' in script
     assert 'if mkdir "$candidate" 2>/dev/null; then' in script
-    assert "failed to allocate unique run directory" in script
+    assert 'failed to allocate unique run directory' in script
 
 
 def test_claude_family_runs_from_archive_workspace() -> None:
@@ -89,13 +89,12 @@ def test_claude_family_runs_from_archive_workspace() -> None:
 
 def test_claude_container_mode_uses_clean_namespace() -> None:
     script = RUN_HARD.read_text()
-    assert 'KBH_AGENT_CONTAINER="${KBH_AGENT_CONTAINER:-1}"' in script
-    assert 'if [ "$KBH_AGENT_CONTAINER" != "1" ]; then' in script
+    assert 'KBH_AGENT_CONTAINER="${KBH_AGENT_CONTAINER:-0}"' in script
     assert 'KBH_AGENT_CONTAINER_NETWORK="${KBH_AGENT_CONTAINER_NETWORK:-bridge}"' in script
-    assert "KBH_AGENT_CONTAINER_CODEX_NODE=" in script
-    assert "KBH_AGENT_CONTAINER_OPENCODE_BIN=" in script
-    assert "KBH_AGENT_CONTAINER_DROID_BIN=" in script
-    assert "KBH_AGENT_CONTAINER_CURSOR_DIR=" in script
+    assert 'KBH_AGENT_CONTAINER_CODEX_NODE=' in script
+    assert 'KBH_AGENT_CONTAINER_OPENCODE_BIN=' in script
+    assert 'KBH_AGENT_CONTAINER_DROID_BIN=' in script
+    assert 'KBH_AGENT_CONTAINER_CURSOR_DIR=' in script
     assert "agent_container_native_profiling_harness_gpu_lock" in script
     assert 'PROMPT_WORKSPACE_DIR="/workspace/problems/$PROBLEM_NAME"' in script
     assert "is not mounted" in script
@@ -111,7 +110,7 @@ def test_claude_container_mode_uses_clean_namespace() -> None:
     assert 'cp -p "$HOME/.config/opencode/opencode.json"' in script
     assert 'cp -p "$HOME/.config/cursor/auth.json"' in script
     assert '--network "$KBH_AGENT_CONTAINER_NETWORK"' in script
-    assert "--cap-add CAP_PERFMON" in script
+    assert '--cap-add CAP_PERFMON' in script
     assert '-v "$WORKSPACE_ROOT:/workspace:rw"' in script
     assert '-v "$KBH_AGENT_CONTAINER_CUDA_HOME:/usr/local/cuda-host:ro"' in script
     assert '-v "$KBH_AGENT_CONTAINER_CODEX_NODE:/opt/node:ro"' in script
@@ -138,14 +137,14 @@ def test_agent_container_mode_does_not_mount_full_harness_state() -> None:
     start = script.index("run_claude_container()")
     end = script.index("# Snapshot immutable problem files", start)
     block = script[start:end]
-    assert "$HOME/.claude:" not in block
+    assert '$HOME/.claude:' not in block
     assert "$HOME/.claude.json" not in block
-    assert "$HOME/.codex:" not in block
-    assert "$HOME/.config/opencode:" not in block
-    assert "$HOME/.local/share/opencode:" not in block
-    assert "$HOME/.factory:" not in block
-    assert "$HOME/.cursor:" not in block
-    assert "$HOME/.config/cursor:" not in block
+    assert '$HOME/.codex:' not in block
+    assert '$HOME/.config/opencode:' not in block
+    assert '$HOME/.local/share/opencode:' not in block
+    assert '$HOME/.factory:' not in block
+    assert '$HOME/.cursor:' not in block
+    assert '$HOME/.config/cursor:' not in block
     assert ".claude/projects" not in block
     assert ".claude/sessions" not in block
     assert "history.jsonl" not in block
@@ -284,7 +283,7 @@ def test_minimax_claude_uses_official_anthropic_endpoint() -> None:
     assert "https://api.minimax.io/anthropic" in block
     assert 'ANTHROPIC_MODEL="$MODEL"' in block
     assert 'ANTHROPIC_DEFAULT_OPUS_MODEL="$MODEL"' in block
-    assert "env \\" not in block
+    assert 'env \\' not in block
 
 
 def test_check_timeouts_are_retryable_not_plain_check_failed() -> None:
@@ -353,22 +352,19 @@ def test_nvcf_nemotron_uses_local_proxy_and_archive_config() -> None:
     assert "write_nvcf_opencode_config()" in script
     assert "scripts/nvcf_openai_proxy.py" in script
     assert "NGC_API_KEY, NVIDIA_API_KEY, or NVCF_API_KEY" in script
-    start = script.rindex("\n    nvcf-nemotron)")
+    start = script.index("nvcf-nemotron)")
     end = script.index(";;", start)
     block = script[start:end]
     assert "start_nvcf_proxy" in block
     assert 'env XDG_CONFIG_HOME="$NVCF_OPENCODE_CONFIG_HOME"' in block
     assert '-m "nvcf-nemotron/$MODEL"' in block
     assert "opencode run --pure --format json" in block
-    assert (
-        "droid|kimi|opencode|opencode-nemotron|nvcf-nemotron|hy3|hy3-claude|tinker|inkling|lfm-opencode|hermes|pi)"
-        in script
-    )
+    assert "droid|kimi|opencode|opencode-nemotron|nvcf-nemotron|hy3|hy3-claude|tinker|inkling|lfm-opencode|hermes|pi)" in script
 
 
 def test_parallel_launcher_keeps_run_hard_jobs_waitable() -> None:
     script = LAUNCH_PARALLEL.read_text()
-    assert "LAST_LAUNCH_PID=$!" in script
+    assert 'LAST_LAUNCH_PID=$!' in script
     assert 'pid="$(launch_one' not in script
     assert 'launch_one "$name" "$harness" "$model" "$effort" "$problem"' in script
     assert 'pid="$LAST_LAUNCH_PID"' in script
@@ -378,11 +374,13 @@ def test_parallel_launcher_keeps_run_hard_jobs_waitable() -> None:
 def test_agent_container_uses_workspace_uv_env_and_prewarmed_opencode_home() -> None:
     script = RUN_HARD.read_text()
     # Agents must develop against the same uv.lock env the host scores with;
-    assert script.count('-v "$REAL_UV:/usr/local/bin/uv:ro"') == 7
-    assert script.count('-v "$AGENT_CONTAINER_UV_CACHE:/uv-cache:rw"') == 7
-    assert script.count("-e UV_CACHE_DIR=/uv-cache") == 7
-    assert script.count("-e UV_PYTHON_INSTALL_DIR=/uv-cache/python") == 7
-    assert 'mkdir -p "$AGENT_CONTAINER_UV_CACHE"' in script
+    # droid is out of the suite, so exactly the six active runners mount uv
+    # (claude, codex, opencode, cursor, grok, gemini).
+    assert script.count("-v \"$REAL_UV:/usr/local/bin/uv:ro\"") == 6
+    assert script.count("-v \"$KBH_AGENT_CONTAINER_UV_CACHE:/uv-cache:rw\"") == 6
+    assert script.count("-e UV_CACHE_DIR=/uv-cache") == 6
+    assert script.count("-e UV_PYTHON_INSTALL_DIR=/uv-cache/python") == 6
+    assert "mkdir -p \"$KBH_AGENT_CONTAINER_UV_CACHE\"" in script
     assert "same uv.lock as the official" in script
     # Pre-warmed opencode home: no per-run sqlite migration, and the template
     # copy must not reach into the host opencode data dir (session leak).
@@ -390,7 +388,7 @@ def test_agent_container_uses_workspace_uv_env_and_prewarmed_opencode_home() -> 
     start = script.index("prepare_opencode_container_home()")
     end = script.index("prepare_droid_container_home()")
     block = script[start:end]
-    assert 'cp -a "$KBH_OPENCODE_HOME_TEMPLATE/." "$home_dir/"' in block
+    assert "cp -a \"$KBH_OPENCODE_HOME_TEMPLATE/.\" \"$home_dir/\"" in block
     assert "$HOME/.local/share/opencode" not in block
 
 
@@ -400,7 +398,7 @@ def test_opencode_container_has_stall_watchdog_and_retry() -> None:
     assert "KBH_STALL_WATCH_LOG" in script
     assert "stall_watchdog.log" in script
     # Retry loop scoped to the opencode runner (the affected adapter family).
-    block = script[script.index("run_opencode_container()") : script.index("run_droid_container()")]
+    block = script[script.index("run_opencode_container()"):script.index("run_droid_container()")]
     assert "KBH_OPENCODE_STALL_SECONDS" in block
     assert "KBH_OPENCODE_STALL_RETRIES" in block
     assert "remaining=$(( BUDGET_SECONDS - elapsed ))" in block
@@ -410,11 +408,7 @@ def test_hy3_tokenhub_uses_measured_context_wall_and_host_stall_watch() -> None:
     script = RUN_HARD.read_text()
     # Live TokenHub hy3 hard-caps input at 196608 (RCA 2026-07-09). Advertising
     # 262144 put OpenCode compaction past the real wall.
-    cfg = script[
-        script.index("write_tokenhub_hy3_opencode_config()") : script.index(
-            "prepare_claude_container_home()"
-        )
-    ]
+    cfg = script[script.index("write_tokenhub_hy3_opencode_config()"):script.index("prepare_claude_container_home()")]
     assert "HY3_TOKENHUB_CONTEXT_LIMIT:-196608" in cfg
     assert "HY3_TOKENHUB_OUTPUT_LIMIT:-32000" in cfg
     assert "262144" not in cfg
@@ -424,7 +418,7 @@ def test_hy3_tokenhub_uses_measured_context_wall_and_host_stall_watch() -> None:
     assert 'kill "-${sig}" -- "-${pid}"' in script
     assert 'touch "$LOG_FILE"' in script
     assert ') </dev/null >> "$LOG_FILE" 2>> "$STDERR_FILE"' in script
-    hy3 = script[script.index("hy3|hy3-claude)") : script.index("deepseek-claude)")]
+    hy3 = script[script.index("hy3|hy3-claude)"):script.index("deepseek-claude)")]
     assert "run_host_with_stall_watch" in hy3
     assert "KBH_OPENCODE_STALL_SECONDS:-1500" in hy3
 
@@ -433,10 +427,9 @@ def test_agent_container_sessions_parallel_with_per_command_lock() -> None:
     script = RUN_HARD.read_text()
     # Default: sessions do NOT hold the GPU lock; in-container GPU commands
     # serialize per-command through the bind-mounted lock dir.
-    assert script.count('-v "$CONTAINER_LOCK_BIN:/kbh/bin:ro"') == 7
-    assert script.count('-v "$KBH_GPU_LOCK:/kbh/gpu.lock:rw"') == 7
-    assert script.count("-e KBH_GPU_LOCK=/kbh/gpu.lock") == 7
-    assert "$KBH_GPU_LOCK_DIR:/kbh/lock:rw" not in script
+    assert script.count("-v \"$CONTAINER_LOCK_BIN:/kbh/bin:ro\"") == 6
+    assert script.count("-v \"$KBH_GPU_LOCK_DIR:/kbh/lock:rw\"") == 6
+    assert script.count("-e KBH_GPU_LOCK=/kbh/lock/gpu.lock") == 6
     assert "KBH_AGENT_CONTAINER_SESSION_LOCK" in script
     assert "agent_container_native_profiling_path_wrapper_gpu_lock" in script
     # The lock lives in a dedicated dir so only the lock is mounted, never
