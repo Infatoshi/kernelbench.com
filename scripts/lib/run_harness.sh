@@ -94,6 +94,9 @@ if [ -z "$RUN_DIR" ]; then
     exit 1
 fi
 RUN_ID="$(basename "$RUN_DIR")"
+REPLAY_ROOT="$RUN_DIR/replays"
+mkdir -m 700 "$REPLAY_ROOT"
+REPLAY_ROOT_ID="$(stat -c '%d:%i' "$REPLAY_ROOT")"
 RUN_GROUP="${KBH_RUN_GROUP:-}"
 NVCF_PROXY_PID=""
 NVCF_PROXY_BASE_URL=""
@@ -203,14 +206,11 @@ scoring environment. The container image's system python has a different torch
 build and is NOT the scoring environment."
 fi
 
-# check.py and benchmark.py derive REPO_ROOT as parents[2]. Keep that shape
-# while sharing src/. Copy project metadata so agents can mutate dependencies
-# inside their disposable workspace without touching the source repo.
-if [ "$KBH_AGENT_CONTAINER" = "1" ]; then
-    cp -a "$REPO_ROOT/src" "$WORKSPACE_ROOT/src"
-else
-    ln -s "$REPO_ROOT/src" "$WORKSPACE_ROOT/src"
-fi
+# check.py and benchmark.py derive REPO_ROOT as parents[2]. Keep that shape and
+# copy project metadata so agents can experiment inside a disposable workspace.
+# The agent always receives a disposable copy. Post-agent scoring uses a new
+# copy from the canonical bench, so workspace edits cannot change trusted code.
+cp -a "$REPO_ROOT/src" "$WORKSPACE_ROOT/src"
 cp -p "$REPO_ROOT/pyproject.toml" "$WORKSPACE_ROOT/pyproject.toml"
 cp -p "$REPO_ROOT/uv.lock" "$WORKSPACE_ROOT/uv.lock"
 if [ -e "$REPO_ROOT/.python-version" ]; then
@@ -244,6 +244,91 @@ REAL_NSYS="$(command -v nsys || true)"
 REAL_NVCC="$(command -v nvcc || true)"
 REAL_DOCKER="$(command -v docker || true)"
 REAL_TIMEOUT="$(command -v timeout)"
+REAL_UNSHARE="$(command -v unshare || true)"
+REAL_SETPRIV="$(command -v setpriv || true)"
+BUNDLE_PYTHON="$(readlink -f /usr/bin/python3)"
+TRUSTED_PYTHON="$REPO_ROOT/.venv/bin/python"
+TRUSTED_PYTHON_RUNTIME="$(dirname "$(dirname "$(readlink -f "$TRUSTED_PYTHON")")")"
+SUBMISSION_BUNDLE_TOOL="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/submission_bundle.py"
+TRUSTED_TOOLS_DIR="$(dirname "$(dirname "$SUBMISSION_BUNDLE_TOOL")")"
+if [ -z "$REAL_UNSHARE" ] || [ -z "$REAL_SETPRIV" ]; then
+    echo "STOP: post-agent grading requires user, network, and mount namespaces plus setpriv." >&2
+    exit 3
+fi
+if [ ! -x "$TRUSTED_PYTHON" ]; then
+    echo "STOP: canonical grading environment is missing: $TRUSTED_PYTHON (run uv sync first)." >&2
+    exit 3
+fi
+if [ ! -d "$TRUSTED_PYTHON_RUNTIME" ]; then
+    echo "STOP: canonical Python runtime is missing: $TRUSTED_PYTHON_RUNTIME" >&2
+    exit 3
+fi
+TRUSTED_PYTHON_VERSION="$(
+    "$TRUSTED_PYTHON" -I -S -c \
+        'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")'
+)"
+TRUSTED_SITE_PACKAGES="$REPO_ROOT/.venv/lib/python$TRUSTED_PYTHON_VERSION/site-packages"
+if [ ! -d "$TRUSTED_SITE_PACKAGES" ]; then
+    echo "STOP: canonical site-packages is missing: $TRUSTED_SITE_PACKAGES" >&2
+    exit 3
+fi
+if [ -n "$REAL_NVIDIA_SMI" ] && ! \
+    "$REAL_UNSHARE" --user --map-root-user --net \
+        "$REAL_NVIDIA_SMI" -L >/dev/null 2>&1; then
+    echo "STOP: the grading user namespace cannot access the GPU devices." >&2
+    exit 3
+fi
+if [ ! -f "$SUBMISSION_BUNDLE_TOOL" ]; then
+    echo "STOP: submission bundle helper is missing: $SUBMISSION_BUNDLE_TOOL" >&2
+    exit 3
+fi
+# Keep the reviewed helper source in the parent shell. A host-mode agent can
+# write elsewhere in the checkout, but post-agent capture never reopens a
+# helper file that the agent could have replaced.
+SUBMISSION_BUNDLE_SOURCE="$(<"$SUBMISSION_BUNDLE_TOOL")"
+run_submission_bundle() {
+    "$BUNDLE_PYTHON" -I -S -c "$SUBMISSION_BUNDLE_SOURCE" "$@"
+}
+SUBMISSION_REPLAY_SOURCE='import os
+import runpy
+import sys
+from pathlib import Path
+
+site_packages, script = sys.argv[1:]
+problem = os.getcwd()
+repo = str(Path(problem).parents[1])
+sys.path.extend((site_packages, repo, problem))
+sys.argv[:] = [script]
+runpy.run_path(script, run_name="__main__")
+'
+if ! "$REAL_UNSHARE" --user --map-root-user --net --mount --pid --fork \
+    --kill-child=KILL --mount-proc --propagation private -- /bin/sh -eu -c '
+        readonly_root=$1
+        python_runtime=$2
+        trusted_tools=$3
+        writable_stage=$4
+        setpriv=$5
+        python=$6
+        site_packages=$7
+        replay_source=$8
+        for path in "$readonly_root" "$python_runtime" "$trusted_tools"; do
+            /usr/bin/mount --bind "$path" "$path"
+            /usr/bin/mount -o remount,bind,ro "$path"
+        done
+        /usr/bin/mount --bind "$writable_stage" "$writable_stage"
+        /usr/bin/mount -o remount,bind,rw "$writable_stage"
+        exec "$setpriv" --no-new-privs --bounding-set=-all \
+            --inh-caps=-all --ambient-caps=-all \
+            /usr/bin/env -i PATH=/usr/bin:/bin PYTHONNOUSERSITE=1 \
+            PYTHONDONTWRITEBYTECODE=1 "$python" -I -S -c "$replay_source" \
+            "$site_packages" /dev/null
+    ' replay-preflight "$REPO_ROOT" "$TRUSTED_PYTHON_RUNTIME" \
+    "$TRUSTED_TOOLS_DIR" "$REPLAY_ROOT" "$REAL_SETPRIV" \
+    "$TRUSTED_PYTHON" "$TRUSTED_SITE_PACKAGES" "$SUBMISSION_REPLAY_SOURCE" \
+    >/dev/null 2>&1; then
+    echo "STOP: the exact post-agent grading isolation preflight failed." >&2
+    exit 3
+fi
 REAL_UV_FALLBACK="$REAL_UV"
 REAL_PYTHON_FALLBACK="$REAL_PYTHON"
 LOCK_WRAPPER_DIR="$RUN_DIR/bin"
@@ -347,6 +432,7 @@ fi
 } 3>>"$KBH_GPU_LOCK_LOG" 9>"$KBH_GPU_LOCK"
 EOF
 chmod +x "$LOCK_WRAPPER_DIR/gpu-lock-exec"
+GPU_LOCK_EXEC_SOURCE="$(<"$LOCK_WRAPPER_DIR/gpu-lock-exec")"
 
 cat > "$LOCK_WRAPPER_DIR/uv" <<'EOF'
 #!/bin/bash
@@ -404,8 +490,10 @@ run_gpu_locked_timeout() {
     local lock_name="$1"
     local timeout_seconds="$2"
     shift 2
-    "$RUN_DIR/bin/gpu-lock-exec" "$lock_name" "$REAL_TIMEOUT" \
-        --kill-after="${KBH_TIMEOUT_KILL_AFTER_SECONDS:-30}s" "${timeout_seconds}s" "$@"
+    PATH=/usr/bin:/bin /bin/bash -c "$GPU_LOCK_EXEC_SOURCE" gpu-lock-exec \
+        "$lock_name" "$REAL_TIMEOUT" \
+        --kill-after="${KBH_TIMEOUT_KILL_AFTER_SECONDS:-30}s" \
+        "${timeout_seconds}s" "$@"
 }
 
 run_docker_locked_timeout() {
@@ -1318,11 +1406,12 @@ TEMPLATE_MUTATED=false
 
 detect_template_mutation() {
     local phase="$1"
+    local problem_dir="${2:-$PROBLEM_DIR}"
     local found=0
     local log="$RUN_DIR/template_mutations.log"
     for t in "${TEMPLATE_FILES[@]}"; do
         local orig="$TEMPLATE_BACKUP_DIR/$t"
-        local cur="$PROBLEM_DIR/$t"
+        local cur="$problem_dir/$t"
         if [ -e "$orig" ] && [ -e "$cur" ]; then
             if ! cmp -s "$orig" "$cur"; then
                 if [ "$found" -eq 0 ]; then
@@ -2596,6 +2685,10 @@ fi
 HAS_SOLUTION=false
 CORRECT=false
 SCORE="null"
+SUBMISSION_BUNDLE_STATUS="missing"
+SUBMISSION_BUNDLE_VALID=false
+SUBMISSION_DIGEST=""
+BUNDLE_DIR="$RUN_DIR/submission"
 
 if ! detect_template_mutation "after harness"; then
     TEMPLATE_MUTATED=true
@@ -2603,51 +2696,207 @@ if ! detect_template_mutation "after harness"; then
     restore_template_files
 fi
 
-if [ -f "$PROBLEM_DIR/solution.py" ]; then
-    HAS_SOLUTION=true
+if [ -e "$PROBLEM_DIR/solution.py" ] || [ -L "$PROBLEM_DIR/solution.py" ]; then
+    CAPTURE_ARGS=()
+    for t in "${TEMPLATE_FILES[@]}"; do
+        CAPTURE_ARGS+=(--exclude "$t")
+    done
+    CAPTURE_ARGS+=(
+        --exclude .venv
+        --exclude framework.txt
+        --exclude cuda_language.json
+    )
+    if SUBMISSION_DIGEST="$(
+        run_submission_bundle capture \
+            "$PROBLEM_DIR" "$BUNDLE_DIR" "${CAPTURE_ARGS[@]}"
+    )" 2> "$RUN_DIR/submission.log"; then
+        HAS_SOLUTION=true
+        SUBMISSION_BUNDLE_STATUS="captured"
+        SUBMISSION_BUNDLE_VALID=true
+    else
+        SUBMISSION_BUNDLE_STATUS="rejected"
+        echo "FAIL: submission could not be captured safely; see submission.log."
+    fi
 fi
+
+prepare_replay_stage() {
+    local stage_name="$1"
+    local stage_dir="$REPLAY_ROOT/$stage_name"
+    local stage_root="$stage_dir/repo"
+    local stage_problem="$stage_root/problems/$PROBLEM_NAME"
+    local item
+
+    if [ ! -d "$REPLAY_ROOT" ] || [ -L "$REPLAY_ROOT" ] || \
+        [ "$(stat -c '%d:%i' "$REPLAY_ROOT")" != "$REPLAY_ROOT_ID" ] || \
+        [ -e "$stage_dir" ] || [ -L "$stage_dir" ]; then
+        echo "unsafe replay directory" >&2
+        return 1
+    fi
+    mkdir -m 700 "$stage_dir" || return
+    mkdir -p "$stage_root/problems" "$stage_dir/home" "$stage_dir/tmp" \
+        "$stage_dir/cache/torch_extensions" "$stage_dir/cache/triton" \
+        "$stage_dir/cache/cuda" "$stage_dir/cache/xdg" || return
+    cp -a -- "$REPO_ROOT/src" "$stage_root/src" || return
+    for item in pyproject.toml uv.lock .python-version; do
+        if [ -e "$REPO_ROOT/$item" ]; then
+            cp -p -- "$REPO_ROOT/$item" "$stage_root/$item" || return
+        fi
+    done
+    run_submission_bundle extract \
+        "$BUNDLE_DIR" "$stage_problem" --expect "$SUBMISSION_DIGEST" \
+        >/dev/null || return
+    for item in "${TEMPLATE_FILES[@]}"; do
+        if [ -e "$TEMPLATE_BACKUP_DIR/$item" ]; then
+            cp -p -- "$TEMPLATE_BACKUP_DIR/$item" "$stage_problem/$item" || return
+        fi
+    done
+    find "$stage_root" -type d -name __pycache__ -prune \
+        -exec rm -rf -- {} + || return
+    find "$stage_root" -type f \( -name '*.pyc' -o -name '*.pyo' \) \
+        -delete || return
+    REPLAY_PROBLEM_DIR="$stage_problem"
+}
+
+run_replay_stage() {
+    local lock_name="$1"
+    local timeout_seconds="$2"
+    local stage_problem="$3"
+    local script="$4"
+    local stage_dir
+    stage_dir="$(cd "$stage_problem/../../.." && pwd)" || return
+    local replay_path
+    replay_path="$(dirname "$TRUSTED_PYTHON")"
+    if [ -n "$REAL_NVCC" ]; then
+        replay_path="$replay_path:$(dirname "$REAL_NVCC")"
+    fi
+    replay_path="$replay_path:$KBH_CUDA_HOME/bin:/usr/local/bin:/usr/bin:/bin"
+    local -a replay_env=(
+        "HOME=$stage_dir/home"
+        "PATH=$replay_path"
+        "VIRTUAL_ENV=$REPO_ROOT/.venv"
+        "PYTHONNOUSERSITE=1"
+        "PYTHONDONTWRITEBYTECODE=1"
+        "TMPDIR=$stage_dir/tmp"
+        "TEMP=$stage_dir/tmp"
+        "TMP=$stage_dir/tmp"
+        "XDG_CACHE_HOME=$stage_dir/cache/xdg"
+        "TORCH_EXTENSIONS_DIR=$stage_dir/cache/torch_extensions"
+        "TRITON_CACHE_DIR=$stage_dir/cache/triton"
+        "CUDA_CACHE_PATH=$stage_dir/cache/cuda"
+        "UV_OFFLINE=1"
+        "PIP_NO_INDEX=1"
+        "PIP_DISABLE_PIP_VERSION_CHECK=1"
+        "GIT_ALLOW_PROTOCOL=file"
+        "GIT_CONFIG_GLOBAL=/dev/null"
+        "HF_HUB_OFFLINE=1"
+        "TRANSFORMERS_OFFLINE=1"
+    )
+    local name
+    for name in CUDA_HOME CUDA_VISIBLE_DEVICES CUDA_DEVICE_ORDER \
+        NVIDIA_VISIBLE_DEVICES NVIDIA_DRIVER_CAPABILITIES LD_LIBRARY_PATH \
+        LIBRARY_PATH CPATH CPLUS_INCLUDE_PATH CC CXX CUDACXX MAX_JOBS \
+        TORCH_CUDA_ARCH_LIST; do
+        if [ -n "${!name+x}" ]; then
+            replay_env+=("$name=${!name}")
+        fi
+    done
+    local -a replay_command=(
+        "$REAL_UNSHARE" --user --map-root-user --net --mount --pid --fork
+        --kill-child=KILL --mount-proc --propagation private -- /bin/sh -eu -c '
+            readonly_root=$1
+            python_runtime=$2
+            trusted_tools=$3
+            writable_stage=$4
+            setpriv=$5
+            shift 5
+            for path in "$readonly_root" "$python_runtime" "$trusted_tools"; do
+                /usr/bin/mount --bind "$path" "$path"
+                /usr/bin/mount -o remount,bind,ro "$path"
+            done
+            /usr/bin/mount --bind "$writable_stage" "$writable_stage"
+            /usr/bin/mount -o remount,bind,rw "$writable_stage"
+            exec "$setpriv" --no-new-privs --bounding-set=-all \
+                --inh-caps=-all --ambient-caps=-all "$@"
+        ' replay-isolate "$REPO_ROOT" "$TRUSTED_PYTHON_RUNTIME" \
+        "$TRUSTED_TOOLS_DIR" "$stage_dir" "$REAL_SETPRIV"
+        /usr/bin/env -i "${replay_env[@]}" "$TRUSTED_PYTHON" -I -S \
+        -c "$SUBMISSION_REPLAY_SOURCE" "$TRUSTED_SITE_PACKAGES" "$script"
+    )
+    (
+        cd "$stage_problem"
+        case "$lock_name" in
+            check.py)
+                run_gpu_locked_timeout check.py "$timeout_seconds" "${replay_command[@]}"
+                ;;
+            benchmark.py)
+                run_gpu_locked_timeout benchmark.py "$timeout_seconds" "${replay_command[@]}"
+                ;;
+            *) return 2 ;;
+        esac
+    )
+}
 
 if [ "$TEMPLATE_MUTATED" = "false" ] && [ "$HAS_SOLUTION" = "true" ]; then
     CHECK_LOG="$RUN_DIR/check.log"
     BENCH_LOG="$RUN_DIR/benchmark.log"
 
-    echo "Running check.py..."
-    CHECK_START_TIME=$(date +%s)
-    CHECK_EXIT_CODE=0
-    (cd "$PROBLEM_DIR" && run_gpu_locked_timeout check.py "$CHECK_TIMEOUT_SECONDS" uv run python check.py) > "$CHECK_LOG" 2>&1 || CHECK_EXIT_CODE=$?
-    CHECK_END_TIME=$(date +%s)
-    CHECK_ELAPSED=$((CHECK_END_TIME - CHECK_START_TIME))
+    if prepare_replay_stage check; then
+        CHECK_PROBLEM_DIR="$REPLAY_PROBLEM_DIR"
+        echo "Running check.py from captured submission..."
+        CHECK_START_TIME=$(date +%s)
+        CHECK_EXIT_CODE=0
+        run_replay_stage check.py "$CHECK_TIMEOUT_SECONDS" \
+            "$CHECK_PROBLEM_DIR" check.py > "$CHECK_LOG" 2>&1 || CHECK_EXIT_CODE=$?
+        CHECK_END_TIME=$(date +%s)
+        CHECK_ELAPSED=$((CHECK_END_TIME - CHECK_START_TIME))
+    else
+        CHECK_EXIT_CODE=1
+        SUBMISSION_BUNDLE_STATUS="modified"
+        SUBMISSION_BUNDLE_VALID=false
+        echo "FAIL: captured submission failed verification before check.py."
+    fi
 
-    if ! detect_template_mutation "after check.py"; then
+    if [ -n "${CHECK_PROBLEM_DIR:-}" ] && \
+        ! detect_template_mutation "after check.py" "$CHECK_PROBLEM_DIR"; then
         TEMPLATE_MUTATED=true
         CORRECT=false
         SCORE="null"
         echo "FAIL: immutable problem files changed during check.py."
-        restore_template_files
     elif [ "$CHECK_EXIT_CODE" -eq 0 ] && grep -aq "PASS" "$CHECK_LOG"; then
-        # Not anchored (^PASS): solution stdout without a trailing newline can
-        # glue onto check.py's PASS marker (seen 2026-07-07: "kv_cache=0x7PASS"
-        # from an agent's debug printf), and that false-negative silently
-        # skipped benchmark.py. Requiring check.py exit 0 alongside the marker
-        # is strictly stronger than the old anchored grep alone.
+        # Keep the existing checker protocol: a clean exit plus PASS in its
+        # log. The bundle boundary does not turn in-process Python checkers into
+        # a hostile-code sandbox.
         CORRECT=true
         echo "Running benchmark.py..."
         # Some problems (KDA chunked recurrence, sonic-MoE)
         # have references that loop in Python, so 20 perf trials × 4 variants ×
         # 5 shapes can take 5-10 min. Generous budget.
-        BENCH_START_TIME=$(date +%s)
-        BENCH_EXIT_CODE=0
-        (cd "$PROBLEM_DIR" && run_gpu_locked_timeout benchmark.py "$BENCHMARK_TIMEOUT_SECONDS" uv run python benchmark.py) > "$BENCH_LOG" 2>&1 || BENCH_EXIT_CODE=$?
-        BENCH_END_TIME=$(date +%s)
-        BENCH_ELAPSED=$((BENCH_END_TIME - BENCH_START_TIME))
-        if ! detect_template_mutation "after benchmark.py"; then
+        if prepare_replay_stage benchmark; then
+            BENCH_PROBLEM_DIR="$REPLAY_PROBLEM_DIR"
+            BENCH_START_TIME=$(date +%s)
+            BENCH_EXIT_CODE=0
+            run_replay_stage benchmark.py "$BENCHMARK_TIMEOUT_SECONDS" \
+                "$BENCH_PROBLEM_DIR" benchmark.py > "$BENCH_LOG" 2>&1 || BENCH_EXIT_CODE=$?
+            BENCH_END_TIME=$(date +%s)
+            BENCH_ELAPSED=$((BENCH_END_TIME - BENCH_START_TIME))
+        else
+            BENCH_EXIT_CODE=1
+            SUBMISSION_BUNDLE_STATUS="modified"
+            SUBMISSION_BUNDLE_VALID=false
+            CORRECT=false
+            SCORE="null"
+            echo "FAIL: captured submission failed verification before benchmark.py."
+        fi
+        if [ -n "${BENCH_PROBLEM_DIR:-}" ] && \
+            ! detect_template_mutation "after benchmark.py" "$BENCH_PROBLEM_DIR"; then
             TEMPLATE_MUTATED=true
             CORRECT=false
             SCORE="null"
             echo "FAIL: immutable problem files changed during benchmark.py."
-            restore_template_files
         else
-            SCORE=$(grep -oP 'peak_fraction:\s*\K[0-9.]+' "$BENCH_LOG" | head -1 || echo "null")
+            SCORE=$(grep -aom1 -P \
+                '^peak_fraction:\s*\K(?:0|[1-9][0-9]*)(?:\.[0-9]+)?(?=\s*$)' \
+                "$BENCH_LOG" || echo "null")
         fi
     fi
 fi
@@ -2656,6 +2905,26 @@ CHECK_ELAPSED="${CHECK_ELAPSED:-null}"
 BENCH_ELAPSED="${BENCH_ELAPSED:-null}"
 CHECK_EXIT_CODE="${CHECK_EXIT_CODE:-null}"
 BENCH_EXIT_CODE="${BENCH_EXIT_CODE:-null}"
+
+# Recreate the legacy solution.py/scratch view only from verified bundle bytes.
+# result.json is written afterwards, so it remains the run's completion marker.
+if [ "$SUBMISSION_BUNDLE_VALID" = "true" ]; then
+    PROJECT_ARGS=()
+    if [ -n "${CHECK_PROBLEM_DIR:-}" ]; then
+        PROJECT_ARGS+=(--reports-from "$CHECK_PROBLEM_DIR")
+    fi
+    if ! run_submission_bundle project \
+        "$BUNDLE_DIR" "$RUN_DIR" --expect "$SUBMISSION_DIGEST" \
+        "${PROJECT_ARGS[@]}" \
+        >> "$RUN_DIR/submission.log" 2>&1; then
+        SUBMISSION_BUNDLE_STATUS="modified"
+        SUBMISSION_BUNDLE_VALID=false
+        CORRECT=false
+        SCORE="null"
+        echo "FAIL: captured submission failed final verification."
+    fi
+fi
+
 FINISH_TIME=$(date +%s)
 FINISHED_AT="$(date -Is)"
 TOTAL_ELAPSED=$((FINISH_TIME - START_TIME))
@@ -2711,7 +2980,13 @@ print("true" if json.loads(os.environ["CLASSIFICATION_JSON"])["retryable_infra_f
 PY
 )"
 
-cat > "$RUN_DIR/result.json" <<JSON
+if [ -n "$SUBMISSION_DIGEST" ]; then
+    SUBMISSION_DIGEST_JSON="\"$SUBMISSION_DIGEST\""
+else
+    SUBMISSION_DIGEST_JSON="null"
+fi
+RESULT_TMP="$(mktemp -p "$RUN_DIR" .result.json.XXXXXX)"
+cat > "$RESULT_TMP" <<JSON
 {
     "run_id": "$RUN_ID",
     "run_group": "$RUN_GROUP",
@@ -2732,6 +3007,8 @@ cat > "$RUN_DIR/result.json" <<JSON
     "minimum_useful_output_tokens": $MIN_USEFUL_OUTPUT_TOKENS,
     "peak_fraction": $SCORE,
     "template_mutated": $TEMPLATE_MUTATED,
+    "submission_bundle_status": "$SUBMISSION_BUNDLE_STATUS",
+    "submission_manifest_sha256": $SUBMISSION_DIGEST_JSON,
     "elapsed_seconds": $ELAPSED,
     "total_elapsed_seconds": $TOTAL_ELAPSED,
     "check_elapsed_seconds": $CHECK_ELAPSED,
@@ -2751,26 +3028,8 @@ cat > "$RUN_DIR/result.json" <<JSON
     "usage": $USAGE_JSON
 }
 JSON
-
-# Archive solution + any scratch
-if [ -f "$PROBLEM_DIR/solution.py" ]; then
-    cp "$PROBLEM_DIR/solution.py" "$RUN_DIR/solution.py"
-fi
-
-SCRATCH_DIR="$RUN_DIR/scratch"
-shopt -s nullglob dotglob
-for f in "$PROBLEM_DIR"/*; do
-    base="$(basename "$f")"
-    [[ "$base" == "." || "$base" == ".." ]] && continue
-    [[ "$base" == "solution.py" ]] && continue
-    # Never archive a per-run venv into scratch (multi-GB CUDA wheels).
-    [[ "$base" == ".venv" ]] && continue
-    if ! is_template "$base"; then
-        mkdir -p "$SCRATCH_DIR"
-        cp -r "$f" "$SCRATCH_DIR/"
-    fi
-done
-shopt -u nullglob dotglob
+chmod 0644 "$RESULT_TMP"
+mv -f -- "$RESULT_TMP" "$RUN_DIR/result.json"
 
 # Clean the problem workspace for the next run
 shopt -s nullglob dotglob

@@ -125,6 +125,14 @@ rm -f uv.lock; fi; export PATH="$HOME/.local/bin:$PATH"; uv sync'
   regrade)
     RID="${1:?run_id}"; RUNS_DIR="${2:-$BENCH_DIR/outputs/runs-h100}"
     SRC="$RUNS_DIR/$RID"
+    if ! RESULT_KIND="$(python3 -c 'import json,sys; r=json.load(open(sys.argv[1])); type(r) is dict or sys.exit(2); print("bundle" if any(k in r for k in ("submission_bundle_status","submission_manifest_sha256")) else "legacy")' "$SRC/result.json")"; then
+      echo "FATAL: $RID has missing or unreadable result metadata; refusing remote regrade" >&2
+      exit 3
+    fi
+    if [ "$RESULT_KIND" = "bundle" ]; then
+      echo "FATAL: $RID is bundle-bound; remote legacy regrade is disabled" >&2
+      exit 3
+    fi
     [ -f "$SRC/solution.py" ] || { echo "no solution.py in $SRC" >&2; exit 1; }
     PROBLEM="$(sed -E 's/^[0-9]{8}_[0-9]{6}_.*_([0-9]{2}_[a-z0-9_]+)$/\1/' <<<"$RID")"
     ensure_reachable
