@@ -356,6 +356,14 @@ rm -f uv.lock; fi; export PATH=\"\$HOME/.local/bin:\$PATH\"; uv sync"
     [ "$BENCH" = multi ] && { echo "ERROR: use benchmarks/multi/scripts/regrade.py on the worker for multi" >&2; exit 2; }
     NAME="${1:?name}"; RID="${2:?run_id}"; RUNS_DIR="${3:-$BENCH_DIR/outputs/runs-h100}"
     SRC="$RUNS_DIR/$RID"
+    if ! RESULT_KIND="$(python3 -c 'import json,sys; r=json.load(open(sys.argv[1])); type(r) is dict or sys.exit(2); print("bundle" if any(k in r for k in ("submission_bundle_status","submission_manifest_sha256")) else "legacy")' "$SRC/result.json")"; then
+      echo "FATAL: $RID has missing or unreadable result metadata; refusing remote regrade" >&2
+      exit 3
+    fi
+    if [ "$RESULT_KIND" = "bundle" ]; then
+      echo "FATAL: $RID is bundle-bound; remote legacy regrade is disabled" >&2
+      exit 3
+    fi
     [ -f "$SRC/solution.py" ] || {
       echo "no solution.py in $SRC" >&2
       exit 1
