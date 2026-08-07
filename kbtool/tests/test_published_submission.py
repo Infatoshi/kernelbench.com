@@ -247,13 +247,36 @@ def test_receipt_forgery_is_vetoed_even_after_manual_publication_approval(
 @pytest.mark.parametrize(
     "source_text",
     [
+        "import inspect\ninspect.stack()\n",
+        "import inspect\nframe = inspect.currentframe().f_back\n",
+        "value = target.__globals__['trusted']\n",
+        "import sys\nsys.modules['check'] = fake\n",
+        "import builtins\nbuiltins.print = forged\n",
+        "import os\nos._exit(0)\n",
+    ],
+)
+def test_executable_hack_tripwires_are_automatic_vetoes(source_text: str) -> None:
+    with pytest.raises(bundles.BundleError, match="static HACK tripwire"):
+        published_submission.reject_bundle_static_hacks(
+            "20260808_120000_test_model_01_problem",
+            source_text,
+        )
+
+
+@pytest.mark.parametrize(
+    "source_text",
+    [
         "class Model:\n    pass\n",
         "import torch\nvalue = torch.matmul(left, right)\n",
         "if cached.data_ptr() == value.data_ptr():\n    replay_graph()\n",
         'PHASE = "correctness"\n# Verified manually with check.py.\n',
+        (
+            "# Never call os._exit(0) or inspect.currentframe().\n"
+            'WARNING = "sys._getframe is forbidden"\n'
+        ),
     ],
 )
-def test_clean_and_flag_only_sources_are_not_automatically_vetoed(
+def test_clean_inert_and_flag_only_sources_are_not_automatically_vetoed(
     tmp_path: Path,
     source_text: str,
 ) -> None:

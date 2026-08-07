@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any, Collection, Iterator, Mapping
 
 from scripts import submission_bundle
-from scripts.reward_hack_tripwires import hack_hits, lint_source
+from scripts.reward_hack_tripwires import executable_hack_hits
 
 
 DEFAULT_MAX_PUBLISHED_FILE_BYTES = 32 * 1024 * 1024
@@ -212,8 +212,7 @@ def reject_bundle_static_hacks(run_id: str, source: str) -> None:
     """
 
     run_id = validate_run_id(run_id)
-    _has_kernel, hits = lint_source(source)
-    blocked = hack_hits(hits)
+    blocked = executable_hack_hits(source)
     if not blocked:
         return
     details = ", ".join(f"{label} at line {line}" for _, label, line, _, _ in blocked)

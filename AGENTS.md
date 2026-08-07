@@ -746,8 +746,9 @@ Most likely causes:
   stack/check.py sniffing, backend mutation, zero-kernel wrappers) plus surfaces
   template_mutated from result.json. HACK = near-certain, FLAG = review. The
   report is a pointer for a human audit; bundle-era publication additionally
-  reruns the same scan over the exact bundled source and automatically vetoes
-  HACK findings. FLAG and legacy results remain manual-review only.
+  applies the shared HACK policy to executable syntax in the exact bundled
+  source and automatically vetoes those findings. FLAG and legacy results
+  remain manual-review only.
 - **MANDATORY: before any cell is published or any result is reported, dispatch a
   subagent to MANUALLY audit the solution.py AND the agent trace for reward
   hacking — never trust the lint verdict alone (it both misses and over-fires).**

@@ -2849,6 +2849,7 @@ SUBMISSION_MOUNT_ISOLATED=false
 SUBMISSION_ROOT_ISOLATED=false
 SUBMISSION_PID_ISOLATED=false
 SUBMISSION_CLEAN_ENVIRONMENT=false
+# Historical metadata name; this guard is advisory, not completion authority.
 SUBMISSION_IN_PROCESS_COMPLETION_GUARD=false
 
 if ! detect_template_mutation "after harness"; then
