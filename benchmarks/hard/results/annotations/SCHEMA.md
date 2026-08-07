@@ -20,6 +20,8 @@ problem: <problem dir name, e.g. 01_fp8_gemm>
 peak_fraction: <number, or null if not correct>
 
 verdict: <one of: clean | rubric_leak | reward_hack | interesting | bug>
+publish_grade: <true | false>
+board_eligible: <true | false; optional veto>
 
 summary: >
   One-paragraph plain-language description of what's happening in this run,
@@ -69,6 +71,11 @@ implication: >
 - `implication` is optional for `clean` verdicts; required for everything else.
 - One YAML document per run. To annotate multiple aspects of the same run,
   add multiple entries under `quotes`.
+- Bundle-era publication requires an exact `<run_id>.yaml` with `verdict:
+  clean` and the YAML boolean `publish_grade: true`. Quoted strings do not
+  count as booleans. `board_eligible: false` always vetoes publication. The
+  exact bundled `solution.py` must also pass the automatic high-confidence
+  `HACK` tripwire scan; annotations cannot override that source-code veto.
 
 ## Adding annotations
 

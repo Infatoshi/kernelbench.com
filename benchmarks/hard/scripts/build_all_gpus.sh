@@ -2,7 +2,15 @@
 # Build every per-GPU leaderboard from its isolated runs dir using KBH_RUNS_DIR.
 # Run from benchmarks/hard. Writes results/leaderboard[.<gpu>].json.
 # Pass a space-list of GPU keys to limit (default: all present).
-set -uo pipefail
+set -euo pipefail
+if [[ "${KBH_TRUST_ARCHIVE_LOCK_FD:-}" =~ ^[0-9]+$ ]] \
+  && [ "/dev/fd/$KBH_TRUST_ARCHIVE_LOCK_FD" -ef / ]; then
+  /usr/bin/flock -x -w 7200 "$KBH_TRUST_ARCHIVE_LOCK_FD" || exit 3
+else
+  exec {TRUST_PHASE_LOCK_FD}</
+  /usr/bin/flock -x -w 7200 "$TRUST_PHASE_LOCK_FD" || exit 3
+  export KBH_TRUST_ARCHIVE_LOCK_FD="$TRUST_PHASE_LOCK_FD"
+fi
 cd "$(cd "$(dirname "$0")/.." && pwd)"
 
 # gpu_key : KBH_HARDWARE : runs_dir : out_file
@@ -15,9 +23,11 @@ WANT="${*:-rtx h100 b200}"
 
 reshape() {  # $1 = out file
   uv run python - "$1" <<'PY'
-import json, sys
+import json, os, sys
+sys.path.insert(0, os.path.abspath("../.."))
+from scripts.published_submission import atomic_write_text, read_json_file
 out_file = sys.argv[1]
-v = json.load(open("results/leaderboard_v2.json"))
+v = read_json_file("results/leaderboard_v2.json")
 models = [{"label":m["label"],"harness":m["harness"],"model":m["model"],"effort":m["effort"],
           "results":m["results"],"pass_count":m["valid_pass_count"],"total_runs":m["total_problems"]}
          for m in v["models"]]
@@ -28,7 +38,7 @@ pp = {p:{"n_attempted":d["n_models"],"n_passed":d["n_valid_passes"],
 out = {"schema_version":1,"environment":"v2_containerized","hardware":v["hardware"],
        "problems":v["problems"],"models":models,"per_problem":pp,
        "generated_from_summary":{"input":"benchmarks/hard/outputs/runs","tag":"v2","imported_rows":len(models)}}
-json.dump(out, open(out_file,"w"), indent=2)
+atomic_write_text(out_file, json.dumps(out, indent=2) + "\n")
 print(f"  wrote {out_file} ({len(models)} models)")
 PY
 }
@@ -40,12 +50,13 @@ for row in "${ROWS[@]}"; do
     echo "[$key] no runs in $runs, skipping"; continue
   fi
   echo "[$key] build hw=$hw runs=$runs -> $out"
-  # The published-run curation manifest is RTX_PRO_6000-specific; the other GPU
-  # boards keep date-gated collection from their own runs dir. The rtx row uses
-  # the default manifest (results/published_runs.json); others disable it.
-  manifest_env=""
-  [ "$key" = "rtx" ] || manifest_env="KBH_PUBLISHED_MANIFEST="
-  env $manifest_env KBH_HARDWARE="$hw" KBH_RUNS_DIR="$runs" uv run python scripts/build_v2_leaderboard.py | tail -1
+  manifest="results/published_runs.json"
+  [ "$key" = "rtx" ] || manifest="results/published_runs.$key.json"
+  if [ ! -f "$manifest" ]; then
+    echo "[$key] missing required curation manifest: $manifest" >&2
+    exit 3
+  fi
+  env KBH_PUBLISHED_MANIFEST="$manifest" KBH_HARDWARE="$hw" KBH_RUNS_DIR="$runs" uv run python scripts/build_v2_leaderboard.py | tail -1
   reshape "$out"
 done
 

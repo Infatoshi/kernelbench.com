@@ -3,18 +3,28 @@
 # Run from benchmarks/cuda (or anywhere; paths resolve from script location).
 # Writes results/leaderboard.json (site data) and public/runs/*.html (viewers).
 set -euo pipefail
+if [[ "${KBH_TRUST_ARCHIVE_LOCK_FD:-}" =~ ^[0-9]+$ ]] \
+  && [ "/dev/fd/$KBH_TRUST_ARCHIVE_LOCK_FD" -ef / ]; then
+  /usr/bin/flock -x -w 7200 "$KBH_TRUST_ARCHIVE_LOCK_FD"
+else
+  exec {TRUST_PHASE_LOCK_FD}</
+  /usr/bin/flock -x -w 7200 "$TRUST_PHASE_LOCK_FD"
+  export KBH_TRUST_ARCHIVE_LOCK_FD="$TRUST_PHASE_LOCK_FD"
+fi
 HARD_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 REPO_ROOT="$(cd "$HARD_DIR/../.." && pwd)"
 cd "$HARD_DIR"
 
 echo "[1/3] rebuilding leaderboard_v2.json from archives..."
-uv run python scripts/build_v2_leaderboard.py | head -1
+uv run python scripts/build_v2_leaderboard.py | tail -1
 
 echo "[2/3] reshaping to site schema (results/leaderboard.json)..."
 uv run python - <<'PY'
+import os, sys
+sys.path.insert(0, os.path.abspath("../.."))
 import json
-from pathlib import Path
-v = json.load(open("results/leaderboard_v2.json"))
+from scripts.published_submission import atomic_write_text, read_json_file
+v = read_json_file("results/leaderboard_v2.json")
 models = [{"label":m["label"],"harness":m["harness"],"model":m["model"],"effort":m["effort"],
           "results":m["results"],"pass_count":m["valid_pass_count"],"total_runs":m["total_problems"]}
          for m in v["models"]]
@@ -25,73 +35,28 @@ pp = {p:{"n_attempted":d["n_models"],"n_passed":d["n_valid_passes"],
 out = {"schema_version":1,"environment":"v2_containerized","hardware":v["hardware"],
        "problems":v["problems"],"models":models,"per_problem":pp,
        "generated_from_summary":{"input":"benchmarks/cuda/outputs/runs","tag":"v2","imported_rows":len(models)}}
-json.dump(out, open("results/leaderboard.json","w"), indent=2)
+atomic_write_text("results/leaderboard.json", json.dumps(out, indent=2) + "\n")
 print(f"  wrote results/leaderboard.json ({len(models)} models)")
 PY
 
 echo "[3/3] emitting redacted solution files into public/runs (transcripts live on HuggingFace)..."
-mkdir -p "$REPO_ROOT/public/runs"
 PUB="$REPO_ROOT/public/runs" uv run python - <<'PY'
-import json, os, re, sys
-pub = os.environ["PUB"]
-# inline the kernel sidecars a thin-loader solution actually loads (nsa_kernel.cu
-# etc.) so the published artifact shows real kernel code, not Python glue.
-sys.path.insert(0, os.path.join(os.environ.get("REPO_ROOT", "../.."), "scripts"))
-from kernel_sidecars import augment
-rids = sorted({c["run_id"] for m in json.load(open("results/leaderboard.json"))["models"]
-               for c in m["results"].values() if c.get("run_id")})
-vals = []
-envf = os.path.expanduser("~/.env_vars")
-if os.path.exists(envf):
-    for ln in open(envf):
-        if "=" in ln and "export" in ln:
-            v = ln.split("=", 1)[1].strip().strip('"').strip("'")
-            if len(v) >= 12:
-                vals.append(v)
-vals = sorted(set(vals), key=len, reverse=True)
-pats = [re.compile(p) for p in [r"sk-ant-oat01-[A-Za-z0-9_\-]+", r"sk-proj-[A-Za-z0-9_\-]+",
-        r"AIzaSy[A-Za-z0-9_\-]{20,}", r"sk-[a-z]{2,}-[A-Za-z0-9_\-]{16,}", r"hf_[A-Za-z0-9]{20,}"]]
-def red(s):
-    for v in vals: s = s.replace(v, "REDACTED")
-    for p in pats: s = p.sub("REDACTED", s)
-    return s
-n = 0
-for rid in rids:
-    sp = f"outputs/runs/{rid}/solution.py"
-    if os.path.isfile(sp):
-        txt = augment(open(sp).read(), f"outputs/runs/{rid}")
-        open(f"{pub}/{rid}_solution.py.txt", "w").write(red(txt))
-        n += 1
-print(f"  wrote {n} solution files")
+import os, sys
+sys.path.insert(0, os.path.abspath("../.."))
+from scripts.published_submission import publish_selected_solutions
+
+count = publish_selected_solutions(
+    "results/leaderboard.json",
+    "outputs/runs",
+    os.environ["PUB"],
+)
+print(f"  wrote {count} solution files")
 PY
 
 # Per-GPU board solutions share the canonical emitter with Hard. It covers
 # CUDA H100/B200 and namespaces them under public/runs/<gpu>/.
 uv run python ../hard/scripts/emit_board_solutions.py
 
-echo "[3b/3] redacting secrets from viewers (agents can echo env keys)"
-# Build sed rules from every ~/.env_vars value + token prefixes. Never printed.
-SEDF=$(mktemp)
-# BSD sed (macOS) needs an explicit empty backup suffix for -i
-if sed --version >/dev/null 2>&1; then SED_INPLACE=(-i); else SED_INPLACE=(-i ''); fi
-if [ -f "$HOME/.env_vars" ]; then
-  while IFS= read -r line; do
-    val="${line#*=}"; val="${val%\"}"; val="${val#\"}"
-    [ ${#val} -ge 16 ] && printf 's|%s|REDACTED|g\n' "$(printf '%s' "$val" | sed 's/[&/\\|]/\\&/g')" >> "$SEDF"
-  done < <(grep -E "^(export )?[A-Z_]+=." "$HOME/.env_vars" | sed 's/^export //')
-fi
-cat >> "$SEDF" <<'PAT'
-s|sk-[A-Za-z0-9_-]\{20,\}|sk-REDACTED|g
-s|ghp_[A-Za-z0-9]\{30,\}|ghp_REDACTED|g
-s|github_pat_[A-Za-z0-9_]\{30,\}|github_pat_REDACTED|g
-s|hf_[A-Za-z0-9]\{30,\}|hf_REDACTED|g
-PAT
-# Legacy HTML viewers moved to HuggingFace; redact any that still exist locally.
-# RIDS may be unset (no local *.html viewers), so default to empty to stay set -u safe.
-for rid in ${RIDS:-}; do
-  [ -f "$REPO_ROOT/public/runs/$rid.html" ] && sed "${SED_INPLACE[@]}" -f "$SEDF" "$REPO_ROOT/public/runs/$rid.html"
-done
-rm -f "$SEDF"
-echo "  redacted secrets from viewers"
+echo "[3b/3] validating and redacting the complete publication tree"
 uv run python "$REPO_ROOT/scripts/redaction.py" "$REPO_ROOT/public/runs"
 echo "done. review, then: git push (or: kb deploy \"msg\")"

@@ -744,8 +744,10 @@ Most likely causes:
 - `kb lint <run_id|--all>` is a static reward-hack TRIPWIRE: scans solution.py
   for the patterns we have caught by hand (input-identity memoization,
   stack/check.py sniffing, backend mutation, zero-kernel wrappers) plus surfaces
-  template_mutated from result.json. HACK = near-certain, FLAG = review. It is a
-  pointer for a human audit, NOT an auto-reject. Run it before publishing.
+  template_mutated from result.json. HACK = near-certain, FLAG = review. The
+  report is a pointer for a human audit; bundle-era publication additionally
+  reruns the same scan over the exact bundled source and automatically vetoes
+  HACK findings. FLAG and legacy results remain manual-review only.
 - **MANDATORY: before any cell is published or any result is reported, dispatch a
   subagent to MANUALLY audit the solution.py AND the agent trace for reward
   hacking — never trust the lint verdict alone (it both misses and over-fires).**
@@ -763,7 +765,9 @@ Most likely causes:
   reads >>1.0 of roofline; a real kernel lands near its theoretical time); (4)
   confirm numeric stress actually ran (`check.py` unmodified, KBH_NUMERIC_STRESS
   not 0). Record the verdict + evidence in `results/annotations/<run_id>.yaml`
-  (clean | reward_hack | ...). Treat a lint HACK as "review," not "reject."
+  (clean | reward_hack | ...). If a HACK tripwire is a demonstrated false
+  positive, fix or downgrade the shared pattern with a regression; an
+  annotation cannot override the bundle-era publication veto.
 - `04_kahan_softmax` was removed from the hard deck (rewarded skipping Kahan); do not
   re-add. (This is also why the hard deck skips 04.)
 - **KernelBench-Multi (`benchmarks/multi/`, the WIP 4×H100 NVLink bench) runs on
