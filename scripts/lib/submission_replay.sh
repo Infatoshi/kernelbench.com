@@ -453,7 +453,7 @@ if [ -d /usr/lib64 ]; then
 fi
 "$mount_bin" --rbind /usr "$probe_root/usr"
 "$mount_attr_python" -c "$mount_attr_code" "$probe_root/usr"
-"$mount_bin" -t proc -o ro,nosuid,nodev,noexec proc "$probe_root/proc"
+"$mount_bin" -t proc -o rw,nosuid,nodev,noexec proc "$probe_root/proc"
 cd "$probe_root"
 "$pivot_root_bin" . .oldroot
 cd /
@@ -625,9 +625,9 @@ submission_build_isolated_command() {
     local stage_root="$1" project_root="$2" problem_dir="$3" template path
     local tree_real private_root
     local new_root python_root logical_python_root cuda_root cuda_real_root
-    local library_root library_real_root
+    local library_root library_real_root env_index current_env venv_bin path_updated
     local trusted_count tree_count etc_count device_count env_count
-    local -a templates=() trusted_paths=() readonly_trees=()
+    local -a templates=() trusted_paths=() readonly_trees=() clean_env_args=()
     local -a etc_paths=() device_paths=() command=()
     shift 3
     while [ "$#" -gt 0 ] && [ "$1" != "--" ]; do
@@ -833,11 +833,37 @@ PY
         fi
     done
 
+    # The replay interpreter and its installed tools are one trusted read-only
+    # tree. Expose that venv's bin directory only when it is also the selected
+    # executable; arbitrary isolated commands retain the system-only PATH.
+    clean_env_args=("${SUBMISSION_CLEAN_ENV_PREFIX[@]}")
+    venv_bin="$project_root/.venv/bin"
+    if [ "${command[0]}" = "$venv_bin/python" ]; then
+        case "$venv_bin" in
+            *:*) echo "replay venv path cannot contain ':'" >&2; return 1 ;;
+        esac
+        path_updated=0
+        for env_index in "${!clean_env_args[@]}"; do
+            current_env="${clean_env_args[$env_index]}"
+            case "$current_env" in
+                PATH=*)
+                    clean_env_args[$env_index]="PATH=$venv_bin:${current_env#PATH=}"
+                    path_updated=1
+                    break
+                    ;;
+            esac
+        done
+        [ "$path_updated" = 1 ] || {
+            echo "clean replay environment is missing PATH" >&2
+            return 1
+        }
+    fi
+
     trusted_count="${#trusted_paths[@]}"
     tree_count="${#readonly_trees[@]}"
     etc_count="${#etc_paths[@]}"
     device_count="${#device_paths[@]}"
-    env_count="${#SUBMISSION_CLEAN_ENV_PREFIX[@]}"
+    env_count="${#clean_env_args[@]}"
     SUBMISSION_ISOLATED_COMMAND=(
         "$SUBMISSION_UNSHARE_BIN"
         --user --map-root-user --mount --pid --fork --kill-child=KILL
@@ -948,7 +974,11 @@ for path in "${etc_paths[@]}"; do
 done
 "$mount_bin" --rbind /sys "$new_root/sys"
 "$mount_attr_python" -c "$mount_attr_code" "$new_root/sys"
-"$mount_bin" -t proc -o ro,nosuid,nodev,noexec proc "$new_root/proc"
+# CUDA names worker threads by opening /proc/self/task/<tid>/comm for writing;
+# a read-only procfs makes initialization fail with CUDA_ERROR_OPERATING_SYSTEM.
+# This fresh procfs exposes only the private PID namespace process tree, uses
+# noexec/nodev/nosuid, and the replay drops every capability before submission.
+"$mount_bin" -t proc -o rw,nosuid,nodev,noexec proc "$new_root/proc"
 "$mount_bin" -t tmpfs -o ro,nosuid,nodev,noexec,mode=0755,size=16m,nr_inodes=4096 \
     tmpfs "$new_root/run"
 "$mount_bin" -t tmpfs -o nosuid,nodev,mode=1777,size=1g,nr_inodes=131072 \
@@ -1017,7 +1047,7 @@ exec "$setpriv_bin" --nnp --bounding-set=-all --inh-caps=-all \
         "$trusted_count"
         "${trusted_paths[@]}" "$tree_count" "${readonly_trees[@]}"
         "$etc_count" "${etc_paths[@]}" "$device_count" "${device_paths[@]}"
-        "$env_count" "${SUBMISSION_CLEAN_ENV_PREFIX[@]}"
+        "$env_count" "${clean_env_args[@]}"
         -- "${command[@]}"
     )
 }

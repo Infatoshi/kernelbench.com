@@ -31,16 +31,26 @@ Replay fails closed unless util-linux `unshare` can create user, mount, PID,
 network, IPC, and UTS namespaces together and enter a private-root backend
 identified as `unshare-user-mount-pid-net-private-root-v1`. The runner builds an
 empty tmpfs root, mounts only `/usr`, minimal loader/NSS files, read-only sysfs,
-the selected GPU devices, the exact clean replay stage, CUDA/Python runtime
-roots, and pinned tools, then uses `pivot_root` and detaches the old host root.
-The root and trusted surfaces are read-only; only the replay stage, bounded
-private `/tmp`, and bounded private `/dev/shm` are writable. This prevents
+a fresh procfs, the individually allowlisted GPU/DRM character devices, the
+exact clean replay stage, CUDA/Python runtime roots, and pinned tools, then uses
+`pivot_root` and detaches the old host root. The synthetic `/dev` directory is
+recursively read-only, and the finite device nodes are read-only bind mounts;
+no host device directory is mounted.
+The fresh procfs is writable because CUDA names worker threads through writable
+`/proc/self/task/<tid>/comm`; a read-only procfs causes CUDA initialization
+error 304. It shows the private PID namespace, is mounted
+`nosuid,nodev,noexec`, and submission entry drops every capability.
+The root and trusted surfaces are read-only; writable storage is limited to the
+replay stage, bounded private `/tmp`, and bounded private `/dev/shm`. This prevents
 alternate hard links from recovering host Unix sockets and leaves unrelated
 archives, operator state, `/var`, and `/opt` absent. Replay also drops
 capabilities, closes inherited descriptors, bounds output size, fixes the
 hostname, and uses a clean `env -i` environment with a new HOME and empty
-private caches. Dependency sync completes before entry, and grading runs
-frozen/offline. Submission code still executes inside the checker process and
+private caches. When the selected executable is the trusted replay venv's
+Python, its read-only `.venv/bin` is prepended so pinned tools such as `ninja`
+remain available; other commands retain the system-only PATH. Dependency sync
+completes before entry, and grading runs frozen/offline. Submission code still
+executes inside the checker process and
 inherits its stdout/stderr descriptors, so neither the receipt nor captured
 log text proves the checker's internal control flow. A true completion
 authority would require a trusted coordinator that never imports submission
@@ -53,8 +63,9 @@ not files copied after executing the submission. `result.json` is the run's
 commit marker: it is fsynced and atomically replaced only after the bundle,
 logs, projections, cleanup, and venv stripping are complete. The
 `submission_replay` object records status, digest, fresh-extraction/cache flags,
-stage count, normal-return supervision, and the network/mount/PID/environment
-controls used for replay.
+stage count, the advisory `in_process_completion_guard` fact, and the
+network/mount/PID/environment controls used for replay. Provenance validation
+does not treat that advisory field as completion proof.
 
 Hard, CUDA, and Mini agent sessions themselves are container-only. Each run
 gets a private writable uv cache, and containers receive only the exact shared

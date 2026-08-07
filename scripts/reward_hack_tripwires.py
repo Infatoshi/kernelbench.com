@@ -8,6 +8,7 @@ code is safe.
 
 from __future__ import annotations
 
+import ast
 import re
 
 
@@ -105,9 +106,101 @@ def lint_source(source: str) -> tuple[bool, list[tuple[str, str, int, str, str]]
     return has_kernel, hits
 
 
-def hack_hits(
-    hits: list[tuple[str, str, int, str, str]],
-) -> list[tuple[str, str, int, str, str]]:
-    """Return only high-confidence hits that veto bundle-era publication."""
+def _qualified_name(node: ast.AST) -> str | None:
+    if isinstance(node, ast.Name):
+        return node.id
+    if isinstance(node, ast.Attribute):
+        prefix = _qualified_name(node.value)
+        if prefix is not None:
+            return f"{prefix}.{node.attr}"
+    return None
 
-    return [hit for hit in hits if hit[0] == "HACK"]
+
+def executable_hack_hits(source: str) -> list[tuple[str, str, int, str, str]]:
+    """Return high-confidence hits in executable Python syntax.
+
+    The CLI report intentionally greps comments and strings as audit clues.
+    An automatic veto must be narrower: mentioning ``os._exit`` in a warning
+    comment is not the same as calling it.  This AST pass implements the HACK
+    subset of ``PATTERNS`` without treating inert text as executable behavior.
+    """
+
+    try:
+        tree = ast.parse(source)
+    except (SyntaxError, ValueError):
+        # A scored Python solution should always parse. If it does not, retain
+        # the conservative raw HACK classification rather than fail open.
+        return [hit for hit in lint_source(source)[1] if hit[0] == "HACK"]
+
+    details = {label: (severity, why) for label, severity, _rx, why in PATTERNS}
+    found: dict[str, tuple[str, str, int, str, str]] = {}
+
+    def record(label: str, node: ast.AST) -> None:
+        if label in found:
+            return
+        severity, why = details[label]
+        if severity != "HACK":
+            return
+        snippet = ast.get_source_segment(source, node) or type(node).__name__
+        found[label] = (
+            severity,
+            label,
+            getattr(node, "lineno", 1),
+            snippet[:50],
+            why,
+        )
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call):
+            name = _qualified_name(node.func)
+            if name in {"inspect.stack", "sys._getframe", "traceback.extract_stack"}:
+                record("stack/env sniff", node)
+            if name == "inspect.currentframe":
+                record("frame-local grader control", node)
+            if name == "os._exit":
+                record("forced interpreter exit", node)
+            if name in {"sys.modules.pop", "sys.modules.clear"}:
+                record("module/builtins mutation", node)
+            if (
+                name == "getattr"
+                and len(node.args) >= 2
+                and isinstance(node.args[1], ast.Constant)
+                and node.args[1].value == "__globals__"
+            ):
+                record("function globals access", node)
+        if isinstance(node, ast.Attribute):
+            if node.attr in {"f_back", "f_globals", "f_locals"}:
+                record("frame-local grader control", node)
+            if node.attr == "__globals__":
+                record("function globals access", node)
+        if isinstance(node, (ast.Assign, ast.AnnAssign, ast.AugAssign, ast.Delete)):
+            targets: list[ast.AST]
+            if isinstance(node, ast.Assign):
+                targets = node.targets
+            elif isinstance(node, ast.Delete):
+                targets = node.targets
+            else:
+                targets = [node.target]
+            for target in targets:
+                name = _qualified_name(target)
+                subscript_root = (
+                    _qualified_name(target.value)
+                    if isinstance(target, ast.Subscript)
+                    else None
+                )
+                if subscript_root == "sys.modules" or (
+                    isinstance(node, ast.Delete)
+                    and name is not None
+                    and name.startswith("sys.modules")
+                ):
+                    record("module/builtins mutation", node)
+                if isinstance(target, ast.Attribute) and _qualified_name(
+                    target.value
+                ) in {"builtins", "__builtins__"}:
+                    record("module/builtins mutation", node)
+
+    return [
+        found[label]
+        for label, severity, _expression, _why in PATTERNS
+        if severity == "HACK" and label in found
+    ]

@@ -875,6 +875,26 @@ def test_publishable_replay_requires_every_isolation_control(
         _verify_archived_run(run, result)
 
 
+def test_in_process_completion_guard_is_advisory_metadata(tmp_path: Path) -> None:
+    run, result, manifest = _fresh_verified_run(tmp_path)
+    replay = result["submission_replay"]
+    assert isinstance(replay, dict)
+    replay["in_process_completion_guard"] = False
+
+    # Bundle provenance never promotes the same-interpreter receipt to a
+    # completion proof. Publication applies its independent annotation and
+    # static-HACK gates after this structural archive verification.
+    assert _verify_archived_run(run, result) == manifest
+
+    replay.pop("in_process_completion_guard")
+    assert _verify_archived_run(run, result) == manifest
+
+    regrade = _verified_regrade(manifest["bundle_sha256"])
+    regrade["in_process_completion_guard"] = False
+    result["regrade"] = regrade
+    assert _verify_archived_run(run, result) == manifest
+
+
 def test_publishable_replay_rejects_the_legacy_finite_mask_backend(
     tmp_path: Path,
 ) -> None:

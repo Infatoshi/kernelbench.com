@@ -358,6 +358,10 @@ absent /etc/environment
 absent /etc/hostname
 absent /etc/machine-id
 absent /dev/tty
+readonly_path /dev/kernelbench-unallowlisted
+exec 7<>/dev/null
+printf 'device-rw-probe' >&7
+exec 7>&-
 [ ! -S /run/docker.sock ]
 [ ! -S /var/run/docker.sock ]
 [ ! -S "${11}" ]
@@ -372,6 +376,9 @@ rm -f "${14}"
 [ "$UV_CACHE_DIR" = "$7" ]
 [ "$UV_LINK_MODE" = copy ]
 [ "$HOME" = "$8" ]
+case ":$PATH:" in
+    *":${3%/src/gate.py}/.venv/bin:"*) exit 34 ;;
+esac
 [ "$(ulimit -f)" = 131072 ]
 read -r self_pid _ < /proc/self/stat
 [ "$self_pid" = 1 ]
@@ -394,6 +401,11 @@ while IFS=: read -r interface _; do
 done < /proc/net/dev
 [ "$network_devices" -eq 1 ]
 [ "$(hostname)" = kernelbench-replay ]
+if [ "${16}" = 1 ]; then
+    [ -d /proc/driver/nvidia ]
+else
+    [ ! -e /proc/driver/nvidia ]
+fi
 
 compile_root="${2%/*}/compiler-probe"
 printf 'int main(void) { return 0; }\n' > "$compile_root.c"
@@ -403,20 +415,31 @@ rm -f "$compile_root" "$compile_root.c"
 
 stage_root="${2%/*}"
 root_readonly=0
+dev_root_readonly=0
+null_device_readonly=0
+private_proc_rw=0
 while read -r _ _ _ _ mountpoint options _; do
     case ",$options," in
         *,rw,*)
             case "$mountpoint" in
                 "$stage_root"|/tmp|/dev/shm) ;;
+                /proc)
+                    private_proc_rw=1
+                    ;;
                 *) echo "unexpected rw mount: $mountpoint"; exit 33 ;;
             esac
             ;;
         *,ro,*)
             [ "$mountpoint" != / ] || root_readonly=1
+            [ "$mountpoint" != /dev ] || dev_root_readonly=1
+            [ "$mountpoint" != /dev/null ] || null_device_readonly=1
             ;;
     esac
 done < /proc/self/mountinfo
 [ "$root_readonly" -eq 1 ]
+[ "$dev_root_readonly" -eq 1 ]
+[ "$null_device_readonly" -eq 1 ]
+[ "$private_proc_rw" -eq 1 ]
 printf 'sandbox-ok\n'
 """
     driver = r"""
@@ -431,7 +454,7 @@ submission_build_isolated_command \
     "$3" "$4" "$5" check.py -- \
     "$6" -c "$7" kernelbench-candidate \
     "$8" "$9" "${10}" "${11}" "${12}" "${13}" "${14}" "${15}" "${16}" \
-    "${17}" "${18}" "${19}" "${20}" "${21}" "${22}"
+    "${17}" "${18}" "${19}" "${20}" "${21}" "${22}" "${23}"
 "${SUBMISSION_ISOLATED_COMMAND[@]}" > "${13}" 2>&1
 """
     try:
@@ -459,6 +482,7 @@ submission_build_isolated_command \
             str(home_socket),
             str(host_shm),
             str(socket_alias),
+            "1" if Path("/proc/driver/nvidia").is_dir() else "0",
         )
     finally:
         host_shm_contents = host_shm.read_text()
@@ -504,12 +528,31 @@ def test_namespace_replay_mounts_the_managed_python_runtime(
         capture_output=True,
         text=True,
     )
+    trusted_tool = project / ".venv/bin/replay-trusted-tool"
+    trusted_tool.write_text("#!/bin/sh\nexit 0\n")
+    trusted_tool.chmod(0o755)
     output = stage / "python-runtime.json"
     (problem / "check.py").write_text(
-        "import json, pathlib, socket, ssl, sys\n"
+        "import json, os, pathlib, shutil, socket, ssl, sys, threading\n"
         "assert socket.getaddrinfo('localhost', 0)\n"
+        "thread_errors = []\n"
+        "def rename_native_thread():\n"
+        "    try:\n"
+        "        comm = pathlib.Path(f'/proc/self/task/{threading.get_native_id()}/comm')\n"
+        "        comm.write_text('kb-replay\\n')\n"
+        "        assert comm.read_text().strip() == 'kb-replay'\n"
+        "    except BaseException as exc:\n"
+        "        thread_errors.append(exc)\n"
+        "thread = threading.Thread(target=rename_native_thread)\n"
+        "thread.start()\n"
+        "thread.join()\n"
+        "assert not thread_errors, thread_errors\n"
+        "tool = pathlib.Path(sys.argv[2])\n"
+        "assert os.environ['PATH'].split(':', 1)[0] == str(tool.parent)\n"
+        "assert pathlib.Path(shutil.which(tool.name)).samefile(tool)\n"
         "pathlib.Path(sys.argv[1]).write_text(json.dumps({\n"
         "    'base_prefix': sys.base_prefix, 'ssl': ssl.OPENSSL_VERSION,\n"
+        "    'path': os.environ['PATH'],\n"
         "}))\n"
     )
     driver = r"""
@@ -521,7 +564,7 @@ submission_configure_isolation "$1" "$2"
 submission_reset_caches "$3/cache"
 submission_select_clean_environment "$3/home"
 submission_build_isolated_command "$3" "$4" "$5" check.py -- \
-    "$4/.venv/bin/python" -P "$SUBMISSION_TRUSTED_STAGE_TOOL" check.py "$7"
+    "$4/.venv/bin/python" -P "$SUBMISSION_TRUSTED_STAGE_TOOL" check.py "$7" "$8"
 "${SUBMISSION_ISOLATED_COMMAND[@]}"
 """
     result = _bash(
@@ -533,6 +576,7 @@ submission_build_isolated_command "$3" "$4" "$5" check.py -- \
         str(problem),
         str(managed_python),
         str(output),
+        str(trusted_tool),
     )
     if result.returncode == 77:
         pytest.skip("combined user/mount/PID/network namespaces unavailable")
@@ -540,6 +584,7 @@ submission_build_isolated_command "$3" "$4" "$5" check.py -- \
     runtime = json.loads(output.read_text())
     assert Path(runtime["base_prefix"]).resolve() == managed_python.parent.parent
     assert runtime["ssl"]
+    assert runtime["path"].split(":", 1)[0] == str(project / ".venv/bin")
 
 
 def test_namespace_selection_fails_closed_when_full_stack_is_unavailable() -> None:
@@ -668,6 +713,11 @@ def test_shared_regraders_use_full_namespace_but_mega_remains_unchanged() -> Non
 
 def test_isolation_helper_bounds_output_and_uses_private_uv_cache() -> None:
     text = HELPER.read_text()
+    device_block = text[
+        text.index('for path in "${device_paths[@]}"; do') : text.index(
+            'tmpfs "$new_root/dev/shm"'
+        )
+    ]
     assert "ulimit -f 131072" in text
     assert 'export UV_CACHE_DIR="$cache_root/uv"' in text
     assert 'export UV_LINK_MODE="copy"' in text
@@ -677,6 +727,11 @@ def test_isolation_helper_bounds_output_and_uses_private_uv_cache() -> None:
     assert '"$pivot_root_bin" . .oldroot' in text
     assert '"$umount_bin" -l /.oldroot' in text
     assert '"$mount_attr_python" -c "$mount_attr_code" / single' in text
+    assert text.count('-t proc -o rw,nosuid,nodev,noexec proc') == 2
+    assert '-t proc -o ro,nosuid,nodev,noexec proc' not in text
+    assert 'remount,bind,ro "$target"' in device_block
+    assert '"$mount_attr_python" -c "$mount_attr_code" "$new_root/dev"' in device_block
+    assert 'remount,bind,rw' not in device_block
     assert "/var/snap/lxd/common/lxd" not in text
     assert "size=4g,nr_inodes=262144" in text
 
