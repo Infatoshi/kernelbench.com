@@ -19,6 +19,29 @@
 
 set -euo pipefail
 
+KBH_AGENT_CONTAINER="${KBH_AGENT_CONTAINER:-1}"
+if [ "$KBH_AGENT_CONTAINER" != "1" ]; then
+    echo "STOP: shared single-GPU harnesses require KBH_AGENT_CONTAINER=1" >&2
+    exit 3
+fi
+
+# Coordinate every shared single-GPU harness before reading repository-owned
+# helpers. Container agents may overlap under shared locks because their host
+# mounts are restricted to their own archive/workspace. Locking the stable
+# root-directory inode avoids an attacker replacing a user-owned lock file.
+# Always allocate the descriptor here; a caller-supplied FD must never bypass
+# acquisition. It is closed in the agent subprocess below.
+TRUST_FLOCK_BIN="/usr/bin/flock"
+[ -x "$TRUST_FLOCK_BIN" ] || {
+    echo "STOP: trusted cross-run flock is unavailable" >&2
+    exit 3
+}
+exec {TRUST_PHASE_LOCK_FD}</
+"$TRUST_FLOCK_BIN" -s -w 7200 "$TRUST_PHASE_LOCK_FD"
+
+# shellcheck source=scripts/lib/submission_replay.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/submission_replay.sh"
+
 # Pin CUDA 13 — /usr/local/cuda may still point at 12.8. Override the pinned
 # toolkit dir on other machines with KBH_CUDA_HOME (default /usr/local/cuda-13).
 KBH_CUDA_HOME="${KBH_CUDA_HOME:-/usr/local/cuda-13}"
@@ -48,7 +71,16 @@ MODEL="${2:?model required}"
 SOURCE_PROBLEM_DIR="${3:?problem_dir required}"
 REASONING_EFFORT="${4:-}"
 CLAUDE_KBH_SETTINGS="${CLAUDE_KBH_SETTINGS:-{\"fastMode\":false,\"alwaysThinkingEnabled\":true}}"
-KBH_AGENT_CONTAINER="${KBH_AGENT_CONTAINER:-0}"
+case "$HARNESS" in
+    ccr-claude|kimi|lfm-opencode|lfm-claude|lfm-grok|hermes|pi|nvcf-nemotron)
+        echo "STOP: harness '$HARNESS' has no isolated container implementation" >&2
+        exit 3
+        ;;
+esac
+if [ -n "${KBH_OR_PROVIDER:-}" ]; then
+    echo "STOP: KBH_OR_PROVIDER has no isolated container proxy route" >&2
+    exit 3
+fi
 KBH_AGENT_CONTAINER_IMAGE="${KBH_AGENT_CONTAINER_IMAGE:-nvcr.io/nvidia/tensorrt-llm/release:1.2.1}"
 KBH_AGENT_CONTAINER_NETWORK="${KBH_AGENT_CONTAINER_NETWORK:-bridge}"
 KBH_AGENT_CONTAINER_CUDA_HOME="${KBH_AGENT_CONTAINER_CUDA_HOME:-/usr/local/cuda-13.2}"
@@ -64,9 +96,6 @@ KBH_AGENT_CONTAINER_GEMINI_DIR="${KBH_AGENT_CONTAINER_GEMINI_DIR:-/usr/lib/node_
 REPO_ROOT="${KB_BENCH_DIR:?run via a bench wrapper (benchmarks/<bench>/scripts/run_hard.sh), not directly}"
 SOURCE_PROBLEM_DIR="$(cd "$SOURCE_PROBLEM_DIR" && pwd)"
 
-# Shared across container runs so the workspace uv env (same uv.lock as host
-# scoring) does not re-download wheels or managed pythons every run.
-KBH_AGENT_CONTAINER_UV_CACHE="${KBH_AGENT_CONTAINER_UV_CACHE:-$REPO_ROOT/outputs/container_uv_cache}"
 # Pre-warmed opencode home (clean, migrated sqlite DB, no host session data).
 # Built once via scripts/warm_opencode_home.sh; copied into each run's
 # agent_home so opencode does not redo its DB migration inside the budget.
@@ -95,6 +124,10 @@ if [ -z "$RUN_DIR" ]; then
 fi
 RUN_ID="$(basename "$RUN_DIR")"
 RUN_GROUP="${KBH_RUN_GROUP:-}"
+# A writable cross-run package cache lets one agent poison another agent's
+# Python/runtime inputs. Keep all uv downloads and managed Pythons in this
+# disposable archive instead. Official scoring uses separate fresh caches.
+AGENT_CONTAINER_UV_CACHE="$RUN_DIR/container_uv_cache"
 NVCF_PROXY_PID=""
 NVCF_PROXY_BASE_URL=""
 OR_PROVIDER_PROXY_PID=""
@@ -203,18 +236,12 @@ scoring environment. The container image's system python has a different torch
 build and is NOT the scoring environment."
 fi
 
-# check.py and benchmark.py derive REPO_ROOT as parents[2]. Keep that shape,
-# but always copy src/: a writable symlink lets host-mode candidates modify the
-# trusted checker helpers in the source checkout. Project metadata remains a
-# disposable copy so agents may iterate on dependencies inside their archive.
-strip_python_bytecode() {
-    /usr/bin/find "$1" -type d -name __pycache__ -prune \
-        -exec /bin/rm -rf -- {} +
-    /usr/bin/find "$1" -type f \( -name '*.pyc' -o -name '*.pyo' \) -delete
-}
-
+# check.py and benchmark.py derive REPO_ROOT as parents[2]. Keep that shape
+# while sharing src/. Copy project metadata so agents can mutate dependencies
+# inside their disposable workspace without touching the source repo.
+# The agent always receives an archive-local copy.  A host-mode symlink let an
+# agent poison the canonical src tree that later replays treated as trusted.
 cp -a "$REPO_ROOT/src" "$WORKSPACE_ROOT/src"
-strip_python_bytecode "$WORKSPACE_ROOT/src"
 cp -p "$REPO_ROOT/pyproject.toml" "$WORKSPACE_ROOT/pyproject.toml"
 cp -p "$REPO_ROOT/uv.lock" "$WORKSPACE_ROOT/uv.lock"
 if [ -e "$REPO_ROOT/.python-version" ]; then
@@ -241,13 +268,55 @@ if ! command -v uv >/dev/null 2>&1; then
     exit 3
 fi
 REAL_UV="$(command -v uv)"
-REAL_PYTHON="$(command -v python3 || command -v python)"
+BOOTSTRAP_PYTHON="/usr/bin/python3"
+[ -x "$BOOTSTRAP_PYTHON" ] || {
+    echo "STOP: trusted bootstrap Python is unavailable: $BOOTSTRAP_PYTHON" >&2
+    exit 3
+}
 REAL_NVIDIA_SMI="$(command -v nvidia-smi || true)"
 REAL_NCU="$(command -v ncu || true)"
 REAL_NSYS="$(command -v nsys || true)"
 REAL_NVCC="$(command -v nvcc || true)"
 REAL_DOCKER="$(command -v docker || true)"
 REAL_TIMEOUT="$(command -v timeout)"
+REAL_FLOCK="$(command -v flock)"
+export SUBMISSION_BUNDLE_PYTHON="$BOOTSTRAP_PYTHON"
+if ! submission_bind_bundle_tool; then
+    echo "STOP: could not bind the immutable submission bundle helper" >&2
+    exit 3
+fi
+if ! submission_bind_trusted_stage_tool; then
+    echo "STOP: could not bind the trusted stage supervisor" >&2
+    exit 3
+fi
+if ! REAL_UV_IDENTITY="$(submission_executable_identity "$REAL_UV")"; then
+    echo "STOP: could not bind the resolved uv executable identity" >&2
+    exit 3
+fi
+if ! REAL_PYTHON="$("$REAL_UV" python find --project "$REPO_ROOT")"; then
+    echo "STOP: uv could not resolve the benchmark Python interpreter" >&2
+    exit 3
+fi
+if ! REAL_PYTHON_IDENTITY="$(submission_executable_identity "$REAL_PYTHON")"; then
+    echo "STOP: could not bind the resolved Python executable identity" >&2
+    exit 3
+fi
+if ! REAL_TIMEOUT_IDENTITY="$(submission_executable_identity "$REAL_TIMEOUT")" \
+    || ! REAL_FLOCK_IDENTITY="$(submission_executable_identity "$REAL_FLOCK")"; then
+    echo "STOP: could not bind timeout/flock executable identities" >&2
+    exit 3
+fi
+if ! submission_add_isolation_readonly_executable \
+    "$REAL_UV" "$REAL_PYTHON" "$REAL_TIMEOUT" "$REAL_FLOCK"; then
+    echo "STOP: could not protect resolved uv/Python executables" >&2
+    exit 3
+fi
+if submission_resolve_isolation_tools; then
+    if ! submission_configure_isolation "$RUN_DIR"; then
+        SUBMISSION_ISOLATION_AVAILABLE=0
+        SUBMISSION_NETWORK_MODE="unavailable"
+    fi
+fi
 REAL_UV_FALLBACK="$REAL_UV"
 REAL_PYTHON_FALLBACK="$REAL_PYTHON"
 LOCK_WRAPPER_DIR="$RUN_DIR/bin"
@@ -260,7 +329,51 @@ mkdir -p "$LOCK_WRAPPER_DIR" "$RUN_DIR/cache/torch_extensions" \
 KBH_GPU_LOCK_DIR="${KBH_GPU_LOCK_DIR:-$REPO_ROOT/outputs/gpu_lock}"
 mkdir -p "$KBH_GPU_LOCK_DIR"
 export KBH_GPU_LOCK="${KBH_GPU_LOCK:-$KBH_GPU_LOCK_DIR/gpu.lock}"
+case "$KBH_GPU_LOCK" in
+    /*) ;;
+    *) echo "STOP: KBH_GPU_LOCK must be an absolute path" >&2; exit 3 ;;
+esac
+if ! "$BOOTSTRAP_PYTHON" - "$KBH_GPU_LOCK" <<'PY'
+import os
+import stat
+import sys
+
+path = os.path.abspath(sys.argv[1])
+parent, name = os.path.split(path)
+if not name or name in {".", ".."} or os.path.realpath(parent) != parent:
+    raise SystemExit("unsafe GPU lock path")
+parent_fd = os.open(
+    parent,
+    os.O_RDONLY
+    | getattr(os, "O_DIRECTORY", 0)
+    | getattr(os, "O_NOFOLLOW", 0)
+    | getattr(os, "O_CLOEXEC", 0),
+)
+try:
+    fd = os.open(
+        name,
+        os.O_RDWR
+        | os.O_CREAT
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_CLOEXEC", 0),
+        0o600,
+        dir_fd=parent_fd,
+    )
+    try:
+        metadata = os.fstat(fd)
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+            raise SystemExit("GPU lock must be one regular, unlinked inode")
+    finally:
+        os.close(fd)
+finally:
+    os.close(parent_fd)
+PY
+then
+    echo "STOP: unsafe GPU lock file: $KBH_GPU_LOCK" >&2
+    exit 3
+fi
 export KBH_GPU_LOCK_LOG="$RUN_DIR/gpu_lock.log"
+export KBH_GPU_LOCK_OWNER_FILE="$RUN_DIR/gpu_lock.owner"
 export TORCH_EXTENSIONS_DIR="$RUN_DIR/cache/torch_extensions"
 export TRITON_CACHE_DIR="$RUN_DIR/cache/triton"
 export CUDA_CACHE_PATH="$RUN_DIR/cache/cuda"
@@ -298,7 +411,7 @@ fi
 if [ "${KBH_GPU_LOCK_HELD:-0}" = "1" ]; then
     exec "$real" "$@"
 fi
-owner_file="${KBH_GPU_LOCK}.owner"
+owner_file="${KBH_GPU_LOCK_OWNER_FILE:-${KBH_GPU_LOCK}.owner}"
 if [ -f "$owner_file" ]; then
     IFS=$'\t' read -r owner_pid owner_run_dir < "$owner_file" || true
     if [ "${owner_run_dir:-}" = "${RUN_DIR:-}" ] && kill -0 "${owner_pid:-}" 2>/dev/null; then
@@ -407,9 +520,78 @@ fi
 run_gpu_locked_timeout() {
     local lock_name="$1"
     local timeout_seconds="$2"
+    local owner_file owner_pid owner_run_dir lock_wait_timeout start status
+    local -a timed_command
     shift 2
-    "$RUN_DIR/bin/gpu-lock-exec" "$lock_name" "$REAL_TIMEOUT" \
-        --kill-after="${KBH_TIMEOUT_KILL_AFTER_SECONDS:-30}s" "${timeout_seconds}s" "$@"
+    if ! submission_executable_matches "$REAL_TIMEOUT" "$REAL_TIMEOUT_IDENTITY" \
+        || ! submission_executable_matches "$REAL_FLOCK" "$REAL_FLOCK_IDENTITY"; then
+        echo "trusted timeout/flock executable changed; refusing $lock_name" >&2
+        return 125
+    fi
+    timed_command=(
+        "$REAL_TIMEOUT" --kill-after="${KBH_TIMEOUT_KILL_AFTER_SECONDS:-30}s"
+        "${timeout_seconds}s" "$@"
+    )
+    if [ "${KBH_GPU_LOCK_HELD:-0}" = "1" ]; then
+        "${timed_command[@]}"
+        return
+    fi
+
+    owner_file="${KBH_GPU_LOCK_OWNER_FILE:-${KBH_GPU_LOCK}.owner}"
+    if [ -f "$owner_file" ]; then
+        IFS=$'\t' read -r owner_pid owner_run_dir < "$owner_file" || true
+        if [ "${owner_run_dir:-}" = "${RUN_DIR:-}" ] \
+            && kill -0 "${owner_pid:-}" 2>/dev/null; then
+            "${timed_command[@]}"
+            return
+        fi
+    fi
+
+    # Keep the trusted lock implementation in this parent shell.  The agent's
+    # PATH wrappers live in its writable archive and are intentionally usable
+    # during the session, but must never launch post-agent scoring.
+    (
+        exec 3>>"$KBH_GPU_LOCK_LOG" 9>"$KBH_GPU_LOCK"
+        printf '%s wait pid=%s cmd=%s args=%q\n' \
+            "$(date -Is)" "$BASHPID" "$lock_name" "${timed_command[*]}" >&3
+        lock_wait_timeout="${KBH_GPU_LOCK_WAIT_TIMEOUT_SECONDS:-}"
+        if [ -n "$lock_wait_timeout" ] && [ "$lock_wait_timeout" != "0" ]; then
+            if ! "$REAL_FLOCK" -x -w "$lock_wait_timeout" 9; then
+                printf '%s lock_timeout pid=%s cmd=%s wait_timeout_s=%s\n' \
+                    "$(date -Is)" "$BASHPID" "$lock_name" "$lock_wait_timeout" >&3
+                exit 124
+            fi
+        else
+            until "$REAL_FLOCK" -x -w 5 9; do
+                if [ -f "$owner_file" ]; then
+                    IFS=$'\t' read -r owner_pid owner_run_dir \
+                        < "$owner_file" || true
+                    if [ "${owner_run_dir:-}" = "${RUN_DIR:-}" ] \
+                        && kill -0 "${owner_pid:-}" 2>/dev/null; then
+                        "${timed_command[@]}" 3>&- 9>&-
+                        exit $?
+                    fi
+                fi
+            done
+        fi
+        start="$(date +%s)"
+        printf '%s\t%s\n' "$BASHPID" "${RUN_DIR:-}" > "$owner_file"
+        printf '%s start pid=%s cmd=%s\n' \
+            "$(date -Is)" "$BASHPID" "$lock_name" >&3
+        set +e
+        KBH_GPU_LOCK_HELD=1 "${timed_command[@]}" 3>&- 9>&-
+        status=$?
+        set -e
+        if [ -f "$owner_file" ] \
+            && IFS=$'\t' read -r owner_pid _ < "$owner_file" \
+            && [ "$owner_pid" = "$BASHPID" ]; then
+            rm -f "$owner_file"
+        fi
+        printf '%s end pid=%s cmd=%s status=%s elapsed_s=%s\n' \
+            "$(date -Is)" "$BASHPID" "$lock_name" "$status" \
+            "$(($(date +%s) - start))" >&3
+        exit "$status"
+    )
 }
 
 run_docker_locked_timeout() {
@@ -852,7 +1034,7 @@ check_container_basics() {
         echo "uv binary missing for container mode: $REAL_UV" >&2
         return 127
     fi
-    mkdir -p "$KBH_AGENT_CONTAINER_UV_CACHE"
+    mkdir -p "$AGENT_CONTAINER_UV_CACHE"
 }
 
 run_claude_container() {
@@ -902,7 +1084,8 @@ run_claude_container() {
         -e UV_CACHE_DIR=/uv-cache
         -e UV_PYTHON_INSTALL_DIR=/uv-cache/python
         -e RUN_DIR=/kbh
-        -e KBH_GPU_LOCK=/kbh/lock/gpu.lock
+        -e KBH_GPU_LOCK=/kbh/gpu.lock
+        -e KBH_GPU_LOCK_OWNER_FILE=/home/agent/gpu_lock.owner
         -e KBH_GPU_LOCK_LOG=/home/agent/gpu_lock_container.log
         -e PATH=/kbh/bin:/usr/local/cuda-host/bin:/usr/local/bin:/usr/bin:/bin
         -v "$WORKSPACE_ROOT:/workspace:rw"
@@ -910,9 +1093,9 @@ run_claude_container() {
         -v "$KBH_AGENT_CONTAINER_CUDA_HOME:/usr/local/cuda-host:ro"
         -v "$KBH_AGENT_CONTAINER_CLAUDE_BIN:/usr/local/bin/claude:ro"
         -v "$REAL_UV:/usr/local/bin/uv:ro"
-        -v "$KBH_AGENT_CONTAINER_UV_CACHE:/uv-cache:rw"
+        -v "$AGENT_CONTAINER_UV_CACHE:/uv-cache:rw"
         -v "$CONTAINER_LOCK_BIN:/kbh/bin:ro"
-        -v "$KBH_GPU_LOCK_DIR:/kbh/lock:rw"
+        -v "$KBH_GPU_LOCK:/kbh/gpu.lock:rw"
         -w "/workspace/problems/$PROBLEM_NAME"
         "$KBH_AGENT_CONTAINER_IMAGE"
         claude
@@ -963,7 +1146,8 @@ run_codex_container() {
         -e UV_CACHE_DIR=/uv-cache
         -e UV_PYTHON_INSTALL_DIR=/uv-cache/python
         -e RUN_DIR=/kbh
-        -e KBH_GPU_LOCK=/kbh/lock/gpu.lock
+        -e KBH_GPU_LOCK=/kbh/gpu.lock
+        -e KBH_GPU_LOCK_OWNER_FILE=/home/agent/gpu_lock.owner
         -e KBH_GPU_LOCK_LOG=/home/agent/gpu_lock_container.log
         -e PATH=/kbh/bin:/usr/local/cuda-host/bin:/opt/node/bin:/usr/local/bin:/usr/bin:/bin
         -v "$WORKSPACE_ROOT:/workspace:rw"
@@ -971,9 +1155,9 @@ run_codex_container() {
         -v "$KBH_AGENT_CONTAINER_CUDA_HOME:/usr/local/cuda-host:ro"
         -v "$KBH_AGENT_CONTAINER_CODEX_NODE:/opt/node:ro"
         -v "$REAL_UV:/usr/local/bin/uv:ro"
-        -v "$KBH_AGENT_CONTAINER_UV_CACHE:/uv-cache:rw"
+        -v "$AGENT_CONTAINER_UV_CACHE:/uv-cache:rw"
         -v "$CONTAINER_LOCK_BIN:/kbh/bin:ro"
-        -v "$KBH_GPU_LOCK_DIR:/kbh/lock:rw"
+        -v "$KBH_GPU_LOCK:/kbh/gpu.lock:rw"
         -w "/workspace/problems/$PROBLEM_NAME"
         "$KBH_AGENT_CONTAINER_IMAGE"
         /opt/node/bin/codex
@@ -1023,7 +1207,8 @@ run_opencode_container() {
         -e UV_CACHE_DIR=/uv-cache
         -e UV_PYTHON_INSTALL_DIR=/uv-cache/python
         -e RUN_DIR=/kbh
-        -e KBH_GPU_LOCK=/kbh/lock/gpu.lock
+        -e KBH_GPU_LOCK=/kbh/gpu.lock
+        -e KBH_GPU_LOCK_OWNER_FILE=/home/agent/gpu_lock.owner
         -e KBH_GPU_LOCK_LOG=/home/agent/gpu_lock_container.log
         -e PATH=/kbh/bin:/usr/local/cuda-host/bin:/usr/local/bin:/usr/bin:/bin
         -v "$WORKSPACE_ROOT:/workspace:rw"
@@ -1031,9 +1216,9 @@ run_opencode_container() {
         -v "$KBH_AGENT_CONTAINER_CUDA_HOME:/usr/local/cuda-host:ro"
         -v "$KBH_AGENT_CONTAINER_OPENCODE_BIN:/usr/local/bin/opencode:ro"
         -v "$REAL_UV:/usr/local/bin/uv:ro"
-        -v "$KBH_AGENT_CONTAINER_UV_CACHE:/uv-cache:rw"
+        -v "$AGENT_CONTAINER_UV_CACHE:/uv-cache:rw"
         -v "$CONTAINER_LOCK_BIN:/kbh/bin:ro"
-        -v "$KBH_GPU_LOCK_DIR:/kbh/lock:rw"
+        -v "$KBH_GPU_LOCK:/kbh/gpu.lock:rw"
         -w "/workspace/problems/$PROBLEM_NAME"
         "$KBH_AGENT_CONTAINER_IMAGE"
         opencode
@@ -1106,11 +1291,21 @@ run_droid_container() {
         -e FACTORY_API_KEY
         -e DROID_API_KEY
         -e CUDA_HOME=/usr/local/cuda-host
+        -e UV_CACHE_DIR=/uv-cache
+        -e UV_PYTHON_INSTALL_DIR=/uv-cache/python
+        -e RUN_DIR=/kbh
+        -e KBH_GPU_LOCK=/kbh/gpu.lock
+        -e KBH_GPU_LOCK_OWNER_FILE=/home/agent/gpu_lock.owner
+        -e KBH_GPU_LOCK_LOG=/home/agent/gpu_lock_container.log
         -e PATH=/kbh/bin:/usr/local/cuda-host/bin:/usr/local/bin:/usr/bin:/bin
         -v "$WORKSPACE_ROOT:/workspace:rw"
         -v "$agent_home:/home/agent:rw"
         -v "$KBH_AGENT_CONTAINER_CUDA_HOME:/usr/local/cuda-host:ro"
         -v "$KBH_AGENT_CONTAINER_DROID_BIN:/usr/local/bin/droid:ro"
+        -v "$REAL_UV:/usr/local/bin/uv:ro"
+        -v "$AGENT_CONTAINER_UV_CACHE:/uv-cache:rw"
+        -v "$CONTAINER_LOCK_BIN:/kbh/bin:ro"
+        -v "$KBH_GPU_LOCK:/kbh/gpu.lock:rw"
         -w "/workspace/problems/$PROBLEM_NAME"
         "$KBH_AGENT_CONTAINER_IMAGE"
         droid
@@ -1174,7 +1369,8 @@ run_grok_container() {
         -e UV_CACHE_DIR=/uv-cache
         -e UV_PYTHON_INSTALL_DIR=/uv-cache/python
         -e RUN_DIR=/kbh
-        -e KBH_GPU_LOCK=/kbh/lock/gpu.lock
+        -e KBH_GPU_LOCK=/kbh/gpu.lock
+        -e KBH_GPU_LOCK_OWNER_FILE=/home/agent/gpu_lock.owner
         -e KBH_GPU_LOCK_LOG=/home/agent/gpu_lock_container.log
         -e PATH=/kbh/bin:/usr/local/cuda-host/bin:/opt/node/bin:/usr/local/bin:/usr/bin:/bin
         -v "$WORKSPACE_ROOT:/workspace:rw"
@@ -1184,9 +1380,9 @@ run_grok_container() {
         -v "$grok_bin:/opt/grok/bin/grok:ro"
         -v "$KBH_AGENT_CONTAINER_GROK_DIR/bundled:/opt/grok/bundled:ro"
         -v "$REAL_UV:/usr/local/bin/uv:ro"
-        -v "$KBH_AGENT_CONTAINER_UV_CACHE:/uv-cache:rw"
+        -v "$AGENT_CONTAINER_UV_CACHE:/uv-cache:rw"
         -v "$CONTAINER_LOCK_BIN:/kbh/bin:ro"
-        -v "$KBH_GPU_LOCK_DIR:/kbh/lock:rw"
+        -v "$KBH_GPU_LOCK:/kbh/gpu.lock:rw"
         -w "/workspace/problems/$PROBLEM_NAME"
         "$KBH_AGENT_CONTAINER_IMAGE"
         /opt/grok/bin/grok
@@ -1230,7 +1426,8 @@ run_gemini_container() {
         -e UV_CACHE_DIR=/uv-cache
         -e UV_PYTHON_INSTALL_DIR=/uv-cache/python
         -e RUN_DIR=/kbh
-        -e KBH_GPU_LOCK=/kbh/lock/gpu.lock
+        -e KBH_GPU_LOCK=/kbh/gpu.lock
+        -e KBH_GPU_LOCK_OWNER_FILE=/home/agent/gpu_lock.owner
         -e KBH_GPU_LOCK_LOG=/home/agent/gpu_lock_container.log
         -e PATH=/kbh/bin:/usr/local/cuda-host/bin:/opt/node/bin:/usr/local/bin:/usr/bin:/bin
         -v "$WORKSPACE_ROOT:/workspace:rw"
@@ -1239,9 +1436,9 @@ run_gemini_container() {
         -v "$KBH_AGENT_CONTAINER_CODEX_NODE:/opt/node:ro"
         -v "$KBH_AGENT_CONTAINER_GEMINI_DIR:/opt/gemini-cli:ro"
         -v "$REAL_UV:/usr/local/bin/uv:ro"
-        -v "$KBH_AGENT_CONTAINER_UV_CACHE:/uv-cache:rw"
+        -v "$AGENT_CONTAINER_UV_CACHE:/uv-cache:rw"
         -v "$CONTAINER_LOCK_BIN:/kbh/bin:ro"
-        -v "$KBH_GPU_LOCK_DIR:/kbh/lock:rw"
+        -v "$KBH_GPU_LOCK:/kbh/gpu.lock:rw"
         -w "/workspace/problems/$PROBLEM_NAME"
         "$KBH_AGENT_CONTAINER_IMAGE"
         /opt/node/bin/node /opt/gemini-cli/bundle/gemini.js
@@ -1282,7 +1479,8 @@ run_cursor_container() {
         -e UV_CACHE_DIR=/uv-cache
         -e UV_PYTHON_INSTALL_DIR=/uv-cache/python
         -e RUN_DIR=/kbh
-        -e KBH_GPU_LOCK=/kbh/lock/gpu.lock
+        -e KBH_GPU_LOCK=/kbh/gpu.lock
+        -e KBH_GPU_LOCK_OWNER_FILE=/home/agent/gpu_lock.owner
         -e KBH_GPU_LOCK_LOG=/home/agent/gpu_lock_container.log
         -e PATH=/kbh/bin:/usr/local/cuda-host/bin:/usr/local/bin:/usr/bin:/bin
         -v "$WORKSPACE_ROOT:/workspace:rw"
@@ -1290,9 +1488,9 @@ run_cursor_container() {
         -v "$KBH_AGENT_CONTAINER_CUDA_HOME:/usr/local/cuda-host:ro"
         -v "$KBH_AGENT_CONTAINER_CURSOR_DIR:/opt/cursor-agent:ro"
         -v "$REAL_UV:/usr/local/bin/uv:ro"
-        -v "$KBH_AGENT_CONTAINER_UV_CACHE:/uv-cache:rw"
+        -v "$AGENT_CONTAINER_UV_CACHE:/uv-cache:rw"
         -v "$CONTAINER_LOCK_BIN:/kbh/bin:ro"
-        -v "$KBH_GPU_LOCK_DIR:/kbh/lock:rw"
+        -v "$KBH_GPU_LOCK:/kbh/gpu.lock:rw"
         -w "/workspace/problems/$PROBLEM_NAME"
         "$KBH_AGENT_CONTAINER_IMAGE"
         /opt/cursor-agent/cursor-agent
@@ -1317,49 +1515,17 @@ for t in "${TEMPLATE_FILES[@]}"; do
         cp -p "$PROBLEM_DIR/$t" "$TEMPLATE_BACKUP_DIR/$t"
     fi
 done
-TRUSTED_SRC_BACKUP_DIR="$RUN_DIR/trusted_src"
-cp -a "$WORKSPACE_ROOT/src" "$TRUSTED_SRC_BACKUP_DIR"
-TRUSTED_ENTRYPOINT="$TRUSTED_SRC_BACKUP_DIR/eval/trusted_entrypoint.py"
-if [ ! -f "$TRUSTED_ENTRYPOINT" ]; then
-    echo "STOP: trusted grading entrypoint is missing" >&2
+
+# Capture the canonical grader surface before the agent runs.  The value stays
+# in the parent shell; later replay inputs must reproduce it exactly rather than
+# establishing a new baseline from agent-accessible files.
+if ! SUBMISSION_EXPECTED_TRUSTED_SURFACE_DIGEST="$(
+    submission_trusted_surface_digest \
+        "$WORKSPACE_ROOT" "$PROBLEM_NAME" "${TEMPLATE_FILES[@]}"
+)"; then
+    echo "STOP: could not snapshot the pristine trusted grading surface" >&2
     exit 3
 fi
-
-trusted_src_digest() {
-    "$REAL_PYTHON" - "$1" <<'PY'
-import hashlib
-import stat
-import sys
-from pathlib import Path
-
-root = Path(sys.argv[1])
-root_metadata = root.lstat()
-if not stat.S_ISDIR(root_metadata.st_mode):
-    raise SystemExit(f"unsafe trusted src root: {root}")
-digest = hashlib.sha256()
-for path in sorted(root.rglob("*"), key=lambda item: item.relative_to(root).as_posix()):
-    relative = path.relative_to(root).as_posix()
-    metadata = path.lstat()
-    if "__pycache__" in path.parts or path.suffix == ".pyc":
-        continue
-    if stat.S_ISDIR(metadata.st_mode):
-        kind = b"d"
-        contents = b""
-    elif stat.S_ISREG(metadata.st_mode):
-        kind = b"f"
-        contents = path.read_bytes()
-    else:
-        raise SystemExit(f"unsafe trusted src entry: {relative}")
-    digest.update(kind + relative.encode() + b"\0")
-    digest.update(hashlib.sha256(contents).digest())
-print(digest.hexdigest())
-PY
-}
-
-TRUSTED_SRC_DIGEST="$(trusted_src_digest "$TRUSTED_SRC_BACKUP_DIR")" || {
-    echo "STOP: could not snapshot trusted src/" >&2
-    exit 3
-}
 
 TEMPLATE_MUTATED=false
 
@@ -1393,41 +1559,7 @@ detect_template_mutation() {
             printf 'CREATED TEMPLATE FILE: %s\n' "$t" >> "$log"
         fi
     done
-    if [ "$(trusted_src_digest "$TRUSTED_SRC_BACKUP_DIR" 2>/dev/null || true)" \
-        != "$TRUSTED_SRC_DIGEST" ] \
-        || [ "$(trusted_src_digest "$WORKSPACE_ROOT/src" 2>/dev/null || true)" \
-        != "$TRUSTED_SRC_DIGEST" ]; then
-        if [ "$found" -eq 0 ]; then
-            printf 'phase: %s\n' "$phase" >> "$log"
-        fi
-        found=1
-        printf 'MUTATED: trusted src/\n' >> "$log"
-        diff -qr --exclude='__pycache__' --exclude='*.pyc' \
-            "$TRUSTED_SRC_BACKUP_DIR" "$WORKSPACE_ROOT/src" >> "$log" 2>&1 || true
-    fi
     return "$found"
-}
-
-restore_trusted_src() {
-    local trusted_source=""
-    if [ "$(trusted_src_digest "$TRUSTED_SRC_BACKUP_DIR" 2>/dev/null || true)" \
-        = "$TRUSTED_SRC_DIGEST" ]; then
-        trusted_source="$TRUSTED_SRC_BACKUP_DIR"
-    elif [ "$(trusted_src_digest "$REPO_ROOT/src" 2>/dev/null || true)" \
-        = "$TRUSTED_SRC_DIGEST" ]; then
-        trusted_source="$REPO_ROOT/src"
-    else
-        echo "STOP: every trusted src/ copy changed during the agent session" >&2
-        return 1
-    fi
-    /bin/rm -rf "$WORKSPACE_ROOT/src"
-    /bin/cp -a "$trusted_source" "$WORKSPACE_ROOT/src"
-    # Bytecode is deliberately outside the content digest because ordinary
-    # imports create it. Never trust or restore it: a matching-timestamp pyc
-    # can override unchanged source without changing the digest.
-    strip_python_bytecode "$WORKSPACE_ROOT/src"
-    [ "$(trusted_src_digest "$WORKSPACE_ROOT/src" 2>/dev/null || true)" \
-        = "$TRUSTED_SRC_DIGEST" ]
 }
 
 restore_template_files() {
@@ -1439,7 +1571,6 @@ restore_template_files() {
             cp -p "$orig" "$cur"
         fi
     done
-    restore_trusted_src || exit 3
 }
 
 # --- KernelBench-Mini LFM harness helpers ---------------------------------
@@ -1560,7 +1691,10 @@ START_TIME=$(date +%s)
 STARTED_AT="$(date -Is)"
 HARNESS_EXIT=0
 
-case "$HARNESS" in
+AGENT_SESSION_EXIT=0
+(
+    exec {TRUST_PHASE_LOCK_FD}>&-
+    case "$HARNESS" in
     claude)
         EFFORT_ARG=()
         if [ -n "$REASONING_EFFORT" ]; then
@@ -2613,7 +2747,28 @@ case "$HARNESS" in
         echo "Supported: claude, zai-claude, minimax-claude, kimi-claude, kinetic-claude, or-fable, or-opus, longcat-claude, hy3, deepseek-claude, qwen-claude, ccr-claude, codex, kimi, droid, gemini, cursor, grok, opencode, opencode-nemotron, nvcf-nemotron, tinker, lfm-opencode, lfm-claude, lfm-grok, hermes, pi" >&2
         exit 1
         ;;
-esac
+    esac
+    exit "$HARNESS_EXIT"
+) || AGENT_SESSION_EXIT=$?
+HARNESS_EXIT="$AGENT_SESSION_EXIT"
+
+# Return to system-owned command lookup before any trusted post-processing,
+# then revalidate every explicitly retained user-space tool.
+PATH="/usr/sbin:/usr/bin:/sbin:/bin"
+if [[ "${CUDA_HOME:-}" = /* ]] && [ -d "$CUDA_HOME/bin" ]; then
+    PATH="$PATH:$CUDA_HOME/bin"
+fi
+export PATH
+if ! submission_executable_matches "$REAL_UV" "$REAL_UV_IDENTITY" \
+    || ! submission_executable_matches "$REAL_PYTHON" "$REAL_PYTHON_IDENTITY" \
+    || ! submission_executable_matches "$REAL_TIMEOUT" "$REAL_TIMEOUT_IDENTITY" \
+    || ! submission_executable_matches "$REAL_FLOCK" "$REAL_FLOCK_IDENTITY" \
+    || ! submission_bundle_tool >/dev/null \
+    || ! submission_trusted_stage_tool >/dev/null; then
+    echo "STOP: a trusted post-agent tool changed during the harness session" >&2
+    exit 3
+fi
+submission_prepare_output_file "$RUN_DIR/template_mutations.log" || exit 3
 
 HARNESS_END_TIME=$(date +%s)
 HARNESS_FINISHED_AT="$(date -Is)"
@@ -2675,95 +2830,296 @@ fi
 
 # --- Post-run: correctness + benchmark + archive --------------------------
 
+AGENT_PROBLEM_DIR="$PROBLEM_DIR"
 HAS_SOLUTION=false
 CORRECT=false
 SCORE="null"
+SUBMISSION_BUNDLE_DIR="$RUN_DIR/submission_bundle"
+SUBMISSION_BUNDLE_SHA256=""
+SUBMISSION_BUNDLE_FILE_COUNT="null"
+SUBMISSION_BUNDLE_TOTAL_SIZE="null"
+SUBMISSION_REPLAY_STATUS="not_applicable"
+SUBMISSION_REPLAY_FRESH_EXTRACTION=false
+SUBMISSION_REPLAY_FRESH_CACHES=false
+SUBMISSION_REPLAY_STAGE_COUNT=0
+SUBMISSION_TRUSTED_SURFACE_DIGEST=""
+SUBMISSION_NETWORK_MODE="unavailable"
+SUBMISSION_NETWORK_PREFIX=()
+SUBMISSION_MOUNT_ISOLATED=false
+SUBMISSION_ROOT_ISOLATED=false
+SUBMISSION_PID_ISOLATED=false
+SUBMISSION_CLEAN_ENVIRONMENT=false
+SUBMISSION_IN_PROCESS_COMPLETION_GUARD=false
 
 if ! detect_template_mutation "after harness"; then
     TEMPLATE_MUTATED=true
     echo "FAIL: immutable problem files changed by harness; skipping check.py and benchmark.py."
     restore_template_files
-else
-    # Drop candidate-created bytecode and restore trusted helper contents even
-    # when the content diff is clean. Final grading must never import from the
-    # writable src/ tree that was visible during the agent session.
-    restore_trusted_src || exit 3
 fi
-# A candidate can also leave timestamp-matched bytecode beside the immutable
-# problem sources. Purge it after the agent session, immediately before grading.
-strip_python_bytecode "$PROBLEM_DIR"
 
-if [ -f "$PROBLEM_DIR/solution.py" ]; then
+if [ -e "$AGENT_PROBLEM_DIR/solution.py" ] || [ -L "$AGENT_PROBLEM_DIR/solution.py" ]; then
     HAS_SOLUTION=true
 fi
 
-if [ "$TEMPLATE_MUTATED" = "false" ] && [ "$HAS_SOLUTION" = "true" ]; then
+prepare_submission_replay_stage() {
+    local stage="$1"
+    local replay_root="$RUN_DIR/replays/$stage"
+    local setup_log="$RUN_DIR/replay_${stage}_setup.log"
+    local stage_surface_digest
+    submission_prepare_output_file "$setup_log" || return 1
+    submission_prepare_replay \
+        "$SUBMISSION_BUNDLE_DIR" "$SUBMISSION_BUNDLE_SHA256" "$REPO_ROOT" \
+        "$SOURCE_PROBLEM_DIR" "$replay_root" "$PROBLEM_NAME" \
+        "${TEMPLATE_FILES[@]}" || return 1
+    submission_reset_caches "$replay_root/cache" || return 1
+    # Reject poisoned canonical metadata/src before uv is allowed to interpret
+    # the copied project.  Keep the post-sync check below as a TOCTOU guard.
+    if ! stage_surface_digest="$(submission_trusted_surface_digest \
+        "$replay_root/repo" "$PROBLEM_NAME" "${TEMPLATE_FILES[@]}")"; then
+        return 1
+    fi
+    if [ "$stage_surface_digest" != "$SUBMISSION_EXPECTED_TRUSTED_SURFACE_DIGEST" ]; then
+        echo "trusted replay surface does not match the pre-agent snapshot" \
+            >> "$setup_log"
+        return 1
+    fi
+    if ! submission_executable_matches "$REAL_UV" "$REAL_UV_IDENTITY" \
+        || ! submission_executable_matches "$REAL_PYTHON" "$REAL_PYTHON_IDENTITY"; then
+        echo "resolved uv/Python executable changed after agent execution" >> "$setup_log"
+        return 1
+    fi
+    # Provision the trusted, frozen project before entering the network
+    # namespace.  --project prevents an agent-authored nested pyproject.toml
+    # from changing which environment uv resolves.
+    if ! "$REAL_UV" sync --frozen --python "$REAL_PYTHON" \
+        --project "$replay_root/repo" \
+        > "$setup_log" 2>&1; then
+        return 1
+    fi
+    PROBLEM_DIR="$replay_root/repo/problems/$PROBLEM_NAME"
+    if ! stage_surface_digest="$(submission_trusted_surface_digest \
+        "$replay_root/repo" "$PROBLEM_NAME" "${TEMPLATE_FILES[@]}")"; then
+        return 1
+    fi
+    if [ "$stage_surface_digest" != "$SUBMISSION_EXPECTED_TRUSTED_SURFACE_DIGEST" ]; then
+        echo "trusted replay surface does not match the pre-agent snapshot" \
+            >> "$setup_log"
+        return 1
+    fi
+    SUBMISSION_TRUSTED_SURFACE_DIGEST="$stage_surface_digest"
+    submission_select_clean_environment "$replay_root/home" || return 1
+    SUBMISSION_REPLAY_FRESH_EXTRACTION=true
+    SUBMISSION_REPLAY_FRESH_CACHES=true
+    SUBMISSION_CLEAN_ENVIRONMENT=true
+    SUBMISSION_REPLAY_STAGE_COUNT=$((SUBMISSION_REPLAY_STAGE_COUNT + 1))
+}
+
+if [ "$HAS_SOLUTION" = "true" ]; then
+    # These names are deterministic archive paths, so remove anything the
+    # agent may have planted there before publishing the new bundle/replays.
+    rm -rf -- "$SUBMISSION_BUNDLE_DIR" "$RUN_DIR/replays"
+    BUNDLE_CREATE_LOG="$RUN_DIR/submission_bundle.log"
+    submission_prepare_output_file "$BUNDLE_CREATE_LOG" || exit 3
+    if ! submission_executable_matches "$REAL_UV" "$REAL_UV_IDENTITY" \
+        || ! submission_executable_matches "$REAL_PYTHON" "$REAL_PYTHON_IDENTITY"; then
+        SUBMISSION_REPLAY_STATUS="bundle_failed"
+        echo "FAIL: trusted uv/Python executable changed; refusing bundle creation."
+    elif BUNDLE_SUMMARY="$(submission_bundle_create \
+        "$AGENT_PROBLEM_DIR" "$SUBMISSION_BUNDLE_DIR" 2> "$BUNDLE_CREATE_LOG")"; then
+        SUBMISSION_BUNDLE_SHA256="$(
+            printf '%s\n' "$BUNDLE_SUMMARY" | submission_json_field bundle_sha256
+        )"
+        SUBMISSION_BUNDLE_FILE_COUNT="$(
+            printf '%s\n' "$BUNDLE_SUMMARY" | submission_json_field file_count
+        )"
+        SUBMISSION_BUNDLE_TOTAL_SIZE="$(
+            printf '%s\n' "$BUNDLE_SUMMARY" | submission_json_field total_size
+        )"
+        SUBMISSION_REPLAY_STATUS="captured"
+        submission_select_network_isolation
+        if [ "$SUBMISSION_NETWORK_MODE" = "unavailable" ]; then
+            SUBMISSION_REPLAY_STATUS="network_isolation_unavailable"
+            echo "FAIL: this host cannot isolate grading network access; skipping grading."
+        fi
+    else
+        SUBMISSION_REPLAY_STATUS="bundle_failed"
+        echo "FAIL: submission could not be frozen; skipping untrusted grading."
+    fi
+fi
+if [ "$TEMPLATE_MUTATED" = "true" ] \
+    && [ "$SUBMISSION_REPLAY_STATUS" = "captured" ]; then
+    SUBMISSION_REPLAY_STATUS="template_mutated"
+fi
+
+if [ "$TEMPLATE_MUTATED" = "false" ] \
+    && [ "$SUBMISSION_REPLAY_STATUS" = "captured" ]; then
     CHECK_LOG="$RUN_DIR/check.log"
     BENCH_LOG="$RUN_DIR/benchmark.log"
+    submission_prepare_output_file "$CHECK_LOG" || exit 3
+    submission_prepare_output_file "$BENCH_LOG" || exit 3
 
-    echo "Running check.py..."
-    CHECK_START_TIME=$(date +%s)
-    CHECK_EXIT_CODE=0
-    (cd "$PROBLEM_DIR" && run_gpu_locked_timeout check.py "$CHECK_TIMEOUT_SECONDS" \
-        uv run python "$TRUSTED_ENTRYPOINT" check.py) > "$CHECK_LOG" 2>&1 || CHECK_EXIT_CODE=$?
-    CHECK_END_TIME=$(date +%s)
-    CHECK_ELAPSED=$((CHECK_END_TIME - CHECK_START_TIME))
-    CHECK_PASS_COUNT=$(grep -axc 'PASS' "$CHECK_LOG" || true)
+    if ! prepare_submission_replay_stage check; then
+        SUBMISSION_REPLAY_STATUS="setup_failed"
+        echo "FAIL: could not prepare fresh check replay; skipping grading."
+    else
+        echo "Running check.py from verified submission bundle..."
+        CHECK_START_TIME=$(date +%s)
+        CHECK_EXIT_CODE=125
+        if submission_executable_matches "$REAL_UV" "$REAL_UV_IDENTITY" \
+            && submission_executable_matches "$REAL_PYTHON" "$REAL_PYTHON_IDENTITY" \
+            && submission_build_isolated_command \
+            "$RUN_DIR/replays/check" "$RUN_DIR/replays/check/repo" \
+            "$PROBLEM_DIR" "${TEMPLATE_FILES[@]}" -- \
+            "$RUN_DIR/replays/check/repo/.venv/bin/python" \
+            -P "$SUBMISSION_TRUSTED_STAGE_TOOL" \
+            --preload-module torch --preload-module yaml check.py; then
+            SUBMISSION_MOUNT_ISOLATED=true
+            SUBMISSION_ROOT_ISOLATED=true
+            SUBMISSION_PID_ISOLATED=true
+            SUBMISSION_IN_PROCESS_COMPLETION_GUARD=true
+            CHECK_EXIT_CODE=0
+            (run_gpu_locked_timeout check.py "$CHECK_TIMEOUT_SECONDS" \
+                "${SUBMISSION_ISOLATED_COMMAND[@]}") \
+                > "$CHECK_LOG" 2>&1 || CHECK_EXIT_CODE=$?
+        else
+            echo "failed to construct isolated check replay" > "$CHECK_LOG"
+        fi
+        CHECK_END_TIME=$(date +%s)
+        CHECK_ELAPSED=$((CHECK_END_TIME - CHECK_START_TIME))
 
-    if ! detect_template_mutation "after check.py"; then
-        TEMPLATE_MUTATED=true
-        CORRECT=false
-        SCORE="null"
-        echo "FAIL: immutable problem files changed during check.py."
-        restore_template_files
-    elif [ "$CHECK_EXIT_CODE" -eq 0 ] && [ "$CHECK_PASS_COUNT" -eq 1 ]; then
-        # solution.py executes in-process during correctness and can write new
-        # bytecode without changing source text. Recreate src/ before benchmark.
-        restore_trusted_src || exit 3
-        strip_python_bytecode "$PROBLEM_DIR"
-        # Require the one standalone marker emitted by a normally completed
-        # checker. Candidate PASS text is either a duplicate or, when followed
-        # by SystemExit(0), rejected by the trusted entrypoint above.
+        if [ "$CHECK_EXIT_CODE" -eq 125 ]; then
+            SUBMISSION_REPLAY_STATUS="setup_failed"
+            CORRECT=false
+            SCORE="null"
+        elif ! submission_bundle_verify \
+            "$SUBMISSION_BUNDLE_DIR" "$SUBMISSION_BUNDLE_SHA256" >/dev/null 2>&1; then
+            SUBMISSION_REPLAY_STATUS="verification_failed"
+            CORRECT=false
+            SCORE="null"
+            echo "FAIL: immutable submission bundle changed during check.py."
+        elif ! detect_template_mutation "after check.py"; then
+            SUBMISSION_REPLAY_STATUS="template_mutated"
+            TEMPLATE_MUTATED=true
+            CORRECT=false
+            SCORE="null"
+            echo "FAIL: immutable problem files changed during check.py."
+            restore_template_files
+        elif [ "$(submission_trusted_surface_digest \
+            "$RUN_DIR/replays/check/repo" "$PROBLEM_NAME" \
+            "${TEMPLATE_FILES[@]}" 2>/dev/null || true)" \
+            != "$SUBMISSION_TRUSTED_SURFACE_DIGEST" ]; then
+            SUBMISSION_REPLAY_STATUS="trusted_surface_mutated"
+            CORRECT=false
+            SCORE="null"
+            echo "FAIL: trusted replay project/src changed during check.py."
+        else
+            SUBMISSION_REPLAY_STATUS="verified"
+        fi
+    fi
+
+    if [ "$SUBMISSION_REPLAY_STATUS" = "verified" ] \
+        && [ "${CHECK_EXIT_CODE:-1}" -eq 0 ] \
+        && submission_check_passed "$CHECK_LOG"; then
+        # Require exit 0 and exactly one standalone marker as a preliminary
+        # replay gate. The in-process receipt can itself be forged by frame
+        # walking plus os._exit(0), so this is not publication authority;
+        # bundle-era publishing independently audits and scans exact source.
         CORRECT=true
         echo "Running benchmark.py..."
         # Some problems (KDA chunked recurrence, sonic-MoE)
         # have references that loop in Python, so 20 perf trials × 4 variants ×
         # 5 shapes can take 5-10 min. Generous budget.
-        BENCH_START_TIME=$(date +%s)
-        BENCH_EXIT_CODE=0
-        (cd "$PROBLEM_DIR" && run_gpu_locked_timeout benchmark.py "$BENCHMARK_TIMEOUT_SECONDS" \
-            uv run python "$TRUSTED_ENTRYPOINT" benchmark.py) > "$BENCH_LOG" 2>&1 || BENCH_EXIT_CODE=$?
-        BENCH_END_TIME=$(date +%s)
-        BENCH_ELAPSED=$((BENCH_END_TIME - BENCH_START_TIME))
-        if ! detect_template_mutation "after benchmark.py"; then
-            TEMPLATE_MUTATED=true
+        if ! prepare_submission_replay_stage benchmark; then
+            SUBMISSION_REPLAY_STATUS="setup_failed"
             CORRECT=false
             SCORE="null"
-            echo "FAIL: immutable problem files changed during benchmark.py."
-            restore_template_files
-        elif [ "$BENCH_EXIT_CODE" -eq 0 ]; then
-            restore_trusted_src || exit 3
-            # A complete benchmark emits exactly one trusted summary. Reject
-            # missing or duplicate lookalikes instead of choosing one from
-            # candidate-controlled stdout.
-            BENCH_METRIC_RE='^peak_fraction:[[:space:]]*([0-9]+([.][0-9]*)?|[.][0-9]+)([eE][+-]?[0-9]+)?[[:space:]]*$'
-            BENCH_METRIC_COUNT=$(grep -aEc "$BENCH_METRIC_RE" "$BENCH_LOG" || true)
-            if [ "$BENCH_METRIC_COUNT" -eq 1 ]; then
-                SCORE=$(grep -aE "$BENCH_METRIC_RE" "$BENCH_LOG" \
-                    | sed -E 's/^peak_fraction:[[:space:]]*//; s/[[:space:]]*$//')
-            else
-                SCORE="null"
-                echo "FAIL: benchmark.py emitted $BENCH_METRIC_COUNT complete score markers."
-            fi
+            echo "FAIL: could not prepare fresh benchmark replay."
         else
-            restore_trusted_src || exit 3
-            SCORE="null"
-            echo "FAIL: benchmark.py did not complete successfully (exit $BENCH_EXIT_CODE)."
+            BENCH_START_TIME=$(date +%s)
+            BENCH_EXIT_CODE=125
+            if submission_executable_matches "$REAL_UV" "$REAL_UV_IDENTITY" \
+                && submission_executable_matches "$REAL_PYTHON" "$REAL_PYTHON_IDENTITY" \
+                && submission_build_isolated_command \
+                "$RUN_DIR/replays/benchmark" "$RUN_DIR/replays/benchmark/repo" \
+                "$PROBLEM_DIR" "${TEMPLATE_FILES[@]}" -- \
+                "$RUN_DIR/replays/benchmark/repo/.venv/bin/python" \
+                -P "$SUBMISSION_TRUSTED_STAGE_TOOL" \
+                --preload-module torch --preload-module yaml benchmark.py; then
+                SUBMISSION_MOUNT_ISOLATED=true
+                SUBMISSION_ROOT_ISOLATED=true
+                SUBMISSION_PID_ISOLATED=true
+                SUBMISSION_IN_PROCESS_COMPLETION_GUARD=true
+                BENCH_EXIT_CODE=0
+                (run_gpu_locked_timeout benchmark.py \
+                    "$BENCHMARK_TIMEOUT_SECONDS" \
+                    "${SUBMISSION_ISOLATED_COMMAND[@]}") \
+                    > "$BENCH_LOG" 2>&1 || BENCH_EXIT_CODE=$?
+            else
+                echo "failed to construct isolated benchmark replay" > "$BENCH_LOG"
+            fi
+            BENCH_END_TIME=$(date +%s)
+            BENCH_ELAPSED=$((BENCH_END_TIME - BENCH_START_TIME))
+            if [ "$BENCH_EXIT_CODE" -eq 125 ]; then
+                SUBMISSION_REPLAY_STATUS="setup_failed"
+                CORRECT=false
+                SCORE="null"
+            elif ! submission_bundle_verify \
+                "$SUBMISSION_BUNDLE_DIR" "$SUBMISSION_BUNDLE_SHA256" >/dev/null 2>&1; then
+                SUBMISSION_REPLAY_STATUS="verification_failed"
+                CORRECT=false
+                SCORE="null"
+                echo "FAIL: immutable submission bundle changed during benchmark.py."
+            elif ! detect_template_mutation "after benchmark.py"; then
+                SUBMISSION_REPLAY_STATUS="template_mutated"
+                TEMPLATE_MUTATED=true
+                CORRECT=false
+                SCORE="null"
+                echo "FAIL: immutable problem files changed during benchmark.py."
+                restore_template_files
+            elif [ "$(submission_trusted_surface_digest \
+                "$RUN_DIR/replays/benchmark/repo" "$PROBLEM_NAME" \
+                "${TEMPLATE_FILES[@]}" 2>/dev/null || true)" \
+                != "$SUBMISSION_TRUSTED_SURFACE_DIGEST" ]; then
+                SUBMISSION_REPLAY_STATUS="trusted_surface_mutated"
+                CORRECT=false
+                SCORE="null"
+                echo "FAIL: trusted replay project/src changed during benchmark.py."
+            else
+                SUBMISSION_REPLAY_STATUS="verified"
+                if [ "$BENCH_EXIT_CODE" -eq 0 ]; then
+                    if ! SCORE="$(submission_extract_peak_fraction "$BENCH_LOG")"; then
+                        SCORE="null"
+                        BENCH_EXIT_CODE=65
+                        echo "FAIL: benchmark emitted an ambiguous or invalid final metric."
+                    fi
+                fi
+                if [ "$BENCH_EXIT_CODE" -ne 0 ]; then
+                    CORRECT=false
+                    SCORE="null"
+                fi
+            fi
         fi
-    else
-        restore_trusted_src || exit 3
     fi
 fi
+
+# Compatibility projections are regenerated from one final verified
+# extraction.  They therefore cannot contain self-modifications made by
+# check.py or benchmark.py, while old audit/publish tooling can keep reading
+# run-root solution.py and scratch/.
+if [ -n "$SUBMISSION_BUNDLE_SHA256" ] \
+    && submission_bundle_verify "$SUBMISSION_BUNDLE_DIR" \
+        "$SUBMISSION_BUNDLE_SHA256" >/dev/null 2>&1; then
+    ARCHIVE_EXTRACTION="$RUN_DIR/replays/archive_submission"
+    rm -rf -- "$ARCHIVE_EXTRACTION"
+    if submission_bundle_extract "$SUBMISSION_BUNDLE_DIR" \
+        "$SUBMISSION_BUNDLE_SHA256" "$ARCHIVE_EXTRACTION" >/dev/null; then
+        submission_project_legacy_archive "$ARCHIVE_EXTRACTION" "$RUN_DIR"
+    fi
+    rm -rf -- "$ARCHIVE_EXTRACTION"
+fi
+
+# Cleanup below applies to the disposable agent workspace, not either replay.
+PROBLEM_DIR="$AGENT_PROBLEM_DIR"
 
 CHECK_ELAPSED="${CHECK_ELAPSED:-null}"
 BENCH_ELAPSED="${BENCH_ELAPSED:-null}"
@@ -2777,10 +3133,10 @@ TOTAL_ELAPSED=$((FINISH_TIME - START_TIME))
 # count for cost comparison even when the harness uses a coding-plan billing
 # (which hides per-call USD).
 USAGE_JSON="$(
-    KBH_GPU_LOCK_HELD=1 uv run --quiet python \
+    KBH_GPU_LOCK_HELD=1 "$REAL_UV" run --quiet python \
         "$REPO_ROOT/scripts/extract_usage.py" "$RUN_DIR" "$HARNESS" 2>/dev/null || echo '{}'
 )"
-OUTPUT_TOKENS_PER_SECOND="$(USAGE_JSON="$USAGE_JSON" ELAPSED="$ELAPSED" KBH_GPU_LOCK_HELD=1 uv run --quiet python - <<'PY'
+OUTPUT_TOKENS_PER_SECOND="$(USAGE_JSON="$USAGE_JSON" ELAPSED="$ELAPSED" KBH_GPU_LOCK_HELD=1 "$REAL_UV" run --quiet python - <<'PY'
 import json
 import os
 
@@ -2809,81 +3165,29 @@ CLASSIFICATION_JSON="$(
     LOG_FILE="$LOG_FILE" \
     STDERR_FILE="$STDERR_FILE" \
     MIN_USEFUL_OUTPUT_TOKENS="$MIN_USEFUL_OUTPUT_TOKENS" \
-    KBH_GPU_LOCK_HELD=1 uv run --quiet python scripts/classify_run.py
+    KBH_GPU_LOCK_HELD=1 "$REAL_UV" run --quiet python scripts/classify_run.py
 )"
-FAILURE_REASON="$(CLASSIFICATION_JSON="$CLASSIFICATION_JSON" KBH_GPU_LOCK_HELD=1 uv run --quiet python - <<'PY'
+FAILURE_REASON="$(CLASSIFICATION_JSON="$CLASSIFICATION_JSON" KBH_GPU_LOCK_HELD=1 "$REAL_UV" run --quiet python - <<'PY'
 import json
 import os
 print(json.loads(os.environ["CLASSIFICATION_JSON"])["failure_reason"])
 PY
 )"
-RETRYABLE_INFRA_FAILURE="$(CLASSIFICATION_JSON="$CLASSIFICATION_JSON" KBH_GPU_LOCK_HELD=1 uv run --quiet python - <<'PY'
+RETRYABLE_INFRA_FAILURE="$(CLASSIFICATION_JSON="$CLASSIFICATION_JSON" KBH_GPU_LOCK_HELD=1 "$REAL_UV" run --quiet python - <<'PY'
 import json
 import os
 print("true" if json.loads(os.environ["CLASSIFICATION_JSON"])["retryable_infra_failure"] else "false")
 PY
 )"
 
-cat > "$RUN_DIR/result.json" <<JSON
-{
-    "run_id": "$RUN_ID",
-    "run_group": "$RUN_GROUP",
-    "problem": "$PROBLEM_NAME",
-    "harness": "$HARNESS",
-    "model": "$MODEL",
-    "reasoning_effort": "$REASONING_EFFORT",
-    "started_at": "$STARTED_AT",
-    "harness_finished_at": "$HARNESS_FINISHED_AT",
-    "finished_at": "$FINISHED_AT",
-    "start_epoch": $START_TIME,
-    "harness_end_epoch": $HARNESS_END_TIME,
-    "end_epoch": $FINISH_TIME,
-    "has_solution": $HAS_SOLUTION,
-    "correct": $CORRECT,
-    "failure_reason": "$FAILURE_REASON",
-    "retryable_infra_failure": $RETRYABLE_INFRA_FAILURE,
-    "minimum_useful_output_tokens": $MIN_USEFUL_OUTPUT_TOKENS,
-    "peak_fraction": $SCORE,
-    "template_mutated": $TEMPLATE_MUTATED,
-    "elapsed_seconds": $ELAPSED,
-    "total_elapsed_seconds": $TOTAL_ELAPSED,
-    "check_elapsed_seconds": $CHECK_ELAPSED,
-    "benchmark_elapsed_seconds": $BENCH_ELAPSED,
-    "check_timeout_seconds": $CHECK_TIMEOUT_SECONDS,
-    "benchmark_timeout_seconds": $BENCHMARK_TIMEOUT_SECONDS,
-    "check_exit_code": $CHECK_EXIT_CODE,
-    "benchmark_exit_code": $BENCH_EXIT_CODE,
-    "harness_exit_code": $HARNESS_EXIT,
-    "session_complete": $SESSION_COMPLETE,
-    "agent_cuda_disabled": $AGENT_CUDA_DISABLED,
-    "agent_container": $([ "$KBH_AGENT_CONTAINER" = "1" ] && echo true || echo false),
-    "agent_container_image": "$KBH_AGENT_CONTAINER_IMAGE",
-    "agent_container_network": "$KBH_AGENT_CONTAINER_NETWORK",
-    "gpu_queue_mode": "$GPU_QUEUE_MODE",
-    "output_tokens_per_second": $OUTPUT_TOKENS_PER_SECOND,
-    "usage": $USAGE_JSON
-}
-JSON
-
-# Archive solution + any scratch
-if [ -f "$PROBLEM_DIR/solution.py" ]; then
-    cp "$PROBLEM_DIR/solution.py" "$RUN_DIR/solution.py"
+if [[ "$SUBMISSION_REPLAY_STATUS" == "bundle_failed" \
+    || "$SUBMISSION_REPLAY_STATUS" == "setup_failed" \
+    || "$SUBMISSION_REPLAY_STATUS" == "verification_failed" \
+    || "$SUBMISSION_REPLAY_STATUS" == "network_isolation_unavailable" \
+    || "$SUBMISSION_REPLAY_STATUS" == "trusted_surface_mutated" ]]; then
+    FAILURE_REASON="submission_${SUBMISSION_REPLAY_STATUS}"
+    RETRYABLE_INFRA_FAILURE=false
 fi
-
-SCRATCH_DIR="$RUN_DIR/scratch"
-shopt -s nullglob dotglob
-for f in "$PROBLEM_DIR"/*; do
-    base="$(basename "$f")"
-    [[ "$base" == "." || "$base" == ".." ]] && continue
-    [[ "$base" == "solution.py" ]] && continue
-    # Never archive a per-run venv into scratch (multi-GB CUDA wheels).
-    [[ "$base" == ".venv" ]] && continue
-    if ! is_template "$base"; then
-        mkdir -p "$SCRATCH_DIR"
-        cp -r "$f" "$SCRATCH_DIR/"
-    fi
-done
-shopt -u nullglob dotglob
 
 # Clean the problem workspace for the next run
 shopt -s nullglob dotglob
@@ -2901,6 +3205,12 @@ shopt -u nullglob dotglob
 # shellcheck source=scripts/lib/strip_run_venv.sh
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/strip_run_venv.sh"
 strip_run_venv "$RUN_DIR"
+# Replay environments are independently provisioned and can be reproduced
+# from the archived lockfile; never retain their multi-GB CUDA wheels.
+rm -rf -- "$RUN_DIR/replays/check" "$RUN_DIR/replays/benchmark"
+# Agent uv state is per-run specifically so it cannot influence later agents;
+# it is reproducible download/cache material, not an archive artifact.
+rm -rf -- "$AGENT_CONTAINER_UV_CACHE"
 
 STATUS="ERR"
 if $CORRECT; then
@@ -2914,6 +3224,110 @@ elif [ "$RETRYABLE_INFRA_FAILURE" = "true" ]; then
 else
     STATUS="ERR ($FAILURE_REASON)"
 fi
+
+SUBMISSION_NETWORK_ISOLATED="$SUBMISSION_MOUNT_ISOLATED"
+AGENT_CONTAINER_RESULT=$([ "$KBH_AGENT_CONTAINER" = "1" ] && echo true || echo false)
+
+export RUN_ID RUN_GROUP PROBLEM_NAME HARNESS MODEL REASONING_EFFORT STARTED_AT
+export HARNESS_FINISHED_AT FINISHED_AT START_TIME HARNESS_END_TIME FINISH_TIME
+export HAS_SOLUTION CORRECT FAILURE_REASON RETRYABLE_INFRA_FAILURE
+export MIN_USEFUL_OUTPUT_TOKENS SCORE TEMPLATE_MUTATED ELAPSED TOTAL_ELAPSED
+export CHECK_ELAPSED BENCH_ELAPSED CHECK_TIMEOUT_SECONDS BENCHMARK_TIMEOUT_SECONDS
+export CHECK_EXIT_CODE BENCH_EXIT_CODE HARNESS_EXIT SESSION_COMPLETE
+export AGENT_CUDA_DISABLED AGENT_CONTAINER_RESULT KBH_AGENT_CONTAINER_IMAGE
+export KBH_AGENT_CONTAINER_NETWORK GPU_QUEUE_MODE OUTPUT_TOKENS_PER_SECOND USAGE_JSON
+export SUBMISSION_BUNDLE_SHA256 SUBMISSION_BUNDLE_FILE_COUNT
+export SUBMISSION_BUNDLE_TOTAL_SIZE SUBMISSION_REPLAY_STATUS
+export SUBMISSION_REPLAY_FRESH_EXTRACTION SUBMISSION_REPLAY_FRESH_CACHES
+export SUBMISSION_REPLAY_STAGE_COUNT SUBMISSION_NETWORK_ISOLATED SUBMISSION_NETWORK_MODE
+export SUBMISSION_TRUSTED_SURFACE_DIGEST
+export SUBMISSION_MOUNT_ISOLATED SUBMISSION_PID_ISOLATED SUBMISSION_CLEAN_ENVIRONMENT
+export SUBMISSION_ROOT_ISOLATED
+export SUBMISSION_IN_PROCESS_COMPLETION_GUARD
+
+# result.json is the archive commit marker.  Publish it atomically only after
+# the bundle, compatibility projections, logs, cleanup, and venv stripping are
+# complete, so readers never observe a half-finished run.
+# Schema compatibility (Python safely JSON-encodes these values below):
+# "agent_container_network": "$KBH_AGENT_CONTAINER_NETWORK"
+# "agent_container": $([ "$KBH_AGENT_CONTAINER" = "1" ] && echo true || echo false)
+"$REAL_PYTHON" - <<'PY' | submission_atomic_write_json "$RUN_DIR/result.json"
+import json
+import os
+import sys
+
+def value(name):
+    return json.loads(os.environ[name])
+
+digest = os.environ["SUBMISSION_BUNDLE_SHA256"] or None
+bundle = None
+if digest is not None:
+    bundle = {
+        "path": "submission_bundle",
+        "schema": "kernelbench.submission-bundle",
+        "version": 1,
+        "bundle_sha256": digest,
+        "file_count": value("SUBMISSION_BUNDLE_FILE_COUNT"),
+        "total_size": value("SUBMISSION_BUNDLE_TOTAL_SIZE"),
+    }
+result = {
+    "run_id": os.environ["RUN_ID"],
+    "run_group": os.environ["RUN_GROUP"],
+    "problem": os.environ["PROBLEM_NAME"],
+    "harness": os.environ["HARNESS"],
+    "model": os.environ["MODEL"],
+    "reasoning_effort": os.environ["REASONING_EFFORT"],
+    "started_at": os.environ["STARTED_AT"],
+    "harness_finished_at": os.environ["HARNESS_FINISHED_AT"],
+    "finished_at": os.environ["FINISHED_AT"],
+    "start_epoch": value("START_TIME"),
+    "harness_end_epoch": value("HARNESS_END_TIME"),
+    "end_epoch": value("FINISH_TIME"),
+    "has_solution": value("HAS_SOLUTION"),
+    "correct": value("CORRECT"),
+    "failure_reason": os.environ["FAILURE_REASON"],
+    "retryable_infra_failure": value("RETRYABLE_INFRA_FAILURE"),
+    "minimum_useful_output_tokens": value("MIN_USEFUL_OUTPUT_TOKENS"),
+    "peak_fraction": value("SCORE"),
+    "template_mutated": value("TEMPLATE_MUTATED"),
+    "elapsed_seconds": value("ELAPSED"),
+    "total_elapsed_seconds": value("TOTAL_ELAPSED"),
+    "check_elapsed_seconds": value("CHECK_ELAPSED"),
+    "benchmark_elapsed_seconds": value("BENCH_ELAPSED"),
+    "check_timeout_seconds": value("CHECK_TIMEOUT_SECONDS"),
+    "benchmark_timeout_seconds": value("BENCHMARK_TIMEOUT_SECONDS"),
+    "check_exit_code": value("CHECK_EXIT_CODE"),
+    "benchmark_exit_code": value("BENCH_EXIT_CODE"),
+    "harness_exit_code": value("HARNESS_EXIT"),
+    "session_complete": value("SESSION_COMPLETE"),
+    "agent_cuda_disabled": value("AGENT_CUDA_DISABLED"),
+    "agent_container": value("AGENT_CONTAINER_RESULT"),
+    "agent_container_image": os.environ["KBH_AGENT_CONTAINER_IMAGE"],
+    "agent_container_network": os.environ["KBH_AGENT_CONTAINER_NETWORK"],
+    "gpu_queue_mode": os.environ["GPU_QUEUE_MODE"],
+    "output_tokens_per_second": value("OUTPUT_TOKENS_PER_SECOND"),
+    "usage": value("USAGE_JSON"),
+    "submission_bundle_sha256": digest,
+    "submission_replay_status": os.environ["SUBMISSION_REPLAY_STATUS"],
+    "submission_bundle": bundle,
+    "submission_replay": {
+        "status": os.environ["SUBMISSION_REPLAY_STATUS"],
+        "bundle_sha256": digest,
+        "fresh_extraction": value("SUBMISSION_REPLAY_FRESH_EXTRACTION"),
+        "fresh_caches": value("SUBMISSION_REPLAY_FRESH_CACHES"),
+        "stage_count": value("SUBMISSION_REPLAY_STAGE_COUNT"),
+        "grader_surface_sha256": os.environ.get("SUBMISSION_TRUSTED_SURFACE_DIGEST") or None,
+        "network_isolated": value("SUBMISSION_NETWORK_ISOLATED"),
+        "network_isolation": os.environ["SUBMISSION_NETWORK_MODE"],
+        "mount_isolated": value("SUBMISSION_MOUNT_ISOLATED"),
+        "root_isolated": value("SUBMISSION_ROOT_ISOLATED"),
+        "pid_isolated": value("SUBMISSION_PID_ISOLATED"),
+        "clean_environment": value("SUBMISSION_CLEAN_ENVIRONMENT"),
+        "in_process_completion_guard": value("SUBMISSION_IN_PROCESS_COMPLETION_GUARD"),
+    },
+}
+json.dump(result, sys.stdout)
+PY
 
 echo "========================================"
 echo "[$STATUS] $PROBLEM_NAME (${ELAPSED}s)"

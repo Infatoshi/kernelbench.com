@@ -19,12 +19,14 @@ Ground rules (mirrors AGENTS.md):
 
 Run: uv run --with pyyaml python scripts/build_model_index.py
 """
+
 from __future__ import annotations
 
 import csv
 import json
 import re
 import subprocess
+import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -32,6 +34,13 @@ import yaml
 
 REPO = Path(__file__).resolve().parent.parent
 OUT = REPO / "public" / "data" / "models.json"
+sys.path.insert(0, str(REPO))
+from scripts.published_submission import (  # noqa: E402
+    atomic_write_text,
+    read_bounded_text,
+    read_json_file,
+    trusted_archive_lock,
+)
 
 FLAG_VERDICTS = {"reward_hack", "contamination", "rubric_leak"}
 
@@ -230,7 +239,9 @@ def _merge_block(dst: dict, src: dict, *, keep_gpus: bool) -> None:
             npass += 1
         # harness not on cell — keep src harness vote when it won any cell
     dst["passed"] = npass
-    dst["total_problems"] = max(dst.get("total_problems") or 0, src.get("total_problems") or 0)
+    dst["total_problems"] = max(
+        dst.get("total_problems") or 0, src.get("total_problems") or 0
+    )
     # Prefer non-empty label/harness from the higher-pass contributor
     if (src.get("passed") or 0) >= (dst.get("passed") or 0) or not dst.get("harness"):
         if src.get("label"):
@@ -243,7 +254,9 @@ def _merge_block(dst: dict, src: dict, *, keep_gpus: bool) -> None:
         dst["gpus"] = gpus if gpus is not None else {}
 
 
-def load_site_board(models: Models, bench: str, path: Path, gpu_key: str | None) -> None:
+def load_site_board(
+    models: Models, bench: str, path: Path, gpu_key: str | None
+) -> None:
     """Ingest one site-schema leaderboard file (what the pages render).
 
     gpu_key None = canonical board (fills benches.<bench>); otherwise fills
@@ -254,12 +267,14 @@ def load_site_board(models: Models, bench: str, path: Path, gpu_key: str | None)
     Same model slug from multiple harness routes (e.g. native claude-fable-5 vs
     or-fable anthropic/claude-fable-5) merges by best cell — never last-writer-wins.
     """
-    d = json.loads(path.read_text())
+    d = read_json_file(path)
     problems = d.get("problems", [])
     KNOWN_PROBLEMS.update(problems)
     # The attempted-problem union across rows is the true board denominator
     # (a board's deck can drop a problem the problems array still lists).
-    n_attempted = max((len(m.get("results") or {}) for m in d.get("models", [])), default=0)
+    n_attempted = max(
+        (len(m.get("results") or {}) for m in d.get("models", [])), default=0
+    )
     total_problems = n_attempted or len(problems)
 
     for m in d.get("models", []):
@@ -274,7 +289,9 @@ def load_site_board(models: Models, bench: str, path: Path, gpu_key: str | None)
                 "has_solution": bool(c.get("has_solution")),
                 "score": c.get("peak_fraction"),
                 "verdict": verdict,
-                "valid": bool(c.get("correct")) and c.get("peak_fraction") is not None and verdict not in FLAG_VERDICTS,
+                "valid": bool(c.get("correct"))
+                and c.get("peak_fraction") is not None
+                and verdict not in FLAG_VERDICTS,
                 "elapsed_seconds": c.get("elapsed_seconds"),
                 "solution_url": solution_url(c.get("run_id") or "", gpu_key),
                 "trace_url": trace_url(bench, c.get("run_id") or "", gpu_key),
@@ -300,9 +317,14 @@ def load_site_board(models: Models, bench: str, path: Path, gpu_key: str | None)
             bench_block = entry["benches"].setdefault(
                 bench,
                 {
-                    "label": None, "harness": None, "effort": None,
-                    "passed": 0, "total_problems": total_problems, "perf": None,
-                    "cells": {}, "gpus": {},
+                    "label": None,
+                    "harness": None,
+                    "effort": None,
+                    "passed": 0,
+                    "total_problems": total_problems,
+                    "perf": None,
+                    "cells": {},
+                    "gpus": {},
                 },
             )
             gpus = bench_block.setdefault("gpus", {})
@@ -313,7 +335,11 @@ def load_site_board(models: Models, bench: str, path: Path, gpu_key: str | None)
 
 
 def load_mega(models: Models, csv_path: Path) -> None:
-    rows = list(csv.DictReader(csv_path.read_text().splitlines()))
+    rows = list(
+        csv.DictReader(
+            read_bounded_text(csv_path, max_bytes=64 * 1024 * 1024).splitlines()
+        )
+    )
     KNOWN_PROBLEMS.update(r["problem"] for r in rows)
     canonical = [r for r in rows if "RTX PRO" in (r.get("gpu") or "")]
 
@@ -335,14 +361,20 @@ def load_mega(models: Models, csv_path: Path) -> None:
         for (slug, prob), r in picked.items():
             b = per_slug.setdefault(slug, {"cells": {}})
             b["harnesses"] = b.get("harnesses", {})
-            b["harnesses"][r.get("harness") or ""] = b["harnesses"].get(r.get("harness") or "", 0) + 1
+            b["harnesses"][r.get("harness") or ""] = (
+                b["harnesses"].get(r.get("harness") or "", 0) + 1
+            )
             correct = r.get("correct") == "true"
             b["cells"][prob] = {
                 "run_id": r.get("run_id"),
                 "correct": correct,
                 "score": float(r["score"]) if r.get("score") else None,
                 "tok_s": int(float(r["tok_s"])) if r.get("tok_s") else None,
-                "ctx": {k: float(r[k]) for k in ("ctx2048", "ctx8192", "ctx16384") if r.get(k)},
+                "ctx": {
+                    k: float(r[k])
+                    for k in ("ctx2048", "ctx8192", "ctx16384")
+                    if r.get(k)
+                },
                 "framework": r.get("framework") or None,
                 "solution_url": mega_solution_url(r.get("run_id") or ""),
                 "trace_url": trace_url("mega", r.get("run_id") or ""),
@@ -351,7 +383,10 @@ def load_mega(models: Models, csv_path: Path) -> None:
                 "valid": correct,
             }
         for slug, b in per_slug.items():
-            harness = max(b.get("harnesses", {"": 1}), key=b.get("harnesses", {"": 1}).get) or None
+            harness = (
+                max(b.get("harnesses", {"": 1}), key=b.get("harnesses", {"": 1}).get)
+                or None
+            )
             block = {
                 "label": f"{harness}/{slug}" if harness else slug,
                 "harness": harness,
@@ -368,9 +403,16 @@ def load_mega(models: Models, csv_path: Path) -> None:
             else:
                 mb = entry["benches"].setdefault(
                     "mega",
-                    {"label": None, "harness": None, "effort": None, "passed": 0,
-                     "total_problems": block["total_problems"], "perf": None,
-                     "cells": {}, "gpus": {}},
+                    {
+                        "label": None,
+                        "harness": None,
+                        "effort": None,
+                        "passed": 0,
+                        "total_problems": block["total_problems"],
+                        "perf": None,
+                        "cells": {},
+                        "gpus": {},
+                    },
                 )
                 mb.setdefault("gpus", {})[gpu_key] = block
 
@@ -382,13 +424,16 @@ def load_mega(models: Models, csv_path: Path) -> None:
 
 
 def load_legacy_v1(models: Models, path: Path) -> None:
-    d = json.loads(path.read_text())
+    d = read_json_file(path)
     n_problems = len(d.get("problems", []))
     KNOWN_PROBLEMS.update(d.get("problems", []))
     for m in d.get("models", []):
         slug = slugify(m.get("model") or m.get("label") or "")
         entry = models.get(slug)
-        leg = entry["legacy"].setdefault("hard_v1", {"best_pass_count": 0, "total_problems": n_problems, "labels": set()})
+        leg = entry["legacy"].setdefault(
+            "hard_v1",
+            {"best_pass_count": 0, "total_problems": n_problems, "labels": set()},
+        )
         leg["labels"].add(m.get("label"))
         leg["best_pass_count"] = max(leg["best_pass_count"], m.get("pass_count", 0))
     for entry in models.by_slug.values():
@@ -407,7 +452,11 @@ def annotation_files(ann_dir: Path) -> list[Path]:
     try:
         rel = ann_dir.relative_to(REPO)
         out = subprocess.run(
-            ["git", "ls-files", str(rel)], capture_output=True, text=True, cwd=REPO, check=False
+            ["git", "ls-files", str(rel)],
+            capture_output=True,
+            text=True,
+            cwd=REPO,
+            check=False,
         )
         if out.returncode == 0:
             return sorted(
@@ -423,8 +472,17 @@ def annotation_files(ann_dir: Path) -> list[Path]:
 def regex_annotation(text: str) -> dict:
     """Last-resort extractor for YAMLs pyyaml rejects (verbatim field scrape)."""
     out: dict = {}
-    for k in ("run_id", "model", "verdict", "problem", "harness", "effort", "gpu",
-              "failure_reason", "measurement_status"):
+    for k in (
+        "run_id",
+        "model",
+        "verdict",
+        "problem",
+        "harness",
+        "effort",
+        "gpu",
+        "failure_reason",
+        "measurement_status",
+    ):
         m = re.search(rf"^{k}:\s*(.+?)\s*$", text, re.M)
         if m:
             out[k] = m.group(1).strip().strip('"').strip("'")
@@ -461,18 +519,23 @@ def annotation_gpu_key(gpu: object) -> str | None:
     return None
 
 
-def join_annotations(models: Models, bench: str, ann_dir: Path) -> tuple[list[str], int]:
+def join_annotations(
+    models: Models, bench: str, ann_dir: Path
+) -> tuple[list[str], int]:
     """Attach audit counts + flag lists. Returns (annotation-only slugs, n_files)."""
-    files = [f for f in annotation_files(ann_dir) if f.exists()]
+    files = [f for f in annotation_files(ann_dir) if f.exists() or f.is_symlink()]
     annotation_only: set[str] = set()
     for f in files:
+        text = read_bounded_text(f, max_bytes=4 * 1024 * 1024)
         try:
-            a = yaml.safe_load(f.read_text()) or {}
+            a = yaml.safe_load(text) or {}
         except yaml.YAMLError:
             print(f"  WARN: yaml parse fallback {f.name}")
-            a = regex_annotation(f.read_text())
+            a = regex_annotation(text)
         run_id = a.get("run_id") or f.stem
-        model_field = (a.get("model") or "").strip() if isinstance(a.get("model"), str) else ""
+        model_field = (
+            (a.get("model") or "").strip() if isinstance(a.get("model"), str) else ""
+        )
         if not model_field:
             model_field = model_from_run_id(run_id) or ""
         slug = slugify(model_field)
@@ -492,9 +555,16 @@ def join_annotations(models: Models, bench: str, ann_dir: Path) -> tuple[list[st
         bench_block = entry["benches"].get(bench)
         if bench_block is None:
             annotation_only.add(slug)
-            bench_block = {"label": None, "harness": None, "effort": None,
-                           "passed": 0, "total_problems": 0, "perf": None,
-                           "cells": {}, "gpus": {}}
+            bench_block = {
+                "label": None,
+                "harness": None,
+                "effort": None,
+                "passed": 0,
+                "total_problems": 0,
+                "perf": None,
+                "cells": {},
+                "gpus": {},
+            }
             entry["benches"][bench] = bench_block
         bench_block["audited"] = bench_block.get("audited", 0) + 1
         bench_block.setdefault("outcomes", []).append(
@@ -517,9 +587,7 @@ def join_annotations(models: Models, bench: str, ann_dir: Path) -> tuple[list[st
                     if bench == "mega"
                     else solution_url(run_id, annotation_gpu_key(a.get("gpu")))
                 ),
-                "trace_url": trace_url(
-                    bench, run_id, annotation_gpu_key(a.get("gpu"))
-                ),
+                "trace_url": trace_url(bench, run_id, annotation_gpu_key(a.get("gpu"))),
             }
         )
         if bench == "mega":
@@ -573,7 +641,11 @@ def join_annotations(models: Models, bench: str, ann_dir: Path) -> tuple[list[st
         if flagged:
             eff = verdict if verdict in FLAG_VERDICTS else "megakernel_not_authentic"
             bench_block.setdefault("flags", []).append(
-                {"run_id": run_id, "verdict": eff, "summary": (a.get("summary") or "").strip()}
+                {
+                    "run_id": run_id,
+                    "verdict": eff,
+                    "summary": (a.get("summary") or "").strip(),
+                }
             )
             # reflect the flag onto the matching cell so the UI chips line up
             for block in blocks:
@@ -584,7 +656,10 @@ def join_annotations(models: Models, bench: str, ann_dir: Path) -> tuple[list[st
         else:
             for block in blocks:
                 for cell in block.get("cells", {}).values():
-                    if cell.get("run_id") == run_id and cell.get("verdict") in (None, "unaudited"):
+                    if cell.get("run_id") == run_id and cell.get("verdict") in (
+                        None,
+                        "unaudited",
+                    ):
                         cell["verdict"] = verdict or "unaudited"
     return sorted(annotation_only), len(files)
 
@@ -603,10 +678,12 @@ def join_catalog(models: Models) -> None:
     catalog is a soft no-op so model-index builds still work offline.
     """
     path = REPO / "public" / "data" / "catalog.json"
-    if not path.exists():
-        print("WARN: no catalog.json — outcomes not joined (run scripts/build_catalog.py)")
+    if not path.exists() and not path.is_symlink():
+        print(
+            "WARN: no catalog.json — outcomes not joined (run scripts/build_catalog.py)"
+        )
         return
-    cat = json.loads(path.read_text())
+    cat = read_json_file(path)
     legend = {x["code"]: x["label"] for x in cat.get("legend", [])}
     by_run = {c["run_id"]: c for c in cat.get("cells", []) if c.get("run_id")}
     n = 0
@@ -624,7 +701,10 @@ def join_catalog(models: Models) -> None:
                         fallback = "pass" if cell.get("valid") else "other"
                         cell.setdefault("outcome", fallback)
                         cell.setdefault(
-                            "outcome_label", legend.get(fallback, "pass" if fallback == "pass" else "fail")
+                            "outcome_label",
+                            legend.get(
+                                fallback, "pass" if fallback == "pass" else "fail"
+                            ),
                         )
                         continue
                     fallback = src.get("outcome") or "other"
@@ -649,7 +729,11 @@ def compute_perf(models: Models) -> None:
     Bests are recomputed from CURRENT board rows post-flag (valid cells only).
     """
     for bench in ("hard", "mega", "cuda"):
-        blocks = [e["benches"][bench] for e in models.by_slug.values() if bench in e["benches"]]
+        blocks = [
+            e["benches"][bench]
+            for e in models.by_slug.values()
+            if bench in e["benches"]
+        ]
         groups: list[list[dict]] = [blocks]
         gpu_keys = sorted({k for b in blocks for k in b.get("gpus", {})})
         for g in gpu_keys:
@@ -705,21 +789,36 @@ def finalize(models: Models) -> dict:
     bench_meta = {}
     for bench in ("hard", "cuda"):
         p = REPO / "benchmarks" / bench / "results" / "leaderboard_v2.json"
-        if p.exists():
-            d = json.loads(p.read_text())
-            bench_meta[bench] = {"problems": d.get("problems", []), "gpu": d.get("hardware", "")}
-    mega_rows = list(csv.DictReader((REPO / "public" / "data" / "mega" / "results.csv").read_text().splitlines()))
+        if p.exists() or p.is_symlink():
+            d = read_json_file(p)
+            bench_meta[bench] = {
+                "problems": d.get("problems", []),
+                "gpu": d.get("hardware", ""),
+            }
+    mega_rows = list(
+        csv.DictReader(
+            read_bounded_text(
+                REPO / "public" / "data" / "mega" / "results.csv",
+                max_bytes=64 * 1024 * 1024,
+            ).splitlines()
+        )
+    )
     bench_meta["mega"] = {
         "problems": sorted({r["problem"] for r in mega_rows}),
         "gpu": "RTX PRO 6000 Blackwell",
     }
     for bench in bench_meta:
-        gpu_keys = sorted({
-            k for e in models.by_slug.values()
-            for k in e["benches"].get(bench, {}).get("gpus", {})
-        })
+        gpu_keys = sorted(
+            {
+                k
+                for e in models.by_slug.values()
+                for k in e["benches"].get(bench, {}).get("gpus", {})
+            }
+        )
         bench_meta[bench]["gpus"] = ["rtxpro6000", *gpu_keys]
-        bench_meta[bench]["gpu_labels"] = {k: GPU_LABELS.get(k, k) for k in bench_meta[bench]["gpus"]}
+        bench_meta[bench]["gpu_labels"] = {
+            k: GPU_LABELS.get(k, k) for k in bench_meta[bench]["gpus"]
+        }
 
     out_models = []
     for slug in sorted(models.by_slug):
@@ -767,19 +866,21 @@ def finalize(models: Models) -> dict:
     }
 
 
-def main() -> None:
+def _build() -> None:
     models = Models()
-    load_site_board(models, "hard", REPO / "benchmarks/hard/results/leaderboard.json", None)
+    load_site_board(
+        models, "hard", REPO / "benchmarks/hard/results/leaderboard.json", None
+    )
     for gpu_key in ("h100", "b200"):
         p = REPO / f"benchmarks/hard/results/leaderboard.{gpu_key}.json"
-        if p.exists():
+        if p.exists() or p.is_symlink():
             load_site_board(models, "hard", p, gpu_key)
     cuda_board = REPO / "benchmarks/cuda/results/leaderboard.json"
-    if cuda_board.exists():
+    if cuda_board.exists() or cuda_board.is_symlink():
         load_site_board(models, "cuda", cuda_board, None)
     for gpu_key in ("h100", "b200"):
         p = REPO / f"benchmarks/cuda/results/leaderboard.{gpu_key}.json"
-        if p.exists():
+        if p.exists() or p.is_symlink():
             load_site_board(models, "cuda", p, gpu_key)
     load_mega(models, REPO / "public/data/mega/results.csv")
     load_legacy_v1(models, REPO / "benchmarks/hard/results/leaderboard_v1.json")
@@ -803,28 +904,40 @@ def main() -> None:
             continue
         for block in [mb, *mb.get("gpus", {}).values()]:
             if block.get("cells"):
-                block["passed"] = sum(1 for c in block["cells"].values() if c.get("valid"))
+                block["passed"] = sum(
+                    1 for c in block["cells"].values() if c.get("valid")
+                )
 
     join_catalog(models)
 
     out = finalize(models)
-    OUT.write_text(json.dumps(out, indent=2) + "\n")
 
     # ---- verification report ----
     n = len(out["models"])
     flagged_models = [m for m in out["models"] if m["totals"]["flagged"]]
-    print(f"models.json written: {OUT} ({n} models)")
     for bench in ("hard", "mega", "cuda"):
         present = [m["slug"] for m in out["models"] if bench in m["benches"]]
         print(f"  {bench}: {len(present)} models")
-    print(f"  flagged models: {len(flagged_models)} -> {[m['slug'] for m in flagged_models]}")
+    print(
+        f"  flagged models: {len(flagged_models)} -> {[m['slug'] for m in flagged_models]}"
+    )
     for bench, slugs in annotation_only_all.items():
         print(f"  {bench} annotations with no board row (sink section): {slugs}")
     # invariant: every tracked annotation file joined to exactly one model
     total_flags = sum(m["totals"]["flagged"] for m in out["models"])
     total_aud = sum(m["totals"]["audited"] for m in out["models"])
-    print(f"  audited total {total_aud} (tracked annotation files: {n_files_total})  flags total {total_flags}")
-    assert total_aud == n_files_total, "annotation count mismatch — a yaml failed to join"
+    print(
+        f"  audited total {total_aud} (tracked annotation files: {n_files_total})  flags total {total_flags}"
+    )
+    if total_aud != n_files_total:
+        raise RuntimeError("annotation count mismatch — a yaml failed to join")
+    atomic_write_text(OUT, json.dumps(out, indent=2) + "\n")
+    print(f"models.json written: {OUT} ({n} models)")
+
+
+def main() -> None:
+    with trusted_archive_lock():
+        _build()
 
 
 if __name__ == "__main__":

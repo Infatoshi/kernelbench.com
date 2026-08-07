@@ -9,9 +9,12 @@ The GPU-coupled sweep orchestration stays as bench-local shell
 (benchmarks/<bench>/scripts/*.sh); this CLI shells out to it. The cross-bench
 post-hoc Python (audit, lint, contamination, traces->HF) lives here.
 """
+
 from __future__ import annotations
 
 import csv
+import contextlib
+import fcntl
 import json
 import os
 import re
@@ -69,13 +72,17 @@ def repo_root() -> Path:
         return Path(env).resolve()
     cur = Path.cwd().resolve()
     for cand in (cur, *cur.parents):
-        if (cand / "benchmarks" / "hard").is_dir() and (cand / "package.json").is_file():
+        if (cand / "benchmarks" / "hard").is_dir() and (
+            cand / "package.json"
+        ).is_file():
             return cand
     # last resort: package lives at <root>/kbtool/kb/cli.py
     guess = Path(__file__).resolve().parents[2]
     if (guess / "benchmarks").is_dir():
         return guess
-    sys.exit("kb: cannot locate repo root (set KB_REPO_ROOT or run from inside the repo)")
+    sys.exit(
+        "kb: cannot locate repo root (set KB_REPO_ROOT or run from inside the repo)"
+    )
 
 
 def _load_env_vars() -> dict[str, str]:
@@ -86,7 +93,7 @@ def _load_env_vars() -> dict[str, str]:
     for ln in envf.read_text().splitlines():
         ln = ln.strip()
         if ln.startswith("export "):
-            ln = ln[len("export "):]
+            ln = ln[len("export ") :]
         if "=" in ln and not ln.startswith("#"):
             k, v = ln.split("=", 1)
             out[k.strip()] = v.strip().strip('"').strip("'")
@@ -96,7 +103,11 @@ def _load_env_vars() -> dict[str, str]:
 def preflight_key(harness: str, model: str = "") -> None:
     need = _NEED.get(harness, "")
     if harness == "opencode":
-        if model.startswith(("openrouter-",)) or any(s in model for s in ("/qwen/", "/xiaomi/")) or model.startswith("moonshotai/"):
+        if (
+            model.startswith(("openrouter-",))
+            or any(s in model for s in ("/qwen/", "/xiaomi/"))
+            or model.startswith("moonshotai/")
+        ):
             need = "OPENROUTER_API_KEY"
         elif model.startswith("deepseek/"):
             need = "DEEPSEEK_API_KEY"
@@ -147,6 +158,7 @@ DEFAULT_PROBLEMS_ROOT = {
     "cuda": "problems-rtxpro6000",
     "mini": "problems-h100",
 }
+_ACTIVE_ARCHIVE_LOCK_FD: int | None = None
 
 
 def _bench_dir(root: Path, bench: str) -> Path:
@@ -156,10 +168,60 @@ def _bench_dir(root: Path, bench: str) -> Path:
     return d
 
 
+@contextlib.contextmanager
+def _trusted_archive_lock():
+    """Hold one archive/publication snapshot across composite CLI commands."""
+
+    global _ACTIVE_ARCHIVE_LOCK_FD
+    inherited_text = os.environ.get("KBH_TRUST_ARCHIVE_LOCK_FD", "")
+    if inherited_text.isdigit():
+        inherited = int(inherited_text)
+        try:
+            opened = os.fstat(inherited)
+            root = os.stat("/", follow_symlinks=False)
+            if (opened.st_dev, opened.st_ino) == (root.st_dev, root.st_ino):
+                fcntl.flock(inherited, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                previous_active = _ACTIVE_ARCHIVE_LOCK_FD
+                _ACTIVE_ARCHIVE_LOCK_FD = inherited
+                try:
+                    yield inherited
+                finally:
+                    _ACTIVE_ARCHIVE_LOCK_FD = previous_active
+                return
+        except (BlockingIOError, OSError, ValueError):
+            pass
+    descriptor = os.open("/", os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    previous = os.environ.get("KBH_TRUST_ARCHIVE_LOCK_FD")
+    previous_active = _ACTIVE_ARCHIVE_LOCK_FD
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        os.set_inheritable(descriptor, True)
+        os.environ["KBH_TRUST_ARCHIVE_LOCK_FD"] = str(descriptor)
+        _ACTIVE_ARCHIVE_LOCK_FD = descriptor
+        yield descriptor
+    finally:
+        _ACTIVE_ARCHIVE_LOCK_FD = previous_active
+        if previous is None:
+            os.environ.pop("KBH_TRUST_ARCHIVE_LOCK_FD", None)
+        else:
+            os.environ["KBH_TRUST_ARCHIVE_LOCK_FD"] = previous
+        fcntl.flock(descriptor, fcntl.LOCK_UN)
+        os.close(descriptor)
+
+
+def _publication_run(*args, **kwargs) -> subprocess.CompletedProcess:
+    if _ACTIVE_ARCHIVE_LOCK_FD is not None:
+        inherited = tuple(kwargs.pop("pass_fds", ()))
+        kwargs["pass_fds"] = (*inherited, _ACTIVE_ARCHIVE_LOCK_FD)
+    return subprocess.run(*args, **kwargs)
+
+
 def cmd_sweep(root: Path, args: list[str], bench: str = "hard") -> int:
     if bench not in SWEEPABLE:
-        sys.exit(f"kb sweep: '{bench}' has its own driver — see benchmarks/{bench}/scripts/ "
-                 "(mega: sweep.sh, multi: sweep_wave.sh)")
+        sys.exit(
+            f"kb sweep: '{bench}' has its own driver — see benchmarks/{bench}/scripts/ "
+            "(mega: sweep.sh, multi: sweep_wave.sh)"
+        )
     _require_local_gpu()
     harness = args[0] if args else ""
     model = args[1] if len(args) > 1 else ""
@@ -171,7 +233,9 @@ def cmd_run(root: Path, args: list[str], bench: str = "hard") -> int:
     if len(args) < 3:
         sys.exit("usage: kb [-b bench] run <harness> <model> <problem> [effort]")
     if bench not in SWEEPABLE:
-        sys.exit(f"kb run: '{bench}' has its own driver — see benchmarks/{bench}/scripts/")
+        sys.exit(
+            f"kb run: '{bench}' has its own driver — see benchmarks/{bench}/scripts/"
+        )
     _require_local_gpu()
     h, m, p = args[0], args[1], args[2]
     effort = args[3:] if len(args) > 3 else []
@@ -189,24 +253,31 @@ def cmd_publish(root: Path, args: list[str], bench: str = "hard") -> int:
     args = [a for a in args if a != "--push"]
     if args:  # positional bench (kb publish mega) wins over -b
         bench = args[0]
-    script = {"hard": "publish_v2.sh", "cuda": "publish_v2.sh", "mini": "publish_v2.sh",
-              "mega": "publish_mega.sh"}.get(bench)
+    script = {
+        "hard": "publish_v2.sh",
+        "cuda": "publish_v2.sh",
+        "mini": "publish_v2.sh",
+        "mega": "publish_mega.sh",
+    }.get(bench)
     if not script:
-        sys.exit(f"kb publish: no publish script for bench '{bench}' (hard|cuda|mini|mega)")
+        sys.exit(
+            f"kb publish: no publish script for bench '{bench}' (hard|cuda|mini|mega)"
+        )
     pub = _bench_dir(root, bench) / "scripts" / script
-    subprocess.run([str(pub)], check=True)
-    # Run detail must be rebuilt BEFORE the model index: build_model_index.py
-    # only bakes a cell's detail_url when its rundetail/<rid>.json exists.
-    rc = _rebuild_run_detail(root)
-    if rc != 0:
-        return rc
-    rc = _rebuild_model_index(root)
-    if rc != 0:
-        return rc
-    if not push:
-        return 0
-    # --push: publish, then upload the published runs' traces to HF.
-    return cmd_push_runs(root, [bench])
+    with _trusted_archive_lock():
+        _publication_run([str(pub)], check=True)
+        # Run detail must be rebuilt BEFORE the model index: build_model_index.py
+        # only bakes a cell's detail_url when its rundetail/<rid>.json exists.
+        rc = _rebuild_run_detail(root)
+        if rc != 0:
+            return rc
+        rc = _rebuild_model_index(root)
+        if rc != 0:
+            return rc
+        if not push:
+            return 0
+        # --push: upload exactly the published snapshot while its lock is held.
+        return cmd_push_runs(root, [bench])
 
 
 def _rebuild_run_detail(root: Path) -> int:
@@ -217,7 +288,7 @@ def _rebuild_run_detail(root: Path) -> int:
     if not script.exists():
         return 0
     print("kb: rebuilding public/data/rundetail")
-    return subprocess.run(
+    return _publication_run(
         ["uv", "run", "--with", "pyyaml", "python", str(script)],
         cwd=root,
     ).returncode
@@ -230,7 +301,7 @@ def _rebuild_model_index(root: Path) -> int:
     if not script.exists():
         return 0
     print("kb: rebuilding public/data/models.json")
-    return subprocess.run(
+    return _publication_run(
         ["uv", "run", "--with", "pyyaml", "python", str(script)],
         cwd=root,
     ).returncode
@@ -257,7 +328,10 @@ def _mega_csv_run_ids(root: Path) -> list[str]:
     if not f.exists():
         return []
     with f.open() as fh:
-        return sorted({row["run_id"] for row in csv.DictReader(fh) if row.get("run_id")})
+        return sorted(
+            {row["run_id"] for row in csv.DictReader(fh) if row.get("run_id")}
+        )
+
 
 def _audited_run_ids(bench_dir: Path, board: str | None) -> list[str]:
     """Return manually audited runs for one hardware namespace.
@@ -324,16 +398,18 @@ def cmd_push_runs(root: Path, args: list[str], bench: str = "hard") -> int:
     if "--dataset" in args:
         i = args.index("--dataset")
         dataset = args[i + 1]
-        del args[i:i + 2]
+        del args[i : i + 2]
     board = None  # non-canonical GPU board key (h100|b200)
     if "--board" in args:
         i = args.index("--board")
         board = args[i + 1]
-        del args[i:i + 2]
+        del args[i : i + 2]
     if args:  # positional bench wins over -b
         bench = args[0]
     if bench not in ("hard", "mega", "cuda"):
-        sys.exit("kb push-runs: only hard|mega|cuda have trace datasets (v3 is archived)")
+        sys.exit(
+            "kb push-runs: only hard|mega|cuda have trace datasets (v3 is archived)"
+        )
     if board and bench not in ("hard", "mega", "cuda"):
         sys.exit("kb push-runs: --board only applies to hard|mega|cuda")
     bench_dir = _bench_dir(root, bench)
@@ -361,8 +437,7 @@ def cmd_push_runs(root: Path, args: list[str], bench: str = "hard") -> int:
         src_dir = "runs"
         if bench == "mega":
             rids = sorted(
-                set(_mega_csv_run_ids(root))
-                | set(_audited_run_ids(bench_dir, None))
+                set(_mega_csv_run_ids(root)) | set(_audited_run_ids(bench_dir, None))
             )
         else:
             rids = sorted(
@@ -370,7 +445,11 @@ def cmd_push_runs(root: Path, args: list[str], bench: str = "hard") -> int:
                 | set(_audited_run_ids(bench_dir, None))
             )
     if not rids:
-        src = "public/data/mega/results.csv" if bench == "mega" else f"{bench}/results/leaderboard.json"
+        src = (
+            "public/data/mega/results.csv"
+            if bench == "mega"
+            else f"{bench}/results/leaderboard.json"
+        )
         sys.exit(f"kb push-runs: no run_ids in {src}")
     rids = _check_rid_collisions(root, bench, rids, src_dir)
 
@@ -386,10 +465,21 @@ def cmd_push_runs(root: Path, args: list[str], bench: str = "hard") -> int:
         conv = _bench_dir(root, "hard") / "scripts" / "traces_to_hf.py"
     print(f"converting {len(rids)} published/audited run traces -> {staging} ...")
     bench_env = {k: v for k, v in os.environ.items() if k != "VIRTUAL_ENV"}
-    subprocess.run(
-        ["uv", "run", "python", str(conv), str(staging),
-         "--from-list", str(listfile), "--search", f"outputs/{src_dir}"],
-        cwd=bench_dir, check=True, env=bench_env,
+    _publication_run(
+        [
+            "uv",
+            "run",
+            "python",
+            str(conv),
+            str(staging),
+            "--from-list",
+            str(listfile),
+            "--search",
+            f"outputs/{src_dir}",
+        ],
+        cwd=bench_dir,
+        check=True,
+        env=bench_env,
     )
     produced = sorted(staging.glob("*.jsonl"))
     print(f"  produced {len(produced)} jsonl traces")
@@ -400,37 +490,62 @@ def cmd_push_runs(root: Path, args: list[str], bench: str = "hard") -> int:
         return 0
 
     from huggingface_hub import HfApi
+
     api = HfApi()
     api.create_repo(dataset, repo_type="dataset", exist_ok=True)
     print(f"uploading {len(produced)} traces -> {dest} ...")
-    api.upload_folder(folder_path=str(staging), repo_id=dataset, repo_type="dataset",
-                      path_in_repo=(board or ""),
-                      commit_message=f"publish {bench} run traces ({len(produced)} runs)"
-                                     + (f" [{board}]" if board else ""))
+    api.upload_folder(
+        folder_path=str(staging),
+        repo_id=dataset,
+        repo_type="dataset",
+        path_in_repo=(board or ""),
+        commit_message=f"publish {bench} run traces ({len(produced)} runs)"
+        + (f" [{board}]" if board else ""),
+    )
     print(f"done: https://huggingface.co/datasets/{dataset}")
     return 0
 
 
 def cmd_deploy(root: Path, args: list[str], bench: str = "hard") -> int:
     msg = args[0] if args else "publish kernelbench results"
-    subprocess.run([str(_bench_dir(root, "hard") / "scripts" / "publish_v2.sh")], check=True)
-    subprocess.run([str(_bench_dir(root, "cuda") / "scripts" / "publish_v2.sh")], check=True)
-    subprocess.run([str(_bench_dir(root, "mega") / "scripts" / "publish_mega.sh")], check=True)
-    rc = _rebuild_model_index(root)
-    if rc != 0:
-        return rc
-    os.chdir(root)
-    subprocess.run(["git", "add", "-A", "benchmarks/hard/results", "benchmarks/cuda/results",
-                    "benchmarks/mega/results", "public/runs", "public/data", "app"], check=True)
-    rc = subprocess.run(
-        ["git", "-c", "user.email=elliot@arledge.net", "commit", "-m", msg]
-    ).returncode
-    if rc != 0:
-        print("nothing to commit")
+    with _trusted_archive_lock():
+        _publication_run(
+            [str(_bench_dir(root, "hard") / "scripts" / "publish_v2.sh")], check=True
+        )
+        _publication_run(
+            [str(_bench_dir(root, "cuda") / "scripts" / "publish_v2.sh")], check=True
+        )
+        _publication_run(
+            [str(_bench_dir(root, "mega") / "scripts" / "publish_mega.sh")], check=True
+        )
+        rc = _rebuild_run_detail(root)
+        if rc != 0:
+            return rc
+        rc = _rebuild_model_index(root)
+        if rc != 0:
+            return rc
+        os.chdir(root)
+        _publication_run(
+            [
+                "git",
+                "add",
+                "-A",
+                "benchmarks/hard/results",
+                "benchmarks/cuda/results",
+                "benchmarks/mega/results",
+                "public/runs",
+                "public/data",
+                "app",
+            ],
+            check=True,
+        )
+        rc = _publication_run(["git", "commit", "-m", msg]).returncode
+        if rc != 0:
+            print("nothing to commit")
+            return 0
+        _publication_run(["git", "push", "origin", "master"], check=True)
+        print("pushed; Vercel auto-builds.")
         return 0
-    subprocess.run(["git", "push", "origin", "master"], check=True)
-    print("pushed; Vercel auto-builds.")
-    return 0
 
 
 def _js_runner() -> str:
@@ -458,7 +573,14 @@ def cmd_audit(root: Path, args: list[str], bench: str = "hard") -> int:
     if not d.is_dir():
         sys.exit(f"no such run: {rid}")
     r = json.loads((d / "result.json").read_text())
-    keys = ("harness", "model", "correct", "peak_fraction", "template_mutated", "failure_reason")
+    keys = (
+        "harness",
+        "model",
+        "correct",
+        "peak_fraction",
+        "template_mutated",
+        "failure_reason",
+    )
     print({k: r.get(k) for k in keys})
     ann = bdir / "results" / "annotations" / f"{rid}.yaml"
     if ann.exists():
@@ -469,13 +591,18 @@ def cmd_audit(root: Path, args: list[str], bench: str = "hard") -> int:
 
 def cmd_lint(root: Path, args: list[str], bench: str = "hard") -> int:
     # mega/multi have no local lint copy; hard's scanner works on any run dir.
-    b = bench if (root / "benchmarks" / bench / "scripts" / "reward_hack_lint.py").exists() else "hard"
+    b = (
+        bench
+        if (root / "benchmarks" / bench / "scripts" / "reward_hack_lint.py").exists()
+        else "hard"
+    )
     script = _bench_dir(root, b) / "scripts" / "reward_hack_lint.py"
     return _exec(["python3", str(script), *args])
 
 
 def cmd_contamination(root: Path, args: list[str], bench: str = "hard") -> int:
     from kb import contamination
+
     return contamination.run(args, repo_root=root)
 
 
@@ -490,7 +617,11 @@ def cmd_lambda(root: Path, args: list[str], bench: str = "hard") -> int:
 
 
 def cmd_traces_to_hf(root: Path, args: list[str], bench: str = "hard") -> int:
-    b = bench if (root / "benchmarks" / bench / "scripts" / "traces_to_hf.py").exists() else "hard"
+    b = (
+        bench
+        if (root / "benchmarks" / bench / "scripts" / "traces_to_hf.py").exists()
+        else "hard"
+    )
     script = _bench_dir(root, b) / "scripts" / "traces_to_hf.py"
     os.chdir(_bench_dir(root, b))
     os.execvp("uv", ["uv", "run", "python", str(script), *args])
@@ -524,7 +655,7 @@ def _pop_bench(argv: list[str]) -> str:
             if i + 1 >= len(argv):
                 sys.exit("kb: -b/--bench needs a value (hard|cuda|mini|mega|multi)")
             bench = argv[i + 1]
-            del argv[i:i + 2]
+            del argv[i : i + 2]
             continue
         if a.startswith("--bench="):
             bench = a.split("=", 1)[1]

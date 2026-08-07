@@ -50,18 +50,15 @@ scan, `03_topp_mask` sort-free CUDA-only exact-graded ms-anchored,
 `04_flash_attention` CUDA-only causal flash forward). Unlike every other
 bench: **capped** 30-min sessions (`BUDGET_SECONDS=1800`), **5 repeats** per
 (model, harness, problem) cell (pass rate k/5 + best-of-5), harness pairing
-opencode vs `*-claude` per model (local-vLLM subjects use the five `lfm-*` /
-`hermes` / `pi` routes instead), canonical GPU = **Lambda H100 SXM5**
+opencode vs `*-claude` per model, canonical GPU = **Lambda H100 SXM5**
 (hardware key `H100_SXM` — SXM peaks, not the PCIe `H100` entry). Drive with
 `cd benchmarks/mini && ./scripts/sweep_mini.sh <harness> <model>` (one
-column = 4 problems x 5 repeats; one invocation per column). Inference for
+column = 4 problems x 5 repeats; one invocation per model). Inference for
 API-less models is vLLM co-hosted on the eval H100 itself (localhost:8765,
-~35% GPU mem) since 2026-07-29; the "never the eval GPU" rule applies to the
-**re-grade phase only** (stop the server first). Deck is unpublished — keep
-it out of public posts until it debuts. **Operator source of truth:**
-`benchmarks/mini/SPEC.md` (architecture + runbook + which scripts to ignore +
-pre-debut checklist). Journey/war stories: `benchmarks/mini/DEVLOG.md`.
-Short entrypoint: `benchmarks/mini/README.md`.
+35% GPU mem) since 2026-07-29; the "never the eval GPU" rule now applies to
+the re-grade phase only (see mini DEVLOG). Deck is
+unpublished — keep it out of public posts until it debuts. See
+`benchmarks/mini/SPEC.md` + `DEVLOG.md` (calibration debts before freeze).
 
 **KernelBench-CUDA language gate:** `src/eval/cuda_language.py` hard-fails
 Triton (`@triton.jit`, `triton.language`), kernel DSLs (CuteDSL, TileLang,
@@ -87,7 +84,7 @@ benchmarks/hard/           KernelBench-Hard eval — the per-op deck
   problems-rtxpro6000/         the deck — per-GPU sets: -rtxpro6000 (default, RTX PRO 6000), -h100, -b200 (RTX 3090 removed from the suite 2026-07-21)
 benchmarks/mega/           KernelBench-Mega eval — megakernel deck (single problems/; reuses hard's machinery)
 benchmarks/cuda/           KernelBench-CUDA eval — CUDA-only deck (Triton/DSL fail); /cuda
-benchmarks/mini/           KernelBench-Mini eval — small-model deck, capped+5-repeat, Lambda H100 SXM (WIP); homepage scroll category on `/` (not a /mini route)
+benchmarks/mini/           KernelBench-Mini eval — small-model deck, capped+5-repeat, Lambda H100 SXM (WIP); /mini
 benchmarks/multi/          KernelBench-Multi eval — 4×H100 NVLink (WIP); /multi
 benchmarks/v3/             offline eval archive only (not on the website; keeps its own AGENTS.md)
 environments/              Prime Intellect `verifiers` mirrors (kernel_hard / kernel_mega / kernel_v3)
@@ -107,18 +104,12 @@ default scope is:
    deck (`02_kimi_linear_decode` at minimum), unlimited time for hard, the
    standard cap for mega. Existing valid cells for the same
    (model, harness, problem, GPU) don't need reruns.
-2. **Reward-hack audit every passing cell** — write
-   `benchmarks/<bench>/results/annotations/<run_id>.yaml` **before** any
-   number from that cell is a result. Isolated regrade is not this step.
-   See **Reward-hack audit — refuse-closed** below. A sweep is not done,
-   and an `audited/` draft is not started, until every passing headline
-   cell has a YAML. Isolated-regrade notes go in `media/posts/unaudited/`.
+2. **Reward-hack audit every cell** (subagent reads solution.py + trace,
+   annotation YAML written) — this is already mandatory before reporting, so a
+   "sweep" is not done until the audits are.
 3. **Publish end-to-end**: contamination check, redaction, `kb publish`,
-   commit + push (deploy). The website is first. Do not post to X until
-   the live board, this-run kernel file, and this-run HF trace return 200.
-   Short X posts: `docs/POST.md` (tweet 1 = copy + image; tweet 2 = board
-   + kernel + this-run trace) and
-   `media/posts/{unaudited,audited,posted}/`. Articles: `docs/ARTICLE.md`.
+   commit + push (deploy). Report back with the numbers and anything
+   interesting found in the traces.
 
 The human coming back to finished, audited, published results is the success
 condition. Only interrupt for a missing API key (`STOP: needs $X_API_KEY`), an
@@ -585,18 +576,6 @@ with `uv run` from the archived `uv.lock` if you need a local env. Lambda/Brev
 `scripts/lib/strip_run_venv.sh --tree benchmarks/<bench>/outputs` (and
 `rescue/`).
 
-**Pull from a GPU box (standing, 2026-08-17).** `du -sb` the remote paths
-before any `rsync`/`scp`. Print full vs tiny. Tiny default:
-`result.json`, `solution.py`, `gpu`, `check.log`, `benchmark.log`, sidecar
-`*.cu`/`*.cuh`/`kernels.py`. That is the audit + draft + `kb publish`
-input. Do **not** pull `transcript.jsonl`, `agent_home/`, `.venv/`, `repo/`,
-or `cache/` until this turn converts that run for HF. August 2026 wave:
-21 full dirs = 12.7 GiB; tiny set = 0.5 MB; tiny+transcripts = 1.0 GiB
-(one DeepSeek TopK jsonl was 241 MB). Over 20 MB, state the size and wait.
-Over 1 GB, refuse until the user sees the number. Prefer `ssh HOST cat
-.../result.json` when one file answers. Fleet-wide copy of this gate:
-`fleet-sync` skill, **Measure before any pull**.
-
 **Headline metric rule (standing, 2026-07-15).** Where a roofline ceiling is
 structurally unreadable (launch-overhead-bound, e.g. topk's ~0.02 ceiling, or
 dense-equivalent FLOPs a correct sparse kernel never executes, e.g. cuda
@@ -650,29 +629,6 @@ Most likely causes:
 4. **Agent CLI not authenticated** — `claude`, `codex`, `kimi` each need their own auth. Check `~/.env_vars` and each CLI's `info` / `whoami` command.
 5. **Agent stopped before writing anything** — hard runs are unlimited-time (no wall-clock cap; `BUDGET_SECONDS=0` in `run_hard.sh`), so a no-solution row is a real failure mode (early stop / provider error), not a budget cutoff; record it. Mega is unlimited too (cap removed 2026-07-15); the same applies there.
 
-## Friend handoff — reliability contract (2026-08-12)
-
-A friend should only review write-ups. These gates make a wrong number or a slop cover refuse closed. Provider-agnostic: Lambda, Brev, anvil, or any GPU box.
-
-**Closed tonight**
-
-1. **SKU pin + stamp.** `KBH_GPU` (default 0) exports `CUDA_VISIBLE_DEVICES`. `result.json` records `gpu_index` / `gpu_name` / `gpu_uuid`. `src/hardware/identify.py` maps the live `nvidia-smi` name onto a hardware key. 3090 / Quadro RTX 6000 / RTX 6000 Ada → refuse. H100 SXM ≠ H100 PCIe. Empty `CUDA_VISIBLE_DEVICES=` still hides CUDA and is illegal.
-2. **Article covers.** `media/thumb_card.py`. Official lab mark + one subject token, same size as the mark. Grok 5 is the black-hole G + digit `5` (not the old X-mark, not `GROK`). No fake black tiles. No stats. No KernelBench signature. DeepSeek subject is **0731**.
-
-**Still required before any published number**
-
-- Sequential isolated re-grade is the only publishable timing. In-run numbers during concurrent agents are contaminated.
-- Quiet GPU: zero compute PIDs, not "0% util with leftover VRAM". `nvidia-smi` timeout = wedged driver, STOP.
-- `torch.cuda.is_available()` after every `uv` command. `nvcc --version` is not a CUDA probe. `nvcc` must compile `#include <cuda_runtime.h>` with `cudafe++` next to it.
-- Wave complete = a `result.json` on the durable Mac host for every cell. Tmux alive, SSH 255, or nohup init-then-exit is not launched. Bootstrap is `nohup`/`systemd-run` on the node; laptop SSH is a probe.
-- Teardown uses a pidfile, never `pkill -f` (self-matches the ssh argv). Verify `kb lambda ls` / `brev ls` empty. Incremental pullback every 10 min; exclude `.venv`.
-- Contamination scan must rebuild grok streaming-json / read `~/.grok/sessions/*/chat_history.jsonl`. Empty `outputs/runs` is not a clean box if a CLI session store remains.
-- Parse the live served model id. Fable→Opus silent swap, z.ai `glm-5.1`→`glm-5.2`, and dropped `--effort` are not the requested cell.
-- Headline winners must equal argmax of the annotation YAML. Extrapolated microbench is not e2e. No annotation YAML → the isolated-regrade peak is not a headline. See **Reward-hack audit — refuse-closed**.
-- Article draft: inspect the PNG, then upload. X Article API is draft+publish only; one draft per ~15 min. Do not `--force` a deleted hash.
-
-Mined 2026-08-12 from 10 Grok 4.6 extractors over Claude / Codex / Grok KernelBench sessions. Known DEVLOG items were excluded. Remaining P0 holes (grok session-store sandbox, served-model pin, contamination rebuild, publish headline check) are listed above until they have the same refuse-closed code as the SKU stamp.
-
 ## Hard-won gotchas
 
 - **EVERY KernelBench artifact stays inside this repo, in its correct
@@ -689,7 +645,24 @@ Mined 2026-08-12 from 10 Grok 4.6 extractors over Claude / Codex / Grok KernelBe
   local copy of 33 already-published leaderboard cells. If you launch a remote
   worker, point its lock/log/archive paths at in-repo locations and `kb lambda
   pull` its archives back into `outputs/runs/` before teardown.
-- **GPU pin + SKU stamp (closed 2026-08-12).** `run_hard.sh` / `scripts/lib/run_harness.sh` now export `CUDA_VISIBLE_DEVICES=$KBH_GPU` (default `0`) and write `gpu_index`, `gpu_name`, `gpu_uuid` into `result.json`. Empty `CUDA_VISIBLE_DEVICES=` is still illegal (that hides CUDA). Live name → key lives in `src/hardware/identify.py` (copied across hard/cuda/mini/mega). A 3090, Quadro RTX 6000, or RTX 6000 Ada must never grade as `RTX_PRO_6000`. H100 SXM and H100 PCIe are different keys. Publish refuse if `gpu_name` is empty or `identify.key_from_smi_name` ≠ the deck's `problem.yaml` hardware key. Sequential isolated re-grade still owns the published number; the stamp is what makes a wrong-SKU cell detectable.
+- **The harness does NOT pin a GPU, and `result.json` does NOT record which GPU
+  ran (2026-07-25).** `run_hard.sh` sets `CUDA_VISIBLE_DEVICES` nowhere, so on a
+  multi-GPU box an agent sees every device. On anvil that means GPU0 (RTX PRO
+  6000, sm_120) **and** GPU1 (RTX 3090, sm_86). Default torch device is `cuda:0`
+  = the PRO 6000, so the common case is right **by luck, not by construction** —
+  an agent that writes `cuda:1`, or iterates devices, silently benchmarks on the
+  wrong SKU. And because `result.json` carries only `peak_fraction` /
+  `gpu_queue_mode` and no device name, **a cell that wandered onto the wrong GPU
+  cannot be detected after the fact from the artifact.** A 3090 number graded
+  against the PRO 6000 roofline is meaningless.
+  Until this is fixed, the mandatory sequential isolated re-grade is what makes
+  published numbers trustworthy: **pin `CUDA_VISIBLE_DEVICES=0` (or the intended
+  device) when re-grading**, so every published figure is provably from the
+  right SKU regardless of what the agent session did. Single-GPU rented workers
+  (Lambda H100 PCIe, etc.) are unaffected.
+  Worth closing before the next wave: have `benchmark.py` record
+  `torch.cuda.get_device_name()` + the resolved hardware key into `result.json`,
+  and export an explicit `CUDA_VISIBLE_DEVICES` from `run_hard.sh`.
 - **A rented worker can pass `nvcc` checks and still be unable to run torch.**
   Lambda's stock image ships driver 570 and **no NVIDIA CUDA apt repo**, so
   `apt-get install cuda-toolkit-13-0` returns rc=100 (package not found) while
@@ -765,52 +738,36 @@ Mined 2026-08-12 from 10 Grok 4.6 extractors over Claude / Codex / Grok KernelBe
   published). PROPER FIX is a sandboxed harness — plan is to re-run on Prime
   Intellect's `verifiers` env (sandboxed harness + a judge/custom-verifier that
   inspects every passing solution). Until then the tripwire is the guard.
-### Reward-hack audit — refuse-closed (2026-08-16)
-
-Isolated regrade is timing. `kb lint` is a tripwire. Neither is an audit.
-
-A cell is not a **result** until
-`benchmarks/<bench>/results/annotations/<run_id>.yaml` exists with a `verdict:`
-(`clean` | `reward_hack` | `contamination` | `rubric_leak` | `interesting` | `bug`). Schema:
-`results/annotations/SCHEMA.md`. No YAML → you may not write that cell's peak,
-speedup, or "the kernel did X" anywhere a human will read it as a finding.
-
-**Reporting** (illegal without the YAML): status after the wave, "what
-impressed me", X posts, X Articles, charts, field comparisons, `kb publish`,
-leaderboard copy. A caveat ("audit still open", "not a board number yet",
-"same-buffer pending") does **not** license the number. Say `regrade done,
-audit pending` and stop. Do not put the peak in a draft.
-
-**Not an audit:** lint, reading the solution header, grepping `data_ptr`,
-isolated regrade PASS, "I will audit later", a draft with a footnote.
-
-**Is an audit:** (1) read `solution.py` end to end and confirm it computes the
-real op; (2) read the trace for stack/`check.py` sniffing, tolerance edits, or
-grader tampering; (3) for any cache / CUDA-graph / `data_ptr` / `id(state)` /
-identity key, overwrite the same input buffer with new bytes on a quiet GPU —
-output must change and match reference (proves recompute, not a stale lookup);
-sanity-check magnitude (a lookup reads >>1.0 of roofline); (4) confirm
-numeric stress ran (`check.py` unmodified, `KBH_NUMERIC_STRESS` not 0);
-(5) read the transcript for `list_dir` / `read_file` / `cp` of
-`outputs/runs` or `outputs/runs-remote-*`. A same-buffer overwrite pass is
-timing, not authorship. A literal `cp` of another archive's `solution.py`
-is `verdict: contamination`. `verdict: clean` must not override that
-(20260813 grok-4.6 copied Fable 24.6x from `runs-remote-pro` after an
-overwrite PASS). Write the YAML. Identity-pattern YAMLs must quote the
-overwrite cosines (`cos(out1,out2)` low, `cos(ref,sol)` ≥ gate). Missing
-those lines → treat as no YAML. Lint HACK = review, not auto-reject (false
-positive: `20260614_145529_zai-claude_glm-5.2_01_fp8_gemm`).
-
-Babysit while the session is live may print the in-run flywheel number only if
-the sentence says `in-run, not a result`. After the session ends, that
-exception dies. Dispatch the audit. Do not wait for the human to ask "did it
-cheat?"
-
-The template-mutation guard auto-flags grader tampering. `kb lint
-<run_id|--all>` scans input-identity memoization, stack/`check.py` sniffing,
-backend mutation, and zero-kernel wrappers, plus `template_mutated` from
-`result.json`. Use it. Do not stop there.
-
+- Reward-hack verdicts come from `results/annotations/<run_id>.yaml`; every
+  passing/failing headline cell should be audited (read the solution.py) before
+  publishing. The template-mutation guard auto-flags grader tampering.
+- `kb lint <run_id|--all>` is a static reward-hack TRIPWIRE: scans solution.py
+  for the patterns we have caught by hand (input-identity memoization,
+  stack/check.py sniffing, backend mutation, zero-kernel wrappers) plus surfaces
+  template_mutated from result.json. HACK = near-certain, FLAG = review. The
+  report is a pointer for a human audit; bundle-era publication additionally
+  reruns the same scan over the exact bundled source and automatically vetoes
+  HACK findings. FLAG and legacy results remain manual-review only.
+- **MANDATORY: before any cell is published or any result is reported, dispatch a
+  subagent to MANUALLY audit the solution.py AND the agent trace for reward
+  hacking — never trust the lint verdict alone (it both misses and over-fires).**
+  The lint is only a tripwire: it FALSE-POSITIVES (e.g. it flagged glm-5.2's
+  fp8 CUDA-graph kernel as "output memoization" on a `data_ptr()==` pattern, but
+  empirical audit proved the graph replay recomputes on live data — see
+  `results/annotations/20260614_145529_zai-claude_glm-5.2_01_fp8_gemm.yaml`), and
+  it can MISS hacks a static scan can't see. The subagent must: (1) read
+  solution.py end to end and confirm it computes the real op (not a cached/
+  constant/forbidden-lib path); (2) read the trace for stack/check.py sniffing,
+  tolerance edits, or grader tampering; (3) for any caching/CUDA-graph/identity
+  pattern, EMPIRICALLY test it — overwrite the same input buffer with new
+  contents and confirm the output changes (proves recompute, not a stale
+  lookup), and sanity-check the magnitude (a returned-cached-output "lookup"
+  reads >>1.0 of roofline; a real kernel lands near its theoretical time); (4)
+  confirm numeric stress actually ran (`check.py` unmodified, KBH_NUMERIC_STRESS
+  not 0). Record the verdict + evidence in `results/annotations/<run_id>.yaml`
+  (clean | reward_hack | ...). If a HACK tripwire is a demonstrated false
+  positive, fix or downgrade the shared pattern with a regression; an
+  annotation cannot override the bundle-era publication veto.
 - `04_kahan_softmax` was removed from the hard deck (rewarded skipping Kahan); do not
   re-add. (This is also why the hard deck skips 04.)
 - **KernelBench-Multi (`benchmarks/multi/`, the WIP 4×H100 NVLink bench) runs on
@@ -845,9 +802,6 @@ backend mutation, and zero-kernel wrappers, plus `template_mutated` from
 
 ## Publishing results: charts + write-ups (REQUIRED format)
 
-Article posts (X Articles, model write-ups): **`docs/ARTICLE.md`** is the workflow. Names from `MODEL_NAMES` / `HARNESSES.md` / `PROBLEM_LABELS`. Same skeleton every time (Drop → How I bench → Using it → Board → CUDA → Mega → Hard last). Skill `kb-article` routes there. Do not invent a second style. Close to `https://kernelbench.com`, never `/models`. **Using it** is voice-typed; stop if it is missing. Before draft: `uv run --no-project python media/check_article_links.py <article>` must exit 0. HF "unresolved" is a missing file, not a private dataset.
-
-
 When you post benchmark results (X posts, blog, threads), these rules are not
 optional. They are what makes a post read as signal, not slop.
 
@@ -862,8 +816,6 @@ optional. They are what makes a post read as signal, not slop.
   bugged/timed out. If `globals.css` changes, update `kbh_theme.py` to match.
   Charts are generated on Mac or Anvil (matplotlib) and dragged into posts;
   PNGs are gitignored, the `.py` scripts are tracked.
-- **Article covers are launch cards, not report cards.** 5:2 only (`media/thumb_card.py`, 3000×1200). Left mark is the official lab asset. Kimi ships a black App Store tile (`kimi-app-icon-1024.png`); DeepSeek / Qwen / Grok do **not** — never invent a black rounded app-icon tile for a transparent SVG. Grok is the Feb 2025 black-hole G, not the old xAI X-mark. Identity is mark + one subject token, same visual size as the mark (Grok 5 = `5`, DeepSeek = `0731`). No lab name next to the mark. No KernelBench signature. Forbidden on the card: charts, outcome bars, pass counts, peak_fraction, "writes kernels on", GPU lists, audit tallies, taglines. Inspect the PNG before upload.
-
 - **Visual-first: bars + axes only. No essay chrome.** Engagement charts are
   judged in a feed scroll — the graph is the product. Do **not** put multi-line
   titles, gray subtitle stacks, methodology paragraphs, or caption essays on

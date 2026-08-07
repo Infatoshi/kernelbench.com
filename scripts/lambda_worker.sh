@@ -9,7 +9,7 @@
 #      (bench selected by KB_LAMBDA_BENCH, default hard; `multi` also ships ~/.kbm_env)
 #   lambda_worker.sh bootstrap <name> [--agents]  uv + torch; --agents adds CLIs + auth
 #   lambda_worker.sh run <name> <harness> <model> <problem> [effort]
-#   lambda_worker.sh regrade <name> <run_id> [runs_dir]
+#   lambda_worker.sh regrade <name> <run_id> [runs_dir]  transfer full archive/bundle; run isolated sequential replay
 #   lambda_worker.sh pull <name>                  rsync outputs/runs back -> outputs/runs-lambda-<name>/
 #   lambda_worker.sh down <name>                  terminate by name (verified)
 #   lambda_worker.sh ssh <name> [cmd...]          ssh into instance
@@ -279,6 +279,12 @@ case "$CMD" in
     # root, so ship the lib INTO the bench dir (wrapper falls back to it).
     rsync -az -e "ssh -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=$STATE_DIR/known_hosts -o BatchMode=yes" \
       "$HERE/scripts/lib/" "${SSH_USER}@${IP}:$REMOTE_DIR/scripts/lib/"
+    rsync -az -e "ssh -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=$STATE_DIR/known_hosts -o BatchMode=yes" \
+      "$HERE/scripts/submission_bundle.py" \
+      "${SSH_USER}@${IP}:$REMOTE_DIR/scripts/submission_bundle.py"
+    rsync -az -e "ssh -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=$STATE_DIR/known_hosts -o BatchMode=yes" \
+      "$HERE/scripts/trusted_stage.py" \
+      "${SSH_USER}@${IP}:$REMOTE_DIR/scripts/trusted_stage.py"
     TMPENV="$(mktemp)"
     grep -E "^(export )?($ENV_ALLOWLIST)=" "$HOME/.env_vars" >"$TMPENV" || true
     rsync -az -e "ssh -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=$STATE_DIR/known_hosts -o BatchMode=yes" \
@@ -344,7 +350,7 @@ rm -f uv.lock; fi; export PATH=\"\$HOME/.local/bin:\$PATH\"; uv sync"
       # (e.g. "KBH_OR_PROVIDER=novita KBH_BUDGET_SECONDS_OVERRIDE=900").
       # Logs stay inside the synced bench dir (never $HOME — see AGENTS.md).
       RUN_LOG="outputs/kb_run_${HARNESS}_${PROBLEM}.log"
-      ssh_to_detached "$NAME" "export PATH=\"\$HOME/.local/bin:\$PATH\"; cd ~/$REMOTE_DIR && mkdir -p outputs && setsid nohup env KBH_AGENT_CONTAINER=0 BUDGET_SECONDS=0 ${KB_LAMBDA_RUN_ENV:-} ./scripts/run_hard.sh $HARNESS $MODEL $PROBLEMS_ROOT/$PROBLEM $EFFORT > $RUN_LOG 2>&1 < /dev/null & echo launched PID \$!"
+      ssh_to_detached "$NAME" "export PATH=\"\$HOME/.local/bin:\$PATH\"; cd ~/$REMOTE_DIR && mkdir -p outputs && setsid nohup env KBH_AGENT_CONTAINER=1 BUDGET_SECONDS=0 ${KB_LAMBDA_RUN_ENV:-} ./scripts/run_hard.sh $HARNESS $MODEL $PROBLEMS_ROOT/$PROBLEM $EFFORT > $RUN_LOG 2>&1 < /dev/null & echo launched PID \$!"
     fi
     echo "Poll:  lambda_worker.sh ssh $NAME 'tail -20 ~/$REMOTE_DIR/${RUN_LOG:-outputs/kb_run_*.log}'"
     ;;
@@ -356,23 +362,93 @@ rm -f uv.lock; fi; export PATH=\"\$HOME/.local/bin:\$PATH\"; uv sync"
     [ "$BENCH" = multi ] && { echo "ERROR: use benchmarks/multi/scripts/regrade.py on the worker for multi" >&2; exit 2; }
     NAME="${1:?name}"; RID="${2:?run_id}"; RUNS_DIR="${3:-$BENCH_DIR/outputs/runs-h100}"
     SRC="$RUNS_DIR/$RID"
-    [ -f "$SRC/solution.py" ] || {
-      echo "no solution.py in $SRC" >&2
+    if [[ ! "$RID" =~ ^[A-Za-z0-9._+-]+$ ]] \
+      || [ "$RID" = "." ] || [ "$RID" = ".." ]; then
+      echo "unsafe run_id: $RID" >&2
+      exit 2
+    fi
+    [ -f "$SRC/result.json" ] && [ -f "$SRC/solution.py" ] || {
+      echo "result.json or solution.py missing in $SRC" >&2
       exit 1
     }
-    PROBLEM="$(sed -E 's/^[0-9]{8}_[0-9]{6}_.*_([0-9]{2}_[a-z0-9_]+)$/\1/' <<<"$RID")"
+    # Always gate what leaves this host.  verify-run permits genuinely
+    # pre-cutover archives, but rejects a post-cutover run stripped of its
+    # bundle metadata.
+    LOCAL_PROVENANCE="$(python3 "$HERE/scripts/submission_bundle.py" verify-run "$SRC")"
     ensure_reachable "$NAME"
     IP="$(instance_ip "$NAME")"
-    echo "[regrade] $RID -> $PROBLEMS_ROOT/$PROBLEM"
-    ssh_to "$NAME" "mkdir -p ~/kb-regrade/$RID && cp -r ~/$REMOTE_DIR/$PROBLEMS_ROOT/$PROBLEM/. ~/kb-regrade/$RID/"
+    REMOTE_RUN="$REMOTE_DIR/outputs/imported-regrades/$RID"
+    echo "[regrade] $RID -> bundle-aware sequential replay"
+    ssh_to "$NAME" "rm -rf ~/$REMOTE_RUN && mkdir -p ~/$REMOTE_RUN"
+    # These are run-root work directories.  Root anchoring is important:
+    # submission_bundle/files/cache and .../tmp may be authored sidecars.
     rsync -az -e "ssh -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=$STATE_DIR/known_hosts -o BatchMode=yes" \
-      "$SRC/solution.py" "${SSH_USER}@${IP}:kb-regrade/$RID/solution.py"
-    ssh_to "$NAME" "export PATH=\"\$HOME/.local/bin:\$PATH\"; cd ~/kb-regrade/$RID \
-      && echo '--- check.py ---' && uv run --project ~/$REMOTE_DIR python check.py \
-      && echo '--- benchmark.py ---' && env KBH_HARDWARE=${KBH_HARDWARE:-H100} uv run --project ~/$REMOTE_DIR python benchmark.py"
+      --exclude '/.venv' --exclude '/cache' --exclude '/tmp' --exclude '/replays' \
+      --exclude '/regrade_replays' --exclude '/regrade-reviews' \
+      "$SRC/" "${SSH_USER}@${IP}:$REMOTE_RUN/"
+    REMOTE_STATUS=0
+    ssh_to "$NAME" "export PATH=\"\$HOME/.local/bin:\$PATH\"; cd ~/$REMOTE_DIR \
+      && env KBH_HARDWARE=${KBH_HARDWARE:-H100} ./scripts/regrade_sequential.sh outputs/imported-regrades/$RID \
+        > outputs/imported-regrades/$RID/regrade.log 2>&1" || REMOTE_STATUS=$?
+
+    REVIEW_ROOT="$SRC/regrade-reviews/$(date -u +%Y%m%dT%H%M%SZ)-$$"
+    REVIEW="$REVIEW_ROOT/$RID"
+    mkdir -p "$REVIEW"
     rsync -az -e "ssh -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=$STATE_DIR/known_hosts -o BatchMode=yes" \
-      "${SSH_USER}@${IP}:kb-regrade/$RID/result.json" "$SRC/result.regrade.json" 2>/dev/null \
-      && echo "  -> $SRC/result.regrade.json" || echo "  (benchmark printed to stdout only)"
+      --include '/result.json' --include '/check*.log' --include '/benchmark*.log' \
+      --include '/regrade*.log' --include '/submission_bundle/' \
+      --include '/submission_bundle/***' --exclude '*' \
+      "${SSH_USER}@${IP}:$REMOTE_RUN/" "$REVIEW/"
+    if [ "$REMOTE_STATUS" -ne 0 ]; then
+      echo "ERROR: remote regrader failed (status $REMOTE_STATUS); review: $REVIEW" >&2
+      exit 1
+    fi
+    [ -f "$REVIEW/result.json" ] \
+      || { echo "ERROR: remote regrader returned no result.json; review: $REVIEW" >&2; exit 1; }
+    if ! python3 - "$SRC/result.json" "$REVIEW/result.json" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as stream:
+    original = json.load(stream)
+with open(sys.argv[2], encoding="utf-8") as stream:
+    candidate = json.load(stream)
+candidate_regrade = candidate.get("regrade")
+if not isinstance(candidate_regrade, dict):
+    raise SystemExit("remote result has no regrade provenance")
+if candidate_regrade == original.get("regrade"):
+    raise SystemExit("remote result has no new regrade provenance")
+if candidate_regrade.get("mode") != "sequential_isolated":
+    raise SystemExit("remote result is not a sequential isolated regrade")
+bundled = any(
+    key in candidate
+    for key in (
+        "submission_bundle",
+        "submission_replay",
+        "submission_bundle_sha256",
+        "submission_replay_status",
+    )
+)
+expected_mode, expected_status = ("bundled", "verified") if bundled else ("legacy", "legacy")
+if candidate_regrade.get("submission_mode") != expected_mode:
+    raise SystemExit("remote regrade submission mode does not match the result")
+if candidate_regrade.get("status") != expected_status:
+    raise SystemExit("remote regrade status is not publishable")
+PY
+    then
+      echo "ERROR: remote result was not freshly regraded; review: $REVIEW" >&2
+      exit 1
+    fi
+    if ! PROVENANCE="$(python3 "$HERE/scripts/submission_bundle.py" verify-run "$REVIEW")"; then
+      echo "ERROR: returned regrade failed provenance verification; review: $REVIEW" >&2
+      exit 1
+    fi
+    if [ "$PROVENANCE" != "$LOCAL_PROVENANCE" ]; then
+      echo "ERROR: returned regrade is bound to different submission provenance; review: $REVIEW" >&2
+      exit 1
+    fi
+    printf '%s\n' "$PROVENANCE" > "$REVIEW/provenance.json"
+    echo "  review candidate: $REVIEW (checks passed; archive not promoted)"
     ;;
 
   pull)

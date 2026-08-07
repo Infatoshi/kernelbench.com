@@ -1,5 +1,8 @@
 """Bench-selection behavior of the kb CLI (kb -b <bench> ...)."""
+
 import os
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -33,8 +36,12 @@ def test_default_problems_root_matches_bench_decks():
 
 def test_publish_script_map_covers_every_publishable_bench():
     root = Path(__file__).resolve().parents[2]
-    for bench, script in (("hard", "publish_v2.sh"), ("cuda", "publish_v2.sh"),
-                          ("mini", "publish_v2.sh"), ("mega", "publish_mega.sh")):
+    for bench, script in (
+        ("hard", "publish_v2.sh"),
+        ("cuda", "publish_v2.sh"),
+        ("mini", "publish_v2.sh"),
+        ("mega", "publish_mega.sh"),
+    ):
         assert (root / "benchmarks" / bench / "scripts" / script).is_file(), bench
 
 
@@ -65,6 +72,7 @@ def test_run_dispatches_to_selected_bench(monkeypatch, tmp_path):
 
 def test_contamination_accepts_all_bench_names(tmp_path):
     from kb import contamination
+
     for bench in ("hard", "cuda", "mini", "mega", "multi"):
         runs = tmp_path / "benchmarks" / bench / "outputs" / "runs"
         runs.mkdir(parents=True, exist_ok=True)
@@ -75,16 +83,71 @@ def test_contamination_accepts_all_bench_names(tmp_path):
 def test_audited_run_ids_partition_hardware_namespaces(tmp_path):
     annotations = tmp_path / "results" / "annotations"
     annotations.mkdir(parents=True)
-    (annotations / "rtx.yaml").write_text(
-        "run_id: run-rtx\n"
-        "gpu: RTX_PRO_6000\n"
-    )
+    (annotations / "rtx.yaml").write_text("run_id: run-rtx\ngpu: RTX_PRO_6000\n")
     (annotations / "h100.yaml").write_text(
-        "run_id: run-h100\n"
-        "gpu: NVIDIA H100 PCIe (SM90)\n"
+        "run_id: run-h100\ngpu: NVIDIA H100 PCIe (SM90)\n"
     )
     (annotations / "legacy.yaml").write_text("run_id: run-legacy\n")
 
     assert cli._audited_run_ids(tmp_path, None) == ["run-legacy", "run-rtx"]
     assert cli._audited_run_ids(tmp_path, "h100") == ["run-h100"]
     assert cli._audited_run_ids(tmp_path, "b200") == []
+
+
+def test_publication_lock_fd_is_inherited_by_subprocess(monkeypatch):
+    monkeypatch.delenv("KBH_TRUST_ARCHIVE_LOCK_FD", raising=False)
+    monkeypatch.setenv("KBH_TRUST_ARCHIVE_LOCK_HELD", "1")
+
+    with cli._trusted_archive_lock() as descriptor:
+        result = cli._publication_run(
+            [
+                sys.executable,
+                "-c",
+                "import os; fd=int(os.environ['KBH_TRUST_ARCHIVE_LOCK_FD']); "
+                "a=os.fstat(fd); b=os.stat('/'); "
+                "print(a.st_dev == b.st_dev and a.st_ino == b.st_ino)",
+            ],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        assert descriptor == int(os.environ["KBH_TRUST_ARCHIVE_LOCK_FD"])
+        assert result.stdout.strip() == "True"
+
+    assert "KBH_TRUST_ARCHIVE_LOCK_FD" not in os.environ
+
+
+def test_publish_holds_one_lock_through_all_derived_outputs(
+    monkeypatch, tmp_path: Path
+) -> None:
+    script = tmp_path / "benchmarks/hard/scripts/publish_v2.sh"
+    script.parent.mkdir(parents=True)
+    script.write_text("#!/bin/sh\n")
+    events: list[str] = []
+
+    def assert_locked(event: str) -> None:
+        descriptor = cli._ACTIVE_ARCHIVE_LOCK_FD
+        assert descriptor is not None
+        assert os.environ["KBH_TRUST_ARCHIVE_LOCK_FD"] == str(descriptor)
+        os.fstat(descriptor)
+        events.append(event)
+
+    def fake_run(*_args, **_kwargs):
+        assert_locked("publish")
+        return subprocess.CompletedProcess([], 0)
+
+    def fake_detail(_root):
+        assert_locked("detail")
+        return 0
+
+    def fake_index(_root):
+        assert_locked("index")
+        return 0
+
+    monkeypatch.setattr(cli, "_publication_run", fake_run)
+    monkeypatch.setattr(cli, "_rebuild_run_detail", fake_detail)
+    monkeypatch.setattr(cli, "_rebuild_model_index", fake_index)
+
+    assert cli.cmd_publish(tmp_path, [], bench="hard") == 0
+    assert events == ["publish", "detail", "index"]
+    assert cli._ACTIVE_ARCHIVE_LOCK_FD is None
