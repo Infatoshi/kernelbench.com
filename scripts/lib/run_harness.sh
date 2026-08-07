@@ -203,14 +203,18 @@ scoring environment. The container image's system python has a different torch
 build and is NOT the scoring environment."
 fi
 
-# check.py and benchmark.py derive REPO_ROOT as parents[2]. Keep that shape
-# while sharing src/. Copy project metadata so agents can mutate dependencies
-# inside their disposable workspace without touching the source repo.
-if [ "$KBH_AGENT_CONTAINER" = "1" ]; then
-    cp -a "$REPO_ROOT/src" "$WORKSPACE_ROOT/src"
-else
-    ln -s "$REPO_ROOT/src" "$WORKSPACE_ROOT/src"
-fi
+# check.py and benchmark.py derive REPO_ROOT as parents[2]. Keep that shape,
+# but always copy src/: a writable symlink lets host-mode candidates modify the
+# trusted checker helpers in the source checkout. Project metadata remains a
+# disposable copy so agents may iterate on dependencies inside their archive.
+strip_python_bytecode() {
+    /usr/bin/find "$1" -type d -name __pycache__ -prune \
+        -exec /bin/rm -rf -- {} +
+    /usr/bin/find "$1" -type f \( -name '*.pyc' -o -name '*.pyo' \) -delete
+}
+
+cp -a "$REPO_ROOT/src" "$WORKSPACE_ROOT/src"
+strip_python_bytecode "$WORKSPACE_ROOT/src"
 cp -p "$REPO_ROOT/pyproject.toml" "$WORKSPACE_ROOT/pyproject.toml"
 cp -p "$REPO_ROOT/uv.lock" "$WORKSPACE_ROOT/uv.lock"
 if [ -e "$REPO_ROOT/.python-version" ]; then
@@ -1313,6 +1317,49 @@ for t in "${TEMPLATE_FILES[@]}"; do
         cp -p "$PROBLEM_DIR/$t" "$TEMPLATE_BACKUP_DIR/$t"
     fi
 done
+TRUSTED_SRC_BACKUP_DIR="$RUN_DIR/trusted_src"
+cp -a "$WORKSPACE_ROOT/src" "$TRUSTED_SRC_BACKUP_DIR"
+TRUSTED_ENTRYPOINT="$TRUSTED_SRC_BACKUP_DIR/eval/trusted_entrypoint.py"
+if [ ! -f "$TRUSTED_ENTRYPOINT" ]; then
+    echo "STOP: trusted grading entrypoint is missing" >&2
+    exit 3
+fi
+
+trusted_src_digest() {
+    "$REAL_PYTHON" - "$1" <<'PY'
+import hashlib
+import stat
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1])
+root_metadata = root.lstat()
+if not stat.S_ISDIR(root_metadata.st_mode):
+    raise SystemExit(f"unsafe trusted src root: {root}")
+digest = hashlib.sha256()
+for path in sorted(root.rglob("*"), key=lambda item: item.relative_to(root).as_posix()):
+    relative = path.relative_to(root).as_posix()
+    metadata = path.lstat()
+    if "__pycache__" in path.parts or path.suffix == ".pyc":
+        continue
+    if stat.S_ISDIR(metadata.st_mode):
+        kind = b"d"
+        contents = b""
+    elif stat.S_ISREG(metadata.st_mode):
+        kind = b"f"
+        contents = path.read_bytes()
+    else:
+        raise SystemExit(f"unsafe trusted src entry: {relative}")
+    digest.update(kind + relative.encode() + b"\0")
+    digest.update(hashlib.sha256(contents).digest())
+print(digest.hexdigest())
+PY
+}
+
+TRUSTED_SRC_DIGEST="$(trusted_src_digest "$TRUSTED_SRC_BACKUP_DIR")" || {
+    echo "STOP: could not snapshot trusted src/" >&2
+    exit 3
+}
 
 TEMPLATE_MUTATED=false
 
@@ -1346,7 +1393,41 @@ detect_template_mutation() {
             printf 'CREATED TEMPLATE FILE: %s\n' "$t" >> "$log"
         fi
     done
+    if [ "$(trusted_src_digest "$TRUSTED_SRC_BACKUP_DIR" 2>/dev/null || true)" \
+        != "$TRUSTED_SRC_DIGEST" ] \
+        || [ "$(trusted_src_digest "$WORKSPACE_ROOT/src" 2>/dev/null || true)" \
+        != "$TRUSTED_SRC_DIGEST" ]; then
+        if [ "$found" -eq 0 ]; then
+            printf 'phase: %s\n' "$phase" >> "$log"
+        fi
+        found=1
+        printf 'MUTATED: trusted src/\n' >> "$log"
+        diff -qr --exclude='__pycache__' --exclude='*.pyc' \
+            "$TRUSTED_SRC_BACKUP_DIR" "$WORKSPACE_ROOT/src" >> "$log" 2>&1 || true
+    fi
     return "$found"
+}
+
+restore_trusted_src() {
+    local trusted_source=""
+    if [ "$(trusted_src_digest "$TRUSTED_SRC_BACKUP_DIR" 2>/dev/null || true)" \
+        = "$TRUSTED_SRC_DIGEST" ]; then
+        trusted_source="$TRUSTED_SRC_BACKUP_DIR"
+    elif [ "$(trusted_src_digest "$REPO_ROOT/src" 2>/dev/null || true)" \
+        = "$TRUSTED_SRC_DIGEST" ]; then
+        trusted_source="$REPO_ROOT/src"
+    else
+        echo "STOP: every trusted src/ copy changed during the agent session" >&2
+        return 1
+    fi
+    /bin/rm -rf "$WORKSPACE_ROOT/src"
+    /bin/cp -a "$trusted_source" "$WORKSPACE_ROOT/src"
+    # Bytecode is deliberately outside the content digest because ordinary
+    # imports create it. Never trust or restore it: a matching-timestamp pyc
+    # can override unchanged source without changing the digest.
+    strip_python_bytecode "$WORKSPACE_ROOT/src"
+    [ "$(trusted_src_digest "$WORKSPACE_ROOT/src" 2>/dev/null || true)" \
+        = "$TRUSTED_SRC_DIGEST" ]
 }
 
 restore_template_files() {
@@ -1358,6 +1439,7 @@ restore_template_files() {
             cp -p "$orig" "$cur"
         fi
     done
+    restore_trusted_src || exit 3
 }
 
 # --- KernelBench-Mini LFM harness helpers ---------------------------------
@@ -2601,7 +2683,15 @@ if ! detect_template_mutation "after harness"; then
     TEMPLATE_MUTATED=true
     echo "FAIL: immutable problem files changed by harness; skipping check.py and benchmark.py."
     restore_template_files
+else
+    # Drop candidate-created bytecode and restore trusted helper contents even
+    # when the content diff is clean. Final grading must never import from the
+    # writable src/ tree that was visible during the agent session.
+    restore_trusted_src || exit 3
 fi
+# A candidate can also leave timestamp-matched bytecode beside the immutable
+# problem sources. Purge it after the agent session, immediately before grading.
+strip_python_bytecode "$PROBLEM_DIR"
 
 if [ -f "$PROBLEM_DIR/solution.py" ]; then
     HAS_SOLUTION=true
@@ -2614,9 +2704,11 @@ if [ "$TEMPLATE_MUTATED" = "false" ] && [ "$HAS_SOLUTION" = "true" ]; then
     echo "Running check.py..."
     CHECK_START_TIME=$(date +%s)
     CHECK_EXIT_CODE=0
-    (cd "$PROBLEM_DIR" && run_gpu_locked_timeout check.py "$CHECK_TIMEOUT_SECONDS" uv run python check.py) > "$CHECK_LOG" 2>&1 || CHECK_EXIT_CODE=$?
+    (cd "$PROBLEM_DIR" && run_gpu_locked_timeout check.py "$CHECK_TIMEOUT_SECONDS" \
+        uv run python "$TRUSTED_ENTRYPOINT" check.py) > "$CHECK_LOG" 2>&1 || CHECK_EXIT_CODE=$?
     CHECK_END_TIME=$(date +%s)
     CHECK_ELAPSED=$((CHECK_END_TIME - CHECK_START_TIME))
+    CHECK_PASS_COUNT=$(grep -axc 'PASS' "$CHECK_LOG" || true)
 
     if ! detect_template_mutation "after check.py"; then
         TEMPLATE_MUTATED=true
@@ -2624,12 +2716,14 @@ if [ "$TEMPLATE_MUTATED" = "false" ] && [ "$HAS_SOLUTION" = "true" ]; then
         SCORE="null"
         echo "FAIL: immutable problem files changed during check.py."
         restore_template_files
-    elif [ "$CHECK_EXIT_CODE" -eq 0 ] && grep -aq "PASS" "$CHECK_LOG"; then
-        # Not anchored (^PASS): solution stdout without a trailing newline can
-        # glue onto check.py's PASS marker (seen 2026-07-07: "kv_cache=0x7PASS"
-        # from an agent's debug printf), and that false-negative silently
-        # skipped benchmark.py. Requiring check.py exit 0 alongside the marker
-        # is strictly stronger than the old anchored grep alone.
+    elif [ "$CHECK_EXIT_CODE" -eq 0 ] && [ "$CHECK_PASS_COUNT" -eq 1 ]; then
+        # solution.py executes in-process during correctness and can write new
+        # bytecode without changing source text. Recreate src/ before benchmark.
+        restore_trusted_src || exit 3
+        strip_python_bytecode "$PROBLEM_DIR"
+        # Require the one standalone marker emitted by a normally completed
+        # checker. Candidate PASS text is either a duplicate or, when followed
+        # by SystemExit(0), rejected by the trusted entrypoint above.
         CORRECT=true
         echo "Running benchmark.py..."
         # Some problems (KDA chunked recurrence, sonic-MoE)
@@ -2637,7 +2731,8 @@ if [ "$TEMPLATE_MUTATED" = "false" ] && [ "$HAS_SOLUTION" = "true" ]; then
         # 5 shapes can take 5-10 min. Generous budget.
         BENCH_START_TIME=$(date +%s)
         BENCH_EXIT_CODE=0
-        (cd "$PROBLEM_DIR" && run_gpu_locked_timeout benchmark.py "$BENCHMARK_TIMEOUT_SECONDS" uv run python benchmark.py) > "$BENCH_LOG" 2>&1 || BENCH_EXIT_CODE=$?
+        (cd "$PROBLEM_DIR" && run_gpu_locked_timeout benchmark.py "$BENCHMARK_TIMEOUT_SECONDS" \
+            uv run python "$TRUSTED_ENTRYPOINT" benchmark.py) > "$BENCH_LOG" 2>&1 || BENCH_EXIT_CODE=$?
         BENCH_END_TIME=$(date +%s)
         BENCH_ELAPSED=$((BENCH_END_TIME - BENCH_START_TIME))
         if ! detect_template_mutation "after benchmark.py"; then
@@ -2646,9 +2741,27 @@ if [ "$TEMPLATE_MUTATED" = "false" ] && [ "$HAS_SOLUTION" = "true" ]; then
             SCORE="null"
             echo "FAIL: immutable problem files changed during benchmark.py."
             restore_template_files
+        elif [ "$BENCH_EXIT_CODE" -eq 0 ]; then
+            restore_trusted_src || exit 3
+            # A complete benchmark emits exactly one trusted summary. Reject
+            # missing or duplicate lookalikes instead of choosing one from
+            # candidate-controlled stdout.
+            BENCH_METRIC_RE='^peak_fraction:[[:space:]]*([0-9]+([.][0-9]*)?|[.][0-9]+)([eE][+-]?[0-9]+)?[[:space:]]*$'
+            BENCH_METRIC_COUNT=$(grep -aEc "$BENCH_METRIC_RE" "$BENCH_LOG" || true)
+            if [ "$BENCH_METRIC_COUNT" -eq 1 ]; then
+                SCORE=$(grep -aE "$BENCH_METRIC_RE" "$BENCH_LOG" \
+                    | sed -E 's/^peak_fraction:[[:space:]]*//; s/[[:space:]]*$//')
+            else
+                SCORE="null"
+                echo "FAIL: benchmark.py emitted $BENCH_METRIC_COUNT complete score markers."
+            fi
         else
-            SCORE=$(grep -oP 'peak_fraction:\s*\K[0-9.]+' "$BENCH_LOG" | head -1 || echo "null")
+            restore_trusted_src || exit 3
+            SCORE="null"
+            echo "FAIL: benchmark.py did not complete successfully (exit $BENCH_EXIT_CODE)."
         fi
+    else
+        restore_trusted_src || exit 3
     fi
 fi
 

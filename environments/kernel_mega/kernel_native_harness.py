@@ -62,8 +62,9 @@ from datasets import Dataset
 _PROBLEM_ARTIFACTS = {"solution.py", "framework.txt", "__pycache__", ".pytest_cache"}
 
 CODE_RE = re.compile(r"```(?:python|cpp|cuda|py)?\n(.*?)```", re.DOTALL)
-_PEAK_RE = re.compile(r"peak_fraction:\s*([0-9.]+)")
-_PASS_RE = re.compile(r"^PASS", re.MULTILINE)
+_NUMBER_RE = r"(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?"
+_PEAK_RE = re.compile(rf"^peak_fraction:\s*({_NUMBER_RE})\s*$", re.MULTILINE)
+_PASS_RE = re.compile(r"^PASS$", re.MULTILINE)
 
 ENV_PASSTHROUGH = {
     "system_prompt",
@@ -133,7 +134,11 @@ def run_native(ws: str, problem: str, script: str, timeout_s: int) -> tuple[int,
         env["PATH"] = cuda_bin + ":" + env.get("PATH", "")
     try:
         proc = subprocess.run(
-            [sys.executable, script],
+            [
+                sys.executable,
+                str(Path(ws) / "src" / "eval" / "trusted_entrypoint.py"),
+                script,
+            ],
             cwd=str(pdir),
             env=env,
             capture_output=True,
@@ -161,20 +166,24 @@ def score_workspace(ws: str, problem: str, check_timeout_s: int, bench_timeout_s
         "raw_peak_fraction": 0.0,
         "check_log": "",
         "bench_log": "",
+        "check_exit_code": None,
+        "benchmark_exit_code": None,
     }
     if not (problem_dir(ws, problem) / "solution.py").exists():
         res["check_log"] = "no solution.py"
         return res
-    _, check_log = run_native(ws, problem, "check.py", check_timeout_s)
+    check_rc, check_log = run_native(ws, problem, "check.py", check_timeout_s)
+    res["check_exit_code"] = check_rc
     res["check_log"] = check_log[-4000:]
-    if not _PASS_RE.search(check_log):
+    if check_rc != 0 or len(_PASS_RE.findall(check_log)) != 1:
         return res
     res["correct"] = True
-    _, bench_log = run_native(ws, problem, "benchmark.py", bench_timeout_s)
+    bench_rc, bench_log = run_native(ws, problem, "benchmark.py", bench_timeout_s)
+    res["benchmark_exit_code"] = bench_rc
     res["bench_log"] = bench_log[-4000:]
-    m = _PEAK_RE.search(bench_log)
-    if m:
-        raw = float(m.group(1))
+    scores = _PEAK_RE.findall(bench_log)
+    if bench_rc == 0 and len(scores) == 1:
+        raw = float(scores[0])
         res["raw_peak_fraction"] = raw
         res["peak_fraction"] = max(0.0, min(1.0, raw))
     return res

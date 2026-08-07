@@ -58,6 +58,21 @@ purely on absolute throughput, and reference diagnostics must not block scoring.
 
 - Per-dtype tolerance: fp32 `atol=1e-4, rtol=1e-4`; fp16/bf16 `atol=1e-2, rtol=1e-2`; fp8 `atol=0.1, rtol=0.1` (permissive, noise-dominated).
 - 3 seeds per shape (42, 123, 456). All must pass.
+- KDA, paged attention, top-k, and Sonic MoE also run a fixed adversarial
+  regression plus Hypothesis-generated structural cases on one bounded shape.
+  The generated plan is frozen before solution.py is imported and its seed is
+  printed for exact replay. Run `KBH_PROPERTY_SEED=<printed seed> uv run python
+  check.py` from the problem directory to reproduce that plan; without the
+  override each check draws a fresh 64-bit seed.
+- Structural cases exercise long recurrence history, ragged expert routing,
+  mixed-amplitude prefixes/suffixes, clustered maxima, shortened sequences,
+  fresh pointers, and graph warmup followed by same-storage mutation that
+  preserves both the data pointer and PyTorch version counter. Candidate
+  outputs must be plain tensors with the reference dtype and device.
+- This is stronger input coverage, not a Python authority boundary:
+  `solution.py` still executes in the checker's interpreter. Import isolation
+  and static checker-control tripwires belong to the submission-artifact
+  hardening layer; fully hostile Python requires a separate process or sandbox.
 - No `strict=False` state_dict loading in `check.py` — missing parameters fail correctness.
 - NaN or inf in output is an automatic fail.
 

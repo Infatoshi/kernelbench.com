@@ -1,3 +1,6 @@
+import json
+import os
+import subprocess
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -9,6 +12,7 @@ if "scripts/lib/run_harness.sh" in RUN_HARD.read_text():
 LAUNCH_PARALLEL = ROOT / "scripts" / "launch_parallel_sweep.sh"
 SWEEP = ROOT / "scripts" / "sweep.sh"
 RUN_BASELINES = ROOT / "scripts" / "run_baselines.sh"
+REGRADE = ROOT / "scripts" / "regrade_sequential.sh"
 CLASSIFICATION = ROOT / "src" / "harness" / "classification.py"
 BENCHMARKS = sorted((ROOT / "problems-rtxpro6000").glob("*/benchmark.py"))
 KDA_BENCHMARK = ROOT / "problems-rtxpro6000" / "02_kda_cutlass" / "benchmark.py"
@@ -145,6 +149,129 @@ def test_agent_container_mode_does_not_mount_full_harness_state() -> None:
     assert ".claude/sessions" not in block
     assert "history.jsonl" not in block
     assert "opencode.db" not in block
+
+
+def test_shared_checker_source_is_copied_and_restored_as_trusted_input() -> None:
+    script = RUN_HARD.read_text()
+    assert 'cp -a "$REPO_ROOT/src" "$WORKSPACE_ROOT/src"' in script
+    assert 'ln -s "$REPO_ROOT/src" "$WORKSPACE_ROOT/src"' not in script
+    assert 'TRUSTED_SRC_BACKUP_DIR="$RUN_DIR/trusted_src"' in script
+    assert "MUTATED: trusted src/" in script
+    assert 'TRUSTED_SRC_DIGEST="$(trusted_src_digest' in script
+    assert '"$REAL_PYTHON" - "$1"' in script
+    assert "unsafe trusted src root" in script
+    assert "BOOTSTRAP_PYTHON" not in script
+    assert script.index('REAL_PYTHON="$(command -v') < script.index(
+        'TRUSTED_SRC_DIGEST="$(trusted_src_digest'
+    )
+    assert 'strip_python_bytecode "$WORKSPACE_ROOT/src"' in script
+    assert '/bin/cp -a "$trusted_source" "$WORKSPACE_ROOT/src"' in script
+    after_harness = script.index('detect_template_mutation "after harness"')
+    final_check = script.index('echo "Running check.py..."', after_harness)
+    assert script.index("restore_trusted_src", after_harness, final_check) < final_check
+
+
+def test_canonical_deck_regrade_restores_complete_current_runtime() -> None:
+    script = REGRADE.read_text()
+    canonical = script.index('if [ -n "${KBH_REGRADE_DECK:-}" ]')
+    check = script.index('echo "    check.py..."', canonical)
+    block = script[canonical:check]
+    assert 'WORKSPACE_ROOT="$RUN_DIR/repo"' in script
+    assert '/bin/cp -a "$REPO_ROOT/src" "$WORKSPACE_ROOT/src"' in block
+    assert 'cp -p "$REPO_ROOT/pyproject.toml" "$WORKSPACE_ROOT/pyproject.toml"' in block
+    assert 'cp -p "$REPO_ROOT/uv.lock" "$WORKSPACE_ROOT/uv.lock"' in block
+    assert 'cp -p "$REPO_ROOT/.python-version" "$WORKSPACE_ROOT/.python-version"' in block
+    assert "FATAL: canonical grading surface is incomplete" in block
+    assert "grading workspace as-is" not in block
+    assert 'name = "hypothesis"' in (ROOT / "uv.lock").read_text()
+
+    monorepo = ROOT.parents[1]
+    canonical_bytes = REGRADE.read_bytes()
+    for bench in ("cuda", "mega"):
+        assert (
+            monorepo / "benchmarks" / bench / "scripts" / "regrade_sequential.sh"
+        ).read_bytes() == canonical_bytes
+
+
+def test_legacy_regrade_receives_current_property_helper_and_lock(tmp_path) -> None:
+    run_dir = tmp_path / "legacy-run"
+    workspace = run_dir / "repo"
+    problem_dir = workspace / "problems" / "05_topk_bitonic"
+    problem_dir.mkdir(parents=True)
+    (run_dir / "result.json").write_text(
+        json.dumps({"problem": "05_topk_bitonic", "peak_fraction": 0.1})
+    )
+    (run_dir / "solution.py").write_text("class Model:\n    pass\n")
+    (workspace / "src" / "eval").mkdir(parents=True)
+    (workspace / "src" / "eval" / "legacy.py").write_text("OLD = True\n")
+    (problem_dir / "__pycache__").mkdir()
+    (problem_dir / "__pycache__" / "reference.cpython-311.pyc").write_bytes(b"forged")
+    (run_dir / "scratch" / "__pycache__").mkdir(parents=True)
+    (run_dir / "scratch" / "__pycache__" / "helper.cpython-311.pyc").write_bytes(b"forged")
+    (workspace / "pyproject.toml").write_text("[project]\nname='legacy'\nversion='0'\n")
+    (workspace / "uv.lock").write_text("version = 1\n")
+    (workspace / ".python-version").write_text("3.11\n")
+
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    timeout = fake_bin / "timeout"
+    timeout.write_text("#!/bin/sh\nexit 42\n")
+    timeout.chmod(0o755)
+    env = os.environ.copy()
+    env.update(
+        {
+            "KBH_REGRADE_ALLOW_BUSY": "1",
+            "KBH_REGRADE_DECK": "problems-rtxpro6000",
+            "KBH_KEEP_RUN_VENV": "1",
+            "PATH": f"{fake_bin}:{env['PATH']}",
+        }
+    )
+
+    completed = subprocess.run(
+        ["bash", str(REGRADE), str(run_dir)],
+        cwd=ROOT,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert (workspace / "src" / "eval" / "legacy.py").exists() is False
+    assert (workspace / "src" / "eval" / "property_stress.py").read_bytes() == (
+        ROOT / "src" / "eval" / "property_stress.py"
+    ).read_bytes()
+    assert (workspace / "pyproject.toml").read_bytes() == (ROOT / "pyproject.toml").read_bytes()
+    assert (workspace / "uv.lock").read_bytes() == (ROOT / "uv.lock").read_bytes()
+    assert not tuple((workspace / "src").rglob("*.pyc"))
+    assert not tuple(problem_dir.rglob("*.pyc"))
+    assert not tuple(problem_dir.rglob("*.pyo"))
+    assert not tuple(path for path in problem_dir.rglob("__pycache__") if path.is_dir())
+    assert "check FAILED (exit 42)" in completed.stdout
+
+
+def test_regrade_purges_problem_bytecode_after_candidate_restore() -> None:
+    script = REGRADE.read_text()
+    scratch_restore = script.index('cp -r "$RUN_DIR/scratch/." "$PROBLEM_DIR/"')
+    check_run = script.index('uv run python "$TRUSTED_ENTRYPOINT" check.py', scratch_restore)
+    first_purge = script.index('purge_untrusted_bytecode "$PROBLEM_DIR"', scratch_restore)
+    benchmark_run = script.index('uv run python "$TRUSTED_ENTRYPOINT" benchmark.py', check_run)
+    second_purge = script.index('purge_untrusted_bytecode "$PROBLEM_DIR"', check_run)
+    assert scratch_restore < first_purge < check_run < second_purge < benchmark_run
+
+    monorepo = ROOT.parents[1]
+    canonical_bytes = REGRADE.read_bytes()
+    for bench in ("cuda", "mega"):
+        assert (
+            monorepo / "benchmarks" / bench / "scripts" / "regrade_sequential.sh"
+        ).read_bytes() == canonical_bytes
+
+    mini = (monorepo / "benchmarks" / "mini" / "scripts" / "regrade_sequential.sh").read_text()
+    mini_scratch = mini.index('cp -r "$RUN_DIR/scratch/." "$PROBLEM_DIR/"')
+    mini_check = mini.index('uv run python "$TRUSTED_ENTRYPOINT" check.py', mini_scratch)
+    assert mini_scratch < mini.index(
+        'purge_untrusted_bytecode "$PROBLEM_DIR"', mini_scratch
+    ) < mini_check
 
 
 def test_minimax_claude_uses_official_anthropic_endpoint() -> None:

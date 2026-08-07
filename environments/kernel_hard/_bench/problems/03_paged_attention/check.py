@@ -19,6 +19,12 @@ from src.eval.numeric_stress import (  # noqa: E402
     numeric_stress_context,
     tolerance_for_case,
 )
+from src.eval.property_stress import (  # noqa: E402
+    check_tensor_properties,
+    generate_property_cases,
+    property_shape_index,
+    tolerance_for_property,
+)
 
 
 def _apply_shape(reference, shape: dict) -> None:
@@ -31,16 +37,21 @@ def _apply_shape(reference, shape: dict) -> None:
 
 
 def main():
+    problem_yaml = Path("problem.yaml")
+    meta = yaml.safe_load(problem_yaml.read_text()) if problem_yaml.exists() else {}
     try:
         import reference
         import shapes
-        import solution
     except Exception as e:
         print(f"FAIL: import error: {e}")
         sys.exit(1)
 
-    problem_yaml = Path("problem.yaml")
-    meta = yaml.safe_load(problem_yaml.read_text()) if problem_yaml.exists() else {}
+    _, property_cases = generate_property_cases(meta.get("name", ""))
+    try:
+        import solution
+    except Exception as e:
+        print(f"FAIL: solution import error: {e}")
+        sys.exit(1)
 
     sol_src = Path("solution.py").read_text() if Path("solution.py").exists() else ""
     for forbidden in meta.get("forbidden", []):
@@ -86,6 +97,23 @@ def main():
                 if not ok:
                     print(f"FAIL: shape {shape_idx} {shape} seed {seed} case {case.name}: {msg}")
                     sys.exit(1)
+
+        if shape_idx == property_shape_index(meta.get("name", "")):
+            torch.manual_seed(0xC0DE)
+            torch.cuda.manual_seed_all(0xC0DE)
+            base_inputs = [value.to(device) for value in reference.get_inputs()]
+            try:
+                check_tensor_properties(
+                    meta.get("name", ""),
+                    ref_model,
+                    sol_model,
+                    base_inputs,
+                    tolerance=tolerance_for_property(meta.get("name", ""), tol_override),
+                    cases=property_cases,
+                )
+            except Exception as e:
+                print(f"FAIL: shape {shape_idx} {shape} property stress: {e}")
+                sys.exit(1)
 
     _emit_framework_label()
     print("PASS")
