@@ -11,6 +11,9 @@ Run from benchmarks/hard (publish_v2.sh calls it):
 """
 from __future__ import annotations
 
+import json
+import os
+import re
 from pathlib import Path
 
 HARD = Path(__file__).resolve().parent.parent
@@ -27,51 +30,60 @@ BOARDS = [
 
 import sys  # noqa: E402
 
-sys.path.insert(0, str(REPO))
-from scripts.published_submission import (  # noqa: E402
-    atomic_write_text,
-    prepare_selected_solution_outputs,
-    trusted_archive_lock,
-)
+sys.path.insert(0, str(REPO / "scripts"))
+from kernel_sidecars import augment  # noqa: E402
 
 
-def _emit() -> None:
-    staged: list[tuple[Path, str]] = []
-    summaries: list[tuple[str, str, int]] = []
-    destinations: set[Path] = set()
-    for bench, gpu, lb_rel, runs_rels in BOARDS:
-        bench_dir = REPO / "benchmarks" / bench
-        lb = bench_dir / lb_rel
-        if not lb.exists() and not lb.is_symlink():
-            continue
-        if len(runs_rels) != 1:
-            raise RuntimeError("board publication requires exactly one runs root")
-        outputs = prepare_selected_solution_outputs(
-            lb,
-            bench_dir / runs_rels[0],
-            PUB / gpu,
-        )
-        for destination, contents in outputs:
-            if destination in destinations:
-                raise RuntimeError(f"duplicate board publication target: {destination}")
-            destinations.add(destination)
-            staged.append((destination, contents))
-        summaries.append((bench, gpu, len(outputs)))
+def _redactor():
+    """Same rules as publish_v2.sh: every long ~/.env_vars value + token
+    prefix patterns."""
+    vals: list[str] = []
+    envf = os.path.expanduser("~/.env_vars")
+    if os.path.exists(envf):
+        for ln in open(envf):
+            if "=" in ln and "export" in ln:
+                v = ln.split("=", 1)[1].strip().strip('"').strip("'")
+                if len(v) >= 12:
+                    vals.append(v)
+    vals = sorted(set(vals), key=len, reverse=True)
+    pats = [re.compile(p) for p in (
+        r"sk-ant-oat01-[A-Za-z0-9_\-]+", r"sk-proj-[A-Za-z0-9_\-]+",
+        r"AIzaSy[A-Za-z0-9_\-]{20,}", r"sk-[a-z]{2,}-[A-Za-z0-9_\-]{16,}",
+        r"hf_[A-Za-z0-9]{20,}",
+    )]
 
-    # Every board and selected archive has been validated before the first
-    # public file changes, avoiding a silently partial per-GPU publication.
-    for destination, contents in staged:
-        atomic_write_text(destination, contents)
-    for bench, gpu, count in summaries:
-        print(
-            f"  [{bench}/{gpu}] wrote {count} board solutions "
-            f"-> public/runs/{gpu}/"
-        )
+    def red(s: str) -> str:
+        for v in vals:
+            s = s.replace(v, "REDACTED")
+        for p in pats:
+            s = p.sub("REDACTED", s)
+        return s
+
+    return red
 
 
 def main() -> None:
-    with trusted_archive_lock():
-        _emit()
+    red = _redactor()
+    for bench, gpu, lb_rel, runs_rels in BOARDS:
+        bench_dir = REPO / "benchmarks" / bench
+        lb = bench_dir / lb_rel
+        if not lb.exists():
+            continue
+        data = json.loads(lb.read_text())
+        rids = sorted({c["run_id"] for m in data.get("models", [])
+                       for c in m.get("results", {}).values() if c.get("run_id")})
+        out_dir = PUB / gpu
+        out_dir.mkdir(parents=True, exist_ok=True)
+        n = 0
+        for rid in rids:
+            for runs_rel in runs_rels:
+                sp = bench_dir / runs_rel / rid / "solution.py"
+                if sp.is_file():
+                    txt = augment(sp.read_text(), sp.parent)
+                    (out_dir / f"{rid}_solution.py.txt").write_text(red(txt))
+                    n += 1
+                    break
+        print(f"  [{bench}/{gpu}] wrote {n}/{len(rids)} board solutions -> public/runs/{gpu}/")
 
 
 if __name__ == "__main__":
