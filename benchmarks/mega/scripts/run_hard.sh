@@ -170,6 +170,12 @@ repository's problems/ tree."
 # check.py and benchmark.py derive REPO_ROOT as parents[2]. Keep that shape
 # while sharing src/. Copy project metadata so agents can mutate dependencies
 # inside their disposable workspace without touching the source repo.
+strip_python_bytecode() {
+    /usr/bin/find "$1" -type d -name __pycache__ -prune \
+        -exec /bin/rm -rf -- {} +
+    /usr/bin/find "$1" -type f \( -name '*.pyc' -o -name '*.pyo' \) -delete
+}
+
 ln -s "$REPO_ROOT/src" "$WORKSPACE_ROOT/src"
 cp -p "$REPO_ROOT/pyproject.toml" "$WORKSPACE_ROOT/pyproject.toml"
 cp -p "$REPO_ROOT/uv.lock" "$WORKSPACE_ROOT/uv.lock"
@@ -182,6 +188,8 @@ for t in "${TEMPLATE_FILES[@]}"; do
         cp -p "$SOURCE_PROBLEM_DIR/$t" "$PROBLEM_DIR/$t"
     fi
 done
+TRUSTED_ENTRYPOINT="$RUN_DIR/trusted_entrypoint.py"
+cp -p "$REPO_ROOT/src/eval/trusted_entrypoint.py" "$TRUSTED_ENTRYPOINT"
 
 # --- Per-run GPU/cache isolation -----------------------------------------
 #
@@ -1174,6 +1182,7 @@ if ! detect_template_mutation "after harness"; then
     echo "FAIL: immutable problem files changed by harness; skipping check.py and benchmark.py."
     restore_template_files
 fi
+strip_python_bytecode "$PROBLEM_DIR"
 
 if [ -f "$PROBLEM_DIR/solution.py" ]; then
     HAS_SOLUTION=true
@@ -1186,9 +1195,11 @@ if [ "$TEMPLATE_MUTATED" = "false" ] && [ "$HAS_SOLUTION" = "true" ]; then
     echo "Running check.py..."
     CHECK_START_TIME=$(date +%s)
     CHECK_EXIT_CODE=0
-    (cd "$PROBLEM_DIR" && run_gpu_locked_timeout check.py "$CHECK_TIMEOUT_SECONDS" uv run python check.py) > "$CHECK_LOG" 2>&1 || CHECK_EXIT_CODE=$?
+    (cd "$PROBLEM_DIR" && run_gpu_locked_timeout check.py "$CHECK_TIMEOUT_SECONDS" \
+        uv run python "$TRUSTED_ENTRYPOINT" check.py) > "$CHECK_LOG" 2>&1 || CHECK_EXIT_CODE=$?
     CHECK_END_TIME=$(date +%s)
     CHECK_ELAPSED=$((CHECK_END_TIME - CHECK_START_TIME))
+    CHECK_PASS_COUNT=$(grep -axc 'PASS' "$CHECK_LOG" || true)
 
     if ! detect_template_mutation "after check.py"; then
         TEMPLATE_MUTATED=true
@@ -1196,10 +1207,10 @@ if [ "$TEMPLATE_MUTATED" = "false" ] && [ "$HAS_SOLUTION" = "true" ]; then
         SCORE="null"
         echo "FAIL: immutable problem files changed during check.py."
         restore_template_files
-    elif [ "$CHECK_EXIT_CODE" -eq 0 ] && grep -aq "PASS" "$CHECK_LOG"; then
-        # Not anchored (^PASS): solution stdout without a trailing newline can
-        # glue onto check.py's PASS marker; require check.py exit 0 alongside
-        # the marker instead (same fix as benchmarks/hard, 2026-07-07).
+    elif [ "$CHECK_EXIT_CODE" -eq 0 ] && [ "$CHECK_PASS_COUNT" -eq 1 ]; then
+        # The trusted entrypoint only returns zero if checker execution reaches
+        # normal fallthrough; candidate SystemExit(0) is a failure.
+        strip_python_bytecode "$PROBLEM_DIR"
         CORRECT=true
         echo "Running benchmark.py..."
         # Some problems (KDA chunked recurrence, sonic-MoE)
@@ -1207,7 +1218,8 @@ if [ "$TEMPLATE_MUTATED" = "false" ] && [ "$HAS_SOLUTION" = "true" ]; then
         # 5 shapes can take 5-10 min. Generous budget.
         BENCH_START_TIME=$(date +%s)
         BENCH_EXIT_CODE=0
-        (cd "$PROBLEM_DIR" && run_gpu_locked_timeout benchmark.py "$BENCHMARK_TIMEOUT_SECONDS" uv run python benchmark.py) > "$BENCH_LOG" 2>&1 || BENCH_EXIT_CODE=$?
+        (cd "$PROBLEM_DIR" && run_gpu_locked_timeout benchmark.py "$BENCHMARK_TIMEOUT_SECONDS" \
+            uv run python "$TRUSTED_ENTRYPOINT" benchmark.py) > "$BENCH_LOG" 2>&1 || BENCH_EXIT_CODE=$?
         BENCH_END_TIME=$(date +%s)
         BENCH_ELAPSED=$((BENCH_END_TIME - BENCH_START_TIME))
         if ! detect_template_mutation "after benchmark.py"; then
@@ -1216,8 +1228,19 @@ if [ "$TEMPLATE_MUTATED" = "false" ] && [ "$HAS_SOLUTION" = "true" ]; then
             SCORE="null"
             echo "FAIL: immutable problem files changed during benchmark.py."
             restore_template_files
+        elif [ "$BENCH_EXIT_CODE" -eq 0 ]; then
+            BENCH_METRIC_RE='^peak_fraction:[[:space:]]*([0-9]+([.][0-9]*)?|[.][0-9]+)([eE][+-]?[0-9]+)?[[:space:]]*$'
+            BENCH_METRIC_COUNT=$(grep -aEc "$BENCH_METRIC_RE" "$BENCH_LOG" || true)
+            if [ "$BENCH_METRIC_COUNT" -eq 1 ]; then
+                SCORE=$(grep -aE "$BENCH_METRIC_RE" "$BENCH_LOG" \
+                    | sed -E 's/^peak_fraction:[[:space:]]*//; s/[[:space:]]*$//')
+            else
+                SCORE="null"
+                echo "FAIL: benchmark.py emitted $BENCH_METRIC_COUNT complete score markers."
+            fi
         else
-            SCORE=$(grep -oP 'peak_fraction:\s*\K[0-9.]+' "$BENCH_LOG" | head -1 || echo "null")
+            SCORE="null"
+            echo "FAIL: benchmark.py did not complete successfully (exit $BENCH_EXIT_CODE)."
         fi
     fi
 fi

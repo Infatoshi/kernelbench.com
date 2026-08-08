@@ -4,6 +4,60 @@ A running record of decisions, dead ends, and lessons. Newest entries on top. Th
 
 ---
 
+## 2026-08-07 — Property-generated structural correctness guards
+
+The fixed numeric-stress suite caught whole-tensor scale cheats, but a new
+audit found a more specific failure mode: candidates could recognize its
+uniform distributions or assume structure that never varied. KDA kernels
+truncated old recurrence state while still passing three fixed scales; Sonic
+MoE kernels assumed perfectly balanced expert offsets or sampled a short input
+prefix before choosing an approximate path; Top-k kernels kept too few local
+candidates for clustered maxima; and one CUDA graph replayed an old pointer.
+
+The final checker now pairs the public cases with a small property-generated
+suite. Hypothesis varies semantic structure rather than adding benchmark
+shapes: KDA receives sub-threshold long-memory chains, Sonic receives ragged
+offsets pooled from multiple donors plus a nominal prefix and amplified suffix,
+Top-k receives more than k clustered maxima after graph warmup, and paged
+attention receives nonuniform short sequence lengths. Sonic's fixed 129-row
+transfer moves one expert from the 256-row average through an average-plus-one-
+128-row-block launch cap (384 to 385) on the bounded checker shape. KDA's
+low-key range was calibrated on RTX PRO 6000
+against two independent correct kernels and the audited diagonal/history
+exploit, avoiding the unstable high-interaction regime while retaining a clear
+failure margin. The replay probe rewrites the warmed input through a
+storage alias, preserving both its pointer and version counter so output caches
+cannot masquerade as CUDA-graph replay. One fixed regression example always
+runs, followed by two or three generated examples according to reference cost.
+The plan is created before importing solution.py and its random seed is logged.
+`KBH_PROPERTY_SEED=<logged seed> uv run python check.py` replays the complete plan,
+while an unset override keeps successive official checks fresh rather than
+publishing one permanent input set to memorize.
+
+Only one bounded shape per affected problem receives these extra calls, so the
+performance deck and score remain unchanged. The shared src/ tree is now copied
+into every run instead of symlinked, hash-compared with its pre-agent snapshot,
+and restored before final grading; otherwise a candidate could edit the new
+guard itself in host or container mode. CPU property tests cover strategy
+invariants and checker wiring across RTX PRO 6000, H100, and B200 decks. GPU
+regression results are recorded in the pull request.
+
+Canonical-deck regrades of older archives restore the current `src/`,
+`pyproject.toml`, `uv.lock`, and `.python-version` together with the problem
+templates. This prevents a new checker from running against an old archive
+that lacks its helper module or Hypothesis dependency; an incomplete canonical
+surface now aborts the regrade instead of falling back to archived grader code.
+
+Limitation: these property probes share a Python interpreter with
+`solution.py`. Freezing the plan before that import and restoring trusted files
+closes accidental and known file-mutation paths, but it is not a security
+boundary against arbitrary Python introspection or monkeypatching. Import
+isolation and checker-control tripwires are handled by the separate submission
+artifact hardening work; a true authority boundary requires a process or
+sandbox boundary.
+
+---
+
 ## 2026-07-24 — GPU-lock pipeline deadlock (cost 71 min of the Opus 5 sweep)
 
 During the first Claude Opus 5 hard sweep, the whole box went idle for 71
