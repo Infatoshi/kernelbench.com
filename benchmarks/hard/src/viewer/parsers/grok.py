@@ -234,13 +234,64 @@ def _parse_chat_history(path: Path) -> Session:
     )
 
 
+def _tool_result_text(obj: dict) -> str:
+    """Flatten a Grok streaming tool_call_update into viewer text."""
+    raw = obj.get("rawOutput")
+    if isinstance(raw, str) and raw.strip():
+        return raw
+    if isinstance(raw, dict):
+        return json.dumps(raw, default=str)
+    content = obj.get("content")
+    if isinstance(content, str) and content.strip():
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for block in content:
+            if isinstance(block, dict):
+                inner = block.get("content")
+                if isinstance(inner, dict) and inner.get("text"):
+                    parts.append(str(inner["text"]))
+                elif block.get("text"):
+                    parts.append(str(block["text"]))
+                else:
+                    parts.append(json.dumps(block, default=str))
+            else:
+                parts.append(str(block))
+        return "\n".join(parts)
+    return ""
+
+
 def _parse_streaming_jsonl(path: Path) -> Session:
-    """Legacy streaming-json transcript: token deltas only, no tools."""
+    """Grok --output-format streaming-json (thought/text plus 4.6 tool_call rows)."""
     thought_parts: list[str] = []
     text_parts: list[str] = []
+    pending_tools: list[ToolCall] = []
     events: list[Event] = []
     session_id = None
     final_raw = None
+    last_usage: TokenUsage | None = None
+    final_text: str | None = None
+
+    def flush_assistant() -> None:
+        nonlocal thought_parts, text_parts, pending_tools, final_text
+        reasoning = "".join(thought_parts).strip() or None
+        text = "".join(text_parts).strip() or None
+        tools = pending_tools
+        thought_parts = []
+        text_parts = []
+        pending_tools = []
+        if not reasoning and not text and not tools:
+            return
+        if text:
+            final_text = text
+        events.append(Event(
+            role="assistant",
+            text=text,
+            reasoning=reasoning,
+            tool_calls=tools,
+            usage=last_usage,
+            session_id=session_id,
+        ))
 
     with open(path) as f:
         for raw in f:
@@ -259,10 +310,43 @@ def _parse_streaming_jsonl(path: Path) -> Session:
             if t == "text":
                 text_parts.append(str(obj.get("data") or ""))
                 continue
+            if t == "usage" and isinstance(obj.get("usage"), dict):
+                u = obj["usage"]
+                last_usage = TokenUsage(
+                    input_tokens=int(u.get("input_tokens") or 0),
+                    output_tokens=int(u.get("output_tokens") or 0),
+                    cache_read_tokens=int(u.get("cache_read_input_tokens") or 0),
+                    cache_write_tokens=int(u.get("cache_creation_input_tokens") or 0),
+                )
+                continue
+            if t == "tool_call":
+                pending_tools.append(ToolCall(
+                    name=str(obj.get("toolName") or obj.get("title") or "tool"),
+                    args=_parse_tool_args(obj.get("rawInput")),
+                    call_id=obj.get("toolCallId"),
+                ))
+                continue
+            if t == "tool_call_update":
+                if obj.get("status") != "completed":
+                    continue
+                flush_assistant()
+                events.append(Event(
+                    role="tool",
+                    tool_result=ToolResult(
+                        content=_tool_result_text(obj),
+                        call_id=obj.get("toolCallId"),
+                        is_error=False,
+                    ),
+                    session_id=session_id,
+                    raw=obj,
+                ))
+                continue
             if t == "end":
                 session_id = obj.get("sessionId") or session_id
                 final_raw = obj
                 continue
+
+    flush_assistant()
 
     # Prepend the problem prompt when available so the viewer has a user turn.
     run = _run_dir_for(path)
@@ -281,18 +365,8 @@ def _parse_streaming_jsonl(path: Path) -> Session:
                     prompt_text = None
                 break
     if prompt_text:
-        events.append(Event(role="user", text=prompt_text, session_id=session_id))
+        events.insert(0, Event(role="user", text=prompt_text, session_id=session_id))
 
-    reasoning = "".join(thought_parts).strip() or None
-    final_text = "".join(text_parts).strip() or None
-    if reasoning or final_text:
-        events.append(Event(
-            role="assistant",
-            text=final_text,
-            reasoning=reasoning,
-            session_id=session_id,
-            raw=final_raw,
-        ))
     if final_raw:
         events.append(Event(
             role="system",
@@ -309,7 +383,7 @@ def _parse_streaming_jsonl(path: Path) -> Session:
         cwd=str(path.parent),
         events=events,
         final_text=final_text,
-        total_usage=TokenUsage(),
+        total_usage=last_usage or TokenUsage(),
     )
 
 

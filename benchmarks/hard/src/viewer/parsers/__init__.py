@@ -90,6 +90,16 @@ def sniff(path: Path) -> str:
                     and ("sessionID" in obj or "part" in obj):
                 return "opencode"
 
+            # Grok Build 4.6+ streaming-json starts with available_commands
+            # (tool roster). Do not fall through to Claude on that preamble.
+            tools = obj.get("tools") or []
+            if obj.get("type") == "available_commands" and (
+                "run_terminal_command" in tools or "read_file" in tools
+            ):
+                return "grok"
+            if obj.get("type") in {"tool_call", "tool_call_update", "usage", "plan"}:
+                continue
+
             # Grok Build CLI streaming JSON: token deltas as {type: thought|text, data}.
             if obj.get("type") in {"thought", "text", "end"} and ("data" in obj or "stopReason" in obj):
                 return "grok"
