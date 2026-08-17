@@ -28,7 +28,11 @@ import json
 import re
 from pathlib import Path
 
-_TS = re.compile(r"outputs/runs/(\d{8}_\d{6})")
+_TS = re.compile(r"outputs/runs(?:-remote-[a-z0-9]+)?/(\d{8}_\d{6})")
+# Literal copy of another archive's kernel. Never treat as a false positive.
+_CP_FOREIGN = re.compile(
+    r"\bcp\s+\S*outputs/runs(?:-remote-[a-z0-9]+)?/(\d{8}_\d{6})_\S+/solution\.py"
+)
 # A run referenced by its directory name, without the outputs/runs/ prefix,
 # e.g. "20260715_212751_grok_grok-4.5_01_glm52_fused_moe".
 _RUN_DIR_ID = re.compile(r"\b(\d{8}_\d{6})_[a-z]")
@@ -110,6 +114,31 @@ def _sibling_score_refs(run_dir: Path, text: str, self_ts: str) -> set[str]:
         if re.search(rf"(?<![\d.]){re.escape(pf_str)}(?!\d)", text):
             seen.add(m.group(1))
     return seen
+
+
+def copied_foreign_solution(run_dir: Path) -> bool:
+    """True if the agent `cp`'d another archive's solution.py into this run.
+
+    `verdict: clean` must not override this. Same-buffer overwrite is timing,
+    not authorship. 20260813 grok-4.6 copied Fable from runs-remote-pro.
+    """
+    m = re.match(r"(\d{8}_\d{6})", run_dir.name)
+    self_ts = m.group(1) if m else ""
+    for fn in ("transcript.jsonl", "codex_session.jsonl"):
+        p = run_dir / fn
+        if not p.exists():
+            continue
+        raw = p.read_text(errors="ignore")
+        for ts in _CP_FOREIGN.findall(raw):
+            if ts != self_ts:
+                return True
+        joined = _token_stream_text(raw)
+        if joined is None:
+            continue
+        for ts in _CP_FOREIGN.findall(joined):
+            if ts != self_ts:
+                return True
+    return False
 
 
 def other_archives(run_dir: Path) -> set[str]:

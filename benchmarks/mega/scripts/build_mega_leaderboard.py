@@ -90,7 +90,12 @@ def _framework(run_dir: Path) -> str:
     return "eager"
 
 
-_RUN_TS = re.compile(r"outputs/runs/(\d{8}_\d{6})")
+# Match the live archive and the remote pull trees (runs-remote-pro, -b200, …).
+# `outputs/runs/` alone misses a `cp` from runs-remote-pro (20260813 grok-4.6).
+_RUN_TS = re.compile(r"outputs/runs(?:-remote-[a-z0-9]+)?/(\d{8}_\d{6})")
+_CP_FOREIGN = re.compile(
+    r"\bcp\s+\S*outputs/runs(?:-remote-[a-z0-9]+)?/(\d{8}_\d{6})_\S+/solution\.py"
+)
 
 
 def megakernel_authentic(run_id: str, annotations_dir: Path) -> bool | None:
@@ -173,6 +178,27 @@ def megakernel_row(run_dir: Path, run_id: str, annotations_dir: Path, problem: s
     return kernels, status, verdict is not None
 
 
+def copied_foreign_solution(run_dir: Path) -> bool:
+    """True if the agent `cp`'d another archive's solution.py into this run.
+
+    A manual `verdict: clean` must not override this. The 20260813 grok-4.6
+    cell passed same-buffer overwrite and was marked clean; the transcript
+    still copied Fable's 24.6x kernel from runs-remote-pro.
+    """
+    self_ts_m = re.match(r"(\d{8}_\d{6})", run_dir.name)
+    self_ts = self_ts_m.group(1) if self_ts_m else ""
+    for fn in ("transcript.jsonl", "codex_session.jsonl"):
+        src = run_dir / fn
+        try:
+            txt = src.read_text(errors="ignore")
+        except OSError:
+            continue
+        for ts in _CP_FOREIGN.findall(txt):
+            if ts != self_ts:
+                return True
+    return False
+
+
 def contamination(run_dir: Path) -> int:
     """Count distinct OTHER run-archive timestamps referenced in the AGENT transcript.
 
@@ -230,6 +256,8 @@ def main() -> None:
         # A manual audit verdict of `clean` (which includes a contamination read
         # of the transcript) overrides the tripwire, mirroring hard's builder;
         # anything unaudited or non-clean stays excluded.
+        # Exception: a literal `cp` of another archive's solution.py is never
+        # overridden. Same-buffer overwrite is not authorship.
         rid = d.get("run_id", run_dir.name)
         # A manual audit verdict of `contaminated` excludes the run outright:
         # grok streaming transcripts carry no tool events or paths, so the
@@ -237,6 +265,9 @@ def main() -> None:
         # solution (2026-07-21 B200 incident).
         if annotation_verdict(rid, annotations_dir) in {"contaminated", "contamination"}:
             print(f"  EXCLUDED (manual audit verdict=contaminated): {run_dir.name}")
+            continue
+        if copied_foreign_solution(run_dir):
+            print(f"  EXCLUDED (copied another archive solution.py): {run_dir.name}")
             continue
         nc = contamination(run_dir)
         if nc >= 1:

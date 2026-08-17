@@ -22,6 +22,7 @@ fills FILL-IN → website live 200s → user says post → `posted/`.
 
 No YAML → the folder is `unaudited/`. A caveat in the text does not move it.
 Do not start `audited/` without `benchmarks/<bench>/results/annotations/<run_id>.yaml`.
+`verdict: contamination` is not `audited/`. Do not draft that cell's number.
 Do not post from `unaudited/`. Do not post without FILL-IN and an explicit "post".
 Do not post before the live site has the cell. The website is first.
 

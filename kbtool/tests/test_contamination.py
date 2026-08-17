@@ -7,7 +7,7 @@ looked clean to the raw `outputs/runs/<ts>` regex. See kb/contamination.py.
 import json
 from pathlib import Path
 
-from kb.contamination import other_archives
+from kb.contamination import copied_foreign_solution, other_archives
 
 
 def _write_tokens(path: Path, tokens: list[str], kind: str = "thought") -> None:
@@ -108,6 +108,46 @@ def test_non_grok_transcript_behavior_unchanged(tmp_path):
         "message": "see outputs/runs/20260721_000000_claude_claude-opus-4-8_01_glm52_fused_moe",
     }) + "\n")
     assert other_archives(own_only) == set()
+
+
+def test_runs_remote_pro_path_is_flagged(tmp_path):
+    """Anvil pull trees live at outputs/runs-remote-pro, not outputs/runs."""
+    run = _mk_run(tmp_path, "20260813_152200_grok_grok-4.6_02_kimi_linear_decode",
+                  "02_kimi_linear_decode", 21.0793)
+    (run / "transcript.jsonl").write_text(json.dumps({
+        "type": "assistant",
+        "message": (
+            "read outputs/runs-remote-pro/"
+            "20260719_121747_or-fable_anthropic_claude-fable-5_02_kimi_linear_decode/result.json"
+        ),
+    }) + "\n")
+    assert other_archives(run) == {"20260719_121747"}
+
+
+def test_cp_foreign_solution_is_flagged(tmp_path):
+    run = _mk_run(tmp_path, "20260813_152200_grok_grok-4.6_02_kimi_linear_decode",
+                  "02_kimi_linear_decode", 21.0793)
+    cmd = (
+        "cp /home/infatoshi/dev/sites/kernelbench.com/benchmarks/mega/"
+        "outputs/runs-remote-pro/"
+        "20260719_121747_or-fable_anthropic_claude-fable-5_02_kimi_linear_decode/"
+        "solution.py ./solution.py"
+    )
+    (run / "transcript.jsonl").write_text(json.dumps({
+        "type": "tool_call",
+        "rawInput": {"command": cmd, "description": "Copy proven megakernel into workspace solution.py"},
+    }) + "\n")
+    assert copied_foreign_solution(run) is True
+    assert other_archives(run) == {"20260719_121747"}
+
+
+def test_cp_own_solution_is_not_foreign(tmp_path):
+    run = _mk_run(tmp_path, "20260813_152200_grok_grok-4.6_02_kimi_linear_decode",
+                  "02_kimi_linear_decode", 21.0793)
+    (run / "transcript.jsonl").write_text(
+        "cp outputs/runs/20260813_152200_grok_grok-4.6_02_kimi_linear_decode/solution.py /tmp/bak.py\n"
+    )
+    assert copied_foreign_solution(run) is False
 
 
 def test_sibling_score_after_run_finished_does_not_fire(tmp_path):

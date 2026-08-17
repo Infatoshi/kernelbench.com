@@ -1,5 +1,16 @@
 # DEVLOG
 
+## 2026-08-17 - retracted grok-4.6 21x (copied Fable)
+
+`20260813_152200_grok_grok-4.6_02_kimi_linear_decode` listed `runs-remote-pro`,
+read Fable `20260719_121747` (`peak_fraction` 24.6091), then `cp` that
+`solution.py` (tool description: "Copy proven megakernel into workspace
+solution.py"). The annotation was wrongly `clean` after a same-buffer
+overwrite pass. Flip to `contamination`. The Mega board drops the row.
+`build_mega_leaderboard.py` no longer lets `clean` override a literal `cp`
+of another archive's `solution.py`. `outputs/runs-remote-*` is now a
+tripwire path. Isolated regrade and overwrite cosines are not authorship.
+
 ## 2026-07-31 - run_hard.sh stays a deliberate fork of the shared runner
 
 hard/cuda/mini's run_hard.sh were unified into thin wrappers over
