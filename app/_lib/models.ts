@@ -147,7 +147,7 @@ export const SITE_HIDDEN_GPUS = new Set<string>([])
  * Default GPU board for multi-GPU decks and the homepage ranking toggle.
  * Tab strip order is HOME_GPU_TABS; initial selection is DEFAULT_GPU.
  */
-export const DEFAULT_GPU = "h100"
+export const DEFAULT_GPU = "rtxpro6000"
 
 /** GPU key for the canonical boards — cells built without an explicit gpu
  *  belong to this board (data paths for it are un-namespaced). */
