@@ -28,10 +28,38 @@ capture status are stored in `result.json`. This is an artifact reproducibility
 boundary, not a general sandbox: submission code can still see host files,
 including file-backed credentials and Unix sockets, available to the grading
 user. A colluding host process could relay data over such a socket. Mega and
-Multi keep their existing runners and archive formats. A host-mode agent also
-runs as the grading user before capture, so it can tamper with other
-user-writable host files or leave a detached process behind; container agent
-mode is required when that stronger pre-capture boundary matters.
+Multi keep their existing runners and archive formats.
+
+Host-mode AAB/Codex development now uses the same generated filesystem
+isolation path as final replay. The canonical `.venv`, Python runtime, trusted
+helpers, problem templates, `src/`, project metadata, Rust toolchain, CUDA
+Oxide source, and cuTile Rust source are read-only. Only the candidate files,
+run-local state, logs, compiler caches, and a copy-on-write uv cache can be
+changed. Final replay uses the same helper with a private network namespace.
+The Codex inference client stays online, while every model-generated command
+runs with command networking disabled, approvals disabled, web search
+disabled, and no MCP servers. Before inference, the runner proves DNS lookup,
+`curl`, and a direct Python socket all fail, and it genuinely preflights CUDA
+C++, CUDA Oxide, CuTe DSL, Triton, cuTile Python, and cuTile Rust. Missing
+toolchains fail the run rather than being installed during it. Other host-mode
+agents still run as the grading user before capture; use their container mode
+when a stronger pre-capture boundary is required.
+
+Fresh Hard, CUDA, and Mini workers get this environment through
+`brev_worker.sh bootstrap` or `lambda_worker.sh bootstrap`. Both run the locked
+Python sync and then `scripts/lib/bootstrap_dialects.sh`. The Python lock pins
+cuTile Python 1.5.0 and CUTLASS/CuTe DSL 4.7.0. The bootstrap installs an
+isolated complete CUDA toolkit 13.3.1, avoiding
+the CUDA 13.0 runtime dependency required by the locked PyTorch build. It also
+pins CUDA Oxide commit
+`6c5458fe991bbde32c5bee74d87822aef1b5a691` with Rust
+`nightly-2026-04-03`, and cuTile Rust commit
+`a3ed99d225befcb19f75ec8d81708eb35818fee2` with Rust 1.89.0 and its CUDA
+Tile submodule at `0859212ad19f71133a9b940c05323286cbf28a05`. It fetches
+both Cargo lockfiles, runs real locked Cargo checks, verifies the Python package
+versions/imports, and exposes the locked CUDA compiler as `.venv/bin/nvcc`.
+The runtime preflight repeats compilation and GPU execution offline before an
+agent is allowed to start.
 
 | Harness | Endpoint/transport | Required env key(s) | Benches that have it | Notes/quirks |
 | --- | --- | --- | --- | --- |

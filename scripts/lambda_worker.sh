@@ -7,7 +7,7 @@
 #   lambda_worker.sh up <name> [type] [region]    launch (default gpu_1x_h100_sxm5)
 #   lambda_worker.sh sync <name>                  rsync thin bench -> name:kb-<bench>/
 #      (bench selected by KB_LAMBDA_BENCH, default hard; `multi` also ships ~/.kbm_env)
-#   lambda_worker.sh bootstrap <name> [--agents]  uv + torch; --agents adds CLIs + auth
+#   lambda_worker.sh bootstrap <name> [--agents]  uv + torch + pinned CUDA dialects; --agents adds CLIs + auth
 #   lambda_worker.sh run <name> <harness> <model> <problem> [effort]
 #   lambda_worker.sh regrade <name> <run_id> [runs_dir]
 #   lambda_worker.sh pull <name>                  rsync outputs/runs back -> outputs/runs-lambda-<name>/
@@ -267,7 +267,7 @@ case "$CMD" in
     # time, found 2026-08-01). Preserve them once the patch marker is present.
     SYNC_EXCLUDES=(--exclude outputs --exclude __pycache__ --exclude '.venv' --exclude '*.pyc'
       --exclude .git --exclude 'docs/refs')
-    if ssh_to "$NAME" "grep -q pytorch-cu128 $REMOTE_DIR/pyproject.toml" 2>/dev/null; then
+    if ssh_to "$NAME" "grep -q pytorch-cu128 $REMOTE_DIR/pyproject.toml && grep -q 'cuda-tile==1.5.0' $REMOTE_DIR/pyproject.toml" 2>/dev/null; then
       echo "[sync] preserving node torch-index patch (pyproject.toml/uv.lock not shipped)"
       SYNC_EXCLUDES+=(--exclude /pyproject.toml --exclude /uv.lock)
     fi
@@ -299,7 +299,7 @@ case "$CMD" in
     AGENTS=0
     [ "${1:-}" = "--agents" ] && AGENTS=1
     ensure_reachable "$NAME"
-    echo "[bootstrap] uv + torch (agents=$AGENTS)"
+    echo "[bootstrap] uv + torch + pinned CUDA dialects (agents=$AGENTS)"
     ssh_to "$NAME" 'command -v uv >/dev/null 2>&1 || curl -LsSf https://astral.sh/uv/install.sh | sh'
     # Prefer cu128 for driver compatibility (same as brev workers); override with KB_LAMBDA_TORCH_INDEX.
     TORCH_INDEX="${KB_LAMBDA_TORCH_INDEX:-https://download.pytorch.org/whl/cu128}"
@@ -309,11 +309,22 @@ case "$CMD" in
 name = \"pytorch-cu128\"
 url = \"${TORCH_INDEX}\"
 explicit = true
+TOML
+if grep -q '^\\[tool\\.uv\\.sources\\]$' pyproject.toml; then
+  sed -i '/^\\[tool\\.uv\\.sources\\]$/a torch = { index = \"pytorch-cu128\" }' pyproject.toml
+else
+  cat >> pyproject.toml <<'TOML'
 
 [tool.uv.sources]
 torch = { index = \"pytorch-cu128\" }
 TOML
+fi
 rm -f uv.lock; fi; export PATH=\"\$HOME/.local/bin:\$PATH\"; uv sync"
+    case "$BENCH" in
+      hard|cuda|mini)
+        ssh_to "$NAME" "cd ~/$REMOTE_DIR && export PATH=\"\$HOME/.local/bin:\$PATH\" && bash scripts/lib/bootstrap_dialects.sh"
+        ;;
+    esac
     if [ "$AGENTS" = 1 ]; then
       ssh_to "$NAME" 'command -v node >/dev/null 2>&1 || { curl -fsSL https://deb.nodesource.com/setup_22.x | sudo -E bash - >/dev/null 2>&1 && sudo apt-get install -y nodejs >/dev/null 2>&1; }
         command -v bwrap >/dev/null 2>&1 || sudo apt-get install -y -qq bubblewrap >/dev/null 2>&1

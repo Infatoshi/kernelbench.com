@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import random
+import shutil
 import stat
 import subprocess
 import sys
@@ -446,14 +447,163 @@ def test_shared_runner_uses_separate_check_and_benchmark_replays() -> None:
 
 def test_shared_runner_clears_environment_and_unshares_user_and_network() -> None:
     text = (REPO / "scripts/lib/run_harness.sh").read_text()
-    collapsed = " ".join(text.replace("\\\n", " ").split())
-    assert '"$REAL_UNSHARE" --user --map-root-user --net --mount' in collapsed
-    assert '/usr/bin/env -i "${replay_env[@]}" "$TRUSTED_PYTHON" -I -S' in collapsed
+    start = text.index("run_replay_stage()")
+    end = text.index('\n}\n\nif [ "$TEMPLATE_MUTATED"', start)
+    runtime = text[start:end]
+    collapsed = " ".join(runtime.replace("\\\n", " ").split())
+    assert "KBH_ISOLATION_NETWORK=off" in collapsed
+    assert '"$HOST_AGENT_ISOLATOR" /usr/bin/env -i "${replay_env[@]}"' in collapsed
+    assert '"$TRUSTED_PYTHON" -I -S' in collapsed
     assert '"$TRUSTED_SITE_PACKAGES" "$script"' in collapsed
-    assert 'mount -o remount,bind,ro "$path"' in text
-    assert 'mount -o remount,bind,rw "$writable_stage"' in text
-    assert 'run_gpu_locked_timeout check.py' in text
+    assert 'WORKSPACE_ROOT="$stage_root"' in runtime
+    assert 'WORKSPACE_TRUSTED_PATHS="$replay_trusted_paths"' in runtime
+    assert 'run_gpu_locked_timeout check.py' in runtime
     assert "replay-preflight" in text
+
+
+def test_host_agent_isolator_seals_dependencies_and_uses_cache_overlay() -> None:
+    text = (REPO / "scripts/lib/run_harness.sh").read_text()
+    start = text.index("HOST_AGENT_ISOLATOR=")
+    end = text.index("\nEOF\nchmod", start)
+    isolator = text[start:end]
+
+    assert (
+        'for path in "$home" "$repo" "$python_runtime" "$trusted_tools" "$trusted_uv"'
+        in isolator
+    )
+    assert '/usr/bin/mount --bind "$repo/.venv" "$workspace/.venv"' in isolator
+    assert 'printf "%s\\n" "$workspace_trusted"' in isolator
+    assert (
+        'for path in "$cargo_home" "$rustup_home" "$cuda_oxide" "$cutile_rust"'
+        in isolator
+    )
+    assert '/usr/bin/mount -t overlay overlay' in isolator
+    assert 'CARGO_NET_OFFLINE=true' in isolator
+    assert '"${KBH_ISOLATION_WRITABLE_ROOT:-$RUN_DIR}"' in isolator
+
+
+def test_host_agent_isolator_enforces_read_only_and_copy_on_write_mounts(
+    tmp_path: Path,
+) -> None:
+    unshare = shutil.which("unshare")
+    setpriv = shutil.which("setpriv")
+    if unshare is None or setpriv is None:
+        pytest.skip("util-linux namespace tools are unavailable")
+
+    text = (REPO / "scripts/lib/run_harness.sh").read_text()
+    marker = 'cat > "$HOST_AGENT_ISOLATOR" <<\'EOF\'\n'
+    isolator = text.split(marker, 1)[1].split("\nEOF\n", 1)[0]
+
+    repo = tmp_path / "repo"
+    run = repo / "run"
+    workspace = run / "workspace"
+    template_backup = run / "template_files"
+    wrappers = run / "bin"
+    replays = run / "replays"
+    lock = repo / "lock"
+    lock_file = lock / "gpu.lock"
+    lock_log = run / "gpu_lock.log"
+    runtime = tmp_path / "python-runtime"
+    trusted_tools = tmp_path / "trusted-tools"
+    trusted_uv = tmp_path / "trusted-uv"
+    cache = tmp_path / "uv-cache"
+    overlay = run / "agent_uv_overlay"
+    for path in (
+        workspace,
+        workspace / ".venv",
+        repo / ".venv",
+        template_backup,
+        wrappers,
+        replays,
+        lock,
+        runtime,
+        trusted_tools,
+        cache,
+        overlay / "upper",
+        overlay / "work",
+        overlay / "merged",
+    ):
+        path.mkdir(parents=True, exist_ok=True)
+    (cache / "package.py").write_text("lower\n")
+    lock_file.touch()
+    lock_log.touch()
+    trusted_uv.touch(mode=0o755)
+
+    command = """
+if /usr/bin/touch "$1/forbidden" 2>/dev/null; then exit 21; fi
+if /usr/bin/touch "$2/forbidden" 2>/dev/null; then exit 22; fi
+if /usr/bin/touch "$5/forbidden" 2>/dev/null; then exit 23; fi
+if /usr/bin/touch "$6/forbidden" 2>/dev/null; then exit 24; fi
+if printf poisoned > "$7" 2>/dev/null; then exit 25; fi
+printf 'upper\n' > "$3/package.py"
+grep -qx upper "$3/package.py"
+printf 'workspace\n' > "$4/wrote"
+"""
+    env = os.environ | {
+        "REPO_ROOT": str(repo),
+        "RUN_DIR": str(run),
+        "KBH_GPU_LOCK": str(lock_file),
+        "KBH_GPU_LOCK_LOG": str(lock_log),
+        "TEMPLATE_BACKUP_DIR": str(template_backup),
+        "LOCK_WRAPPER_DIR": str(wrappers),
+        "REPLAY_ROOT": str(replays),
+        "TRUSTED_PYTHON_RUNTIME": str(runtime),
+        "TRUSTED_TOOLS_DIR": str(trusted_tools),
+        "REAL_UV": str(trusted_uv),
+        "REAL_UNSHARE": unshare,
+        "REAL_SETPRIV": setpriv,
+        "UV_CACHE_HOST": str(cache),
+        "AGENT_UV_OVERLAY": str(overlay),
+        "WORKSPACE_ROOT": str(workspace),
+        "WORKSPACE_TRUSTED_PATHS": str(workspace / ".venv"),
+        "KBH_CARGO_HOME": str(tmp_path / "cargo"),
+        "KBH_RUSTUP_HOME": str(tmp_path / "rustup"),
+        "KBH_CUDA_OXIDE_ROOT": str(tmp_path / "cuda-oxide"),
+        "KBH_CUTILE_RUST_ROOT": str(tmp_path / "cutile-rust"),
+        "DIALECT_CUDA_TOOLKIT": str(runtime),
+    }
+    try:
+        completed = subprocess.run(
+            [
+                "bash",
+                "-s",
+                "--",
+                "/bin/sh",
+                "-u",
+                "-c",
+                command,
+                "probe",
+                str(repo),
+                str(template_backup),
+                str(cache),
+                str(workspace),
+                str(runtime),
+                str(trusted_tools),
+                str(trusted_uv),
+            ],
+            input=isolator,
+            text=True,
+            capture_output=True,
+            cwd=workspace,
+            env=env,
+            timeout=10,
+        )
+        if completed.returncode != 0 and "Operation not permitted" in completed.stderr:
+            pytest.skip("unprivileged user namespaces are unavailable")
+        assert completed.returncode == 0, completed.stderr
+        assert (cache / "package.py").read_text() == "lower\n"
+        assert (workspace / "wrote").read_text() == "workspace\n"
+        assert not (repo / "forbidden").exists()
+        assert not (template_backup / "forbidden").exists()
+        assert not (runtime / "forbidden").exists()
+        assert not (trusted_tools / "forbidden").exists()
+        assert trusted_uv.read_bytes() == b""
+    finally:
+        subprocess.run(
+            ["chmod", "-R", "u+rwX", str(tmp_path)],
+            check=False,
+            capture_output=True,
+        )
 
 
 def test_shared_runner_projects_bundle_before_publishing_result() -> None:
