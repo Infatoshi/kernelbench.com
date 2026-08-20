@@ -1,0 +1,494 @@
+"""GLM-5.2 fused MoE layer, CUDA implementation.
+
+Structure (matching reference.py / GLM-5.x routing):
+  E=256 routed experts, top_k=8, n_shared=1 shared expert (always on),
+  H=4096, I=2048.
+
+Per expert:  h = silu(x @ w1[:I].T) * (x @ w1[I:].T);  y = h @ w2.T
+out = sum_s y_shared(s) + sum_k weight[t,k] * y_routed(e[t,k])
+
+Implementation: token-slots are grouped by expert with a counting sort, then
+experts are clustered into equal-size buckets (each rounded up to a multiple of
+32) and each bucket is dispatched as a pointer-array batched GEMM
+(cublasGemmBatchedEx) so the weights are read in place with minimal padding.
+Experts with more than 256 tokens are split: 256 slots go to a main bucket and
+the remainder to a compact overflow bucket.
+  * large T: bf16 tensor-core GEMMs (cuBLAS, fp32 accumulate) per bucket.
+  * small T (decode): a SIMT GEMV kernel (one warp per output element).
+The shared expert runs as a dense GEMM on all tokens on a second stream,
+overlapping the memory-bound routed GEMMs. Custom CUDA kernels handle the sort,
+the silu*mul activation, and the weighted scatter-add.
+"""
+from __future__ import annotations
+
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+_CPP_SRC = r"""
+#include <torch/extension.h>
+torch::Tensor moe_forward(torch::Tensor x, torch::Tensor expert_ids,
+                          torch::Tensor expert_weights, torch::Tensor w1_routed,
+                          torch::Tensor w2_routed, torch::Tensor w1_shared,
+                          torch::Tensor w2_shared);
+"""
+
+_CUDA_SRC = r"""
+#include <torch/extension.h>
+#include <ATen/cuda/CUDAContext.h>
+#include <cuda_runtime.h>
+#include <cuda_bf16.h>
+#include <cublas_v2.h>
+#include <algorithm>
+#include <vector>
+
+using bf16 = __nv_bfloat16;
+
+__global__ void hist_kernel(const long long* __restrict__ expert_ids,
+                            int* __restrict__ counts, int M) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < M) atomicAdd(&counts[(int)expert_ids[i]], 1);
+}
+
+// Single-block exclusive scan over E<=256 elements.
+__global__ void exclusive_scan_kernel(const int* __restrict__ counts,
+                                      int* __restrict__ starts, int E) {
+    __shared__ int s[256];
+    int tid = threadIdx.x;
+    int v = (tid < E) ? counts[tid] : 0;
+    s[tid] = v;
+    __syncthreads();
+    for (int offset = 1; offset < 256; offset <<= 1) {
+        int add = (tid >= offset) ? s[tid - offset] : 0;
+        __syncthreads();
+        s[tid] += add;
+        __syncthreads();
+    }
+    if (tid < E) starts[tid] = s[tid] - v;
+}
+
+// Assign each (token, slot) pair a padded row index.  Experts are grouped into
+// size buckets; `main_base`/`ov_base` give each expert's start row in the padded
+// (bucket) layout, and `ov_total` is where the overflow layout begins.
+__global__ void scatter_kernel(const long long* __restrict__ expert_ids,
+                               const int* __restrict__ main_base,
+                               const int* __restrict__ ov_base,
+                               int* __restrict__ cursor, int T, int K, int ov_total,
+                               int* __restrict__ row, int* __restrict__ tok) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    int M = T * K;
+    if (i >= M) return;
+    int t = i / K;
+    int e = (int)expert_ids[i];
+    int local = atomicAdd(&cursor[e], 1);
+    int r = (local < 256) ? (main_base[e] + local)
+                          : (ov_total + ov_base[e] + (local - 256));
+    row[i] = r;
+    tok[i] = t;
+}
+
+__global__ void gather_padded_kernel(const int4* __restrict__ x,
+                                     const int* __restrict__ tok,
+                                     const int* __restrict__ row,
+                                     int4* __restrict__ xp, int4* __restrict__ xp_ov,
+                                     int ov_total, int H4) {
+    int i = blockIdx.x;
+    const int4* src = x + (size_t)tok[i] * H4;
+    int r = row[i];
+    int4* dst = (r < ov_total) ? (xp + (size_t)r * H4)
+                               : (xp_ov + (size_t)(r - ov_total) * H4);
+    for (int j = threadIdx.x; j < H4; j += blockDim.x) dst[j] = src[j];
+}
+
+__global__ void act_kernel(const bf16* __restrict__ gate_up, bf16* __restrict__ h,
+                           size_t n, int I) {
+    size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n) return;
+    size_t row = idx / I;
+    int i = (int)(idx - row * I);
+    size_t base = row * (2 * (size_t)I);
+    float g = __bfloat162float(gate_up[base + i]);
+    float u = __bfloat162float(gate_up[base + I + i]);
+    float s = g * (1.0f / (1.0f + __expf(-g)));
+    h[idx] = __float2bfloat16(s * u);
+}
+
+__global__ void accum_kernel(const bf16* __restrict__ y_padded,
+                             const bf16* __restrict__ y_ov,
+                             const bf16* __restrict__ y_shared,
+                             const int* __restrict__ row,
+                             const bf16* __restrict__ expert_weights,
+                             bf16* __restrict__ out, int ov_base, int K, int H) {
+    int t = blockIdx.x;
+    for (int j = threadIdx.x; j < H; j += blockDim.x) {
+        float acc = __bfloat162float(y_shared[(size_t)t * H + j]);
+        for (int k = 0; k < K; ++k) {
+            int r = row[t * K + k];
+            float w = __bfloat162float(expert_weights[t * K + k]);
+            float v = (r < ov_base) ? __bfloat162float(y_padded[(size_t)r * H + j])
+                                    : __bfloat162float(y_ov[(size_t)(r - ov_base) * H + j]);
+            acc += w * v;
+        }
+        out[(size_t)t * H + j] = __float2bfloat16(acc);
+    }
+}
+
+// Coalesced SIMT GEMV: C(M x N) = A(M x K) @ W(N x K)^T.  One warp per output.
+__global__ void gemv_nt_kernel(const bf16* __restrict__ A, const bf16* __restrict__ W,
+                               bf16* __restrict__ C, int M, int N, int K, int accumulate) {
+    int idx = blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
+    if (idx >= M * N) return;
+    int m = idx / N;
+    int n = idx - m * N;
+    int lane = threadIdx.x & 31;
+    const bf16* arow = A + (size_t)m * K;
+    const bf16* wrow = W + (size_t)n * K;
+    float acc = 0.0f;
+    for (int k = lane; k < K; k += 32) {
+        acc += __bfloat162float(arow[k]) * __bfloat162float(wrow[k]);
+    }
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) acc += __shfl_down_sync(0xffffffffu, acc, off);
+    if (lane == 0) {
+        size_t o = (size_t)m * N + n;
+        if (accumulate) C[o] = __float2bfloat16(__bfloat162float(C[o]) + acc);
+        else C[o] = __float2bfloat16(acc);
+    }
+}
+
+// C(M x N) = A(M x K) @ B(N x K)^T  (A,B bf16 row-major, C fp32 row-major).
+static inline void gemm_bf16_nt(cublasHandle_t h, int M, int N, int K,
+                                const void* A, const void* B, bf16* C, float beta) {
+    const float alpha = 1.0f;
+    cublasStatus_t st = cublasGemmEx(h, CUBLAS_OP_T, CUBLAS_OP_N,
+        N, M, K, &alpha, B, CUDA_R_16BF, K, A, CUDA_R_16BF, K,
+        &beta, C, CUDA_R_16BF, N, CUDA_R_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+    TORCH_CHECK(st == CUBLAS_STATUS_SUCCESS, "cublasGemmEx failed: ", (int)st);
+}
+
+// Pointer-array (cublasGemmBatchedEx) variant: weight matrix per batch is the
+// (non-contiguous) expert `experts[i]`; activation/output are contiguous batches.
+// Pointer arrays are passed as device int64 tensors (torch manages the memory).
+static inline void gemm_bf16_nt_ptrs(cublasHandle_t h, int N, int M, int K,
+                                     const void* W_base, long strideW_elems,
+                                     const void* A_base, long strideA_elems,
+                                     void* C_base, long strideC_elems,
+                                     const int* experts, int batch) {
+    auto opts = torch::TensorOptions().dtype(torch::kInt64);
+    std::vector<int64_t> ap(batch), bp(batch), cp(batch);
+    const char* W = (const char*)W_base;
+    const char* A = (const char*)A_base;
+    char* C = (char*)C_base;
+    for (int i = 0; i < batch; ++i) {
+        ap[i] = (int64_t)(W + (size_t)experts[i] * strideW_elems * 2);  // bf16
+        bp[i] = (int64_t)(A + (size_t)i * strideA_elems * 2);           // bf16
+        cp[i] = (int64_t)(C + (size_t)i * strideC_elems * 2);           // bf16
+    }
+    auto ap_t = torch::from_blob(ap.data(), {batch}, opts).clone().cuda();
+    auto bp_t = torch::from_blob(bp.data(), {batch}, opts).clone().cuda();
+    auto cp_t = torch::from_blob(cp.data(), {batch}, opts).clone().cuda();
+    float alpha = 1.0f, beta = 0.0f;
+    cublasStatus_t st = cublasGemmBatchedEx(h, CUBLAS_OP_T, CUBLAS_OP_N, N, M, K, &alpha,
+        (const void* const*)ap_t.data_ptr(), CUDA_R_16BF, K,
+        (const void* const*)bp_t.data_ptr(), CUDA_R_16BF, K,
+        &beta, (void* const*)cp_t.data_ptr(), CUDA_R_16BF, N,
+        batch, CUDA_R_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+    TORCH_CHECK(st == CUBLAS_STATUS_SUCCESS, "cublasGemmBatchedEx failed: ", (int)st);
+}
+
+torch::Tensor moe_forward(torch::Tensor x, torch::Tensor expert_ids,
+                          torch::Tensor expert_weights, torch::Tensor w1_routed,
+                          torch::Tensor w2_routed, torch::Tensor w1_shared,
+                          torch::Tensor w2_shared) {
+    TORCH_CHECK(x.is_cuda() && x.scalar_type() == torch::kBFloat16, "x must be cuda bf16");
+    const int T = (int)x.size(0);
+    const int H = (int)x.size(1);
+    const int K = (int)expert_ids.size(1);
+    const int E = (int)w1_routed.size(0);
+    const int I2 = (int)w1_routed.size(1);
+    const int I = I2 / 2;
+    const int S = (int)w1_shared.size(0);
+    const int M = T * K;
+    TORCH_CHECK(H % 8 == 0, "H must be a multiple of 8");
+
+    auto opts_i = x.options().dtype(torch::kInt32);
+    auto opts_b = x.options().dtype(torch::kBFloat16);
+
+    auto counts = torch::zeros({E}, opts_i);
+    auto starts = torch::empty({E}, opts_i);
+    auto cursor = torch::zeros({E}, opts_i);
+
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    static cublasHandle_t handle = nullptr;
+    if (handle == nullptr) { cublasCreate(&handle); }
+    cublasSetStream(handle, stream);
+
+    // A second (non-blocking) stream lets the compute-bound shared expert run
+    // concurrently with the memory-bound routed GEMMs.
+    static cudaStream_t stream2 = nullptr;
+    if (stream2 == nullptr) cudaStreamCreateWithFlags(&stream2, cudaStreamNonBlocking);
+    static cublasHandle_t handle2 = nullptr;
+    if (handle2 == nullptr) cublasCreate(&handle2);
+    cublasSetStream(handle2, stream2);
+    static cudaEvent_t ev_shared = nullptr;
+    if (ev_shared == nullptr) cudaEventCreateWithFlags(&ev_shared, cudaEventDisableTiming);
+    static cudaEvent_t ev_entry = nullptr;
+    if (ev_entry == nullptr) cudaEventCreateWithFlags(&ev_entry, cudaEventDisableTiming);
+    // stream2 must observe the caller's prior writes to x (and any stream work).
+    cudaEventRecord(ev_entry, stream);
+    cudaStreamWaitEvent(stream2, ev_entry, 0);
+
+    const long long* ids = (const long long*)expert_ids.data_ptr();
+    int* cnt = (int*)counts.data_ptr();
+    int* stt = (int*)starts.data_ptr();
+    int* cur = (int*)cursor.data_ptr();
+
+    const bool small = (M < E);  // decode / tiny-batch regime
+    const int warps_per_block = 256 / 32;
+
+    // Shared-expert buffers and launch.  The shared expert is compute-bound and
+    // independent of the routing, so run it on a second stream concurrently with
+    // the sort + routed GEMMs below.
+    auto y_shared = torch::empty({T, H}, opts_b);
+    auto gate_up_s = torch::empty({T, I2}, opts_b);
+    auto h_s = torch::empty({T, I}, opts_b);
+    const bf16* w1s = (const bf16*)w1_shared.data_ptr();
+    const bf16* w2s = (const bf16*)w2_shared.data_ptr();
+    bf16* gu_s = (bf16*)gate_up_s.data_ptr();
+    bf16* h_s_p = (bf16*)h_s.data_ptr();
+    bf16* ys_p = (bf16*)y_shared.data_ptr();
+    for (int s = 0; s < S; ++s) {
+        if (!small) {
+            gemm_bf16_nt(handle2, T, I2, H, x.data_ptr(), w1s + (size_t)s * I2 * H, gu_s, 0.0f);
+        } else {
+            int warps = T * I2;
+            int blocks = (warps + warps_per_block - 1) / warps_per_block;
+            gemv_nt_kernel<<<blocks, 256, 0, stream2>>>(
+                (const bf16*)x.data_ptr(), w1s + (size_t)s * I2 * H, gu_s, T, I2, H, 0);
+        }
+        size_t n_s = (size_t)T * I;
+        act_kernel<<<(unsigned)((n_s + 255) / 256), 256, 0, stream2>>>(gu_s, h_s_p, n_s, I);
+        float beta_s = (s == 0) ? 0.0f : 1.0f;
+        if (!small) {
+            gemm_bf16_nt(handle2, T, H, I, h_s_p, w2s + (size_t)s * H * I, ys_p, beta_s);
+        } else {
+            int warps = T * H;
+            int blocks = (warps + warps_per_block - 1) / warps_per_block;
+            gemv_nt_kernel<<<blocks, 256, 0, stream2>>>(
+                h_s_p, w2s + (size_t)s * H * I, ys_p, T, H, I, (s == 0) ? 0 : 1);
+        }
+    }
+    cudaEventRecord(ev_shared, stream2);
+
+    int grid_hist = (M + 255) / 256;
+    hist_kernel<<<grid_hist, 256, 0, stream>>>(ids, cnt, M);
+    exclusive_scan_kernel<<<1, 256, 0, stream>>>(cnt, stt, E);
+
+    auto starts_cpu = starts.to(torch::kCPU, /*non_blocking=*/false);
+    const int* starts_h = starts_cpu.data_ptr<int>();
+
+    // Group experts into size buckets (rounded up to 32) so each GEMM runs at a
+    // near-square tile size with minimal padding.  Experts with >256 tokens are
+    // split: 256 tokens go to the main bucket, the remainder to an overflow bucket.
+    const int CAP = 256;
+    std::vector<int> main_bsize(E, 0), main_base_h(E, 0);
+    std::vector<int> ov_bsize(E, 0), ov_base_h(E, 0);
+    int has_ov = 0;
+    for (int e = 0; e < E; ++e) {
+        int start = starts_h[e];
+        int end = (e + 1 < E) ? starts_h[e + 1] : M;
+        int m_e = end - start;
+        int mc = m_e < CAP ? m_e : CAP;
+        if (mc > 0) main_bsize[e] = (mc + 31) & ~31;
+        int oc = m_e - CAP;
+        if (oc > 0) { ov_bsize[e] = (oc + 31) & ~31; has_ov = 1; }
+    }
+
+    std::vector<int> main_sizes, main_bucket_experts, main_bucket_start, main_bucket_cnt, main_bucket_base;
+    {
+        std::vector<int> srt;
+        for (int e = 0; e < E; ++e) if (main_bsize[e] > 0) srt.push_back(main_bsize[e]);
+        std::sort(srt.begin(), srt.end());
+        for (int v : srt) if (main_sizes.empty() || main_sizes.back() != v) main_sizes.push_back(v);
+    }
+    long long main_rows = 0;
+    for (int s : main_sizes) {
+        main_bucket_start.push_back((int)main_bucket_experts.size());
+        main_bucket_base.push_back((int)main_rows);
+        for (int e = 0; e < E; ++e) {
+            if (main_bsize[e] == s) {
+                main_base_h[e] = (int)main_rows;
+                main_rows += s;
+                main_bucket_experts.push_back(e);
+            }
+        }
+        main_bucket_cnt.push_back((int)main_bucket_experts.size() - main_bucket_start.back());
+    }
+
+    std::vector<int> ov_sizes, ov_bucket_experts, ov_bucket_start, ov_bucket_cnt, ov_bucket_base;
+    if (has_ov) {
+        std::vector<int> srt;
+        for (int e = 0; e < E; ++e) if (ov_bsize[e] > 0) srt.push_back(ov_bsize[e]);
+        std::sort(srt.begin(), srt.end());
+        for (int v : srt) if (ov_sizes.empty() || ov_sizes.back() != v) ov_sizes.push_back(v);
+    }
+    long long ov_rows = 0;
+    for (int s : ov_sizes) {
+        ov_bucket_start.push_back((int)ov_bucket_experts.size());
+        ov_bucket_base.push_back((int)ov_rows);
+        for (int e = 0; e < E; ++e) {
+            if (ov_bsize[e] == s) {
+                ov_base_h[e] = (int)ov_rows;
+                ov_rows += s;
+                ov_bucket_experts.push_back(e);
+            }
+        }
+        ov_bucket_cnt.push_back((int)ov_bucket_experts.size() - ov_bucket_start.back());
+    }
+    int ov_total = (int)main_rows;
+
+    auto main_base = torch::from_blob((void*)main_base_h.data(), {E},
+                                      torch::TensorOptions().dtype(torch::kInt32)).clone().cuda();
+    torch::Tensor ov_base;
+    if (has_ov) {
+        ov_base = torch::from_blob((void*)ov_base_h.data(), {E},
+                                   torch::TensorOptions().dtype(torch::kInt32)).clone().cuda();
+    }
+
+    auto row = torch::empty({M}, opts_i);
+    auto tok = torch::empty({M}, opts_i);
+    auto xp = torch::empty({main_rows, H}, opts_b);
+    auto xp_ov = torch::empty({ov_rows, H}, opts_b);
+    auto gate_up = torch::empty({main_rows, I2}, opts_b);
+    auto gate_up_ov = torch::empty({ov_rows, I2}, opts_b);
+    auto h = torch::empty({main_rows, I}, opts_b);
+    auto h_ov = torch::empty({ov_rows, I}, opts_b);
+    auto y_padded = torch::empty({main_rows, H}, opts_b);
+    auto y_ov = torch::empty({ov_rows, H}, opts_b);
+    auto out = torch::empty({T, H}, opts_b);
+
+    const int* ov_base_p = has_ov ? (int*)ov_base.data_ptr() : nullptr;
+    scatter_kernel<<<grid_hist, 256, 0, stream>>>(ids, (int*)main_base.data_ptr(), ov_base_p,
+                                                  cur, T, K, ov_total,
+                                                  (int*)row.data_ptr(), (int*)tok.data_ptr());
+    gather_padded_kernel<<<M, 256, 0, stream>>>((const int4*)x.data_ptr(),
+                                                (int*)tok.data_ptr(), (int*)row.data_ptr(),
+                                                (int4*)xp.data_ptr(), (int4*)xp_ov.data_ptr(),
+                                                ov_total, H / 8);
+
+    const bf16* w1r = (const bf16*)w1_routed.data_ptr();
+    const bf16* w2r = (const bf16*)w2_routed.data_ptr();
+    const bf16* xp_p = (const bf16*)xp.data_ptr();
+    const bf16* xp_ov_p = (const bf16*)xp_ov.data_ptr();
+    bf16* gu_p = (bf16*)gate_up.data_ptr();
+    bf16* gu_ov_p = (bf16*)gate_up_ov.data_ptr();
+    bf16* h_p = (bf16*)h.data_ptr();
+    bf16* h_ov_p = (bf16*)h_ov.data_ptr();
+    bf16* yr_p = (bf16*)y_padded.data_ptr();
+    bf16* y_ov_p = (bf16*)y_ov.data_ptr();
+
+    if (!small) {
+        for (int b = 0; b < (int)main_sizes.size(); ++b) {
+            int s = main_sizes[b];
+            gemm_bf16_nt_ptrs(handle, I2, s, H, w1r, I2 * H,
+                              xp_p + (size_t)main_bucket_base[b] * H, (long long)s * H,
+                              gu_p + (size_t)main_bucket_base[b] * I2, (long long)s * I2,
+                              main_bucket_experts.data() + main_bucket_start[b], main_bucket_cnt[b]);
+        }
+        for (int b = 0; b < (int)ov_sizes.size(); ++b) {
+            int s = ov_sizes[b];
+            gemm_bf16_nt_ptrs(handle, I2, s, H, w1r, I2 * H,
+                              xp_ov_p + (size_t)ov_bucket_base[b] * H, (long long)s * H,
+                              gu_ov_p + (size_t)ov_bucket_base[b] * I2, (long long)s * I2,
+                              ov_bucket_experts.data() + ov_bucket_start[b], ov_bucket_cnt[b]);
+        }
+    } else {
+        for (int e = 0; e < E; ++e) {
+            int start = starts_h[e];
+            int end = (e + 1 < E) ? starts_h[e + 1] : M;
+            int m_e = end - start;
+            if (m_e <= 0) continue;
+            int warps = m_e * I2;
+            int blocks = (warps + warps_per_block - 1) / warps_per_block;
+            gemv_nt_kernel<<<blocks, 256, 0, stream>>>(
+                xp_p + (size_t)main_base_h[e] * H, w1r + (size_t)e * I2 * H,
+                gu_p + (size_t)main_base_h[e] * I2, m_e, I2, H, 0);
+        }
+    }
+
+    size_t n_act = (size_t)main_rows * I;
+    act_kernel<<<(unsigned)((n_act + 255) / 256), 256, 0, stream>>>(gu_p, h_p, n_act, I);
+    if (has_ov) {
+        size_t n_act_ov = (size_t)ov_rows * I;
+        act_kernel<<<(unsigned)((n_act_ov + 255) / 256), 256, 0, stream>>>(gu_ov_p, h_ov_p, n_act_ov, I);
+    }
+
+    if (!small) {
+        for (int b = 0; b < (int)main_sizes.size(); ++b) {
+            int s = main_sizes[b];
+            gemm_bf16_nt_ptrs(handle, H, s, I, w2r, H * I,
+                              h_p + (size_t)main_bucket_base[b] * I, (long long)s * I,
+                              yr_p + (size_t)main_bucket_base[b] * H, (long long)s * H,
+                              main_bucket_experts.data() + main_bucket_start[b], main_bucket_cnt[b]);
+        }
+        for (int b = 0; b < (int)ov_sizes.size(); ++b) {
+            int s = ov_sizes[b];
+            gemm_bf16_nt_ptrs(handle, H, s, I, w2r, H * I,
+                              h_ov_p + (size_t)ov_bucket_base[b] * I, (long long)s * I,
+                              y_ov_p + (size_t)ov_bucket_base[b] * H, (long long)s * H,
+                              ov_bucket_experts.data() + ov_bucket_start[b], ov_bucket_cnt[b]);
+        }
+    } else {
+        for (int e = 0; e < E; ++e) {
+            int start = starts_h[e];
+            int end = (e + 1 < E) ? starts_h[e + 1] : M;
+            int m_e = end - start;
+            if (m_e <= 0) continue;
+            int warps = m_e * H;
+            int blocks = (warps + warps_per_block - 1) / warps_per_block;
+            gemv_nt_kernel<<<blocks, 256, 0, stream>>>(
+                h_p + (size_t)main_base_h[e] * I, w2r + (size_t)e * H * I,
+                yr_p + (size_t)main_base_h[e] * H, m_e, H, I, 0);
+        }
+    }
+
+    // Wait for the shared expert (stream2) before the weighted scatter-add.
+    cudaStreamWaitEvent(stream, ev_shared, 0);
+    accum_kernel<<<T, 256, 0, stream>>>(yr_p, y_ov_p, ys_p, (int*)row.data_ptr(),
+                                        (const bf16*)expert_weights.data_ptr(),
+                                        (bf16*)out.data_ptr(), ov_total, K, H);
+    cudaError_t err = cudaGetLastError();
+    TORCH_CHECK(err == cudaSuccess, "CUDA error: ", cudaGetErrorString(err));
+    return out;
+}
+"""
+
+_moe = load_inline(
+    name="glm52_fused_moe_ext",
+    cpp_sources=_CPP_SRC,
+    cuda_sources=_CUDA_SRC,
+    functions=["moe_forward"],
+    extra_cuda_cflags=["-O3", "--use_fast_math"],
+    verbose=False,
+)
+
+
+class Model(nn.Module):
+    def __init__(self, T, E, top_k, n_shared, H, I):
+        super().__init__()
+        self.T, self.E, self.top_k = T, E, top_k
+        self.n_shared, self.H, self.I = n_shared, H, I
+        self.w1_routed = nn.Parameter(torch.empty(E, 2 * I, H, dtype=torch.bfloat16))
+        self.w2_routed = nn.Parameter(torch.empty(E, H, I, dtype=torch.bfloat16))
+        self.w1_shared = nn.Parameter(torch.empty(n_shared, 2 * I, H, dtype=torch.bfloat16))
+        self.w2_shared = nn.Parameter(torch.empty(n_shared, H, I, dtype=torch.bfloat16))
+        for p in self.parameters():
+            nn.init.normal_(p, std=0.02)
+
+    def forward(self, x, expert_ids, expert_weights):
+        x = x.contiguous()
+        expert_ids = expert_ids.contiguous()
+        expert_weights = expert_weights.contiguous()
+        return _moe.moe_forward(x, expert_ids, expert_weights,
+                                self.w1_routed, self.w2_routed,
+                                self.w1_shared, self.w2_shared)

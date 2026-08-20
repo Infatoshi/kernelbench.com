@@ -1,0 +1,562 @@
+"""DeepSeek NSA-inspired sparse attention — CUDA implementation.
+
+Matches the bench semantics in reference.nsa_attend (block-select + sliding
+window + causal softmax over the union), computed in fp32 and cast to bf16.
+
+Pipeline (per forward):
+  1. Precompute full-block key sums in fp32 (torch, cheap).
+  2. q . block_sum^T with a full-precision fp32 matmul -> per-query block scores.
+  3. CUDA kernel: per query, override the current (partial) block with a direct
+     prefix score, mask future blocks, and select the top-8 blocks by
+     (importance, block_idx) descending (reference tie-break).
+  4. CUDA kernel: sparse online-softmax attention over
+        window  [t-63, t]            (always)
+      + top-8 blocks restricted to keys j < t-63  (avoids double counting).
+"""
+
+from __future__ import annotations
+
+import math
+import os
+
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Compile only for the target GPU (sm_120); the default multi-arch list makes
+# nvcc build for 7+ generations and is very slow.
+os.environ["TORCH_CUDA_ARCH_LIST"] = "12.0"
+
+BLOCK_SIZE = 64
+TOP_N_BLOCKS = 8
+SLIDING_WINDOW = 64
+
+# Reference computes block importances in fp32; do not let cuBLAS silently
+# down-convert the scoring matmul to tf32.
+torch.backends.cuda.matmul.allow_tf32 = False
+try:
+    torch.backends.cuda.matmul.fp32_precision = "ieee"
+except Exception:
+    pass
+
+_cuda_src = r"""
+#include <torch/extension.h>
+#include <ATen/cuda/CUDAContext.h>
+#include <cuda_runtime.h>
+#include <cuda_bf16.h>
+#include <math_constants.h>
+
+#define BS 64
+#define TOPN 8
+#define WINDOW 64
+
+// ---------------------------------------------------------------------------
+// shared helpers
+// ---------------------------------------------------------------------------
+
+template<int D>
+__device__ __forceinline__ float qk_score(const float* __restrict__ q,
+                                          const __nv_bfloat16* __restrict__ kp,
+                                          float scale) {
+    const __nv_bfloat162* k2 = reinterpret_cast<const __nv_bfloat162*>(kp);
+    float s = 0.f;
+    #pragma unroll
+    for (int d = 0; d < D / 2; ++d) {
+        float2 kk = __bfloat1622float2(k2[d]);
+        s += q[2 * d] * kk.x + q[2 * d + 1] * kk.y;
+    }
+    return s * scale;
+}
+
+template<int D>
+__device__ __forceinline__ void softmax_update(float s,
+                                               const __nv_bfloat16* __restrict__ vp,
+                                               float& m, float& l, float* __restrict__ acc) {
+    if (s > m) {
+        float corr = __expf(m - s);
+        l *= corr;
+        #pragma unroll
+        for (int d = 0; d < D; ++d) acc[d] *= corr;
+        m = s;
+    }
+    float p = __expf(s - m);
+    l += p;
+    const __nv_bfloat162* v2 = reinterpret_cast<const __nv_bfloat162*>(vp);
+    #pragma unroll
+    for (int d = 0; d < D / 2; ++d) {
+        float2 vv = __bfloat1622float2(v2[d]);
+        acc[2 * d] += p * vv.x;
+        acc[2 * d + 1] += p * vv.y;
+    }
+}
+
+__device__ __forceinline__ void insert_top(float imp, int bi,
+                                           float* top_imp, int* top_bi, int& ntop) {
+    int pos = ntop;
+    for (int i = 0; i < ntop; ++i) {
+        if (imp > top_imp[i] || (imp == top_imp[i] && bi > top_bi[i])) { pos = i; break; }
+    }
+    if (pos < TOPN) {
+        int end = ntop < TOPN ? ntop : TOPN - 1;
+        for (int i = end; i > pos; --i) {
+            top_imp[i] = top_imp[i - 1];
+            top_bi[i] = top_bi[i - 1];
+        }
+        top_imp[pos] = imp;
+        top_bi[pos] = bi;
+        if (ntop < TOPN) ntop++;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// kernel 1: per-query block selection
+// ---------------------------------------------------------------------------
+
+template<int D>
+__global__ void __launch_bounds__(128)
+block_select_kernel(const __nv_bfloat16* __restrict__ Q,
+                    const float* __restrict__ scores,   // (BH, S, n_full)
+                    const float* __restrict__ prefix,   // (BH, n_blocks, 64, D) intra-block cumsum
+                    int* __restrict__ sel,              // (BH, S, TOPN)
+                    int S, int n_full, int n_blocks, float scale) {
+    int bh = blockIdx.y;
+    int t = blockIdx.x * blockDim.x + threadIdx.x;
+    if (t >= S) return;
+
+    float q[D];
+    const __nv_bfloat16* qp = Q + ((long long)bh * S + t) * D;
+    #pragma unroll
+    for (int d = 0; d < D; ++d) q[d] = __bfloat162float(qp[d]);
+
+    int cb = t / BS;
+    int r = t - cb * BS;
+
+    // current (partial) block importance = q . (prefix of keys) / count, via the
+    // precomputed intra-block cumulative key sums (padded with zeros).
+    const float* prow = prefix + (((long long)bh * n_blocks + cb) * 64 + r) * D;
+    float cur_sum = 0.f;
+    #pragma unroll
+    for (int d = 0; d < D; ++d) cur_sum += q[d] * prow[d];
+    float cur_imp = cur_sum * scale / (float)(r + 1);
+
+    // top-k over blocks 0..cb (future blocks have -inf and never win)
+    float top_imp[TOPN];
+    int top_bi[TOPN];
+    int ntop = 0;
+    const float* srow = scores + ((long long)bh * S + t) * n_full;
+    for (int bi = 0; bi < cb; ++bi) {
+        float imp = srow[bi] * scale * (1.0f / 64.0f);  // srow[bi] = q . block_sum
+        insert_top(imp, bi, top_imp, top_bi, ntop);
+    }
+    insert_top(cur_imp, cb, top_imp, top_bi, ntop);
+
+    int* orow = sel + ((long long)bh * S + t) * TOPN;
+    for (int i = 0; i < TOPN; ++i) orow[i] = (i < ntop) ? top_bi[i] : -1;
+}
+
+// ---------------------------------------------------------------------------
+// kernel 2: sparse attention (window + selected blocks).  Each query is split
+// across SPD threads over the D dimension (DD dims each); the partial dot
+// products are reduced with warp shuffles (identical result on every lane).
+// A per-tile union of key blocks is built so each block is loaded into shared
+// memory once and reused by every query that selected it.
+// ---------------------------------------------------------------------------
+
+template<int D, int SPD, int QS>
+__global__ void __launch_bounds__(QS * SPD)
+sparse_attend_kernel(const __nv_bfloat16* __restrict__ Q,
+                     const __nv_bfloat16* __restrict__ K,
+                     const __nv_bfloat16* __restrict__ V,
+                     const int* __restrict__ sel,       // (BH, S, TOPN)
+                     __nv_bfloat16* __restrict__ O,
+                     int S, int n_blocks, float scale) {
+    constexpr int DD = D / SPD;
+    const int tid = threadIdx.x;
+    const int sp = tid % SPD;          // dim slice id (low bits -> one query per group)
+    const int qid = tid / SPD;         // query id within tile
+    const int t0 = blockIdx.x * QS;
+    const int t = t0 + qid;
+    const int bh = blockIdx.y;
+    const bool active = (t < S);
+    const int te = active ? t : (S - 1);   // inactive lanes replay the last query (kept convergent)
+    const int qe = te - t0;
+
+    extern __shared__ char smem[];
+    int* s_sel = reinterpret_cast<int*>(smem);            // QS * TOPN
+    int* s_seen = s_sel + QS * TOPN;                      // n_blocks
+    int* s_list = s_seen + n_blocks;                      // n_blocks
+    int* s_cnt = s_list + n_blocks;                       // 1
+    const int sK_off = (QS * TOPN + n_blocks + n_blocks + 1 + 3) & ~3;
+    __nv_bfloat16* sK = reinterpret_cast<__nv_bfloat16*>(smem + sK_off * 4);
+    __nv_bfloat16* sV = sK + 64 * D;
+
+    // ---- load per-query selection into shared ----
+    const int* gsel = sel + (long long)bh * S * TOPN;
+    for (int i = tid; i < QS * TOPN; i += QS * SPD) {
+        const int gi = t0 * TOPN + i;
+        s_sel[i] = (gi < S * TOPN) ? gsel[gi] : -1;
+    }
+    for (int i = tid; i < n_blocks; i += QS * SPD) s_seen[i] = 0;
+    if (tid == 0) *s_cnt = 0;
+    __syncthreads();
+
+    // ---- build the per-tile union of key blocks (sp == 0 only) ----
+    const int cb = te / BS;
+    if (active && sp == 0) {
+        for (int s = 0; s < TOPN; ++s) {
+            int bi = s_sel[qid * TOPN + s];
+            if (bi >= 0) {
+                if (atomicCAS(&s_seen[bi], 0, 1) == 0) {
+                    int pos = atomicAdd(s_cnt, 1);
+                    s_list[pos] = bi;
+                }
+            }
+        }
+        if (cb >= 1) {
+            int bi = cb - 1;
+            if (atomicCAS(&s_seen[bi], 0, 1) == 0) {
+                int pos = atomicAdd(s_cnt, 1);
+                s_list[pos] = bi;
+            }
+        }
+        if (atomicCAS(&s_seen[cb], 0, 1) == 0) {
+            int pos = atomicAdd(s_cnt, 1);
+            s_list[pos] = cb;
+        }
+    }
+    __syncthreads();
+    const int cnt = *s_cnt;
+
+    // ---- per-query state (this thread's D slice) ----
+    float q[DD];
+    {
+        const __nv_bfloat16* qp = Q + ((long long)bh * S + te) * D + sp * DD;
+        #pragma unroll
+        for (int d = 0; d < DD; ++d) q[d] = __bfloat162float(qp[d]);
+    }
+    float m = -CUDART_INF_F;
+    float l = 0.f;
+    float acc[DD];
+    #pragma unroll
+    for (int d = 0; d < DD; ++d) acc[d] = 0.f;
+
+    int mytop[TOPN];
+    #pragma unroll
+    for (int s = 0; s < TOPN; ++s) mytop[s] = s_sel[qe * TOPN + s];
+
+    const int w0 = te + 1 - WINDOW;
+
+    // ---- process each block in the union ----
+    for (int u = 0; u < cnt; ++u) {
+        const int bi = s_list[u];
+        const int s0 = bi * BS;
+        int s1 = s0 + BS;
+        if (s1 > S) s1 = S;
+        const int nb = s1 - s0;
+
+        const __nv_bfloat16* kb = K + ((long long)bh * S + s0) * D;
+        const __nv_bfloat16* vb = V + ((long long)bh * S + s0) * D;
+        const float4* k4 = reinterpret_cast<const float4*>(kb);
+        const float4* v4 = reinterpret_cast<const float4*>(vb);
+        float4* sK4 = reinterpret_cast<float4*>(sK);
+        float4* sV4 = reinterpret_cast<float4*>(sV);
+        const int nvec = (nb * D) >> 3;   // nb*D bf16 = nb*D/8 float4
+        for (int i = tid; i < nvec; i += QS * SPD) {
+            sK4[i] = k4[i];
+            sV4[i] = v4[i];
+        }
+        __syncthreads();
+
+        bool is_top = false;
+        #pragma unroll
+        for (int s = 0; s < TOPN; ++s) if (mytop[s] == bi) is_top = true;
+
+        bool need = false;
+        if (bi == cb) need = true;
+        else if (cb >= 1 && bi == cb - 1) need = true;
+        else if (bi < cb && is_top) need = true;
+
+        const unsigned need_mask = __ballot_sync(0xffffffffu, need ? 1u : 0u);
+        if (need) {
+            constexpr int CH = 8;   // keys per chunk (independent dots -> hides latency)
+            if (bi < cb - 1) {
+                // Pure selected block: every key attends (need implies is_top), the
+                // block is full (bi <= cb-2 is never the last/partial block), and
+                // 64 % CH == 0, so no masking, no -inf, no tail handling.
+                for (int jc = s0; jc < s1; jc += CH) {
+                    float sc[CH];
+                    #pragma unroll
+                    for (int c = 0; c < CH; ++c) {
+                        const __nv_bfloat162* k2 = reinterpret_cast<const __nv_bfloat162*>(sK + (jc + c - s0) * D + sp * DD);
+                        float ss = 0.f;
+                        #pragma unroll
+                        for (int d = 0; d < DD / 2; ++d) {
+                            float2 kk = __bfloat1622float2(k2[d]);
+                            ss += q[2 * d] * kk.x + q[2 * d + 1] * kk.y;
+                        }
+                        sc[c] = ss;
+                    }
+                    #pragma unroll
+                    for (int c = 0; c < CH; ++c) {
+                        #pragma unroll
+                        for (int off = SPD / 2; off > 0; off >>= 1)
+                            sc[c] += __shfl_xor_sync(need_mask, sc[c], off);
+                        sc[c] *= scale;
+                    }
+                    float mc = -CUDART_INF_F;
+                    #pragma unroll
+                    for (int c = 0; c < CH; ++c) mc = fmaxf(mc, sc[c]);
+                    float lc = 0.f;
+                    float accc[DD];
+                    #pragma unroll
+                    for (int d = 0; d < DD; ++d) accc[d] = 0.f;
+                    #pragma unroll
+                    for (int c = 0; c < CH; ++c) {
+                        float p = __expf(sc[c] - mc);
+                        lc += p;
+                        const __nv_bfloat162* v2 = reinterpret_cast<const __nv_bfloat162*>(sV + (jc + c - s0) * D + sp * DD);
+                        #pragma unroll
+                        for (int d = 0; d < DD / 2; ++d) {
+                            float2 vv = __bfloat1622float2(v2[d]);
+                            accc[2 * d] += p * vv.x;
+                            accc[2 * d + 1] += p * vv.y;
+                        }
+                    }
+                    float m_new = fmaxf(m, mc);
+                    float corr_run = __expf(m - m_new);
+                    float corr_chunk = __expf(mc - m_new);
+                    l = l * corr_run + lc * corr_chunk;
+                    #pragma unroll
+                    for (int d = 0; d < DD; ++d) acc[d] = acc[d] * corr_run + accc[d] * corr_chunk;
+                    m = m_new;
+                }
+            } else {
+                // window (cb-1) or causal (cb) partial block: per-key masking.
+                // Loop bounds stay warp-uniform (s0..s1) so the shuffle reduction
+                // never diverges across the queries sharing a warp.
+                for (int jc = s0; jc < s1; jc += CH) {
+                    const int jend = (jc + CH < s1) ? (jc + CH) : s1;
+                    const int nc = jend - jc;
+
+                    float sc[CH];
+                    #pragma unroll
+                    for (int c = 0; c < CH; ++c) {
+                        const int j = jc + c;
+                        if (c < nc) {
+                            bool attend;
+                            if (bi < cb) attend = (bi == cb - 1) ? (j >= w0 || is_top) : is_top;
+                            else attend = (bi == cb) ? (j <= te) : false;
+                            if (attend) {
+                                const __nv_bfloat162* k2 = reinterpret_cast<const __nv_bfloat162*>(sK + (j - s0) * D + sp * DD);
+                                float ss = 0.f;
+                                #pragma unroll
+                                for (int d = 0; d < DD / 2; ++d) {
+                                    float2 kk = __bfloat1622float2(k2[d]);
+                                    ss += q[2 * d] * kk.x + q[2 * d + 1] * kk.y;
+                                }
+                                sc[c] = ss;
+                            } else sc[c] = -CUDART_INF_F;
+                        } else sc[c] = -CUDART_INF_F;
+                    }
+                    #pragma unroll
+                    for (int c = 0; c < CH; ++c) {
+                        #pragma unroll
+                        for (int off = SPD / 2; off > 0; off >>= 1)
+                            sc[c] += __shfl_xor_sync(need_mask, sc[c], off);
+                        sc[c] *= scale;
+                    }
+
+                    float mc = -CUDART_INF_F;
+                    #pragma unroll
+                    for (int c = 0; c < CH; ++c) mc = fmaxf(mc, sc[c]);
+
+                    if (mc != -CUDART_INF_F) {
+                        float lc = 0.f;
+                        float accc[DD];
+                        #pragma unroll
+                        for (int d = 0; d < DD; ++d) accc[d] = 0.f;
+                        #pragma unroll
+                        for (int c = 0; c < CH; ++c) {
+                            if (c < nc) {
+                                const int j = jc + c;
+                                float p = __expf(sc[c] - mc);
+                                lc += p;
+                                const __nv_bfloat162* v2 = reinterpret_cast<const __nv_bfloat162*>(sV + (j - s0) * D + sp * DD);
+                                #pragma unroll
+                                for (int d = 0; d < DD / 2; ++d) {
+                                    float2 vv = __bfloat1622float2(v2[d]);
+                                    accc[2 * d] += p * vv.x;
+                                    accc[2 * d + 1] += p * vv.y;
+                                }
+                            }
+                        }
+                        float m_new = fmaxf(m, mc);
+                        float corr_run = __expf(m - m_new);
+                        float corr_chunk = __expf(mc - m_new);
+                        l = l * corr_run + lc * corr_chunk;
+                        #pragma unroll
+                        for (int d = 0; d < DD; ++d) acc[d] = acc[d] * corr_run + accc[d] * corr_chunk;
+                        m = m_new;
+                    }
+                }
+            }
+        }
+        __syncthreads();
+    }
+
+    if (active) {
+        float inv_l = 1.0f / l;
+        __nv_bfloat16* op = O + ((long long)bh * S + t) * D + sp * DD;
+        #pragma unroll
+        for (int d = 0; d < DD; ++d) op[d] = __float2bfloat16(acc[d] * inv_l);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// launchers
+// ---------------------------------------------------------------------------
+
+torch::Tensor block_select(torch::Tensor q, torch::Tensor scores, torch::Tensor prefix, double scale) {
+    int B = q.size(0), H = q.size(1), S = q.size(2), D = q.size(3);
+    int BH = B * H;
+    int n_full = scores.size(3);
+    int n_blocks = (S + BS - 1) / BS;
+    auto sel = torch::empty({B, H, S, TOPN}, q.options().dtype(torch::kInt32));
+    auto stream = at::cuda::getCurrentCUDAStream();
+
+    const __nv_bfloat16* Qp = reinterpret_cast<const __nv_bfloat16*>(q.data_ptr<at::BFloat16>());
+    const float* Sp = scores.data_ptr<float>();
+    const float* Ppf = prefix.data_ptr<float>();
+    int* selp = sel.data_ptr<int>();
+
+    int threads = 128;
+    dim3 grid((S + threads - 1) / threads, BH);
+
+    if (D == 64) {
+        block_select_kernel<64><<<grid, threads, 0, stream>>>(Qp, Sp, Ppf, selp, S, n_full, n_blocks, (float)scale);
+    } else if (D == 128) {
+        block_select_kernel<128><<<grid, threads, 0, stream>>>(Qp, Sp, Ppf, selp, S, n_full, n_blocks, (float)scale);
+    } else {
+        TORCH_CHECK(false, "unsupported D for block_select");
+    }
+    return sel;
+}
+
+torch::Tensor sparse_attend(torch::Tensor q, torch::Tensor k, torch::Tensor v, torch::Tensor sel, double scale) {
+    int B = q.size(0), H = q.size(1), S = q.size(2), D = q.size(3);
+    int BH = B * H;
+    int n_blocks = (S + BS - 1) / BS;
+    auto out = torch::empty({B, H, S, D}, q.options());
+    auto stream = at::cuda::getCurrentCUDAStream();
+
+    const __nv_bfloat16* Qp = reinterpret_cast<const __nv_bfloat16*>(q.data_ptr<at::BFloat16>());
+    const __nv_bfloat16* Kp = reinterpret_cast<const __nv_bfloat16*>(k.data_ptr<at::BFloat16>());
+    const __nv_bfloat16* Vp = reinterpret_cast<const __nv_bfloat16*>(v.data_ptr<at::BFloat16>());
+    const int* selp = sel.data_ptr<int>();
+    __nv_bfloat16* Op = reinterpret_cast<__nv_bfloat16*>(out.data_ptr<at::BFloat16>());
+
+    if (D == 64) {
+        constexpr int QS = 32;
+        // Large unions (many blocks) favor more D-split threads (higher
+        // occupancy to hide per-block sync latency); short sequences favor a
+        // wider D slice per thread (more ILP, fewer shuffles).
+        if (n_blocks >= 96) {
+            constexpr int SPD = 8;
+            int threads = QS * SPD;
+            dim3 grid((S + QS - 1) / QS, BH);
+            int int_elems = QS * TOPN + n_blocks + n_blocks + 1;
+            int_elems = (int_elems + 3) & ~3;
+            size_t shm = (size_t)int_elems * 4 + (size_t)2 * 64 * D * 2;
+            sparse_attend_kernel<64, SPD, QS><<<grid, threads, shm, stream>>>(Qp, Kp, Vp, selp, Op, S, n_blocks, (float)scale);
+        } else {
+            constexpr int SPD = 4;
+            int threads = QS * SPD;
+            dim3 grid((S + QS - 1) / QS, BH);
+            int int_elems = QS * TOPN + n_blocks + n_blocks + 1;
+            int_elems = (int_elems + 3) & ~3;
+            size_t shm = (size_t)int_elems * 4 + (size_t)2 * 64 * D * 2;
+            sparse_attend_kernel<64, SPD, QS><<<grid, threads, shm, stream>>>(Qp, Kp, Vp, selp, Op, S, n_blocks, (float)scale);
+        }
+    } else if (D == 128) {
+        constexpr int SPD = 8, QS = 32;
+        int threads = QS * SPD;
+        dim3 grid((S + QS - 1) / QS, BH);
+        int int_elems = QS * TOPN + n_blocks + n_blocks + 1;
+        int_elems = (int_elems + 3) & ~3;
+        size_t shm = (size_t)int_elems * 4 + (size_t)2 * 64 * D * 2;
+        sparse_attend_kernel<128, SPD, QS><<<grid, threads, shm, stream>>>(Qp, Kp, Vp, selp, Op, S, n_blocks, (float)scale);
+    } else {
+        TORCH_CHECK(false, "unsupported D for sparse_attend");
+    }
+    return out;
+}
+"""
+
+_ext = load_inline(
+    name="deepseek_nsa_kernels",
+    cpp_sources="""
+#include <torch/extension.h>
+torch::Tensor block_select(torch::Tensor q, torch::Tensor scores, torch::Tensor prefix, double scale);
+torch::Tensor sparse_attend(torch::Tensor q, torch::Tensor k, torch::Tensor v, torch::Tensor sel, double scale);
+""",
+    cuda_sources=_cuda_src,
+    functions=["block_select", "sparse_attend"],
+    extra_cuda_cflags=["-O3", "--use_fast_math"],
+    verbose=False,
+)
+
+
+def _forward(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+    B, H, S, D = q.shape
+    scale = 1.0 / math.sqrt(D)
+    q = q.contiguous()
+    k = k.contiguous()
+    v = v.contiguous()
+
+    n_full = S // BLOCK_SIZE
+    qf = q.float()
+
+    # Intra-block cumulative key sums (padded to a whole number of blocks).  These
+    # give the current partial block's importance for every query in one D-long
+    # dot product, instead of a serial O(t%64 . D) loop inside the kernel.
+    n_blocks = (S + BLOCK_SIZE - 1) // BLOCK_SIZE
+    S_pad = n_blocks * BLOCK_SIZE
+    kf = k.float()
+    if S_pad > S:
+        kf = torch.nn.functional.pad(kf, (0, 0, 0, S_pad - S))
+    kprefix = kf.view(B, H, n_blocks, BLOCK_SIZE, D).cumsum(dim=3).contiguous()
+
+    if n_full > 0:
+        block_sum = kprefix[:, :, :n_full, BLOCK_SIZE - 1, :].contiguous()  # (B,H,n_full,D)
+        scores = torch.matmul(qf, block_sum.transpose(-1, -2))  # (B,H,S,n_full) fp32
+    else:
+        scores = qf.new_zeros(B, H, S, 1)
+        n_full = 1
+
+    sel = _ext.block_select(q, scores, kprefix, scale)
+    out = _ext.sparse_attend(q, k, v, sel, scale)
+    return out
+
+
+class Model(nn.Module):
+    def __init__(self, B: int, H: int, S: int, D: int):
+        super().__init__()
+        self.B, self.H, self.S, self.D = B, H, S, D
+        self.register_buffer("_dummy", torch.zeros(1, dtype=torch.bfloat16))
+
+    def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+        return _forward(q, k, v).to(torch.bfloat16)
+
+
+B, H, S, D = 1, 16, 1024, 64
+
+
+def get_init_inputs():
+    return [B, H, S, D]
+
+
+def get_inputs():
+    q = torch.randn(B, H, S, D, dtype=torch.bfloat16)
+    k = torch.randn(B, H, S, D, dtype=torch.bfloat16)
+    v = torch.randn(B, H, S, D, dtype=torch.bfloat16)
+    return [q, k, v]

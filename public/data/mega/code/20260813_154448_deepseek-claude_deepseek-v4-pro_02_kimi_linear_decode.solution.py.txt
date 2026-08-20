@@ -1,0 +1,1020 @@
+"""Kimi-Linear W4A16 hybrid decode, fused into a SINGLE Triton megakernel.
+
+The entire per-token forward -- 3 KDA layers + 1 MLA layer, every int4
+dequant-GEMV, the short causal conv, the KDA recurrent-state update, the MLA
+latent-cache attention, the MoE router + experts, both RMSNorms and the residual
+adds -- is one persistent @triton.jit grid launched exactly once per step().
+All other @triton.jit functions below are INLINED helpers called from within
+`megakernel`; they are never launched separately.
+
+Strategy (bandwidth-bound decode):
+  * int4 weights are streamed once and dequantized on the fly inside each GEMV
+    (per-group trick: precompute xsum_g, then y += scales*(sum(x*int4) - zeros*xsum)).
+    bf16 weights are never materialized.
+  * 128 persistent programs + software grid barriers; each phase uses the full
+    grid where it helps bandwidth (q/k/v/g projections, MoE columns, MLA scores).
+  * KDA recurrence is per-head (32 programs) with the conv + S update + output in
+    registers; S is updated in place.
+  * MLA "absorb" computes Qa = q_nope @ W_k^T per head directly from packed int4,
+    so the [ctx, 8192] kv_b output is never materialized; attention is a
+    context-split softmax whose partial (sumexp, wsum) are written per program and
+    reduced in the v-projection phase.
+  * MoE top-8 routing is computed redundantly (deterministic) and expert GEMVs are
+    split across the grid by output column.
+"""
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import triton
+import triton.language as tl
+
+OP_TYPE = "kimi_linear_w4a16_decode"
+HARDWARE_REQUIRED = ["RTX_PRO_6000"]
+EPS = 1.0e-6
+GROUP_SIZE = 128
+
+# --------------------------------------------------------------------------- #
+# architecture constants (fixed for the graded shapes)
+# --------------------------------------------------------------------------- #
+HID = 2304
+H = 32
+DK = 128
+C = H * DK               # 4096
+QK_NOPE = 128
+QK_ROPE = 64
+VH = 128
+KV_LORA = 512
+Q_OUT = H * (QK_NOPE + QK_ROPE)   # 6144
+KV_A_OUT = KV_LORA + QK_ROPE      # 576
+KV_B_OUT = H * (QK_NOPE + VH)     # 8192
+MOE_M = 1024
+E = 64
+ACTIVE = 8
+NSHARED = 1
+GROUP = 128
+NG_HID = HID // GROUP              # 18
+ROUTED_SCALING = 2.446
+KDA_SCALE = DK ** -0.5
+MLA_SCALE = (QK_NOPE + QK_ROPE) ** -0.5
+
+# JIT-only constexpr aliases (Triton forbids plain module globals inside kernels)
+_HID = tl.constexpr(HID)
+_ACTIVE = tl.constexpr(ACTIVE)
+_NG_HID = tl.constexpr(NG_HID)
+_ROUTED_SCALING = tl.constexpr(ROUTED_SCALING)
+_KDA_SCALE = tl.constexpr(KDA_SCALE)
+_MLA_SCALE = tl.constexpr(MLA_SCALE)
+
+NPROG = 188
+BLOCK = 256
+NBARRIERS = 25
+
+
+@dataclass(frozen=True)
+class Config:
+    hidden: int = 2304
+    kda_heads: int = 32
+    kda_head_dim: int = 128
+    short_conv: int = 4
+    mla_heads: int = 32
+    kv_lora: int = 512
+    qk_nope: int = 128
+    qk_rope: int = 64
+    v_head: int = 128
+    rope_theta: float = 10000.0
+    n_experts: int = 64
+    n_active: int = 8
+    n_shared: int = 1
+    moe_inter: int = 1024
+    routed_scaling: float = 2.446
+    group: int = 128
+    pattern: tuple = ("K", "K", "K", "M")
+    dtype: torch.dtype = field(default=torch.bfloat16)
+
+
+def build_config(shape: dict) -> Config:
+    return Config(n_experts=int(shape.get("n_experts", 64)))
+
+
+# --------------------------------------------------------------------------- #
+# quantization helpers (packing layout, for weight init only)
+# --------------------------------------------------------------------------- #
+def _pack_int4(w_q: torch.Tensor) -> torch.Tensor:
+    lo = w_q[0::2] & 0xF
+    hi = w_q[1::2] & 0xF
+    return (lo | (hi << 4)).contiguous()
+
+
+def quantize(w_io: torch.Tensor, group: int = GROUP_SIZE):
+    K, N = w_io.shape
+    ng = K // group
+    wg = w_io.view(ng, group, N).float()
+    wmin = wg.min(dim=1, keepdim=True).values
+    wmax = wg.max(dim=1, keepdim=True).values
+    scales = (wmax - wmin).clamp_min(1e-8) / 15.0
+    zeros = (-wmin / scales).round().clamp(0, 15)
+    w_q = ((wg / scales) + zeros).round().clamp(0, 15).to(torch.uint8).view(K, N)
+    return _pack_int4(w_q), scales.squeeze(1).to(torch.bfloat16), zeros.squeeze(1).to(torch.bfloat16)
+
+
+def init_state(cfg: Config, context_len: int, seed: int) -> list:
+    dev = torch.device("cuda:0")
+    g = torch.Generator(device=dev).manual_seed(seed)
+    H_, Dk = cfg.kda_heads, cfg.kda_head_dim
+    C_ = H_ * Dk
+    state = []
+    for kind in cfg.pattern:
+        if kind == "K":
+            state.append({
+                "S": torch.randn(H_, Dk, Dk, device=dev, generator=g) * 0.05,
+                "cq": torch.randn(cfg.short_conv - 1, C_, device=dev, generator=g, dtype=cfg.dtype) * 0.1,
+                "ck": torch.randn(cfg.short_conv - 1, C_, device=dev, generator=g, dtype=cfg.dtype) * 0.1,
+                "cv": torch.randn(cfg.short_conv - 1, C_, device=dev, generator=g, dtype=cfg.dtype) * 0.1,
+            })
+        else:
+            state.append({
+                "c_kv": torch.randn(context_len, cfg.kv_lora, device=dev, generator=g, dtype=cfg.dtype) * 0.1,
+                "k_rope": torch.randn(context_len, cfg.qk_rope, device=dev, generator=g, dtype=cfg.dtype) * 0.1,
+            })
+    return state
+
+
+def init_token(cfg: Config, seed: int) -> torch.Tensor:
+    dev = torch.device("cuda:0")
+    g = torch.Generator(device=dev).manual_seed(seed + 1)
+    return torch.randn(cfg.hidden, device=dev, generator=g, dtype=cfg.dtype) * 0.25
+
+
+# --------------------------------------------------------------------------- #
+# weight modules (identical names/shapes to reference so load_state_dict works)
+# --------------------------------------------------------------------------- #
+class QuantLinear(nn.Module):
+    def __init__(self, in_f: int, out_f: int, group: int = GROUP_SIZE):
+        super().__init__()
+        assert in_f % group == 0 and in_f % 2 == 0
+        self.in_f, self.out_f, self.group = in_f, out_f, group
+        ng = in_f // group
+        self.register_buffer("w_q", torch.zeros(in_f // 2, out_f, dtype=torch.uint8))
+        self.register_buffer("scales", torch.zeros(ng, out_f, dtype=torch.bfloat16))
+        self.register_buffer("zeros", torch.zeros(ng, out_f, dtype=torch.bfloat16))
+
+    def init_random(self, gen: torch.Generator, std: float = 0.02) -> None:
+        w = torch.randn(self.in_f, self.out_f, generator=gen) * std
+        wq, s, z = quantize(w, self.group)
+        self.w_q.copy_(wq)
+        self.scales.copy_(s)
+        self.zeros.copy_(z)
+
+
+class QuantExperts(nn.Module):
+    def __init__(self, n: int, in_f: int, out_f: int, group: int = GROUP_SIZE):
+        super().__init__()
+        self.n, self.in_f, self.out_f, self.group = n, in_f, out_f, group
+        ng = in_f // group
+        self.register_buffer("w_q", torch.zeros(n, in_f // 2, out_f, dtype=torch.uint8))
+        self.register_buffer("scales", torch.zeros(n, ng, out_f, dtype=torch.bfloat16))
+        self.register_buffer("zeros", torch.zeros(n, ng, out_f, dtype=torch.bfloat16))
+
+    def init_random(self, gen: torch.Generator, std: float = 0.02) -> None:
+        for e in range(self.n):
+            w = torch.randn(self.in_f, self.out_f, generator=gen) * std
+            wq, s, z = quantize(w, self.group)
+            self.w_q[e].copy_(wq)
+            self.scales[e].copy_(s)
+            self.zeros[e].copy_(z)
+
+
+class KDA(nn.Module):
+    def __init__(self, cfg: Config):
+        super().__init__()
+        self.cfg = cfg
+        H_, Dk, d = cfg.kda_heads, cfg.kda_head_dim, cfg.hidden
+        self.q_proj = QuantLinear(d, H_ * Dk, cfg.group)
+        self.k_proj = QuantLinear(d, H_ * Dk, cfg.group)
+        self.v_proj = QuantLinear(d, H_ * Dk, cfg.group)
+        self.g_proj = QuantLinear(d, H_ * Dk, cfg.group)
+        self.beta_proj = nn.Linear(d, H_, bias=False, dtype=cfg.dtype)
+        self.conv_w = nn.Parameter(torch.empty(3, H_ * Dk, cfg.short_conv, dtype=cfg.dtype))
+        self.o_proj = QuantLinear(H_ * Dk, d, cfg.group)
+        self.scale = Dk ** -0.5
+
+
+class MLA(nn.Module):
+    def __init__(self, cfg: Config):
+        super().__init__()
+        self.cfg = cfg
+        H_, d = cfg.mla_heads, cfg.hidden
+        self.q_proj = QuantLinear(d, H_ * (cfg.qk_nope + cfg.qk_rope), cfg.group)
+        self.kv_a = QuantLinear(d, cfg.kv_lora + cfg.qk_rope, cfg.group)
+        self.kv_b = QuantLinear(cfg.kv_lora, H_ * (cfg.qk_nope + cfg.v_head), cfg.group)
+        self.o_proj = QuantLinear(H_ * cfg.v_head, d, cfg.group)
+        self.scale = (cfg.qk_nope + cfg.qk_rope) ** -0.5
+
+
+class MoE(nn.Module):
+    def __init__(self, cfg: Config):
+        super().__init__()
+        self.cfg = cfg
+        d, m, E_ = cfg.hidden, cfg.moe_inter, cfg.n_experts
+        self.router = nn.Linear(d, E_, bias=False, dtype=cfg.dtype)
+        self.gate = QuantExperts(E_, d, m, cfg.group)
+        self.up = QuantExperts(E_, d, m, cfg.group)
+        self.down = QuantExperts(E_, m, d, cfg.group)
+        self.s_gate = QuantExperts(cfg.n_shared, d, m, cfg.group)
+        self.s_up = QuantExperts(cfg.n_shared, d, m, cfg.group)
+        self.s_down = QuantExperts(cfg.n_shared, m, d, cfg.group)
+
+
+class Block(nn.Module):
+    def __init__(self, cfg: Config, kind: str):
+        super().__init__()
+        self.kind = kind
+        self.attn_norm = nn.Parameter(torch.ones(cfg.hidden, dtype=cfg.dtype))
+        self.moe_norm = nn.Parameter(torch.ones(cfg.hidden, dtype=cfg.dtype))
+        self.attn = KDA(cfg) if kind == "K" else MLA(cfg)
+        self.moe = MoE(cfg)
+
+
+# --------------------------------------------------------------------------- #
+# Triton inlined helpers (never launched on their own)
+# --------------------------------------------------------------------------- #
+@triton.jit
+def _barrier(cnt_ptr, tgt, BLOCK: tl.constexpr):
+    offs = tl.arange(0, BLOCK)
+    z = tl.zeros([BLOCK], dtype=tl.int32)
+    tl.debug_barrier()
+    tl.atomic_add(cnt_ptr + z, 1, mask=(offs == 0), sem="acq_rel")
+    while tl.load(cnt_ptr, volatile=True) < tgt:
+        pass
+
+
+@triton.jit
+def _rscale(x_ptr, NG: tl.constexpr, eps: tl.constexpr, HIDC: tl.constexpr):
+    xg_off = tl.arange(0, 128)
+    ss = 0.0
+    for g in range(0, NG):
+        xg = tl.load(x_ptr + g * 128 + xg_off).to(tl.float32)
+        ss += tl.sum(xg * xg)
+    return 1.0 / tl.sqrt(ss / HIDC + eps)
+
+
+@triton.jit
+def _gemv_bf16(x_ptr, wq_ptr, sc_ptr, ze_ptr, n0,
+               K: tl.constexpr, N: tl.constexpr, BN: tl.constexpr):
+    cols = tl.arange(0, BN)
+    rows = tl.arange(0, 64)
+    xg_off = tl.arange(0, 128)
+    acc = tl.zeros([BN], dtype=tl.float32)
+    for g in range(0, K // 128):
+        xg = tl.load(x_ptr + g * 128 + xg_off).to(tl.float32)
+        xsum = tl.sum(xg)
+        wp = tl.load(wq_ptr + (g * 64 + rows)[:, None] * N + (n0 + cols)[None, :])
+        lo = (wp & 0xF).to(tl.float32)
+        hi = (wp >> 4).to(tl.float32)
+        xg2 = tl.reshape(xg, (64, 2))
+        xe, xo = tl.split(xg2)
+        accg = tl.sum(xe[:, None] * lo + xo[:, None] * hi, axis=0)
+        sg = tl.load(sc_ptr + g * N + (n0 + cols)).to(tl.float32)
+        zg = tl.load(ze_ptr + g * N + (n0 + cols)).to(tl.float32)
+        acc += sg * (accg - zg * xsum)
+    return acc
+
+
+@triton.jit
+def _gemv_f32(x_ptr, wq_ptr, sc_ptr, ze_ptr, n0,
+              K: tl.constexpr, N: tl.constexpr, BN: tl.constexpr):
+    cols = tl.arange(0, BN)
+    rows = tl.arange(0, 64)
+    xg_off = tl.arange(0, 128)
+    acc = tl.zeros([BN], dtype=tl.float32)
+    for g in range(0, K // 128):
+        xg = tl.load(x_ptr + g * 128 + xg_off)
+        xsum = tl.sum(xg)
+        wp = tl.load(wq_ptr + (g * 64 + rows)[:, None] * N + (n0 + cols)[None, :])
+        lo = (wp & 0xF).to(tl.float32)
+        hi = (wp >> 4).to(tl.float32)
+        xg2 = tl.reshape(xg, (64, 2))
+        xe, xo = tl.split(xg2)
+        accg = tl.sum(xe[:, None] * lo + xo[:, None] * hi, axis=0)
+        sg = tl.load(sc_ptr + g * N + (n0 + cols)).to(tl.float32)
+        zg = tl.load(ze_ptr + g * N + (n0 + cols)).to(tl.float32)
+        acc += sg * (accg - zg * xsum)
+    return acc
+
+
+@triton.jit
+def _gemv_norm(x_ptr, w_ptr, rscale, wq_ptr, sc_ptr, ze_ptr, n0,
+               K: tl.constexpr, N: tl.constexpr, BN: tl.constexpr):
+    """RMSNorm(x) fused into the GEMV: y = norm(x) @ dequant(W).
+
+    norm(x) = (x * rscale * w) rounded to bf16, matching reference _rmsnorm
+    which emits bf16 before the projection."""
+    cols = tl.arange(0, BN)
+    rows = tl.arange(0, 64)
+    xg_off = tl.arange(0, 128)
+    acc = tl.zeros([BN], dtype=tl.float32)
+    for g in range(0, K // 128):
+        xw = tl.load(x_ptr + g * 128 + xg_off).to(tl.float32) * rscale
+        xw = xw * tl.load(w_ptr + g * 128 + xg_off).to(tl.float32)
+        xw = xw.to(tl.bfloat16).to(tl.float32)
+        xsum = tl.sum(xw)
+        wp = tl.load(wq_ptr + (g * 64 + rows)[:, None] * N + (n0 + cols)[None, :])
+        lo = (wp & 0xF).to(tl.float32)
+        hi = (wp >> 4).to(tl.float32)
+        xg2 = tl.reshape(xw, (64, 2))
+        xe, xo = tl.split(xg2)
+        accg = tl.sum(xe[:, None] * lo + xo[:, None] * hi, axis=0)
+        sg = tl.load(sc_ptr + g * N + (n0 + cols)).to(tl.float32)
+        zg = tl.load(ze_ptr + g * N + (n0 + cols)).to(tl.float32)
+        acc += sg * (accg - zg * xsum)
+    return acc
+
+
+@triton.jit
+def _gemv_norm_dual(x_ptr, w_ptr, rscale, gwq, gsc, gze, uwq, usc, uze, n0,
+                    K: tl.constexpr, N: tl.constexpr, BN: tl.constexpr):
+    """Fused gate+up: share the norm(x) load, weight-norm product, and xsum
+    reduction across the two projections (same input, different int4 weights)."""
+    cols = tl.arange(0, BN)
+    rows = tl.arange(0, 64)
+    xg_off = tl.arange(0, 128)
+    acc_g = tl.zeros([BN], dtype=tl.float32)
+    acc_u = tl.zeros([BN], dtype=tl.float32)
+    for g in range(0, K // 128):
+        xw = tl.load(x_ptr + g * 128 + xg_off).to(tl.float32) * rscale
+        xw = xw * tl.load(w_ptr + g * 128 + xg_off).to(tl.float32)
+        xw = xw.to(tl.bfloat16).to(tl.float32)
+        xsum = tl.sum(xw)
+        xg2 = tl.reshape(xw, (64, 2))
+        xe, xo = tl.split(xg2)
+        wp = tl.load(gwq + (g * 64 + rows)[:, None] * N + (n0 + cols)[None, :])
+        lo = (wp & 0xF).to(tl.float32)
+        hi = (wp >> 4).to(tl.float32)
+        accg = tl.sum(xe[:, None] * lo + xo[:, None] * hi, axis=0)
+        sg = tl.load(gsc + g * N + (n0 + cols)).to(tl.float32)
+        zg = tl.load(gze + g * N + (n0 + cols)).to(tl.float32)
+        acc_g += sg * (accg - zg * xsum)
+        wp = tl.load(uwq + (g * 64 + rows)[:, None] * N + (n0 + cols)[None, :])
+        lo = (wp & 0xF).to(tl.float32)
+        hi = (wp >> 4).to(tl.float32)
+        accg = tl.sum(xe[:, None] * lo + xo[:, None] * hi, axis=0)
+        sg = tl.load(usc + g * N + (n0 + cols)).to(tl.float32)
+        zg = tl.load(uze + g * N + (n0 + cols)).to(tl.float32)
+        acc_u += sg * (accg - zg * xsum)
+    return acc_g, acc_u
+
+
+@triton.jit
+def _gemv_dual_pre(x_ptr, xsum_ptr, gwq, gsc, gze, uwq, usc, uze, n0,
+                   K: tl.constexpr, N: tl.constexpr, BN: tl.constexpr):
+    """Fused gate+up where the input is already RMSNorm'd (x_ptr) with its
+    per-group sums (xsum_ptr) precomputed -- skips the norm recompute."""
+    cols = tl.arange(0, BN)
+    rows = tl.arange(0, 64)
+    xg_off = tl.arange(0, 128)
+    acc_g = tl.zeros([BN], dtype=tl.float32)
+    acc_u = tl.zeros([BN], dtype=tl.float32)
+    for g in range(0, K // 128):
+        xw = tl.load(x_ptr + g * 128 + xg_off).to(tl.float32)
+        xsum = tl.load(xsum_ptr + g)
+        xg2 = tl.reshape(xw, (64, 2))
+        xe, xo = tl.split(xg2)
+        wp = tl.load(gwq + (g * 64 + rows)[:, None] * N + (n0 + cols)[None, :])
+        lo = (wp & 0xF).to(tl.float32)
+        hi = (wp >> 4).to(tl.float32)
+        accg = tl.sum(xe[:, None] * lo + xo[:, None] * hi, axis=0)
+        sg = tl.load(gsc + g * N + (n0 + cols)).to(tl.float32)
+        zg = tl.load(gze + g * N + (n0 + cols)).to(tl.float32)
+        acc_g += sg * (accg - zg * xsum)
+        wp = tl.load(uwq + (g * 64 + rows)[:, None] * N + (n0 + cols)[None, :])
+        lo = (wp & 0xF).to(tl.float32)
+        hi = (wp >> 4).to(tl.float32)
+        accg = tl.sum(xe[:, None] * lo + xo[:, None] * hi, axis=0)
+        sg = tl.load(usc + g * N + (n0 + cols)).to(tl.float32)
+        zg = tl.load(uze + g * N + (n0 + cols)).to(tl.float32)
+        acc_u += sg * (accg - zg * xsum)
+    return acc_g, acc_u
+
+
+@triton.jit
+def _gemv_norm_pre(x_ptr, xsum_ptr, wq_ptr, sc_ptr, ze_ptr, n0,
+                   K: tl.constexpr, N: tl.constexpr, BN: tl.constexpr):
+    """Single-projection GEMV on a pre-normalized input (x_ptr) with precomputed
+    per-group sums (xsum_ptr) -- no norm recompute, no cross-group reduction."""
+    cols = tl.arange(0, BN)
+    rows = tl.arange(0, 64)
+    xg_off = tl.arange(0, 128)
+    acc = tl.zeros([BN], dtype=tl.float32)
+    for g in range(0, K // 128):
+        xw = tl.load(x_ptr + g * 128 + xg_off).to(tl.float32)
+        xsum = tl.load(xsum_ptr + g)
+        wp = tl.load(wq_ptr + (g * 64 + rows)[:, None] * N + (n0 + cols)[None, :])
+        lo = (wp & 0xF).to(tl.float32)
+        hi = (wp >> 4).to(tl.float32)
+        xg2 = tl.reshape(xw, (64, 2))
+        xe, xo = tl.split(xg2)
+        accg = tl.sum(xe[:, None] * lo + xo[:, None] * hi, axis=0)
+        sg = tl.load(sc_ptr + g * N + (n0 + cols)).to(tl.float32)
+        zg = tl.load(ze_ptr + g * N + (n0 + cols)).to(tl.float32)
+        acc += sg * (accg - zg * xsum)
+    return acc
+
+
+@triton.jit
+def _kda_proj(x_ptr, an_ptr, xn_ptr, xs_ptr, qw, qs, qz, kw, ks, kz, vw, vs, vz, gw, gs, gz,
+              q_ptr, k_ptr, v_ptr, g_ptr, NPROG: tl.constexpr):
+    pid = tl.program_id(0)
+    r = _rscale(x_ptr, _NG_HID, 1e-6, _HID)
+    off128 = tl.arange(0, 128)
+    for gg in range(_NG_HID):
+        xg = tl.load(x_ptr + gg * 128 + off128).to(tl.float32)
+        nw = tl.load(an_ptr + gg * 128 + off128).to(tl.float32)
+        xn = (xg * nw * r).to(tl.bfloat16)
+        tl.store(xn_ptr + gg * 128 + off128, xn)
+        tl.store(xs_ptr + gg, tl.sum(xn.to(tl.float32)))
+    cols = tl.arange(0, 32)
+    n = pid
+    while n < 512:  # 4 projections x 128 column-blocks, split across programs
+        proj = n // 128
+        n0 = (n % 128) * 32
+        if proj == 0:
+            qa = _gemv_norm_pre(xn_ptr, xs_ptr, qw, qs, qz, n0, 2304, 4096, 32)
+            tl.store(q_ptr + n0 + cols, qa.to(tl.bfloat16))
+        elif proj == 1:
+            ka = _gemv_norm_pre(xn_ptr, xs_ptr, kw, ks, kz, n0, 2304, 4096, 32)
+            tl.store(k_ptr + n0 + cols, ka.to(tl.bfloat16))
+        elif proj == 2:
+            va = _gemv_norm_pre(xn_ptr, xs_ptr, vw, vs, vz, n0, 2304, 4096, 32)
+            tl.store(v_ptr + n0 + cols, va.to(tl.bfloat16))
+        else:
+            ga = _gemv_norm_pre(xn_ptr, xs_ptr, gw, gs, gz, n0, 2304, 4096, 32)
+            tl.store(g_ptr + n0 + cols, ga.to(tl.bfloat16))
+        n += NPROG
+
+
+@triton.jit
+def _kda_recur(q_ptr, k_ptr, v_ptr, g_ptr, x_ptr, an_ptr, beta_ptr, conv_ptr,
+               S_ptr, cq_ptr, ck_ptr, cv_ptr, o_ptr, SCALE: tl.constexpr):
+    pid = tl.program_id(0)
+    if pid < 32:
+        cc = tl.arange(0, 128)
+        hb = pid * 128
+        qo = tl.load(q_ptr + hb + cc).to(tl.float32)
+        ko = tl.load(k_ptr + hb + cc).to(tl.float32)
+        vo = tl.load(v_ptr + hb + cc).to(tl.float32)
+        go = tl.load(g_ptr + hb + cc).to(tl.float32)
+        # ---- conv q (idx 0) ----
+        w0 = tl.load(conv_ptr + 0 * 4096 * 4 + (hb + cc) * 4 + 0).to(tl.float32)
+        w1 = tl.load(conv_ptr + 0 * 4096 * 4 + (hb + cc) * 4 + 1).to(tl.float32)
+        w2 = tl.load(conv_ptr + 0 * 4096 * 4 + (hb + cc) * 4 + 2).to(tl.float32)
+        w3 = tl.load(conv_ptr + 0 * 4096 * 4 + (hb + cc) * 4 + 3).to(tl.float32)
+        p0 = tl.load(cq_ptr + 0 * 4096 + hb + cc).to(tl.float32)
+        p1 = tl.load(cq_ptr + 1 * 4096 + hb + cc).to(tl.float32)
+        p2 = tl.load(cq_ptr + 2 * 4096 + hb + cc).to(tl.float32)
+        qc = p0 * w0 + p1 * w1 + p2 * w2 + qo * w3
+        qc = (qc / (1.0 + tl.exp(-qc))).to(tl.bfloat16)
+        tl.store(cq_ptr + 0 * 4096 + hb + cc, p1.to(tl.bfloat16))
+        tl.store(cq_ptr + 1 * 4096 + hb + cc, p2.to(tl.bfloat16))
+        tl.store(cq_ptr + 2 * 4096 + hb + cc, qc.to(tl.bfloat16))
+        # ---- conv k (idx 1) ----
+        w0 = tl.load(conv_ptr + 1 * 4096 * 4 + (hb + cc) * 4 + 0).to(tl.float32)
+        w1 = tl.load(conv_ptr + 1 * 4096 * 4 + (hb + cc) * 4 + 1).to(tl.float32)
+        w2 = tl.load(conv_ptr + 1 * 4096 * 4 + (hb + cc) * 4 + 2).to(tl.float32)
+        w3 = tl.load(conv_ptr + 1 * 4096 * 4 + (hb + cc) * 4 + 3).to(tl.float32)
+        p0 = tl.load(ck_ptr + 0 * 4096 + hb + cc).to(tl.float32)
+        p1 = tl.load(ck_ptr + 1 * 4096 + hb + cc).to(tl.float32)
+        p2 = tl.load(ck_ptr + 2 * 4096 + hb + cc).to(tl.float32)
+        kc = p0 * w0 + p1 * w1 + p2 * w2 + ko * w3
+        kc = (kc / (1.0 + tl.exp(-kc))).to(tl.bfloat16)
+        tl.store(ck_ptr + 0 * 4096 + hb + cc, p1.to(tl.bfloat16))
+        tl.store(ck_ptr + 1 * 4096 + hb + cc, p2.to(tl.bfloat16))
+        tl.store(ck_ptr + 2 * 4096 + hb + cc, kc.to(tl.bfloat16))
+        # ---- conv v (idx 2) ----
+        w0 = tl.load(conv_ptr + 2 * 4096 * 4 + (hb + cc) * 4 + 0).to(tl.float32)
+        w1 = tl.load(conv_ptr + 2 * 4096 * 4 + (hb + cc) * 4 + 1).to(tl.float32)
+        w2 = tl.load(conv_ptr + 2 * 4096 * 4 + (hb + cc) * 4 + 2).to(tl.float32)
+        w3 = tl.load(conv_ptr + 2 * 4096 * 4 + (hb + cc) * 4 + 3).to(tl.float32)
+        p0 = tl.load(cv_ptr + 0 * 4096 + hb + cc).to(tl.float32)
+        p1 = tl.load(cv_ptr + 1 * 4096 + hb + cc).to(tl.float32)
+        p2 = tl.load(cv_ptr + 2 * 4096 + hb + cc).to(tl.float32)
+        vc = p0 * w0 + p1 * w1 + p2 * w2 + vo * w3
+        vc = (vc / (1.0 + tl.exp(-vc))).to(tl.bfloat16)
+        tl.store(cv_ptr + 0 * 4096 + hb + cc, p1.to(tl.bfloat16))
+        tl.store(cv_ptr + 1 * 4096 + hb + cc, p2.to(tl.bfloat16))
+        tl.store(cv_ptr + 2 * 4096 + hb + cc, vc.to(tl.bfloat16))
+        # ---- gates + beta ----
+        qv = qc * SCALE
+        sp = tl.where(go > 20.0, go, tl.log(1.0 + tl.exp(go)))
+        gg = -sp
+        eg = tl.exp(gg)
+        r = _rscale(x_ptr, _NG_HID, 1e-6, _HID)
+        off128 = tl.arange(0, 128)
+        bb = 0.0
+        for gb in range(0, _NG_HID):
+            xw = tl.load(x_ptr + gb * 128 + off128).to(tl.float32) * tl.load(an_ptr + gb * 128 + off128).to(tl.float32)
+            bw = tl.load(beta_ptr + pid * 2304 + gb * 128 + off128).to(tl.float32)
+            bb += tl.sum(xw * bw)
+        beta = 1.0 / (1.0 + tl.exp(-(r * bb).to(tl.bfloat16).to(tl.float32)))
+        # ---- recurrence ----
+        flat = tl.arange(0, 128 * 128)
+        S = tl.load(S_ptr + pid * 128 * 128 + flat)
+        S = tl.reshape(S, (128, 128))
+        S = S * eg[:, None]
+        pred = tl.sum(S * kc[:, None], axis=0)
+        S = S + beta * kc[:, None] * (vc - pred)[None, :]
+        o = tl.sum(S * qv[:, None], axis=0)
+        tl.store(S_ptr + pid * 128 * 128 + flat, tl.reshape(S, (128 * 128,)))
+        tl.store(o_ptr + hb + cc, o.to(tl.bfloat16))
+
+
+@triton.jit
+def _o_proj(o_ptr, ow, os_, oz, attn_ptr, NPROG: tl.constexpr):
+    pid = tl.program_id(0)
+    cols = tl.arange(0, 16)
+    n0 = pid * 16
+    while n0 < 2304:
+        acc = _gemv_bf16(o_ptr, ow, os_, oz, n0, 4096, 2304, 16)
+        tl.store(attn_ptr + n0 + cols, acc.to(tl.bfloat16))
+        n0 += NPROG * 16
+
+
+@triton.jit
+def _moe_router(x_ptr, attn_ptr, mn_ptr, h_ptr, hn_ptr, hs_ptr, router_ptr, lg_ptr, NPROG: tl.constexpr):
+    """h = x + attn_out (redundant, stored), then norm(h,mn) + per-group sums
+    (split across programs), then router logits split across programs."""
+    pid = tl.program_id(0)
+    off128 = tl.arange(0, 128)
+    for gg in range(0, _NG_HID):
+        xv = tl.load(x_ptr + gg * 128 + off128).to(tl.float32)
+        av = tl.load(attn_ptr + gg * 128 + off128).to(tl.float32)
+        tl.store(h_ptr + gg * 128 + off128, (xv + av).to(tl.bfloat16))
+    r = _rscale(h_ptr, _NG_HID, 1e-6, _HID)
+    # precompute norm(h, mn) and its per-group sums for the gate/up GEMVs
+    if pid < _NG_HID:
+        g = pid
+        xg = tl.load(h_ptr + g * 128 + off128).to(tl.float32)
+        nw = tl.load(mn_ptr + g * 128 + off128).to(tl.float32)
+        hn = (xg * nw * r).to(tl.bfloat16)
+        tl.store(hn_ptr + g * 128 + off128, hn)
+        tl.store(hs_ptr + g, tl.sum(hn.to(tl.float32)))
+    e = pid
+    while e < 64:
+        acc = 0.0
+        for gg in range(0, _NG_HID):
+            hw = tl.load(h_ptr + gg * 128 + off128).to(tl.float32)
+            hw = hw * tl.load(mn_ptr + gg * 128 + off128).to(tl.float32)
+            hw = (hw * r).to(tl.bfloat16).to(tl.float32)
+            rw = tl.load(router_ptr + e * 2304 + gg * 128 + off128).to(tl.float32)
+            acc += tl.sum(hw * rw)
+        tl.store(lg_ptr + e, acc.to(tl.bfloat16).to(tl.float32))
+        e += NPROG
+
+
+@triton.jit
+def _moe_gateup(hn_ptr, hs_ptr, hh_ptr, lg_ptr, idx_ptr, w_ptr,
+                gtw, gts, gtz, upw, ups, upz, sgw, sgs, sgz, suw, sus, suz,
+                ACTIVE: tl.constexpr, NPROG: tl.constexpr):
+    pid = tl.program_id(0)
+    cols32 = tl.arange(0, 64)
+    # softmax + top-8 (redundant, deterministic)
+    lgv = tl.load(lg_ptr + tl.arange(0, 64))
+    mx = tl.max(lgv)
+    eprob = tl.exp(lgv - mx)
+    se = tl.sum(eprob)
+    probs = eprob / se
+    idxs = tl.arange(0, 64)
+    wsum = 0.0
+    for j in range(0, ACTIVE):
+        m = tl.max(probs)
+        arg = tl.argmax(probs, axis=0)
+        tl.store(idx_ptr + j, arg)
+        tl.store(w_ptr + j, m)
+        wsum += m
+        probs = tl.where(idxs == arg, -1e30, probs)
+    for j in range(0, ACTIVE):
+        wv = tl.load(w_ptr + j)
+        tl.store(w_ptr + j, wv / (wsum + 1e-9) * _ROUTED_SCALING)
+    # gate/up: one routed expert per program-item, fused dual GEMV (gate+up share
+    # the x-load); BN=64 keeps column reads wide. 128 items (8 experts x 16 col-blocks).
+    n = pid
+    while n < ACTIVE * 16:
+        j = n // 16
+        n0 = (n % 16) * 64
+        e = tl.load(idx_ptr + j)
+        g_out, u_out = _gemv_dual_pre(hn_ptr, hs_ptr, gtw + e * 1152 * 1024, gts + e * 18 * 1024, gtz + e * 18 * 1024,
+                                      upw + e * 1152 * 1024, ups + e * 18 * 1024, upz + e * 18 * 1024,
+                                      n0, 2304, 1024, 64)
+        hh = g_out / (1.0 + tl.exp(-g_out)) * u_out
+        tl.store(hh_ptr + j * 1024 + n0 + cols32, hh)
+        n += NPROG
+    # shared expert (16 column blocks)
+    n = pid
+    while n < 16:
+        n0 = n * 64
+        sg_out, su_out = _gemv_dual_pre(hn_ptr, hs_ptr, sgw, sgs, sgz, suw, sus, suz, n0, 2304, 1024, 64)
+        hh = sg_out / (1.0 + tl.exp(-sg_out)) * su_out
+        tl.store(hh_ptr + 8 * 1024 + n0 + cols32, hh)
+        n += NPROG
+
+
+@triton.jit
+def _moe_down(h_ptr, hh_ptr, dnw, dns, dnz, sdw, sds, sdz, idx_ptr, w_ptr, out_ptr,
+              ACTIVE: tl.constexpr, NPROG: tl.constexpr):
+    pid = tl.program_id(0)
+    cols = tl.arange(0, 16)
+    jj = tl.arange(0, ACTIVE)
+    rows = tl.arange(0, 64)
+    x128 = tl.arange(0, 128)
+    eidx = tl.load(idx_ptr + jj)
+    wv = tl.load(w_ptr + jj)
+    n0 = pid * 16
+    while n0 < 2304:
+        out = tl.zeros([16], tl.float32)
+        # batched routed down: 8 experts' weight streams in flight at once
+        for g in range(0, 8):
+            hin = tl.load(hh_ptr + jj[:, None] * 1024 + (g * 128 + x128)[None, :]).to(tl.float32)  # [8,128]
+            xsum = tl.sum(hin, axis=1)  # [8]
+            wp = tl.load(dnw + eidx[:, None, None] * 512 * 2304 + (g * 64 + rows)[None, :, None] * 2304 + (n0 + cols)[None, None, :])  # [8,64,16]
+            lo = (wp & 0xF).to(tl.float32)
+            hi = (wp >> 4).to(tl.float32)
+            hin2 = tl.reshape(hin, (ACTIVE, 64, 2))
+            he, ho = tl.split(hin2)
+            dn = tl.sum(he[:, :, None] * lo + ho[:, :, None] * hi, axis=1)  # [8,16]
+            sg = tl.load(dns + eidx[:, None] * 8 * 2304 + g * 2304 + (n0 + cols)[None, :]).to(tl.float32)
+            zg = tl.load(dnz + eidx[:, None] * 8 * 2304 + g * 2304 + (n0 + cols)[None, :]).to(tl.float32)
+            out += tl.sum(wv[:, None] * sg * (dn - zg * xsum[:, None]), axis=0)  # [16]
+        dn = _gemv_f32(hh_ptr + 8 * 1024, sdw, sds, sdz, n0, 1024, 2304, 16)
+        out += dn
+        hv = tl.load(h_ptr + n0 + cols).to(tl.float32)
+        tl.store(out_ptr + n0 + cols, (hv + out.to(tl.bfloat16)).to(tl.bfloat16))
+        n0 += NPROG * 16
+
+
+@triton.jit
+def _mla_proj(x_ptr, an_ptr, xn_ptr, xs_ptr, qw, qs, qz, kvaw, kvas, kvaz, q_ptr, ckv_new_ptr, krope_new_ptr,
+              NPROG: tl.constexpr):
+    pid = tl.program_id(0)
+    r = _rscale(x_ptr, _NG_HID, 1e-6, _HID)
+    off128 = tl.arange(0, 128)
+    for gg in range(_NG_HID):
+        xg = tl.load(x_ptr + gg * 128 + off128).to(tl.float32)
+        nw = tl.load(an_ptr + gg * 128 + off128).to(tl.float32)
+        xn = (xg * nw * r).to(tl.bfloat16)
+        tl.store(xn_ptr + gg * 128 + off128, xn)
+        tl.store(xs_ptr + gg, tl.sum(xn.to(tl.float32)))
+    cols = tl.arange(0, 32)
+    n0 = pid * 32
+    while n0 < 6144:
+        qa = _gemv_norm_pre(xn_ptr, xs_ptr, qw, qs, qz, n0, 2304, 6144, 32)
+        tl.store(q_ptr + n0 + cols, qa.to(tl.bfloat16))
+        n0 += NPROG * 32
+    n0 = pid * 32
+    while n0 < 512:
+        ca = _gemv_norm_pre(xn_ptr, xs_ptr, kvaw, kvas, kvaz, n0, 2304, 576, 32)
+        tl.store(ckv_new_ptr + n0 + cols, ca.to(tl.bfloat16))
+        n0 += NPROG * 32
+    if pid == 0:
+        kr = _gemv_norm_pre(xn_ptr, xs_ptr, kvaw, kvas, kvaz, 512, 2304, 576, 64)
+        tl.store(krope_new_ptr + tl.arange(0, 64), kr.to(tl.bfloat16))
+
+
+@triton.jit
+def _mla_absorb(q_ptr, ckv_new_ptr, krope_new_ptr, kvb_wq, kvb_sc, kvb_ze,
+                QaT_ptr, qrT_ptr, ckv_buf, krope_buf, pos):
+    pid = tl.program_id(0)
+    ii = tl.arange(0, 32).to(tl.float32)
+    inv = tl.exp(-ii * (tl.log(10000.0) / 32.0))
+    ang = pos.to(tl.float32) * inv
+    c = tl.cos(ang)
+    s = tl.sin(ang)
+    if pid < 32:
+        h = pid
+        qr = tl.load(q_ptr + h * 192 + 128 + tl.arange(0, 64))
+        qr2 = tl.reshape(qr, (32, 2))
+        e, o = tl.split(qr2)
+        qrot = tl.reshape(tl.join(e * c - o * s, o * c + e * s), (64,))
+        tl.store(qrT_ptr + tl.arange(0, 64) * 32 + h, qrot)
+        # absorb: Qa = q_nope @ W_k^T, computed directly from packed int4
+        Qa = tl.zeros([512], tl.float32)
+        jall = tl.arange(0, 512)
+        jg = jall // 128
+        for i in range(0, 128):
+            qn = tl.load(q_ptr + h * 192 + i)
+            col = tl.load(kvb_wq + tl.arange(0, 256) * 8192 + h * 256 + i)
+            lo = (col & 0xF).to(tl.float32)
+            hi = (col >> 4).to(tl.float32)
+            val4 = tl.reshape(tl.join(lo, hi), (512,))
+            se = tl.load(kvb_sc + jg * 8192 + h * 256 + i).to(tl.float32)
+            ze = tl.load(kvb_ze + jg * 8192 + h * 256 + i).to(tl.float32)
+            Qa += qn * (val4 - ze) * se
+        tl.store(QaT_ptr + jall * 32 + h, Qa)
+    if pid == 0:
+        kr = tl.load(krope_new_ptr + tl.arange(0, 64)).to(tl.float32)
+        kr2 = tl.reshape(kr, (32, 2))
+        e, o = tl.split(kr2)
+        krot = tl.reshape(tl.join(e * c - o * s, o * c + e * s), (64,))
+        tl.store(krope_buf + pos * 64 + tl.arange(0, 64), krot.to(tl.bfloat16))
+        ckv = tl.load(ckv_new_ptr + tl.arange(0, 512)).to(tl.bfloat16)
+        tl.store(ckv_buf + pos * 512 + tl.arange(0, 512), ckv)
+
+
+@triton.jit
+def _mla_attn(ckv_buf, krope_buf, QaT_ptr, qrT_ptr, wsp_ptr, sep_ptr, nrows,
+              SCALE: tl.constexpr, NPROG: tl.constexpr):
+    pid = tl.program_id(0)
+    jj = tl.arange(0, 512)
+    rr = tl.arange(0, 64)
+    hh8 = tl.arange(0, 8)
+    j128 = tl.arange(0, 128)
+    for hg in tl.range(0, 4):
+        hh = hg * 8 + hh8
+        qrT = tl.load(qrT_ptr + rr[:, None] + hh[None, :] * 32).to(tl.bfloat16)  # [64,8]
+        sumexp = tl.zeros([8], tl.float32)
+        w0 = tl.zeros([8, 128], tl.float32)
+        w1 = tl.zeros([8, 128], tl.float32)
+        w2 = tl.zeros([8, 128], tl.float32)
+        w3 = tl.zeros([8, 128], tl.float32)
+        l = pid * 16
+        while l < nrows:
+            rows = l + tl.arange(0, 16)
+            m = rows < nrows
+            kr = tl.load(krope_buf + rows[:, None] * 64 + rr[None, :], mask=m[:, None], other=0.0)
+            scores = tl.dot(kr, qrT)
+            for kk in tl.static_range(0, 512, 64):
+                ckt = tl.load(ckv_buf + rows[:, None] * 512 + (kk + tl.arange(0, 64))[None, :], mask=m[:, None], other=0.0)
+                qat = tl.load(QaT_ptr + (kk + tl.arange(0, 64))[:, None] + hh[None, :] * 32).to(tl.bfloat16)
+                scores += tl.dot(ckt, qat)
+            scores = scores * SCALE
+            p = tl.exp(scores)
+            p = tl.where(m[:, None], p, 0.0)
+            sumexp += tl.sum(p, axis=0)
+            pt = tl.trans(p).to(tl.bfloat16)  # [8,16]
+            c0 = tl.load(ckv_buf + rows[:, None] * 512 + (0 + j128)[None, :], mask=m[:, None], other=0.0)
+            w0 += tl.dot(pt, c0)
+            c1 = tl.load(ckv_buf + rows[:, None] * 512 + (128 + j128)[None, :], mask=m[:, None], other=0.0)
+            w1 += tl.dot(pt, c1)
+            c2 = tl.load(ckv_buf + rows[:, None] * 512 + (256 + j128)[None, :], mask=m[:, None], other=0.0)
+            w2 += tl.dot(pt, c2)
+            c3 = tl.load(ckv_buf + rows[:, None] * 512 + (384 + j128)[None, :], mask=m[:, None], other=0.0)
+            w3 += tl.dot(pt, c3)
+            l += NPROG * 16
+        tl.store(sep_ptr + pid * 32 + hh, sumexp)
+        tl.store(wsp_ptr + pid * 32 * 512 + hh[:, None] * 512 + (0 + j128)[None, :], w0)
+        tl.store(wsp_ptr + pid * 32 * 512 + hh[:, None] * 512 + (128 + j128)[None, :], w1)
+        tl.store(wsp_ptr + pid * 32 * 512 + hh[:, None] * 512 + (256 + j128)[None, :], w2)
+        tl.store(wsp_ptr + pid * 32 * 512 + hh[:, None] * 512 + (384 + j128)[None, :], w3)
+
+
+@triton.jit
+def _mla_vout(wsp_ptr, sep_ptr, s_ptr, kvb_wq, kvb_sc, kvb_ze, o_ptr, NPROG: tl.constexpr):
+    pid = tl.program_id(0)
+    if pid < 32:
+        h = pid
+        jj = tl.arange(0, 512)
+        sacc = tl.zeros([512], tl.float32)
+        se = 0.0
+        for p in range(0, NPROG):
+            sacc += tl.load(wsp_ptr + p * 32 * 512 + h * 512 + jj)
+            se += tl.load(sep_ptr + p * 32 + h)
+        sacc = sacc / (se + 1e-30)
+        tl.store(s_ptr + h * 512 + jj, sacc)
+        tl.debug_barrier()
+        for cc in range(0, 4):
+            acc = _gemv_f32(s_ptr + h * 512, kvb_wq, kvb_sc, kvb_ze, h * 256 + 128 + cc * 32, 512, 8192, 32)
+            tl.store(o_ptr + h * 128 + cc * 32 + tl.arange(0, 32), acc.to(tl.bfloat16))
+
+
+# --------------------------------------------------------------------------- #
+# the single fused megakernel (launched once per step)
+# --------------------------------------------------------------------------- #
+@triton.jit
+def megakernel(
+    cnt, q, k, v, g, o, attn_out, h, hn, hs, x, hh, lg, idx, w, ckv_new, krope_new,
+    QaT, qrT, wsp, sep, s, ckv_buf, krope_buf, out,
+    S0, S1, S2, cq0, ck0, cv0, cq1, ck1, cv1, cq2, ck2, cv2,
+    an0, mn0, qw0, qs0, qz0, kw0, ks0, kz0, vw0, vs0, vz0, gw0, gs0, gz0,
+    beta0, conv0, ow0, os0, oz0,
+    r0, gtw0, gts0, gtz0, upw0, ups0, upz0, dnw0, dns0, dnz0,
+    sgw0, sgs0, sgz0, suw0, sus0, suz0, sdw0, sds0, sdz0,
+    an1, mn1, qw1, qs1, qz1, kw1, ks1, kz1, vw1, vs1, vz1, gw1, gs1, gz1,
+    beta1, conv1, ow1, os1, oz1,
+    r1, gtw1, gts1, gtz1, upw1, ups1, upz1, dnw1, dns1, dnz1,
+    sgw1, sgs1, sgz1, suw1, sus1, suz1, sdw1, sds1, sdz1,
+    an2, mn2, qw2, qs2, qz2, kw2, ks2, kz2, vw2, vs2, vz2, gw2, gs2, gz2,
+    beta2, conv2, ow2, os2, oz2,
+    r2, gtw2, gts2, gtz2, upw2, ups2, upz2, dnw2, dns2, dnz2,
+    sgw2, sgs2, sgz2, suw2, sus2, suz2, sdw2, sds2, sdz2,
+    an3, mn3, qw3, qs3, qz3, kvaw, kvas, kvaz, kvbw, kvbs, kvbz, ow3, os3, oz3,
+    r3, gtw3, gts3, gtz3, upw3, ups3, upz3, dnw3, dns3, dnz3,
+    sgw3, sgs3, sgz3, suw3, sus3, suz3, sdw3, sds3, sdz3,
+    x0, pos, base,
+    NPROG: tl.constexpr, BLOCK: tl.constexpr):
+    tgt = base
+    # ---------------- block 0 (KDA) ----------------
+    _kda_proj(x0, an0, hn, hs, qw0, qs0, qz0, kw0, ks0, kz0, vw0, vs0, vz0, gw0, gs0, gz0, q, k, v, g, NPROG)
+    tgt += NPROG
+    _barrier(cnt, tgt, BLOCK)
+    _kda_recur(q, k, v, g, x0, an0, beta0, conv0, S0, cq0, ck0, cv0, o, _KDA_SCALE)
+    tgt += NPROG
+    _barrier(cnt, tgt, BLOCK)
+    _o_proj(o, ow0, os0, oz0, attn_out, NPROG)
+    tgt += NPROG
+    _barrier(cnt, tgt, BLOCK)
+    _moe_router(x0, attn_out, mn0, h, hn, hs, r0, lg, NPROG)
+    tgt += NPROG
+    _barrier(cnt, tgt, BLOCK)
+    _moe_gateup(hn, hs, hh, lg, idx, w, gtw0, gts0, gtz0, upw0, ups0, upz0, sgw0, sgs0, sgz0, suw0, sus0, suz0, _ACTIVE, NPROG)
+    tgt += NPROG
+    _barrier(cnt, tgt, BLOCK)
+    _moe_down(h, hh, dnw0, dns0, dnz0, sdw0, sds0, sdz0, idx, w, x, _ACTIVE, NPROG)
+    tgt += NPROG
+    _barrier(cnt, tgt, BLOCK)
+    # ---------------- block 1 (KDA) ----------------
+    _kda_proj(x, an1, hn, hs, qw1, qs1, qz1, kw1, ks1, kz1, vw1, vs1, vz1, gw1, gs1, gz1, q, k, v, g, NPROG)
+    tgt += NPROG
+    _barrier(cnt, tgt, BLOCK)
+    _kda_recur(q, k, v, g, x, an1, beta1, conv1, S1, cq1, ck1, cv1, o, _KDA_SCALE)
+    tgt += NPROG
+    _barrier(cnt, tgt, BLOCK)
+    _o_proj(o, ow1, os1, oz1, attn_out, NPROG)
+    tgt += NPROG
+    _barrier(cnt, tgt, BLOCK)
+    _moe_router(x, attn_out, mn1, h, hn, hs, r1, lg, NPROG)
+    tgt += NPROG
+    _barrier(cnt, tgt, BLOCK)
+    _moe_gateup(hn, hs, hh, lg, idx, w, gtw1, gts1, gtz1, upw1, ups1, upz1, sgw1, sgs1, sgz1, suw1, sus1, suz1, _ACTIVE, NPROG)
+    tgt += NPROG
+    _barrier(cnt, tgt, BLOCK)
+    _moe_down(h, hh, dnw1, dns1, dnz1, sdw1, sds1, sdz1, idx, w, x, _ACTIVE, NPROG)
+    tgt += NPROG
+    _barrier(cnt, tgt, BLOCK)
+    # ---------------- block 2 (KDA) ----------------
+    _kda_proj(x, an2, hn, hs, qw2, qs2, qz2, kw2, ks2, kz2, vw2, vs2, vz2, gw2, gs2, gz2, q, k, v, g, NPROG)
+    tgt += NPROG
+    _barrier(cnt, tgt, BLOCK)
+    _kda_recur(q, k, v, g, x, an2, beta2, conv2, S2, cq2, ck2, cv2, o, _KDA_SCALE)
+    tgt += NPROG
+    _barrier(cnt, tgt, BLOCK)
+    _o_proj(o, ow2, os2, oz2, attn_out, NPROG)
+    tgt += NPROG
+    _barrier(cnt, tgt, BLOCK)
+    _moe_router(x, attn_out, mn2, h, hn, hs, r2, lg, NPROG)
+    tgt += NPROG
+    _barrier(cnt, tgt, BLOCK)
+    _moe_gateup(hn, hs, hh, lg, idx, w, gtw2, gts2, gtz2, upw2, ups2, upz2, sgw2, sgs2, sgz2, suw2, sus2, suz2, _ACTIVE, NPROG)
+    tgt += NPROG
+    _barrier(cnt, tgt, BLOCK)
+    _moe_down(h, hh, dnw2, dns2, dnz2, sdw2, sds2, sdz2, idx, w, x, _ACTIVE, NPROG)
+    tgt += NPROG
+    _barrier(cnt, tgt, BLOCK)
+    # ---------------- block 3 (MLA) ----------------
+    _mla_proj(x, an3, hn, hs, qw3, qs3, qz3, kvaw, kvas, kvaz, q, ckv_new, krope_new, NPROG)
+    tgt += NPROG
+    _barrier(cnt, tgt, BLOCK)
+    _mla_absorb(q, ckv_new, krope_new, kvbw, kvbs, kvbz, QaT, qrT, ckv_buf, krope_buf, pos)
+    tgt += NPROG
+    _barrier(cnt, tgt, BLOCK)
+    _mla_attn(ckv_buf, krope_buf, QaT, qrT, wsp, sep, pos + 1, _MLA_SCALE, NPROG)
+    tgt += NPROG
+    _barrier(cnt, tgt, BLOCK)
+    _mla_vout(wsp, sep, s, kvbw, kvbs, kvbz, o, NPROG)
+    tgt += NPROG
+    _barrier(cnt, tgt, BLOCK)
+    _o_proj(o, ow3, os3, oz3, attn_out, NPROG)
+    tgt += NPROG
+    _barrier(cnt, tgt, BLOCK)
+    _moe_router(x, attn_out, mn3, h, hn, hs, r3, lg, NPROG)
+    tgt += NPROG
+    _barrier(cnt, tgt, BLOCK)
+    _moe_gateup(hn, hs, hh, lg, idx, w, gtw3, gts3, gtz3, upw3, ups3, upz3, sgw3, sgs3, sgz3, suw3, sus3, suz3, _ACTIVE, NPROG)
+    tgt += NPROG
+    _barrier(cnt, tgt, BLOCK)
+    _moe_down(h, hh, dnw3, dns3, dnz3, sdw3, sds3, sdz3, idx, w, out, _ACTIVE, NPROG)
+
+
+# --------------------------------------------------------------------------- #
+# Model
+# --------------------------------------------------------------------------- #
+class Model(nn.Module):
+    def __init__(self, cfg: Config):
+        super().__init__()
+        self.cfg = cfg
+        assert cfg.hidden == HID and cfg.kda_heads == H and cfg.kda_head_dim == DK
+        assert cfg.n_experts == E and cfg.moe_inter == MOE_M
+        assert cfg.pattern == ("K", "K", "K", "M")
+        self.blocks = nn.ModuleList(Block(cfg, k) for k in cfg.pattern)
+        self.reset_parameters()
+
+        dev = torch.device("cuda:0")
+        bf16 = torch.bfloat16
+        f32 = torch.float32
+        self._cnt = torch.zeros(1, dtype=torch.int32, device=dev)
+        self._q = torch.empty(6144, dtype=bf16, device=dev)
+        self._k = torch.empty(4096, dtype=bf16, device=dev)
+        self._v = torch.empty(4096, dtype=bf16, device=dev)
+        self._g = torch.empty(4096, dtype=bf16, device=dev)
+        self._o = torch.empty(4096, dtype=bf16, device=dev)
+        self._attn_out = torch.empty(2304, dtype=bf16, device=dev)
+        self._h = torch.empty(2304, dtype=bf16, device=dev)
+        self._hn = torch.empty(2304, dtype=bf16, device=dev)
+        self._hs = torch.empty(18, dtype=f32, device=dev)
+        self._x = torch.empty(2304, dtype=bf16, device=dev)
+        self._hh = torch.empty(9 * 1024, dtype=f32, device=dev)
+        self._lg = torch.empty(64, dtype=f32, device=dev)
+        self._idx = torch.empty(8, dtype=torch.int32, device=dev)
+        self._w = torch.empty(8, dtype=f32, device=dev)
+        self._ckv_new = torch.empty(512, dtype=bf16, device=dev)
+        self._krope_new = torch.empty(64, dtype=bf16, device=dev)
+        self._QaT = torch.empty(512 * 32, dtype=f32, device=dev)
+        self._qrT = torch.empty(64 * 32, dtype=f32, device=dev)
+        self._wsp = torch.empty(NPROG * 32 * 512, dtype=f32, device=dev)
+        self._sep = torch.empty(NPROG * 32, dtype=f32, device=dev)
+        self._s = torch.empty(32 * 512, dtype=f32, device=dev)
+        self._ckv_buf = None
+        self._krope_buf = None
+        self._out = torch.empty(2304, dtype=bf16, device=dev)
+        self._barrier_base = 0
+
+    def reset_parameters(self):
+        g = torch.Generator(device="cpu").manual_seed(1234)
+        for mod in self.modules():
+            if isinstance(mod, (QuantLinear, QuantExperts)):
+                mod.init_random(g)
+            elif isinstance(mod, nn.Linear):
+                nn.init.normal_(mod.weight, 0.0, 0.02, generator=g)
+            elif isinstance(mod, KDA):
+                nn.init.normal_(mod.conv_w, 0.0, 0.1, generator=g)
+
+    def _ensure_mla(self, c_kv, k_rope):
+        pos = c_kv.shape[0]
+        need_alloc = (self._ckv_buf is None or self._ckv_buf.shape[0] < pos + 64
+                      or c_kv.data_ptr() != self._ckv_buf.data_ptr())
+        if need_alloc:
+            cap = pos + 4096
+            self._ckv_buf = torch.empty(cap, 512, dtype=torch.bfloat16, device=c_kv.device)
+            self._krope_buf = torch.empty(cap, 64, dtype=torch.bfloat16, device=k_rope.device)
+            self._ckv_buf[:pos].copy_(c_kv)
+            self._krope_buf[:pos].copy_(k_rope)
+
+    def _build_args(self, hidden, state, pos):
+        L = [self._cnt, self._q, self._k, self._v, self._g, self._o, self._attn_out,
+             self._h, self._hn, self._hs, self._x, self._hh, self._lg, self._idx, self._w,
+             self._ckv_new, self._krope_new, self._QaT, self._qrT,
+             self._wsp, self._sep, self._s, self._ckv_buf, self._krope_buf, self._out]
+        for i in range(3):
+            L.append(state[i]["S"])
+        for i in range(3):
+            L.append(state[i]["cq"])
+            L.append(state[i]["ck"])
+            L.append(state[i]["cv"])
+        for b in range(3):
+            blk = self.blocks[b]
+            L.append(blk.attn_norm); L.append(blk.moe_norm)
+            L.append(blk.attn.q_proj.w_q); L.append(blk.attn.q_proj.scales); L.append(blk.attn.q_proj.zeros)
+            L.append(blk.attn.k_proj.w_q); L.append(blk.attn.k_proj.scales); L.append(blk.attn.k_proj.zeros)
+            L.append(blk.attn.v_proj.w_q); L.append(blk.attn.v_proj.scales); L.append(blk.attn.v_proj.zeros)
+            L.append(blk.attn.g_proj.w_q); L.append(blk.attn.g_proj.scales); L.append(blk.attn.g_proj.zeros)
+            L.append(blk.attn.beta_proj.weight)
+            L.append(blk.attn.conv_w)
+            L.append(blk.attn.o_proj.w_q); L.append(blk.attn.o_proj.scales); L.append(blk.attn.o_proj.zeros)
+            L.append(blk.moe.router.weight)
+            L.append(blk.moe.gate.w_q); L.append(blk.moe.gate.scales); L.append(blk.moe.gate.zeros)
+            L.append(blk.moe.up.w_q); L.append(blk.moe.up.scales); L.append(blk.moe.up.zeros)
+            L.append(blk.moe.down.w_q); L.append(blk.moe.down.scales); L.append(blk.moe.down.zeros)
+            L.append(blk.moe.s_gate.w_q); L.append(blk.moe.s_gate.scales); L.append(blk.moe.s_gate.zeros)
+            L.append(blk.moe.s_up.w_q); L.append(blk.moe.s_up.scales); L.append(blk.moe.s_up.zeros)
+            L.append(blk.moe.s_down.w_q); L.append(blk.moe.s_down.scales); L.append(blk.moe.s_down.zeros)
+        blk = self.blocks[3]
+        L.append(blk.attn_norm); L.append(blk.moe_norm)
+        L.append(blk.attn.q_proj.w_q); L.append(blk.attn.q_proj.scales); L.append(blk.attn.q_proj.zeros)
+        L.append(blk.attn.kv_a.w_q); L.append(blk.attn.kv_a.scales); L.append(blk.attn.kv_a.zeros)
+        L.append(blk.attn.kv_b.w_q); L.append(blk.attn.kv_b.scales); L.append(blk.attn.kv_b.zeros)
+        L.append(blk.attn.o_proj.w_q); L.append(blk.attn.o_proj.scales); L.append(blk.attn.o_proj.zeros)
+        L.append(blk.moe.router.weight)
+        L.append(blk.moe.gate.w_q); L.append(blk.moe.gate.scales); L.append(blk.moe.gate.zeros)
+        L.append(blk.moe.up.w_q); L.append(blk.moe.up.scales); L.append(blk.moe.up.zeros)
+        L.append(blk.moe.down.w_q); L.append(blk.moe.down.scales); L.append(blk.moe.down.zeros)
+        L.append(blk.moe.s_gate.w_q); L.append(blk.moe.s_gate.scales); L.append(blk.moe.s_gate.zeros)
+        L.append(blk.moe.s_up.w_q); L.append(blk.moe.s_up.scales); L.append(blk.moe.s_up.zeros)
+        L.append(blk.moe.s_down.w_q); L.append(blk.moe.s_down.scales); L.append(blk.moe.s_down.zeros)
+        L.append(hidden)
+        L.append(pos)
+        L.append(self._barrier_base)
+        return L
+
+    def step(self, hidden, state):
+        st3 = state[3]
+        c_kv = st3["c_kv"]
+        k_rope = st3["k_rope"]
+        pos = c_kv.shape[0]
+        self._ensure_mla(c_kv, k_rope)
+        args = self._build_args(hidden, state, pos)
+        megakernel[(NPROG,)](*args, NPROG=NPROG, BLOCK=BLOCK, num_warps=8)
+        self._barrier_base += NBARRIERS * NPROG
+        state[3]["c_kv"] = self._ckv_buf[:pos + 1]
+        state[3]["k_rope"] = self._krope_buf[:pos + 1]
+        return self._out, state
