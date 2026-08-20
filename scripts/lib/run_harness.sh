@@ -216,11 +216,18 @@ scoring environment. The container image's system python has a different torch
 build and is NOT the scoring environment."
 fi
 
-# check.py and benchmark.py derive REPO_ROOT as parents[2]. Keep that shape and
-# copy project metadata so agents can experiment inside a disposable workspace.
-# The agent always receives a disposable copy. Post-agent scoring uses a new
-# copy from the canonical bench, so workspace edits cannot change trusted code.
+# check.py and benchmark.py derive REPO_ROOT as parents[2]. Keep that shape,
+# but always copy src/: a writable symlink lets host-mode candidates modify the
+# trusted checker helpers in the source checkout. Post-agent grading makes a
+# second copy from the verified trusted snapshot below.
+strip_python_bytecode() {
+    /usr/bin/find "$1" -type d -name __pycache__ -prune \
+        -exec /bin/rm -rf -- {} +
+    /usr/bin/find "$1" -type f \( -name '*.pyc' -o -name '*.pyo' \) -delete
+}
+
 cp -a "$REPO_ROOT/src" "$WORKSPACE_ROOT/src"
+strip_python_bytecode "$WORKSPACE_ROOT/src"
 cp -p "$REPO_ROOT/pyproject.toml" "$WORKSPACE_ROOT/pyproject.toml"
 cp -p "$REPO_ROOT/uv.lock" "$WORKSPACE_ROOT/uv.lock"
 if [ -e "$REPO_ROOT/.python-version" ]; then
@@ -247,7 +254,7 @@ if ! command -v uv >/dev/null 2>&1; then
     echo "STOP: uv not found on PATH ($PATH). Install uv or fix PATH; this is not an agent failure." >&2
     exit 3
 fi
-REAL_UV="$(command -v uv)"
+REAL_UV="$(readlink -f "$(command -v uv)")"
 REAL_PYTHON="$(command -v python3 || command -v python)"
 REAL_NVIDIA_SMI="$(command -v nvidia-smi || true)"
 REAL_NCU="$(command -v ncu || true)"
@@ -263,6 +270,13 @@ TRUSTED_PYTHON_RUNTIME="$(dirname "$(dirname "$(readlink -f "$TRUSTED_PYTHON")")
 SUBMISSION_BUNDLE_TOOL="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/submission_bundle.py"
 TRUSTED_TOOLS_DIR="$(dirname "$(dirname "$SUBMISSION_BUNDLE_TOOL")")"
 DIALECT_PREFLIGHT_TOOL="$TRUSTED_TOOLS_DIR/lib/dialect_preflight.py"
+TRUSTED_WORKTREE_ROOTS="$(
+    /usr/bin/git -C "$REPO_ROOT" worktree list --porcelain 2>/dev/null \
+        | /usr/bin/sed -n 's/^worktree //p'
+)"
+if [ -z "$TRUSTED_WORKTREE_ROOTS" ]; then
+    TRUSTED_WORKTREE_ROOTS="$REPO_ROOT"
+fi
 if [ -z "$REAL_UNSHARE" ] || [ -z "$REAL_SETPRIV" ]; then
     echo "STOP: post-agent grading requires user, network, and mount namespaces plus setpriv." >&2
     exit 3
@@ -295,6 +309,13 @@ if [ ! -d "$TRUSTED_SITE_PACKAGES" ]; then
     echo "STOP: canonical site-packages is missing: $TRUSTED_SITE_PACKAGES" >&2
     exit 3
 fi
+# NVIDIA's cu13 wheel ships libcudart.so.13 while extension link commands use
+# -lcudart. Fix the trusted environment before replay remounts it read-only.
+TRUSTED_CUDA_LIB="$TRUSTED_SITE_PACKAGES/nvidia/cu13/lib"
+if [ -f "$TRUSTED_CUDA_LIB/libcudart.so.13" ] && \
+    [ ! -e "$TRUSTED_CUDA_LIB/libcudart.so" ]; then
+    ln -s libcudart.so.13 "$TRUSTED_CUDA_LIB/libcudart.so"
+fi
 if [ -n "$REAL_NVIDIA_SMI" ] && ! \
     "$REAL_UNSHARE" --user --map-root-user --net \
         "$REAL_NVIDIA_SMI" -L >/dev/null 2>&1; then
@@ -321,11 +342,11 @@ import runpy
 import sys
 from pathlib import Path
 
-site_packages, script = sys.argv[1:]
+script, *script_args = sys.argv[1:]
 problem = os.getcwd()
 repo = str(Path(problem).parents[1])
-sys.path.extend((site_packages, repo, problem))
-sys.argv[:] = [script]
+sys.path.append(repo)
+sys.argv[:] = [script, *script_args]
 runpy.run_path(script, run_name="__main__")
 '
 if ! "$REAL_UNSHARE" --user --map-root-user --net --mount --pid --fork \
@@ -336,8 +357,7 @@ if ! "$REAL_UNSHARE" --user --map-root-user --net --mount --pid --fork \
         writable_stage=$4
         setpriv=$5
         python=$6
-        site_packages=$7
-        replay_source=$8
+        replay_source=$7
         for path in "$readonly_root" "$python_runtime" "$trusted_tools"; do
             /usr/bin/mount --bind "$path" "$path"
             /usr/bin/mount -o remount,bind,ro "$path"
@@ -347,11 +367,11 @@ if ! "$REAL_UNSHARE" --user --map-root-user --net --mount --pid --fork \
         exec "$setpriv" --no-new-privs --bounding-set=-all \
             --inh-caps=-all --ambient-caps=-all \
             /usr/bin/env -i PATH=/usr/bin:/bin PYTHONNOUSERSITE=1 \
-            PYTHONDONTWRITEBYTECODE=1 "$python" -I -S -c "$replay_source" \
-            "$site_packages" /dev/null
+            PYTHONDONTWRITEBYTECODE=1 "$python" -I -c "$replay_source" \
+            /dev/null
     ' replay-preflight "$REPO_ROOT" "$TRUSTED_PYTHON_RUNTIME" \
     "$TRUSTED_TOOLS_DIR" "$REPLAY_ROOT" "$REAL_SETPRIV" \
-    "$TRUSTED_PYTHON" "$TRUSTED_SITE_PACKAGES" "$SUBMISSION_REPLAY_SOURCE" \
+    "$TRUSTED_PYTHON" "$SUBMISSION_REPLAY_SOURCE" \
     >/dev/null 2>&1; then
     echo "STOP: the exact post-agent grading isolation preflight failed." >&2
     exit 3
@@ -368,7 +388,20 @@ mkdir -p "$LOCK_WRAPPER_DIR" "$RUN_DIR/cache/torch_extensions" \
 KBH_GPU_LOCK_DIR="${KBH_GPU_LOCK_DIR:-$REPO_ROOT/outputs/gpu_lock}"
 mkdir -p "$KBH_GPU_LOCK_DIR"
 export KBH_GPU_LOCK="${KBH_GPU_LOCK:-$KBH_GPU_LOCK_DIR/gpu.lock}"
+export KBH_GPU_LOCK_OWNER="$RUN_DIR/gpu_lock.owner"
 export KBH_GPU_LOCK_LOG="$RUN_DIR/gpu_lock.log"
+for trusted_lock_file in "$KBH_GPU_LOCK" "$KBH_GPU_LOCK_LOG"; do
+    if [ -L "$trusted_lock_file" ] || \
+        { [ -e "$trusted_lock_file" ] && [ ! -f "$trusted_lock_file" ]; }; then
+        echo "STOP: unsafe GPU lock path: $trusted_lock_file" >&2
+        exit 3
+    fi
+    : >> "$trusted_lock_file"
+    if [ "$(stat -c %h "$trusted_lock_file")" -ne 1 ]; then
+        echo "STOP: hard-linked GPU lock path: $trusted_lock_file" >&2
+        exit 3
+    fi
+done
 export TORCH_EXTENSIONS_DIR="$RUN_DIR/cache/torch_extensions"
 export TRITON_CACHE_DIR="$RUN_DIR/cache/triton"
 export CUDA_CACHE_PATH="$RUN_DIR/cache/cuda"
@@ -406,7 +439,7 @@ fi
 if [ "${KBH_GPU_LOCK_HELD:-0}" = "1" ]; then
     exec "$real" "$@"
 fi
-owner_file="${KBH_GPU_LOCK}.owner"
+owner_file="${KBH_GPU_LOCK_OWNER:-${KBH_GPU_LOCK}.owner}"
 if [ -f "$owner_file" ]; then
     IFS=$'\t' read -r owner_pid owner_run_dir < "$owner_file" || true
     if [ "${owner_run_dir:-}" = "${RUN_DIR:-}" ] && kill -0 "${owner_pid:-}" 2>/dev/null; then
@@ -447,7 +480,10 @@ fi
     printf '%s start pid=%s cmd=%s\n' "$(date -Is)" "$$" "$name" >&3
     set +e
     export KBH_GPU_LOCK_HELD=1
-    "$real" "$@"
+    # The broker shell retains the lock and audit-log descriptors while the
+    # untrusted child runs. Closing both in the child prevents submission code
+    # from unlocking the shared OFD lock or forging lock events.
+    "$real" "$@" 3>&- 9>&-
     status=$?
     set -e
     if [ -f "$owner_file" ] && IFS=$'\t' read -r current_owner _ < "$owner_file" && [ "$current_owner" = "$$" ]; then
@@ -495,10 +531,11 @@ cat > "$HOST_AGENT_ISOLATOR" <<'EOF'
 set -euo pipefail
 
 : "${REPO_ROOT:?}" "${RUN_DIR:?}" "${KBH_GPU_LOCK:?}" "${KBH_GPU_LOCK_LOG:?}"
-: "${TEMPLATE_BACKUP_DIR:?}" "${LOCK_WRAPPER_DIR:?}" "${REPLAY_ROOT:?}"
+: "${TEMPLATE_BACKUP_DIR:?}" "${TRUSTED_SRC_BACKUP_DIR:?}"
+: "${LOCK_WRAPPER_DIR:?}" "${REPLAY_ROOT:?}" "${HARNESS_CONTROL_DIR:?}"
 : "${TRUSTED_PYTHON_RUNTIME:?}" "${TRUSTED_TOOLS_DIR:?}" "${REAL_UV:?}"
-: "${REAL_UNSHARE:?}" "${REAL_SETPRIV:?}"
-: "${UV_CACHE_HOST:?}" "${AGENT_UV_OVERLAY:?}"
+: "${REAL_UNSHARE:?}"
+: "${REAL_SETPRIV:?}" "${UV_CACHE_HOST:?}" "${AGENT_UV_OVERLAY:?}"
 : "${WORKSPACE_ROOT:?}" "${WORKSPACE_TRUSTED_PATHS:?}"
 : "${DIALECT_CUDA_TOOLKIT:?}"
 
@@ -513,27 +550,30 @@ exec "$REAL_UNSHARE" --user --map-root-user "${network_args[@]}" --mount --pid -
         lock_file=$3
         lock_log=$4
         template_backup=$5
-        wrapper_dir=$6
-        replay_root=$7
-        python_runtime=$8
-        trusted_tools=$9
-        trusted_uv=${10}
-        setpriv=${11}
-        uv_cache=${12}
-        uv_overlay=${13}
-        agent_cwd=${14}
-        transcript=${15}
-        stderr_log=${16}
-        home=${17}
-        workspace=${18}
-        workspace_trusted=${19}
-        cargo_home=${20}
-        rustup_home=${21}
-        cuda_oxide=${22}
-        cutile_rust=${23}
-        writable_root=${24}
-        cuda_toolkit=${25}
-        shift 25
+        trusted_src=$6
+        wrapper_dir=$7
+        replay_root=$8
+        control_dir=$9
+        python_runtime=${10}
+        trusted_tools=${11}
+        trusted_uv=${12}
+        trusted_worktrees=${13}
+        setpriv=${14}
+        uv_cache=${15}
+        uv_overlay=${16}
+        agent_cwd=${17}
+        transcript=${18}
+        stderr_log=${19}
+        home=${20}
+        workspace=${21}
+        workspace_trusted=${22}
+        cargo_home=${23}
+        rustup_home=${24}
+        cuda_oxide=${25}
+        cutile_rust=${26}
+        writable_root=${27}
+        cuda_toolkit=${28}
+        shift 28
 
         for path in "$home" "$repo" "$python_runtime" "$trusted_tools" "$trusted_uv"; do
             /usr/bin/mount --bind "$path" "$path"
@@ -545,7 +585,15 @@ exec "$REAL_UNSHARE" --user --map-root-user "${network_args[@]}" --mount --pid -
                 /usr/bin/mount -o remount,bind,ro "$path"
             fi
         done
+        printf "%s\n" "$trusted_worktrees" | while IFS= read -r path; do
+            if [ -n "$path" ] && [ -d "$path" ]; then
+                /usr/bin/mount --bind "$path" "$path"
+                /usr/bin/mount -o remount,bind,ro "$path"
+            fi
+        done
 
+        # The run workspace remains writable. Re-bind its parent first, then
+        # seal every trusted child and expose only the existing lock/log files.
         /usr/bin/mount --bind "$run_dir" "$run_dir"
         /usr/bin/mount -o remount,bind,ro "$run_dir"
         /usr/bin/mount --bind "$writable_root" "$writable_root"
@@ -562,7 +610,7 @@ exec "$REAL_UNSHARE" --user --map-root-user "${network_args[@]}" --mount --pid -
             /usr/bin/mount --bind "$path" "$path"
             /usr/bin/mount -o remount,bind,rw "$path"
         done
-        for path in "$template_backup" "$wrapper_dir"; do
+        for path in "$template_backup" "$trusted_src" "$wrapper_dir" "$control_dir"; do
             /usr/bin/mount --bind "$path" "$path"
             /usr/bin/mount -o remount,bind,ro "$path"
         done
@@ -580,6 +628,8 @@ exec "$REAL_UNSHARE" --user --map-root-user "${network_args[@]}" --mount --pid -
             fi
         done
 
+        # Cache writes are allowed, but only through a per-run overlay. The
+        # canonical cache remains the immutable lower layer used by grading.
         /usr/bin/mount -t overlay overlay \
             -o "lowerdir=$uv_cache,upperdir=$uv_overlay/upper,workdir=$uv_overlay/work,userxattr" \
             "$uv_overlay/merged"
@@ -593,12 +643,14 @@ exec "$REAL_UNSHARE" --user --map-root-user "${network_args[@]}" --mount --pid -
         exec "$setpriv" --no-new-privs --bounding-set=-all \
             --inh-caps=-all --ambient-caps=-all "$@"
     ' host-agent-isolate "$REPO_ROOT" "$RUN_DIR" "$KBH_GPU_LOCK" \
-    "$KBH_GPU_LOCK_LOG" "$TEMPLATE_BACKUP_DIR" "$LOCK_WRAPPER_DIR" \
-    "$REPLAY_ROOT" "$TRUSTED_PYTHON_RUNTIME" "$TRUSTED_TOOLS_DIR" "$REAL_UV" \
-    "$REAL_SETPRIV" "$UV_CACHE_HOST" "$AGENT_UV_OVERLAY" "$PWD" \
-    "${LOG_FILE:-}" "${STDERR_FILE:-}" "${KBH_ISOLATION_HOME:-$HOME}" \
-    "$WORKSPACE_ROOT" "$WORKSPACE_TRUSTED_PATHS" "$KBH_CARGO_HOME" \
-    "$KBH_RUSTUP_HOME" "$KBH_CUDA_OXIDE_ROOT" "$KBH_CUTILE_RUST_ROOT" \
+    "$KBH_GPU_LOCK_LOG" "$TEMPLATE_BACKUP_DIR" "$TRUSTED_SRC_BACKUP_DIR" \
+    "$LOCK_WRAPPER_DIR" "$REPLAY_ROOT" "$HARNESS_CONTROL_DIR" \
+    "$TRUSTED_PYTHON_RUNTIME" "$TRUSTED_TOOLS_DIR" "$REAL_UV" \
+    "$TRUSTED_WORKTREE_ROOTS" "$REAL_SETPRIV" \
+    "$UV_CACHE_HOST" "$AGENT_UV_OVERLAY" "$PWD" \
+    "${LOG_FILE:-}" "${STDERR_FILE:-}" "${KBH_ISOLATION_HOME:-$HOME}" "$WORKSPACE_ROOT" \
+    "$WORKSPACE_TRUSTED_PATHS" "$KBH_CARGO_HOME" "$KBH_RUSTUP_HOME" \
+    "$KBH_CUDA_OXIDE_ROOT" "$KBH_CUTILE_RUST_ROOT" \
     "${KBH_ISOLATION_WRITABLE_ROOT:-$RUN_DIR}" "$DIALECT_CUDA_TOOLKIT" "$@"
 EOF
 chmod +x "$LOCK_WRAPPER_DIR"/uv "$LOCK_WRAPPER_DIR"/python \
@@ -661,7 +713,7 @@ run_docker_locked_timeout() {
                 if [ $((now - mt)) -ge "$KBH_STALL_SECONDS" ]; then
                     printf '%s stall_watchdog killed %s after %ss of silence (%s)\n' \
                         "$(date -Is)" "$local_cid" "$KBH_STALL_SECONDS" "$lock_name" \
-                        >> "$RUN_DIR/stall_watchdog.log"
+                        >> "$HARNESS_CONTROL_DIR/stall_watchdog.log"
                     "$REAL_DOCKER" rm -f "$local_cid" >/dev/null 2>&1 || true
                     break
                 fi
@@ -720,9 +772,9 @@ run_host_with_stall_watch() {
     # (which means unlimited). That lets the watchdog terminate the complete
     # command tree without touching this harness process group.
     "$REAL_TIMEOUT" --kill-after="${KBH_TIMEOUT_KILL_AFTER_SECONDS:-30}s" \
-        "${timeout_seconds}s" "$@" &
+        "${timeout_seconds}s" "$HOST_AGENT_ISOLATOR" "$@" &
     cmd_pid=$!
-    stall_marker="$RUN_DIR/host_stall_watchdog.$cmd_pid"
+    stall_marker="$HARNESS_CONTROL_DIR/host_stall_watchdog.$cmd_pid"
     rm -f "$stall_marker"
 
     if [ -n "${stall_seconds}" ] && [ "${stall_seconds}" -gt 0 ]; then
@@ -738,7 +790,7 @@ run_host_with_stall_watch() {
                     : > "$stall_marker"
                     printf '%s host_stall_watchdog killed pid=%s after %ss of silence on %s\n' \
                         "$(date -Is)" "$cmd_pid" "$stall_seconds" "$watch_log" \
-                        >> "$RUN_DIR/stall_watchdog.log"
+                        >> "$HARNESS_CONTROL_DIR/stall_watchdog.log"
                     _kill_pid_group "$cmd_pid" TERM
                     sleep 2
                     _kill_pid_group "$cmd_pid" KILL
@@ -764,6 +816,16 @@ run_host_with_stall_watch() {
     rm -f "$stall_marker"
     set -e
     return "$status"
+}
+
+# Every direct host-mode agent command uses this shell function instead of the
+# timeout binary. The timeout remains outside the agent mount/PID namespace;
+# the command itself runs through the read-only trust-boundary wrapper above.
+timeout() {
+    local timeout_seconds="$1"
+    shift
+    "$REAL_TIMEOUT" --kill-after="${KBH_TIMEOUT_KILL_AFTER_SECONDS:-30}s" \
+        "${timeout_seconds}s" "$HOST_AGENT_ISOLATOR" "$@"
 }
 
 start_nvcf_proxy() {
@@ -1138,6 +1200,7 @@ run_claude_container() {
         -e UV_PYTHON_INSTALL_DIR=/uv-cache/python
         -e RUN_DIR=/kbh
         -e KBH_GPU_LOCK=/kbh/lock/gpu.lock
+        -e KBH_GPU_LOCK_OWNER=/home/agent/gpu_lock.owner
         -e KBH_GPU_LOCK_LOG=/home/agent/gpu_lock_container.log
         -e PATH=/kbh/bin:/usr/local/cuda-host/bin:/usr/local/bin:/usr/bin:/bin
         -v "$WORKSPACE_ROOT:/workspace:rw"
@@ -1147,7 +1210,7 @@ run_claude_container() {
         -v "$REAL_UV:/usr/local/bin/uv:ro"
         -v "$KBH_AGENT_CONTAINER_UV_CACHE:/uv-cache:rw"
         -v "$CONTAINER_LOCK_BIN:/kbh/bin:ro"
-        -v "$KBH_GPU_LOCK_DIR:/kbh/lock:rw"
+        -v "$KBH_GPU_LOCK:/kbh/lock/gpu.lock:rw"
         -w "/workspace/problems/$PROBLEM_NAME"
         "$KBH_AGENT_CONTAINER_IMAGE"
         claude
@@ -1199,6 +1262,7 @@ run_codex_container() {
         -e UV_PYTHON_INSTALL_DIR=/uv-cache/python
         -e RUN_DIR=/kbh
         -e KBH_GPU_LOCK=/kbh/lock/gpu.lock
+        -e KBH_GPU_LOCK_OWNER=/home/agent/gpu_lock.owner
         -e KBH_GPU_LOCK_LOG=/home/agent/gpu_lock_container.log
         -e PATH=/kbh/bin:/usr/local/cuda-host/bin:/opt/node/bin:/usr/local/bin:/usr/bin:/bin
         -v "$WORKSPACE_ROOT:/workspace:rw"
@@ -1208,7 +1272,7 @@ run_codex_container() {
         -v "$REAL_UV:/usr/local/bin/uv:ro"
         -v "$KBH_AGENT_CONTAINER_UV_CACHE:/uv-cache:rw"
         -v "$CONTAINER_LOCK_BIN:/kbh/bin:ro"
-        -v "$KBH_GPU_LOCK_DIR:/kbh/lock:rw"
+        -v "$KBH_GPU_LOCK:/kbh/lock/gpu.lock:rw"
         -w "/workspace/problems/$PROBLEM_NAME"
         "$KBH_AGENT_CONTAINER_IMAGE"
         /opt/node/bin/codex
@@ -1259,6 +1323,7 @@ run_opencode_container() {
         -e UV_PYTHON_INSTALL_DIR=/uv-cache/python
         -e RUN_DIR=/kbh
         -e KBH_GPU_LOCK=/kbh/lock/gpu.lock
+        -e KBH_GPU_LOCK_OWNER=/home/agent/gpu_lock.owner
         -e KBH_GPU_LOCK_LOG=/home/agent/gpu_lock_container.log
         -e PATH=/kbh/bin:/usr/local/cuda-host/bin:/usr/local/bin:/usr/bin:/bin
         -v "$WORKSPACE_ROOT:/workspace:rw"
@@ -1268,7 +1333,7 @@ run_opencode_container() {
         -v "$REAL_UV:/usr/local/bin/uv:ro"
         -v "$KBH_AGENT_CONTAINER_UV_CACHE:/uv-cache:rw"
         -v "$CONTAINER_LOCK_BIN:/kbh/bin:ro"
-        -v "$KBH_GPU_LOCK_DIR:/kbh/lock:rw"
+        -v "$KBH_GPU_LOCK:/kbh/lock/gpu.lock:rw"
         -w "/workspace/problems/$PROBLEM_NAME"
         "$KBH_AGENT_CONTAINER_IMAGE"
         opencode
@@ -1410,6 +1475,7 @@ run_grok_container() {
         -e UV_PYTHON_INSTALL_DIR=/uv-cache/python
         -e RUN_DIR=/kbh
         -e KBH_GPU_LOCK=/kbh/lock/gpu.lock
+        -e KBH_GPU_LOCK_OWNER=/home/agent/gpu_lock.owner
         -e KBH_GPU_LOCK_LOG=/home/agent/gpu_lock_container.log
         -e PATH=/kbh/bin:/usr/local/cuda-host/bin:/opt/node/bin:/usr/local/bin:/usr/bin:/bin
         -v "$WORKSPACE_ROOT:/workspace:rw"
@@ -1421,7 +1487,7 @@ run_grok_container() {
         -v "$REAL_UV:/usr/local/bin/uv:ro"
         -v "$KBH_AGENT_CONTAINER_UV_CACHE:/uv-cache:rw"
         -v "$CONTAINER_LOCK_BIN:/kbh/bin:ro"
-        -v "$KBH_GPU_LOCK_DIR:/kbh/lock:rw"
+        -v "$KBH_GPU_LOCK:/kbh/lock/gpu.lock:rw"
         -w "/workspace/problems/$PROBLEM_NAME"
         "$KBH_AGENT_CONTAINER_IMAGE"
         /opt/grok/bin/grok
@@ -1466,6 +1532,7 @@ run_gemini_container() {
         -e UV_PYTHON_INSTALL_DIR=/uv-cache/python
         -e RUN_DIR=/kbh
         -e KBH_GPU_LOCK=/kbh/lock/gpu.lock
+        -e KBH_GPU_LOCK_OWNER=/home/agent/gpu_lock.owner
         -e KBH_GPU_LOCK_LOG=/home/agent/gpu_lock_container.log
         -e PATH=/kbh/bin:/usr/local/cuda-host/bin:/opt/node/bin:/usr/local/bin:/usr/bin:/bin
         -v "$WORKSPACE_ROOT:/workspace:rw"
@@ -1476,7 +1543,7 @@ run_gemini_container() {
         -v "$REAL_UV:/usr/local/bin/uv:ro"
         -v "$KBH_AGENT_CONTAINER_UV_CACHE:/uv-cache:rw"
         -v "$CONTAINER_LOCK_BIN:/kbh/bin:ro"
-        -v "$KBH_GPU_LOCK_DIR:/kbh/lock:rw"
+        -v "$KBH_GPU_LOCK:/kbh/lock/gpu.lock:rw"
         -w "/workspace/problems/$PROBLEM_NAME"
         "$KBH_AGENT_CONTAINER_IMAGE"
         /opt/node/bin/node /opt/gemini-cli/bundle/gemini.js
@@ -1518,6 +1585,7 @@ run_cursor_container() {
         -e UV_PYTHON_INSTALL_DIR=/uv-cache/python
         -e RUN_DIR=/kbh
         -e KBH_GPU_LOCK=/kbh/lock/gpu.lock
+        -e KBH_GPU_LOCK_OWNER=/home/agent/gpu_lock.owner
         -e KBH_GPU_LOCK_LOG=/home/agent/gpu_lock_container.log
         -e PATH=/kbh/bin:/usr/local/cuda-host/bin:/usr/local/bin:/usr/bin:/bin
         -v "$WORKSPACE_ROOT:/workspace:rw"
@@ -1527,7 +1595,7 @@ run_cursor_container() {
         -v "$REAL_UV:/usr/local/bin/uv:ro"
         -v "$KBH_AGENT_CONTAINER_UV_CACHE:/uv-cache:rw"
         -v "$CONTAINER_LOCK_BIN:/kbh/bin:ro"
-        -v "$KBH_GPU_LOCK_DIR:/kbh/lock:rw"
+        -v "$KBH_GPU_LOCK:/kbh/lock/gpu.lock:rw"
         -w "/workspace/problems/$PROBLEM_NAME"
         "$KBH_AGENT_CONTAINER_IMAGE"
         /opt/cursor-agent/cursor-agent
@@ -1552,9 +1620,57 @@ for t in "${TEMPLATE_FILES[@]}"; do
         cp -p "$PROBLEM_DIR/$t" "$TEMPLATE_BACKUP_DIR/$t"
     fi
 done
+TRUSTED_SRC_BACKUP_DIR="$RUN_DIR/trusted_src"
+cp -a "$WORKSPACE_ROOT/src" "$TRUSTED_SRC_BACKUP_DIR"
+TRUSTED_ENTRYPOINT="$TRUSTED_SRC_BACKUP_DIR/eval/trusted_entrypoint.py"
+if [ ! -f "$TRUSTED_ENTRYPOINT" ]; then
+    echo "STOP: trusted grading entrypoint is missing" >&2
+    exit 3
+fi
+
+trusted_src_digest() {
+    "$BUNDLE_PYTHON" -I -S - "$1" <<'PY'
+import hashlib
+import stat
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1])
+root_metadata = root.lstat()
+if not stat.S_ISDIR(root_metadata.st_mode):
+    raise SystemExit(f"unsafe trusted src root: {root}")
+digest = hashlib.sha256()
+for path in sorted(root.rglob("*"), key=lambda item: item.relative_to(root).as_posix()):
+    relative = path.relative_to(root).as_posix()
+    metadata = path.lstat()
+    if "__pycache__" in path.parts or path.suffix == ".pyc":
+        continue
+    if stat.S_ISDIR(metadata.st_mode):
+        kind = b"d"
+        contents = b""
+    elif stat.S_ISREG(metadata.st_mode):
+        kind = b"f"
+        contents = path.read_bytes()
+    else:
+        raise SystemExit(f"unsafe trusted src entry: {relative}")
+    digest.update(kind + relative.encode() + b"\0")
+    digest.update(hashlib.sha256(contents).digest())
+print(digest.hexdigest())
+PY
+}
+
+TRUSTED_SRC_DIGEST="$(trusted_src_digest "$TRUSTED_SRC_BACKUP_DIR")" || {
+    echo "STOP: could not snapshot trusted src/" >&2
+    exit 3
+}
+TEMPLATE_BACKUP_DIGEST="$(trusted_src_digest "$TEMPLATE_BACKUP_DIR")" || {
+    echo "STOP: could not snapshot trusted problem files" >&2
+    exit 3
+}
 
 UV_CACHE_HOST="${UV_CACHE_DIR:-$HOME/.cache/uv}"
 AGENT_UV_OVERLAY="$RUN_DIR/agent_uv_overlay"
+HARNESS_CONTROL_DIR="$RUN_DIR/harness_control"
 WORKSPACE_TRUSTED_PATHS="$WORKSPACE_ROOT/src
 $WORKSPACE_ROOT/pyproject.toml
 $WORKSPACE_ROOT/uv.lock
@@ -1570,14 +1686,34 @@ $PROBLEM_DIR/$trusted_template"
     fi
 done
 mkdir -p "$UV_CACHE_HOST" "$AGENT_UV_OVERLAY/upper" \
-    "$AGENT_UV_OVERLAY/work" "$AGENT_UV_OVERLAY/merged"
-touch "$KBH_GPU_LOCK" "$KBH_GPU_LOCK_LOG"
-export REPO_ROOT RUN_DIR TEMPLATE_BACKUP_DIR LOCK_WRAPPER_DIR REPLAY_ROOT \
-    REAL_UNSHARE REAL_SETPRIV UV_CACHE_HOST AGENT_UV_OVERLAY \
+    "$AGENT_UV_OVERLAY/work" "$AGENT_UV_OVERLAY/merged" \
+    "$HARNESS_CONTROL_DIR"
+export REPO_ROOT RUN_DIR KBH_GPU_LOCK_DIR TEMPLATE_BACKUP_DIR \
+    TRUSTED_SRC_BACKUP_DIR LOCK_WRAPPER_DIR REPLAY_ROOT REAL_UNSHARE \
+    REAL_SETPRIV UV_CACHE_HOST AGENT_UV_OVERLAY HARNESS_CONTROL_DIR \
     TRUSTED_PYTHON_RUNTIME TRUSTED_TOOLS_DIR KBH_GPU_LOCK KBH_GPU_LOCK_LOG \
-    REAL_UV WORKSPACE_ROOT WORKSPACE_TRUSTED_PATHS KBH_CARGO_HOME \
-    KBH_RUSTUP_HOME KBH_CUDA_OXIDE_ROOT KBH_CUTILE_RUST_ROOT \
+    REAL_UV TRUSTED_WORKTREE_ROOTS WORKSPACE_ROOT WORKSPACE_TRUSTED_PATHS \
+    KBH_CARGO_HOME KBH_RUSTUP_HOME KBH_CUDA_OXIDE_ROOT KBH_CUTILE_RUST_ROOT \
     DIALECT_CUDA_TOOLKIT
+
+trusted_path_manifest() {
+    {
+        printf '%s\n' "$REAL_UV" "$TRUSTED_PYTHON_RUNTIME" \
+            "$TRUSTED_TOOLS_DIR" "$UV_CACHE_HOST"
+        printf '%s\n' "$TRUSTED_WORKTREE_ROOTS"
+    } | while IFS= read -r path; do
+        [ -n "$path" ] || continue
+        if [ ! -e "$path" ]; then
+            printf '%s\tMISSING\n' "$path"
+            continue
+        fi
+        printf '%s\t%s\n' "$path" "$(/usr/bin/stat -Lc '%d:%i:%f' "$path")"
+    done
+}
+TRUSTED_PATH_MANIFEST="$(trusted_path_manifest)"
+verify_trusted_path_manifest() {
+    [ "$(trusted_path_manifest)" = "$TRUSTED_PATH_MANIFEST" ]
+}
 
 if [ "$KBH_AGENT_CONTAINER" = "0" ]; then
     if ! "$HOST_AGENT_ISOLATOR" /bin/sh -eu -c '
@@ -1642,7 +1778,7 @@ if ! "$HOST_AGENT_ISOLATOR" /bin/sh -eu -c '
         "$CUDA_OXIDE_REVISION" "$CUDA_OXIDE_TOOLCHAIN" \
         "$CUTILE_RUST_REVISION" "$CUTILE_RUST_TOOLCHAIN" \
         "$CUTILE_RUST_CUDA_TILE_REVISION"; then
-        echo "STOP: immutable grading environment is missing one or more CUDA dialect toolchains (CUDA C++, CUDA Oxide, CuTe DSL, Triton, cuTile Python, cuTile Rust)." >&2
+    echo "STOP: immutable grading environment is missing one or more CUDA dialect toolchains (CUDA C++, CUDA Oxide, CuTe DSL, Triton, cuTile Python, cuTile Rust)." >&2
     exit 3
 fi
 
@@ -1653,6 +1789,12 @@ detect_template_mutation() {
     local problem_dir="${2:-$PROBLEM_DIR}"
     local found=0
     local log="$RUN_DIR/template_mutations.log"
+    if [ "$(trusted_src_digest "$TEMPLATE_BACKUP_DIR" 2>/dev/null || true)" \
+        != "$TEMPLATE_BACKUP_DIGEST" ]; then
+        printf 'phase: %s\n' "$phase" >> "$log"
+        found=1
+        printf 'MUTATED: trusted problem backup\n' >> "$log"
+    fi
     for t in "${TEMPLATE_FILES[@]}"; do
         local orig="$TEMPLATE_BACKUP_DIR/$t"
         local cur="$problem_dir/$t"
@@ -1679,10 +1821,49 @@ detect_template_mutation() {
             printf 'CREATED TEMPLATE FILE: %s\n' "$t" >> "$log"
         fi
     done
+    if [ "$(trusted_src_digest "$TRUSTED_SRC_BACKUP_DIR" 2>/dev/null || true)" \
+        != "$TRUSTED_SRC_DIGEST" ] \
+        || [ "$(trusted_src_digest "$WORKSPACE_ROOT/src" 2>/dev/null || true)" \
+        != "$TRUSTED_SRC_DIGEST" ]; then
+        if [ "$found" -eq 0 ]; then
+            printf 'phase: %s\n' "$phase" >> "$log"
+        fi
+        found=1
+        printf 'MUTATED: trusted src/\n' >> "$log"
+        diff -qr --exclude='__pycache__' --exclude='*.pyc' \
+            "$TRUSTED_SRC_BACKUP_DIR" "$WORKSPACE_ROOT/src" >> "$log" 2>&1 || true
+    fi
     return "$found"
 }
 
+restore_trusted_src() {
+    local trusted_source=""
+    if [ "$(trusted_src_digest "$TRUSTED_SRC_BACKUP_DIR" 2>/dev/null || true)" \
+        = "$TRUSTED_SRC_DIGEST" ]; then
+        trusted_source="$TRUSTED_SRC_BACKUP_DIR"
+    elif [ "$(trusted_src_digest "$REPO_ROOT/src" 2>/dev/null || true)" \
+        = "$TRUSTED_SRC_DIGEST" ]; then
+        trusted_source="$REPO_ROOT/src"
+    else
+        echo "STOP: every trusted src/ copy changed during the agent session" >&2
+        return 1
+    fi
+    /bin/rm -rf "$WORKSPACE_ROOT/src"
+    /bin/cp -a "$trusted_source" "$WORKSPACE_ROOT/src"
+    # Bytecode is deliberately outside the content digest because ordinary
+    # imports create it. Never trust or restore it: a matching-timestamp pyc
+    # can override unchanged source without changing the digest.
+    strip_python_bytecode "$WORKSPACE_ROOT/src"
+    [ "$(trusted_src_digest "$WORKSPACE_ROOT/src" 2>/dev/null || true)" \
+        = "$TRUSTED_SRC_DIGEST" ]
+}
+
 restore_template_files() {
+    if [ "$(trusted_src_digest "$TEMPLATE_BACKUP_DIR" 2>/dev/null || true)" \
+        != "$TEMPLATE_BACKUP_DIGEST" ]; then
+        echo "STOP: trusted problem backup changed during the agent session" >&2
+        exit 3
+    fi
     for t in "${TEMPLATE_FILES[@]}"; do
         local orig="$TEMPLATE_BACKUP_DIR/$t"
         local cur="$PROBLEM_DIR/$t"
@@ -1691,6 +1872,7 @@ restore_template_files() {
             cp -p "$orig" "$cur"
         fi
     done
+    restore_trusted_src || exit 3
 }
 
 # --- KernelBench-Mini LFM harness helpers ---------------------------------
@@ -1789,6 +1971,9 @@ TOML
 
 LOG_FILE="${RUN_DIR}/transcript.jsonl"
 STDERR_FILE="${RUN_DIR}/stderr.log"
+: > "$LOG_FILE"
+: > "$STDERR_FILE"
+export LOG_FILE STDERR_FILE
 
 echo "========================================"
 echo "${KB_BENCH_BANNER:-KERNELBENCH RUN}"
@@ -2885,6 +3070,15 @@ case "$HARNESS" in
         ;;
 esac
 
+# Drop every agent-writable PATH entry before the parent inspects or grades
+# outputs. The generated wrappers were mounted read-only during host runs and
+# call the already-resolved tool paths captured before the agent started.
+export PATH="$LOCK_WRAPPER_DIR:$KBH_CUDA_HOME/bin:/usr/local/bin:/usr/bin:/bin"
+if ! verify_trusted_path_manifest; then
+    echo "STOP: an agent replaced a trusted tool, runtime, cache, or worktree path." >&2
+    exit 3
+fi
+
 HARNESS_END_TIME=$(date +%s)
 HARNESS_FINISHED_AT="$(date -Is)"
 ELAPSED=$((HARNESS_END_TIME - START_TIME))
@@ -2943,6 +3137,27 @@ if [ "$SESSION_COMPLETE" = "false" ]; then
     echo "WARN: harness session is INCOMPLETE (exit=$HARNESS_EXIT). Transcript usable but partial."
 fi
 
+# Agent namespaces are gone now. Remove their advisory lock ownership and
+# reject every path that the trusted post-run phase will create or redirect.
+# This prevents a candidate-created symlink or hardlink from turning a later
+# trusted open into a write outside the run archive.
+/bin/rm -rf -- "$KBH_GPU_LOCK_OWNER"
+for trusted_log in "$LOG_FILE" "$STDERR_FILE"; do
+    if [ -L "$trusted_log" ] || [ ! -f "$trusted_log" ] || \
+        [ "$(stat -c %h "$trusted_log")" -ne 1 ]; then
+        echo "STOP: agent replaced a trusted run log: $trusted_log" >&2
+        exit 3
+    fi
+done
+for reserved_name in submission submission.log check.log benchmark.log \
+    result.json solution.py scratch template_mutations.log; do
+    reserved_path="$RUN_DIR/$reserved_name"
+    if [ -e "$reserved_path" ] || [ -L "$reserved_path" ]; then
+        echo "STOP: agent created reserved run path: $reserved_name" >&2
+        exit 3
+    fi
+done
+
 # --- Post-run: correctness + benchmark + archive --------------------------
 
 HAS_SOLUTION=false
@@ -2957,17 +3172,29 @@ if ! detect_template_mutation "after harness"; then
     TEMPLATE_MUTATED=true
     echo "FAIL: immutable problem files changed by harness; skipping check.py and benchmark.py."
     restore_template_files
+else
+    # Drop candidate-created bytecode and restore trusted helper contents even
+    # when the content diff is clean. Final grading must never import from the
+    # writable src/ tree that was visible during the agent session.
+    restore_trusted_src || exit 3
 fi
+# A candidate can also leave timestamp-matched bytecode beside the immutable
+# problem sources. Purge it after the agent session, immediately before grading.
+strip_python_bytecode "$PROBLEM_DIR"
 
 if [ -e "$PROBLEM_DIR/solution.py" ] || [ -L "$PROBLEM_DIR/solution.py" ]; then
     CAPTURE_ARGS=()
     for t in "${TEMPLATE_FILES[@]}"; do
         CAPTURE_ARGS+=(--exclude "$t")
+        if [[ "$t" == *.py ]]; then
+            CAPTURE_ARGS+=(--reserved-module "${t%.py}")
+        fi
     done
     CAPTURE_ARGS+=(
         --exclude .venv
         --exclude framework.txt
         --exclude cuda_language.json
+        --reserved-module src
     )
     if SUBMISSION_DIGEST="$(
         run_submission_bundle capture \
@@ -2995,13 +3222,14 @@ prepare_replay_stage() {
         echo "unsafe replay directory" >&2
         return 1
     fi
+    restore_trusted_src || return
     mkdir -m 700 "$stage_dir" || return
     mkdir -p "$stage_root/problems" "$stage_root/.venv" "$stage_dir/home" "$stage_dir/tmp" \
         "$stage_dir/cache/torch_extensions" "$stage_dir/cache/triton" \
         "$stage_dir/cache/cuda" "$stage_dir/cache/xdg" \
         "$stage_dir/uv_overlay/upper" "$stage_dir/uv_overlay/work" \
         "$stage_dir/uv_overlay/merged" || return
-    cp -a -- "$REPO_ROOT/src" "$stage_root/src" || return
+    cp -a -- "$WORKSPACE_ROOT/src" "$stage_root/src" || return
     for item in pyproject.toml uv.lock .python-version; do
         if [ -e "$REPO_ROOT/$item" ]; then
             cp -p -- "$REPO_ROOT/$item" "$stage_root/$item" || return
@@ -3029,6 +3257,11 @@ run_replay_stage() {
     local script="$4"
     local stage_dir
     stage_dir="$(cd "$stage_problem/../../.." && pwd)" || return
+    local trusted_entrypoint="$stage_dir/repo/src/eval/trusted_entrypoint.py"
+    if [ ! -f "$trusted_entrypoint" ]; then
+        echo "trusted grading entrypoint is missing from replay stage" >&2
+        return 1
+    fi
     local replay_path
     replay_path="$(dirname "$TRUSTED_PYTHON")"
     if [ -n "$REAL_NVCC" ]; then
@@ -3084,10 +3317,10 @@ $stage_problem/$item"
     local -a replay_command=(
         /usr/bin/env KBH_ISOLATION_NETWORK=off KBH_ISOLATION_HOME="$stage_dir/home"
         KBH_ISOLATION_WRITABLE_ROOT="$stage_dir" AGENT_UV_OVERLAY="$stage_dir/uv_overlay"
-        WORKSPACE_ROOT="$stage_root"
-        WORKSPACE_TRUSTED_PATHS="$replay_trusted_paths" "$HOST_AGENT_ISOLATOR"
-        /usr/bin/env -i "${replay_env[@]}" "$TRUSTED_PYTHON" -I -S \
-        -c "$SUBMISSION_REPLAY_SOURCE" "$TRUSTED_SITE_PACKAGES" "$script"
+        WORKSPACE_ROOT="$stage_root" WORKSPACE_TRUSTED_PATHS="$replay_trusted_paths"
+        "$HOST_AGENT_ISOLATOR" /usr/bin/env -i "${replay_env[@]}"
+        "$TRUSTED_PYTHON" -I -c "$SUBMISSION_REPLAY_SOURCE"
+        "$trusted_entrypoint" "$script"
     )
     (
         cd "$stage_problem"
@@ -3114,6 +3347,10 @@ if [ "$TEMPLATE_MUTATED" = "false" ] && [ "$HAS_SOLUTION" = "true" ]; then
         CHECK_EXIT_CODE=0
         run_replay_stage check.py "$CHECK_TIMEOUT_SECONDS" \
             "$CHECK_PROBLEM_DIR" check.py > "$CHECK_LOG" 2>&1 || CHECK_EXIT_CODE=$?
+        if ! verify_trusted_path_manifest; then
+            echo "STOP: check.py replaced a trusted path." >&2
+            exit 3
+        fi
         CHECK_END_TIME=$(date +%s)
         CHECK_ELAPSED=$((CHECK_END_TIME - CHECK_START_TIME))
     else
@@ -3122,6 +3359,7 @@ if [ "$TEMPLATE_MUTATED" = "false" ] && [ "$HAS_SOLUTION" = "true" ]; then
         SUBMISSION_BUNDLE_VALID=false
         echo "FAIL: captured submission failed verification before check.py."
     fi
+    CHECK_PASS_COUNT=$(grep -axc 'PASS' "$CHECK_LOG" 2>/dev/null || true)
 
     if [ -n "${CHECK_PROBLEM_DIR:-}" ] && \
         ! detect_template_mutation "after check.py" "$CHECK_PROBLEM_DIR"; then
@@ -3129,10 +3367,10 @@ if [ "$TEMPLATE_MUTATED" = "false" ] && [ "$HAS_SOLUTION" = "true" ]; then
         CORRECT=false
         SCORE="null"
         echo "FAIL: immutable problem files changed during check.py."
-    elif [ "$CHECK_EXIT_CODE" -eq 0 ] && grep -aq "PASS" "$CHECK_LOG"; then
-        # Keep the existing checker protocol: a clean exit plus PASS in its
-        # log. The bundle boundary does not turn in-process Python checkers into
-        # a hostile-code sandbox.
+    elif [ "$CHECK_EXIT_CODE" -eq 0 ] && [ "$CHECK_PASS_COUNT" -eq 1 ]; then
+        # Require the one standalone marker emitted by a normally completed
+        # checker. Candidate PASS text is either a duplicate or, when followed
+        # by SystemExit(0), rejected by the replay's trusted entrypoint.
         CORRECT=true
         echo "Running benchmark.py..."
         # Some problems (KDA chunked recurrence, sonic-MoE)
@@ -3144,6 +3382,10 @@ if [ "$TEMPLATE_MUTATED" = "false" ] && [ "$HAS_SOLUTION" = "true" ]; then
             BENCH_EXIT_CODE=0
             run_replay_stage benchmark.py "$BENCHMARK_TIMEOUT_SECONDS" \
                 "$BENCH_PROBLEM_DIR" benchmark.py > "$BENCH_LOG" 2>&1 || BENCH_EXIT_CODE=$?
+            if ! verify_trusted_path_manifest; then
+                echo "STOP: benchmark.py replaced a trusted path." >&2
+                exit 3
+            fi
             BENCH_END_TIME=$(date +%s)
             BENCH_ELAPSED=$((BENCH_END_TIME - BENCH_START_TIME))
         else
@@ -3160,10 +3402,23 @@ if [ "$TEMPLATE_MUTATED" = "false" ] && [ "$HAS_SOLUTION" = "true" ]; then
             CORRECT=false
             SCORE="null"
             echo "FAIL: immutable problem files changed during benchmark.py."
+        elif [ "$BENCH_EXIT_CODE" -eq 0 ]; then
+            # A complete benchmark emits exactly one trusted summary. Reject
+            # missing or duplicate lookalikes instead of choosing one from
+            # candidate-controlled stdout.
+            BENCH_METRIC_RE='^peak_fraction:[[:space:]]*([0-9]+([.][0-9]*)?|[.][0-9]+)([eE][+-]?[0-9]+)?[[:space:]]*$'
+            BENCH_METRIC_COUNT=$(grep -aEc "$BENCH_METRIC_RE" "$BENCH_LOG" || true)
+            if [ "$BENCH_METRIC_COUNT" -eq 1 ]; then
+                SCORE=$(grep -aE "$BENCH_METRIC_RE" "$BENCH_LOG" \
+                    | sed -E 's/^peak_fraction:[[:space:]]*//; s/[[:space:]]*$//')
+            else
+                SCORE="null"
+                echo "FAIL: benchmark.py emitted $BENCH_METRIC_COUNT complete score markers."
+            fi
         else
-            SCORE=$(grep -aom1 -P \
-                '^peak_fraction:\s*\K(?:0|[1-9][0-9]*)(?:\.[0-9]+)?(?=\s*$)' \
-                "$BENCH_LOG" || echo "null")
+            restore_trusted_src || exit 3
+            SCORE="null"
+            echo "FAIL: benchmark.py did not complete successfully (exit $BENCH_EXIT_CODE)."
         fi
     fi
 fi
@@ -3297,6 +3552,11 @@ cat > "$RESULT_TMP" <<JSON
 JSON
 chmod 0644 "$RESULT_TMP"
 mv -f -- "$RESULT_TMP" "$RUN_DIR/result.json"
+
+# Replay extracts and the host-agent uv overlay are disposable trust-boundary
+# state, not run artifacts. Keeping them can retain duplicate CUDA toolchains
+# and compiler caches that make a single archived run several gigabytes.
+/bin/rm -rf -- "$REPLAY_ROOT" "$AGENT_UV_OVERLAY"
 
 # Clean the problem workspace for the next run
 shopt -s nullglob dotglob

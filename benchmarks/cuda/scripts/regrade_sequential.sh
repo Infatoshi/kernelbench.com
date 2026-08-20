@@ -9,7 +9,9 @@
 # This replays the exact graded path run_hard.sh uses -- check.py then
 # benchmark.py, from the run's own archive workspace, with the run's own
 # isolated caches -- one run at a time, refusing to start while another CUDA
-# process holds the GPU.
+# process holds the GPU. When KBH_REGRADE_DECK is set, the canonical deck,
+# src/, and locked project environment replace their archived counterparts as
+# one indivisible grading surface.
 #
 # Usage:
 #   scripts/regrade_sequential.sh outputs/runs/<run_id> [<run_id> ...]
@@ -42,6 +44,11 @@ set -uo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 cd "$REPO_ROOT" || exit 1
+TRUSTED_ENTRYPOINT="$REPO_ROOT/src/eval/trusted_entrypoint.py"
+if [ ! -f "$TRUSTED_ENTRYPOINT" ]; then
+    echo "FATAL: trusted grading entrypoint is missing" >&2
+    exit 3
+fi
 
 GPU="${KBH_REGRADE_GPU:-0}"
 DRY="${KBH_REGRADE_DRY_RUN:-0}"
@@ -96,6 +103,13 @@ require_idle_gpu() {
     done
 }
 
+purge_untrusted_bytecode() {
+    /usr/bin/find "$1" -type d -name __pycache__ -prune \
+        -exec /bin/rm -rf -- {} + || return 1
+    /usr/bin/find "$1" -type f \( -name '*.pyc' -o -name '*.pyo' \) \
+        -delete || return 1
+}
+
 PASS=0; FAIL=0; SKIP=0
 
 for RUN_DIR in "$@"; do
@@ -123,7 +137,8 @@ for RUN_DIR in "$@"; do
     fi
 
     PROBLEM=$(python3 -c "import json,sys;print(json.load(open(sys.argv[1]))['problem'])" "$RUN_DIR/result.json")
-    PROBLEM_DIR="$RUN_DIR/repo/problems/$PROBLEM"
+    WORKSPACE_ROOT="$RUN_DIR/repo"
+    PROBLEM_DIR="$WORKSPACE_ROOT/problems/$PROBLEM"
     if [ ! -d "$PROBLEM_DIR" ]; then
         echo "[skip] $RID: archive workspace missing ($PROBLEM_DIR)"; SKIP=$((SKIP+1)); continue
     fi
@@ -140,16 +155,38 @@ for RUN_DIR in "$@"; do
     # either way the re-grade must score against the deck, so report and replace.
     if [ -n "${KBH_REGRADE_DECK:-}" ]; then
         SRC_DECK="$REPO_ROOT/$KBH_REGRADE_DECK/$PROBLEM"
-        if [ -d "$SRC_DECK" ]; then
-            for t in reference.py sota.py shapes.py problem.yaml check.py benchmark.py PROMPT.txt; do
-                if [ -f "$SRC_DECK/$t" ] && ! cmp -s "$SRC_DECK/$t" "$PROBLEM_DIR/$t"; then
-                    echo "    restoring $t from $KBH_REGRADE_DECK (workspace copy differed)"
-                    cp "$SRC_DECK/$t" "$PROBLEM_DIR/$t"
-                fi
-            done
-        else
-            echo "    WARN: KBH_REGRADE_DECK set but $SRC_DECK missing; grading workspace as-is" >&2
+        if [ ! -d "$SRC_DECK" ] \
+            || [ ! -d "$REPO_ROOT/src" ] \
+            || [ ! -f "$REPO_ROOT/pyproject.toml" ] \
+            || [ ! -f "$REPO_ROOT/uv.lock" ] \
+            || [ ! -f "$REPO_ROOT/.python-version" ]; then
+            echo "FATAL: canonical grading surface is incomplete for $KBH_REGRADE_DECK/$PROBLEM" >&2
+            exit 3
         fi
+        for t in reference.py sota.py shapes.py problem.yaml check.py benchmark.py PROMPT.txt; do
+            if [ ! -f "$SRC_DECK/$t" ]; then
+                echo "FATAL: canonical grading surface missing $SRC_DECK/$t" >&2
+                exit 3
+            fi
+            if ! cmp -s "$SRC_DECK/$t" "$PROBLEM_DIR/$t"; then
+                echo "    restoring $t from $KBH_REGRADE_DECK (workspace copy differed)"
+                cp -p "$SRC_DECK/$t" "$PROBLEM_DIR/$t" || exit 3
+            fi
+        done
+
+        # A canonical check may import helpers or dependencies added after this
+        # archive was created. Restore src and the complete locked project
+        # environment together; mixing a new check.py with an old archive lock
+        # can silently omit part of the validation surface.
+        /bin/rm -rf "$WORKSPACE_ROOT/src" || exit 3
+        /bin/cp -a "$REPO_ROOT/src" "$WORKSPACE_ROOT/src" || exit 3
+        /usr/bin/find "$WORKSPACE_ROOT/src" -type d -name __pycache__ -prune \
+            -exec /bin/rm -rf -- {} + || exit 3
+        /usr/bin/find "$WORKSPACE_ROOT/src" -type f \
+            \( -name '*.pyc' -o -name '*.pyo' \) -delete || exit 3
+        cp -p "$REPO_ROOT/pyproject.toml" "$WORKSPACE_ROOT/pyproject.toml" || exit 3
+        cp -p "$REPO_ROOT/uv.lock" "$WORKSPACE_ROOT/uv.lock" || exit 3
+        cp -p "$REPO_ROOT/.python-version" "$WORKSPACE_ROOT/.python-version" || exit 3
     fi
 
     # run_hard.sh clears non-template files from the workspace after archiving,
@@ -159,6 +196,10 @@ for RUN_DIR in "$@"; do
     if [ -d "$RUN_DIR/scratch" ]; then
         cp -r "$RUN_DIR/scratch/." "$PROBLEM_DIR/" 2>/dev/null || true
     fi
+    # The archived problem and scratch tree are candidate-controlled. Purge
+    # bytecode only after every restore so timestamp-matched pyc files cannot
+    # shadow the canonical checker, benchmark, reference, or helper sources.
+    purge_untrusted_bytecode "$PROBLEM_DIR" || exit 3
 
     require_idle_gpu || { SKIP=$((SKIP+1)); continue; }
 
@@ -187,20 +228,34 @@ for RUN_DIR in "$@"; do
 
     echo "    check.py..."
     C0=$(date +%s); CEXIT=0
-    (cd "$PROBLEM_DIR" && timeout "$CHECK_TIMEOUT" uv run python check.py) > "$CLOG" 2>&1 || CEXIT=$?
+    (cd "$PROBLEM_DIR" && timeout "$CHECK_TIMEOUT" \
+        uv run python "$TRUSTED_ENTRYPOINT" check.py) > "$CLOG" 2>&1 || CEXIT=$?
     CEL=$(( $(date +%s) - C0 ))
 
     CORRECT=false; SCORE=null; BEXIT=null; BEL=null
-    # Same gate as run_hard.sh: exit 0 AND a PASS marker. Neither alone is
-    # sufficient (solution stdout can glue onto the marker).
-    if [ "$CEXIT" -eq 0 ] && grep -aq "PASS" "$CLOG"; then
+    # Same gate as run_hard.sh: normal return and exactly one standalone PASS.
+    # The trusted entrypoint converts a candidate's SystemExit(0) into failure.
+    CPASS_COUNT=$(grep -axc 'PASS' "$CLOG" || true)
+    if [ "$CEXIT" -eq 0 ] && [ "$CPASS_COUNT" -eq 1 ]; then
         CORRECT=true
         echo "    benchmark.py..."
+        # solution.py ran in the checker and may have written a forged import
+        # cache for the next process. Never carry problem bytecode across the
+        # correctness/performance trust boundary.
+        purge_untrusted_bytecode "$PROBLEM_DIR" || exit 3
         B0=$(date +%s); BEXIT=0
-        (cd "$PROBLEM_DIR" && timeout "$BENCH_TIMEOUT" uv run python benchmark.py) > "$BLOG" 2>&1 || BEXIT=$?
+        (cd "$PROBLEM_DIR" && timeout "$BENCH_TIMEOUT" \
+            uv run python "$TRUSTED_ENTRYPOINT" benchmark.py) > "$BLOG" 2>&1 || BEXIT=$?
         BEL=$(( $(date +%s) - B0 ))
-        SCORE=$(grep -oP 'peak_fraction:\s*\K[0-9.]+' "$BLOG" | head -1 || true)
-        [ -z "$SCORE" ] && SCORE=null
+        SCORE_RE='^peak_fraction:[[:space:]]*([0-9]+([.][0-9]*)?|[.][0-9]+)([eE][+-]?[0-9]+)?[[:space:]]*$'
+        SCORE_COUNT=$(grep -aEc "$SCORE_RE" "$BLOG" || true)
+        if [ "$BEXIT" -eq 0 ] && [ "$SCORE_COUNT" -eq 1 ]; then
+            SCORE=$(grep -aE "$SCORE_RE" "$BLOG" \
+                | sed -E 's/^peak_fraction:[[:space:]]*//; s/[[:space:]]*$//')
+        else
+            SCORE=null
+            echo "    benchmark FAILED (exit $BEXIT, score markers $SCORE_COUNT) -- see $BLOG"
+        fi
     else
         echo "    check FAILED (exit $CEXIT) -- see $CLOG"
     fi

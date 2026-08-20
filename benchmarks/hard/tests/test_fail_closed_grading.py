@@ -139,12 +139,14 @@ def test_shell_grading_uses_exact_markers_and_process_status() -> None:
     assert '[ "$CHECK_PASS_COUNT" -eq 1 ]' in shared
     assert '[ "$BENCH_EXIT_CODE" -eq 0 ]' in shared
     assert '[ "$BENCH_METRIC_COUNT" -eq 1 ]' in shared
-    assert 'uv run python "$TRUSTED_ENTRYPOINT" check.py' in shared
-    assert 'uv run python "$TRUSTED_ENTRYPOINT" benchmark.py' in shared
-    shared_check = shared.index('uv run python "$TRUSTED_ENTRYPOINT" check.py')
-    shared_benchmark = shared.index('uv run python "$TRUSTED_ENTRYPOINT" benchmark.py')
+    assert '"$trusted_entrypoint" "$script"' in shared
+    assert 'run_replay_stage check.py' in shared
+    assert 'run_replay_stage benchmark.py' in shared
+    shared_check = shared.index('run_replay_stage check.py')
+    shared_benchmark = shared.index('run_replay_stage benchmark.py')
     assert shared.index('strip_python_bytecode "$PROBLEM_DIR"') < shared_check
-    assert shared.index('strip_python_bytecode "$PROBLEM_DIR"', shared_check) < shared_benchmark
+    assert shared.index('find "$stage_root" -type d -name __pycache__') < shared_check
+    assert shared.index('prepare_replay_stage benchmark', shared_check) < shared_benchmark
 
     mega = (BENCH_ROOT.parent / "mega" / "scripts" / "run_hard.sh").read_text()
     assert "grep -axc 'PASS'" in mega

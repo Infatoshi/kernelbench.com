@@ -453,12 +453,12 @@ def test_shared_runner_clears_environment_and_unshares_user_and_network() -> Non
     collapsed = " ".join(runtime.replace("\\\n", " ").split())
     assert "KBH_ISOLATION_NETWORK=off" in collapsed
     assert '"$HOST_AGENT_ISOLATOR" /usr/bin/env -i "${replay_env[@]}"' in collapsed
-    assert '"$TRUSTED_PYTHON" -I -S' in collapsed
-    assert '"$TRUSTED_SITE_PACKAGES" "$script"' in collapsed
+    assert '"$trusted_entrypoint" "$script"' in collapsed
+    assert '"$TRUSTED_PYTHON" -I -S' not in runtime
     assert 'WORKSPACE_ROOT="$stage_root"' in runtime
     assert 'WORKSPACE_TRUSTED_PATHS="$replay_trusted_paths"' in runtime
     assert 'run_gpu_locked_timeout check.py' in runtime
-    assert "replay-preflight" in text
+    assert text.index("replay-preflight") < start
 
 
 def test_host_agent_isolator_seals_dependencies_and_uses_cache_overlay() -> None:
@@ -498,11 +498,13 @@ def test_host_agent_isolator_enforces_read_only_and_copy_on_write_mounts(
     run = repo / "run"
     workspace = run / "workspace"
     template_backup = run / "template_files"
+    trusted_src = run / "trusted_src"
     wrappers = run / "bin"
     replays = run / "replays"
     lock = repo / "lock"
     lock_file = lock / "gpu.lock"
     lock_log = run / "gpu_lock.log"
+    control = run / "harness_control"
     runtime = tmp_path / "python-runtime"
     trusted_tools = tmp_path / "trusted-tools"
     trusted_uv = tmp_path / "trusted-uv"
@@ -513,9 +515,11 @@ def test_host_agent_isolator_enforces_read_only_and_copy_on_write_mounts(
         workspace / ".venv",
         repo / ".venv",
         template_backup,
+        trusted_src,
         wrappers,
         replays,
         lock,
+        control,
         runtime,
         trusted_tools,
         cache,
@@ -524,6 +528,7 @@ def test_host_agent_isolator_enforces_read_only_and_copy_on_write_mounts(
         overlay / "merged",
     ):
         path.mkdir(parents=True, exist_ok=True)
+    (repo / "trusted.txt").write_text("trusted\n")
     (cache / "package.py").write_text("lower\n")
     lock_file.touch()
     lock_log.touch()
@@ -542,14 +547,18 @@ printf 'workspace\n' > "$4/wrote"
     env = os.environ | {
         "REPO_ROOT": str(repo),
         "RUN_DIR": str(run),
+        "KBH_GPU_LOCK_DIR": str(lock),
         "KBH_GPU_LOCK": str(lock_file),
         "KBH_GPU_LOCK_LOG": str(lock_log),
         "TEMPLATE_BACKUP_DIR": str(template_backup),
+        "TRUSTED_SRC_BACKUP_DIR": str(trusted_src),
         "LOCK_WRAPPER_DIR": str(wrappers),
         "REPLAY_ROOT": str(replays),
+        "HARNESS_CONTROL_DIR": str(control),
         "TRUSTED_PYTHON_RUNTIME": str(runtime),
         "TRUSTED_TOOLS_DIR": str(trusted_tools),
         "REAL_UV": str(trusted_uv),
+        "TRUSTED_WORKTREE_ROOTS": str(repo),
         "REAL_UNSHARE": unshare,
         "REAL_SETPRIV": setpriv,
         "UV_CACHE_HOST": str(cache),

@@ -35,6 +35,11 @@ set -uo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 cd "$REPO_ROOT" || exit 1
+TRUSTED_ENTRYPOINT="$REPO_ROOT/src/eval/trusted_entrypoint.py"
+if [ ! -f "$TRUSTED_ENTRYPOINT" ]; then
+    echo "FATAL: trusted grading entrypoint is missing" >&2
+    exit 3
+fi
 
 GPU="${KBH_REGRADE_GPU:-0}"
 DRY="${KBH_REGRADE_DRY_RUN:-0}"
@@ -80,6 +85,13 @@ require_idle_gpu() {
     done
 }
 
+purge_untrusted_bytecode() {
+    /usr/bin/find "$1" -type d -name __pycache__ -prune \
+        -exec /bin/rm -rf -- {} + || return 1
+    /usr/bin/find "$1" -type f \( -name '*.pyc' -o -name '*.pyo' \) \
+        -delete || return 1
+}
+
 PASS=0; FAIL=0; SKIP=0
 
 for RUN_DIR in "$@"; do
@@ -121,6 +133,8 @@ for RUN_DIR in "$@"; do
     if [ -d "$RUN_DIR/scratch" ]; then
         cp -r "$RUN_DIR/scratch/." "$PROBLEM_DIR/" 2>/dev/null || true
     fi
+    # Purge only after restoring every candidate-controlled archived file.
+    purge_untrusted_bytecode "$PROBLEM_DIR" || exit 3
 
     require_idle_gpu || { SKIP=$((SKIP+1)); continue; }
 
@@ -149,20 +163,29 @@ for RUN_DIR in "$@"; do
 
     echo "    check.py..."
     C0=$(date +%s); CEXIT=0
-    (cd "$PROBLEM_DIR" && timeout "$CHECK_TIMEOUT" uv run python check.py) > "$CLOG" 2>&1 || CEXIT=$?
+    (cd "$PROBLEM_DIR" && timeout "$CHECK_TIMEOUT" \
+        uv run python "$TRUSTED_ENTRYPOINT" check.py) > "$CLOG" 2>&1 || CEXIT=$?
     CEL=$(( $(date +%s) - C0 ))
 
     CORRECT=false; SCORE=null; BEXIT=null; BEL=null
-    # Same gate as run_hard.sh: exit 0 AND a PASS marker. Neither alone is
-    # sufficient (solution stdout can glue onto the marker).
-    if [ "$CEXIT" -eq 0 ] && grep -aq "PASS" "$CLOG"; then
+    CPASS_COUNT=$(grep -axc 'PASS' "$CLOG" || true)
+    if [ "$CEXIT" -eq 0 ] && [ "$CPASS_COUNT" -eq 1 ]; then
         CORRECT=true
         echo "    benchmark.py..."
+        purge_untrusted_bytecode "$PROBLEM_DIR" || exit 3
         B0=$(date +%s); BEXIT=0
-        (cd "$PROBLEM_DIR" && timeout "$BENCH_TIMEOUT" uv run python benchmark.py) > "$BLOG" 2>&1 || BEXIT=$?
+        (cd "$PROBLEM_DIR" && timeout "$BENCH_TIMEOUT" \
+            uv run python "$TRUSTED_ENTRYPOINT" benchmark.py) > "$BLOG" 2>&1 || BEXIT=$?
         BEL=$(( $(date +%s) - B0 ))
-        SCORE=$(grep -oP 'peak_fraction:\s*\K[0-9.]+' "$BLOG" | head -1 || true)
-        [ -z "$SCORE" ] && SCORE=null
+        SCORE_RE='^peak_fraction:[[:space:]]*([0-9]+([.][0-9]*)?|[.][0-9]+)([eE][+-]?[0-9]+)?[[:space:]]*$'
+        SCORE_COUNT=$(grep -aEc "$SCORE_RE" "$BLOG" || true)
+        if [ "$BEXIT" -eq 0 ] && [ "$SCORE_COUNT" -eq 1 ]; then
+            SCORE=$(grep -aE "$SCORE_RE" "$BLOG" \
+                | sed -E 's/^peak_fraction:[[:space:]]*//; s/[[:space:]]*$//')
+        else
+            SCORE=null
+            echo "    benchmark FAILED (exit $BEXIT, score markers $SCORE_COUNT) -- see $BLOG"
+        fi
     else
         echo "    check FAILED (exit $CEXIT) -- see $CLOG"
     fi
