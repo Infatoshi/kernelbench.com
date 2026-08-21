@@ -27,6 +27,14 @@ def test_post_run_timeout_starts_inside_gpu_lock() -> None:
     assert "timeout 1800 uv run python benchmark.py" not in script
 
 
+def test_agent_check_and_benchmark_use_the_grading_entrypoint() -> None:
+    script = RUN_HARD.read_text()
+    entrypoint = '${WORKSPACE_ROOT:-/workspace}/src/eval/trusted_entrypoint.py'
+    assert 'REAL_PYTHON="$TRUSTED_PYTHON"' in script
+    assert script.count(f'{entrypoint}" "$1"') == 2
+    assert f'run python "{entrypoint}" "$3"' in script
+
+
 def test_scoring_environment_links_cuda_runtime_for_extensions() -> None:
     script = RUN_HARD.read_text()
     assert 'TRUSTED_CUDA_LIB="$TRUSTED_SITE_PACKAGES/nvidia/cu13/lib"' in script
@@ -262,10 +270,10 @@ def test_legacy_regrade_receives_current_property_helper_and_lock(tmp_path) -> N
 def test_regrade_purges_problem_bytecode_after_candidate_restore() -> None:
     script = REGRADE.read_text()
     scratch_restore = script.index('cp -r "$RUN_DIR/scratch/." "$PROBLEM_DIR/"')
-    check_run = script.index('uv run python -I "$TRUSTED_ENTRYPOINT" check.py', scratch_restore)
+    check_run = script.index('uv run python "$TRUSTED_ENTRYPOINT" check.py', scratch_restore)
     first_purge = script.index('purge_untrusted_bytecode "$PROBLEM_DIR"', scratch_restore)
     benchmark_run = script.index(
-        'uv run python -I "$TRUSTED_ENTRYPOINT" benchmark.py', check_run
+        'uv run python "$TRUSTED_ENTRYPOINT" benchmark.py', check_run
     )
     second_purge = script.index('purge_untrusted_bytecode "$PROBLEM_DIR"', check_run)
     assert scratch_restore < first_purge < check_run < second_purge < benchmark_run
@@ -279,7 +287,7 @@ def test_regrade_purges_problem_bytecode_after_candidate_restore() -> None:
 
     mini = (monorepo / "benchmarks" / "mini" / "scripts" / "regrade_sequential.sh").read_text()
     mini_scratch = mini.index('cp -r "$RUN_DIR/scratch/." "$PROBLEM_DIR/"')
-    mini_check = mini.index('uv run python -I "$TRUSTED_ENTRYPOINT" check.py', mini_scratch)
+    mini_check = mini.index('uv run python "$TRUSTED_ENTRYPOINT" check.py', mini_scratch)
     assert mini_scratch < mini.index(
         'purge_untrusted_bytecode "$PROBLEM_DIR"', mini_scratch
     ) < mini_check

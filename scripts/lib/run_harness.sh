@@ -376,6 +376,8 @@ if ! "$REAL_UNSHARE" --user --map-root-user --net --mount --pid --fork \
     echo "STOP: the exact post-agent grading isolation preflight failed." >&2
     exit 3
 fi
+# Agent-side `python` must be the same locked interpreter used by grading.
+REAL_PYTHON="$TRUSTED_PYTHON"
 REAL_UV_FALLBACK="$REAL_UV"
 REAL_PYTHON_FALLBACK="$REAL_PYTHON"
 LOCK_WRAPPER_DIR="$RUN_DIR/bin"
@@ -499,14 +501,40 @@ GPU_LOCK_EXEC_SOURCE="$(<"$LOCK_WRAPPER_DIR/gpu-lock-exec")"
 
 cat > "$LOCK_WRAPPER_DIR/uv" <<'EOF'
 #!/bin/bash
+if [ "${1:-}" = run ] && [ "${2:-}" = python ] && [ "$#" -eq 3 ]; then
+    case "$3" in
+        check.py|./check.py|benchmark.py|./benchmark.py)
+            exec "$RUN_DIR/bin/gpu-lock-exec" uv "${REAL_UV:-$REAL_UV_FALLBACK}" \
+                run python "${WORKSPACE_ROOT:-/workspace}/src/eval/trusted_entrypoint.py" "$3"
+            ;;
+    esac
+fi
 exec "$RUN_DIR/bin/gpu-lock-exec" uv "${REAL_UV:-$REAL_UV_FALLBACK}" "$@"
 EOF
 cat > "$LOCK_WRAPPER_DIR/python" <<'EOF'
 #!/bin/bash
+if [ "$#" -eq 1 ]; then
+    case "$1" in
+        check.py|./check.py|benchmark.py|./benchmark.py)
+            exec "$RUN_DIR/bin/gpu-lock-exec" python \
+                "${REAL_PYTHON:-$REAL_PYTHON_FALLBACK}" \
+                "${WORKSPACE_ROOT:-/workspace}/src/eval/trusted_entrypoint.py" "$1"
+            ;;
+    esac
+fi
 exec "$RUN_DIR/bin/gpu-lock-exec" python "${REAL_PYTHON:-$REAL_PYTHON_FALLBACK}" "$@"
 EOF
 cat > "$LOCK_WRAPPER_DIR/python3" <<'EOF'
 #!/bin/bash
+if [ "$#" -eq 1 ]; then
+    case "$1" in
+        check.py|./check.py|benchmark.py|./benchmark.py)
+            exec "$RUN_DIR/bin/gpu-lock-exec" python3 \
+                "${REAL_PYTHON:-$REAL_PYTHON_FALLBACK}" \
+                "${WORKSPACE_ROOT:-/workspace}/src/eval/trusted_entrypoint.py" "$1"
+            ;;
+    esac
+fi
 exec "$RUN_DIR/bin/gpu-lock-exec" python3 "${REAL_PYTHON:-$REAL_PYTHON_FALLBACK}" "$@"
 EOF
 cat > "$LOCK_WRAPPER_DIR/nvidia-smi" <<'EOF'
