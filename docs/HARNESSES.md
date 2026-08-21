@@ -4,6 +4,63 @@ These tables are the single source of truth for runner harness names, transports
 
 “CLI login” means the branch does not enforce one environment key: the named CLI may use its existing login/config or one of the noted optional keys. Single-GPU runners source `~/.env_vars`; Multi provider routes load the worker's `~/.kbm_env` where noted.
 
+## Submission capture and grading
+
+The shared Hard, CUDA, and Mini runner captures `solution.py` and its regular
+sidecar files immediately after the agent exits. A canonical manifest records
+each relative path, mode, size, and SHA-256 digest. Links, special files,
+hardlinks, and submissions over the fixed file/size limits are rejected;
+generated Python bytecode is excluded. The archive's `solution.py` and
+submission sidecars are then regenerated from that bundle rather than copied
+from the mutable agent workspace. Checker-generated `framework.txt` and
+`cuda_language.json` reports are archived separately under `scratch/`.
+Legacy sequential and remote regraders refuse bundle-bound runs: they cannot
+replace a score while preserving the original manifest binding. Such a run
+must be graded again through the isolated bundle path.
+
+Correctness and performance run from separate verified extractions with fresh
+compiler caches. They use the canonical benchmark environment, do not inherit
+API credential environment variables, and run in private network and process
+namespaces. There is no externally routed interface, and remaining descendants
+are killed when each stage exits. Direct package downloads and remote repository
+clones therefore fail while the submission is being graded. The manifest digest and
+capture status are stored in `result.json`. This is an artifact reproducibility
+boundary, not a general sandbox: submission code can still see host files,
+including file-backed credentials and Unix sockets, available to the grading
+user. A colluding host process could relay data over such a socket. Mega and
+Multi keep their existing runners and archive formats.
+
+Host-mode AAB/Codex development now uses the same generated filesystem
+isolation path as final replay. The canonical `.venv`, Python runtime, trusted
+helpers, problem templates, `src/`, project metadata, Rust toolchain, CUDA
+Oxide source, and cuTile Rust source are read-only. Only the candidate files,
+run-local state, logs, compiler caches, and a copy-on-write uv cache can be
+changed. Final replay uses the same helper with a private network namespace.
+The Codex inference client stays online, while every model-generated command
+runs with command networking disabled, approvals disabled, web search
+disabled, and no MCP servers. Before inference, the runner proves DNS lookup,
+`curl`, and a direct Python socket all fail, and it genuinely preflights CUDA
+C++, CUDA Oxide, CuTe DSL, Triton, cuTile Python, and cuTile Rust. Missing
+toolchains fail the run rather than being installed during it. Other host-mode
+agents still run as the grading user before capture; use their container mode
+when a stronger pre-capture boundary is required.
+
+Fresh Hard, CUDA, and Mini workers get this environment through
+`brev_worker.sh bootstrap` or `lambda_worker.sh bootstrap`. Both run the locked
+Python sync and then `scripts/lib/bootstrap_dialects.sh`. The Python lock pins
+cuTile Python 1.5.0 and CUTLASS/CuTe DSL 4.7.0. The bootstrap installs an
+isolated complete CUDA toolkit 13.3.1, avoiding
+the CUDA 13.0 runtime dependency required by the locked PyTorch build. It also
+pins CUDA Oxide commit
+`6c5458fe991bbde32c5bee74d87822aef1b5a691` with Rust
+`nightly-2026-04-03`, and cuTile Rust commit
+`a3ed99d225befcb19f75ec8d81708eb35818fee2` with Rust 1.89.0 and its CUDA
+Tile submodule at `0859212ad19f71133a9b940c05323286cbf28a05`. It fetches
+both Cargo lockfiles, runs real locked Cargo checks, verifies the Python package
+versions/imports, and exposes the locked CUDA compiler as `.venv/bin/nvcc`.
+The runtime preflight repeats compilation and GPU execution offline before an
+agent is allowed to start.
+
 | Harness | Endpoint/transport | Required env key(s) | Benches that have it | Notes/quirks |
 | --- | --- | --- | --- | --- |
 | `claude` | Native Claude Code to Anthropic | CLI login; optionally `CLAUDE_CODE_OAUTH_TOKEN`, `ANTHROPIC_API_KEY`, or `ANTHROPIC_AUTH_TOKEN` | hard, cuda, mini, mega, multi | The branch enforces no key. Reasoning effort is forwarded; single-GPU settings disable fast mode and enable thinking. |
@@ -35,4 +92,3 @@ These tables are the single source of truth for runner harness names, transports
 | `pi` | badlogic pi through a generated `lfm` OpenAI-completions provider to local vLLM | `KBMINI_API_KEY` (defaults to `local`) | mini | Additively updates `~/.pi/agent/models.json`; `--no-session` avoids a headless hang. |
 | `lfm-grok` | Grok CLI custom `chat_completions` model to local vLLM | `KBMINI_API_KEY` (defaults to `local`) | mini | Additively appends a model block to `~/.grok/config.toml`. |
 | `opencode-or` | OpenCode to OpenRouter's OpenAI-compatible API at `https://openrouter.ai/api/v1` | `OPENROUTER_API_KEY` from `~/.kbm_env` | multi | Pins `KBM_OR_PROVIDER` with fallbacks disabled. The adapter has stalled intermittently, and the branch ignores the reasoning-effort argument. |
-

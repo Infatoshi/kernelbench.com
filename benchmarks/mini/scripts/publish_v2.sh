@@ -31,9 +31,11 @@ PY
 
 echo "[3/3] emitting redacted solution files into public/runs (transcripts live on HuggingFace)..."
 mkdir -p "$REPO_ROOT/public/runs"
-PUB="$REPO_ROOT/public/runs" uv run python - <<'PY'
-import json, os, re
+PUB="$REPO_ROOT/public/runs" REPO_ROOT="$REPO_ROOT" uv run python - <<'PY'
+import json, os, re, sys
 pub = os.environ["PUB"]
+sys.path.insert(0, os.path.join(os.environ["REPO_ROOT"], "scripts"))
+from kernel_sidecars import augment
 rids = sorted({c["run_id"] for m in json.load(open("results/leaderboard.json"))["models"]
                for c in m["results"].values() if c.get("run_id")})
 vals = []
@@ -55,7 +57,8 @@ n = 0
 for rid in rids:
     sp = f"outputs/runs/{rid}/solution.py"
     if os.path.isfile(sp):
-        open(f"{pub}/{rid}_solution.py.txt", "w").write(red(open(sp).read()))
+        txt = augment(open(sp).read(), f"outputs/runs/{rid}")
+        open(f"{pub}/{rid}_solution.py.txt", "w").write(red(txt))
         n += 1
 print(f"  wrote {n} solution files")
 PY

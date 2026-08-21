@@ -101,6 +101,15 @@ for RUN_DIR in "$@"; do
     if [ ! -f "$RUN_DIR/result.json" ]; then
         echo "[skip] $RID: no result.json (run never scored)"; SKIP=$((SKIP+1)); continue
     fi
+    if ! RESULT_KIND="$(python3 -c 'import json,sys; r=json.load(open(sys.argv[1])); type(r) is dict or sys.exit(2); print("bundle" if any(k in r for k in ("submission_bundle_status","submission_manifest_sha256")) else "legacy")' "$RUN_DIR/result.json")"; then
+        echo "FATAL: $RID has unreadable result metadata; refusing to regrade" >&2
+        exit 3
+    fi
+    if [ "$RESULT_KIND" = "bundle" ]; then
+        echo "FATAL: $RID is bundle-bound; the legacy regrader cannot safely change its score" >&2
+        echo "       rerun it through a bundle-aware isolated grader" >&2
+        exit 3
+    fi
     if [ ! -f "$RUN_DIR/solution.py" ]; then
         echo "[skip] $RID: no solution.py"; SKIP=$((SKIP+1)); continue
     fi

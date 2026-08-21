@@ -1,5 +1,6 @@
 import json
 import os
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -24,6 +25,20 @@ def test_post_run_timeout_starts_inside_gpu_lock() -> None:
     assert "run_gpu_locked_timeout benchmark.py" in script
     assert "timeout 180 uv run python check.py" not in script
     assert "timeout 1800 uv run python benchmark.py" not in script
+
+
+def test_agent_check_and_benchmark_use_the_grading_entrypoint() -> None:
+    script = RUN_HARD.read_text()
+    entrypoint = '${WORKSPACE_ROOT:-/workspace}/src/eval/trusted_entrypoint.py'
+    assert 'REAL_PYTHON="$TRUSTED_PYTHON"' in script
+    assert script.count(f'{entrypoint}" "$1"') == 2
+    assert f'run python "{entrypoint}" "$3"' in script
+
+
+def test_scoring_environment_links_cuda_runtime_for_extensions() -> None:
+    script = RUN_HARD.read_text()
+    assert 'TRUSTED_CUDA_LIB="$TRUSTED_SITE_PACKAGES/nvidia/cu13/lib"' in script
+    assert 'ln -s libcudart.so.13 "$TRUSTED_CUDA_LIB/libcudart.so"' in script
 
 
 def test_cuda_cannot_be_disabled_for_agent_phase() -> None:
@@ -158,7 +173,7 @@ def test_shared_checker_source_is_copied_and_restored_as_trusted_input() -> None
     assert 'TRUSTED_SRC_BACKUP_DIR="$RUN_DIR/trusted_src"' in script
     assert "MUTATED: trusted src/" in script
     assert 'TRUSTED_SRC_DIGEST="$(trusted_src_digest' in script
-    assert '"$REAL_PYTHON" - "$1"' in script
+    assert '"$BUNDLE_PYTHON" -I -S - "$1"' in script
     assert "unsafe trusted src root" in script
     assert "BOOTSTRAP_PYTHON" not in script
     assert script.index('REAL_PYTHON="$(command -v') < script.index(
@@ -167,7 +182,7 @@ def test_shared_checker_source_is_copied_and_restored_as_trusted_input() -> None
     assert 'strip_python_bytecode "$WORKSPACE_ROOT/src"' in script
     assert '/bin/cp -a "$trusted_source" "$WORKSPACE_ROOT/src"' in script
     after_harness = script.index('detect_template_mutation "after harness"')
-    final_check = script.index('echo "Running check.py..."', after_harness)
+    final_check = script.index('echo "Running check.py from captured submission..."', after_harness)
     assert script.index("restore_trusted_src", after_harness, final_check) < final_check
 
 
@@ -187,7 +202,9 @@ def test_canonical_deck_regrade_restores_complete_current_runtime() -> None:
 
     monorepo = ROOT.parents[1]
     canonical_bytes = REGRADE.read_bytes()
-    for bench in ("cuda", "mega"):
+    # Hard and CUDA share the bundle-aware regrader. Mega keeps its existing
+    # isolated legacy regrader and Mini has its own deck-specific variant.
+    for bench in ("cuda",):
         assert (
             monorepo / "benchmarks" / bench / "scripts" / "regrade_sequential.sh"
         ).read_bytes() == canonical_bytes
@@ -255,13 +272,15 @@ def test_regrade_purges_problem_bytecode_after_candidate_restore() -> None:
     scratch_restore = script.index('cp -r "$RUN_DIR/scratch/." "$PROBLEM_DIR/"')
     check_run = script.index('uv run python "$TRUSTED_ENTRYPOINT" check.py', scratch_restore)
     first_purge = script.index('purge_untrusted_bytecode "$PROBLEM_DIR"', scratch_restore)
-    benchmark_run = script.index('uv run python "$TRUSTED_ENTRYPOINT" benchmark.py', check_run)
+    benchmark_run = script.index(
+        'uv run python "$TRUSTED_ENTRYPOINT" benchmark.py', check_run
+    )
     second_purge = script.index('purge_untrusted_bytecode "$PROBLEM_DIR"', check_run)
     assert scratch_restore < first_purge < check_run < second_purge < benchmark_run
 
     monorepo = ROOT.parents[1]
     canonical_bytes = REGRADE.read_bytes()
-    for bench in ("cuda", "mega"):
+    for bench in ("cuda",):
         assert (
             monorepo / "benchmarks" / bench / "scripts" / "regrade_sequential.sh"
         ).read_bytes() == canonical_bytes
@@ -426,12 +445,139 @@ def test_hy3_tokenhub_uses_measured_context_wall_and_host_stall_watch() -> None:
 def test_agent_container_sessions_parallel_with_per_command_lock() -> None:
     script = RUN_HARD.read_text()
     # Default: sessions do NOT hold the GPU lock; in-container GPU commands
-    # serialize per-command through the bind-mounted lock dir.
+    # serialize per-command through the bind-mounted lock file.
     assert script.count("-v \"$CONTAINER_LOCK_BIN:/kbh/bin:ro\"") == 6
-    assert script.count("-v \"$KBH_GPU_LOCK_DIR:/kbh/lock:rw\"") == 6
+    assert script.count("-v \"$KBH_GPU_LOCK:/kbh/lock/gpu.lock:rw\"") == 6
+    assert script.count("-e KBH_GPU_LOCK_OWNER=/home/agent/gpu_lock.owner") == 6
     assert script.count("-e KBH_GPU_LOCK=/kbh/lock/gpu.lock") == 6
     assert "KBH_AGENT_CONTAINER_SESSION_LOCK" in script
     assert "agent_container_native_profiling_path_wrapper_gpu_lock" in script
     # The lock lives in a dedicated dir so only the lock is mounted, never
     # the rest of outputs/.
     assert "outputs/gpu_lock" in script
+
+
+def test_codex_agent_and_final_grading_share_immutable_environment_path() -> None:
+    script = RUN_HARD.read_text()
+    codex = script[script.index("    codex)"):script.index("    kimi)")]
+    replay = script[script.index("run_replay_stage()"):script.index("if [ \"$TEMPLATE_MUTATED\"")]
+
+    assert '"$HOST_AGENT_ISOLATOR" "$REAL_TIMEOUT" "$BUDGET_SECONDS"' in codex
+    assert 'CODEX_HOME="$HOST_CODEX_HOME" codex exec' in codex
+    assert "codex sandbox" in codex
+    assert "sandbox_workspace_write.network_access=false" in codex
+    assert "/usr/bin/getent hosts example.com" in codex
+    assert "/usr/bin/curl -fsS --connect-timeout 1" in codex
+    assert "/usr/bin/python3 -c" in codex
+    assert "--sandbox workspace-write" in codex
+    assert 'approval_policy="never"' in codex
+    assert 'web_search="disabled"' in codex
+    assert 'mcp_servers={}' in codex
+    assert '--add-dir "$RUN_DIR"' in codex
+    assert "--dangerously-bypass-approvals-and-sandbox" not in codex
+    assert '"$HOST_AGENT_ISOLATOR" /usr/bin/env -i' in replay
+    assert "KBH_ISOLATION_NETWORK=off" in replay
+    assert '"$TRUSTED_PYTHON" -I -c "$SUBMISSION_REPLAY_SOURCE"' in replay
+
+
+def test_immutable_environment_seals_dependencies_and_trusted_grader_files() -> None:
+    script = RUN_HARD.read_text()
+    isolate = script[script.index("HOST_AGENT_ISOLATOR="):script.index("# Container-side lock wrappers")]
+
+    assert '/usr/bin/mount --bind "$repo/.venv" "$workspace/.venv"' in isolate
+    assert '/usr/bin/mount -o remount,bind,ro "$workspace/.venv"' in isolate
+    assert 'printf "%s\\n" "$workspace_trusted"' in isolate
+    assert 'for path in "$home" "$repo" "$python_runtime" "$trusted_tools" "$trusted_uv"' in isolate
+    assert 'for path in "$cargo_home" "$rustup_home" "$cuda_oxide" "$cutile_rust"' in isolate
+    assert 'UV_NO_SYNC=1 UV_OFFLINE=1 PIP_NO_INDEX=1' in isolate
+    assert 'CARGO_NET_OFFLINE=true' in isolate
+    assert 'WORKSPACE_TRUSTED_PATHS="$WORKSPACE_ROOT/src' in script
+    for name in ("check.py", "benchmark.py", "reference.py", "problem.yaml", "shapes.py"):
+        assert name in script[script.index("TEMPLATE_FILES="):script.index("is_template()")]
+
+
+def test_immutable_environment_preflights_all_six_cuda_dialects() -> None:
+    script = RUN_HARD.read_text()
+    helper = (ROOT.parents[1] / "scripts" / "lib" / "dialect_preflight.py").read_text()
+    start = script.index("DIALECT_NVCC=")
+    end = script.index("TEMPLATE_MUTATED=false", start)
+    preflight = script[start:end]
+
+    assert '"$nvcc" -std=c++17 -c' in preflight
+    assert '"$cargo" "+$cuda_oxide_toolchain" --version' in preflight
+    assert '"$rustc" "+$cutile_rust_toolchain" --version' in preflight
+    assert '"+$cuda_oxide_toolchain" check --locked --offline' in preflight
+    assert '"+$cutile_rust_toolchain" check --locked --offline' in preflight
+    assert "6c5458fe991bbde32c5bee74d87822aef1b5a691" in script
+    assert "a3ed99d225befcb19f75ec8d81708eb35818fee2" in script
+    assert "0859212ad19f71133a9b940c05323286cbf28a05" in script
+    assert '"$python" -I "$python_preflight"' in preflight
+    assert "@triton.jit" in helper
+    assert "@ct.kernel()" in helper
+    assert "cute.compile(_cute_scalar_add" in helper
+    assert "torch.testing.assert_close" in helper
+    assert "CUDA C++, CUDA Oxide, CuTe DSL, Triton, cuTile Python, cuTile Rust" in preflight
+
+
+def test_worker_bootstrap_pins_and_provisions_all_cuda_dialects() -> None:
+    bootstrap = (ROOT.parents[1] / "scripts" / "lib" / "bootstrap_dialects.sh").read_text()
+    brev = (ROOT.parents[1] / "scripts" / "brev_worker.sh").read_text()
+    lambda_worker = (ROOT.parents[1] / "scripts" / "lambda_worker.sh").read_text()
+
+    for bench in ("hard", "cuda", "mini"):
+        bench_root = ROOT.parents[1] / "benchmarks" / bench
+        project = (bench_root / "pyproject.toml").read_text()
+        lock = (bench_root / "uv.lock").read_text()
+        assert '"cuda-tile==1.5.0"' in project
+        assert '"nvidia-cutlass-dsl==4.7.0"' in project
+        assert 'name = "cuda-tile"\nversion = "1.5.0"' in lock
+        assert 'name = "nvidia-cutlass-dsl"\nversion = "4.7.0"' in lock
+
+    for value in (
+        "6c5458fe991bbde32c5bee74d87822aef1b5a691",
+        "nightly-2026-04-03",
+        "a3ed99d225befcb19f75ec8d81708eb35818fee2",
+        "1.89.0",
+        "0859212ad19f71133a9b940c05323286cbf28a05",
+        'CUDA_TOOLKIT_VERSION="13.3.1"',
+    ):
+        assert value in bootstrap
+    assert 'cargo "+$CUDA_OXIDE_TOOLCHAIN" fetch --locked' in bootstrap
+    assert 'cargo "+$CUDA_OXIDE_TOOLCHAIN" check --locked' in bootstrap
+    assert 'cargo "+$CUTILE_RUST_TOOLCHAIN" fetch --locked' in bootstrap
+    assert 'cargo "+$CUTILE_RUST_TOOLCHAIN" check --locked' in bootstrap
+    assert 'ln -sfn "$cuda_toolkit_root/bin/nvcc"' in bootstrap
+    assert '"cuda-toolkit[all]==$CUDA_TOOLKIT_VERSION"' in bootstrap
+    assert "bash scripts/lib/bootstrap_dialects.sh" in brev
+    assert "bash scripts/lib/bootstrap_dialects.sh" in lambda_worker
+
+
+def test_codex_child_command_sandbox_blocks_network() -> None:
+    codex = shutil.which("codex")
+    if codex is None:
+        return
+    probe = """
+if /usr/bin/getent hosts example.com >/dev/null 2>&1; then exit 31; fi
+if /usr/bin/curl -fsS --connect-timeout 1 https://example.com/ >/dev/null 2>&1; then exit 32; fi
+if /usr/bin/python3 -c 'import socket; socket.create_connection(("1.1.1.1", 53), 1)' >/dev/null 2>&1; then exit 33; fi
+"""
+    completed = subprocess.run(
+        [
+            codex,
+            "sandbox",
+            "-c",
+            'sandbox_mode="workspace-write"',
+            "-c",
+            "sandbox_workspace_write.network_access=false",
+            "--",
+            "/bin/sh",
+            "-eu",
+            "-c",
+            probe,
+        ],
+        text=True,
+        capture_output=True,
+        check=False,
+        timeout=10,
+    )
+    assert completed.returncode == 0, completed.stderr

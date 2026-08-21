@@ -292,9 +292,9 @@ def test_hy3_tokenhub_uses_measured_context_wall_and_host_stall_watch() -> None:
 def test_agent_container_sessions_parallel_with_per_command_lock() -> None:
     script = RUN_HARD.read_text()
     # Default: sessions do NOT hold the GPU lock; in-container GPU commands
-    # serialize per-command through the bind-mounted lock dir.
+    # serialize per-command through the bind-mounted lock file.
     assert script.count("-v \"$CONTAINER_LOCK_BIN:/kbh/bin:ro\"") == 6
-    assert script.count("-v \"$KBH_GPU_LOCK_DIR:/kbh/lock:rw\"") == 6
+    assert script.count("-v \"$KBH_GPU_LOCK:/kbh/lock/gpu.lock:rw\"") == 6
     assert script.count("-e KBH_GPU_LOCK=/kbh/lock/gpu.lock") == 6
     assert "KBH_AGENT_CONTAINER_SESSION_LOCK" in script
     assert "agent_container_native_profiling_path_wrapper_gpu_lock" in script
