@@ -53,6 +53,7 @@ MODEL_NAMES = {
     "claude-sonnet-5": "Claude Sonnet 5",
     "claude-fable-5": "Claude Fable 5",
     "glm-5.2": "GLM-5.2",
+    "glm-5.3": "GLM-5.3",
     "glm-5.1": "GLM-5.1",
     "gpt-5.5": "GPT-5.5",
     "gpt-5.6-sol": "GPT-5.6 Sol",
