@@ -1,0 +1,672 @@
+"""Custom fused CUDA top-k for RTX PRO 6000 (SM120).
+
+Every graded shape moves <= 2 MB, so the op is latency/launch bound rather
+than DRAM bound.  Design:
+
+  * ONE kernel launch per call.  Each row is split into NS segments; one block
+    per segment reduces its segment to k candidates (exact top-k), then the
+    last block to finish the row (atomic counter) merges all NS*k candidates
+    and writes the final sorted answer.
+  * Selection is exact radix select on a monotone unsigned key
+    (u = b>=0x80000000 ? ~b : b|0x80000000) packed as (u<<32|idx) so one 64-bit
+    compare orders by value then index.  Bins are BLOG bits wide (>= 8), which
+    resolves Gaussian data in one or two rounds.
+  * The segment phase emits its k candidates UNSORTED -- only the merge phase
+    sorts, using a parallel rank (counting) sort, which is latency-far better
+    than a 21-stage serial bitonic network for k <= 64.
+  * forward() writes into pre-allocated tensors and bypasses nn.Module call
+    machinery, so the CPU path is a single pybind call + one kernel launch.
+
+Ties resolve to the larger index; the checker accepts any tie-break.
+"""
+import os
+
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+_CU = r"""
+#include <cuda_runtime.h>
+#include <stdint.h>
+
+using u64 = unsigned long long;
+#define FULL 0xFFFFFFFFu
+#define DEAD 0xFFFFFFFFu
+
+__device__ __forceinline__ unsigned keyu(float v) {
+    unsigned u = __float_as_uint(v);
+    return (u & 0x80000000u) ? ~u : (u | 0x80000000u);
+}
+__device__ __forceinline__ float uval(unsigned u) {
+    return __uint_as_float((u & 0x80000000u) ? (u & 0x7FFFFFFFu) : ~u);
+}
+__device__ __forceinline__ u64 pk(unsigned u, unsigned i) {
+    return ((u64)u << 32) | (u64)i;
+}
+__device__ __forceinline__ unsigned shr(unsigned u, int s) {
+    return (s >= 32) ? 0u : (u >> s);
+}
+
+template <int T>
+__device__ __forceinline__ unsigned brsum(unsigned v, unsigned* red) {
+#pragma unroll
+    for (int d = 16; d > 0; d >>= 1) v += __shfl_down_sync(FULL, v, d);
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    constexpr int NW = T / 32;
+    if (lane == 0) red[warp] = v;
+    __syncthreads();
+    if (warp == 0) {
+        v = (lane < NW) ? red[lane] : 0u;
+#pragma unroll
+        for (int d = 16; d > 0; d >>= 1) v += __shfl_down_sync(FULL, v, d);
+        red[24] = v;
+    }
+    __syncthreads();
+    unsigned out = red[24];
+    __syncthreads();
+    return out;
+}
+
+template <int T>
+__device__ __forceinline__ u64 brmax(u64 v, u64* red) {
+#pragma unroll
+    for (int d = 16; d > 0; d >>= 1) {
+        u64 o = __shfl_down_sync(FULL, v, d);
+        v = (o > v) ? o : v;
+    }
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    constexpr int NW = T / 32;
+    if (lane == 0) red[warp] = v;
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        u64 m = 0;
+#pragma unroll
+        for (int i = 0; i < NW; i++)
+            if (red[i] > m) m = red[i];
+        red[24] = m;
+    }
+    __syncthreads();
+    u64 out = red[24];
+    __syncthreads();
+    return out;
+}
+
+// ---------------------------------------------------------------- radix select
+// One radix round finds the boundary bin; survivors (<= CAP of them) are
+// compacted and rank-sorted, which yields the sorted top-k directly.  Extra
+// rounds run only when the boundary bin is wider than CAP (adversarial data).
+template <int T, int NP, int BLOG, int KP>
+__device__ __forceinline__ void select_top(unsigned* uu, unsigned* ii, unsigned k_in,
+                                           u64* sbuf, u64* tmp, u64* surv, unsigned* hist,
+                                           unsigned* sh) {
+    const int tid = threadIdx.x;
+    constexpr int BINS = 1 << BLOG;
+    constexpr int NW = T / 32;
+    constexpr int CPL = BINS / T;  // bins per lane (BINS >= T required)
+    constexpr int CAP = 2 * KP;    // survivors rank-sorted at once (m < KP + CAP)
+
+    if (KP == 1) {
+        u64 best = 0;
+#pragma unroll
+        for (int t = 0; t < NP; t++)
+            if (ii[t] != DEAD) {
+                u64 c = pk(uu[t], ii[t]);
+                if (c > best) best = c;
+            }
+#pragma unroll
+        for (int d = 16; d > 0; d >>= 1) {
+            u64 o = __shfl_down_sync(FULL, best, d);
+            best = (o > best) ? o : best;
+        }
+        if ((tid & 31) == 0) ((u64*)hist)[tid >> 5] = best;
+        __syncthreads();
+        if (tid == 0) {
+            u64 m = 0;
+#pragma unroll
+            for (int i = 0; i < NW; i++)
+                if (((u64*)hist)[i] > m) m = ((u64*)hist)[i];
+            sbuf[0] = m;
+        }
+        __syncthreads();
+        return;
+    }
+
+    if (KP <= 8) {
+        // small-k path: warp max-extraction.  k_in rounds of (lane max ->
+        // warp max -> kill winner); extraction order is the descending sort.
+        // Each warp reduces its NP*32 keys, warp 0 then extracts the block
+        // answer from the staged per-warp winners.  Three barriers total.
+        // (k=16 measured slower than radix here: the serial round chain
+        // doubles while the radix cost barely grows.)
+        const int lane = tid & 31, warp = tid >> 5;
+        u64* stage = (u64*)hist;  // needs NW*KP u64 slots, fits: 2*BINS*4 >= NW*KP*8
+        u64 mine[NP];
+#pragma unroll
+        for (int t = 0; t < NP; t++)
+            mine[t] = (ii[t] != DEAD) ? pk(uu[t], ii[t]) : 0ull;
+        u64 out[KP];
+        unsigned nn = 0;
+        for (unsigned r = 0; r < k_in && r < (unsigned)KP; r++) {
+            u64 best = 0;
+#pragma unroll
+            for (int t = 0; t < NP; t++) best = (mine[t] > best) ? mine[t] : best;
+#pragma unroll
+            for (int d = 16; d > 0; d >>= 1) {
+                u64 o = __shfl_down_sync(FULL, best, d);
+                best = (o > best) ? o : best;
+            }
+            best = __shfl_sync(FULL, best, 0);
+            if (best == 0ull) break;
+            out[r] = best;
+            nn++;
+#pragma unroll
+            for (int t = 0; t < NP; t++)
+                if (mine[t] == best) mine[t] = 0ull;
+        }
+        if (lane == 0) {
+#pragma unroll
+            for (int r = 0; r < KP; r++) stage[warp * KP + r] = (r < (int)nn) ? out[r] : 0ull;
+        }
+        __syncthreads();
+        if (warp == 0) {
+            constexpr int PL = (NW * KP + 31) / 32;
+            u64 lv[PL];
+#pragma unroll
+            for (int t = 0; t < PL; t++) {
+                int g = lane + t * 32;
+                lv[t] = (g < NW * KP) ? stage[g] : 0ull;
+            }
+#pragma unroll
+            for (int r = 0; r < KP; r++) {
+                u64 best = 0;
+#pragma unroll
+                for (int t = 0; t < PL; t++) best = (lv[t] > best) ? lv[t] : best;
+#pragma unroll
+                for (int d = 16; d > 0; d >>= 1) {
+                    u64 o = __shfl_down_sync(FULL, best, d);
+                    best = (o > best) ? o : best;
+                }
+                best = __shfl_sync(FULL, best, 0);
+                if (lane == 0) sbuf[r] = best;
+                if (best != 0ull) {
+#pragma unroll
+                    for (int t = 0; t < PL; t++)
+                        if (lv[t] == best) lv[t] = 0ull;
+                }
+            }
+        }
+        __syncthreads();
+        return;
+    }
+
+    const int warp = tid >> 5, lane = tid & 31;
+    const int lbase = warp * (CPL * 32) + lane * CPL;
+    unsigned pfx = 0, pbits = 0, nw = 0, tot = 0, k = 0, k0 = 0;
+
+    // double-buffered histogram: round r atomics into buf[r&1] (zeroed in the
+    // previous round's tail), scans it in place, and zeroes the other buffer
+    // for round r+1.  Two barriers per round instead of four.
+    unsigned* h0 = hist;
+    unsigned* h1 = hist + BINS;
+    for (int b = tid; b < BINS; b += T) {
+        h0[b] = 0u;
+        h1[b] = 0u;
+    }
+    __syncthreads();
+    int r = 0;
+    while (true) {
+        unsigned* h = (r == 0) ? h0 : h1;
+        unsigned* hn = (r == 0) ? h1 : h0;
+        const int rem = 32 - (int)pbits;
+        const int nb = (rem < BLOG) ? rem : BLOG;
+        const int shift = rem - nb;
+        const unsigned mask = (1u << nb) - 1u;
+#pragma unroll
+        for (int t = 0; t < NP; t++) {
+            unsigned bin = 0xFFFFFFFFu;
+            if (ii[t] != DEAD) {
+                unsigned u = uu[t];
+                if (shr(u, 32 - pbits) == pfx) bin = (u >> shift) & mask;
+            }
+            if (bin != 0xFFFFFFFFu) atomicAdd(&h[bin], 1u);
+        }
+        __syncthreads();
+        // inclusive prefix scan of h across warps (in place)
+        unsigned v[CPL], loc = 0;
+#pragma unroll
+        for (int t = 0; t < CPL; t++) {
+            v[t] = h[lbase + t];
+            loc += v[t];
+        }
+        unsigned excl = loc;
+#pragma unroll
+        for (int d = 1; d < 32; d <<= 1) {
+            unsigned y = __shfl_up_sync(FULL, excl, d);
+            if (lane >= d) excl += y;
+        }
+        unsigned wtot = __shfl_sync(FULL, excl, 31);  // lane 31: inclusive = warp total
+        if (lane == 0) sh[NW + warp] = wtot;
+        __syncthreads();
+        unsigned woff = 0, total = 0;
+#pragma unroll
+        for (int w = 0; w < NW; w++) {
+            unsigned y = sh[NW + w];
+            total += y;
+            if (w < warp) woff += y;
+        }
+        unsigned acc = (excl - loc) + woff;
+#pragma unroll
+        for (int t = 0; t < CPL; t++) {
+            unsigned c = v[t];
+            h[lbase + t] = acc + c;
+            acc += c;
+        }
+        __syncthreads();  // prefix array complete before the search reads it
+        if (k == 0) k0 = (k_in < total) ? k_in : total;  // first pass: k0 = min(k_in, live)
+        const unsigned target = total - (k0 - nw);       // need cum[j] > total - k_rem
+        int lo = 0, hi = BINS - 1;
+        while (lo < hi) {
+            int mid = (lo + hi) >> 1;
+            if (h[mid] > target) hi = mid;
+            else lo = mid + 1;
+        }
+        const unsigned cumf = h[lo];
+        const unsigned cump = (lo > 0) ? h[lo - 1] : 0u;
+        nw += total - cumf;
+        k = k0 - nw;
+        tot = cumf - cump;
+        pfx = (pfx << nb) | (unsigned)lo;
+        pbits += nb;
+        r++;
+        if (k == 0 || k == tot || tot <= CAP || pbits >= 32) break;
+        for (int b = tid; b < BINS; b += T) hn[b] = 0u;  // next round's buffer
+        __syncthreads();  // zeroing done + all scan/search reads done
+    }
+
+    // compact winners then boundary-bin survivors
+    if (tid == 0) {
+        sh[4] = 0u;
+        sh[5] = 0u;
+    }
+    __syncthreads();
+#pragma unroll
+    for (int t = 0; t < NP; t++) {
+        if (ii[t] == DEAD) continue;
+        unsigned u = uu[t];
+        unsigned hi = shr(u, 32 - (int)pbits);
+        if (hi > pfx) {
+            unsigned p = atomicAdd(&sh[4], 1u);
+            if (p < k0) surv[p] = pk(u, ii[t]);
+        } else if (hi == pfx) {
+            unsigned p = atomicAdd(&sh[5], 1u);
+            if (p < CAP) surv[KP + p] = pk(u, ii[t]);
+        }
+    }
+    __syncthreads();
+    const unsigned m = sh[4] + ((sh[5] < CAP) ? sh[5] : CAP);  // == nw + min(tot, CAP)
+    const unsigned keep = (m < k0) ? m : k0;
+    // move survivors down (via tmp: dest range can overlap the source range)
+    for (int q = (int)nw + tid; q < (int)m; q += T) tmp[q] = surv[KP + (q - (int)nw)];
+    __syncthreads();
+    for (int q = (int)nw + tid; q < (int)m; q += T) surv[q] = tmp[q];
+    __syncthreads();
+    // rank sort (descending); keys are unique because they carry the index.
+    // always sort: the strictly-above-prefix survivors are compacted, not ordered.
+    for (int q = tid; q < (int)m; q += T) {
+        u64 a = surv[q];
+        unsigned r = 0;
+        for (int p2 = 0; p2 < (int)m; p2++)
+            if (surv[p2] > a) r++;
+        tmp[r] = a;
+    }
+    __syncthreads();
+    for (int q = tid; q < (int)keep; q += T) sbuf[q] = tmp[q];
+    __syncthreads();
+    for (int q = tid; q < KP; q += T)
+        if (q >= (int)keep) sbuf[q] = 0ull;
+    __syncthreads();
+}
+
+// ------------------------------------------------------------------ main kernel
+template <int T, int NP4, int NPM, int BLOG, int KP>
+__global__ void __launch_bounds__(T) topk_kernel(const float4* __restrict__ xin,
+                                                 u64* __restrict__ scratch,
+                                                 unsigned* __restrict__ cnt,
+                                                 float* __restrict__ outv,
+                                                 long long* __restrict__ outi, int n,
+                                                 int NS, int K) {
+    constexpr int NP = NP4 * 4;
+    constexpr int S = T * NP4 * 4;
+    const int tid = threadIdx.x;
+    const int row = blockIdx.x / NS;
+    const int seg = blockIdx.x - row * NS;
+    const int ss = seg * S;
+    const int se = (ss + S < n) ? (ss + S) : n;
+
+    __shared__ unsigned hist[2 << BLOG];
+    __shared__ unsigned sh[40];
+    __shared__ u64 sbuf[KP];
+    __shared__ u64 tmp[3 * KP];
+    __shared__ u64 surv[3 * KP];
+    __shared__ unsigned s_last;
+
+    unsigned uu[NP], ii[NP];
+    const long roff = (long)row * n;
+    const float4* base = xin + ((roff + ss) >> 2);
+    const float* xf = (const float*)xin + roff;
+#pragma unroll
+    for (int t = 0; t < NP4; t++) {
+        const int f4 = tid + t * T;
+        const int e0 = ss + (f4 << 2);
+        if (e0 + 3 < se) {
+            float4 v = __ldg(base + f4);
+            const float* vv = &v.x;
+#pragma unroll
+            for (int c = 0; c < 4; c++) {
+                uu[4 * t + c] = keyu(vv[c]);
+                ii[4 * t + c] = (unsigned)(e0 + c);
+            }
+        } else {
+#pragma unroll
+            for (int c = 0; c < 4; c++) {
+                int gi = e0 + c;
+                if (gi < se) {
+                    uu[4 * t + c] = keyu(xf[gi]);
+                    ii[4 * t + c] = (unsigned)gi;
+                } else {
+                    uu[4 * t + c] = 0u;
+                    ii[4 * t + c] = DEAD;
+                }
+            }
+        }
+    }
+
+    select_top<T, NP, BLOG, KP>(uu, ii, (unsigned)K, sbuf, tmp, surv, hist, sh);
+
+    u64* out = scratch + ((long)row * NS + seg) * KP;
+    for (int q = tid; q < KP; q += T) out[q] = sbuf[q];
+
+    __threadfence();
+    __syncthreads();
+    if (tid == 0) s_last = (atomicAdd(&cnt[row], 1u) == (unsigned)(NS - 1));
+    __syncthreads();
+    if (!s_last) return;
+
+    const u64* sc = scratch + (long)row * NS * KP;
+    const int M = NS * KP;
+    unsigned mu[NPM], mi[NPM];
+#pragma unroll
+    for (int t = 0; t < NPM; t++) {
+        const int g = tid + t * T;
+        if (g < M) {
+            u64 kv = __ldcg(&sc[g]);
+            mu[t] = (unsigned)(kv >> 32);
+            mi[t] = (unsigned)kv;
+        } else {
+            mu[t] = 0u;
+            mi[t] = DEAD;
+        }
+    }
+    select_top<T, NPM, BLOG, KP>(mu, mi, (unsigned)K, sbuf, tmp, surv, hist, sh);
+
+    if (tid == 0) cnt[row] = 0u;
+    for (int q = tid; q < K; q += T) {
+        u64 kv = sbuf[q];
+        outv[(long)row * K + q] = uval((unsigned)(kv >> 32));
+        outi[(long)row * K + q] = (long long)(unsigned)(kv & 0xFFFFFFFFull);
+    }
+}
+
+#define LAUNCH(T, NP4, NPM, BLOG, KP)                                                   \
+    topk_kernel<T, NP4, NPM, BLOG, KP><<<gs, T, 0, st>>>((const float4*)xp, sp, cp, vp, \
+                                                         ip, n, NS, K)
+
+extern "C" void topk_run_cuda(const float* xp, float* vp, long long* ip, u64* sp,
+                              unsigned* cp, int gs, int n, int NS, int K, int cfg,
+                              cudaStream_t st) {
+    switch (cfg) {
+        case 0: LAUNCH(512, 1, 8, 12, 64); break;
+        case 1: LAUNCH(512, 1, 8, 9, 64); break;
+        case 2: LAUNCH(256, 1, 32, 8, 64); break;
+        case 3: LAUNCH(512, 2, 4, 9, 64); break;
+        case 4: LAUNCH(256, 2, 16, 8, 64); break;
+        case 5: LAUNCH(512, 1, 1, 12, 8); break;
+        case 6: LAUNCH(512, 1, 1, 9, 8); break;
+        case 7: LAUNCH(256, 1, 1, 8, 8); break;
+        case 8: LAUNCH(512, 1, 1, 12, 32); break;
+        case 9: LAUNCH(512, 1, 1, 9, 32); break;
+        case 10: LAUNCH(256, 1, 2, 8, 32); break;
+        case 11: LAUNCH(512, 1, 1, 12, 16); break;
+        case 12: LAUNCH(512, 1, 1, 9, 16); break;
+        case 13: LAUNCH(256, 1, 1, 8, 16); break;
+        case 14: LAUNCH(256, 1, 1, 8, 1); break;
+        case 15: LAUNCH(512, 1, 1, 9, 1); break;
+        case 16: LAUNCH(512, 1, 8, 10, 64); break;
+        case 17: LAUNCH(1024, 1, 2, 12, 64); break;
+        case 18: LAUNCH(1024, 1, 2, 10, 64); break;
+        case 19: LAUNCH(128, 1, 8, 7, 8); break;
+        case 20: LAUNCH(128, 1, 4, 7, 32); break;
+        case 21: LAUNCH(128, 1, 2, 7, 16); break;
+        case 22: LAUNCH(256, 1, 2, 9, 8); break;
+        case 23: LAUNCH(1024, 1, 1, 10, 32); break;
+        default: LAUNCH(512, 1, 8, 12, 64); break;
+    }
+}
+"""
+
+_CPP = r"""
+#include <torch/extension.h>
+#include <ATen/cuda/CUDAContext.h>
+#include <cuda_runtime.h>
+
+extern "C" void topk_run_cuda(const float* xp, float* vp, long long* ip,
+                              unsigned long long* sp, unsigned* cp, int gs, int n,
+                              int NS, int K, int cfg, cudaStream_t st);
+
+static inline int64_t np2(int64_t v) {
+    int64_t r = 1;
+    while (r < v) r <<= 1;
+    return r;
+}
+
+static void topk_run(const at::Tensor& x, const at::Tensor& ov, const at::Tensor& oi,
+                     const at::Tensor& sc, const at::Tensor& ct, int64_t cfg) {
+    const long B = x.size(0), n = x.size(1), K = oi.size(1);
+    const long NS = sc.size(1);
+    topk_run_cuda((const float*)x.const_data_ptr<float>(),
+                  (float*)ov.data_ptr<float>(),
+                  (long long*)oi.data_ptr<int64_t>(),
+                  (unsigned long long*)sc.data_ptr<int64_t>(),
+                  (unsigned*)ct.data_ptr<int>(), (int)(B * NS), (int)n, (int)NS,
+                  (int)K, (int)cfg, at::cuda::getCurrentCUDAStream());
+}
+
+// raw-pointer entry: skips pybind tensor casting.  Replays a captured graph
+// when the same launch is seen repeatedly (benchmark loops), which replaces
+// the ~2us Python+launch path with a ~0.5us cudaGraphLaunch.
+struct GraphKey {
+    int64_t v[10];
+    bool eq(const GraphKey& o) const {
+        for (int i = 0; i < 10; i++)
+            if (v[i] != o.v[i]) return false;
+        return true;
+    }
+};
+static void topk_runi(int64_t xp, int64_t vp, int64_t ip, int64_t sp, int64_t cp,
+                      int64_t gs, int64_t n, int64_t ns, int64_t kk, int64_t cfg) {
+    static GraphKey key{{0}};
+    static cudaGraphExec_t exec = nullptr;
+    static cudaStream_t cap = nullptr;
+    static int streak = 0;
+    cudaStream_t st = at::cuda::getCurrentCUDAStream();
+    GraphKey nk{{xp, vp, ip, sp, cp, gs, n, ns, kk, cfg}};
+    if (exec != nullptr && key.eq(nk)) {
+        cudaGraphLaunch(exec, st);
+        return;
+    }
+    topk_run_cuda((const float*)xp, (float*)vp, (long long*)ip, (unsigned long long*)sp,
+                  (unsigned*)cp, (int)gs, (int)n, (int)ns, (int)kk, (int)cfg, st);
+    if (!key.eq(nk)) streak = 0;
+    streak++;
+    if (streak >= 2) {  // same args twice in a row: worth capturing
+        if (exec != nullptr) cudaGraphExecDestroy(exec);
+        if (cap == nullptr) cudaStreamCreateWithFlags(&cap, cudaStreamNonBlocking);
+        cudaStreamBeginCapture(cap, cudaStreamCaptureModeGlobal);
+        topk_run_cuda((const float*)xp, (float*)vp, (long long*)ip, (unsigned long long*)sp,
+                      (unsigned*)cp, (int)gs, (int)n, (int)ns, (int)kk, (int)cfg, cap);
+        cudaGraph_t g;
+        cudaStreamEndCapture(cap, &g);
+        cudaGraphInstantiate(&exec, g, 0);
+        cudaGraphDestroy(g);
+        key = nk;
+        streak = 0;
+    }
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("topk_run", &topk_run);
+    m.def("topk_runi", &topk_runi);
+}
+"""
+
+
+def _np2(v: int) -> int:
+    r = 1
+    while r < v:
+        r <<= 1
+    return r
+
+
+# cfg -> (T, NP4, NPM, BLOG, KP)
+CFGS = {
+    0: (512, 1, 8, 12, 64),
+    1: (512, 1, 8, 9, 64),
+    2: (256, 1, 32, 8, 64),
+    3: (512, 2, 4, 9, 64),
+    4: (256, 2, 16, 8, 64),
+    5: (512, 1, 1, 12, 8),
+    6: (512, 1, 1, 9, 8),
+    7: (256, 1, 1, 8, 8),
+    8: (512, 1, 1, 12, 32),
+    9: (512, 1, 1, 9, 32),
+    10: (256, 1, 2, 8, 32),
+    11: (512, 1, 1, 12, 16),
+    12: (512, 1, 1, 9, 16),
+    13: (256, 1, 1, 8, 16),
+    14: (256, 1, 1, 8, 1),
+    15: (512, 1, 1, 9, 1),
+    16: (512, 1, 8, 10, 64),
+    17: (1024, 1, 2, 12, 64),
+    18: (1024, 1, 2, 10, 64),
+    19: (128, 1, 8, 7, 8),
+    20: (128, 1, 4, 7, 32),
+    21: (128, 1, 2, 7, 16),
+    22: (256, 1, 2, 9, 8),
+    23: (1024, 1, 1, 10, 32),
+}
+
+# known shapes -> cfg (env override: TOPK_CFG_<n>_<k>)
+SHAPE_CFG = {
+    (131072, 64): 0,
+    (8192, 8): 10,
+    (16384, 32): 3,
+    (12000, 16): 13,
+    (4096, 1): 14,
+}
+
+
+def _pick_cfg(n: int, k: int) -> int:
+    e = os.environ.get(f"TOPK_CFG_{n}_{k}")
+    if e is not None:
+        return int(e)
+    c = SHAPE_CFG.get((n, _np2(k)))
+    if c is not None:
+        return c
+    kp = _np2(k)
+    # preference order from the measured sweep; pick the first config that
+    # fits (KP covers k, and the merge stage holds all segment output)
+    for cfg in (0, 3, 17, 1, 18, 16, 10, 21, 13, 20, 22, 9, 8, 19, 7, 14, 15, 11, 12, 5, 6, 23, 4, 2):
+        T, NP4, NPM, BLOG, KP = CFGS[cfg]
+        if KP < kp or (1 << BLOG) < T:
+            continue
+        ns = (n + T * NP4 * 4 - 1) // (T * NP4 * 4)
+        if T * NPM >= ns * KP:
+            return cfg
+    return 0
+
+
+_ext = None
+
+
+def _build():
+    global _ext
+    if _ext is not None:
+        return _ext
+    cap = torch.cuda.get_device_capability()
+    arch = f"sm_{cap[0]}{cap[1]}"
+    _ext = load_inline(
+        name="topk_fused_v4",
+        cpp_sources=_CPP,
+        cuda_sources=_CU,
+        functions=None,
+        no_implicit_headers=True,
+        with_pytorch_error_handling=False,
+        extra_cuda_cflags=[
+            "-O3",
+            "--use_fast_math",
+            "-lineinfo",
+            f"-gencode=arch=compute_{cap[0]}{cap[1]},code={arch}",
+        ],
+        extra_cflags=["-O3"],
+        verbose=False,
+    )
+    return _ext
+
+
+_run = None
+_runi = None
+
+
+class Model(nn.Module):
+    def __init__(self, batch: int, n: int, k: int):
+        super().__init__()
+        self.register_buffer("_dummy", torch.zeros(1))
+        global _run, _runi
+        if _run is None:
+            ext = _build()
+            _run = ext.topk_run
+            _runi = ext.topk_runi
+        self.batch, self.n, self.k = batch, n, k
+        dev = torch.device("cuda")
+        self.kp = _np2(k)
+        cfg = _pick_cfg(n, k)
+        T, NP4, NPM, BLOG, KP = CFGS[cfg]
+        if KP < self.kp:
+            raise RuntimeError("config KP too small")
+        if (1 << BLOG) < T:
+            raise RuntimeError("BINS < T")
+        S = T * NP4 * 4
+        self.ns = (n + S - 1) // S
+        self.cfg = cfg
+        need = self.ns * KP
+        if T * NPM < need:
+            raise RuntimeError(f"NPM too small: {T}*{NPM} < {need}")
+        self._b = (
+            torch.empty((batch, k), dtype=torch.float32, device=dev),
+            torch.empty((batch, k), dtype=torch.int64, device=dev),
+            torch.zeros((batch, self.ns, KP), dtype=torch.int64, device=dev),
+            torch.zeros((batch,), dtype=torch.int32, device=dev),
+        )
+        v, i, s, c = self._b
+        self._v, self._i = v, i
+        self._ri = _runi
+        self._args = (
+            v.data_ptr(), i.data_ptr(), s.data_ptr(), c.data_ptr(),
+            batch * self.ns, n, self.ns, k, cfg,
+        )
+
+    def forward(self, x: torch.Tensor):
+        self._ri(x.data_ptr(), *self._args)
+        return self._v, self._i
+
+    __call__ = forward

@@ -1,0 +1,460 @@
+"""DeepSeek NSA-inspired sparse attention — hand-written CUDA for RTX PRO 6000 (SM120).
+
+Bench semantics (identical to reference.nsa_attend):
+  per query t: score keys causally, rank 64-key blocks by mean score, take top-8,
+  union with the last-64-token sliding window, softmax-attend over that key set.
+
+Implementation notes
+--------------------
+Block importance = mean_{j in block, j<=t} (q_t.k_j)/sqrt(D)
+                 = q_t . (sum_{j} k_j) / cnt / sqrt(D),
+so scoring needs one dot per (query, block) against a *precomputed block key
+prefix-sum* table instead of O(S) per-query work:
+  P[bh, bi, m, :] = sum_{j<=m} k[bi*64+j]   (fp32)
+Fully-causal blocks use m=63; the diagonal block uses m = t - bi*64 (causal
+prefix), which reproduces the reference's causal-only mean exactly.
+
+Kernel A: builds P (coalesced fp32 writes, one CTA per (bh, block)).
+Kernel B: fused select + sparse attention, one CTA per 128 queries of a (b,h),
+one warp per query (small shared footprint -> many CTAs per SM, which matters
+because the kernel is latency-bound):
+  - stage Q as fp32 in shared memory
+  - phase 1: per-query importance dots against P rows -> shared scratch,
+    iterative warp argmax extracts the top-8 block ids
+  - sliding-window blocks merge in; entries coming only from the window are
+    clipped to start at w0 so the attended key set equals the reference union
+    exactly (no double counting when a window block is also a top block)
+  - phase 3: online (streaming) softmax over the <=10 chosen segments; QK dots
+    are lane-per-key with full-row uint4 bf16 loads, PV keeps two independent
+    FMA accumulator chains per dim pair (latency hiding), probs broadcast
+    through shuffles
+
+Everything accumulates in fp32 from the same bf16 inputs the oracle casts to
+fp32, so results track the reference well inside the 0.1 tolerance.
+"""
+from __future__ import annotations
+
+import math
+
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+OP_TYPE = "deepseek_nsa"
+SUPPORTED_PRECISIONS = ["bf16"]
+HARDWARE_REQUIRED = ["RTX_PRO_6000"]
+
+B, H, S, D = 1, 16, 1024, 64
+BLOCK_SIZE = 64
+TOP_N_BLOCKS = 8
+SLIDING_WINDOW = 64
+
+_CUDA_SRC = r"""
+#include <torch/extension.h>
+#include <ATen/cuda/CUDAContext.h>
+#include <cuda_bf16.h>
+#include <cmath>
+
+#define NWA 8          // warps per CTA
+#define TPQ 128        // queries per CTA
+#define BSZ 64         // NSA block size
+#define TOPN 8         // blocks kept by importance
+#define WINSZ 64       // sliding window
+#define MAXSEL (TOPN + 2)
+
+// ---------------------------------------------------------------------------
+// Kernel A: block key prefix sums.
+//   P[(bh*NB + bi)*BSZ*D + m*D + d] = sum_{j<=m} K[bh, bi*BSZ+j, d]
+// ---------------------------------------------------------------------------
+__global__ void nsa_prefix_kernel(const __nv_bfloat16* __restrict__ K,
+                                  float* __restrict__ P,
+                                  int S, int D, int NB, int BH)
+{
+    const int bi = blockIdx.x;
+    const int bh = blockIdx.y;
+    const int d  = threadIdx.x;
+    if (d >= D) return;
+
+    const int valid = min(BSZ, S - bi * BSZ);
+    const __nv_bfloat16* kbase = K + ((size_t)bh * S + (size_t)bi * BSZ) * D;
+    float* pbase = P + ((size_t)(bh * NB + bi) * BSZ) * D;
+
+    float acc = 0.f;
+    for (int m = 0; m < BSZ; ++m) {
+        if (m < valid) acc += __bfloat162float(kbase[(size_t)m * D + d]);
+        pbase[(size_t)m * D + d] = acc;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Warp reductions (full-warp, converged call sites only).
+// ---------------------------------------------------------------------------
+__device__ __forceinline__ float warp_sum(float v) {
+    #pragma unroll
+    for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
+    return v;
+}
+__device__ __forceinline__ float warp_max(float v) {
+    #pragma unroll
+    for (int o = 16; o > 0; o >>= 1) v = fmaxf(v, __shfl_xor_sync(0xffffffffu, v, o));
+    return v;
+}
+// Arg-max keeping the smallest index on ties; result replicated on all lanes.
+__device__ __forceinline__ void warp_argmin_idx(float v, int idx, float& bv, int& bidx) {
+    #pragma unroll
+    for (int o = 16; o > 0; o >>= 1) {
+        const float ov = __shfl_xor_sync(0xffffffffu, v, o);
+        const int   oi = __shfl_xor_sync(0xffffffffu, idx, o);
+        if (ov > v || (ov == v && oi < idx)) { v = ov; idx = oi; }
+    }
+    bv = v; bidx = idx;
+}
+
+// ---------------------------------------------------------------------------
+// Kernel B: fused importance scoring + top-n select + sparse attention.
+// GC = ceil(D/64): each lane owns the dim pair {g*64 + 2*lane, +1} within every
+// 64-dim half, so all D dims are covered exactly once (guards trim odd tails).
+//
+// Shared layout (floats): q_sm[NWA*D] | imp[NWA*sp],  sp = NB + 1 (padding
+// keeps per-warp importance rows bank-spread).
+// ---------------------------------------------------------------------------
+template <int GC>
+__global__ void __launch_bounds__(NWA * 32)
+nsa_attend_kernel(const __nv_bfloat16* __restrict__ Q,
+                  const __nv_bfloat16* __restrict__ K,
+                  const __nv_bfloat16* __restrict__ V,
+                  const float*         __restrict__ P,
+                  __nv_bfloat16*       __restrict__ O,
+                  int S, int D, int NB, float scale)
+{
+    extern __shared__ float smem[];
+    const int sp = NB + 1;
+    const int tx   = threadIdx.x;
+    const int wid  = tx >> 5;
+    const int lane = tx & 31;
+    float* q_sm = smem + (size_t)wid * D;              // this warp's query row
+    float* imp  = smem + (size_t)NWA * D + (size_t)wid * sp;
+
+    const int bh = blockIdx.y;
+    const int t0 = blockIdx.x * TPQ;
+
+    const size_t bhOff = (size_t)bh * S * D;
+    const __nv_bfloat16* Kb = K + bhOff;
+    const __nv_bfloat16* Vb = V + bhOff;
+    const float* Pb = P + (size_t)bh * NB * BSZ * D;
+
+    for (int ti = wid; ti < TPQ; ti += NWA) {
+        const int t = t0 + ti;
+        if (t >= S) break;
+        const size_t qoff = bhOff + (size_t)t * D;
+
+        // ---- stage q (fp32) ----
+        for (int i = lane; i < D; i += 32) q_sm[i] = __bfloat162float(Q[qoff + i]);
+        __syncwarp();
+
+        const int diag = t / BSZ;
+        const int nv   = diag + 1;                 // blocks 0..diag are causal
+        const int mdg  = t - diag * BSZ + 1;       // causal keys in diagonal block
+        const int w0   = max(0, t + 1 - WINSZ);    // sliding window start
+        const float f_bl = scale / (float)BSZ;
+        const float f_dg = scale / (float)mdg;
+
+        // lane's fixed q values (dim pairs per 64-dim half) for phase 1
+        // (skipped entirely when every causal block makes the top-N anyway)
+        if (nv > TOPN) {
+            float qr[GC][2];
+            #pragma unroll
+            for (int g = 0; g < GC; ++g) {
+                const int d0 = g * 64 + 2 * lane;
+                qr[g][0] = (d0     < D) ? q_sm[d0]     : 0.f;
+                qr[g][1] = (d0 + 1 < D) ? q_sm[d0 + 1] : 0.f;
+            }
+
+            // ---- phase 1: block importances ----
+            for (int bi = 0; bi < nv; ++bi) {
+                const bool full = (bi < diag);
+                const float* row = Pb + (size_t)bi * BSZ * D
+                                 + (size_t)(full ? BSZ - 1 : mdg - 1) * D;
+                float a = 0.f;
+                #pragma unroll
+                for (int g = 0; g < GC; ++g) {
+                    const int d0 = g * 64 + 2 * lane;
+                    if (d0 < D) {
+                        const float r0 = row[d0];
+                        const float r1 = (d0 + 1 < D) ? row[d0 + 1] : 0.f;
+                        a = fmaf(qr[g][0], r0, a);
+                        a = fmaf(qr[g][1], r1, a);
+                    }
+                }
+                imp[bi] = warp_sum(a) * (full ? f_bl : f_dg);
+            }
+            __syncwarp();   // imp writes must be visible across lanes before scanning
+        }
+
+        // ---- phase 2: top-N selection ----
+        // All sel_* indices are unroll-time constants so the arrays live in
+        // registers instead of spilling to local memory.
+        int  sel_id[MAXSEL];
+        int  sel_lo[MAXSEL];
+        bool sel_ok[MAXSEL];       // slot holds a real segment
+        #pragma unroll
+        for (int i = 0; i < MAXSEL; ++i) sel_ok[i] = false;
+
+        if (nv <= TOPN) {
+            // all causal blocks are selected; scoring would not change the set
+            #pragma unroll
+            for (int bi = 0; bi < TOPN; ++bi)
+                if (bi < nv) { sel_id[bi] = bi; sel_lo[bi] = bi * BSZ; sel_ok[bi] = true; }
+        } else {
+            #pragma unroll
+            for (int kk = 0; kk < TOPN; ++kk) {
+                float best = -INFINITY; int bidx = lane;
+                for (int i = lane; i < nv; i += 32) {
+                    const float v = imp[i];
+                    if (v > best) { best = v; bidx = i; }
+                }
+                float bv; int bid;
+                warp_argmin_idx(best, bidx, bv, bid);
+                sel_id[kk] = bid; sel_lo[kk] = bid * BSZ; sel_ok[kk] = true;
+                if (lane == 0) imp[bid] = -INFINITY;
+                __syncwarp();
+            }
+        }
+        // window blocks (clipped to w0 unless already picked as a top block)
+        const int wb0 = w0 / BSZ;
+        #pragma unroll
+        for (int c = 0; c < 2; ++c) {
+            const int cand = c ? diag : wb0;
+            sel_id[TOPN + c] = cand;
+            sel_lo[TOPN + c] = max(cand * BSZ, w0);
+            bool dup = false;
+            #pragma unroll
+            for (int i = 0; i < TOPN + c; ++i)   // include earlier window slot
+                dup = dup || (sel_ok[i] && sel_id[i] == cand);
+            sel_ok[TOPN + c] = !dup;
+        }
+
+        // ---- phase 3: online softmax over selected segments ----
+        float m_run = -INFINITY, l_run = 0.f;
+        float acA[GC][2], acB[GC][2];              // two independent FMA chains
+        #pragma unroll
+        for (int g = 0; g < GC; ++g) {
+            acA[g][0] = 0.f; acA[g][1] = 0.f;
+            acB[g][0] = 0.f; acB[g][1] = 0.f;
+        }
+
+        #pragma unroll
+        for (int e = 0; e < MAXSEL; ++e) {
+            if (!sel_ok[e]) continue;
+            const int lo = sel_lo[e];
+            const int hi = min(sel_id[e] * BSZ + BSZ, t + 1);
+            for (int j0 = lo; j0 < hi; j0 += 32) {
+                const int jj = j0 + lane;
+                const bool val = (jj < hi);
+                float s = -INFINITY;
+                if (val) {
+                    const uint4* kr = reinterpret_cast<const uint4*>(Kb + (size_t)jj * D);
+                    float s0 = 0.f, s1 = 0.f, s2 = 0.f, s3 = 0.f;
+                    #pragma unroll
+                    for (int c = 0; c < GC * 8; ++c) {      // 8 dims per chunk
+                        if (c * 8 < D) {
+                            const uint4 kvu = kr[c];
+                            const __nv_bfloat162* kp = reinterpret_cast<const __nv_bfloat162*>(&kvu);
+                            const float2 fa = __bfloat1622float2(kp[0]);
+                            const float2 fb = __bfloat1622float2(kp[1]);
+                            const float2 fc = __bfloat1622float2(kp[2]);
+                            const float2 fd = __bfloat1622float2(kp[3]);
+                            s0 = fmaf(fa.x, q_sm[c*8+0], s0); s0 = fmaf(fa.y, q_sm[c*8+1], s0);
+                            s1 = fmaf(fb.x, q_sm[c*8+2], s1); s1 = fmaf(fb.y, q_sm[c*8+3], s1);
+                            s2 = fmaf(fc.x, q_sm[c*8+4], s2); s2 = fmaf(fc.y, q_sm[c*8+5], s2);
+                            s3 = fmaf(fd.x, q_sm[c*8+6], s3); s3 = fmaf(fd.y, q_sm[c*8+7], s3);
+                        }
+                    }
+                    s = (s0 + s1 + s2 + s3) * scale;
+                }
+                const float mc  = warp_max(val ? s : -INFINITY);
+                const float mn  = fmaxf(m_run, mc);
+                const float alpha = __expf(m_run - mn);
+                const float p   = val ? __expf(s - mn) : 0.f;
+                l_run = l_run * alpha + warp_sum(p);
+                m_run = mn;
+                #pragma unroll
+                for (int g = 0; g < GC; ++g) {
+                    acA[g][0] *= alpha; acA[g][1] *= alpha;
+                    acB[g][0] *= alpha; acB[g][1] *= alpha;
+                }
+                // PV: probs broadcast by shuffle, two keys in flight per step
+                #pragma unroll
+                for (int kk = 0; kk < 32; kk += 2) {
+                    const float pk0 = __shfl_sync(0xffffffffu, p, kk);
+                    const float pk1 = __shfl_sync(0xffffffffu, p, kk + 1);
+                    const int ja = j0 + kk, jb = j0 + kk + 1;
+                    #pragma unroll
+                    for (int g = 0; g < GC; ++g) {
+                        const int d0 = g * 64 + 2 * lane;
+                        if (d0 < D) {
+                            if (ja < hi) {
+                                const __nv_bfloat162 vb =
+                                    *reinterpret_cast<const __nv_bfloat162*>(Vb + (size_t)ja * D + d0);
+                                const float2 vf = __bfloat1622float2(vb);
+                                acA[g][0] = fmaf(pk0, vf.x, acA[g][0]);
+                                acA[g][1] = fmaf(pk0, vf.y, acA[g][1]);
+                            }
+                            if (jb < hi) {
+                                const __nv_bfloat162 vb =
+                                    *reinterpret_cast<const __nv_bfloat162*>(Vb + (size_t)jb * D + d0);
+                                const float2 vf = __bfloat1622float2(vb);
+                                acB[g][0] = fmaf(pk1, vf.x, acB[g][0]);
+                                acB[g][1] = fmaf(pk1, vf.y, acB[g][1]);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // ---- epilogue ----
+        const float li = 1.f / l_run;
+        #pragma unroll
+        for (int g = 0; g < GC; ++g) {
+            const int d0 = g * 64 + 2 * lane;
+            if (d0 < D) {
+                __nv_bfloat162 ob;
+                ob.x = __float2bfloat16((acA[g][0] + acB[g][0]) * li);
+                ob.y = __float2bfloat16((acA[g][1] + acB[g][1]) * li);
+                *reinterpret_cast<__nv_bfloat162*>(O + qoff + d0) = ob;
+            }
+        }
+        __syncwarp();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Host entry
+// ---------------------------------------------------------------------------
+torch::Tensor nsa_forward(torch::Tensor q, torch::Tensor k, torch::Tensor v)
+{
+    TORCH_CHECK(q.is_cuda() && k.is_cuda() && v.is_cuda(), "cuda tensors required");
+    TORCH_CHECK(q.scalar_type() == torch::kBFloat16, "q/k/v must be bf16");
+    auto qc = q.contiguous();
+    auto kc = k.contiguous();
+    auto vc = v.contiguous();
+
+    const int B = qc.size(0), H = qc.size(1), Sn = qc.size(2), Dn = qc.size(3);
+    TORCH_CHECK(kc.sizes() == qc.sizes() && vc.sizes() == qc.sizes(), "shape mismatch");
+    const int BH = B * H;
+    const int NB = (Sn + BSZ - 1) / BSZ;
+
+    auto O = torch::empty_like(qc);
+    auto opts = qc.options().dtype(torch::kFloat32);
+    auto P = torch::empty({(long)BH, (long)NB, (long)BSZ, (long)Dn}, opts);
+
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    const float scale = 1.0f / std::sqrt((float)Dn);
+
+    {
+        dim3 grid(NB, BH);
+        int thr = ((Dn + 31) / 32) * 32;
+        nsa_prefix_kernel<<<grid, thr, 0, stream>>>(
+            reinterpret_cast<const __nv_bfloat16*>(kc.data_ptr()),
+            P.data_ptr<float>(), Sn, Dn, NB, BH);
+    }
+
+    const size_t smem = ((size_t)NWA * (Dn + NB + 1)) * sizeof(float);
+    TORCH_CHECK(smem <= 48 * 1024, "shared memory requirement too large");
+
+    dim3 grid((Sn + TPQ - 1) / TPQ, BH);
+    dim3 block(NWA * 32);
+    const __nv_bfloat16* qp = reinterpret_cast<const __nv_bfloat16*>(qc.data_ptr());
+    const __nv_bfloat16* kp = reinterpret_cast<const __nv_bfloat16*>(kc.data_ptr());
+    const __nv_bfloat16* vp = reinterpret_cast<const __nv_bfloat16*>(vc.data_ptr());
+    __nv_bfloat16* op = reinterpret_cast<__nv_bfloat16*>(O.data_ptr());
+
+    switch (Dn) {
+        case 64:  nsa_attend_kernel<1><<<grid, block, smem, stream>>>(qp, kp, vp, P.data_ptr<float>(), op, Sn, Dn, NB, scale); break;
+        case 128: nsa_attend_kernel<2><<<grid, block, smem, stream>>>(qp, kp, vp, P.data_ptr<float>(), op, Sn, Dn, NB, scale); break;
+        default:  TORCH_CHECK(false, "unsupported head dim (use 64 or 128)");
+    }
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return O;
+}
+"""
+
+_CPP_SRC = "torch::Tensor nsa_forward(torch::Tensor q, torch::Tensor k, torch::Tensor v);"
+
+_ext = None
+
+
+def _get_ext():
+    global _ext
+    if _ext is None:
+        _ext = load_inline(
+            name="nsa_p6000_v7",
+            cpp_sources=[_CPP_SRC],
+            cuda_sources=[_CUDA_SRC],
+            functions=["nsa_forward"],
+            extra_cuda_cflags=["-O3", "--use_fast_math", "-lineinfo"],
+            verbose=False,
+        )
+    return _ext
+
+
+def _nsa_fallback(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+    """Slow pure-torch path for head dims the CUDA kernels do not cover."""
+    qf, kf, vf = q.float(), k.float(), v.float()
+    Bh, Hn, Sn, Dn = qf.shape
+    scale = 1.0 / math.sqrt(Dn)
+    nb = (Sn + BLOCK_SIZE - 1) // BLOCK_SIZE
+    out = torch.zeros_like(qf)
+    for b in range(Bh):
+        for h in range(Hn):
+            sc_all = (qf[b, h] @ kf[b, h].transpose(0, 1)) * scale  # (S, S)
+            for t in range(Sn):
+                scores = sc_all[t, : t + 1]
+                imps = []
+                for bi in range(nb):
+                    s0 = bi * BLOCK_SIZE
+                    if s0 > t:
+                        continue
+                    s1 = min(s0 + BLOCK_SIZE, t + 1)
+                    imps.append((float(scores[s0:s1].mean()), bi))
+                imps.sort(reverse=True)
+                sel: set[int] = set()
+                for _, bi in imps[:TOP_N_BLOCKS]:
+                    s0 = bi * BLOCK_SIZE
+                    sel.update(range(s0, min(s0 + BLOCK_SIZE, t + 1)))
+                sel.update(range(max(0, t + 1 - SLIDING_WINDOW), t + 1))
+                idx = torch.tensor(sorted(sel), device=q.device, dtype=torch.long)
+                att = torch.softmax(scores.index_select(0, idx), dim=-1)
+                out[b, h, t] = att @ vf[b, h].index_select(0, idx)
+    return out
+
+
+class Model(nn.Module):
+    def __init__(self, B: int, H: int, S: int, D: int):
+        super().__init__()
+        self.B, self.H, self.S, self.D = B, H, S, D
+        self.register_buffer("_dummy", torch.zeros(1, dtype=torch.bfloat16))
+
+    def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+        d = q.size(-1)
+        s = q.size(-2)
+        if (
+            q.dtype != torch.bfloat16
+            or q.device.type != "cuda"
+            or d not in (64, 128)
+            or s > 16000   # shared-memory tile limit of the CUDA path
+        ):
+            return _nsa_fallback(q, k, v).to(torch.bfloat16)
+        return _get_ext().nsa_forward(q, k, v)
+
+
+def get_init_inputs():
+    return [B, H, S, D]
+
+
+def get_inputs():
+    q = torch.randn(B, H, S, D, dtype=torch.bfloat16)
+    k = torch.randn(B, H, S, D, dtype=torch.bfloat16)
+    v = torch.randn(B, H, S, D, dtype=torch.bfloat16)
+    return [q, k, v]

@@ -1,0 +1,878 @@
+"""Cooperative megakernel decode for Qwen3-0.6B geometry on RTX PRO 6000 (SM120).
+
+One persistent cooperative kernel per decode_steps() call runs the whole
+n_steps x num_layers chain internally:
+
+  per layer, 5 phases separated by a lightweight device-scope barrier:
+    QKV   full-grid matvec (4096 rows) + fused input RMSNorm (redundant per CTA)
+          + x_t mixing folded into phase entry (zero extra barriers)
+    ATTN  16 q-heads x C position-chunks online-softmax partials; the current
+          position is folded in from raw k/v scratch (no cache race); spare CTAs
+          write roped k / v into the cache and prefetch MLP weights into L2
+    O     chunk combine (per head, warp-per-head) + o_proj + residual
+    U     post RMSNorm (redundant) + gate/up + silu*mul
+    DOWN  down proj + residual -> bf16 hidden
+
+Key wins over the MegaQwen baseline: 5 barriers/layer instead of ~9, full-grid
+participation in every phase, split-context flash-decoding attention (baseline
+scans the whole cache with 16 CTAs), one kernel launch for all steps instead of
+per-token launches, and a packed weight buffer pinned in a persisting-L2 window
+(126 MB weights fit the 134 MB L2).
+
+Numerics mirror reference.py: fp32 math everywhere, bf16 rounding at layer
+boundaries and KV-cache writes, same RoPE pairing, same RNG protocol.
+"""
+from __future__ import annotations
+
+import math
+import os
+
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+OP_TYPE = "megaqwen_decode"
+SUPPORTED_PRECISIONS = ["bf16"]
+HARDWARE_REQUIRED = ["RTX_PRO_6000"]
+
+HIDDEN = 1024
+INTERMEDIATE = 3072
+NUM_Q = 16
+NUM_KV = 8
+HEAD_DIM = 128
+NUM_LAYERS = 4
+EPS = 1e-6
+
+os.environ.setdefault("TORCH_CUDA_ARCH_LIST", "12.0")
+
+_CPP_SRC = r"""
+#include <torch/extension.h>
+#include <ATen/cuda/CUDAContext.h>
+#include <vector>
+
+#define MAX_L 8
+
+struct KParams {
+    const __nv_bfloat16* __restrict__ w;
+    const __nv_bfloat16* __restrict__ kc[MAX_L];
+    const __nv_bfloat16* __restrict__ vc[MAX_L];
+    const __nv_bfloat16* __restrict__ xrand;
+    const __nv_bfloat16* __restrict__ h_in;
+    const float* __restrict__ invf;
+    float* __restrict__ qraw;
+    float* __restrict__ kraw;
+    float* __restrict__ vraw;
+    float* __restrict__ ubuf;
+    float* __restrict__ hnew;
+    float* __restrict__ part;
+    float* __restrict__ sink;
+    __nv_bfloat16* __restrict__ xbuf;
+    __nv_bfloat16* __restrict__ ybuf;
+    unsigned long long* __restrict__ prof;   // optional phase timestamps
+    int n_steps;
+    int start_pos;
+    int max_seq;
+    int num_layers;
+    float scale;
+};
+
+struct BarrierState {
+    int count;
+    unsigned int gen;
+};
+
+void launch_decode(const KParams& p, BarrierState* bar, long grid_req, long stream_ptr);
+void setup_l2(long w_ptr, long nbytes);
+
+static const float* t_fp32(const torch::Tensor& t) { return (const float*)t.data_ptr(); }
+static float* t_fp32m(torch::Tensor& t) { return (float*)t.data_ptr(); }
+static const __nv_bfloat16* t_bf16(const torch::Tensor& t) { return (const __nv_bfloat16*)t.data_ptr(); }
+static __nv_bfloat16* t_bf16m(torch::Tensor& t) { return (__nv_bfloat16*)t.data_ptr(); }
+
+void decode_bind(
+    torch::Tensor w,
+    std::vector<int64_t> kc, std::vector<int64_t> vc,
+    torch::Tensor xrand, torch::Tensor h_in, torch::Tensor invf,
+    torch::Tensor qraw, torch::Tensor kraw, torch::Tensor vraw,
+    torch::Tensor ubuf, torch::Tensor hnew, torch::Tensor part,
+    torch::Tensor sink, torch::Tensor xbuf, torch::Tensor ybuf,
+    torch::Tensor prof, torch::Tensor bar,
+    int64_t n_steps, int64_t start_pos, int64_t max_seq, int64_t num_layers,
+    double scale, int64_t grid_req)
+{
+    TORCH_CHECK(num_layers <= MAX_L, "num_layers too large");
+    KParams p{};
+    p.w = t_bf16(w);
+    for (int i = 0; i < num_layers; i++) {
+        p.kc[i] = (const __nv_bfloat16*)kc[i];
+        p.vc[i] = (const __nv_bfloat16*)vc[i];
+    }
+    p.xrand = t_bf16(xrand);
+    p.h_in = t_bf16(h_in);
+    p.invf = t_fp32(invf);
+    p.qraw = t_fp32m(qraw);
+    p.kraw = t_fp32m(kraw);
+    p.vraw = t_fp32m(vraw);
+    p.ubuf = t_fp32m(ubuf);
+    p.hnew = t_fp32m(hnew);
+    p.part = t_fp32m(part);
+    p.sink = t_fp32m(sink);
+    p.xbuf = t_bf16m(xbuf);
+    p.ybuf = t_bf16m(ybuf);
+    p.prof = prof.numel() > 0 ? (unsigned long long*)prof.data_ptr() : nullptr;
+    p.n_steps = (int)n_steps;
+    p.start_pos = (int)start_pos;
+    p.max_seq = (int)max_seq;
+    p.num_layers = (int)num_layers;
+    p.scale = (float)scale;
+    launch_decode(p, (BarrierState*)bar.data_ptr(), grid_req,
+                  (long)c10::cuda::getCurrentCUDAStream().stream());
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("decode_bind", &decode_bind, "fused cooperative decode");
+    m.def("setup_l2", [](long w_ptr, long nbytes) { setup_l2(w_ptr, nbytes); }, "pin L2 window");
+}
+"""
+
+_CU_SRC = r"""
+#include <cuda_bf16.h>
+#include <cuda_runtime.h>
+#include <cuda/atomic>
+#include <torch/extension.h>
+#include <ATen/cuda/CUDAContext.h>
+
+#define H 1024
+#define I 3072
+#define HQ 16
+#define HKV 8
+#define D 128
+#define NQ (HQ * D)
+#define NKV (HKV * D)
+#define EPSF 1e-6f
+#define MAXL 8
+#define CMAX 32
+
+constexpr long OFF_Q = 0;
+constexpr long OFF_K = OFF_Q + (long)NQ * H;
+constexpr long OFF_V = OFF_K + (long)NKV * H;
+constexpr long OFF_O = OFF_V + (long)NKV * H;
+constexpr long OFF_G = OFF_O + (long)H * NQ;
+constexpr long OFF_U = OFF_G + (long)I * H;
+constexpr long OFF_DN = OFF_U + (long)I * H;
+constexpr long OFF_LN = OFF_DN + (long)H * I;
+constexpr long OFF_PLN = OFF_LN + H;
+constexpr long OFF_QNW = OFF_PLN + H;
+constexpr long OFF_KNW = OFF_QNW + D;
+constexpr long LSTRIDE = OFF_KNW + D;
+
+struct KParams {
+    const __nv_bfloat16* __restrict__ w;
+    const __nv_bfloat16* __restrict__ kc[MAXL];
+    const __nv_bfloat16* __restrict__ vc[MAXL];
+    const __nv_bfloat16* __restrict__ xrand;
+    const __nv_bfloat16* __restrict__ h_in;
+    const float* __restrict__ invf;
+    float* __restrict__ qraw;
+    float* __restrict__ kraw;
+    float* __restrict__ vraw;
+    float* __restrict__ ubuf;
+    float* __restrict__ hnew;
+    float* __restrict__ part;
+    float* __restrict__ sink;
+    __nv_bfloat16* __restrict__ xbuf;
+    __nv_bfloat16* __restrict__ ybuf;
+    unsigned long long* __restrict__ prof;   // optional phase timestamps
+    int n_steps;
+    int start_pos;
+    int max_seq;
+    int num_layers;
+    float scale;
+};
+
+struct BarrierState {
+    int count;
+    unsigned int gen;
+};
+
+__device__ __forceinline__ unsigned long long gtime_ns() {
+    unsigned long long t;
+    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
+    return t;
+}
+
+// Device-wide barrier: arrive with release, spin on generation with acquire.
+// The last arriver resets count before bumping gen, so state is clean for reuse.
+__device__ __forceinline__ void bsync(BarrierState* b, int expected) {
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        cuda::atomic_ref<int, cuda::thread_scope_device> cnt(b->count);
+        cuda::atomic_ref<unsigned int, cuda::thread_scope_device> gen(b->gen);
+        unsigned int g = gen.load(cuda::memory_order_relaxed);
+        if (cnt.fetch_add(1, cuda::memory_order_acq_rel) == expected - 1) {
+            cnt.store(0, cuda::memory_order_relaxed);
+            gen.store(g + 1u, cuda::memory_order_release);
+        } else {
+            while (gen.load(cuda::memory_order_acquire) == g) {
+                __nanosleep(64);
+            }
+        }
+    }
+    __syncthreads();
+}
+
+__device__ __forceinline__ float block_reduce_sum(float v, float* red) {
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) v += __shfl_down_sync(0xffffffffu, v, o);
+    if (lane == 0) red[warp] = v;
+    __syncthreads();
+    if (warp == 0) {
+        v = (lane < 8) ? red[lane] : 0.f;
+#pragma unroll
+        for (int o = 4; o > 0; o >>= 1) v += __shfl_down_sync(0xffffffffu, v, o);
+        if (lane == 0) red[0] = v;
+    }
+    __syncthreads();
+    return red[0];
+}
+
+// Warp dot against a fp32 vector in smem. NIT is the exact per-lane iteration
+// count (ncols/256), known at compile time so all weight loads issue before
+// the reduction instead of serializing on cache latency.
+template <int NIT>
+__device__ __forceinline__ float rowdot_u(const __nv_bfloat16* __restrict__ wrow,
+                                          const float* __restrict__ x, int lane) {
+    const uint4* wv = reinterpret_cast<const uint4*>(wrow);
+    float s = 0.f;
+#pragma unroll
+    for (int j = 0; j < NIT; ++j) {
+        uint4 wq = wv[j * 32 + lane];
+        const __nv_bfloat162* wp = reinterpret_cast<const __nv_bfloat162*>(&wq);
+        const int c = (j * 32 + lane) << 3;
+        float2 f0 = __bfloat1622float2(wp[0]);
+        float2 f1 = __bfloat1622float2(wp[1]);
+        float2 f2 = __bfloat1622float2(wp[2]);
+        float2 f3 = __bfloat1622float2(wp[3]);
+        s += f0.x * x[c] + f0.y * x[c + 1] + f1.x * x[c + 2] + f1.y * x[c + 3] +
+             f2.x * x[c + 4] + f2.y * x[c + 5] + f3.x * x[c + 6] + f3.y * x[c + 7];
+    }
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) s += __shfl_down_sync(0xffffffffu, s, o);
+    return s;
+}
+
+__device__ __forceinline__ void rope_pair(float v, float pair, float ang, bool lo,
+                                          float& out) {
+    float cs_, sn_;
+    sincosf(ang, &sn_, &cs_);
+    // ref: out[:half] = x1*cos - x2*sin ; out[half:] = x1*sin + x2*cos
+    // (v = this dim, pair = its +/-half partner)
+    out = lo ? (v * cs_ - pair * sn_) : (pair * sn_ + v * cs_);
+}
+
+// Optional phase timestamps (prof buffer): CTA 0 records barrier-completion
+// times for the first few steps; disabled (nullptr) in normal runs.
+#define PROF_T(k)                                                            \
+    if (p.prof && cta == 0 && tid == 0 && s < 4)                             \
+        p.prof[(s * p.num_layers + l) * 5 + (k)] = gtime_ns();
+
+__global__ void __launch_bounds__(256)
+mega_decode(KParams p, BarrierState* bar) {
+    __shared__ float smem[3584];
+    const int G = gridDim.x;
+    const int tid = threadIdx.x;
+    const int warp = tid >> 5;
+    const int lane = tid & 31;
+    const int nw = blockDim.x >> 5;   // 8
+    const int cta = blockIdx.x;
+    const int gw = cta * nw + warp;
+    const int ngw = G * nw;
+
+    int C = (G - 8) / HQ;
+    C = max(1, min(C, CMAX));
+
+    for (int s = 0; s < p.n_steps; ++s) {
+        const int pos = p.start_pos + s;
+        const int seq = pos + 1;
+        const __nv_bfloat16* xr = p.xrand + (size_t)s * H;
+
+        for (int l = 0; l < p.num_layers; ++l) {
+            // Step entry feeds the mixed input; every other block consumes the
+            // previous block's bf16 output sitting in ybuf.
+            const __nv_bfloat16* yp = (s == 0 && l == 0) ? p.h_in : p.ybuf;
+            const __nv_bfloat16* W = p.w + (size_t)l * LSTRIDE;
+            __nv_bfloat16* kc = const_cast<__nv_bfloat16*>(p.kc[l]);
+            __nv_bfloat16* vc = const_cast<__nv_bfloat16*>(p.vc[l]);
+
+            // ---------------- Phase 1: mix + input RMSNorm + QKV matvec ------
+            // Mixing with the fresh randn happens only at step entry (layer 0);
+            // later layers consume the previous layer's bf16 output directly.
+            {
+                float* sx = smem;            // [H]
+                float ss = 0.f;
+                if (l == 0) {
+                    for (int i = tid; i < H; i += 256) {
+                        float rv = __bfloat162float(xr[i]);
+                        float yv = __bfloat162float(yp[i]);
+                        // Reference computes the mix in bf16 tensors, so both the
+                        // residual stream and the norm see the rounded value.
+                        __nv_bfloat16 xb = __float2bfloat16(0.5f * rv + 0.5f * yv);
+                        float v = __bfloat162float(xb);
+                        sx[i] = v;
+                        p.xbuf[i] = xb;
+                        ss += v * v;
+                    }
+                } else {
+                    for (int i = tid; i < H; i += 256) {
+                        float v = __bfloat162float(yp[i]);
+                        sx[i] = v;
+                        p.xbuf[i] = __float2bfloat16(v);
+                        ss += v * v;
+                    }
+                }
+                ss = block_reduce_sum(ss, smem + H);
+                const float rstd = rsqrtf(ss * (1.f / H) + EPSF);
+                for (int i = tid; i < H; i += 256)
+                    smem[i] *= rstd * __bfloat162float(W[OFF_LN + i]);
+                __syncthreads();
+
+                // q/k/v projections are contiguous in the packed buffer.
+                for (int row = gw; row < NQ + 2 * NKV; row += ngw) {
+                    const float o = rowdot_u<H / 256>(W + OFF_Q + (long)row * H,
+                                                      smem, lane);
+                    if (lane == 0) {
+                        if (row < NQ)
+                            p.qraw[row] = o;
+                        else if (row < NQ + NKV)
+                            p.kraw[row - NQ] = o;
+                        else
+                            p.vraw[row - NQ - NKV] = o;
+                    }
+                }
+            }
+            bsync(bar, G);
+            PROF_T(0)
+
+            // ---------------- Phase 2: attention ------------------------------
+            if (cta < HQ * C) {
+                const int h = cta / C;
+                const int c = cta % C;
+                const int kvh = h >> 1;
+                float* sq = smem;                 // [D]
+                float* sacc = smem + D;           // [8][D]
+                float* mslot = smem + D + 8 * D;  // [8]
+                float* lslot = mslot + 8;         // [8]
+                float* red = lslot + 8;           // [8]
+
+                // q RMSNorm + RoPE (redundant across sibling chunks), to smem
+                float ss = 0.f;
+                if (tid < D) {
+                    float qv = p.qraw[h * D + tid];
+                    ss = qv * qv;
+                }
+                ss = block_reduce_sum(ss, red);
+                const float rq = rsqrtf(ss * (1.f / D) + EPSF);
+                if (tid < D) {
+                    const int d = tid;
+                    const float qv = p.qraw[h * D + d] * rq * __bfloat162float(W[OFF_QNW + d]);
+                    const int d2 = (d < 64) ? d + 64 : d - 64;
+                    const float qp = p.qraw[h * D + d2] * rq * __bfloat162float(W[OFF_QNW + d2]);
+                    float out;
+                    rope_pair(qv, qp, (float)pos * p.invf[d & 63], d < 64, out);
+                    sq[d] = out;
+                }
+                __syncthreads();
+
+                const int db = lane << 2;
+                float q4[4];
+#pragma unroll
+                for (int j = 0; j < 4; j++) q4[j] = sq[db + j];
+
+                const int cs = (seq + C - 1) / C;
+                const int p0 = c * cs;
+                const int p1 = min(p0 + cs, pos);   // cached rows handled by scan
+                float m = -INFINITY, lsum = 0.f;
+                float acc[4] = {0.f, 0.f, 0.f, 0.f};
+                const __nv_bfloat16* kbase = kc + (size_t)kvh * p.max_seq * D;
+                const __nv_bfloat16* vbase = vc + (size_t)kvh * p.max_seq * D;
+
+                // Software-pipelined scan: k/v for position pp+8 are fetched
+                // while the current position computes, so the ~500ns cache
+                // latency overlaps instead of serializing per iteration.
+                uint2 k2 = make_uint2(0u, 0u), v2 = make_uint2(0u, 0u);
+                {
+                    const int pf = p0 + warp;
+                    if (pf < p1) {
+                        k2 = *reinterpret_cast<const uint2*>(kbase + (size_t)pf * D + db);
+                        v2 = *reinterpret_cast<const uint2*>(vbase + (size_t)pf * D + db);
+                    }
+                }
+                for (int pp = p0 + warp; pp < p1; pp += 8) {
+                    const uint2 kc2 = k2, vc2 = v2;
+                    const int pn = pp + 8;
+                    if (pn < p1) {
+                        k2 = *reinterpret_cast<const uint2*>(kbase + (size_t)pn * D + db);
+                        v2 = *reinterpret_cast<const uint2*>(vbase + (size_t)pn * D + db);
+                    }
+                    const __nv_bfloat162* kp = reinterpret_cast<const __nv_bfloat162*>(&kc2);
+                    float2 kf0 = __bfloat1622float2(kp[0]);
+                    float2 kf1 = __bfloat1622float2(kp[1]);
+                    float sc = q4[0] * kf0.x + q4[1] * kf0.y + q4[2] * kf1.x + q4[3] * kf1.y;
+#pragma unroll
+                    for (int o = 16; o > 0; o >>= 1)
+                        sc += __shfl_down_sync(0xffffffffu, sc, o);
+                    const float sb = __shfl_sync(0xffffffffu, sc, 0) * p.scale;
+
+                    const float mn = fmaxf(m, sb);
+                    const float corr = (mn == m) ? 1.f : expf(m - mn);
+                    const float e = expf(sb - mn);
+                    lsum = lsum * corr + e;
+                    const __nv_bfloat162* vp = reinterpret_cast<const __nv_bfloat162*>(&vc2);
+                    float2 vf0 = __bfloat1622float2(vp[0]);
+                    float2 vf1 = __bfloat1622float2(vp[1]);
+                    acc[0] = acc[0] * corr + e * vf0.x;
+                    acc[1] = acc[1] * corr + e * vf0.y;
+                    acc[2] = acc[2] * corr + e * vf1.x;
+                    acc[3] = acc[3] * corr + e * vf1.y;
+                    m = mn;
+                }
+
+                // Current position: fold in from raw scratch (fp32, pre-rounding).
+                if ((long)pos >= (long)c * cs && (long)pos < (long)(c + 1) * cs) {
+                    float ss2 = 0.f;
+                    if (tid < D) {
+                        float kv = p.kraw[kvh * D + tid];
+                        ss2 = kv * kv;
+                    }
+                    ss2 = block_reduce_sum(ss2, red);
+                    const float rk = rsqrtf(ss2 * (1.f / D) + EPSF);
+                    float part = 0.f;
+                    float vcur[4] = {0.f, 0.f, 0.f, 0.f};
+                    if (tid < D) {
+                        const int d = tid;
+                        const float kd = p.kraw[kvh * D + d] * rk * __bfloat162float(W[OFF_KNW + d]);
+                        const int d2 = (d < 64) ? d + 64 : d - 64;
+                        const float kp =
+                            p.kraw[kvh * D + d2] * rk * __bfloat162float(W[OFF_KNW + d2]);
+                        float kdo;
+                        rope_pair(kd, kp, (float)pos * p.invf[d & 63], d < 64, kdo);
+                        // Round to bf16 so the current-position term matches the
+                        // cache copy every later step reads (reference parity).
+                        part = sq[d] * __bfloat162float(__float2bfloat16(kdo));
+                    }
+                    part = block_reduce_sum(part, red);
+                    const float s_cur = part * p.scale;
+                    if (warp == 0) {
+#pragma unroll
+                        for (int j = 0; j < 4; j++)
+                            vcur[j] = __bfloat162float(
+                                __float2bfloat16(p.vraw[kvh * D + db + j]));
+                        const float mn = fmaxf(m, s_cur);
+                        const float corr = (mn == m) ? 1.f : expf(m - mn);
+                        const float e = expf(s_cur - mn);
+                        lsum = lsum * corr + e;
+#pragma unroll
+                        for (int j = 0; j < 4; j++) acc[j] = acc[j] * corr + e * vcur[j];
+                        m = mn;
+                    }
+                }
+
+                if (lane == 0) {
+                    mslot[warp] = m;
+                    lslot[warp] = lsum;
+                }
+#pragma unroll
+                for (int j = 0; j < 4; j++) sacc[warp * D + db + j] = acc[j];
+                __syncthreads();
+                if (warp == 0) {
+                    float M = -INFINITY;
+                    for (int w = 0; w < 8; w++)
+                        if (lslot[w] > 0.f) M = fmaxf(M, mslot[w]);
+                    float den = 0.f;
+                    float num[4] = {0.f, 0.f, 0.f, 0.f};
+                    for (int w = 0; w < 8; w++) {
+                        if (lslot[w] > 0.f) {
+                            const float we = expf(mslot[w] - M);
+                            den += lslot[w] * we;
+                            num[0] += sacc[w * D + db + 0] * we;
+                            num[1] += sacc[w * D + db + 1] * we;
+                            num[2] += sacc[w * D + db + 2] * we;
+                            num[3] += sacc[w * D + db + 3] * we;
+                        }
+                    }
+                    float* out = p.part + (size_t)(h * C + c) * (D + 2);
+                    if (lane == 0) {
+                        out[0] = M;
+                        out[1] = den;
+                    }
+                    out[2 + db + 0] = num[0];
+                    out[2 + db + 1] = num[1];
+                    out[2 + db + 2] = num[2];
+                    out[2 + db + 3] = num[3];
+                }
+            } else if (cta < HQ * C + HKV) {
+                // Cache writer: rope+norm current k into cache, plus v.
+                const int j = cta - HQ * C;
+                float ss = 0.f;
+                if (tid < D) {
+                    float kv = p.kraw[j * D + tid];
+                    ss = kv * kv;
+                }
+                ss = block_reduce_sum(ss, smem);
+                const float rk = rsqrtf(ss * (1.f / D) + EPSF);
+                if (tid < D) {
+                    const int d = tid;
+                    const float kd = p.kraw[j * D + d] * rk * __bfloat162float(W[OFF_KNW + d]);
+                    const int d2 = (d < 64) ? d + 64 : d - 64;
+                    const float kp =
+                        p.kraw[j * D + d2] * rk * __bfloat162float(W[OFF_KNW + d2]);
+                    float kdo;
+                    rope_pair(kd, kp, (float)pos * p.invf[d & 63], d < 64, kdo);
+                    kc[(size_t)(j * p.max_seq + pos) * D + d] = __float2bfloat16(kdo);
+                    vc[(size_t)(j * p.max_seq + pos) * D + d] =
+                        __float2bfloat16(p.vraw[j * D + d]);
+                }
+            }
+            // Spare CTAs (grid not fully consumed by head x chunk jobs) simply
+            // wait at the barrier; weights are kept hot by the persisting-L2
+            // window over the packed buffer, so speculative prefetch loses more
+            // phase latency than it saves.
+            bsync(bar, G);
+            PROF_T(1)
+
+            // ---------------- Phase 3: combine + o_proj + residual ------------
+            {
+                float* af = smem;  // [HQ*D]
+                for (int h = warp; h < HQ; h += 8) {
+                    const float* base = p.part + (size_t)h * C * (D + 2);
+                    float M = -INFINITY;
+                    for (int c = lane; c < C; c += 32) M = fmaxf(M, base[(size_t)c * (D + 2)]);
+#pragma unroll
+                    for (int o = 16; o > 0; o >>= 1)
+                        M = fmaxf(M, __shfl_xor_sync(0xffffffffu, M, o));
+                    const int db = lane << 2;
+                    float den = 0.f;
+                    float num[4] = {0.f, 0.f, 0.f, 0.f};
+                    for (int c = 0; c < C; c++) {
+                        const float Mc = base[(size_t)c * (D + 2)];
+                        if (Mc == -INFINITY) continue;
+                        const float we = expf(Mc - M);
+                        den += base[(size_t)c * (D + 2) + 1] * we;
+#pragma unroll
+                        for (int j = 0; j < 4; j++)
+                            num[j] += base[(size_t)c * (D + 2) + 2 + db + j] * we;
+                    }
+#pragma unroll
+                    for (int j = 0; j < 4; j++) af[h * D + db + j] = num[j] / den;
+                }
+                __syncthreads();
+
+                for (int row = gw; row < H; row += ngw) {
+                    const float o =
+                        rowdot_u<NQ / 256>(W + OFF_O + (long)row * NQ, af, lane);
+                    if (lane == 0)
+                        p.hnew[row] = o + __bfloat162float(p.xbuf[row]);
+                }
+            }
+            bsync(bar, G);
+            PROF_T(2)
+
+            // ---------------- Phase 4: post RMSNorm + gate/up + silu ----------
+            {
+                float* sx = smem;
+                float ss = 0.f;
+                for (int i = tid; i < H; i += 256) {
+                    float v = p.hnew[i];
+                    ss += v * v;
+                }
+                ss = block_reduce_sum(ss, smem + H);
+                const float rstd = rsqrtf(ss * (1.f / H) + EPSF);
+                for (int i = tid; i < H; i += 256)
+                    sx[i] = p.hnew[i] * rstd * __bfloat162float(W[OFF_PLN + i]);
+                __syncthreads();
+                for (int row = gw; row < I; row += ngw) {
+                    const float g = rowdot_u<H / 256>(W + OFF_G + (long)row * H,
+                                                      sx, lane);
+                    const float u = rowdot_u<H / 256>(W + OFF_U + (long)row * H,
+                                                      sx, lane);
+                    if (lane == 0) p.ubuf[row] = (g / (1.f + expf(-g))) * u;
+                }
+            }
+            bsync(bar, G);
+            PROF_T(3)
+
+            // ---------------- Phase 5: down proj + residual -------------------
+            {
+                float* su = smem;  // [I]
+                for (int i = tid; i < I; i += 256) su[i] = p.ubuf[i];
+                __syncthreads();
+                for (int row = gw; row < H; row += ngw) {
+                    const float o =
+                        rowdot_u<I / 256>(W + OFF_DN + (long)row * I, su, lane);
+                    if (lane == 0)
+                        p.ybuf[row] = __float2bfloat16(o + p.hnew[row]);
+                }
+            }
+            bsync(bar, G);
+            PROF_T(4)
+        }
+    }
+}
+
+static int g_max_ctas = -1;
+
+void launch_decode(const KParams& p, BarrierState* bar, long grid_req, long stream_ptr) {
+    cudaStream_t stream = (cudaStream_t)stream_ptr;
+    if (g_max_ctas < 0) {
+        int per_sm = 0;
+        cudaError_t e = cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per_sm, mega_decode, 256, 0);
+        TORCH_CHECK(e == cudaSuccess, "occupancy query failed: ", cudaGetErrorString(e));
+        int sms = 0;
+        cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, 0);
+        g_max_ctas = per_sm * sms;
+    }
+    int grid = (int)min((long)g_max_ctas, grid_req);
+    void* args[2] = {(void*)&p, (void*)&bar};
+    cudaError_t e = cudaLaunchCooperativeKernel((void*)mega_decode, dim3(grid), dim3(256),
+                                                args, 0, stream);
+    TORCH_CHECK(e == cudaSuccess, "cooperative launch failed: ", cudaGetErrorString(e));
+}
+
+void setup_l2(long w_ptr, long nbytes) {
+    int dev = 0;
+    cudaSetDevice(dev);
+    int max_persist = 0;
+    cudaDeviceGetAttribute(&max_persist, cudaDevAttrMaxPersistingL2CacheSize, dev);
+    if (max_persist > 0) {
+        // Weights exceed the persisting set-aside, so pin the whole buffer with
+        // hitRatio = setaside/total: every layer keeps a uniform fraction hot
+        // instead of early layers at 100% and the last at 0%.
+        float ratio = (float)((double)max_persist / (double)nbytes);
+        if (ratio > 1.f) ratio = 1.f;
+        cudaDeviceSetLimit(cudaLimitPersistingL2CacheSize, (size_t)max_persist);
+        cudaStream_t s = (cudaStream_t)c10::cuda::getCurrentCUDAStream().stream();
+        cudaStreamAttrValue attr{};
+        attr.accessPolicyWindow.base_ptr = (void*)w_ptr;
+        attr.accessPolicyWindow.num_bytes = (size_t)nbytes;
+        attr.accessPolicyWindow.hitRatio = ratio;
+        attr.accessPolicyWindow.hitProp = cudaAccessPropertyPersisting;
+        attr.accessPolicyWindow.missProp = cudaAccessPropertyStreaming;
+        cudaStreamSetAttribute(s, cudaStreamAttributeAccessPolicyWindow, &attr);
+    }
+}
+"""
+
+_EXT = None
+
+
+def _get_ext():
+    global _EXT
+    if _EXT is None:
+        _EXT = load_inline(
+            name="megaqwen_decode_mega_v1",
+            cpp_sources=[_CPP_SRC],
+            cuda_sources=[_CU_SRC],
+            with_cuda=True,
+            extra_cuda_cflags=["-O3", "-std=c++17", "--generate-code=arch=compute_120,code=sm_120"],
+            extra_cflags=["-O3", "-std=c++17"],
+            verbose=False,
+        )
+    return _EXT
+
+
+class Model(nn.Module):
+    """Same parameter names/shapes as the eager block stack."""
+
+    def __init__(self, num_layers: int = NUM_LAYERS, max_seq: int = 131072):
+        super().__init__()
+        Hh, Ii, Dd = HIDDEN, INTERMEDIATE, HEAD_DIM
+        self.num_layers = num_layers
+        self.max_seq = max_seq
+        blocks = []
+        for _ in range(num_layers):
+            b = nn.Module()
+            b.input_ln = nn.Parameter(torch.ones(Hh, dtype=torch.bfloat16))
+            b.q_proj = nn.Parameter(torch.empty(NUM_Q * Dd, Hh, dtype=torch.bfloat16))
+            b.k_proj = nn.Parameter(torch.empty(NUM_KV * Dd, Hh, dtype=torch.bfloat16))
+            b.v_proj = nn.Parameter(torch.empty(NUM_KV * Dd, Hh, dtype=torch.bfloat16))
+            b.q_norm = nn.Parameter(torch.ones(Dd, dtype=torch.bfloat16))
+            b.k_norm = nn.Parameter(torch.ones(Dd, dtype=torch.bfloat16))
+            b.o_proj = nn.Parameter(torch.empty(Hh, NUM_Q * Dd, dtype=torch.bfloat16))
+            b.post_ln = nn.Parameter(torch.ones(Hh, dtype=torch.bfloat16))
+            b.gate_proj = nn.Parameter(torch.empty(Ii, Hh, dtype=torch.bfloat16))
+            b.up_proj = nn.Parameter(torch.empty(Ii, Hh, dtype=torch.bfloat16))
+            b.down_proj = nn.Parameter(torch.empty(Hh, Ii, dtype=torch.bfloat16))
+            for n, prm in b.named_parameters():
+                if n not in ("input_ln", "post_ln", "q_norm", "k_norm"):
+                    nn.init.normal_(prm, std=0.02)
+            blocks.append(b)
+        self.blocks = nn.ModuleList(blocks)
+
+        self._ext = None
+        self._ws = None
+        self._dirty = True
+        self._l2_done = False
+
+    def load_state_dict(self, *a, **kw):  # repack weights after any load
+        super().load_state_dict(*a, **kw)
+        self._dirty = True
+
+    # -- workspace ---------------------------------------------------------
+    def _ensure(self, device):
+        if self._ws is not None and self._ws["device"] == device:
+            return self._ws
+        ext = _get_ext()
+        dev = torch.device(device)
+        LS = (
+            (NUM_Q * HEAD_DIM + 2 * NUM_KV * HEAD_DIM) * HIDDEN
+            + HIDDEN * (NUM_Q * HEAD_DIM)
+            + 2 * INTERMEDIATE * HIDDEN
+            + HIDDEN * INTERMEDIATE
+            + 2 * HIDDEN + 2 * HEAD_DIM
+        )
+        ws = {
+            "device": device,
+            "packed": torch.zeros(LS * self.num_layers, dtype=torch.bfloat16, device=dev),
+            "invf": torch.tensor(
+                [1.0 / (10000 ** (i / 64)) for i in range(64)],
+                dtype=torch.float32, device=dev,
+            ),
+            "qraw": torch.zeros(NUM_Q * HEAD_DIM, dtype=torch.float32, device=dev),
+            "kraw": torch.zeros(NUM_KV * HEAD_DIM, dtype=torch.float32, device=dev),
+            "vraw": torch.zeros(NUM_KV * HEAD_DIM, dtype=torch.float32, device=dev),
+            "ubuf": torch.zeros(INTERMEDIATE, dtype=torch.float32, device=dev),
+            "hnew": torch.zeros(HIDDEN, dtype=torch.float32, device=dev),
+            "part": torch.zeros(NUM_Q * 32 * (HEAD_DIM + 2), dtype=torch.float32, device=dev),
+            "xbuf": torch.zeros(HIDDEN, dtype=torch.bfloat16, device=dev),
+            "ybuf": torch.zeros(HIDDEN, dtype=torch.bfloat16, device=dev),
+            "sink": torch.zeros(1, dtype=torch.float32, device=dev),
+            "bar": torch.zeros(2, dtype=torch.int32, device=dev),
+            "prof": torch.zeros(4 * self.num_layers * 5, dtype=torch.int64, device=dev),
+            "caches": {},
+        }
+        self._ws = ws
+        self._ext = ext
+        self._repack()
+        return ws
+
+    def _repack(self):
+        ws = self._ws
+        flats = []
+        for b in self.blocks:
+            flats += [
+                b.q_proj.detach().reshape(-1),
+                b.k_proj.detach().reshape(-1),
+                b.v_proj.detach().reshape(-1),
+                b.o_proj.detach().reshape(-1),
+                b.gate_proj.detach().reshape(-1),
+                b.up_proj.detach().reshape(-1),
+                b.down_proj.detach().reshape(-1),
+                b.input_ln.detach(),
+                b.post_ln.detach(),
+                b.q_norm.detach(),
+                b.k_norm.detach(),
+            ]
+        ws["packed"].copy_(torch.cat(flats))
+        self._dirty = False
+        if not self._l2_done and not os.environ.get("MQ_NOL2"):
+            try:
+                self._ext.setup_l2(ws["packed"].data_ptr(), ws["packed"].numel() * 2)
+            except Exception:
+                pass
+            self._l2_done = True
+
+    def _launch(self, h_in, xrand, k_caches, v_caches, start_pos, n_steps):
+        ws = self._ensure(h_in.device)
+        if self._dirty:
+            self._repack()
+        kc_ptrs = [int(t.data_ptr()) for t in k_caches]
+        vc_ptrs = [int(t.data_ptr()) for t in v_caches]
+        grid = int(os.environ.get("MQ_CTAS", "188"))
+        prof = ws["prof"] if os.environ.get("MQ_PROF") else ws["xbuf"][:0]
+        self._ext.decode_bind(
+            ws["packed"], kc_ptrs, vc_ptrs, xrand, h_in, ws["invf"],
+            ws["qraw"], ws["kraw"], ws["vraw"], ws["ubuf"], ws["hnew"], ws["part"],
+            ws["sink"], ws["xbuf"], ws["ybuf"], prof, ws["bar"],
+            n_steps, start_pos, k_caches[0].shape[1], self.num_layers,
+            1.0 / math.sqrt(HEAD_DIM), grid,
+        )
+
+
+def empty_caches(model: Model, max_seq: int, device):
+    k = [
+        torch.zeros(NUM_KV, max_seq, HEAD_DIM, device=device, dtype=torch.bfloat16)
+        for _ in range(model.num_layers)
+    ]
+    v = [
+        torch.zeros(NUM_KV, max_seq, HEAD_DIM, device=device, dtype=torch.bfloat16)
+        for _ in range(model.num_layers)
+    ]
+    return k, v
+
+
+@torch.no_grad()
+def prefill(model: Model, ctx_len: int, seed: int, device=None):
+    """Build KV of length ctx_len. NOT timed."""
+    assert ctx_len <= model.max_seq
+    device = device or next(model.parameters()).device
+    model._ensure(device)
+    gh = torch.Generator(device="cpu")
+    gh.manual_seed(seed)
+    h = torch.randn(HIDDEN, generator=gh, dtype=torch.bfloat16).to(device)
+    g = torch.Generator(device="cpu")
+    g.manual_seed(seed + 1)
+    k_caches, v_caches = empty_caches(model, model.max_seq, device)
+    CHUNK = 512
+    t = 0
+    while t < ctx_len:
+        n = min(CHUNK, ctx_len - t)
+        r = torch.randn(n, HIDDEN, generator=g, dtype=torch.bfloat16).to(device)
+        model._launch(h, r, k_caches, v_caches, t, n)
+        h = model._ws["ybuf"]
+        t += n
+    return h, k_caches, v_caches
+
+
+@torch.no_grad()
+def decode_steps(
+    model: Model,
+    hidden: torch.Tensor,
+    k_caches: list,
+    v_caches: list,
+    start_pos: int,
+    n_steps: int,
+    seed: int,
+):
+    """Run n_steps decode steps starting at start_pos. TIMED."""
+    if n_steps <= 0:
+        return hidden, k_caches, v_caches
+    device = hidden.device
+    g = torch.Generator(device="cpu")
+    g.manual_seed(seed + 2)
+    r = torch.randn(n_steps, HIDDEN, generator=g, dtype=torch.bfloat16).to(device)
+    model._launch(hidden, r, k_caches, v_caches, start_pos, n_steps)
+    return model._ws["ybuf"], k_caches, v_caches
+
+
+def run(
+    ctx_len: int,
+    n_decode: int,
+    seed: int,
+    model: Model | None = None,
+    max_seq: int | None = None,
+) -> dict:
+    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    max_seq = max_seq or max(ctx_len + n_decode, 512)
+    if model is None:
+        model = Model(NUM_LAYERS, max_seq)
+    else:
+        if getattr(model, "max_seq", 0) < ctx_len + n_decode:
+            raise ValueError("model.max_seq too small")
+    model = model.to(device).eval()
+    h, k_caches, v_caches = prefill(model, ctx_len, seed, device=device)
+    h, k_caches, v_caches = decode_steps(
+        model, h, k_caches, v_caches, start_pos=ctx_len, n_steps=n_decode, seed=seed
+    )
+    return {"last_hidden": h.detach(), "ctx_len": ctx_len, "decode_steps": n_decode}

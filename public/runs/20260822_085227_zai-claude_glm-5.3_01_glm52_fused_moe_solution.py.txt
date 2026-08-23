@@ -1,0 +1,622 @@
+"""GLM-5.2 fused MoE layer — hand-written CUDA (KernelBench-CUDA).
+
+Structure (matches reference.py exactly):
+  out[t] = sum_s silu_mul_down(x[t], w1_shared[s], w2_shared[s])
+         + sum_k expert_weights[t,k] * silu_mul_down(x[t], w1_routed[e_k], w2_routed[e_k])
+
+Design (RTX PRO 6000, sm_120, 188 SMs, ~1.66 TB/s DRAM, ~548 TF mma.sync bf16):
+  The layer is weight-streaming bound for every benchmark shape: per call we must
+  read (E+n_shared) * 3*I*H*2 bytes of weights (12.9 GB) once. So the kernel is a
+  grouped NT GEMM where each expert's weights stream once per m-tile and
+  activations/intermediates stay small.
+
+  forward() =
+    S1  setup     : histogram of expert loads + prefix sums + device tile list.
+                    Shared experts are virtual experts E..E+n_shared-1 holding all
+                    T tokens with weight 1.0 — same kernels handle them.
+    S2  scatter   : build sorted row list (row -> token, routing weight).
+    G1  gemm1     : per (expert, 128-row tile, 64-col-of-I tile):
+                    B tile interleaves w1 gate row j and up row I+j so silu(g)*u
+                    pairs land in adjacent mma accumulator registers; writes h
+                    (bf16) in sorted-row layout.
+    G2r gemm2     : h @ w2^T per (expert, row tile, 128-col-of-H tile); epilogue
+                    multiplies the routing weight and atomically adds into an
+                    fp32 accumulator.
+    G2s gemm2     : shared-expert tiles of the same kernel (separate launch, so it
+                    is ordered after all routed atomics) read the fp32 accumulator,
+                    add their unweighted contribution and write the final bf16.
+
+  GEMM core: mma.sync.m16n8k16 bf16->fp32, 128x128x64 CTA tile, 8 warps (2x4),
+  cp.async 3-stage pipeline (96 KB smem), 128B-swizzled smem, n-major grid order
+  so sibling m-tiles of one expert co-schedule and share B tiles in L2.
+"""
+
+from __future__ import annotations
+
+import os
+
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+os.environ.setdefault("TORCH_CUDA_ARCH_LIST", "12.0")
+
+_CUDA_SRC = r"""
+#include <torch/extension.h>
+#include <ATen/cuda/CUDAContext.h>
+#include <cuda_bf16.h>
+#include <cuda_runtime.h>
+
+using bf16 = __nv_bfloat16;
+
+// ---------------------------------------------------------------------------
+// tile config
+// ---------------------------------------------------------------------------
+constexpr int BM = 128;      // rows (sorted tokens) per CTA tile
+constexpr int BN = 128;      // B rows per CTA tile (gemm1: 64 gate/up pairs)
+constexpr int BK = 64;       // k step
+constexpr int STAGES = 3;    // cp.async stages
+constexpr int NTHREADS = 256;
+
+constexpr int SMEM_BYTES = STAGES * (BM * BK + BN * BK) * 2;
+
+#define DEVI __device__ __forceinline__
+
+DEVI uint32_t smem_u32(const void* p) {
+  return static_cast<uint32_t>(__cvta_generic_to_shared(p));
+}
+
+// cp.async 16B with optional zero-fill (src-size 0 fills 16 zero bytes).
+DEVI void cp_async16(void* dst, const void* src, bool pred) {
+  asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" ::"r"(smem_u32(dst)),
+               "l"(src), "r"(pred ? 16 : 0));
+}
+DEVI void cp_commit() { asm volatile("cp.async.commit_group;\n" ::); }
+template <int N>
+DEVI void cp_wait() { asm volatile("cp.async.wait_group %0;\n" ::"n"(N)); }
+
+DEVI void ldm_x4(uint32_t& r0, uint32_t& r1, uint32_t& r2, uint32_t& r3, uint32_t a) {
+  asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+               : "=r"(r0), "=r"(r1), "=r"(r2), "=r"(r3)
+               : "r"(a));
+}
+DEVI void ldm_x2(uint32_t& r0, uint32_t& r1, uint32_t a) {
+  asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0,%1}, [%2];\n"
+               : "=r"(r0), "=r"(r1)
+               : "r"(a));
+}
+
+DEVI void mma_bf16(float* c, const uint32_t* a, uint32_t b0, uint32_t b1) {
+  asm volatile(
+      "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
+      "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+      : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
+      : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+}
+
+// 128B-row swizzled element offset inside a (rows x BK) bf16 tile.
+DEVI int swz(int row, int col) {
+  int unit = col >> 3;                       // 16B unit in row
+  int unit_s = unit ^ (row & 7);
+  return row * BK + unit_s * 8 + (col & 7);
+}
+
+// ldmatrix lane address helpers (row.col mma: both operands non-trans, k-major smem)
+DEVI uint32_t ldm_addr_A(const bf16* tile, int row, int col, int lane) {
+  int r = row + (lane & 7) + ((lane & 8) ? 8 : 0);
+  int c = col + ((lane & 16) ? 8 : 0);
+  return smem_u32(tile + swz(r, c));
+}
+DEVI uint32_t ldm_addr_B(const bf16* tile, int row, int col, int lane) {
+  int r = row + (lane & 7);
+  int c = col + ((lane & 8) ? 8 : 0);
+  return smem_u32(tile + swz(r, c));
+}
+
+DEVI float silu(float x) { return x / (1.0f + __expf(-x)); }
+
+DEVI void red_add_f32(float* p, float v) {
+  asm volatile("red.global.add.f32 [%0], %1;\n" ::"l"(p), "f"(v) : "memory");
+}
+
+// warp tiling of the 128x128 CTA tile: 2x4 warps, each 64 rows x 32 b-rows
+constexpr int WM = 2, WN = 4;
+constexpr int TM = BM / WM;   // 64
+constexpr int TN = BN / WN;   // 32
+
+// ---------------------------------------------------------------------------
+// S1: per-expert row counts, prefix sums, tile list. Single CTA.
+// ---------------------------------------------------------------------------
+__global__ void moe_setup(const int64_t* __restrict__ ids, int T, int top_k, int E,
+                          int EV, int slots, int* __restrict__ row_off,
+                          int* __restrict__ tile_row0, int* __restrict__ tile_exp,
+                          int* __restrict__ cursor) {
+  extern __shared__ int sh[];   // [32*EV] hist | [EV] counts | [EV] scan | [EV] tmp
+  int tid = threadIdx.x;
+  int* hist = sh;
+  int* counts = sh + 32 * EV;
+  int* scan = counts + EV;
+  int* tmp = scan + EV;
+
+  for (int i = tid; i < 32 * EV; i += 1024) hist[i] = 0;
+  __syncthreads();
+
+  int N = T * top_k;
+  for (int i = tid; i < N; i += 1024) {
+    atomicAdd(&hist[(tid >> 5) * EV + (int)ids[i]], 1);
+  }
+  __syncthreads();
+
+  if (tid < EV) {
+    int c = 0;
+    for (int w = 0; w < 32; ++w) c += hist[w * EV + tid];
+    if (tid >= E) c += T;   // shared experts see all T tokens
+    counts[tid] = c;
+  }
+  __syncthreads();
+
+  // inclusive scan (Hillis-Steele, double buffered) of counts -> row_off (excl)
+  if (tid < EV) tmp[tid] = counts[tid];
+  __syncthreads();
+  for (int s = 1; s < EV; s <<= 1) {
+    if (tid < EV) scan[tid] = tmp[tid] + ((tid >= s) ? tmp[tid - s] : 0);
+    __syncthreads();
+    if (tid < EV) tmp[tid] = scan[tid];
+    __syncthreads();
+  }
+  if (tid == 0) row_off[0] = 0;
+  if (tid < EV) row_off[tid + 1] = tmp[tid];
+
+  // tile counts -> inclusive scan -> tile lists
+  __syncthreads();
+  if (tid < EV) tmp[tid] = (counts[tid] + BM - 1) / BM;
+  __syncthreads();
+  for (int s = 1; s < EV; s <<= 1) {
+    if (tid < EV) scan[tid] = tmp[tid] + ((tid >= s) ? tmp[tid - s] : 0);
+    __syncthreads();
+    if (tid < EV) tmp[tid] = scan[tid];
+    __syncthreads();
+  }
+  __shared__ int total_sh;
+  if (tid == 0) total_sh = (EV > 0) ? tmp[EV - 1] : 0;
+  __syncthreads();
+  if (tid < EV) {
+    int tc = (counts[tid] + BM - 1) / BM;
+    int t0 = tmp[tid] - tc;
+    int r0 = (tid == 0) ? 0 : row_off[tid];
+    for (int t = 0; t < tc; ++t) {
+      tile_row0[t0 + t] = r0 + t * BM;
+      tile_exp[t0 + t] = tid;
+    }
+  }
+  __syncthreads();
+  for (int i = tid; i < slots; i += 1024)
+    if (i >= total_sh) {
+      tile_row0[i] = -1;
+      tile_exp[i] = -1;
+    }
+  for (int e = tid; e < EV; e += 1024) cursor[e] = 0;
+}
+
+// ---------------------------------------------------------------------------
+// S2: scatter (token, k) assignments into sorted rows; shared expert rows.
+// ---------------------------------------------------------------------------
+__global__ void moe_scatter(const int64_t* __restrict__ ids, const bf16* __restrict__ wts,
+                            int T, int top_k, int E, int n_shared,
+                            const int* __restrict__ row_off, int* __restrict__ cursor,
+                            int* __restrict__ sorted_tok, float* __restrict__ sorted_wt) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  int N = T * top_k;
+  int NT = N + T * n_shared;
+  if (i >= NT) return;
+  if (i < N) {
+    int e = (int)ids[i];
+    int r = row_off[e] + atomicAdd(&cursor[e], 1);
+    sorted_tok[r] = i / top_k;
+    sorted_wt[r] = __bfloat162float(wts[i]);
+  } else {
+    int j = i - N;
+    int s = j / T;
+    int t = j - s * T;
+    int r = row_off[E + s] + t;
+    sorted_tok[r] = t;
+    sorted_wt[r] = 1.0f;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// G1: grouped gemm + silu*mul.  A = x rows (gathered), B = w1 rows
+// interleaved [gate j | up I+j] so pairs land in adjacent accum registers.
+// ---------------------------------------------------------------------------
+__global__ void __launch_bounds__(NTHREADS, 1) moe_gemm1(
+    const bf16* __restrict__ x,       // (T, H)
+    const bf16* __restrict__ w1r,     // (E, 2I, H)
+    const bf16* __restrict__ w1s,     // (n_shared, 2I, H)
+    bf16* __restrict__ h,             // (R, I)
+    const int* __restrict__ sorted_tok, const int* __restrict__ row_off,
+    const int* __restrict__ tile_row0, const int* __restrict__ tile_exp, int m_slots,
+    int E, int T, int H, int I) {
+  constexpr int ASZ = BM * BK;   // bf16 elements per A stage tile
+  constexpr int BSZ = BN * BK;
+  extern __shared__ char smem[];
+  bf16* sm = reinterpret_cast<bf16*>(smem);
+
+  int bx = blockIdx.x;
+  int n_tiles = I / (BN / 2);
+  int slot = bx / n_tiles;          // m-major: all n-tiles of a row-tile adjacent
+  int j_blk = bx % n_tiles;
+
+  int e = tile_exp[slot];
+  if (e < 0) return;
+  int m0 = tile_row0[slot];
+  int valid = min(BM, row_off[e + 1] - m0);
+  if (valid <= 0) return;
+
+  const bf16* w1 = (e < E) ? (w1r + (size_t)e * 2 * I * H)
+                           : (w1s + (size_t)(e - E) * 2 * I * H);
+  int j0 = j_blk * (BN / 2);   // first h column of this CTA
+
+  int tid = threadIdx.x;
+  int lane = tid & 31;
+  int warp = tid >> 5;
+  int wm = warp >> 2, wn = warp & 3;
+
+  // A row gather target (token row in x); -1 => zero fill
+  int arow[4];
+#pragma unroll
+  for (int i = 0; i < 4; ++i) {
+    int r = (tid + i * NTHREADS) >> 3;
+    arow[i] = (r < valid) ? sorted_tok[m0 + r] : 0;
+  }
+
+  auto load_stage = [&](int kk, int stg) {
+    bf16* Adst = sm + stg * (ASZ + BSZ);
+    bf16* Bdst = Adst + ASZ;
+    int koff = kk * BK;
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+      int idx = tid + i * NTHREADS;
+      int r = idx >> 3, u = idx & 7;
+      const bf16* asrc = x + (size_t)arow[i] * H + koff + u * 8;
+      cp_async16(Adst + swz(r, u * 8), asrc, (tid + i * NTHREADS) >> 3 < valid);
+      int wrow = ((r & 1) ? (I + j0 + (r >> 1)) : (j0 + (r >> 1)));
+      const bf16* bsrc = w1 + (size_t)wrow * H + koff + u * 8;
+      cp_async16(Bdst + swz(r, u * 8), bsrc, true);
+    }
+  };
+
+  int ksteps = H / BK;
+#pragma unroll
+  for (int s = 0; s < STAGES - 1; ++s) {
+    if (s < ksteps) load_stage(s, s);
+    cp_commit();
+  }
+
+  float c[4][4][4];
+#pragma unroll
+  for (int mi = 0; mi < 4; ++mi)
+#pragma unroll
+    for (int ni = 0; ni < 4; ++ni)
+#pragma unroll
+      for (int j = 0; j < 4; ++j) c[mi][ni][j] = 0.f;
+
+  for (int kk = 0; kk < ksteps; ++kk) {
+    int nx = kk + STAGES - 1;
+    if (nx < ksteps) load_stage(nx, nx % STAGES);
+    cp_commit();
+    cp_wait<STAGES - 1>();
+    __syncthreads();
+
+    const bf16* As = sm + (kk % STAGES) * (ASZ + BSZ);
+    const bf16* Bs = As + ASZ;
+#pragma unroll
+    for (int ki = 0; ki < BK / 16; ++ki) {
+      uint32_t a[4][4], b[4][2];
+#pragma unroll
+      for (int mi = 0; mi < 4; ++mi)
+        ldm_x4(a[mi][0], a[mi][1], a[mi][2], a[mi][3],
+               ldm_addr_A(As, wm * TM + mi * 16, ki * 16, lane));
+#pragma unroll
+      for (int ni = 0; ni < 4; ++ni)
+        ldm_x2(b[ni][0], b[ni][1], ldm_addr_B(Bs, wn * TN + ni * 8, ki * 16, lane));
+#pragma unroll
+      for (int mi = 0; mi < 4; ++mi)
+#pragma unroll
+        for (int ni = 0; ni < 4; ++ni) mma_bf16(c[mi][ni], a[mi], b[ni][0], b[ni][1]);
+    }
+    __syncthreads();
+  }
+
+  // epilogue: h[r, j0 + col/2] = silu(gate) * up
+#pragma unroll
+  for (int mi = 0; mi < 4; ++mi) {
+    int r0 = wm * TM + mi * 16 + (lane >> 2);
+#pragma unroll
+    for (int ni = 0; ni < 4; ++ni) {
+      int col = wn * TN + ni * 8 + (lane & 3) * 2;
+      int jc = j0 + (col >> 1);
+      if (r0 < valid) {
+        float v = silu(c[mi][ni][0]) * c[mi][ni][1];
+        h[(size_t)(m0 + r0) * I + jc] = __float2bfloat16(v);
+      }
+      if (r0 + 8 < valid) {
+        float v = silu(c[mi][ni][2]) * c[mi][ni][3];
+        h[(size_t)(m0 + r0 + 8) * I + jc] = __float2bfloat16(v);
+      }
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// G2: grouped gemm (h @ w2^T) + weighted combine.
+//   WANT_SHARED=false: routed experts, red.global.add.f32 into out32
+//   WANT_SHARED=true : shared experts, out = bf16(out32 + y)  (final writer)
+// ---------------------------------------------------------------------------
+template <bool WANT_SHARED>
+__global__ void __launch_bounds__(NTHREADS, 1) moe_gemm2(
+    const bf16* __restrict__ h,        // (R, I)
+    const bf16* __restrict__ w2r,      // (E, H, I)
+    const bf16* __restrict__ w2s,      // (n_shared, H, I)
+    const float* __restrict__ out32,   // (T, H)
+    bf16* __restrict__ out,            // (T, H)
+    const int* __restrict__ sorted_tok, const float* __restrict__ sorted_wt,
+    const int* __restrict__ row_off, const int* __restrict__ tile_row0,
+    const int* __restrict__ tile_exp, int m_slots, int E, int T, int H, int I) {
+  constexpr int ASZ = BM * BK;
+  constexpr int BSZ = BN * BK;
+  extern __shared__ char smem[];
+  bf16* sm = reinterpret_cast<bf16*>(smem);
+
+  int bx = blockIdx.x;
+  int n_tiles = H / BN;
+  int slot = bx / n_tiles;          // m-major: h rows of this tile stay hot in L2
+  int n_blk = bx % n_tiles;
+
+  int e = tile_exp[slot];
+  if (e < 0) return;
+  if (WANT_SHARED != (e >= E)) return;
+  int m0 = tile_row0[slot];
+  int valid = min(BM, row_off[e + 1] - m0);
+  if (valid <= 0) return;
+
+  const bf16* w2 = (e < E) ? (w2r + (size_t)e * H * I)
+                           : (w2s + (size_t)(e - E) * H * I);
+  int n0 = n_blk * BN;
+
+  int tid = threadIdx.x;
+  int lane = tid & 31;
+  int warp = tid >> 5;
+  int wm = warp >> 2, wn = warp & 3;
+
+  int alast = m0 + valid - 1;
+  auto load_stage = [&](int kk, int stg) {
+    bf16* Adst = sm + stg * (ASZ + BSZ);
+    bf16* Bdst = Adst + ASZ;
+    int koff = kk * BK;
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+      int idx = tid + i * NTHREADS;
+      int r = idx >> 3, u = idx & 7;
+      const bf16* asrc = h + (size_t)(r < valid ? m0 + r : alast) * I + koff + u * 8;
+      cp_async16(Adst + swz(r, u * 8), asrc, r < valid);
+      const bf16* bsrc = w2 + (size_t)(n0 + r) * I + koff + u * 8;
+      cp_async16(Bdst + swz(r, u * 8), bsrc, true);
+    }
+  };
+
+  int ksteps = I / BK;
+#pragma unroll
+  for (int s = 0; s < STAGES - 1; ++s) {
+    if (s < ksteps) load_stage(s, s);
+    cp_commit();
+  }
+
+  float c[4][4][4];
+#pragma unroll
+  for (int mi = 0; mi < 4; ++mi)
+#pragma unroll
+    for (int ni = 0; ni < 4; ++ni)
+#pragma unroll
+      for (int j = 0; j < 4; ++j) c[mi][ni][j] = 0.f;
+
+  for (int kk = 0; kk < ksteps; ++kk) {
+    int nx = kk + STAGES - 1;
+    if (nx < ksteps) load_stage(nx, nx % STAGES);
+    cp_commit();
+    cp_wait<STAGES - 1>();
+    __syncthreads();
+
+    const bf16* As = sm + (kk % STAGES) * (ASZ + BSZ);
+    const bf16* Bs = As + ASZ;
+#pragma unroll
+    for (int ki = 0; ki < BK / 16; ++ki) {
+      uint32_t a[4][4], b[4][2];
+#pragma unroll
+      for (int mi = 0; mi < 4; ++mi)
+        ldm_x4(a[mi][0], a[mi][1], a[mi][2], a[mi][3],
+               ldm_addr_A(As, wm * TM + mi * 16, ki * 16, lane));
+#pragma unroll
+      for (int ni = 0; ni < 4; ++ni)
+        ldm_x2(b[ni][0], b[ni][1], ldm_addr_B(Bs, wn * TN + ni * 8, ki * 16, lane));
+#pragma unroll
+      for (int mi = 0; mi < 4; ++mi)
+#pragma unroll
+        for (int ni = 0; ni < 4; ++ni) mma_bf16(c[mi][ni], a[mi], b[ni][0], b[ni][1]);
+    }
+    __syncthreads();
+  }
+
+  // epilogue
+#pragma unroll
+  for (int mi = 0; mi < 4; ++mi) {
+    int r0 = wm * TM + mi * 16 + (lane >> 2);
+#pragma unroll
+    for (int rr = 0; rr < 2; ++rr) {
+      int row = r0 + rr * 8;
+      if (row >= valid) continue;
+      int tok = sorted_tok[m0 + row];
+      float wt = WANT_SHARED ? 1.f : sorted_wt[m0 + row];
+      const float* o32 = out32 + (size_t)tok * H + n0;
+      bf16* ob = out + (size_t)tok * H + n0;
+#pragma unroll
+      for (int ni = 0; ni < 4; ++ni) {
+        int col = wn * TN + ni * 8 + (lane & 3) * 2;
+        float v0 = c[mi][ni][rr * 2 + 0] * wt;
+        float v1 = c[mi][ni][rr * 2 + 1] * wt;
+        if (WANT_SHARED) {
+          __nv_bfloat162 v2 = __floats2bfloat162_rn(o32[col] + v0, o32[col + 1] + v1);
+          *reinterpret_cast<__nv_bfloat162*>(ob + col) = v2;
+        } else {
+          red_add_f32(const_cast<float*>(o32 + col), v0);
+          red_add_f32(const_cast<float*>(o32 + col + 1), v1);
+        }
+      }
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// host side
+// ---------------------------------------------------------------------------
+static void set_smem_attr(const void* fn, int bytes) {
+  cudaFuncSetAttribute(fn, cudaFuncAttributeMaxDynamicSharedMemorySize, bytes);
+}
+
+// Grow-only workspace cache (keyed on exact geometry) so steady-state calls do
+// not churn the caching allocator. `out` is returned to python and stays fresh.
+struct WsCache {
+  int64_t T = -1, EV = -1, I = -1, H = -1, R = -1;
+  int slots = -1;
+  torch::Tensor ibuf;   // i32: row_off | tile_row0 | tile_exp | cursor | sorted_tok | sorted_wt(f32)
+  torch::Tensor h;      // (R, I) bf16
+  torch::Tensor out32;  // (T, H) f32
+};
+static WsCache g_ws;
+
+torch::Tensor glm_moe_forward(torch::Tensor x, torch::Tensor ids, torch::Tensor wts,
+                              torch::Tensor w1r, torch::Tensor w2r, torch::Tensor w1s,
+                              torch::Tensor w2s) {
+  TORCH_CHECK(x.is_cuda() && x.is_contiguous() && x.scalar_type() == torch::kBFloat16);
+  TORCH_CHECK(ids.is_contiguous() && ids.scalar_type() == torch::kLong);
+  TORCH_CHECK(wts.is_contiguous() && wts.scalar_type() == torch::kBFloat16);
+
+  const int T = (int)x.size(0);
+  const int H = (int)x.size(1);
+  const int E = (int)w1r.size(0);
+  const int I = (int)w1r.size(1) / 2;
+  const int top_k = (int)ids.size(1);
+  const int n_shared = (int)w1s.size(0);
+  const int EV = E + n_shared;
+  TORCH_CHECK(EV <= 1024, "E + n_shared too large for setup kernel");
+  TORCH_CHECK(H % BK == 0 && I % BK == 0 && I % (BN / 2) == 0 && H % BN == 0);
+
+  const int64_t R = (int64_t)T * (top_k + n_shared);
+  const int slots = (int)(R / BM + EV + 2);
+
+  auto stream = at::cuda::getCurrentCUDAStream();
+  if (g_ws.T != T || g_ws.EV != EV || g_ws.I != I || g_ws.H != H) {
+    g_ws.T = T; g_ws.EV = EV; g_ws.I = I; g_ws.H = H; g_ws.R = R; g_ws.slots = slots;
+    auto opt_i = x.options().dtype(torch::kInt32);
+    g_ws.ibuf = torch::empty(
+        {(int64_t)(EV + 1) + 3 * (int64_t)slots + EV + 2 * R}, opt_i);
+    g_ws.h = torch::empty({R, (int64_t)I}, x.options());
+    g_ws.out32 = torch::empty({(int64_t)T, (int64_t)H}, x.options().dtype(torch::kFloat));
+  }
+  int* row_off = g_ws.ibuf.data_ptr<int>();
+  int* tile_row0 = row_off + (EV + 1);
+  int* tile_exp = tile_row0 + slots;
+  int* cursor = tile_exp + slots;
+  int* sorted_tok = cursor + EV;
+  float* sorted_wt = reinterpret_cast<float*>(sorted_tok + R);
+
+  auto out = torch::empty({(int64_t)T, (int64_t)H}, x.options());
+
+  const int setup_smem = (32 * EV + 4 * EV) * sizeof(int);
+  static bool attrs_done = false;
+  if (!attrs_done) {
+    set_smem_attr((const void*)moe_setup, 96 * 1024);
+    set_smem_attr((const void*)moe_gemm1, SMEM_BYTES);
+    set_smem_attr((const void*)moe_gemm2<false>, SMEM_BYTES);
+    set_smem_attr((const void*)moe_gemm2<true>, SMEM_BYTES);
+    attrs_done = true;
+  }
+
+  moe_setup<<<1, 1024, setup_smem, stream>>>(ids.data_ptr<int64_t>(), T, top_k, E, EV,
+                                             slots, row_off, tile_row0, tile_exp, cursor);
+  int NT = T * top_k + T * n_shared;
+  moe_scatter<<<(NT + 255) / 256, 256, 0, stream>>>(
+      ids.data_ptr<int64_t>(), reinterpret_cast<const bf16*>(wts.data_ptr()), T, top_k,
+      E, n_shared, row_off, cursor, sorted_tok, sorted_wt);
+  float* out32p = g_ws.out32.data_ptr<float>();
+  bf16* hp = reinterpret_cast<bf16*>(g_ws.h.data_ptr());
+  cudaMemsetAsync(out32p, 0, (size_t)T * H * 4, stream);
+
+  moe_gemm1<<<slots * (I / (BN / 2)), NTHREADS, SMEM_BYTES, stream>>>(
+      reinterpret_cast<const bf16*>(x.data_ptr()),
+      reinterpret_cast<const bf16*>(w1r.data_ptr()),
+      reinterpret_cast<const bf16*>(w1s.data_ptr()), hp, sorted_tok, row_off,
+      tile_row0, tile_exp, slots, E, T, H, I);
+  moe_gemm2<false><<<slots * (H / BN), NTHREADS, SMEM_BYTES, stream>>>(
+      hp, reinterpret_cast<const bf16*>(w2r.data_ptr()),
+      reinterpret_cast<const bf16*>(w2s.data_ptr()), out32p,
+      reinterpret_cast<bf16*>(out.data_ptr()), sorted_tok, sorted_wt, row_off,
+      tile_row0, tile_exp, slots, E, T, H, I);
+  moe_gemm2<true><<<slots * (H / BN), NTHREADS, SMEM_BYTES, stream>>>(
+      hp, reinterpret_cast<const bf16*>(w2r.data_ptr()),
+      reinterpret_cast<const bf16*>(w2s.data_ptr()), out32p,
+      reinterpret_cast<bf16*>(out.data_ptr()), sorted_tok, sorted_wt, row_off,
+      tile_row0, tile_exp, slots, E, T, H, I);
+  return out;
+}
+"""
+
+_CPP_DECL = "torch::Tensor glm_moe_forward(torch::Tensor x, torch::Tensor ids, torch::Tensor wts, torch::Tensor w1r, torch::Tensor w2r, torch::Tensor w1s, torch::Tensor w2s);"
+
+_ext = None
+
+
+def _get_ext():
+    global _ext
+    if _ext is None:
+        _ext = load_inline(
+            name="glm52_fused_moe_sm120",
+            cpp_sources=[_CPP_DECL],
+            cuda_sources=[_CUDA_SRC],
+            functions=["glm_moe_forward"],
+            extra_cuda_cflags=["-O3", "--use_fast_math"],
+            verbose=False,
+        )
+    return _ext
+
+
+class Model(nn.Module):
+    def __init__(
+        self,
+        T: int,
+        E: int,
+        top_k: int,
+        n_shared: int,
+        H: int,
+        I: int,
+    ):
+        super().__init__()
+        self.T, self.E, self.top_k = T, E, top_k
+        self.n_shared, self.H, self.I = n_shared, H, I
+        self.w1_routed = nn.Parameter(torch.empty(E, 2 * I, H, dtype=torch.bfloat16))
+        self.w2_routed = nn.Parameter(torch.empty(E, H, I, dtype=torch.bfloat16))
+        self.w1_shared = nn.Parameter(torch.empty(n_shared, 2 * I, H, dtype=torch.bfloat16))
+        self.w2_shared = nn.Parameter(torch.empty(n_shared, H, I, dtype=torch.bfloat16))
+        for p in self.parameters():
+            nn.init.normal_(p, std=0.02)
+        self._ext = _get_ext()
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        expert_ids: torch.Tensor,
+        expert_weights: torch.Tensor,
+    ) -> torch.Tensor:
+        return self._ext.glm_moe_forward(
+            x, expert_ids, expert_weights,
+            self.w1_routed, self.w2_routed, self.w1_shared, self.w2_shared,
+        )
