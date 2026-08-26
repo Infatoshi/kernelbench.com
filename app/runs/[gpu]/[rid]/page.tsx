@@ -11,7 +11,7 @@ import {
   type Bench,
   type ModelCell,
 } from "@/app/_lib/models"
-import { loadModelIndex } from "@/app/_lib/models.server"
+import { loadAllModelIndex } from "@/app/_lib/models.server"
 
 // One page per published run: the cell you clicked on a board, expanded.
 // Fully static — every (gpu, run_id) cell in models.json gets a page at
@@ -73,7 +73,7 @@ interface FoundCell {
 }
 
 async function findCell(gpu: string, rid: string): Promise<FoundCell | null> {
-  const idx = await loadModelIndex()
+  const idx = await loadAllModelIndex()
   for (const m of idx.models) {
     for (const [bench, block] of Object.entries(m.benches)) {
       if (!block) continue
@@ -157,7 +157,7 @@ async function loadDetail(gpu: string, rid: string): Promise<RunDetailData | nul
 }
 
 export async function generateStaticParams() {
-  const idx = await loadModelIndex()
+  const idx = await loadAllModelIndex()
   const params: { gpu: string; rid: string }[] = []
   const seen = new Set<string>()
   for (const m of idx.models) {

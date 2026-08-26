@@ -1,6 +1,6 @@
 import type { Metadata } from "next"
 import { JetBrains_Mono } from "next/font/google"
-import { SiteBrand } from "@/app/_components/site-brand"
+import { SiteNav } from "@/app/_components/site-nav"
 import "./globals.css"
 import { ContactLink } from "./_components/contact-link"
 
@@ -56,7 +56,7 @@ export default function RootLayout({
     // Mac preview shows a noisy hydration overlay that is not app state.
     <html lang="en" className={mono.variable} data-theme="dark" suppressHydrationWarning>
       <body className="min-h-screen" suppressHydrationWarning>
-        <SiteBrand />
+        <SiteNav />
         <main className="container mx-auto px-4 sm:px-6 max-w-7xl pt-6 pb-12">
           {children}
         </main>

@@ -18,6 +18,8 @@ export interface ModelCell {
   outcome?: string
   outcome_label?: string
   failure_reason?: string | null
+  retryable_infra_failure?: boolean | null
+  session_complete?: boolean | null
   elapsed_seconds?: number | null
   tok_s?: number | null
   ctx?: Record<string, number>
@@ -46,6 +48,8 @@ export interface AuditOutcome {
   measurement_status: string | null
   verdict: string
   failure_reason: string | null
+  retryable_infra_failure?: boolean | null
+  session_complete?: boolean | null
   score: number | null
   summary: string
   solution_url: string | null
@@ -198,6 +202,7 @@ export const LAB_BRANDS: Record<string, Brand> = {
   Xiaomi: { color: "#ff7a1a", logo: "/logos/labs/xiaomi.svg" },
   Meta: { color: "#0082fb", logo: "/logos/labs/meta.svg" },
   "Sakana AI": { color: "#f472b6", logo: null },
+  OpenRouter: { color: "#9aa4b2", logo: null },
 }
 
 export function brandFor(lab: string, slug: string): Brand {
@@ -385,29 +390,62 @@ function shortProblem(id: string): string {
   return first.slice(0, 6)
 }
 
+const WARNING_OUTCOMES = new Set([
+  "build",
+  "timeout",
+  "check_timeout",
+  "benchmark_timeout",
+  "benchmark_failed",
+  "memory",
+  "incomplete",
+  "rate_limit",
+  "credits",
+  "provider_cut",
+  "provider_unavailable",
+  "harness",
+  "hardware",
+  "ungraded",
+  "not_megakernel",
+  "other",
+])
+
 /** Map catalog outcome → chip kind (styling). */
 function kindFromOutcome(outcome: string | undefined, c: ModelCell): ProblemChip["kind"] {
   if (c.valid && c.score != null) return "pass"
-  if (FLAG_VERDICTS.has(c.verdict) || outcome === "flagged") return "hack"
-  if (outcome === "empty" || c.has_solution === false) return "no_kernel"
-  if (outcome === "wrong" || outcome === "build" || outcome === "timeout" || outcome === "memory")
-    return "numerics"
-  if (outcome === "cut" || outcome === "infra" || outcome === "other") return "fail"
+  if (FLAG_VERDICTS.has(c.verdict) || outcome === "flagged" || FLAG_VERDICTS.has(outcome ?? ""))
+    return "hack"
+  if (outcome === "wrong") return "numerics"
+  if (outcome === "empty") return "no_kernel"
+  if (outcome && WARNING_OUTCOMES.has(outcome)) return "fail"
+  if (c.has_solution === false) return "no_kernel"
   if (!c.correct) return "numerics"
   return "fail"
 }
 
 const OUTCOME_TITLE: Record<string, string> = {
   pass: "correct on the tests",
-  wrong: "ran, but answers don't match",
-  build: "couldn't compile or import",
-  timeout: "ran too long / timed out",
+  wrong: "ran, but answers did not match",
+  build: "could not compile or import",
+  timeout: "agent session timed out",
+  check_timeout: "correctness check timed out",
+  benchmark_timeout: "benchmark timed out",
+  benchmark_failed: "correctness passed, but benchmarking failed",
   memory: "ran out of GPU memory",
   empty: "never wrote a kernel",
-  cut: "session stopped early",
-  infra: "provider / harness glitch",
+  incomplete: "session ended before a final result",
+  rate_limit: "provider rate-limited the session",
+  credits: "provider account ran out of credits",
+  provider_cut: "provider stopped before a useful answer",
+  provider_unavailable: "requested provider route was unavailable",
+  harness: "agent harness failed",
+  hardware: "measurement used the wrong GPU SKU",
+  ungraded: "no publishable measurement was produced",
+  reward_hack: "audit found evaluator exploitation",
+  contamination: "run used another attempt's artifacts",
+  rubric_leak: "candidate only satisfied the exposed rubric",
+  not_megakernel: "audit found the submission was not one megakernel",
   flagged: "audit rejected the run",
-  other: "didn't pass",
+  other: "did not pass for another recorded reason",
 }
 
 function chipFromCell(
@@ -462,11 +500,11 @@ function chipFromCell(
   // Audit verdicts outrank generic harness outcomes. A mathematically passing
   // run can still be quarantined, so do not render its catalog fallback as
   // an ordinary "fail".
-  const rawLabel = c.outcome_label || outcome || "fail"
+  const rawLabel = c.outcome_label || outcome || "failed"
   const label =
     kind === "hack"
       ? "flag"
-      : rawLabel.replace(/_/g, " ").slice(0, 8).trimEnd()
+      : rawLabel.replace(/_/g, " ").slice(0, 10).trimEnd()
   const title =
     kind === "hack"
       ? OUTCOME_TITLE.flagged

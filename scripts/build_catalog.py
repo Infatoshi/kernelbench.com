@@ -20,18 +20,33 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parents[1]
 OUT = REPO / "public" / "data" / "catalog.json"
 
-# Short UI labels + one-line plain-English blurb (legend).
+# Short UI labels + one-line plain-English blurb (legend). Provider and
+# evaluator failures stay distinct: a model bug, an exhausted account, and a
+# harness interruption are different outcomes even when none produces a score.
 LEGEND = [
     {"code": "pass", "label": "pass", "blurb": "correct on the tests"},
-    {"code": "wrong", "label": "wrong", "blurb": "ran, but answers don't match"},
-    {"code": "build", "label": "build", "blurb": "couldn't compile or import"},
-    {"code": "timeout", "label": "slow", "blurb": "ran too long / timed out"},
+    {"code": "wrong", "label": "wrong", "blurb": "ran, but answers did not match"},
+    {"code": "build", "label": "build", "blurb": "could not compile or import"},
+    {"code": "timeout", "label": "timeout", "blurb": "agent session timed out"},
+    {"code": "check_timeout", "label": "check t/o", "blurb": "correctness check timed out"},
+    {"code": "benchmark_timeout", "label": "bench t/o", "blurb": "benchmark timed out"},
+    {"code": "benchmark_failed", "label": "bench fail", "blurb": "correctness passed but benchmark failed"},
     {"code": "memory", "label": "OOM", "blurb": "ran out of GPU memory"},
     {"code": "empty", "label": "empty", "blurb": "never wrote a kernel"},
-    {"code": "cut", "label": "cut", "blurb": "session stopped early"},
-    {"code": "infra", "label": "infra", "blurb": "provider / harness glitch"},
-    {"code": "flagged", "label": "flag", "blurb": "audit rejected the run"},
-    {"code": "other", "label": "fail", "blurb": "didn't pass (other)"},
+    {"code": "incomplete", "label": "cut", "blurb": "session ended before a final result"},
+    {"code": "rate_limit", "label": "rate", "blurb": "provider rate-limited the session"},
+    {"code": "credits", "label": "credits", "blurb": "provider account ran out of credits"},
+    {"code": "provider_cut", "label": "early stop", "blurb": "provider stopped before a useful answer"},
+    {"code": "provider_unavailable", "label": "route", "blurb": "requested provider route was unavailable"},
+    {"code": "harness", "label": "harness", "blurb": "agent harness failed"},
+    {"code": "hardware", "label": "wrong gpu", "blurb": "measurement used the wrong GPU SKU"},
+    {"code": "ungraded", "label": "ungraded", "blurb": "no publishable measurement was produced"},
+    {"code": "reward_hack", "label": "hack", "blurb": "audit found evaluator exploitation"},
+    {"code": "contamination", "label": "contam", "blurb": "run used another attempt's artifacts"},
+    {"code": "rubric_leak", "label": "rubric", "blurb": "candidate only satisfied the exposed rubric"},
+    {"code": "not_megakernel", "label": "not mega", "blurb": "audit found the submission was not one megakernel"},
+    {"code": "flagged", "label": "flag", "blurb": "audit rejected the run for another reason"},
+    {"code": "other", "label": "failed", "blurb": "did not pass for another recorded reason"},
 ]
 
 FLAG_VERDICTS = {
@@ -124,39 +139,50 @@ def outcome_from_archive(
     text: str,
 ) -> str:
     if verdict and verdict in FLAG_VERDICTS:
-        return "flagged"
+        return verdict
     if correct:
+        if failure_reason == "benchmark_timeout":
+            return "benchmark_timeout"
+        if failure_reason == "benchmark_failed":
+            return "benchmark_failed"
         return "pass"
     fr = failure_reason or ""
     if fr == "template_mutated":
         return "flagged"
-    if fr in {
-        "provider_rate_limited",
-        "provider_insufficient_credits",
-        "provider_early_stop",
-        "harness_error",
-    }:
-        return "infra"
-    if fr in {"timeout", "check_timeout", "benchmark_timeout"}:
+    if fr == "provider_rate_limited":
+        return "rate_limit"
+    if fr == "provider_insufficient_credits":
+        return "credits"
+    if fr == "provider_early_stop":
+        return "provider_cut"
+    if fr == "provider_unavailable":
+        return "provider_unavailable"
+    if fr == "harness_error":
+        return "harness"
+    if fr == "check_timeout":
+        return "check_timeout"
+    if fr == "benchmark_timeout":
+        return "benchmark_timeout"
+    if fr == "timeout":
         return "timeout"
-    if fr in {"no_solution"} or not has_solution:
-        if fr == "incomplete_session":
-            return "cut"
-        return "empty"
     if fr == "incomplete_session":
-        return "cut"
-    # Has a solution but didn't pass — look at logs.
+        return "incomplete"
+    if fr == "no_solution" or not has_solution:
+        return "empty"
+    # Has a solution but did not pass. Logs separate compile/runtime setup from
+    # numerical defects; the raw failure_reason remains available on the cell.
     if OOM_RE.search(text):
         return "memory"
     if COMPILE_RE.search(text):
         return "build"
     if NUMERICS_RE.search(text) or fr == "incorrect":
         return "wrong"
-    if fr in {"check_failed", "benchmark_failed"}:
-        # check_failed without clear log signal
+    if fr == "check_failed":
         if "import error" in text.lower() or "ninja" in text.lower():
             return "build"
         return "wrong"
+    if fr == "benchmark_failed":
+        return "benchmark_failed"
     return "other"
 
 
@@ -225,6 +251,8 @@ def cells_from_hard_leaderboard(path: Path, gpu_key: str, ann: dict[str, str]) -
                     "score": score,
                     "outcome": outcome,
                     "failure_reason": fr,
+                    "retryable_infra_failure": result.get("retryable_infra_failure"),
+                    "session_complete": result.get("session_complete"),
                     "has_solution": has_sol,
                     "verdict": verdict,
                     "solution_url": solution_url(rid) if rid else None,
@@ -280,6 +308,8 @@ def cells_from_cuda(ann: dict[str, str]) -> list[dict]:
                     "score": score,
                     "outcome": outcome,
                     "failure_reason": fr,
+                    "retryable_infra_failure": result.get("retryable_infra_failure"),
+                    "session_complete": result.get("session_complete"),
                     "has_solution": has_sol,
                     "verdict": verdict,
                     "solution_url": solution_url(rid) if rid else None,
@@ -349,6 +379,8 @@ def cells_from_mega(ann: dict[str, str]) -> list[dict]:
                 "score": score,
                 "outcome": outcome,
                 "failure_reason": fr,
+                "retryable_infra_failure": result.get("retryable_infra_failure"),
+                "session_complete": result.get("session_complete"),
                 "has_solution": has_sol,
                 "verdict": verdict,
                 "solution_url": solution_url(rid) if rid else None,
@@ -375,20 +407,13 @@ def main() -> int:
     cells += cells_from_cuda(load_annotations("cuda"))
     cells += cells_from_mega(load_annotations("mega"))
 
-    # index by id for fast lookup
-    by_id = {c["id"]: c for c in cells}
-    # also by run_id
-    by_run = {c["run_id"]: c for c in cells if c.get("run_id")}
 
     catalog = {
         "generated": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "legend": LEGEND,
         "n_cells": len(cells),
         "cells": cells,
-        "by_id": by_id,  # convenient for tools; duplicates cells
     }
-    # Don't double-store huge by_id in file — keep cells only + build index in consumers
-    catalog.pop("by_id")
 
     OUT.parent.mkdir(parents=True, exist_ok=True)
     OUT.write_text(json.dumps(catalog, indent=2) + "\n")

@@ -5,34 +5,33 @@ import type { ModelIndex } from "./models"
 // Server-side loader for the model index. Kept separate from ./models so the
 // shared types/transforms stay importable from client components.
 
-/** Models pulled from the site entirely (every chart, /models, model pages).
- *  Filtered at load so `kb publish` regenerating models.json can't
- *  resurrect them. */
-const REMOVED_MODEL_SLUGS = new Set([
-  "gemini-3.1-pro-preview",
-  "gemini-3.5-flash",
-  "claude-sonnet-5",
-  "composer-2.5-fast",
-  "deepseek-v4-pro",
-  "minimax-m2.7",
-  // Superseded by gpt-5.6-sol
-  "gpt-5.5",
-  // Retired preview ids — canonical is `hy3` only
-  "hy3-preview",
-  "tencent-hy3-preview",
-  "tencent/hy3-preview",
+/** Current models shown on the homepage and in the model directory.
+ * Historical model pages and run pages still load the full index. */
+const LIVE_MODEL_SLUGS = new Set([
+  "claude-fable-5",
+  "claude-opus-5",
+  "deepseek-v4-flash-0731",
+  "glm-5.3",
+  "gpt-5.6-sol",
+  "grok-4.6",
+  "kinetic-0715",
+  "ox-alpha",
+  "qwen3.8-max",
 ])
 
 // No module-level cache: Next dev (and prod workers) keep one module graph per
 // route segment, so a `cached ??=` here pins each page to whatever models.json
 // said at that segment's first request — the roster visibly desyncs across
 // pages after a publish. The file is ~1 MB; reading it per request is noise.
-export function loadModelIndex(): Promise<ModelIndex> {
+export function loadAllModelIndex(): Promise<ModelIndex> {
   return readFile(join(process.cwd(), "public/data/models.json"), "utf8").then(
-    (raw) => {
-      const idx = JSON.parse(raw) as ModelIndex
-      idx.models = idx.models.filter((m) => !REMOVED_MODEL_SLUGS.has(m.slug))
-      return idx
-    },
+    (raw) => JSON.parse(raw) as ModelIndex,
   )
+}
+
+export function loadModelIndex(): Promise<ModelIndex> {
+  return loadAllModelIndex().then((idx) => {
+    idx.models = idx.models.filter((m) => LIVE_MODEL_SLUGS.has(m.slug))
+    return idx
+  })
 }

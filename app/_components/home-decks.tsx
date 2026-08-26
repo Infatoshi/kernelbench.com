@@ -377,10 +377,14 @@ function DeckPanel({ deck }: { deck: HomeDeck }) {
           return (
             <div key={row.slug} className="hd-row-block">
               <div className="hd-row">
-                <span className="hd-model">
+                <Link
+                  href={`/models/${row.slug}`}
+                  className="hd-model no-underline"
+                  aria-label={`Open ${row.name} model record`}
+                >
                   <LabMark row={row} />
                   <span className="hd-model-name">{row.name}</span>
-                </span>
+                </Link>
                 <div className="hd-cells">
                   {row.chips.map((c, i) => {
                     const animDelayMs = Math.min(i * 40 + rowIdx * 28, 420)
@@ -436,10 +440,14 @@ function DeckPanel({ deck }: { deck: HomeDeck }) {
                     const animDelayMs = Math.min(pIdx * 80 + i * 28, 520)
                     return (
                       <div key={`${row.slug}::${chip.problem}`} className="hd-rank-row">
-                        <span className="hd-rank-model">
+                        <Link
+                          href={`/models/${row.slug}`}
+                          className="hd-rank-model no-underline"
+                          aria-label={`Open ${row.name} model record`}
+                        >
                           <LabMark row={row} />
                           <span className="hd-model-name">{row.name}</span>
-                        </span>
+                        </Link>
                         <Chip
                           chip={chip}
                           best={problemBest}

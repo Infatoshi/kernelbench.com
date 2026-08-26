@@ -6,9 +6,8 @@ import { usePathname } from "next/navigation"
 // Sticky site header: wordmark + primary nav + source links. Active route is
 // derived client-side so every page gets the same server-rendered shell.
 
-// Wordmark is the home/dashboard link; Models is the roster of every ranked
-// model. No per-bench entries — the homepage IS the boards (one deck per
-// bench), and each cell links to its own /runs/<gpu>/<rid> page.
+// Wordmark is the home/dashboard link; primary navigation exposes the ranked
+// models and full run ledger.
 const NAV = [
   { href: "/models", label: "Models" },
   { href: "/runs", label: "Runs" },
@@ -51,7 +50,7 @@ export function SiteNav() {
                 key={item.href}
                 href={item.href}
                 aria-current={active ? "page" : undefined}
-                className={`nav-link no-underline${active ? " nav-link-active" : ""}${item.soon ? " nav-link-soon" : ""}`}
+                className={`nav-link no-underline${active ? " nav-link-active" : ""}`}
               >
                 {item.label}
               </Link>

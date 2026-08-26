@@ -55,9 +55,11 @@ MODEL_NAMES = {
     "glm-5.2": "GLM-5.2",
     "glm-5.3": "GLM-5.3",
     "glm-5.1": "GLM-5.1",
+    "ox-alpha": "GLM-5.3 Flash",
     "gpt-5.5": "GPT-5.5",
     "gpt-5.6-sol": "GPT-5.6 Sol",
     "grok-4.5": "Grok 4.5",
+    "grok-4.6": "Grok 4.6",
     "grok-build": "Grok Build",
     "minimax-m3": "MiniMax-M3",
     "kimi-k2.7-code": "Kimi K2.7-Code",
@@ -87,6 +89,7 @@ LAB_BY_PREFIX = [
     ("claude", "Anthropic"),
     ("gpt", "OpenAI"),
     ("glm", "Z.ai"),
+    ("ox-alpha", "Z.ai"),
     ("kimi", "Moonshot AI"),
     ("kinetic", "Moonshot AI"),
     ("grok", "xAI"),
@@ -105,6 +108,7 @@ LAB_BY_PREFIX = [
 _TAG_TAIL = re.compile(r"\s*\[[^\]]*\]\s*$")
 _TS_PREFIX = re.compile(r"^\d{8}_\d{6}_")
 KNOWN_PROBLEMS: set[str] = set()
+ACTIVE_PROBLEMS: dict[str, set[str]] = {}
 
 
 def slugify(model_field: str) -> str:
@@ -258,6 +262,7 @@ def load_site_board(models: Models, bench: str, path: Path, gpu_key: str | None)
     d = json.loads(path.read_text())
     problems = d.get("problems", [])
     KNOWN_PROBLEMS.update(problems)
+    ACTIVE_PROBLEMS.setdefault(bench, set()).update(problems)
     # The attempted-problem union across rows is the true board denominator
     # (a board's deck can drop a problem the problems array still lists).
     n_attempted = max((len(m.get("results") or {}) for m in d.get("models", [])), default=0)
@@ -277,6 +282,9 @@ def load_site_board(models: Models, bench: str, path: Path, gpu_key: str | None)
                 "verdict": verdict,
                 "valid": bool(c.get("correct")) and c.get("peak_fraction") is not None and verdict not in FLAG_VERDICTS,
                 "elapsed_seconds": c.get("elapsed_seconds"),
+                "failure_reason": c.get("failure_reason"),
+                "retryable_infra_failure": c.get("retryable_infra_failure"),
+                "session_complete": c.get("session_complete"),
                 "solution_url": solution_url(c.get("run_id") or "", gpu_key),
                 "trace_url": trace_url(bench, c.get("run_id") or "", gpu_key),
                 "detail_url": detail_url(bench, c.get("run_id") or "", gpu_key),
@@ -316,6 +324,7 @@ def load_site_board(models: Models, bench: str, path: Path, gpu_key: str | None)
 def load_mega(models: Models, csv_path: Path) -> None:
     rows = list(csv.DictReader(csv_path.read_text().splitlines()))
     KNOWN_PROBLEMS.update(r["problem"] for r in rows)
+    ACTIVE_PROBLEMS.setdefault("mega", set()).update(r["problem"] for r in rows)
     canonical = [r for r in rows if "RTX PRO" in (r.get("gpu") or "")]
 
     def ingest(rowset: list[dict], gpu_key: str | None) -> None:
@@ -461,6 +470,90 @@ def annotation_gpu_key(gpu: object) -> str | None:
         return "b200"
     return None
 
+ANNOTATION_FAILURE_OUTCOMES = {
+    "provider_rate_limited": "rate_limit",
+    "provider_insufficient_credits": "credits",
+    "provider_early_stop": "provider_cut",
+    "provider_unavailable": "provider_unavailable",
+    "harness_error": "harness",
+    "timeout": "timeout",
+    "check_timeout": "check_timeout",
+    "benchmark_timeout": "benchmark_timeout",
+    "benchmark_failed": "benchmark_failed",
+    "incomplete_session": "incomplete",
+    "no_solution": "empty",
+}
+
+
+def annotation_outcome(a: dict, effective_verdict: str) -> str:
+    """Map manually audited, non-board attempts onto the public taxonomy."""
+    if effective_verdict in FLAG_VERDICTS:
+        return effective_verdict
+    if a.get("template_mutated") is True:
+        return "flagged"
+    if effective_verdict == "megakernel_not_authentic":
+        return "not_megakernel"
+    measurement_status = str(a.get("measurement_status") or "")
+    if a.get("board_eligible") is False or any(
+        marker in measurement_status for marker in ("wrong_hardware", "wrong_gpu")
+    ):
+        return "hardware"
+
+    failure_reason = str(a.get("failure_reason") or "")
+    if failure_reason in ANNOTATION_FAILURE_OUTCOMES:
+        return ANNOTATION_FAILURE_OUTCOMES[failure_reason]
+    if a.get("has_solution") is False:
+        return "empty"
+
+    if failure_reason == "check_failed":
+        scope = " ".join(
+            str(a.get(field) or "")
+            for field in ("correctness_scope", "correctness_status", "summary")
+        )
+        if re.search(
+            r"\b(build|compile|compiler|import|undefined identifier|missing header)\b",
+            scope,
+            re.I,
+        ):
+            return "build"
+        return "wrong"
+
+    if a.get("correct") is True:
+        measurement_status = str(a.get("measurement_status") or "")
+        if a.get("publish_grade") is False or measurement_status.startswith("ungraded"):
+            return "ungraded"
+        if a.get("peak_fraction") is not None:
+            return "pass"
+        return "ungraded"
+    if a.get("correct") is False or effective_verdict in {
+        "bug",
+        "genuine_check_failure",
+    }:
+        return "wrong"
+    if "timeout" in effective_verdict:
+        return "check_timeout"
+    return "other"
+
+
+def should_replace_annotation_cell(
+    *,
+    bench: str,
+    problem: str | None,
+    current: dict | None,
+    publishable: bool,
+    score: float | None,
+    run_id: str,
+) -> bool:
+    """Prefer clean audited cells; otherwise show the latest failed attempt."""
+    if problem not in ACTIVE_PROBLEMS.get(bench, set()):
+        return False
+    if current is None:
+        return True
+    if publishable:
+        return not current.get("valid") or (score or 0) > float(current.get("score") or 0)
+    return not current.get("valid") and run_id > str(current.get("run_id") or "")
+
+
 
 def join_annotations(models: Models, bench: str, ann_dir: Path) -> tuple[list[str], int]:
     """Attach audit counts + flag lists. Returns (annotation-only slugs, n_files)."""
@@ -511,6 +604,8 @@ def join_annotations(models: Models, bench: str, ann_dir: Path) -> tuple[list[st
                 "measurement_status": a.get("measurement_status"),
                 "verdict": effective_verdict or "unaudited",
                 "failure_reason": a.get("failure_reason"),
+                "retryable_infra_failure": a.get("retryable_infra_failure"),
+                "session_complete": a.get("session_complete"),
                 "score": a.get("peak_fraction"),
                 "summary": str(a.get("summary") or "").strip(),
                 "solution_url": (
@@ -523,7 +618,59 @@ def join_annotations(models: Models, bench: str, ann_dir: Path) -> tuple[list[st
                 ),
             }
         )
-        if bench == "mega":
+        if bench != "mega":
+            gpu_key = annotation_gpu_key(a.get("gpu"))
+            target = bench_block
+            if gpu_key:
+                target = bench_block.setdefault("gpus", {}).setdefault(
+                    gpu_key,
+                    {
+                        "label": None,
+                        "harness": a.get("harness"),
+                        "effort": a.get("effort"),
+                        "passed": 0,
+                        "total_problems": 0,
+                        "perf": None,
+                        "cells": {},
+                    },
+                )
+            problem = a.get("problem")
+            current = target.get("cells", {}).get(problem)
+            publishable_annotation = (
+                effective_verdict not in FLAG_VERDICTS
+                and a.get("correct") is True
+                and a.get("publish_grade") is True
+                and a.get("peak_fraction") is not None
+            )
+            raw_score = a.get("peak_fraction")
+            score = float(raw_score) if raw_score is not None else None
+            replace = should_replace_annotation_cell(
+                bench=bench,
+                problem=problem,
+                current=current,
+                publishable=publishable_annotation,
+                score=score,
+                run_id=run_id,
+            )
+            if replace:
+                has_solution = a.get("has_solution", True)
+                target.setdefault("cells", {})[problem] = {
+                    "run_id": run_id,
+                    "correct": bool(a.get("correct")),
+                    "has_solution": has_solution,
+                    "score": score,
+                    "verdict": effective_verdict or "unaudited",
+                    "valid": publishable_annotation,
+                    "outcome": annotation_outcome(a, effective_verdict),
+                    "failure_reason": a.get("failure_reason"),
+                    "retryable_infra_failure": a.get("retryable_infra_failure"),
+                    "session_complete": a.get("session_complete"),
+                    "framework": a.get("framework"),
+                    "solution_url": solution_url(run_id, gpu_key) if has_solution else None,
+                    "trace_url": trace_url(bench, run_id, gpu_key),
+                    "detail_url": detail_url(bench, run_id, gpu_key),
+                }
+        if bench == "mega" and a.get("problem") in ACTIVE_PROBLEMS.get("mega", set()):
             # The Mega CSV contains only publishable scores. Preserve audited
             # rejected/failed attempts as invalid cells so the public homepage
             # still shows that the model ran on each GPU instead of silently
@@ -546,25 +693,20 @@ def join_annotations(models: Models, bench: str, ann_dir: Path) -> tuple[list[st
             target["total_problems"] = max(target.get("total_problems", 0), 1)
             problem = a.get("problem") or "02_kimi_linear_decode"
             failure_reason = a.get("failure_reason")
-            outcome = (
-                "timeout"
-                if "timeout" in str(failure_reason or "")
-                else "wrong"
-                if a.get("correct") is False
-                else "other"
-            )
+            outcome = annotation_outcome(a, effective_verdict)
             target.setdefault("cells", {}).setdefault(
                 problem,
                 {
                     "run_id": run_id,
                     "correct": bool(a.get("correct")),
-                    "has_solution": True,
+                    "has_solution": a.get("has_solution", True),
                     "score": None,
                     "verdict": effective_verdict or "unaudited",
                     "valid": False,
                     "outcome": outcome,
-                    "outcome_label": effective_verdict or verdict or failure_reason,
                     "failure_reason": failure_reason,
+                    "retryable_infra_failure": a.get("retryable_infra_failure"),
+                    "session_complete": a.get("session_complete"),
                     "framework": a.get("framework"),
                     "solution_url": mega_solution_url(run_id),
                     "trace_url": trace_url("mega", run_id, gpu_key),
@@ -576,17 +718,38 @@ def join_annotations(models: Models, bench: str, ann_dir: Path) -> tuple[list[st
             bench_block.setdefault("flags", []).append(
                 {"run_id": run_id, "verdict": eff, "summary": (a.get("summary") or "").strip()}
             )
-            # reflect the flag onto the matching cell so the UI chips line up
-            for block in blocks:
-                for cell in block.get("cells", {}).values():
-                    if cell.get("run_id") == run_id:
-                        cell["verdict"] = eff
-                        cell["valid"] = False
         else:
-            for block in blocks:
-                for cell in block.get("cells", {}).values():
-                    if cell.get("run_id") == run_id and cell.get("verdict") in (None, "unaudited"):
-                        cell["verdict"] = verdict or "unaudited"
+            eff = verdict or "unaudited"
+        # Annotation files are the audited source of truth. Project their
+        # failure classification onto any published-board cell with this run.
+        # Filled per matching cell below so sparse legacy annotations inherit
+        # the board's observed correctness and score.
+        for block in blocks:
+            for cell in block.get("cells", {}).values():
+                if cell.get("run_id") != run_id:
+                    continue
+                audited_facts = {
+                    "correct": cell.get("correct"),
+                    "peak_fraction": cell.get("score"),
+                    **a,
+                }
+                audited_outcome = annotation_outcome(audited_facts, eff)
+                cell["outcome"] = audited_outcome
+                for key in (
+                    "failure_reason",
+                    "retryable_infra_failure",
+                    "session_complete",
+                    "has_solution",
+                    "framework",
+                ):
+                    if a.get(key) is not None:
+                        cell[key] = a[key]
+                if a.get("correct") is not None:
+                    cell["correct"] = bool(a["correct"])
+                if flagged or audited_outcome != "pass":
+                    cell["valid"] = False
+                if flagged or cell.get("verdict") in (None, "unaudited"):
+                    cell["verdict"] = eff
     return sorted(annotation_only), len(files)
 
 
@@ -619,13 +782,17 @@ def join_catalog(models: Models) -> None:
                     rid = cell.get("run_id")
                     src = by_run.get(rid) if rid else None
                     if not src:
-                        # Synthesize pass/fail without archive detail. Audit-
-                        # derived cells may already carry a more precise public
-                        # outcome such as `bug` or `timeout_unverified`.
+                        # Synthesize pass/failure detail without archive data.
+                        # Audit-derived cells already carry a precise outcome.
                         fallback = "pass" if cell.get("valid") else "other"
-                        cell.setdefault("outcome", fallback)
+                        outcome = cell.get("outcome") or fallback
+                        cell["outcome"] = outcome
                         cell.setdefault(
-                            "outcome_label", legend.get(fallback, "pass" if fallback == "pass" else "fail")
+                            "outcome_label",
+                            legend.get(
+                                outcome,
+                                "pass" if outcome == "pass" else "failed",
+                            ),
                         )
                         continue
                     fallback = src.get("outcome") or "other"
@@ -636,6 +803,13 @@ def join_catalog(models: Models) -> None:
                     )
                     if src.get("failure_reason") is not None:
                         cell.setdefault("failure_reason", src["failure_reason"])
+                    if src.get("retryable_infra_failure") is not None:
+                        cell.setdefault(
+                            "retryable_infra_failure",
+                            src["retryable_infra_failure"],
+                        )
+                    if src.get("session_complete") is not None:
+                        cell.setdefault("session_complete", src["session_complete"])
                     n += 1
     print(f"joined catalog outcomes into {n} cells")
 
@@ -681,6 +855,10 @@ def compute_perf(models: Models) -> None:
                     if cell.get("valid") and s and s > best.get(prob, 0.0):
                         best[prob] = s
             for b in group:
+                b["passed"] = sum(
+                    1 for cell in b.get("cells", {}).values() if cell.get("valid")
+                )
+                b["total_problems"] = len(deck)
                 # No cells at all → not on this board.
                 if not b.get("cells"):
                     b["perf"] = None

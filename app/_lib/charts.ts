@@ -22,8 +22,8 @@ export const MODEL_NAMES: Record<string, string> = {
   "claude-sonnet-5": "Claude Sonnet 5",
   "glm-5.2": "GLM-5.2",
   "glm-5.3": "GLM-5.3",
-  "ox-alpha": "Ox Alpha",
-  "stealth/ox-alpha": "Ox Alpha",
+  "ox-alpha": "GLM-5.3 Flash",
+  "stealth/ox-alpha": "GLM-5.3 Flash",
   "gpt-5.5": "GPT-5.5",
   "gpt-5.6-sol": "GPT-5.6 Sol",
   "grok-4.5": "Grok 4.5",
@@ -47,13 +47,24 @@ function displayName(modelId: string): string {
   return MODEL_NAMES[modelId] ?? modelId
 }
 
-/** Models pulled from the site entirely — keep in sync with
- *  REMOVED_MODEL_SLUGS in models.server.ts. Matches raw leaderboard/CSV ids
- *  like "gemini/gemini-3.5-flash" or "codex/gpt-5.5". */
+const LIVE_MODEL_IDS = new Set([
+  "anthropic/claude-fable-5",
+  "anthropic/claude-opus-5",
+  "claude-fable-5",
+  "claude-opus-5",
+  "deepseek/deepseek-v4-flash-0731",
+  "glm-5.3",
+  "gpt-5.6-sol",
+  "grok-4.6",
+  "kinetic-0715",
+  "ox-alpha",
+  "qwen/qwen3.8-max",
+  "stealth/ox-alpha",
+])
+
+/** Keep charts on the same current-model roster as the homepage. */
 export function isRemovedModel(modelId: string): boolean {
-  return /gemini-3\.1-pro|gemini-3\.5-flash|(^|\/)gpt-5\.5($|[^0-9])|hy3-preview|tencent\/hy3-preview|tencent-hy3-preview/.test(
-    modelId,
-  )
+  return !LIVE_MODEL_IDS.has(modelId)
 }
 
 // GPU series colors — match the published charts (B200 is the NVIDIA accent).
@@ -172,8 +183,8 @@ const SHORT_NAMES: Record<string, string> = {
   "claude-sonnet-5": "Sonnet 5",
   "glm-5.2": "GLM-5.2",
   "glm-5.3": "GLM-5.3",
-  "ox-alpha": "Ox",
-  "stealth/ox-alpha": "Ox",
+  "ox-alpha": "5.3 Flash",
+  "stealth/ox-alpha": "5.3 Flash",
   "gpt-5.5": "GPT-5.5",
   "gpt-5.6-sol": "GPT-5.6 Sol",
   "grok-4.5": "Grok 4.5",

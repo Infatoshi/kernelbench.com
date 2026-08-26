@@ -17,9 +17,8 @@ import {
   type ModelEntry,
   type ModelIndex,
 } from "@/app/_lib/models"
-import { loadModelIndex } from "@/app/_lib/models.server"
+import { loadAllModelIndex } from "@/app/_lib/models.server"
 import { PageHead } from "@/app/_components/page-head"
-import { ModelStoryArticle, ModelStoryLead } from "@/app/_components/model-story"
 
 // One static page per published model (and per audited-but-unpublished model,
 // whose page carries the integrity record). Everything renders from
@@ -28,7 +27,7 @@ import { ModelStoryArticle, ModelStoryLead } from "@/app/_components/model-story
 export const dynamicParams = false
 
 export async function generateStaticParams() {
-  const idx = await loadModelIndex()
+  const idx = await loadAllModelIndex()
   return idx.models.map((m) => ({ slug: m.slug }))
 }
 
@@ -38,7 +37,7 @@ export async function generateMetadata({
   params: Promise<{ slug: string }>
 }) {
   const { slug } = await params
-  const idx = await loadModelIndex()
+  const idx = await loadAllModelIndex()
   const model = idx.models.find((m) => m.slug === slug)
   return { title: model ? `${model.name} · kernelbench` : "model · kernelbench" }
 }
@@ -83,18 +82,21 @@ function CellCard({
   }
   const flagged = FLAG_VERDICTS.has(cell.verdict)
   const outcome = cell.outcome_label ?? cell.failure_reason?.replace(/_/g, " ")
-  const pill = cell.correct
-    ? flagged
+  const status = cell.valid ? "pass" : outcome || "failed"
+  const pill = cell.valid
+    ? "status-pill-good"
+    : flagged
       ? "status-pill-warn"
-      : "status-pill-good"
-    : "status-pill-bad"
+      : cell.outcome === "wrong"
+        ? "status-pill-bad"
+        : cell.outcome === "empty"
+          ? "status-pill-muted"
+          : "status-pill-warn"
   return (
     <div className="cell-card">
       <div className="cell-card-head">
         <span className="cell-card-problem">{problemLabel(probKey)}</span>
-        <span className={`status-pill ${pill}`}>
-          {flagged ? "flag" : cell.correct ? "pass" : "fail"}
-        </span>
+        <span className={`status-pill ${pill}`}>{status}</span>
       </div>
       <div className="cell-card-metrics">
         {bench !== "mega" && cell.score != null && (
@@ -131,7 +133,7 @@ function CellCard({
           {cell.elapsed_seconds != null && <span>session {fmtDur(cell.elapsed_seconds)}</span>}
         </div>
       ) : null}
-      {!cell.correct && outcome && bench !== "mega" && (
+      {!cell.valid && outcome && bench !== "mega" && (
         <p className="cell-card-cause">{outcome}</p>
       )}
       <div className="cell-card-links">
@@ -315,7 +317,7 @@ export default async function ModelPage({
   params: Promise<{ slug: string }>
 }) {
   const { slug } = await params
-  const idx = await loadModelIndex()
+  const idx = await loadAllModelIndex()
   const model = idx.models.find((m) => m.slug === slug)
   if (!model) notFound()
 
@@ -394,7 +396,6 @@ export default async function ModelPage({
           </>
         }
       />
-      <ModelStoryLead slug={model.slug} />
 
       {benches.length > 0 && (
         <div className="chart-panel">
@@ -443,7 +444,6 @@ export default async function ModelPage({
       {benches.map((bench) => (
         <BenchPanel key={bench} bench={bench} model={model} idx={idx} />
       ))}
-      <ModelStoryArticle slug={model.slug} />
 
       {legacy && (
         <p className="model-legacy">
