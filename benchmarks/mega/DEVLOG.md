@@ -1708,3 +1708,5 @@ the hard bench's reward_hack_lint.py with the hard root); run the script with
 the absolute run path. The 0.98 output-cosine gate on 02 is sensitive to
 reference-side MoE router near-ties (seeds 2 and 10 are exact ties, seed 5
 reads 0.977 for a correct kernel); expect dips in future 02 audits.
+
+Deployed 2026-09-02: traces pushed to HF (Infatoshi/kernelbench-mega-traces, 54 files), commit 95d342d on master, live row confirmed on kernelbench.com within a minute of push. Model name maps in app/_lib/charts.ts and scripts/build_model_index.py gained claude-fable-5-1.
