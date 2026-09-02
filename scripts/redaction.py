@@ -28,6 +28,7 @@ TOKEN_PATTERNS = [
         r"gho_[A-Za-z0-9]{20,}",
         r"github_pat_[A-Za-z0-9_]{30,}",
         r"hf_[A-Za-z0-9]{20,}",
+        r"LLM_[A-Za-z0-9_\-]{30,}",  # Meta Model API keys
         r"Bearer\s+[A-Za-z0-9._\-]{20,}",
     ]
 ]

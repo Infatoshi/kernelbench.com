@@ -209,6 +209,13 @@ cp -p "$REPO_ROOT/src/eval/trusted_entrypoint.py" "$TRUSTED_ENTRYPOINT"
 # do not contaminate each other's timing or Torch extension builds.
 REAL_UV="$(command -v uv)"
 REAL_PYTHON="$(command -v python3 || command -v python)"
+# Prefer the bench's own project interpreter: a launch from a plain shell
+# resolves python3 to the system one (no torch), and the agent-facing wrapper
+# then hands the model a dead interpreter. Grading itself always goes through
+# `uv run`, so this only affects what the agent sees on PATH.
+if [ -x "$REPO_ROOT/.venv/bin/python" ]; then
+    REAL_PYTHON="$REPO_ROOT/.venv/bin/python"
+fi
 REAL_NVIDIA_SMI="$(command -v nvidia-smi || true)"
 REAL_NCU="$(command -v ncu || true)"
 REAL_NSYS="$(command -v nsys || true)"
@@ -1082,6 +1089,63 @@ JSON
             </dev/null > "$LOG_FILE" 2> "$STDERR_FILE" ) || HARNESS_EXIT=$?
         ;;
 
+    muse)
+        # Muse Code (Meta's agent) headless. `muse exec --json` streams JSONL
+        # session events; --yolo drops approval and the OS sandbox and trusts
+        # the workspace for this run (mega's own bwrap sandbox still applies).
+        # Effort is a CLI flag (none|minimal|low|medium|high|xhigh|ultra, CLI
+        # default high), so only override when the effort arg is given. The
+        # prompt is the positional argument. Requires META_API_KEY. stdout
+        # carries no per-request usage: export the durable session log into
+        # the archive afterwards so the viewer can count tokens.
+        if [ -z "${META_API_KEY:-}" ]; then
+            echo "META_API_KEY is required for muse" >&2
+            exit 1
+        fi
+        MUSE_EFFORT_ARG=()
+        if [ -n "$REASONING_EFFORT" ]; then
+            MUSE_EFFORT_ARG=(--reasoning-effort "$REASONING_EFFORT")
+        fi
+        ( cd "$PROBLEM_DIR" && "${KBH_SBX[@]}" timeout "$BUDGET_SECONDS" "${MUSE_BIN:-$HOME/.local/bin/muse}" exec \
+            --json \
+            --yolo \
+            --disable-web-tools \
+            --no-foreign-personal-context \
+            --user-input-auto-resolve \
+            --workspace "$PROBLEM_DIR" \
+            --model "$MODEL" \
+            "${MUSE_EFFORT_ARG[@]}" \
+            "$PROMPT" ) \
+            </dev/null > "$LOG_FILE" 2> "$STDERR_FILE" || HARNESS_EXIT=$?
+        MUSE_SESSION_ID="$(grep -o '"stream": *{"kind": *"session", *"id": *"[^"]*"' "$LOG_FILE" 2>/dev/null | head -1 | sed 's/.*"id": *"//; s/"$//')"
+        if [ -n "$MUSE_SESSION_ID" ]; then
+            ( cd "$PROBLEM_DIR" && "${MUSE_BIN:-$HOME/.local/bin/muse}" export --session "$MUSE_SESSION_ID" --out "$RUN_DIR/muse_export.json" ) >> "$STDERR_FILE" 2>&1 || true
+        fi
+        ;;
+    agy)
+        # Antigravity CLI (Google). --print is non-interactive; the model id
+        # carries the effort tier (gemini-3.8-flash-high|medium|low), so the
+        # effort arg only overrides when given. --add-dir trusts the
+        # workspace headlessly (without it write_to_file errors on paths
+        # outside ~/.gemini/antigravity-cli/settings.json trustedWorkspaces).
+        # --print-timeout defaults to 5m; lift it so the wall clock is ours.
+        # -p must be LAST with the prompt as its immediate argument: a bare
+        # --print swallows whatever flag follows it as the prompt.
+        AGY_EFFORT_ARG=()
+        if [ -n "$REASONING_EFFORT" ]; then
+            AGY_EFFORT_ARG=(--effort "$REASONING_EFFORT")
+        fi
+        ( cd "$PROBLEM_DIR" && "${KBH_SBX[@]}" timeout "$BUDGET_SECONDS" "${AGY_BIN:-$HOME/.local/bin/agy}" \
+            --dangerously-skip-permissions \
+            --print-timeout 168h \
+            --output-format stream-json \
+            --model "$MODEL" \
+            "${AGY_EFFORT_ARG[@]}" \
+            --add-dir "$PROBLEM_DIR" \
+            -p "$PROMPT" ) \
+            </dev/null > "$LOG_FILE" 2> "$STDERR_FILE" || HARNESS_EXIT=$?
+        ;;
+
     cursor)
         # Cursor Agent CLI is installed as `agent` on Anvil.
         "${KBH_SBX[@]}" timeout "$BUDGET_SECONDS" agent \
@@ -1125,7 +1189,7 @@ JSON
 
     *)
         echo "Unknown harness: $HARNESS" >&2
-        echo "Supported: claude, zai-claude, minimax-claude, kimi-claude, kinetic-claude, qwen-claude, or-fable, or-opus, longcat-claude, hy3, deepseek-claude, ccr-claude, codex, kimi, droid, gemini, cursor, grok, opencode, tinker, inkling, opencode-inkling" >&2
+        echo "Supported: claude, zai-claude, minimax-claude, kimi-claude, kinetic-claude, qwen-claude, or-fable, or-opus, longcat-claude, hy3, deepseek-claude, ccr-claude, codex, kimi, droid, gemini, cursor, grok, opencode, agy, muse, tinker, inkling, opencode-inkling" >&2
         exit 1
         ;;
 esac
@@ -1158,6 +1222,16 @@ SESSION_COMPLETE=true
 case "$HARNESS" in
     claude|zai-claude|minimax-claude|kimi-claude|kinetic-claude|or-fable|openrouter-fable|longcat-claude|deepseek-claude|ccr-claude|cursor|gemini)
         if ! grep -q '"type":"result"' "$CHECK_FILE" 2>/dev/null; then
+            SESSION_COMPLETE=false
+        fi
+        ;;
+    muse)
+        if ! grep -q '"payload_type": *"run\.terminal\.' "$CHECK_FILE" 2>/dev/null; then
+            SESSION_COMPLETE=false
+        fi
+        ;;
+    agy)
+        if ! grep -q '"event":"result"' "$CHECK_FILE" 2>/dev/null; then
             SESSION_COMPLETE=false
         fi
         ;;

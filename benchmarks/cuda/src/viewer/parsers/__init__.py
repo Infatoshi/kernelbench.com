@@ -46,6 +46,14 @@ def sniff(path: Path) -> str:
             if obj.get("type") == "tool_result" and "tool_call_id" in obj:
                 return "grok"
 
+            # Muse Code (Meta): session records with schema_version, stream{kind:"session"}, payload_type.
+            if "payload_type" in obj and "schema_version" in obj and isinstance(obj.get("stream"), dict):
+                return "muse"
+
+            # Antigravity CLI (agy): {event:"init", conversation_id, init:{model,cwd}}.
+            if obj.get("event") == "init" and isinstance(obj.get("init"), dict):
+                return "agy"
+
             # Gemini CLI: bare {type:"init", session_id, model} with no subtype,
             # followed by message / tool_use / tool_result / result events.
             if obj.get("type") == "init" and "model" in obj and "session_id" in obj:
@@ -120,6 +128,12 @@ def parse(path: Path) -> Session:
     if fmt == "opencode":
         from src.viewer.parsers import opencode
         return opencode.parse(path)
+    if fmt == "muse":
+        from src.viewer.parsers import muse
+        return muse.parse(path)
+    if fmt == "agy":
+        from src.viewer.parsers import agy
+        return agy.parse(path)
     if fmt == "gemini":
         from src.viewer.parsers import gemini
         return gemini.parse(path)
