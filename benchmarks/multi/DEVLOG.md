@@ -60,20 +60,10 @@ it, treat grok's annotation `*_clean` values as board truth and do not claim
 ## 2026-07-31 — sequential regrade wave: the five-model board on the fused deck
 
 All published-candidate cells re-graded sequentially isolated on a quiet
-kbmulti (bench venv torch 2.13 cu130, cuda-13 toolchain). Board at wave end
-(kimi 09 still open then; closed 2026-08-03 above):
-
-- **01 peak_fraction:** grok 0.3229 · glm 0.2788 · codex 0.3281 ·
-  **opus 0.3884** · kimi 0.3811
-- **07 speedup:** grok 1.3699 · glm 1.0989 · codex 1.1461 · **opus 1.5874** ·
-  kimi FAIL (tripwire)
-- **08 speedup:** grok **1.3640** · glm FAIL honest · codex 1.3278 ·
-  opus regrade_failed · kimi FAIL honest
-- **09 speedup:** grok 4.4493 · glm 6.7536 · codex 8.2443 · **opus 10.7528**
-
-Per-cell evidence lives in `results/annotations/`, including empirical
-recompute probes (overwrite the same input buffers in place, confirm outputs
-track) on every headline 09 cell.
+kbmulti (bench venv torch 2.13 cu130, cuda-13 toolchain). The board this wave
+produced is the 2026-08-03 entry above; per-cell evidence lives in
+`results/annotations/`, including empirical recompute probes (overwrite the
+same input buffers in place, confirm outputs track) on every headline 09 cell.
 
 Two regrade-infrastructure bugs surfaced during the wave, both worth naming:
 
@@ -137,7 +127,7 @@ kimi 01 PASSed through this route (regraded 0.3811, second-best on the cell).
 with "Provider returned error" despite healthy curl probes of the same route.
 The final retry ran 31 minutes of productive session and was then killed
 (exit 143) by our own retry-loop cleanup — self-inflicted, not provider.
-Rerun pending.
+Closed 2026-08-03.
 
 ## 2026-07-29 — grade-stack split: in-run PASSes were graded on the system torch
 
@@ -331,7 +321,7 @@ cases: anchor re-export, collective hidden in a helper, bare collective in
 list). All four prompts now state that the restriction follows imports, so an
 honest agent is not blindsided by it.
 
-## 2026-07-24 — contamination sweep, first clean grok-4.5 board, formula fix
+## 2026-07-24 — contamination sweep, first clean grok-4.5 board (numbers superseded), formula fix
 
 Five grok-4.5 waves ran on hades (waves 1/2 killed externally — see below; wave 3
 died on auth; wave 4 full-budget but co-tenant-contended; wave 5 full-budget,
@@ -363,28 +353,19 @@ audit) AND swept for cross-run contamination at tool-call level. Findings:
   yet (wave-5's audit verified real wire traffic, 284 GB/s). Harden with
   rank-distinct expert weights or a wire-traffic check before publish.
 
-**First clean grok-4.5 board (4xH100, sequential isolated re-grades,
-per-cell annotations in `results/annotations/`):**
-01 allreduce+residual 0.306 · 02 reducescatter+rmsnorm — (no clean passing
-cell) · 03 fp8 allgather 0.106 · 04 moe all2all 0.452 · 05 ulysses 0.206
-(wave-6, clean audit: entry+exit barriers, live copy-in before every graph
-replay; isolated quiet-node re-grade 0.2056 vs in-run 0.2042) · 06 fp8 reducescatter — (no clean
-cell). Wave 6 also proved relocating archives to a hidden `~/.kbm-archive`
-is NOT a sandbox: the 02 and 06 agents found and read it (both excluded).
-Durable fix applied — all runs now pulled to the Mac
-(`outputs/runs-hades/`) and deleted from the node, so wave 7 (02, 06)
-launches against a truly empty box.
+**Wave 6 proved relocating archives to a hidden `~/.kbm-archive` is NOT a
+sandbox:** the 02 and 06 agents found and read it (both excluded). Durable fix
+applied — all runs now pulled to the Mac (`outputs/runs-hades/`) and deleted
+from the node, so wave 7 (02, 06) launches against a truly empty box.
 
-**Wave 8 completed the board (2026-07-24).** Under the full-scrub protocol
-both open cells came back clean (audited, sequentially re-graded on the
-quiet node): 02 = 0.2179 (in-run 0.1849 was sibling-contended — the two
-wave-8 agents contended with each other, re-grade recovered 18%),
-06 = 0.1029. **Final clean grok-4.5 board: 01 0.306 · 02 0.218 · 03 0.106 ·
-04 0.452 · 05 0.206 · 06 0.103.** Instructive: the clean 02/06 numbers are
-LOWER than the excluded contaminated cells (0.233/0.149) — the "gains" in
-waves 4-7 were transcript-mined iteration, not capability. Wave-8 agents
-still ran the same archaeology probes (find solution.py, ls ~/.grok/sessions)
-— intent is constant; only supply was cut.
+**Wave 8 completed the board (2026-07-24).** Under the full-scrub protocol both
+open cells came back clean (audited, sequentially re-graded on the quiet node);
+02's in-run number was sibling-contended — the two wave-8 agents contended with
+each other, and the re-grade recovered 18%. Instructive: the clean 02/06 numbers
+came in LOWER than the excluded contaminated cells — the "gains" in waves 4-7
+were transcript-mined iteration, not capability. Wave-8 agents still ran the
+same archaeology probes (find solution.py, ls ~/.grok/sessions) — intent is
+constant; only supply was cut.
 
 **Wave 7 found a THIRD leak channel: grok's own session store.** With the
 runs archive genuinely empty, both agents (02 0.2257, 06 0.1490 — excluded)
@@ -414,10 +395,8 @@ suspect behind the silent fleet kills. Hades now has its own device-code login.
   (read-only, agents poll it). Verified live: two concurrent wrapped sessions
   serialize; second blocks until first frees.
 - Wave 1 (grok-4.5, all 6 problems, 7200s budget, hades): all six grok CLIs
-  were SIGKILLed (exit 137) at ~08:16:38-49 UTC, ~8.5 min in. Partial early
-  solutions still graded: 04 PASS 0.2269, 05 PASS 0.4042, 06 PASS 0.0341,
-  01 solution SIGABRTs (genuine misaligned-address kernel), 02 TypeError,
-  03 no solution.
+  were SIGKILLed (exit 137) at ~08:16:38-49 UTC, ~8.5 min in. 01's partial
+  solution SIGABRTed on a genuine misaligned-address kernel.
 - Kill forensics: ~70 s before the kills, the kernel log shows a massive
   NVRM Xid 13 flood (Graphics SM Warp Exception / Misaligned Address /
   Multiple Warp Errors) across ALL FOUR GPUs — an agent's misaligned IPC

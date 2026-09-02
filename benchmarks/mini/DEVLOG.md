@@ -1,25 +1,6 @@
 # KernelBench-Mini — DEVLOG
 
 
-## 2026-08-03 — docs reconciled for cold-agent handoff
-
-SPEC/README/AGENTS disagreed after the 07-29 architecture flip (SPEC still
-described anvil→tunnel→athena; AGENTS/DEVLOG had self-contained kbmini). Cold
-agents could not tell which SOP was current. Fixed without code changes:
-
-- `SPEC.md` rewritten: current co-hosted-vLLM architecture, script allow/deny
-  table, ordered operator runbook (API vs local-vLLM), first-subject campaign
-  marked complete (not a second SOP), codex anchor explicitly **missing on
-  disk / rerun before debut**, pre-debut checklist.
-- `README.md` expanded to a real entrypoint pointing at SPEC.
-- Root `AGENTS.md` Mini blurb points at SPEC as operator SoT.
-- `scripts/publish_v2.sh` header no longer says "run from benchmarks/cuda".
-- Site surface locked: Mini is a **homepage `HomeDecks` scroll category on
-  `/`**, same pattern as Mega/Hard/CUDA — **not** `kernelbench.com/mini`.
-
-No deck, harness, or result changes. Next human decisions before debut remain:
-rerun codex anchor; clear SPEC calibration debts.
-
 ## 2026-07-29 — self-contained kbmini node: serving moved onto the eval box
 
 Athena (and the whole lease fleet) died mid-campaign with the anvil tunnel as a
@@ -35,15 +16,6 @@ come from one consistent GPU. New architecture, one Lambda `gpu_1x_h100_sxm5`
   the sequential re-grade, which runs with the server stopped. This supersedes
   the 07-23 "inference never on the eval GPU" rule — that rule now applies to
   the re-grade, not the agent phase.
-- ccr-rust's source is deleted everywhere (anvil binary only survives; built
-  against glibc 2.43, node has 2.35). It runs under anvil's shipped loader:
-  `ld-linux-x86-64.so.2 --library-path ~/.kbmini/ccrlibs ccr-rust`. Rebuild
-  properly if ccr ever needs changes.
-- Lambda image gotcha: no `ninja` — vLLM's KV-cache init shells out to it and
-  the engine core dies with FileNotFoundError. `apt install ninja-build`.
-- vLLM API drift: `WeightsMapper(orig_to_new_renamings=...)` kwarg no longer
-  exists (renamed singular). `serve_nvfp4.py` now pops `.w1`/`.w3` from
-  `orig_to_new_stacked` in place instead of constructing a new mapper.
 - 10-min rsync pullback to the Mac runs for the whole campaign (athena lesson:
   a dead node must cost <=10 min of artifacts, and the pullback must exclude
   per-run `.venv`/caches — mirroring them once filled the Mac disk).
@@ -118,38 +90,18 @@ archive holds the full diff, which is why the post-hoc workspace looks clean.
 
 Three environment bugs, all found by running rather than by reading:
 
-- **`uv` not on PATH over non-login ssh.** The first launch reported all 100
-  sessions "done" in under a second. `run_hard.sh` did `REAL_UV="$(command -v
-  uv)"` and died on the empty result, which the sweep loop logged as a finished
-  run. A missing toolchain must never be indistinguishable from a completed
-  session: there is now an explicit preflight that exports `~/.local/bin` and
-  fails with `STOP: uv not found on PATH`.
-- **vLLM needs `--enable-auto-tool-choice --tool-call-parser lfm2`.** Without
-  them every harness 400s on its first tool call. The server also has to be
-  re-served at `--max-model-len 128000`; hermes hard-requires >=64k and its
-  compression loop dies at 65536.
+- **`uv` not on PATH over non-login ssh** made the first launch report all 100
+  sessions "done" in under a second: a missing toolchain must never be
+  indistinguishable from a completed session, so a preflight now fails loudly
+  with `STOP: uv not found on PATH`.
+- **vLLM needs `--enable-auto-tool-choice --tool-call-parser lfm2`** or every
+  harness 400s on its first tool call, and `--max-model-len 128000` because
+  hermes's compression loop dies at 65536.
 - **Timings from this wave are contended by construction** (five columns, two
-  GPUs, per-GPU lock dirs). mini had been left out of the `regrade_sequential.sh`
-  rollout despite needing it more than the other benches; copied in.
+  GPUs), so mini was finally added to the `regrade_sequential.sh` rollout it
+  had been left out of despite needing it more than the other benches.
 
 ## 2026-07-24 — ares (2x H100 SXM) is the eval node; deck validated on it
-
-Lambda is no longer the plan: **ares** (`ssh ares`, 2x H100 80GB HBM3,
-driver 580, 5.2T free) is already-rented capacity and its GPUs are the exact
-SXM part the deck declares (`hardware: [H100_SXM]`). No metered node to
-forget about.
-
-Node bootstrap: uv, **Node 22** (ares shipped none, which also unblocked its
-pre-installed codex), hermes 0.19.0 (clone + venv, matching anvil), pi 0.73.1.
-claude 2.1.218 / grok 0.2.106 / opencode 1.17.8 were already present.
-
-**Inference stays on anvil** — the eval GPU must never host the model. anvil
-serves LFM and reverse-tunnels two ports into ares:
-`~/.kbmini/tunnel_ares.sh` (self-healing retry loop) forwards **8765** (vLLM,
-OpenAI-compatible) and **3456** (ccr-rust, Anthropic shim for Claude Code).
-Tunnelling ccr rather than installing it on ares sidesteps a glibc mismatch
-(anvil 2.43 vs ares 2.35 — an anvil-built binary will not run there).
-Verified under 5-way concurrency, which is the load the matrix produces.
 
 **Deck validated on the canonical node** (reference-as-solution, GPU1):
 - 01, 02: `check.py` **PASS** including numeric stress.
@@ -178,13 +130,6 @@ failure mode is **a 2.6B model narrating instead of calling tools**, and
 which harness happens to survive flips between machines — exactly the
 variance the 5-repeat cell exists to quantify.
 
-Matrix launcher added (`scripts/launch_matrix.sh`): one worker per harness
-column (never problem-major — head-of-line blocking), workers pinned
-round-robin across GPUs, **each GPU gets its own `KBH_GPU_LOCK_DIR`** so
-compile/check/benchmark serialize per GPU while different GPUs run truly
-concurrently. Its timings are contended and not publishable; the sequential
-re-grade rule still applies.
-
 **Calibration: the deck is solvable, and the cap binds.** `codex gpt-5.6-sol`
 (high) on 01: **correct at 0.0900 peak fraction**, 12.8-18.2x the naive
 reference, audited clean (see SPEC). It hit the 1800s cap mid-optimization
@@ -207,14 +152,6 @@ blocks the fast form of the cheat, leaving only a correct-but-slow mislabel.
 Fixing this now, before the matrix runs, means 200 sessions write correct
 labels rather than 200 archives needing relabelling.
 
-Operational notes: an archive costs ~4.7G once a solution triggers the graded
-`uv run` (an archive-local `.venv` of torch+cu130) — reproducible from the
-preserved `pyproject.toml`/`uv.lock`, so reapable after publish. On ares only
-**codex** has live credentials; Claude Code's OAuth expired there and grok
-401s (grok auth does not survive being copied between machines — needs a
-per-box device login or `XAI_API_KEY`). None of that blocks the LFM matrix,
-which routes entirely through the tunnelled local endpoint.
-
 ## 2026-07-23 — LFM2.5-2.6B-Agent harness probes: all five routes green
 
 First subject model wired up: LiquidAI LFM2.5-2.6B-Agent served on anvil GPU0
@@ -223,18 +160,11 @@ via vLLM 0.25.1 (`127.0.0.1:8765`, `--enable-auto-tool-choice
 headless file-write probe (`hello.txt` with exact content) against the live
 bf16 server. What it took:
 
-1. **Serving context raised 8192 -> 65536.** hermes refuses to start below
-   64k context, and Claude Code's default request shape assumes big budgets.
-   The model supports 128k positions, so this is in-spec; the throughput
-   runbook's 8192 was a benchmarking choice, not a model limit.
-2. **pi hangs with sessions.** `pi --mode json -p` (defaults) times out with
-   zero output; `--no-session` fixes it in both text and json modes. The
-   `pi)` branch now passes `--mode json --no-session`.
-3. **hermes context exhaustion is a real failure mode.** A trivial probe
+1. **hermes context exhaustion is a real failure mode.** A trivial probe
    wrote the file correctly but exited 1 with "max compression attempts (3)
    reached" — with a 65k window this is the small-model harness tax, score it
    as-is.
-4. **Claude Code route was broken by a stale ccr-rust binary.** Symptom:
+2. **Claude Code route was broken by a stale ccr-rust binary.** Symptom:
    model emits think-text, says "let me write the file", session ends after
    one turn, no tool ever runs. Wire captures (logging proxies on both sides
    of ccr) showed vLLM streaming a complete `Write` tool_call and ccr
@@ -247,36 +177,23 @@ bf16 server. What it took:
    `~/.cargo/bin/ccr-rust.bak-20260723`. Lesson: a proxy that passes
    single-shot curl tests can still break the agentic loop — probe the loop,
    not the endpoint.
-5. **Two cosmetic vLLM 400s through ccr remain, both harmless:** Claude
-   Code's session-title side request sends `tools: []` (vLLM rejects empty
-   arrays; the request is non-essential), and before the `maxtoken` clamp
-   Claude Code asked for 64000 output tokens (`CLAUDE_CODE_MAX_OUTPUT_TOKENS`
-   is ignored by CC 2.1.218). Fixed by adding
-   `["maxtoken", {"max_tokens": 8192}]` to the ccr transformer chain
-   (`scripts/ccr-lfm.config.json`); the previously listed "openai"
-   transformer does not exist in ccr-rust and was silently skipped.
-6. **Small-model behavior notes from the probes:** LFM emits its reasoning
+3. **Small-model behavior notes from the probes:** LFM emits its reasoning
    as in-band `</think>` text (renders as visible text through every route),
    and it hallucinated `/tmp/kbmini-probe` (hyphen) for a cwd-relative path
    once — problem prompts already use explicit relative paths.
-7. **Grok Build** needed only the documented `[model."<id>"]` config.toml
-   block (`api_backend = "chat_completions"`); worked first try, 2 turns.
 
 Matrix locked in SPEC: 2 precisions (bf16 / NVFP4A16, precision-tagged served
 names `lfm25-agent-bf16` / `lfm25-agent-nvfp4`) x 5 harnesses x 4 problems x
 5 repeats = 200 sessions.
 
-Same-day smoke (one real `01_dequant_gemv` cell per harness, bf16 served on
-anvil GPU1/3090 after Laguna took GPU0; wiring validation only, timings
-contended): all five routes produced valid graded cells. lfm-opencode, pi,
-and lfm-claude wrote real (incorrect) solutions — check_failed; lfm-grok ran
-18 turns then ended by asking a clarifying question (no_solution); hermes at
-65536 ctx crashed its own compression loop ("max compression attempts
-reached"), at 128000 ctx it completes but LFM's in-band think text trips
-hermes's output-length truncation before solution.py exists (no_solution).
-Serving context is therefore 128000, and the hermes branch default provider
-was fixed from `openai` to `lfm`. 0/5 correct — plausible bar for 2.6B;
-repeats will quantify.
+Same-day smoke (one real `01_dequant_gemv` cell per harness, wiring validation
+only, timings contended): all five routes produced valid graded cells, 0/5
+correct. hermes at 65536 ctx crashed its own compression loop, and at 128000
+ctx LFM's in-band think text trips hermes's output-length truncation before
+`solution.py` exists — so serving context is 128000, and the hermes branch
+default provider was fixed from `openai` to `lfm`. The rest failed by writing
+real but incorrect kernels or by never calling a tool, which is the plausible
+bar for 2.6B.
 
 ## 2026-07-23 — Bench created: small-model deck, capped + repeated
 
@@ -325,16 +242,3 @@ Design decisions (user, this session):
    `require_cuda_evidence: false` (the cuda_language module's existing escape
    hatches); 03/04 full CUDA-only gate. Tests updated: the gate-import test
    now only applies to `language: cuda` problems and asserts exactly 2.
-
-Validation this session: `uv run pytest` 56 passed; ruff clean on all new code
-(19 pre-existing errors in inherited `build_v2_leaderboard.py` /
-`reward_hack_lint.py`, identical in benchmarks/cuda — not touched). CPU
-semantics smokes: 01 ragged-group round trip, 02 reference loop vs brute-force
-per-element recurrence, 03 reference mask satisfies its own fp64 oracle bands
-(incl. flat-logits stress) + nucleus mass >= p + top-1 always kept, 04
-reference matches SDPA within 3e-2.
-
-Open before first publish (see SPEC "Calibration debts"): stress-atol
-calibration on real kernels, TAU validation for 03, frozen eager_ms anchor for
-03, and a cheap-model smoke of all four problems end-to-end through the
-harness on a Lambda H100.

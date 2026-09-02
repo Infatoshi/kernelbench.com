@@ -152,25 +152,3 @@ columns (`framework`, `triton_cheat`).
 
 Rsynced from Hard (scripts + src + kbh CLI). Package renamed
 `kernelbench-cuda`. Do not edit Hard/Mega prompts from this workstream.
-
-### First smoke models
-
-Grok 4.5 (fast agent) on RTX PRO 6000 for structure validation, then the
-planned matrix: Fable 5, GPT-5.6 Sol xhigh, Kimi, GLM-5.2, Opus 4.8, Grok 4.5.
-
-Launched 2026-07-15 ~18:43 (Anvil), container mode, unlimited budget; all
-three finished (~37–53 min). Audits in `results/annotations/`:
-
-| run | verdict | notes |
-| --- | --- | --- |
-| `...01_rmsnorm_residual` | clean | real CUDA; geomean 0.33 (skinny-row drag) |
-| `...02_online_softmax` | clean | real CUDA; pf>1 = one-pass bytes formula, not a hack |
-| `...03_grid_mingru_sps` | clean | CUDA + cuBLAS GEMMs + CUDAGraph; peak_sps raised to 150M |
-
-v1 deck replaces 01/02 with grouped GEMM + flash attn + MoE scatter; keeps 03.
-
-### Explicit non-goals this session
-
-- Do not modify `benchmarks/hard` or `benchmarks/mega` problem surfaces.
-- Do not claim a published CUDA board until cells are audited.
-- Full Craftax classic parity is deferred; 03 is the SPS / MinGRU probe.
