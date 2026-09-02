@@ -150,7 +150,7 @@ Hugging Face "unresolved" is a missing file (404), not a private dataset. `Infat
 
 ## In-body charts
 
-Green on black. `kbh_theme`. Square bars. Short labels (`FP8`, `Sonic`, `Paged`). One GPU. Subject bar `#76b900`, field `#4d5d66`. Numbers on the bars. No title essay. Generate with `media/make_<slug>_article.py`, inspect the PNG, then `![short alt](01_….png)`.
+Green on black. `kbh_theme`. Square bars. Short labels (`FP8`, `Sonic`, `Paged`). One GPU. Subject bar `#76b900`, field `#4d5d66`. Numbers on the bars. No title essay. Generate with `media/make_<slug>_article.py`, inspect the PNG, then `![short alt](01_….png)`. The standout cell of each bench section gets the highlight chart instead: `media/trajectory.py <run_dir>` with that run's `trajectory:` checkpoints in its annotation YAML (`docs/POST.md`, charts section).
 
 After it goes live: delete ephemeral `X-*.md` drafts and generated PNGs. Keep the `.py` generators.
 

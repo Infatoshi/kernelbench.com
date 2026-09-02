@@ -4,6 +4,27 @@ A running record of decisions, dead ends, and lessons. Newest entries on top. Th
 
 ---
 
+## 2026-09-02 — highlight chart generator: media/trajectory.py
+
+The Fable 5 Mega 18.7x post (annotated trajectory, Karpathy-liked) is the
+format every model post should converge on: one standout run, the trace as the
+story. `media/make_fable5_trajectory.py` had the 12 points typed in by hand;
+it is replaced by `media/trajectory.py <run_dir>`, which reads any archive
+through the bench's viewer parsers (claude, codex, kimi, cursor, droid, grok).
+What is automatic: wall clock from transcript timestamps, every in-session
+`benchmark.py` result (detected by the `peak_fraction:` + `RESULT:` output
+signature, because agents run it in the background and cat the log), the
+baseline timing line, an output-token curve scaled from emitted characters to
+`result.json` usage. What is not: the labels. Claude transcripts carry only
+3 official benchmark runs for that Fable session; the other 9 points were the
+agent's own microbenchmarks, read out of the prose by hand. So the audit now
+owns a `trajectory:` list in the annotation YAML (schema documented) and the
+chart labels from it. Verified on the Fable Mega run (12 points, matches the
+posted chart), a Fable Hard run (1 point, thin: Hard agents rarely rerun
+`benchmark.py`), and a Codex Hard run (11 points, codex_session.jsonl).
+Regressions are rose only when the drop exceeds 3%; sub-percent jitter is not
+a story.
+
 ## 2026-09-02 — AGENTS.md split into a 10 KB entrypoint plus docs
 
 Grok truncates each AGENTS.md at 10,000 characters and Codex at 32 KB; the operator guide was 63 KB, so Grok never saw a rule or gate and Codex never saw the reward-hack audit, publish rules, or gotchas. AGENTS.md now holds only rules, gates, and a "where to read next" list, and `kbtool/tests/test_repo_consistency.py` fails if it grows past 10,000 bytes. Moved, not deleted: rented-worker runbook (Lambda CLI, bootstrap order, ncu admin gate, Brev teardown, cu128 wheel, pull-size gate) to `docs/REMOTE.md`; harness route notes, runner behaviour, workspace/lock/cache isolation, and broad-sweep launcher notes to `docs/HARNESSES.md`; layout tree, adding a problem, correctness, results, tests, sweep failures to `benchmarks/hard/README.md`; chart palette, cover card, visual-first, write-up, redaction scan, and ephemeral-artifact rules to `docs/POST.md`. Dated stories that used to sit in the guide, kept here for the record:

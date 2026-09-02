@@ -75,3 +75,27 @@ implication: >
 By hand: write the YAML file. The format is small enough that a tool isn't
 strictly necessary. If a tool gets built, it should generate this schema, not
 replace it.
+
+## Optional: `trajectory` (highlight chart checkpoints)
+
+`media/trajectory.py <run_dir>` draws the annotated optimization trajectory for
+one run (the Fable 5 Mega 18.7x chart). It pulls every in-session
+`benchmark.py` result, the baseline timing, and wall clock from the transcript
+by itself. The moves between those points are what the audit already read;
+list them here so the chart can label them:
+
+```yaml
+trajectory:
+  - {t: 43.6, score: 1.0, kind: baseline, label: "baseline timed:\n5.47 ms/tok floor"}
+  - {t: 98.8, score: 14.38, label: "single cooperative megakernel v1\npasses check, first benchmark"}
+  - {t: 144.2, score: 15.94, kind: regress, label: "finer split-K regresses\n-> measured, reverted"}
+  - {t: 152.7, score: 18.70, kind: final, label: "final: MLA barrier folds,\n14 barriers/step -> 18.7x"}
+```
+
+`t` is minutes since session start (from the transcript timestamps), `score`
+is what the agent measured at that point (Mega: speedup; Hard/CUDA: roofline
+fraction), `label` is at most two short lines naming the kernel move, `kind`
+is `baseline | bench | regress | final` (default `bench`). A checkpoint within
+0.6 min of an automatic benchmark point labels that point. Every entry must
+point at something in the trace; do not invent a move.
+
