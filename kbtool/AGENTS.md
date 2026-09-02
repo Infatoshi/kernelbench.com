@@ -1,6 +1,6 @@
 # kbtool — driving runs: the `kb` CLI, harness routes, rented GPU workers
 
-`kb` is this uv package. Install once with `uv tool install -e ./kbtool` (editable, tracks source); on a box with no tool install use `uv run --project kbtool python -m kb ...`. The CLI finds the repo root by walking up from cwd, or from `KB_REPO_ROOT`. Harness routes, runner behaviour, rented nodes, and every `KB_` variable live here. Bench internals and `KBH_`: `benchmarks/hard/AGENTS.md`. Publish gates: root `AGENTS.md`.
+`kb` is this uv package: `uv tool install -e ./kbtool` once (editable), or `uv run --project kbtool python -m kb ...` on a fresh box. Repo root: walk up from cwd, or `KB_REPO_ROOT`. Harness routes, runner behaviour, rented nodes, and every `KB_` variable live here. Bench internals and `KBH_`: `benchmarks/hard/AGENTS.md`. Publish gates: root `AGENTS.md`.
 
 ```
 kb sweep <harness> <model>      # all hard problems, parallel containers, unlimited time
@@ -10,7 +10,7 @@ kb -b <cuda|mini> run|sweep|audit|lint|traces-to-hf ...   # other benches; mega 
 kb lambda ... | kb brev ... | kb contamination <bench> | kb push-runs <bench> | kb help
 ```
 
-Tests: `uv run --project kbtool pytest kbtool/tests/` (the Mac gate; it enforces the docs below against the code). The Mac keeps only this package's `.venv`; bench venvs live on the GPU boxes.
+Tests: `uv run --project kbtool pytest kbtool/tests/` (the Mac gate; enforces this file against the code). The Mac keeps only this package's `.venv`.
 
 ## Harness routes
 
@@ -182,7 +182,7 @@ The following variables can change the meaning, comparability, publishability, o
 | `KB_LAMBDA_SSH_USER` | `scripts/lambda_worker.sh` | `ubuntu` | Selects the remote SSH/rsync user. | Operational only. |
 | `KB_LAMBDA_TORCH_INDEX` | `scripts/lambda_worker.sh` | `https://download.pytorch.org/whl/cu128` | Selects the PyTorch wheel index used during worker bootstrap. | Can change the CUDA/PyTorch runtime. |
 | `KB_LAMBDA_TYPE` | `scripts/lambda_worker.sh` | `gpu_1x_h100_sxm5` | Selects the Lambda instance type when no positional type is supplied. | Direct cost and hardware control. |
-| `KB_REPO_ROOT` | `kbtool/kb/cli.py` | walk upward from cwd / installed package | Overrides how the `kb` CLI locates the monorepo. | Used only if the path contains `benchmarks/`. |
+| `KB_REPO_ROOT` | `kbtool/kb/cli.py` | walk up from cwd | Overrides where `kb` finds the monorepo. | Honoured only if it contains `benchmarks/`. |
 | `KB_SWEEP_EFFORT` | `scripts/guarded_sweep.sh` | `max` | Sets the reasoning effort passed to every guarded sweep cell. | Changes the agent configuration. |
 | `KB_SWEEP_HARNESS` | `scripts/guarded_sweep.sh` | `or-opus` | Selects the harness used by the guarded sweep. | Must be a runner case from the harness table above. |
 | `KB_SWEEP_LOG` | `scripts/guarded_sweep.sh` | `~/guarded_sweep.log` | Selects the guarded sweep's aggregate log file. | Operational only. |
