@@ -270,7 +270,7 @@ function auditSummary(flags: AuditFlag[], evidence: string[]) {
   return evidence.length ? `${prefix}; ${evidence.join("; ")}` : prefix
 }
 
-// Tiny YAML subset parser. We control the schema (results/annotations/SCHEMA.md)
+// Tiny YAML subset parser. We control the schema (benchmarks/hard/AGENTS.md, audit YAML section)
 // so we don't pull in a full YAML library — flat key:value pairs plus block
 // scalars (`|` and `>`) is the entire surface.
 function parseAnnotationYaml(text: string): Annotation | null {

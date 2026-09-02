@@ -13,7 +13,7 @@ Points come from two places, merged:
    the first baseline timing line. Works for every harness the viewer parses
    (claude, codex, kimi, cursor, droid, grok).
 2. Audit checkpoints. Optional `trajectory:` list in
-   `benchmarks/<bench>/results/annotations/<run_id>.yaml` (see SCHEMA.md), or
+   `benchmarks/<bench>/results/annotations/<run_id>.yaml` (schema in benchmarks/hard/AGENTS.md), or
    a `--checkpoints file.yaml`. Each item: `t` (minutes), `score`, `label`,
    optional `kind` (`baseline | bench | regress | final`). The audit already
    reads the whole trace; the auditor lists the timed moves it saw there. A

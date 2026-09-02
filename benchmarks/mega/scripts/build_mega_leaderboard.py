@@ -104,7 +104,7 @@ def megakernel_authentic(run_id: str, annotations_dir: Path) -> bool | None:
     Returns False only when an annotation explicitly says the submission is not a
     genuine megakernel (CUDA-graph / torch.compile / per-op-loop escape hatch, or
     plain eager dressed up as fusion). None = not yet judged (do NOT exclude).
-    See docs/megakernel_authenticity_judge.md.
+    See SPEC.md, Megakernel authenticity section.
     """
     f = annotations_dir / f"{run_id}.yaml"
     if not f.exists():

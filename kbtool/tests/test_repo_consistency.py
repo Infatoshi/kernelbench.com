@@ -17,6 +17,17 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[2]
 BENCHES = ("hard", "cuda", "mini", "mega")
+AGENTS_FILES = (
+    "AGENTS.md",
+    "kbtool/AGENTS.md",
+    "benchmarks/hard/AGENTS.md",
+    "benchmarks/cuda/AGENTS.md",
+    "benchmarks/mega/AGENTS.md",
+    "benchmarks/mini/AGENTS.md",
+    "benchmarks/multi/AGENTS.md",
+    "media/AGENTS.md",
+    "app/AGENTS.md",
+)
 
 # Files that are SUPPOSED to be byte-identical across the single-GPU benches.
 # If you diverge one on purpose, either sync it back or remove it here with a
@@ -93,9 +104,9 @@ def _harness_case_labels() -> set[str]:
 
 
 def test_harness_doc_covers_all_case_labels():
-    doc = (REPO / "docs/HARNESSES.md").read_text()
+    doc = (REPO / "kbtool/AGENTS.md").read_text()
     missing = sorted(h for h in _harness_case_labels() if f"`{h}`" not in doc)
-    assert not missing, f"harness branches with no docs/HARNESSES.md row: {missing}"
+    assert not missing, f"harness branches with no kbtool/AGENTS.md row: {missing}"
 
 
 def test_env_doc_covers_all_read_vars():
@@ -111,10 +122,11 @@ def test_env_doc_covers_all_read_vars():
             if p.suffix not in (".sh", ".py") or not p.is_file():
                 continue
             found |= set(var_re.findall(p.read_text(errors="ignore")))
-    doc = (REPO / "docs/ENV.md").read_text()
-    # ENV.md's footer lists deliberately-excluded scan artifacts.
+    # Every AGENTS.md together must name every variable (each one documents its
+    # own prefix and lists its deliberately-excluded scan artifacts).
+    doc = "\n".join((REPO / rel).read_text() for rel in AGENTS_FILES)
     missing = sorted(v for v in found if f"`{v}`" not in doc)
-    assert not missing, f"env vars read by code but absent from docs/ENV.md: {missing}"
+    assert not missing, f"env vars read by code but absent from every AGENTS.md: {missing}"
 
 
 def test_lambda_worker_ssh_forwards_command():
@@ -189,11 +201,29 @@ def test_lambda_sync_ships_shared_runner_lib():
 def test_agents_md_fits_harness_caps():
     """Grok truncates every AGENTS.md at 10,000 characters and Codex at 32 KB.
     The operator guide reached 63 KB (2026-09-02): Grok never saw a rule and
-    Codex never saw the audit gates. AGENTS.md is the entrypoint; details go
-    to the docs it points at."""
+    Codex never saw the audit gates. The root AGENTS.md is the entrypoint
+    (universal rules + pointers); each directory's AGENTS.md carries the detail
+    and must itself fit Codex's cap."""
     text = (REPO / "AGENTS.md").read_text()
-    assert len(text.encode()) < 10_000, f"AGENTS.md is {len(text.encode())} bytes; move detail into docs/"
-    for rel in ("docs/REMOTE.md", "docs/HARNESSES.md", "docs/ENV.md", "docs/TORCH.md",
-                "docs/POST.md", "docs/ARTICLE.md", "benchmarks/hard/README.md"):
+    assert len(text.encode()) < 10_000, f"AGENTS.md is {len(text.encode())} bytes; move detail into a sub AGENTS.md"
+    for rel in AGENTS_FILES[1:]:
+        p = REPO / rel
+        assert p.exists(), f"{rel} is missing"
+        size = len(p.read_bytes())
+        assert size < 32_000, f"{rel} is {size} bytes; Codex truncates at 32 KB"
+    for rel in ("kbtool/AGENTS.md", "benchmarks/hard/AGENTS.md", "media/AGENTS.md", "app/AGENTS.md"):
         assert rel in text, f"AGENTS.md no longer points at {rel}"
-        assert (REPO / rel).exists(), f"{rel} referenced by AGENTS.md is missing"
+
+
+def test_only_root_claude_md_and_no_stray_docs():
+    """CLAUDE.md and .cursorrules are symlinks to the root AGENTS.md; every other
+    directory gets an AGENTS.md only. Project markdown is AGENTS/SPEC/DEVLOG/GOAL."""
+    skip = ("node_modules", ".venv", "outputs", ".next", "scripts/transcript-extraction")
+    for p in REPO.rglob("CLAUDE.md"):
+        rel = p.relative_to(REPO).as_posix()
+        if any(s in rel for s in skip):
+            continue
+        assert rel == "CLAUDE.md" and p.is_symlink(), f"stray CLAUDE.md: {rel}"
+    assert not (REPO / "docs").exists(), "docs/ came back; fold it into the directory AGENTS.md files"
+    for b in (*BENCHES, "multi"):
+        assert not (REPO / "benchmarks" / b / "README.md").exists(), f"benchmarks/{b}/README.md came back"

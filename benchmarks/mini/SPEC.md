@@ -122,8 +122,8 @@ hard-shaped matrices: `sweep.sh`, `launch_parallel_sweep.sh`,
 `sweep_deck.sh`, `sweep_campaign.sh`. They are hard-bench copies and wrong
 defaults for the 5-repeat Mini cell.
 
-Harness transport reference: repo-root `docs/HARNESSES.md` (includes
-`lfm-*` / `hermes` / `pi`). Env vars: `docs/ENV.md` (`KBMINI_*`, `KBH_*`).
+Harness transport reference: `kbtool/AGENTS.md` (includes
+`lfm-*` / `hermes` / `pi`). Env vars: `KBMINI_*` in `AGENTS.md` here, `KBH_*` in `benchmarks/hard/AGENTS.md`.
 
 ## Operator runbook
 
@@ -131,7 +131,7 @@ Do these in order. Act without asking once the model/harness identity is known.
 
 ### A. API model (OpenRouter / native CLI / `*-claude` provider)
 
-1. **Preflight keys** in `~/.env_vars` for the harness (`docs/HARNESSES.md`).
+1. **Preflight keys** in `~/.env_vars` for the harness (`kbtool/AGENTS.md`).
 2. **Node:** `KB_LAMBDA_BENCH=mini kb lambda up kbmini gpu_1x_h100_sxm5` (or
    equivalent H100 SXM). `kb lambda sync kbmini` + bootstrap (uv, torch cu
    matching driver, agent CLIs). Confirm `torch.cuda.is_available()` — not
@@ -183,7 +183,7 @@ Same as A, plus serving on the eval node:
 8. Then A.6–A.9.
 
 Local harness env defaults: `KBMINI_BASE_URL=http://127.0.0.1:8765/v1`,
-`KBMINI_API_KEY=local` (see `docs/ENV.md`).
+`KBMINI_API_KEY=local` (see `AGENTS.md`).
 
 ### First subject (completed campaign — not a second SOP)
 

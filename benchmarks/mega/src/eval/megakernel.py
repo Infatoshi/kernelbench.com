@@ -2,7 +2,7 @@
 
 This is the DETERMINISTIC half of the mega "is this really a fused megakernel?"
 gate. It does NOT decide authenticity by itself -- deciding is the LLM judge's
-job (see docs/megakernel_authenticity_judge.md). This module only gathers
+job (see SPEC.md, Megakernel authenticity). This module only gathers
 objective, auditable signals and renders the judge prompt:
 
   * recursive static source  -- solution.py + every LOCAL module it imports

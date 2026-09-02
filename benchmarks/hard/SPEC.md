@@ -106,7 +106,7 @@ Agents must navigate to references themselves (`git clone`, `curl`, `gh api`, re
 
 Every agent uses the **native tools** of its CLI. No MCP injections, no custom tool wrappers. We measure the harness as it ships.
 
-Harnesses active in the current sweep: see README.md model matrix.
+Harnesses active in the current sweep: the leaderboard is the list (`results/leaderboard.json`); harness routes in `kbtool/AGENTS.md`.
 
 ## Sandbox
 
