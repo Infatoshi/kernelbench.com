@@ -2,6 +2,158 @@
 
 Newest first. SPEC.md holds the methodology; this holds the journey.
 
+## 2026-08-08 — kimi 09 empirical recompute probe (closes audit gap)
+
+Spun a fresh Brev Nebius 8xH100 SXM (`kbm-probe09`), pinned GPUs 0-3, ran
+the same `audit_probe_09.py` used on the other headline 09 cells against
+kimi's archived `solution.py` (torch 2.13+cu130). 3 trials x 4 ranks,
+in-place overwrite of the same x/dest buffers: **all ranks PROBE_1,
+bad=0, max_abs=1.9531e-03**. Log at
+`outputs/runs/20260803_220730_.../audit_probe_09.log`. Annotation updated
+from "empirical gap" to full clean. Node torn down immediately after.
+
+## 2026-08-03 — kimi-k3 09 closes the five-model board (Brev Nebius 8xH100)
+
+Lambda had zero `gpu_4x_h100_sxm5` capacity; spun a Brev Nebius
+`gpu-h100-sxm.8gpu-128vcpu-1600gb` (full NV18 mesh, driver 580, cuda-13.0
+already present), pinned `CUDA_VISIBLE_DEVICES=0,1,2,3`, bootstrapped the
+multi venv on torch 2.13+cu130 with the cublas-13 dev-symlink retarget, and
+ran the missing kimi cell:
+
+```
+./scripts/sweep_wave.sh opencode-or moonshotai/kimi-k3 high 09_moe_ep_dispatch_combine
+```
+
+Result: **PASS, speedup_clean 5.3965** (in-run 5.4032). Run
+`20260803_220730_opencode-or_moonshotai-kimi-k3_09_moe_ep_dispatch_combine`.
+DeepEP-style fused EP over CUDA symmetric memory, e4m3 wire format, no c10d
+on the data path. Honest kernel, not a headline — sits between grok 4.38x
+and glm 6.75x on 09. Prior kimi 09 attempts (2026-07-30) were OpenRouter
+provider deaths / self-inflicted retry-loop kills, not model fails.
+
+Opus 08 is also settled this wave: third clean sequential re-grade (this
+time on freshly-bootstrapped kbmulti4, correct cublas-13 toolchain) still
+NCCL rank-desync hangs inside `reference.py:47` all_gather. Annotation
+`fail_honest` / `fail_canonical_stack`. The in-run 2.8769 was the
+grade-stack bug (system torch cu12.8), not a real number.
+
+**Final five-model board (all cells sequential-regrade clean or settled FAIL):**
+
+- **01 peak_fraction:** grok 0.3229 · glm 0.2788 · codex 0.3281 ·
+  **opus 0.3884** · kimi 0.3811
+- **07 speedup:** grok 1.3699 · glm 1.0989 · codex 1.1461 · **opus 1.5874** ·
+  kimi FAIL (tripwire)
+- **08 speedup:** grok **1.3640** · glm FAIL honest · codex 1.3278 ·
+  opus FAIL canonical_stack · kimi FAIL honest
+- **09 speedup:** grok 4.4493 · glm 6.7536 · codex 8.2443 · **opus 10.7528** ·
+  kimi 5.3965
+
+Opus takes 3 of 4 rows. Under annotation-truth grok numbers, **grok wins 08**
+(1.3640 > codex 1.3278) — the row that killed opus/GLM/kimi on numerics/stack.
+A second grok number set (1.3134 etc.) is cited inside other models'
+annotations from a later kbmulti regrade that was never written back into
+grok's own annotations; that unresolved provenance is an article blocker
+(Fable readiness review 2026-08-08). Until one single-node regrade reconciles
+it, treat grok's annotation `*_clean` values as board truth and do not claim
+"codex wins 08."
+
+## 2026-07-31 — sequential regrade wave: the five-model board on the fused deck
+
+All published-candidate cells re-graded sequentially isolated on a quiet
+kbmulti (bench venv torch 2.13 cu130, cuda-13 toolchain). Board at wave end
+(kimi 09 still open then; closed 2026-08-03 above):
+
+- **01 peak_fraction:** grok 0.3229 · glm 0.2788 · codex 0.3281 ·
+  **opus 0.3884** · kimi 0.3811
+- **07 speedup:** grok 1.3699 · glm 1.0989 · codex 1.1461 · **opus 1.5874** ·
+  kimi FAIL (tripwire)
+- **08 speedup:** grok **1.3640** · glm FAIL honest · codex 1.3278 ·
+  opus regrade_failed · kimi FAIL honest
+- **09 speedup:** grok 4.4493 · glm 6.7536 · codex 8.2443 · **opus 10.7528**
+
+Per-cell evidence lives in `results/annotations/`, including empirical
+recompute probes (overwrite the same input buffers in place, confirm outputs
+track) on every headline 09 cell.
+
+Two regrade-infrastructure bugs surfaced during the wave, both worth naming:
+
+- **`regrade.py` silently skipped runs whose workspace held more than one
+  problem dir** — glm 07 was reported "no single problem workspace" and never
+  graded; the first board draft carried its in-run number without saying so.
+  `problem_of()` now disambiguates by matching the run-id suffix against the
+  candidate dirs. glm 07 re-graded clean at 1.0989 (in-run 1.0966).
+- **A regrade FAIL is not a solution FAIL until the environment is exonerated.**
+  opus 07 failed two clean regrades before the cause turned out to be our own
+  stale build cache (below); the number that finally stands, 1.5874, is best on
+  the board for that cell. opus 08 is the remaining open item: its in-run 2.8769
+  was graded on the wrong stack (see the grade-stack entry), and two clean
+  regrades on the canonical stack hang with an NCCL rank-desync in check —
+  rank 0 two collectives ahead, timeout inside `reference.py:47` all_gather.
+  Marked `regrade_failed`; possibly stack-sensitive, needs diagnosis before any
+  number is used.
+
+kimi 07 is an instructive FAIL: the solution was honest, but a leftover
+`scratch_dbg.py` containing a bare `dist.all_reduce` tripped the forbidden-op
+scan, which deliberately covers every agent-authored `.py` in the workspace
+(a helper importable from `solution.py` is part of the solution). The scratch
+file was not hand-deleted to flip the cell — the workspace an agent leaves is
+the workspace that gets graded.
+
+## 2026-07-30 — cublas 12/13: CUBLAS_STATUS_NOT_INITIALIZED, then a stale-ninja second act
+
+opus 07's solution builds a workspace-local extension
+(`build_fused/kbm_fused.so`) with hardcoded
+`extra_ldflags=["-L/usr/lib/x86_64-linux-gnu", "-lcublas"]`. On Lambda's stock
+image that dev symlink points at cublas **12**, while the bench venv torch is
+cu130 — so the ext hands a cublas-13-created handle to `libcublas.so.12` and
+every `cublasGemmEx` returns `CUBLAS_STATUS_NOT_INITIALIZED`. Versioned
+symbols mean `LD_PRELOAD`ing the 13 library does not rescue an object whose
+`NEEDED` says `libcublas.so.12`. Fix: install `cuda-toolkit-13-0` (cuda-keyring
+recipe) and permanently retarget `/usr/lib/x86_64-linux-gnu/libcublas.so` +
+`libcublasLt.so` to the `/usr/local/cuda-13.0` versions.
+
+The second act cost two more regrade FAILs: the regrade scratch path is
+stable across attempts, so ninja saw the `.so` built *before* the symlink
+retarget as up-to-date and reused it — the bad `NEEDED libcublas.so.12` is
+baked in at link time (`.so` mtime 00:06, symlink fix 00:26). The linkage is
+invisible unless you `ldd` the artifact. Deleting `build_fused/` and rebuilding
+gave check PASS (`ldd` now shows `libcublas.so.13`) and speedup 1.5874
+(in-run 1.6217). Rule: after any toolchain/symlink change, stale build
+directories are part of the old environment — nuke them.
+
+## 2026-07-30 — Kimi K3 rerouted through OpenRouter (`opencode-or`)
+
+`KIMI_API_KEY` died (401 on both moonshot .ai and .cn endpoints, verified
+against a fingerprint-matched copy of the Mac's key), and OpenRouter has no
+Anthropic-compat endpoint (404) so the `kimi-claude` branch was a dead end.
+New `opencode-or` harness branch: opencode with an archive-local
+`opencode.json` defining an `openrouter-pinned` provider — baseURL
+`https://openrouter.ai/api/v1`, `extraBody.provider = {order: ["Moonshot AI"],
+allow_fallbacks: false}`, context 262144. Pinning matters: an unpinned
+OpenRouter row is a different (and unstated) serving stack per session.
+
+kimi 01 PASSed through this route (regraded 0.3811, second-best on the cell).
+09 hit a provider incident starting ~17:00 UTC: 4+ consecutive sessions died
+with "Provider returned error" despite healthy curl probes of the same route.
+The final retry ran 31 minutes of productive session and was then killed
+(exit 143) by our own retry-loop cleanup — self-inflicted, not provider.
+Rerun pending.
+
+## 2026-07-29 — grade-stack split: in-run PASSes were graded on the system torch
+
+`run_agent.sh` graded with bare `python3`, which resolves through the run's
+`bin/` wrapper to `/usr/bin/python3` — Lambda's **system** torch (cu12.8) —
+while regrades and the frozen anchors run on the bench venv
+(torch 2.13.0+cu130). Every in-run check/benchmark was therefore potentially
+on a different stack than the one the published numbers come from. Fixed by
+pinning `GRADE_PY="$BENCH_ROOT/.venv/bin/python"` (fallback `python3`) for
+`check.py`/`benchmark.py`.
+
+The bug is not hypothetical: opus 08's in-run PASS (2.8769) was graded on the
+system stack, and on the canonical venv stack the same solution hangs in
+check with an NCCL rank-desync (see the regrade entry above). The sequential
+isolated re-grade rule is what kept the wrong-stack number off the board.
+
 ## 2026-07-25 — first wave on the new deck killed itself; sessions now run sequentially
 
 Launched four grok-4.5 sessions concurrently (01/07/08/09) at 08:57 UTC on a

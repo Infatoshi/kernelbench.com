@@ -36,3 +36,37 @@ These tables are the single source of truth for runner harness names, transports
 | `lfm-grok` | Grok CLI custom `chat_completions` model to local vLLM | `KBMINI_API_KEY` (defaults to `local`) | mini | Additively appends a model block to `~/.grok/config.toml`. |
 | `opencode-or` | OpenCode to OpenRouter's OpenAI-compatible API at `https://openrouter.ai/api/v1` | `OPENROUTER_API_KEY` from `~/.kbm_env` | multi | Pins `KBM_OR_PROVIDER` with fallbacks disabled. The adapter has stalled intermittently, and the branch ignores the reasoning-effort argument. |
 
+
+## Route notes
+
+- Always container mode (`KBH_AGENT_CONTAINER=1`): isolated per-run workspace, native GPU, sessions overlap while GPU commands serialize through the lock.
+- Claude-Code-routed providers (`zai-claude`, `minimax-claude`, `kimi-claude`, `deepseek-claude`, `qwen-claude`, `longcat-claude`) mirror each other; to add one, copy the `kimi-claude` branch in `scripts/lib/run_harness.sh` and add a row above. Rationale: opencode is a strong harness but its `@ai-sdk/openai-compatible` transport stalls intermittently (about a third to a half of sessions); routing through Claude Code to the provider's Anthropic endpoint bypasses that adapter.
+- Qwen: the token-plan MaaS endpoint with `QWEN_API_KEY` is the paid coding-plan route and serves production `qwen3.8-max` (verified 2026-08-03). `DASHSCOPE_API_KEY` plus `QWEN_ANTHROPIC_BASE_URL=https://dashscope-intl.aliyuncs.com/apps/anthropic` reaches Model Studio pay-as-you-go. Qwen 3.8 Max is also on OpenRouter as `qwen/qwen3.8-max` via `or-fable` at `xhigh`.
+- Tencent Hy3 (`hy3`): official TokenHub route, OpenAI-compatible only, not Claude Code and not OpenRouter. Model `hy3` only (`hy3-preview` / `tencent/hy3-preview` are retired). Defaults `reasoning_effort=high` (`no_think` / `low` for fast mode); output ceiling up to 262k per Tencent's eval guide. `uv run kbh run hy3 hy3 problems-rtxpro6000/01_fp8_gemm`.
+- Nemotron 3 Ultra is scored through `opencode-nemotron` (OpenRouter pinned to DeepInfra, `allow_fallbacks=false`), not Claude Code via CCR (adds a translation layer) or Droid (not the native endpoint). NVCF is diagnostic only; Ultra was observed degrading and 504ing there. Enable in broad preflight/sweeps with `KBH_USE_OPENROUTER_NEMOTRON=1`; target only that row with `KBH_PREFLIGHT_ONLY=opencode_nemotron_ultra ./scripts/preflight_harnesses.sh`. The mega matrix omits the Nemotron row.
+- Z.ai GLM via Claude Code (`zai-claude`): endpoint `https://api.z.ai/api/anthropic` (the OpenAI-compatible coding endpoint is for Droid/Factory). The branch sets `CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS=1`, `CLAUDE_CODE_MAX_RETRIES=1000000`, `CLAUDE_CODE_MAX_OUTPUT_TOKENS=128000`, `ZAI_CLAUDE_HAIKU_MODEL=<model>` so Haiku / Explore / subagent calls map to the same model, and passes `--disallowedTools ExitPlanMode EnterPlanMode AskUserQuestion`.
+- MiniMax (`minimax-claude`, model `MiniMax-M3`): key in `~/.env_vars`, enable in broad sweeps with `KBH_USE_MINIMAX_M3_CLAUDE=1`.
+- Native Claude Code runs pass `--settings '{"fastMode":false,"alwaysThinkingEnabled":true}'`; the Opus matrix also passes `--effort max`. A Claude rerun with fast mode or a lower effort tier is not comparable.
+- Grok headless route is top-level `grok --cwd <workspace> --output-format streaming-json -p <prompt>`; `grok agent` does not accept those flags. Cursor's CLI binary is `agent`. The harness needs the node Codex binary at `~/.local/node-*/bin/codex`; the `codex` shell alias does not expand in non-interactive scripts.
+- zsh: quote model strings containing `[]` or `:` or the shell globs them.
+
+## Runner behaviour every route shares
+
+- Timeout starts after the GPU lock. Use `run_gpu_locked_timeout` for `check.py`/`benchmark.py`; wrapping `timeout` outside `uv run` fails queued rows that were only waiting for `outputs/gpu.lock`.
+- Never hide CUDA from the agent and never append instructions that prohibit checking, benchmarking, or profiling. If `REAL_UV=$(which uv)` appears in a model command it must not resolve back to the per-run wrapper or the lock owner hangs.
+- Claude-family harnesses launch from the archive-local `$PROBLEM_DIR`, not repo root with `--add-dir`; otherwise the model writes `problems/<name>/solution.py` in the source tree and the archive records `no_solution`.
+- Provider credit/rate detection reads explicit CLI/API error events and stderr only, never assistant text or tool output (models read AGENTS.md, `run_harness.sh`, and old artifacts containing the trigger words), and applies only to rows without a solution. Match credit-specific strings; plain `overage` false-positives on `coverage`.
+- Never pass provider keys via `timeout env KEY=... claude`; that puts the key in argv. Export inside the subshell.
+- `benchmark.py` scores `variant=solution` first. Eager / compiled / SOTA diagnostics are opt-in via `KBH_BENCHMARK_BASELINES=1` and emit `benchmark_event` lines for audits.
+
+## Workspace, caches, GPU lock
+
+`scripts/lib/run_harness.sh` gives every run a repo-shaped workspace under `outputs/runs/<run_id>/repo/problems/<problem>/`: immutable problem files copied from the source tree, `src/` symlinked, local copies of `pyproject.toml`, `uv.lock`, `.python-version` so the agent can mutate deps inside the archive. Per-run caches: `TORCH_EXTENSIONS_DIR`, `TRITON_CACHE_DIR`, `CUDA_CACHE_PATH`, `TMPDIR`/`TEMP`/`TMP` all under `$RUN_DIR`. The harness prepends `$RUN_DIR/bin` to `PATH` and wraps `uv`, `python`, `python3`, `nvidia-smi`, `ncu`, `nsys`, `nvcc`; the wrappers take `outputs/gpu.lock` (bounded `flock -w 5` retry), log to `$RUN_DIR/gpu_lock.log`, then exec the real binary. `KBH_GPU_LOCK_HELD=1` makes the wrapper reentrant so `nvcc` under `benchmark.py` does not deadlock.
+
+The default lock is per bench (`benchmarks/{hard,cuda,mega}/outputs/gpu_lock/gpu.lock`), not machine-wide, so hard + cuda + mega agents can hold the GPU at once, and absolute-path `python`/`nvcc` bypass the wrapper. Parallel sessions are fine for the development flywheel; mid-session `result.json` numbers are never publish-grade (see the regrade gate in `AGENTS.md`). Use a machine-wide `KBH_GPU_LOCK_DIR` for a quiet regrade box. The lock only governs children launched through the runner. Transcript usage extraction is CPU-only and bypasses the lock.
+
+`result.json` carries agent wall time, check/benchmark wall time and exit codes, token/cache/reasoning usage, GPU lock wait/active totals (`scripts/summarize_runs.py`), `failure_reason`, and `retryable_infra_failure`. No-solution rows under 5,000 output tokens are `provider_early_stop` and retryable. The site shows these instead of one red cell.
+
+## Broad sweeps
+
+`scripts/launch_parallel_sweep.sh` defaults to `KBH_HARNESS_CONCURRENCY=2` per harness; raise only after preflight proves quota. Workers are per harness: a problem-major loop head-of-line blocks (Codex holding its two slots keeps freed Cursor/Gemini/OpenCode slots idle). `./scripts/preflight_harnesses.sh` sends tiny prompts through the matrix and fails fast on auth/quota/route problems. After a sweep, `./scripts/launch_infra_retries.sh <run_group>` reruns only `retryable_infra_failure=true` rows; retry rows must keep empty effort fields and pass full `problems/<name>` paths or the problem slides into the effort column. `KBH_SKIP_OPENROUTER=1 KBH_USE_DIRECT_GEMINI=1` runs the non-OpenRouter rows plus Gemini direct when OpenRouter is depleted. Aborting: kill the launcher process group, then verify by cwd; some CLIs spawn orphaned timeout groups.

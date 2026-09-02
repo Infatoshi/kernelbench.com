@@ -1,11 +1,14 @@
 # KernelBench-Mini — SPEC
 
 Machine location: canonical monorepo on the Mac at
-`~/dev/sites/kernelbench.com/benchmarks/mini`. Deck development smokes run on
-anvil's RTX PRO 6000; **the canonical graded GPU is an H100 SXM** (hardware key
-`H100_SXM`). Any node with that part qualifies: currently the rented **athena**
-(2x H100 80GB HBM3), otherwise a Lambda `gpu_1x_h100_sxm5` provisioned per sweep
-via `kb lambda` and torn down after.
+`~/dev/sites/kernelbench.com/benchmarks/mini`. **Canonical graded GPU is an
+H100 SXM** (hardware key `H100_SXM` — SXM peaks in `src/hardware/h100_sxm.py`,
+not the PCIe `H100` entry). Provision per sweep via `kb lambda` as a
+`gpu_1x_h100_sxm5` (campaign name `kbmini` is conventional) and tear down when
+done. Deck smokes may use other boxes; publish-grade numbers do not.
+
+Status: **WIP, deck unpublished.** Keep Mini out of public posts until debut.
+Calibration debts below must clear before the deck freezes.
 
 ## Thesis
 
@@ -19,41 +22,59 @@ unfamiliar shape — the memorized tutorial kernel is wrong by construction.
 Three deltas define Mini against Hard:
 
 1. **Capped sessions.** 30 minutes wall-clock per agent session
-   (`BUDGET_SECONDS=1800` in `scripts/run_hard.sh`), not unlimited. Small
-   models loop; the cap is part of the bench identity and is what makes
-   repeats affordable.
+   (`BUDGET_SECONDS=1800` via `KB_BUDGET_SECONDS_DEFAULT` in
+   `scripts/run_hard.sh`), not unlimited. Small models loop; the cap is part of
+   the bench identity and is what makes repeats affordable.
 2. **5 repeats per cell.** The unit of publication is
    (model, harness, problem) x 5 independent sessions. Score two axes:
    **pass rate k/5** (reliability — where small models actually differentiate)
    and **best-of-5 performance** (capability). No pairwise/Elo machinery: the
    metric is cardinal, repeats give the spread.
-3. **Two harnesses per model** where routes exist: `opencode`
-   (OpenAI-compatible, covers everything) and a `*-claude` route when the
-   provider has an Anthropic skin. Same model under both is itself a published
-   comparison; never mix harnesses inside a cell.
+3. **Harness pairing where routes exist.** Default published comparison is
+   `opencode` (OpenAI-compatible) vs a `*-claude` Anthropic-skin route when the
+   provider has one. Local-vLLM subjects (no public API) use the five LFM
+   harnesses below instead — same model under multiple harnesses is itself a
+   published comparison; never mix harnesses inside a cell.
 
-## Architecture
+Eligibility is machine-readable in `roster.yaml` (`sub_200b_open_weight`,
+advisory until debut). One unranked frontier cell may run as a calibration
+anchor only.
 
-- **Eval GPU:** an H100 SXM node per sweep. Sessions overlap at moderate
-  concurrency; GPU commands serialize through a per-GPU lock dir.
-- **Inference:** provider APIs where they exist; models without an API are
-  served from anvil's RTX PRO 6000 (96 GB, vLLM, OpenAI-compatible) — never on
-  the eval GPU, so kernel timings stay clean.
-- **Publish-grade numbers** come from the standing mandatory sequential
-  isolated re-benchmark (2026-07-19 rule): rerun each cell's best solution
-  through check.py + benchmark.py alone on the quiet canonical node.
+## Architecture (current — 2026-07-29 onward)
+
+**One self-contained H100 SXM node does everything.** Do not rebuild the
+retired anvil→tunnel→athena layout (see DEVLOG history only).
+
+| Phase | Where | Rule |
+| --- | --- | --- |
+| Agent sessions | eval H100 | Agents write kernels; GPU lock serializes compile/check/benchmark |
+| Inference (API-less models) | **same** eval H100 | vLLM on `127.0.0.1:8765` (~35% GPU mem); ccr-rust on `3456` for `lfm-claude` |
+| Inference (API models) | provider APIs | No local vLLM; node is eval-only |
+| **Publish-grade grade** | same H100, **quiet** | vLLM/ccr **stopped**; sequential `regrade_sequential.sh`; GPU at 0 MiB compute |
+
+In-run timings during a parallel wave are contended by construction (serving +
+many workers). They are archive/debug only. **Published peak_fraction / ms /
+speedup must come from the isolated sequential re-grade** (standing 2026-07-19
+rule).
+
+Lambda worker: `KB_LAMBDA_BENCH=mini` (problems root defaults appropriately via
+worker + `kb -b mini`). Archives live under `benchmarks/mini/outputs/runs/`
+(or `outputs/runs-lambda-<name>/` after pull). Never leave Mini artifacts only
+on a rented node.
 
 ## Scoring
 
-- 01 (memory), 02 (memory), 04 (compute): roofline `peak_fraction` vs H100
-  SXM peaks (`src/hardware/h100_sxm.py` — SXM numbers, not the PCIe part in
-  `h100.py`).
-- 03: **ms-anchored** per the standing 2026-07-15 metric rule — headline is
-  geomean speedup vs the eager sort-based reference; the `eager_ms` anchor per
-  shape is frozen at deck publication; peak_fraction is context only.
-- Per-model headline: correctness rate over all 20 runs, plus geomean of
-  best-of-5 scores across problems. Token/cost columns from
-  `scripts/summarize_runs.py` are a secondary axis ($ per passing kernel).
+- 01 (memory), 02 (memory), 04 (compute): roofline `peak_fraction` vs H100 SXM
+  peaks.
+- 03: **ms-anchored** (standing 2026-07-15 metric rule) — headline is geomean
+  speedup vs the eager sort-based reference; the `eager_ms` anchor per shape is
+  frozen at deck publication; peak_fraction is context only.
+- Per-model headline: correctness rate over all runs in the matrix, plus
+  geomean of best-of-5 scores across problems. Token/cost from
+  `scripts/summarize_runs.py` is a secondary axis ($ per passing kernel).
+- Mini's ceiling is **"best kernel in 30 minutes"**, not "best possible
+  kernel." Never compare Mini peak_fraction to unlimited Hard/Mega cells as if
+  they shared a protocol.
 
 ## The deck (frozen at four once published)
 
@@ -79,92 +100,122 @@ Numeric stress cases per problem (`src/eval/numeric_stress.py`), `kb lint`
 tripwire, **manual solution+trace audit per published cell** (annotation YAML),
 contamination tripwire before publish, template-mutation guard. 03's exact
 oracle band and 02's linear-in-x semantics shrink the tolerance-gaming surface
-by design. A fresh eval node per sweep also shrinks cross-run contamination:
-the archive on the node holds only that sweep's runs.
+by design.
 
 Audit note for 03: the launch-overhead regime plus an exact output makes
 "cache the mask/threshold" the obvious cheat; the flat/peaky logits stress
 cases break cached thresholds, but the per-cell audit must still empirically
 overwrite the input buffer and confirm the mask changes.
 
-## Running
+## Which script to use (and which to ignore)
 
-```bash
-# one cell (one session):
-uv run kbh run opencode <model> problems-h100/01_dequant_gemv
-# one full column (4 problems x 5 repeats, sequential):
-./scripts/sweep_mini.sh opencode <model>
-./scripts/sweep_mini.sh <provider>-claude <model>
-# launch one sweep_mini.sh per model to parallelize (per-harness workers).
-```
+| Use | Script | When |
+| --- | --- | --- |
+| **Default column** | `./scripts/sweep_mini.sh <harness> <model> [effort]` | One (harness, model): 4 problems x 5 repeats, sequential |
+| **Local-vLLM full matrix** | `./scripts/launch_matrix.sh <served-model-name>` | All five LFM harnesses in parallel on one node |
+| **One session** | `./scripts/run_hard.sh <harness> <model> problems-h100/<prob> [effort]` or `kb -b mini run ...` | Debug / smoke |
+| **Clean numbers** | `./scripts/regrade_sequential.sh <run_dir> ...` | After every wave, server stopped |
+| **Leaderboard build** | `./scripts/publish_v2.sh` or `kb publish mini` | Only when publishing (deck still WIP) |
 
-Pre-publish checklist: sequential re-benchmark on the canonical node, per-cell
-audits, `kb lint`, contamination check, redaction, then publish to `/mini`.
+**Do not use for Mini campaigns** unless you are deliberately debugging legacy
+hard-shaped matrices: `sweep.sh`, `launch_parallel_sweep.sh`,
+`sweep_deck.sh`, `sweep_campaign.sh`. They are hard-bench copies and wrong
+defaults for the 5-repeat Mini cell.
 
-## First subject: LFM2.5-2.6B-Agent, 5 harnesses x 2 precisions
+Harness transport reference: repo-root `docs/HARNESSES.md` (includes
+`lfm-*` / `hermes` / `pi`). Env vars: `docs/ENV.md` (`KBMINI_*`, `KBH_*`).
 
-The inaugural matrix is one model, LiquidAI LFM2.5-2.6B-Agent, served locally
-on anvil GPU0 (RTX PRO 6000) via vLLM 0.25.1 at `127.0.0.1:8765`, driven
-through five agent harnesses at two weight precisions:
+## Operator runbook
 
-- Precisions (one server at a time; restart between; `nvidia-smi` first):
-  - bf16: `~/dev/liquidai/LFM2.5-2.6B-Agent`, served-model-name
-    `lfm25-agent-bf16`
-  - NVFP4A16: `~/dev/liquidai/LFM2.5-2.6B-Agent-NVFP4A16`, served-model-name
-    `lfm25-agent-nvfp4` — must launch via `scripts/serve_nvfp4.py`, not plain
-    `vllm serve`. vLLM's `Lfm2Model` maps `.w1`/`.w3` onto the fused `.w13`
-    for unfused checkpoints; this one is already fused, so the rewrite fires on
-    the `.w1` inside `.w13` and dies with "no module or parameter named
-    ...`w133`". The entrypoint drops those two rules (keeping qkv stacking) and
-    hands off to vLLM's CLI. Verified on anvil 2026-07-24: startup completes and
-    generation is coherent, so the weights load rather than loading as garbage.
-  - Serve with `--max-model-len 128000` (not the throughput runbook's 8192):
-    hermes hard-requires >=64k context and its compression loop crashed the
-    session at 65536 ("max compression attempts reached"); at 128000 it runs
-    to completion. 128000 is the model's `max_position_embeddings`.
-- Harness routes (all five verified 2026-07-23 against the live bf16 server):
-  - `lfm-claude` — Claude Code -> ccr-rust (port 3456,
-    `scripts/ccr-lfm.config.json`) -> vLLM. Start ccr before the sweep.
-  - `lfm-opencode` — archive-local `opencode.json` provider block.
-  - `hermes` — Nous Hermes agent CLI, named `lfm` provider in
-    `~/.hermes/config.yaml`.
-  - `pi` — badlogic pi coding agent, provider in `~/.pi/agent/models.json`;
-    `--no-session` is mandatory (session persistence hangs headless).
-  - `lfm-grok` — Grok Build CLI, `[model."<id>"]` block in
-    `~/.grok/config.toml` with `api_backend = "chat_completions"`.
-- Full matrix: 2 precisions x 5 harnesses x 4 problems x 5 repeats =
-  200 sessions. Precision is encoded in the served model name, so every run
-  archive self-describes its weight format.
-- The eval GPU never hosts inference; agents on the eval node reach the anvil
-  server via a reverse tunnel. The node is **athena** (`ssh athena`, 2x H100
-  80GB HBM3 = the SXM part the deck declares); anvil runs
-  `~/.kbmini/tunnel_athena.sh`, which forwards **8765** (vLLM) and **3456**
-  (ccr-rust) into athena and retries on drop.
-- Launch a precision's full matrix with `./scripts/launch_matrix.sh <served
-  model name>` (`KBMINI_GPUS="0 1"`): one worker per harness column, round-robin
-  across GPUs, each GPU its own `KBH_GPU_LOCK_DIR`. Those in-run timings are
-  contended by construction — re-grade with `scripts/regrade_sequential.sh`
-  before any published number.
+Do these in order. Act without asking once the model/harness identity is known.
 
-## Deck calibration anchor (01_dequant_gemv)
+### A. API model (OpenRouter / native CLI / `*-claude` provider)
 
-`codex gpt-5.6-sol` (effort high) on the canonical node, 2026-07-24:
-**correct, peak_fraction 0.0900** — 126-587 GB/s across the four shapes,
-12.8-18.2x the naive reference. Audited `clean` (problem files byte-identical,
-no grader writes in 128 tool calls, numeric stress active, in-place buffer
-overwrite and weight perturbation both prove recompute, correct on four
-off-deck shapes). Archive:
-`20260724_221725_codex_gpt-5.6-sol_01_dequant_gemv`.
+1. **Preflight keys** in `~/.env_vars` for the harness (`docs/HARNESSES.md`).
+2. **Node:** `KB_LAMBDA_BENCH=mini kb lambda up kbmini gpu_1x_h100_sxm5` (or
+   equivalent H100 SXM). `kb lambda sync kbmini` + bootstrap (uv, torch cu
+   matching driver, agent CLIs). Confirm `torch.cuda.is_available()` — not
+   merely that `nvcc` exists.
+3. **Smoke:** one `run_hard.sh` cell on `problems-h100/01_dequant_gemv`.
+4. **Sweep:** one `./scripts/sweep_mini.sh <harness> <model> [effort]` per
+   column. Parallelize across columns (per-harness workers), never a
+   problem-major loop.
+5. **Pull:** `kb lambda pull kbmini` into
+   `benchmarks/mini/outputs/runs-lambda-kbmini/` (venvs excluded).
+6. **Re-grade** on a quiet GPU (no other CUDA jobs):  
+   `./scripts/regrade_sequential.sh outputs/runs-lambda-kbmini/<run_id> ...`  
+   (or the merged runs dir you publish from).
+7. **Audit** every solution-bearing cell (solution.py + trace →
+   `results/annotations/<run_id>.yaml`). `kb -b mini lint`,  
+   `kb contamination mini`.
+8. **Publish** only at debut time: `kb publish mini`, redaction, then wire the
+   Mini section into homepage `HomeDecks` on `/` (scroll category alongside
+   Mega/CUDA/Hard — never a dedicated `/mini` page). Until debut: archives +
+   DEVLOG only; no public posts of the deck.
+9. **Teardown:** `kb lambda down kbmini` and confirm `kb lambda ls`.
 
-Two things this pins down:
+### B. Local-vLLM model (no public API) — LFM-class
+
+Same as A, plus serving on the eval node:
+
+1. Copy weights onto the node (or from a known path). Example subject:
+   LiquidAI LFM2.5-2.6B-Agent.
+2. **Install ninja** on Lambda images (`apt install ninja-build`) — vLLM KV
+   init shells out to it.
+3. **Serve one precision at a time** on `127.0.0.1:8765`,
+   `--gpu-memory-utilization` ~0.35, `--max-model-len 128000` (hermes needs
+   ≥64k; 128k is the model max), and for LFM tool calls:
+   `--enable-auto-tool-choice --tool-call-parser lfm2`.
+   - **bf16:** plain `vllm serve <path> --served-model-name lfm25-agent-bf16 ...`
+   - **NVFP4A16:** **must** use `scripts/serve_nvfp4.py` (not plain vLLM) —
+     fused `.w13` checkpoints break default w1/w3 stack rewrites. Served name
+     `lfm25-agent-nvfp4`.
+4. **ccr-rust** on `3456` before any `lfm-claude` column (`scripts/ccr-lfm.config.json`).
+   On glibc-older Lambda images the anvil binary may need the shipped loader +
+   `~/.kbmini/ccrlibs` (DEVLOG 2026-07-29).
+5. **Matrix:**  
+   `KBMINI_GPUS="0" KBMINI_SPLIT_BY_PROBLEM=1 ./scripts/launch_matrix.sh lfm25-agent-bf16`  
+   Default harnesses: `lfm-opencode hermes pi lfm-grok lfm-claude`.  
+   Precision is the served model name — archives self-describe bf16 vs nvfp4.
+6. **Pull continuously** during long waves (rsync exclude `.venv`/caches) so a
+   dead node costs ≤10 minutes of artifacts.
+7. **Stop vLLM and ccr** before re-grade. Confirm GPU compute apps empty.
+8. Then A.6–A.9.
+
+Local harness env defaults: `KBMINI_BASE_URL=http://127.0.0.1:8765/v1`,
+`KBMINI_API_KEY=local` (see `docs/ENV.md`).
+
+### First subject (completed campaign — not a second SOP)
+
+LFM2.5-2.6B-Agent x 2 precisions (bf16, NVFP4A16) x 5 local harnesses x 4
+problems x 5 repeats = **200 sessions** on self-contained `kbmini`. Result:
+**0/200 correct**; solution emission ~43 (bf16) / 37 (NVFP4); harness spread
+dominates precision. Full write-up: DEVLOG 2026-07-29 / 2026-07-25. Do not
+re-run this matrix unless the protocol or deck changes.
+
+## Deck calibration anchor
+
+**Status: MISSING ON DISK — rerun required before Mini debuts.**
+
+Historically (2026-07-24 on the then-canonical node): `codex gpt-5.6-sol`
+(effort high) on `01_dequant_gemv` graded **correct, peak_fraction 0.0900**,
+audited clean (archive id `20260724_221725_codex_gpt-5.6-sol_01_dequant_gemv`).
+That archive lived on lease nodes that died; it is **not** under
+`outputs/runs/` or `outputs/runs-lambda-kbmini/` on the Mac.
+
+What the anchor must re-pin when re-run on H100 SXM under the current 1800s
+cap:
 
 - The deck is **solvable as specified** — a small model scoring zero is a
   capability signal, not a broken problem.
-- The 1800s cap **binds even a frontier model**: codex hit it mid-optimization
-  (exit 124) and was still climbing at 0.09 of peak. Mini's ceiling is
-  therefore "best kernel in 30 minutes", not "best possible kernel". That is
-  the intended bench identity, but headline numbers must be described that way
-  and never compared against an unlimited-time deck like Hard.
+- The 1800s cap **binds even a frontier model** (prior run hit the cap mid-
+  optimization still climbing). Headline language stays "best in 30 minutes."
+
+Rerun recipe: quiet H100 SXM, no local vLLM,  
+`./scripts/run_hard.sh codex gpt-5.6-sol problems-h100/01_dequant_gemv high`  
+(or current codex model slug), then sequential re-grade if the session shared
+the box, full audit → `results/annotations/<run_id>.yaml`, restore the archive
+into `outputs/runs/`, update this section with the new run id and metrics.
 
 ## Calibration debts (must clear before the deck freezes)
 
@@ -184,3 +235,13 @@ Two things this pins down:
   the residue is a correct-but-slow cell mislabelled as CUDA. Before freeze,
   make the evidence check runtime-based (did an extension actually compile /
   did a `.cu` get built during the session) rather than regex-only.
+
+## Pre-debut checklist
+
+- [ ] Codex (or equivalent frontier) anchor re-run on H100 SXM; archive on Mac
+- [ ] Calibration debts above cleared or explicitly waived in DEVLOG
+- [ ] Every published cell: sequential re-grade + manual audit YAML
+- [ ] `kb -b mini lint`, `kb contamination mini`, redaction scan
+- [ ] `roster.yaml` gate enforced at publish if still desired
+- [ ] `kb publish mini` feeds homepage HomeDecks (scroll category on `/`, like Mega/Hard/CUDA — **no** `kernelbench.com/mini` route)
+- [ ] Deck freeze: no PROMPT/reference/check/benchmark edits after publish

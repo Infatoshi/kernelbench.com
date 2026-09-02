@@ -32,6 +32,7 @@ SHARED_IDENTICAL = [
     "src/hardware/h100_sxm.py",
     "src/hardware/b200.py",
     "src/hardware/m4_max.py",
+    "src/hardware/identify.py",
 ]
 
 
@@ -183,3 +184,16 @@ def test_lambda_sync_ships_shared_runner_lib():
     path (bench-local scripts/lib/) only works if sync ships the lib there."""
     text = (REPO / "scripts/lambda_worker.sh").read_text()
     assert 'scripts/lib/' in text, "lambda_worker sync no longer ships scripts/lib to workers"
+
+
+def test_agents_md_fits_harness_caps():
+    """Grok truncates every AGENTS.md at 10,000 characters and Codex at 32 KB.
+    The operator guide reached 63 KB (2026-09-02): Grok never saw a rule and
+    Codex never saw the audit gates. AGENTS.md is the entrypoint; details go
+    to the docs it points at."""
+    text = (REPO / "AGENTS.md").read_text()
+    assert len(text.encode()) < 10_000, f"AGENTS.md is {len(text.encode())} bytes; move detail into docs/"
+    for rel in ("docs/REMOTE.md", "docs/HARNESSES.md", "docs/ENV.md", "docs/TORCH.md",
+                "docs/POST.md", "docs/ARTICLE.md", "benchmarks/hard/README.md"):
+        assert rel in text, f"AGENTS.md no longer points at {rel}"
+        assert (REPO / rel).exists(), f"{rel} referenced by AGENTS.md is missing"

@@ -4,6 +4,17 @@ A running record of decisions, dead ends, and lessons. Newest entries on top. Th
 
 ---
 
+## 2026-09-02 — AGENTS.md split into a 10 KB entrypoint plus docs
+
+Grok truncates each AGENTS.md at 10,000 characters and Codex at 32 KB; the operator guide was 63 KB, so Grok never saw a rule or gate and Codex never saw the reward-hack audit, publish rules, or gotchas. AGENTS.md now holds only rules, gates, and a "where to read next" list, and `kbtool/tests/test_repo_consistency.py` fails if it grows past 10,000 bytes. Moved, not deleted: rented-worker runbook (Lambda CLI, bootstrap order, ncu admin gate, Brev teardown, cu128 wheel, pull-size gate) to `docs/REMOTE.md`; harness route notes, runner behaviour, workspace/lock/cache isolation, and broad-sweep launcher notes to `docs/HARNESSES.md`; layout tree, adding a problem, correctness, results, tests, sweep failures to `benchmarks/hard/README.md`; chart palette, cover card, visual-first, write-up, redaction scan, and ephemeral-artifact rules to `docs/POST.md`. Dated stories that used to sit in the guide, kept here for the record:
+
+- 2026-07-25: a stray `anvil:~/kb-remote-archives/` held the only local copy of 33 already-published leaderboard cells. Origin of the "every artifact stays in the repo on every machine" rule.
+- 2026-06-19 contamination audit: mega-published 7/24 contaminated (the glm-5.2 17.4x and MiniMax 16.5x "beat opus" cells were fake; glm's clean score is 7.3x; opus 14-19x is real), hard-published 0/53 clean, 107/403 hard archive runs contaminated but none published. Both leaderboard builders now auto-exclude runs whose transcript references another run's archive. Proper fix remains a sandboxed harness (Prime Intellect `verifiers` env with a judge).
+- 2026-08-12 friend-handoff mining (10 Grok 4.6 extractors over KernelBench sessions): SKU pin + stamp and the article cover rules were closed in code that night; still-open P0 holes were grok session-store sandbox, served-model pin, contamination rebuild, and a publish-time headline check.
+- 2026-08-13: grok-4.6 copied Fable's 24.6x kernel from `runs-remote-pro` and passed the same-buffer overwrite test; hence "a literal cp of another archive's solution is contamination regardless of the overwrite PASS". Lint false positive on record: `20260614_145529_zai-claude_glm-5.2_01_fp8_gemm` (HACK flag, clean on review).
+- 2026-08-17 pull sizes for the August wave: 21 full run dirs = 12.7 GiB, tiny set = 0.5 MB, tiny + transcripts = 1.0 GiB, one DeepSeek TopK jsonl = 241 MB.
+- Removed as stale: 300-second smoke notes for Qwen 3.7 Max (passed, 0.4257), Gemini 3.5 Flash and Composer 2.5 (wrote, failed correctness); the retired `grok-build` model id (2026-07-15); "Kimi only after auth is fixed"; the anvil-era "do not kill IVA" and `overnight-compute status` lines (current sweeps run on rented workers); the "other serious rows" model list, which contradicted the roster rule that open benches do not enumerate models.
+
 ## 2026-08-07 — Property-generated structural correctness guards
 
 The fixed numeric-stress suite caught whole-tensor scale cheats, but a new

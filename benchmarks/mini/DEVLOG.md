@@ -1,5 +1,25 @@
 # KernelBench-Mini — DEVLOG
 
+
+## 2026-08-03 — docs reconciled for cold-agent handoff
+
+SPEC/README/AGENTS disagreed after the 07-29 architecture flip (SPEC still
+described anvil→tunnel→athena; AGENTS/DEVLOG had self-contained kbmini). Cold
+agents could not tell which SOP was current. Fixed without code changes:
+
+- `SPEC.md` rewritten: current co-hosted-vLLM architecture, script allow/deny
+  table, ordered operator runbook (API vs local-vLLM), first-subject campaign
+  marked complete (not a second SOP), codex anchor explicitly **missing on
+  disk / rerun before debut**, pre-debut checklist.
+- `README.md` expanded to a real entrypoint pointing at SPEC.
+- Root `AGENTS.md` Mini blurb points at SPEC as operator SoT.
+- `scripts/publish_v2.sh` header no longer says "run from benchmarks/cuda".
+- Site surface locked: Mini is a **homepage `HomeDecks` scroll category on
+  `/`**, same pattern as Mega/Hard/CUDA — **not** `kernelbench.com/mini`.
+
+No deck, harness, or result changes. Next human decisions before debut remain:
+rerun codex anchor; clear SPEC calibration debts.
+
 ## 2026-07-29 — self-contained kbmini node: serving moved onto the eval box
 
 Athena (and the whole lease fleet) died mid-campaign with the anvil tunnel as a
