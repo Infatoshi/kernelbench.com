@@ -27,6 +27,20 @@ if [ -d "$KBH_CUDA_HOME" ]; then
     export PATH="$CUDA_HOME/bin:$PATH"
 fi
 
+# Pin one physical GPU. Unset CUDA_VISIBLE_DEVICES lets an agent see every
+# device (anvil GPU0=PRO 6000 and GPU1=3090) and result.json could not prove
+# which SKU produced the number. Empty CUDA_VISIBLE_DEVICES= remains illegal.
+# Override with KBH_GPU (physical index). Default 0.
+KBH_GPU="${KBH_GPU:-0}"
+export CUDA_VISIBLE_DEVICES="$KBH_GPU"
+GPU_SMI_NAME=""
+GPU_SMI_UUID=""
+if command -v nvidia-smi >/dev/null 2>&1; then
+    GPU_SMI_NAME="$(nvidia-smi -i "$KBH_GPU" --query-gpu=name --format=csv,noheader 2>/dev/null | head -1 | tr -d '\r' || true)"
+    GPU_SMI_UUID="$(nvidia-smi -i "$KBH_GPU" --query-gpu=uuid --format=csv,noheader 2>/dev/null | head -1 | tr -d '\r' || true)"
+fi
+
+
 # Source API keys if the user has an env_vars file.
 if [ -f "$HOME/.env_vars" ]; then
     set -a
@@ -2860,6 +2874,9 @@ cat > "$RUN_DIR/result.json" <<JSON
     "agent_container_image": "$KBH_AGENT_CONTAINER_IMAGE",
     "agent_container_network": "$KBH_AGENT_CONTAINER_NETWORK",
     "gpu_queue_mode": "$GPU_QUEUE_MODE",
+    "gpu_index": $KBH_GPU,
+    "gpu_name": "$GPU_SMI_NAME",
+    "gpu_uuid": "$GPU_SMI_UUID",
     "output_tokens_per_second": $OUTPUT_TOKENS_PER_SECOND,
     "usage": $USAGE_JSON
 }

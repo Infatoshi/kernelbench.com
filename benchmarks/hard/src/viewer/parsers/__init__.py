@@ -15,6 +15,8 @@ def sniff(path: Path) -> str:
     """
     if path.suffix == ".txt":
         return "codex"  # codex `exec` writes plain text to stdout
+    if path.name == "stderr.log":
+        return "codex"  # older codex archives kept the readable CLI stream here
     if not path.exists():
         raise FileNotFoundError(path)
 

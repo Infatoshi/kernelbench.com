@@ -62,8 +62,22 @@ def _pick_transcript(run_dir: Path) -> Path | None:
         key=lambda p: p.stat().st_size,
         reverse=True,
     )
+    legacy_grok_histories = sorted(
+        (run_dir / "grok_session").rglob("chat_history.jsonl")
+        if (run_dir / "grok_session").is_dir()
+        else [],
+        key=lambda p: p.stat().st_size,
+        reverse=True,
+    )
+    grok_histories.extend(legacy_grok_histories)
+    grok_histories.sort(key=lambda p: p.stat().st_size, reverse=True)
     if grok_histories:
         return grok_histories[0]
+    stderr = run_dir / "stderr.log"
+    if stderr.exists() and stderr.stat().st_size > 0:
+        head = stderr.read_bytes()[:4096]
+        if b"OpenAI Codex" in head:
+            return stderr
     for name in ("transcript.jsonl", "transcript.txt"):
         p = run_dir / name
         if p.exists() and p.stat().st_size > 0:

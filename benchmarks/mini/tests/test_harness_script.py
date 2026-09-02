@@ -29,7 +29,11 @@ def test_cuda_cannot_be_disabled_for_agent_phase() -> None:
         assert "KBH_DISABLE_AGENT_CUDA" not in text
         assert "AGENT_CUDA_ENV" not in text
         assert "KBH_AGENT_PHASE" not in text
-        assert "CUDA_VISIBLE_DEVICES=" not in text
+        assert 'CUDA_VISIBLE_DEVICES=""' not in text
+        assert "CUDA_VISIBLE_DEVICES=''" not in text
+    assert 'export CUDA_VISIBLE_DEVICES="$KBH_GPU"' in script
+    assert '"gpu_name":' in script
+    assert '"gpu_uuid":' in script
 
 
 def test_all_op_benchmarks_score_solution_first() -> None:

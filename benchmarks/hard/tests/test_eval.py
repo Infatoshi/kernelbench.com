@@ -98,6 +98,24 @@ def test_hardware_lookup_b200():
     assert hw.peak_tflops_dense["fp4"] == pytest.approx(9000.0)
 
 
+def test_identify_smi_name_to_key():
+    from src.hardware.identify import key_from_smi_name, matches_claimed
+
+    assert key_from_smi_name("NVIDIA RTX PRO 6000 Blackwell Workstation") == "RTX_PRO_6000"
+    assert key_from_smi_name("NVIDIA RTX PRO 6000 Blackwell Server Edition") == "RTX_PRO_6000"
+    assert key_from_smi_name("NVIDIA H100 80GB HBM3") == "H100_SXM"
+    assert key_from_smi_name("NVIDIA H100 PCIe") == "H100"
+    assert key_from_smi_name("NVIDIA B200") == "B200"
+    assert key_from_smi_name("NVIDIA GeForce RTX 3090") is None
+    assert key_from_smi_name("Quadro RTX 6000") is None
+    assert key_from_smi_name("NVIDIA RTX 6000 Ada Generation") is None
+    assert key_from_smi_name("") is None
+    assert matches_claimed("NVIDIA H100 80GB HBM3", "H100_SXM")
+    assert not matches_claimed("NVIDIA H100 80GB HBM3", "H100")
+    assert not matches_claimed("NVIDIA GeForce RTX 3090", "RTX_PRO_6000")
+
+
+
 def test_benchmark_baselines_env_flags(monkeypatch):
     monkeypatch.delenv("KBH_BENCHMARK_BASELINES", raising=False)
     monkeypatch.delenv("KBH_KDA_BENCHMARK_BASELINES", raising=False)

@@ -8,6 +8,7 @@ running token totals.
 from __future__ import annotations
 
 import json
+import re
 from datetime import datetime
 from pathlib import Path
 
@@ -24,6 +25,78 @@ def _parse_ts(s: str | None) -> datetime | None:
         return None
 
 
+def _parse_plain_log(path: Path) -> Session:
+    """Parse the human-readable stream written by older `codex exec` runs.
+
+    Some remote archives predate `codex_session.jsonl` capture and retain only
+    stderr.log. The stream uses exact `user`, `codex`, and `exec` marker lines.
+    Keep that useful timeline instead of publishing no trace at all.
+    """
+    raw = path.read_bytes().decode("utf-8", errors="replace")
+    text = "".join(c for c in raw if c in "\n\t" or (c.isprintable() and c != "�"))
+    model_match = re.search(r"^model:\s*(\S+)", text, re.MULTILINE)
+    session_match = re.search(r"^session id:\s*(\S+)", text, re.MULTILINE)
+    cwd_match = re.search(r"^workdir:\s*(.+)$", text, re.MULTILINE)
+    model = model_match.group(1) if model_match else None
+    session_id = session_match.group(1) if session_match else None
+    cwd = cwd_match.group(1).strip() if cwd_match else None
+
+    lines = text.splitlines()
+    try:
+        start = lines.index("user")
+    except ValueError:
+        body = text.strip()
+        events = [Event(role="assistant", text=body)] if body else []
+        return Session(
+            harness="codex", model=model, session_id=session_id, cwd=cwd,
+            events=events, final_text=body or None, total_usage=TokenUsage(),
+        )
+
+    events: list[Event] = []
+    marker: str | None = None
+    block: list[str] = []
+    tool_index = 0
+    final_text = None
+
+    def flush() -> None:
+        nonlocal block, final_text, tool_index
+        body = "\n".join(block).strip()
+        block = []
+        if not marker or not body:
+            return
+        if marker == "user":
+            events.append(Event(role="user", text=body))
+        elif marker == "codex":
+            events.append(Event(role="assistant", text=body, model=model))
+            final_text = body
+        else:
+            tool_index += 1
+            call_id = f"plain-exec-{tool_index}"
+            command, _, output = body.partition("\n")
+            events.append(Event(
+                role="assistant", model=model,
+                tool_calls=[ToolCall(
+                    name="exec_command", args={"command": command}, call_id=call_id,
+                )],
+            ))
+            events.append(Event(
+                role="tool",
+                tool_result=ToolResult(content=output or "(no captured output)", call_id=call_id),
+            ))
+
+    for line in lines[start:]:
+        if line in {"user", "codex", "exec"}:
+            flush()
+            marker = line
+        else:
+            block.append(line)
+    flush()
+    return Session(
+        harness="codex", model=model, session_id=session_id, cwd=cwd,
+        events=events, final_text=final_text, total_usage=TokenUsage(),
+    )
+
+
 def parse(path: Path) -> Session:
     events: list[Event] = []
     model = None
@@ -33,7 +106,9 @@ def parse(path: Path) -> Session:
     total = TokenUsage()
     files = FileTracker()
 
-    if path.suffix == ".txt":
+    if path.suffix == ".txt" or path.name == "stderr.log":
+        if path.name == "stderr.log":
+            return _parse_plain_log(path)
         text = path.read_text()
         events.append(Event(role="assistant", text=text or "(empty)"))
         return Session(harness="codex", model=None, session_id=None, cwd=None,
