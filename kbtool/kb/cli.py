@@ -2,7 +2,7 @@
 
 Drives the kernelbench.com monorepo: run sweeps, publish results, deploy the
 site, audit/lint runs, and push run artifacts to HuggingFace. Resolves the repo
-root from $KB_REPO_ROOT (set by the bin/kb shim) or by walking up from cwd, so
+root from $KB_REPO_ROOT or by walking up from cwd, so
 it works from any directory inside the repo.
 
 The GPU-coupled sweep orchestration stays as bench-local shell

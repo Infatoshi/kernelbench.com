@@ -1,7 +1,7 @@
 """kb — KernelBench operator CLI.
 
-Installable with `uv tool install ./kbtool` (exposes `kb`), or run via the
-repo's `bin/kb` shim which delegates here through `uv run`.
+Installable with `uv tool install -e ./kbtool` (exposes `kb`), or run in place
+with `uv run --project kbtool python -m kb`.
 """
 
 __version__ = "0.1.0"

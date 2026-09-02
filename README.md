@@ -42,7 +42,7 @@ Site data is baked at build time from `benchmarks/*/results/`
 app/ public/         the website (app/AGENTS.md); app/_lib/data.ts bakes benchmark data at build time
 benchmarks/<bench>/  AGENTS.md, SPEC.md, DEVLOG.md, problems, src (eval, hardware, viewer), scripts, results/, outputs/runs/ (gitignored archives)
 scripts/lib/         shared single-GPU runner (run_harness.sh) that hard/cuda/mini wrap
-kbtool/              the `kb` CLI (uv package, kbtool/AGENTS.md); bin/kb shims it
+kbtool/              the `kb` CLI (uv package, kbtool/AGENTS.md); `uv tool install -e ./kbtool` puts `kb` on PATH
 media/               tracked chart generators and the posting pipeline (media/AGENTS.md); PNGs gitignored
 runs/                gitignored HF staging filled by kb publish
 ```

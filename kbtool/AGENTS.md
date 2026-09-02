@@ -1,6 +1,6 @@
 # kbtool — driving runs: the `kb` CLI, harness routes, rented GPU workers
 
-`kb` is this uv package; `bin/kb` shims it. Harness routes, runner behaviour, rented nodes, and every `KB_` variable live here. Bench internals and `KBH_`: `benchmarks/hard/AGENTS.md`. Publish gates: root `AGENTS.md`.
+`kb` is this uv package. Install once with `uv tool install -e ./kbtool` (editable, tracks source); on a box with no tool install use `uv run --project kbtool python -m kb ...`. The CLI finds the repo root by walking up from cwd, or from `KB_REPO_ROOT`. Harness routes, runner behaviour, rented nodes, and every `KB_` variable live here. Bench internals and `KBH_`: `benchmarks/hard/AGENTS.md`. Publish gates: root `AGENTS.md`.
 
 ```
 kb sweep <harness> <model>      # all hard problems, parallel containers, unlimited time

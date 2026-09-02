@@ -37,7 +37,7 @@ kb -b <cuda|mini> run|sweep|audit|lint|traces-to-hf ...   # other benches; mega 
 kb lambda ... | kb brev ... | kb contamination <bench> | kb push-runs <bench> | kb help
 ```
 
-`kb` is the `kbtool/` uv package; `bin/kb` shims it. A new provider needs a harness branch (copy `kimi-claude` in `scripts/lib/run_harness.sh`) and a row in the `kbtool/AGENTS.md` harness table.
+`kb` is the `kbtool/` uv package: `uv tool install -e ./kbtool` once on the Mac, or `uv run --project kbtool python -m kb` on a fresh box. A new provider needs a harness branch (copy `kimi-claude` in `scripts/lib/run_harness.sh`) and a row in the `kbtool/AGENTS.md` harness table.
 
 ## Non-negotiable
 
