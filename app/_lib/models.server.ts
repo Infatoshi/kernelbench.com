@@ -9,6 +9,7 @@ import type { ModelIndex } from "./models"
  * Historical model pages and run pages still load the full index. */
 const LIVE_MODEL_SLUGS = new Set([
   "claude-fable-5",
+  "claude-fable-5-1",
   "claude-opus-5",
   "deepseek-v4-flash-0731",
   "glm-5.3",
