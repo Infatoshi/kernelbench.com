@@ -48,10 +48,6 @@ def load_environment(
     max_turns: int = 12,
     check_timeout_s: int = 900,
     bench_timeout_s: int = 1200,
-    enable_judge: bool = False,
-    judge_model: str = "z-ai/glm-5.2",
-    judge_base_url: str | None = None,
-    judge_api_key: str | None = None,
     max_concurrent: int = 1,
     **kwargs,
 ) -> vf.Environment:
@@ -65,8 +61,6 @@ def load_environment(
         eval_frac: deterministic hash-based held-out eval split (disjoint from train).
         max_turns: max agentic turns (write/check/benchmark iterations).
         check_timeout_s / bench_timeout_s: per-script subprocess timeouts (megakernels are slow).
-        enable_judge: opt-in judge veto (off by default; only zeros a correct reward).
-        judge_model / judge_base_url / judge_api_key: judge config (default GLM-5.2 / OpenRouter).
         max_concurrent: cap concurrent GPU scoring subprocesses (reward GPU, not a training GPU).
     """
     return knh.build_environment(
@@ -77,10 +71,6 @@ def load_environment(
         max_turns=max_turns,
         check_timeout_s=check_timeout_s,
         bench_timeout_s=bench_timeout_s,
-        enable_judge=enable_judge,
-        judge_model=judge_model,
-        judge_base_url=judge_base_url,
-        judge_api_key=judge_api_key,
         max_concurrent=max_concurrent,
         **kwargs,
     )

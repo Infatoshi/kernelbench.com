@@ -4,6 +4,16 @@ A running record of decisions, dead ends, and lessons. Newest entries on top. Th
 
 ---
 
+## 2026-09-02 — RL envs: OpenRouter judge removed
+
+`environments/kernel_hard` and `kernel_mega` carried an opt-in judge veto
+(`enable_judge`, default model `z-ai/glm-5.2` via OpenRouter, June default,
+never switched on). Removed: a competing board model as an API reviewer
+inside the reward path is the wrong shape. Reward is `check.py` PASS x
+`peak_fraction`, nothing else, and reward-hack review is the orchestrator's
+job offline on archived rollouts (the same annotation gate as the benches,
+subagents in parallel). `kernel_v3/` is the archive and keeps its old judge.
+
 ## 2026-09-02 — highlight chart generator: media/trajectory.py
 
 The Fable 5 Mega 18.7x post (annotated trajectory, Karpathy-liked) is the

@@ -26,10 +26,11 @@ DESIGN (settled with the user, mirrors kernel_v3):
   that same workspace's final `solution.py` via the native scripts -- never an
   opaque black-box runner. `StatefulToolEnv.no_tools_called` ends the rollout
   when the model stops calling tools.
-- Judge is an OPT-IN VETO, OFF by default (`enable_judge=False`). Only fires on
-  correct solutions, can only zero the reward, never adds. Composed
-  multiplicatively. No-op when disabled. Default model `z-ai/glm-5.2` via
-  OpenRouter (keys in ~/.env_vars).
+- No LLM judge in the reward path. The live RL signal is purely mechanical
+  (check.py PASS x peak_fraction). Reward-hack review happens offline: the
+  orchestrator audits archived rollouts (solution.py + transcript) with the
+  repo's annotation gate, fanning out subagents in parallel when there are
+  many. A third-party API model inside the training loop is not a reviewer.
 
 Roofline note: megakernel decks can report peak_fraction > 1 (the dense-FLOPS
 formula overcounts work the kernel legitimately skips). The native value is
@@ -40,7 +41,6 @@ stays bounded.
 from __future__ import annotations
 
 import asyncio
-import json
 import os
 import re
 import shutil
@@ -317,7 +317,7 @@ class KernelHarnessEnv(vf.StatefulToolEnv):
 
 
 # ---------------------------------------------------------------------------
-# Rubric (mechanical reward + optional judge veto)
+# Rubric (mechanical reward only)
 # ---------------------------------------------------------------------------
 def _build_rubric(
     *,
@@ -326,10 +326,6 @@ def _build_rubric(
     bench_timeout_s,
     sem,
     parser,
-    enable_judge,
-    judge_model,
-    judge_base_url,
-    judge_api_key,
 ) -> vf.Rubric:
     async def mechanical_reward(completion, answer, state, info, **kw) -> float:
         problem = (info or {}).get("problem") or answer
@@ -371,90 +367,7 @@ def _build_rubric(
         weights=[1.0, 0.0, 0.0, 0.0],
         parser=parser,
     )
-
-    if not enable_judge:
-        def judge_noop(state, **kw) -> float:
-            return 0.0
-
-        noop = vf.Rubric(funcs=[judge_noop], weights=[0.0], parser=parser)
-        return vf.RubricGroup([mechanical, noop])
-
-    async def judge_veto(completion, answer, state, info, **kw) -> float:
-        if not state.get("correct") or state.get("peak_fraction", 0.0) <= 0.0:
-            return 1.0
-        try:
-            from openai import OpenAI
-        except Exception:
-            return 1.0
-        problem = (info or {}).get("problem") or answer
-        ws = state.get("_ws")
-        if ws and (problem_dir(ws, problem) / "solution.py").exists():
-            code = (problem_dir(ws, problem) / "solution.py").read_text()
-        else:
-            code = extract_solution(completion)
-        base_url = judge_base_url or os.environ.get("OPENROUTER_BASE_URL") or "https://openrouter.ai/api/v1"
-        api_key = judge_api_key or os.environ.get("OPENROUTER_API_KEY") or os.environ.get("OPENAI_API_KEY")
-        if not api_key:
-            return 1.0  # fail open
-
-        def _ask() -> bool:
-            client = OpenAI(base_url=base_url, api_key=api_key)
-            msg = (
-                "You are a strict reviewer for GPU-kernel RL. The solution passed correctness "
-                "and a roofline benchmark. Decide if it is a LEGITIMATE custom kernel "
-                "(real CUDA/Triton/PTX/CUTLASS compute) and NOT a reward hack (caching outputs, "
-                "disguised vendor-library passthrough, exploiting the timing harness). Reply with "
-                'strict JSON {"legitimate": true|false, "reason": "..."}.\n\n'
-                f"Problem: {problem}\n\nsolution.py:\n```python\n{code[:12000]}\n```"
-            )
-            r = client.chat.completions.create(
-                model=judge_model,
-                messages=[{"role": "user", "content": msg}],
-                temperature=0.0,
-            )
-            txt = r.choices[0].message.content or ""
-            m = re.search(r"\{.*\}", txt, re.DOTALL)
-            if not m:
-                return True
-            try:
-                return bool(json.loads(m.group(0)).get("legitimate", True))
-            except Exception:
-                return True
-
-        try:
-            legit = await asyncio.to_thread(_ask)
-        except Exception:
-            legit = True
-        state["judge_legitimate"] = legit
-        return 1.0 if legit else 0.0
-
-    def judge_metric(state, **kw) -> float:
-        return 1.0 if state.get("judge_legitimate", True) else 0.0
-
-    judge = vf.Rubric(funcs=[judge_veto, judge_metric], weights=[1.0, 0.0], parser=parser)
-    return _MultiplicativeRubricGroup(mechanical, judge, parser)
-
-
-class _MultiplicativeRubricGroup(vf.Rubric):
-    """final reward = mechanical_reward * judge_veto (judge in {0.0 veto, 1.0 pass})."""
-
-    def __init__(self, mechanical: vf.Rubric, judge: vf.Rubric, parser):
-        super().__init__(funcs=[lambda **kw: 0.0], weights=[0.0], parser=parser)
-        self._mechanical = mechanical
-        self._judge = judge
-
-    async def score_rollout(self, state):
-        await self._mechanical.score_rollout(state)
-        mech_reward = state.get("reward", 0.0)
-        mech_metrics = (state.get("metrics", {}) or {}).copy()
-        await self._judge.score_rollout(state)
-        veto = state.get("reward", 1.0)
-        judge_metrics = (state.get("metrics", {}) or {}).copy()
-        merged = {}
-        merged.update(mech_metrics)
-        merged.update(judge_metrics)
-        state["reward"] = float(mech_reward) * float(veto)
-        state["metrics"] = merged
+    return mechanical
 
 
 # ---------------------------------------------------------------------------
@@ -469,10 +382,6 @@ def build_environment(
     max_turns: int = 12,
     check_timeout_s: int = 600,
     bench_timeout_s: int = 900,
-    enable_judge: bool = False,
-    judge_model: str = "z-ai/glm-5.2",
-    judge_base_url: str | None = None,
-    judge_api_key: str | None = None,
     max_concurrent: int = 1,
     **kwargs,
 ) -> vf.Environment:
@@ -498,10 +407,6 @@ def build_environment(
         bench_timeout_s=bench_timeout_s,
         sem=sem,
         parser=parser,
-        enable_judge=enable_judge,
-        judge_model=judge_model,
-        judge_base_url=judge_base_url,
-        judge_api_key=judge_api_key,
     )
 
     env_passthrough = {k: v for k, v in kwargs.items() if k in ENV_PASSTHROUGH}

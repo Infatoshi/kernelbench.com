@@ -42,8 +42,9 @@ computed at the end from the workspace's final `solution.py` via the same native
 - `reward = peak_fraction` (clamped to `[0,1]`) if `check.py` **PASS**, else `0.0`.
 - **Correctness HARD GATE** (native multi-seed + multi-shape + numeric-stress + forbidden-op grep);
   the PyTorch `reference.py` is correctness-only.
-- **Judge = opt-in VETO, OFF by default** (`enable_judge=True`): only zeros a correct, `peak_fraction>0`
-  reward; default model `z-ai/glm-5.2` via OpenRouter; multiplicative; no-op when disabled.
+- **No LLM judge.** Reward-hack review is offline: the orchestrator audits archived rollouts
+  (solution + transcript, subagents in parallel) under the repo audit gate, never an API model
+  inside the training loop.
 - Weight-0 metrics: `correct`, `peak_fraction`, `raw_peak_fraction`.
 
 ## load_environment kwargs
@@ -56,8 +57,6 @@ computed at the end from the workspace's final `solution.py` via the same native
 | `eval_frac` | `0.2` | deterministic hash-based held-out eval split |
 | `max_turns` | `12` | max agentic turns |
 | `check_timeout_s` / `bench_timeout_s` | `900` / `1200` | per-script subprocess timeouts (megakernels are slow) |
-| `enable_judge` | `False` | opt-in judge veto |
-| `judge_model` / `judge_base_url` / `judge_api_key` | `z-ai/glm-5.2` / OpenRouter | judge config |
 | `max_concurrent` | `1` | cap concurrent GPU scoring subprocesses |
 
 ## GPU / isolation

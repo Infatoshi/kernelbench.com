@@ -11,9 +11,10 @@ and someone can RL-train a model against them on a GPU cluster, unchanged.
   which is hardware-absolute and arch-portable (sm_120 → B200 unchanged). The PyTorch reference is
   used for correctness only, never as the speed denominator.
 - **Mechanical-primary**: the gradient comes from the mechanical compile/correctness/roofline path.
-- **Judge is an opt-in veto, off by default**: when enabled, an LLM judge (default `z-ai/glm-5.2` via
-  OpenRouter) only fires on already-correct solutions and can only zero the reward (reward-hack
-  veto) — never adds reward. Keeps the live RL signal mechanical (no judge in the gradient).
+- **No LLM judge in the reward path**: the live RL signal is mechanical only. Reward-hack review
+  is done offline by the orchestrator on the archived rollouts (`solution.py` + transcript), with
+  subagents fanned out in parallel, under the repo's audit gate (AGENTS.md "A number is
+  publishable only when"). `kernel_v3/` (archive) still carries its old opt-in judge.
 - **No eval contamination**: agentic envs run in an isolated sandbox so the agent can't read prior
   winning solutions (the cross-run contamination hole in the old harness; see repo CLAUDE.md).
 
@@ -41,11 +42,11 @@ trainer), reference the env in the orchestrator TOML; `args` are passed straight
 [[orchestrator.train.env]]
 id   = "kernel-v3"
 name = "kernel_v3"
-args = { levels = "1,2,3,4", hardware = "RTX_PRO_6000", enable_judge = false }
+args = { levels = "1,2,3,4", hardware = "RTX_PRO_6000" }
 ```
 Split GPUs in `[deployment]` (e.g. `num_train_gpus`/`num_infer_gpus`); run the kernel **reward on a
 GPU that is NOT a training GPU** (the spec's rule — timing under vLLM/FSDP contention is meaningless).
-Per-env kwargs (hardware, sandbox, judge, concurrency) are documented in each env's README.
+Per-env kwargs (hardware, sandbox, concurrency) are documented in each env's README.
 
 ## GPU / contract notes
 - `kernel_v3` reward needs CUDA + the repo's `benchmarks/v3` (imported via a repo-relative path; set

@@ -16,7 +16,7 @@ Run the agent (codex) in an ISOLATED Prime GPU sandbox; upload ONLY the problem 
 (reference/baseline/check/benchmark/problem.yaml/shapes/sota + src), NEVER the run archive. Reward =
 peak_fraction from the native `benchmark.py`, gated on `check.py` PASS. Codex uses its own
 `~/.codex/auth.json` uploaded into the sandbox (own-creds mode; the verifiers interception only serves
-chat/anthropic, not codex's Responses API). Optional GLM-5.2-via-OpenRouter judge.
+chat/anthropic, not codex's Responses API).
 
 ## Status: code-complete but BLOCKED on a Prime account permission
 The implementation (a `CliAgentEnv`-based env, own-creds + gpu_type fixes applied) lives in git history
