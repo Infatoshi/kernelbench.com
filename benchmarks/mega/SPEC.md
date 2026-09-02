@@ -43,4 +43,4 @@ Use `scripts/run_hard.sh` for all model smoke tests and sweeps. It stages a disp
 2. Write `reference.py`, `shapes.py`, `problem.yaml`, `check.py`, `benchmark.py`, `sota.py`, and `PROMPT.txt`.
 3. Keep prompts human-voice and benchmark definitions immutable after a published run.
 4. Smoke-test with `./scripts/run_hard.sh codex gpt-5.5 problems/<NN>_<name> xhigh`.
-5. Run `uv run ruff check . --fix && uv run pytest` before declaring repository-level changes complete.
+5. Run `uv run pytest` before declaring repository-level changes complete.

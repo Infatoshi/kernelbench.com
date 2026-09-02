@@ -45,7 +45,7 @@ kb lambda ... | kb brev ... | kb contamination <bench> | kb push-runs <bench> | 
 
 ## Non-negotiable
 
-- uv only, never bare python or pip. `uv run ruff check . --fix && uv run pytest` before committing. Commit email `elliot@arledge.net` or Vercel silently fails the build.
+- uv only, never bare python or pip. `uv run pytest` before committing. Commit email `elliot@arledge.net` or Vercel silently fails the build.
 - Never edit `problems/*/solution.py` (agent output; read it from the run archive). Never change `reference.py`, `check.py`, `benchmark.py`, `problem.yaml`, `shapes.py`, or `PROMPT.txt` after publish unless deliberately versioning the bench; the runner snapshots them and invalidates a run that mutates them.
 - GPU work goes through the harness (`kb`, `uv run kbh run`, or the bench's `run_hard.sh`) in container mode: per-run workspace, isolated caches, per-bench GPU lock. Never hide CUDA from the agent or prohibit check, benchmark, or profile. `benchmark.py` scores `variant=solution` first. Run `./scripts/patch_torch.sh` after every `uv sync`.
 - Every artifact stays in this repo, in its subfolder, on every machine: archives in `benchmarks/<bench>/outputs/runs/`, scripts in `scripts/`, locks under `outputs/gpu_lock/`. Nothing in `$HOME` or `/tmp`. Pull worker archives back before teardown; a stranded archive is invisible to publish, contamination, and regrade.
