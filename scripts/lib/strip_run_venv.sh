@@ -10,7 +10,6 @@
 #   source scripts/lib/strip_run_venv.sh && strip_run_venv "$RUN_DIR"
 #   scripts/lib/strip_run_venv.sh outputs/runs/<run_id>
 #   scripts/lib/strip_run_venv.sh --tree benchmarks/hard/outputs
-#   scripts/lib/strip_run_venv.sh --tree rescue
 #
 # Opt out for a single run: KBH_KEEP_RUN_VENV=1
 
