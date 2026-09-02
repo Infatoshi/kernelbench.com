@@ -1678,3 +1678,33 @@ present, leave it alone and report it as concurrent machine state.
 - **Removing problem.yaml + shapes.py from the model's view.** Currently they sit in the workspace because check.py and benchmark.py import them. Refactor option: pre-render their content into the prompt (already done) and have check.py / benchmark.py read yaml/shapes from a sibling private directory. Closes a small information leak. Not currently load-bearing.
 
 - **Per-problem prompt voice consistency.** All seven prompts hand-written in one session, same voice, same four-paragraph structure. If we add an 8th problem (Metal lightning attn) or add a second hardware target, the temptation will be to write that prompt in a different style. Resist. The voice is part of the experimental control.
+
+## 2026-09-02 — claude-fable-5-1 max on 02_kimi_linear_decode, RTX PRO 6000 (anvil GPU 1)
+
+Cell: 15.84x after sequential isolated regrade (in-run 15.82x; regraded
+0.344/0.388/0.431 ms/tok at ctx 2048/8192/16384), verdict clean,
+megakernel_authentic true, one cooperative persistent work-queue kernel
+(arrival counters, no grid barriers, split-K GEMV, in-kernel MLA cache append).
+Recompute test cos(o1,o2) = -0.018, cos(o2,ref) = 0.994; 1 launch/step;
+0.39 of the 1.8 TB/s roofline. Session was cut by the provider five-hour limit
+at ~91 min while still tuning. Same GPU class as the July Fable 5 18.71x cell
+(20260701_172615, RTX PRO 6000 Blackwell, max, ran to self-termination), so
+the gap is comparable but reads as a session-length effect at least as much
+as a model delta.
+
+Three earlier attempts the same day died before writing a solution
+(annotated bug): the first-party `claude)` block in `scripts/run_hard.sh` did
+not export `CLAUDE_CODE_MAX_OUTPUT_TOKENS`, so Claude Code used its 64000
+default for claude-fable-5-1 and a single max-effort reasoning turn ended the
+session with a terminal max_output_tokens error. `-p` mode does not recover
+from that. Fixed: the block now exports 128000 (the CLI's upper limit for
+this model). Effort tier was not the lever (xhigh died the same way). Also:
+anvil had Claude Code 2.1.252, which did not know the model id at all
+(200k/32k profile); updated to 2.1.257. Preflight a new model id with a
+one-line `-p` call and check the rig's `claude --version`.
+
+Tooling notes: `kb -b mega lint <run_id>` cannot find mega runs (delegates to
+the hard bench's reward_hack_lint.py with the hard root); run the script with
+the absolute run path. The 0.98 output-cosine gate on 02 is sensitive to
+reference-side MoE router near-ties (seeds 2 and 10 are exact ties, seed 5
+reads 0.977 for a correct kernel); expect dips in future 02 audits.

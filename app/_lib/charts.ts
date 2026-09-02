@@ -19,6 +19,8 @@ export const MODEL_NAMES: Record<string, string> = {
   "anthropic/claude-opus-5": "Claude Opus 5",
   "claude-fable-5": "Claude Fable 5",
   "anthropic/claude-fable-5": "Claude Fable 5",
+  "claude-fable-5-1": "Claude Fable 5.1",
+  "anthropic/claude-fable-5-1": "Claude Fable 5.1",
   "claude-sonnet-5": "Claude Sonnet 5",
   "glm-5.2": "GLM-5.2",
   "glm-5.3": "GLM-5.3",
@@ -49,8 +51,10 @@ function displayName(modelId: string): string {
 
 const LIVE_MODEL_IDS = new Set([
   "anthropic/claude-fable-5",
+  "anthropic/claude-fable-5-1",
   "anthropic/claude-opus-5",
   "claude-fable-5",
+  "claude-fable-5-1",
   "claude-opus-5",
   "deepseek/deepseek-v4-flash-0731",
   "glm-5.3",
@@ -180,6 +184,8 @@ const SHORT_NAMES: Record<string, string> = {
   "anthropic/claude-opus-5": "Opus 5",
   "claude-fable-5": "Fable 5",
   "anthropic/claude-fable-5": "Fable 5",
+  "claude-fable-5-1": "Fable 5.1",
+  "anthropic/claude-fable-5-1": "Fable 5.1",
   "claude-sonnet-5": "Sonnet 5",
   "glm-5.2": "GLM-5.2",
   "glm-5.3": "GLM-5.3",

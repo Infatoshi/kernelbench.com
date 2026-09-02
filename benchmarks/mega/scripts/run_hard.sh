@@ -26,6 +26,17 @@ if [ -d "$KBH_CUDA_HOME" ]; then
     export PATH="$CUDA_HOME/bin:$PATH"
 fi
 
+# Pin one physical GPU. Same contract as scripts/lib/run_harness.sh.
+KBH_GPU="${KBH_GPU:-0}"
+export CUDA_VISIBLE_DEVICES="$KBH_GPU"
+GPU_SMI_NAME=""
+GPU_SMI_UUID=""
+if command -v nvidia-smi >/dev/null 2>&1; then
+    GPU_SMI_NAME="$(nvidia-smi -i "$KBH_GPU" --query-gpu=name --format=csv,noheader 2>/dev/null | head -1 | tr -d '\r' || true)"
+    GPU_SMI_UUID="$(nvidia-smi -i "$KBH_GPU" --query-gpu=uuid --format=csv,noheader 2>/dev/null | head -1 | tr -d '\r' || true)"
+fi
+
+
 # Source API keys if the user has an env_vars file.
 if [ -f "$HOME/.env_vars" ]; then
     set -a
@@ -431,7 +442,13 @@ case "$HARNESS" in
         if [ -n "$REASONING_EFFORT" ]; then
             EFFORT_ARG=(--effort "$REASONING_EFFORT")
         fi
-        ( cd "$PROBLEM_DIR" && "${KBH_SBX[@]}" timeout "$BUDGET_SECONDS" claude \
+        # Same per-turn output ceiling the other Claude Code blocks export.
+        # Without it Claude Code uses the model-table default (64000 for
+        # claude-fable-5-1), and one long reasoning turn at max/xhigh effort
+        # ends the session with a terminal max_output_tokens API error.
+        ( cd "$PROBLEM_DIR" && \
+            export CLAUDE_CODE_MAX_OUTPUT_TOKENS="${CLAUDE_CODE_MAX_OUTPUT_TOKENS:-128000}" && \
+            "${KBH_SBX[@]}" timeout "$BUDGET_SECONDS" claude \
             --dangerously-skip-permissions \
             --print --verbose \
             --output-format stream-json \
@@ -1337,6 +1354,9 @@ cat > "$RUN_DIR/result.json" <<JSON
     "session_complete": $SESSION_COMPLETE,
     "agent_cuda_disabled": $AGENT_CUDA_DISABLED,
     "gpu_queue_mode": "$GPU_QUEUE_MODE",
+    "gpu_index": $KBH_GPU,
+    "gpu_name": "$GPU_SMI_NAME",
+    "gpu_uuid": "$GPU_SMI_UUID",
     "output_tokens_per_second": $OUTPUT_TOKENS_PER_SECOND,
     "usage": $USAGE_JSON
 }
