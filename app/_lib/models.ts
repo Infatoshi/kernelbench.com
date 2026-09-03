@@ -139,7 +139,40 @@ export const FLAG_VERDICTS = new Set([
   "contamination",
   "rubric_leak",
   "megakernel_not_authentic",
+  // audited, transcript contaminated but no other run's solution.py was
+  // opened. Still an audit reject: it must not keep its number.
+  "suspect",
 ])
+
+/**
+ * Whether a `correct` cell with no audit annotation (verdict "unaudited")
+ * counts as ranking data. False since 2026-09: unreviewed peaks were entering
+ * pass counts, perf aggregates and the homepage chart averages. Mirrors
+ * UNAUDITED_CELLS_ARE_VALID in scripts/build_model_index.py — keep in sync.
+ */
+export const UNAUDITED_CELLS_ARE_VALID = false
+
+/**
+ * Single definition of a rank-eligible cell, shared by the charts (which read
+ * benchmarks/*\/results/leaderboard*.json directly) and the model index
+ * builder (which bakes the same answer into models.json as `valid`). Keep it
+ * identical to `cell_is_valid` in scripts/build_model_index.py so the chart
+ * and the boards can never disagree.
+ */
+export function isCellValid(c: {
+  correct?: boolean | null
+  score?: number | null
+  verdict?: string | null
+  board_eligible?: boolean | null
+}): boolean {
+  if (!c.correct || c.score == null) return false
+  if (c.board_eligible === false) return false
+  const verdict = c.verdict || "unaudited"
+  if (FLAG_VERDICTS.has(verdict)) return false
+  if (verdict === "unaudited" && !UNAUDITED_CELLS_ARE_VALID) return false
+  if (verdict === "bug") return false // number unreliable (hard/AGENTS.md)
+  return true
+}
 
 /**
  * Boards hidden site-wide (none currently; RTX 3090 was fully removed from
@@ -441,6 +474,8 @@ const OUTCOME_TITLE: Record<string, string> = {
   hardware: "measurement used the wrong GPU SKU",
   ungraded: "no publishable measurement was produced",
   reward_hack: "audit found evaluator exploitation",
+  suspect: "audit found the transcript was contaminated",
+  unaudited: "correct, but no audit annotation yet — not scored",
   contamination: "run used another attempt's artifacts",
   rubric_leak: "candidate only satisfied the exposed rubric",
   not_megakernel: "audit found the submission was not one megakernel",
@@ -497,6 +532,11 @@ function chipFromCell(
       ...links,
     }
   }
+  // A correct-but-unaudited cell is not a failure and not a pass: it ran and
+  // matched, but no audit annotation exists so it cannot carry a number. Say
+  // exactly that instead of borrowing the catalog's "pass" / "failed" label.
+  const unaudited =
+    kind !== "hack" && c.correct === true && (c.verdict || "unaudited") === "unaudited"
   // Audit verdicts outrank generic harness outcomes. A mathematically passing
   // run can still be quarantined, so do not render its catalog fallback as
   // an ordinary "fail".
@@ -504,13 +544,17 @@ function chipFromCell(
   const label =
     kind === "hack"
       ? "flag"
-      : rawLabel.replace(/_/g, " ").slice(0, 10).trimEnd()
+      : unaudited
+        ? "unaudited"
+        : rawLabel.replace(/_/g, " ").slice(0, 10).trimEnd()
   const title =
     kind === "hack"
       ? OUTCOME_TITLE.flagged
-      : OUTCOME_TITLE[outcome || ""] ||
-        c.failure_reason ||
-        OUTCOME_TITLE.other
+      : unaudited
+        ? OUTCOME_TITLE.unaudited
+        : OUTCOME_TITLE[outcome || ""] ||
+          c.failure_reason ||
+          OUTCOME_TITLE.other
   return {
     problem: prob,
     short,
@@ -903,7 +947,6 @@ export const CHART_HIDDEN_SLUGS = new Set([
   "claude-opus-4-6",
   "claude-opus-4-7",
   "glm-5.1",
-  "custom:glm-5.1-[z.ai-coding-plan]-0",
   "kimi-k2.6",
   "kimi-k2.7-code",
   "minimax-m2.7",

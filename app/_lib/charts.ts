@@ -3,11 +3,63 @@
 // megakernel; hard is scored as percent of the hardware roofline (peak_fraction),
 // consistent with the site's stated metric.
 
-import { readFile } from "node:fs/promises"
+import { readFile, readdir } from "node:fs/promises"
 import { join } from "node:path"
+import type { Cell } from "./data"
 import { loadLeaderboard } from "./data"
+import { FLAG_VERDICTS, isCellValid } from "./models"
 
 const REPO_ROOT = process.cwd()
+
+/** Leaderboard cell plus the audit fields the builder bakes in but the shared
+ *  `Cell` type does not declare (app/_lib/data.ts is owned elsewhere). */
+type AuditedCell = Cell & {
+  annotation_verdict?: string | null
+  board_eligible?: boolean | null
+}
+
+/**
+ * Chart-eligible === board-eligible. The charts previously averaged every
+ * `correct` cell, so audit-rejected peaks (reward_hack / contamination /
+ * rubric_leak / suspect) and never-reviewed cells inflated model means while
+ * the boards excluded them. Route every chart cell through the same
+ * `isCellValid` the model index bakes into models.json.
+ */
+function chartEligible(c: AuditedCell): boolean {
+  return isCellValid({
+    correct: c.correct,
+    score: c.peak_fraction,
+    verdict: c.annotation_verdict ?? "unaudited",
+    board_eligible: c.board_eligible,
+  })
+}
+
+/**
+ * run_id -> effective audit verdict, read from the per-bench annotation YAMLs.
+ * Mega's results.csv carries no verdict column, so the mega chart has to join
+ * the audits itself (the CSV builder lives in kbtool). `megakernel_authentic:
+ * false` maps to megakernel_not_authentic, exactly as
+ * scripts/build_model_index.py does.
+ */
+async function loadVerdicts(dir: string): Promise<Map<string, string>> {
+  const out = new Map<string, string>()
+  let names: string[]
+  try {
+    names = await readdir(join(REPO_ROOT, dir))
+  } catch {
+    return out // missing annotations dir: every cell reads as unaudited
+  }
+  for (const name of names) {
+    if (!name.endsWith(".yaml")) continue
+    const text = await readFile(join(REPO_ROOT, dir, name), "utf-8")
+    const runId = /^run_id:\s*(\S+)/m.exec(text)?.[1] ?? name.slice(0, -5)
+    let verdict = /^verdict:\s*([A-Za-z_]+)/m.exec(text)?.[1] ?? ""
+    if (/^megakernel_authentic:\s*false\b/m.test(text) && !FLAG_VERDICTS.has(verdict))
+      verdict = "megakernel_not_authentic"
+    out.set(runId, verdict || "unaudited")
+  }
+  return out
+}
 
 // Formal display names for homepage / chart bars. Prefer adding a row here
 // when a new model is published so labels stay pretty; `displayName()` falls
@@ -102,18 +154,29 @@ export async function loadMegaChart(): Promise<ChartData> {
     join(REPO_ROOT, "public/data/mega/results.csv"),
     "utf-8",
   )
-  const lines = text.trim().split("\n")
+  const verdicts = await loadVerdicts("benchmarks/mega/results/annotations")
+  // The CSV is written with CRLF; splitting on "\n" alone leaves a trailing
+  // \r glued to the last column (run_id), which silently broke the audit join.
+  const lines = text.trim().split(/\r?\n/)
   const header = lines[0].split(",")
   const idx = (k: string) => header.indexOf(k)
   const cell: Record<string, Record<string, number>> = {}
   for (const line of lines.slice(1)) {
     const f = line.split(",")
-    if (f[idx("correct")] !== "true") continue
     const model = f[idx("model")]
     if (isRemovedModel(model)) continue
     const gpu = MEGA_GPU_LABEL[f[idx("gpu")]]
     if (!gpu) continue
-    ;(cell[model] ??= {})[gpu] = parseFloat(f[idx("score")])
+    const score = parseFloat(f[idx("score")])
+    if (
+      !chartEligible({
+        correct: f[idx("correct")] === "true",
+        peak_fraction: Number.isFinite(score) ? score : null,
+        annotation_verdict: verdicts.get(f[idx("run_id")]),
+      } as AuditedCell)
+    )
+      continue
+    ;(cell[model] ??= {})[gpu] = score
   }
   return assemble(cell, "x", 1)
 }
@@ -129,8 +192,8 @@ export async function loadHardChart(): Promise<ChartData> {
     const lb = await loadLeaderboard(file)
     for (const m of lb.models) {
       if (isRemovedModel(m.model)) continue
-      const pfs = Object.values(m.results)
-        .filter((c) => c.correct && c.peak_fraction != null)
+      const pfs = (Object.values(m.results) as AuditedCell[])
+        .filter(chartEligible)
         .map((c) => c.peak_fraction as number)
       if (pfs.length) {
         ;(cell[m.model] ??= {})[gpu] = (pfs.reduce((a, b) => a + b, 0) / pfs.length) * 100
@@ -234,13 +297,23 @@ const HARD_EFF_GPUS = ["H100", "RTX PRO 6000", "B200"]
 export async function loadEfficiency(): Promise<{ mega: EffByGpu; hard: EffByGpu }> {
   // Mega: speedup vs output tokens, grouped by GPU.
   const csv = await readFile(join(REPO_ROOT, "public/data/mega/results.csv"), "utf-8")
-  const lines = csv.trim().split("\n")
+  const megaVerdicts = await loadVerdicts("benchmarks/mega/results/annotations")
+  const lines = csv.trim().split(/\r?\n/)
   const h = lines[0].split(",")
   const ix = (k: string) => h.indexOf(k)
   const megaPts: Record<string, EffPoint[]> = {}
   for (const line of lines.slice(1)) {
     const f = line.split(",")
     if (f[ix("correct")] !== "true") continue
+    const megaScore = parseFloat(f[ix("score")])
+    if (
+      !chartEligible({
+        correct: true,
+        peak_fraction: Number.isFinite(megaScore) ? megaScore : null,
+        annotation_verdict: megaVerdicts.get(f[ix("run_id")]),
+      } as AuditedCell)
+    )
+      continue
     const gpu = MEGA_GPU_MAP[f[ix("gpu")]]
     if (!gpu) continue
     const tok = parseInt(f[ix("output_tokens")], 10)
@@ -275,10 +348,11 @@ export async function loadEfficiency(): Promise<{ mega: EffByGpu; hard: EffByGpu
       let tok = 0
       let any = false
       for (const p of deck) {
-        const c = m.results?.[p]
+        const c = m.results?.[p] as AuditedCell | undefined
         if (!c) continue
         any = true
-        if (c.correct && c.peak_fraction != null) sumPf += c.peak_fraction
+        // Audit-rejected and never-reviewed cells contribute 0, same as a fail.
+        if (chartEligible(c)) sumPf += c.peak_fraction as number
         // fail / missing peak → 0 contribution to mean
         tok += c.output_tokens ?? 0
       }

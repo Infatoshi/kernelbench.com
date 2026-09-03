@@ -135,3 +135,55 @@ def test_annotation_cell_selection_stays_on_active_deck() -> None:
         score=None,
         run_id="20260805_failed",
     )
+
+def test_suspect_is_an_audit_reject_everywhere() -> None:
+    """`suspect` (contaminated transcript, no other run's solution opened) is a
+    verdict the annotations actually emit. It must never keep its number."""
+    assert "suspect" in build_catalog.FLAG_VERDICTS
+    assert "suspect" in build_model_index.FLAG_VERDICTS
+    assert outcome(correct=True, verdict="suspect") == "suspect"
+    assert {x["code"] for x in build_catalog.LEGEND} >= {"suspect"}
+    ts = (REPO / "app" / "_lib" / "models.ts").read_text()
+    flags = ts.split("export const FLAG_VERDICTS", 1)[1].split("])", 1)[0]
+    assert '"suspect"' in flags
+
+
+def test_only_audited_clean_cells_are_valid() -> None:
+    valid = build_model_index.cell_is_valid
+    assert valid(correct=True, score=0.4, verdict="clean")
+    assert valid(correct=True, score=0.4, verdict="interesting")
+    # correctness and a number are not enough on their own
+    assert not valid(correct=False, score=0.4, verdict="clean")
+    assert not valid(correct=True, score=None, verdict="clean")
+    # audit rejects, including suspect
+    for bad in ("reward_hack", "contamination", "rubric_leak", "suspect"):
+        assert not valid(correct=True, score=0.4, verdict=bad)
+    # never reviewed -> visible, but not ranking data
+    assert not valid(correct=True, score=0.4, verdict="unaudited")
+    assert not valid(correct=True, score=0.4, verdict=None)
+    # hardware-ineligible runs stay off the board too
+    assert not valid(correct=True, score=0.4, verdict="clean", board_eligible=False)
+
+
+def test_published_index_has_no_unaudited_or_flagged_valid_cells() -> None:
+    """The live artifact, not just the helper: every valid cell in
+    public/data/models.json carries a non-flag, non-unaudited verdict."""
+    import json
+
+    path = REPO / "public" / "data" / "models.json"
+    if not path.exists():
+        return
+    idx = json.loads(path.read_text())
+    bad = []
+    for model in idx["models"]:
+        for bench, block in (model.get("benches") or {}).items():
+            views = [("rtxpro6000", block)] + list((block.get("gpus") or {}).items())
+            for gpu, view in views:
+                for prob, cell in (view.get("cells") or {}).items():
+                    verdict = cell.get("verdict") or "unaudited"
+                    if cell.get("valid") and (
+                        verdict == "unaudited"
+                        or verdict in build_model_index.FLAG_VERDICTS
+                    ):
+                        bad.append((model["slug"], bench, gpu, prob, verdict))
+    assert not bad, f"valid cells without a clean audit verdict: {bad}"

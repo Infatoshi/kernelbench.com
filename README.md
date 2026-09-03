@@ -40,12 +40,14 @@ Site data is baked at build time from `benchmarks/*/results/`
 
 ```
 app/ public/         the website (app/AGENTS.md); app/_lib/data.ts bakes benchmark data at build time
-benchmarks/<bench>/  AGENTS.md, SPEC.md, DEVLOG.md, problems, src (eval, hardware, viewer), scripts, results/, outputs/runs/ (gitignored archives)
-scripts/lib/         shared single-GPU runner (run_harness.sh) that hard/cuda/mini wrap
-kbtool/              the `kb` CLI (uv package, kbtool/AGENTS.md); `uv tool install -e ./kbtool` puts `kb` on PATH
-media/               tracked chart generators and the posting pipeline (media/AGENTS.md); PNGs gitignored
-runs/                gitignored HF staging filled by kb publish
+benchmarks/<bench>/  AGENTS.md, SPEC.md, DEVLOG.md, problems, src, scripts, results/, outputs/runs/ (gitignored archives)
+scripts/             shared runner (lib/run_harness.sh), workers, publish helpers
+kbtool/              the `kb` CLI (uv package); `uv tool install -e ./kbtool` puts `kb` on PATH
+media/               tracked chart generators (media/AGENTS.md); PNGs gitignored
+runs/                gitignored HF staging from `kb push-runs` (not a third archive)
 ```
+
+This list is closed. A new thing goes in the directory that owns it. `kbtool/tests` fails on a new top-level dir.
 
 Bench virtualenvs exist only on the GPU boxes that run the benchmark; the
 Mac checkout carries `kbtool/.venv` alone.

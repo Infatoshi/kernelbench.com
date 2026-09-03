@@ -23,7 +23,7 @@ Monorepo for the KernelBench website and the evals. Canonical checkout is the Ma
 | mini | `benchmarks/mini/` | 4 problems, sub-200B open weights, 30-min cap, 5 repeats, Lambda H100 SXM | `cd benchmarks/mini && ./scripts/sweep_mini.sh` | homepage category; unpublished, keep out of posts |
 | multi | `benchmarks/multi/` | 4xH100 NVLink, frontier roster only | `benchmarks/multi/scripts/sweep_wave.sh` | unpublished |
 
-Hard, mega, and cuda share harness, archive, and roofline code and run unlimited wall-clock. Removed problems stay removed: hard `04_kahan_softmax`, mega `01_rl_grid_ppo`; KernelBench v3 and the Prime Intellect `environments/` are gone, do not resurrect them. Eligibility is `benchmarks/<bench>/roster.yaml`: open benches do not enumerate models (the leaderboard is the list); multi refuses off-roster before any GPU time because one session holds four H100s; a `KBM_ALLOW_OFF_ROSTER=1` cell is archived but never publishable.
+Hard, mega, and cuda share the runner and run unlimited. Removed stay removed (`04_kahan_softmax`, mega `01_rl_grid_ppo`, v3, `environments/`). Eligibility is `benchmarks/<bench>/roster.yaml` (open benches: the leaderboard is the list; multi refuses off-roster before GPU time).
 
 ## "Do a sweep of <model>" is an order, not a question
 
@@ -45,7 +45,8 @@ kb lambda ... | kb brev ... | kb contamination <bench> | kb push-runs <bench> | 
 - Venvs live only where the benchmark runs. The Mac carries `kbtool/.venv` and nothing else; `uv sync` a bench on the GPU box, never here. Never commit or rsync a `.venv`.
 - Never edit `problems/*/solution.py` (agent output; read it from the run archive). Never change `reference.py`, `check.py`, `benchmark.py`, `problem.yaml`, `shapes.py`, or `PROMPT.txt` after publish unless deliberately versioning the bench; the runner snapshots them and invalidates a run that mutates them.
 - GPU work goes through the harness (`kb`, `uv run kbh run`, or the bench's `run_hard.sh`) in container mode: per-run workspace, isolated caches, per-bench GPU lock. Never hide CUDA from the agent or prohibit check, benchmark, or profile. `benchmark.py` scores `variant=solution` first. Run `./scripts/patch_torch.sh` after every `uv sync`.
-- Every artifact stays in this repo, in its subfolder, on every machine: archives in `benchmarks/<bench>/outputs/runs/`, scripts in `scripts/`, locks under `outputs/gpu_lock/`. Nothing in `$HOME` or `/tmp`. Pull worker archives back before teardown; a stranded archive is invisible to publish, contamination, and regrade.
+- Top-level tree is closed: `app/` `benchmarks/` `kbtool/` `media/` `public/` `scripts/` plus lockfiles. New work goes in the directory that owns it, never a sibling. `kbtool/tests` fails on a new top-level dir.
+- Every artifact stays in this repo, in its subfolder, on every machine: archives in `benchmarks/<bench>/outputs/runs/`, scripts in `scripts/`, locks under `<bench>/outputs/gpu_lock/`. Nothing in `$HOME` or `/tmp`. Pull worker archives back before teardown; a stranded archive is invisible to publish, contamination, and regrade.
 - Archives are thin (`.venv` stripped after scoring). Before any pull: `du -sb`, print full vs tiny, pull the tiny set (`result.json`, `solution.py`, `gpu`, logs, sidecar `.cu`). Over 20 MB say the size and wait; over 1 GB refuse until the user has seen it.
 - Secrets never in argv or repo files. Provider credit/rate detection reads CLI/API error events and stderr only, on rows without a solution.
 - Teardown by pidfile, never `pkill -f`. Confirm `kb lambda ls` / `brev ls` empty; Brev teardown only via `scripts/brev_teardown.sh`. Idle nodes bill the credits.

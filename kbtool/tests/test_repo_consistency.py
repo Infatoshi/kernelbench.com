@@ -11,6 +11,7 @@ in this repo (see benchmarks/*/DEVLOG.md):
 
 Run via: uv run --project kbtool pytest kbtool/tests/
 """
+
 import re
 import subprocess
 from pathlib import Path
@@ -72,7 +73,11 @@ def test_shared_bench_files_are_identical():
 def test_all_shell_scripts_parse():
     scripts = sorted(
         list((REPO / "scripts").glob("*.sh"))
-        + [p for b in (*BENCHES, "multi") for p in (REPO / "benchmarks" / b / "scripts").glob("*.sh")]
+        + [
+            p
+            for b in (*BENCHES, "multi")
+            for p in (REPO / "benchmarks" / b / "scripts").glob("*.sh")
+        ]
     )
     assert scripts, "no shell scripts found — path bug in the test"
     bad = []
@@ -126,7 +131,9 @@ def test_env_doc_covers_all_read_vars():
     # own prefix and lists its deliberately-excluded scan artifacts).
     doc = "\n".join((REPO / rel).read_text() for rel in AGENTS_FILES)
     missing = sorted(v for v in found if f"`{v}`" not in doc)
-    assert not missing, f"env vars read by code but absent from every AGENTS.md: {missing}"
+    assert not missing, (
+        f"env vars read by code but absent from every AGENTS.md: {missing}"
+    )
 
 
 def test_lambda_worker_ssh_forwards_command():
@@ -152,7 +159,9 @@ def test_gpu_lock_bounded_retry_everywhere():
     """The unbounded `flock -x 9` deadlock cost 71 min of an Opus 5 sweep; the
     bounded-retry fix must exist in the shared single-GPU runner."""
     text = (REPO / "scripts/lib/run_harness.sh").read_text()
-    assert "until flock -x -w 5 9; do" in text, "bounded flock retry missing from shared runner"
+    assert "until flock -x -w 5 9; do" in text, (
+        "bounded flock retry missing from shared runner"
+    )
 
 
 def test_or_proxy_launch_bypasses_gpu_lock_wrapper():
@@ -160,7 +169,7 @@ def test_or_proxy_launch_bypasses_gpu_lock_wrapper():
     python3 wrapper it inherits the flock fd and holds outputs/gpu.lock for its
     whole life, starving every later run (2026-08-01)."""
     text = (REPO / "scripts/lib/run_harness.sh").read_text()
-    m = re.search(r'\n\s*OR_PROXY_UPSTREAM=[^\n]*', text)
+    m = re.search(r"\n\s*OR_PROXY_UPSTREAM=[^\n]*", text)
     assert m, "or-provider proxy launch line not found"
     assert '"$OR_PROXY_PYTHON"' in m.group(0), (
         "proxy launch must use the wrapper-bypassing $OR_PROXY_PYTHON, not bare python3"
@@ -175,10 +184,18 @@ def test_bench_wrappers_are_thin_and_use_shared_runner():
     for b in ("hard", "cuda", "mini"):
         p = REPO / "benchmarks" / b / "scripts/run_hard.sh"
         text = p.read_text()
-        assert "scripts/lib/run_harness.sh" in text, f"{b}: wrapper does not exec the shared runner"
-        assert "KB_BENCH_DIR" in text and "KB_BENCH_BANNER" in text, f"{b}: wrapper missing identity pins"
-        assert 'case "$HARNESS"' not in text, f"{b}: harness dispatch leaked back into the wrapper"
-        assert len(text.splitlines()) < 30, f"{b}: wrapper no longer thin ({len(text.splitlines())} lines)"
+        assert "scripts/lib/run_harness.sh" in text, (
+            f"{b}: wrapper does not exec the shared runner"
+        )
+        assert "KB_BENCH_DIR" in text and "KB_BENCH_BANNER" in text, (
+            f"{b}: wrapper missing identity pins"
+        )
+        assert 'case "$HARNESS"' not in text, (
+            f"{b}: harness dispatch leaked back into the wrapper"
+        )
+        assert len(text.splitlines()) < 30, (
+            f"{b}: wrapper no longer thin ({len(text.splitlines())} lines)"
+        )
 
 
 def test_lambda_sync_preserves_torch_index_patch():
@@ -195,7 +212,9 @@ def test_lambda_sync_ships_shared_runner_lib():
     """kb lambda sync copies one bench dir to the node; the wrapper's fallback
     path (bench-local scripts/lib/) only works if sync ships the lib there."""
     text = (REPO / "scripts/lambda_worker.sh").read_text()
-    assert 'scripts/lib/' in text, "lambda_worker sync no longer ships scripts/lib to workers"
+    assert "scripts/lib/" in text, (
+        "lambda_worker sync no longer ships scripts/lib to workers"
+    )
 
 
 def test_agents_md_fits_harness_caps():
@@ -205,25 +224,66 @@ def test_agents_md_fits_harness_caps():
     (universal rules + pointers); each directory's AGENTS.md carries the detail
     and must itself fit Codex's cap."""
     text = (REPO / "AGENTS.md").read_text()
-    assert len(text.encode()) < 10_000, f"AGENTS.md is {len(text.encode())} bytes; move detail into a sub AGENTS.md"
+    assert len(text.encode()) < 10_000, (
+        f"AGENTS.md is {len(text.encode())} bytes; move detail into a sub AGENTS.md"
+    )
     for rel in AGENTS_FILES[1:]:
         p = REPO / rel
         assert p.exists(), f"{rel} is missing"
         size = len(p.read_bytes())
         assert size < 32_000, f"{rel} is {size} bytes; Codex truncates at 32 KB"
-    for rel in ("kbtool/AGENTS.md", "benchmarks/hard/AGENTS.md", "media/AGENTS.md", "app/AGENTS.md"):
+    for rel in (
+        "kbtool/AGENTS.md",
+        "benchmarks/hard/AGENTS.md",
+        "media/AGENTS.md",
+        "app/AGENTS.md",
+    ):
         assert rel in text, f"AGENTS.md no longer points at {rel}"
 
 
 def test_only_root_claude_md_and_no_stray_docs():
     """CLAUDE.md and .cursorrules are symlinks to the root AGENTS.md; every other
     directory gets an AGENTS.md only. Project markdown is AGENTS/SPEC/DEVLOG/GOAL."""
-    skip = ("node_modules", ".venv", "outputs", ".next", "scripts/transcript-extraction")
+    skip = ("node_modules", ".venv", "outputs", ".next")
     for p in REPO.rglob("CLAUDE.md"):
         rel = p.relative_to(REPO).as_posix()
         if any(s in rel for s in skip):
             continue
         assert rel == "CLAUDE.md" and p.is_symlink(), f"stray CLAUDE.md: {rel}"
-    assert not (REPO / "docs").exists(), "docs/ came back; fold it into the directory AGENTS.md files"
+    assert not (REPO / "docs").exists(), (
+        "docs/ came back; fold it into the directory AGENTS.md files"
+    )
     for b in (*BENCHES, "multi"):
-        assert not (REPO / "benchmarks" / b / "README.md").exists(), f"benchmarks/{b}/README.md came back"
+        assert not (REPO / "benchmarks" / b / "README.md").exists(), (
+            f"benchmarks/{b}/README.md came back"
+        )
+
+
+ALLOWED_TOP_DIRS = ("app", "benchmarks", "kbtool", "media", "public", "scripts")
+BANNED_PREFIXES = (
+    "archive/",
+    "paper/",
+    "bin/",
+    "docs/",
+    "environments/",
+    "rescue/",
+    "benchmarks/v3/",
+)
+
+
+def test_top_level_tree_stays_closed():
+    """The 2026-09-02 cleanup deleted archive/, paper/, bin/, docs/,
+    environments/, rescue/, and root outputs/. A new sibling is how the
+    repo bloated last time; put the work in the directory that owns it."""
+    files = subprocess.check_output(
+        ["git", "ls-files"], cwd=REPO, text=True
+    ).splitlines()
+    top = {Path(p).parts[0] for p in files if "/" in p}
+    extra = sorted(top - set(ALLOWED_TOP_DIRS))
+    assert not extra, f"new top-level dir (put it under an existing one): {extra}"
+    missing = sorted(set(ALLOWED_TOP_DIRS) - top)
+    assert not missing, f"expected top-level dir vanished: {missing}"
+    banned = [p for p in files if p.startswith(BANNED_PREFIXES)]
+    assert not banned, f"deleted path came back: {banned}"
+    cli = (REPO / "kbtool/kb/cli.py").read_text()
+    assert "build_catalog.py" in cli, "kb publish no longer rebuilds catalog.json"

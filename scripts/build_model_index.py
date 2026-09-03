@@ -12,6 +12,8 @@ Ground rules (mirrors AGENTS.md):
 - A run is a FLAG when its annotation verdict is in FLAG_VERDICTS, or (mega)
   when megakernel_authentic is false. `interesting`, `bug`, `harness_limited`,
   `fail` are NOT hacks.
+- Only audited-clean cells are valid (rank/average) data. `unaudited` cells
+  stay visible but do not score — see UNAUDITED_CELLS_ARE_VALID.
 - Join annotations by the `model:` field (slugified), never by harness strings
   or run_id parsing.
 - Legacy v1 hard rows are date-tagged snapshots of an evolving prompt set; they
@@ -33,7 +35,32 @@ import yaml
 REPO = Path(__file__).resolve().parent.parent
 OUT = REPO / "public" / "data" / "models.json"
 
-FLAG_VERDICTS = {"reward_hack", "contamination", "rubric_leak"}
+FLAG_VERDICTS = {"reward_hack", "contamination", "rubric_leak", "suspect"}
+
+# An audited-clean verdict is a precondition for ranking data. Cells that are
+# merely `correct` on a board with no annotation carry verdict "unaudited";
+# before 2026-09 they counted as valid, so unreviewed peaks entered pass counts,
+# perf aggregates and the homepage chart averages. Flip this back to True only
+# to reproduce that historical behaviour.
+UNAUDITED_CELLS_ARE_VALID = False
+
+
+def cell_is_valid(*, correct, score, verdict, board_eligible=None) -> bool:
+    """Single definition of a rank-eligible cell, mirrored by
+    `isCellValid` in app/_lib/models.ts (keep the two in sync)."""
+    if not correct or score is None:
+        return False
+    if board_eligible is False:
+        return False
+    verdict = verdict or "unaudited"
+    if verdict in FLAG_VERDICTS:
+        return False
+    if verdict == "unaudited" and not UNAUDITED_CELLS_ARE_VALID:
+        return False
+    if verdict == "bug":
+        # harness/infra or kernel defect: the number is unreliable (hard/AGENTS.md)
+        return False
+    return True
 
 # HF trace datasets per bench; omit a key (or set None) only when that
 # dataset is not published yet — site then drops the trace link.
@@ -284,7 +311,12 @@ def load_site_board(models: Models, bench: str, path: Path, gpu_key: str | None)
                 "has_solution": bool(c.get("has_solution")),
                 "score": c.get("peak_fraction"),
                 "verdict": verdict,
-                "valid": bool(c.get("correct")) and c.get("peak_fraction") is not None and verdict not in FLAG_VERDICTS,
+                "valid": cell_is_valid(
+                    correct=bool(c.get("correct")),
+                    score=c.get("peak_fraction"),
+                    verdict=verdict,
+                    board_eligible=c.get("board_eligible"),
+                ),
                 "elapsed_seconds": c.get("elapsed_seconds"),
                 "failure_reason": c.get("failure_reason"),
                 "retryable_infra_failure": c.get("retryable_infra_failure"),
@@ -359,10 +391,14 @@ def load_mega(models: Models, csv_path: Path) -> None:
                 "ctx": {k: float(r[k]) for k in ("ctx2048", "ctx8192", "ctx16384") if r.get(k)},
                 "framework": r.get("framework") or None,
                 "solution_url": mega_solution_url(r.get("run_id") or ""),
-                "trace_url": trace_url("mega", r.get("run_id") or ""),
+                "trace_url": trace_url("mega", r.get("run_id") or "", gpu_key),
                 # verdict/validity filled in after annotations are joined
                 "verdict": "unaudited",
-                "valid": correct,
+                "valid": cell_is_valid(
+                    correct=correct,
+                    score=float(r["score"]) if r.get("score") else None,
+                    verdict="unaudited",
+                ),
             }
         for slug, b in per_slug.items():
             harness = max(b.get("harnesses", {"": 1}), key=b.get("harnesses", {"": 1}).get) or None
@@ -648,7 +684,11 @@ def join_annotations(models: Models, bench: str, ann_dir: Path) -> tuple[list[st
             )
             raw_score = a.get("peak_fraction")
             score = float(raw_score) if raw_score is not None else None
-            replace = should_replace_annotation_cell(
+            board_ineligible = a.get("board_eligible") is False or any(
+                marker in str(a.get("measurement_status") or "")
+                for marker in ("wrong_hardware", "wrong_gpu")
+            )
+            replace = not board_ineligible and should_replace_annotation_cell(
                 bench=bench,
                 problem=problem,
                 current=current,
@@ -750,8 +790,16 @@ def join_annotations(models: Models, bench: str, ann_dir: Path) -> tuple[list[st
                         cell[key] = a[key]
                 if a.get("correct") is not None:
                     cell["correct"] = bool(a["correct"])
-                if flagged or audited_outcome != "pass":
-                    cell["valid"] = False
+                cell["valid"] = (
+                    not flagged
+                    and audited_outcome == "pass"
+                    and cell_is_valid(
+                        correct=cell.get("correct"),
+                        score=cell.get("score"),
+                        verdict=eff,
+                        board_eligible=a.get("board_eligible"),
+                    )
+                )
                 if flagged or cell.get("verdict") in (None, "unaudited"):
                     cell["verdict"] = eff
     return sorted(annotation_only), len(files)
@@ -939,10 +987,11 @@ def finalize(models: Models) -> dict:
         "benches": bench_meta,
         "methodology": (
             "Rank per bench: valid passes (audited-clean correct cells / problems) desc, "
+            "Cells with no audit annotation are shown but never scored. "
             "then mean normalized performance over the FULL problem deck (cell score / "
             "board best per problem; fail/invalid/missing cells count as 0) desc. "
             "Hack badge = flagged audited sessions / total audited sessions for that model; "
-            "flagged = annotation verdict reward_hack | contamination | rubric_leak, or "
+            "flagged = annotation verdict reward_hack | contamination | rubric_leak | suspect, or "
             "megakernel_authentic false (mega). Verdicts come from per-run audit YAMLs, not "
             "static lint. Hack rate is displayed, never a sort key."
         ),

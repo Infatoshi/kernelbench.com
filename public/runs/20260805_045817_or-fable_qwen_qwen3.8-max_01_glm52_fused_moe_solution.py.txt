@@ -1,0 +1,650 @@
+"""Fused GLM-5.2-class MoE layer in hand-written CUDA (SM120, mma.sync bf16).
+
+Pipeline (all device-side, no host sync):
+  1. routing hist / scan / fill  -> tokens grouped by expert (shared expert
+     appended as pseudo-experts E..E+n_shared)
+  2. gemm1: per-expert grouped GEMM  X @ [gate|up]^T with silu*mul fused in
+     the epilogue -> H1 (bf16).  Grid: m-blocks fastest (weights streamed once,
+     X is small and stays in L2).
+  3. gemm2: per-expert grouped GEMM  H1 @ W2^T -> Y' (bf16).
+     Grid: n-tiles fastest, so each H1 row-block stays in L2 across all
+     n-tiles while W2[expert] is reused across m-blocks from L2.
+  4. finalize: out[t] = sum_j w[t,j] * Y'[slot(t,j)]  (shared unweighted)
+
+GEMMs use mma.sync.aligned.m16n8k16 bf16->fp32 with cp.async multistage
+pipelines, written as TN products against the (N,K) row-major weight layout.
+"""
+from __future__ import annotations
+
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+_CPP = r"""
+#include <torch/extension.h>
+void moe_forward(
+    torch::Tensor x, torch::Tensor expert_ids, torch::Tensor expert_weights,
+    torch::Tensor w1_routed, torch::Tensor w2_routed,
+    torch::Tensor w1_shared, torch::Tensor w2_shared,
+    torch::Tensor out,
+    torch::Tensor cnt_fill, torch::Tensor offsets, torch::Tensor bstart,
+    torch::Tensor row_token, torch::Tensor inv_slot,
+    torch::Tensor h1, torch::Tensor y1,
+    int64_t T, int64_t E, int64_t top_k, int64_t n_shared,
+    int64_t H, int64_t I, int64_t cfg1, int64_t cfg2);
+"""
+
+_CU = r"""
+#include <cuda_runtime.h>
+#include <cuda_bf16.h>
+#include <torch/extension.h>
+#include <ATen/cuda/CUDAContext.h>
+#include <cstdint>
+
+#define DI __device__ __forceinline__
+
+DI unsigned smem_u32(const void* p) { return (unsigned)__cvta_generic_to_shared(p); }
+
+DI void cp_async16(unsigned dst, const void* src) {
+  asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" :: "r"(dst), "l"(src));
+}
+DI void cp_commit() { asm volatile("cp.async.commit_group;\n"); }
+template <int N> DI void cp_wait() { asm volatile("cp.async.wait_group %0;\n" :: "n"(N)); }
+
+DI void ldm_x4(unsigned& r0, unsigned& r1, unsigned& r2, unsigned& r3, unsigned a) {
+  asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+               : "=r"(r0), "=r"(r1), "=r"(r2), "=r"(r3) : "r"(a));
+}
+
+DI void mma16816(float* c, const unsigned* a, unsigned b0, unsigned b1) {
+  asm volatile(
+      "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
+      "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+      : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
+      : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+}
+
+// smem row offset: BK=64 uses XOR swizzle (no padding), BK=32 uses 16B padding
+template <int BKV> DI int soff_fn(int r, int cbo) {
+  if (BKV == 64) return r * 128 + (((cbo >> 4) ^ (r & 7)) << 4);
+  return r * (BKV * 2 + 16) + cbo;
+}
+
+DI float silu_f(float g) { return g / (1.0f + __expf(-g)); }
+
+// ---------------------------------------------------------------------------
+// Routing kernels
+// ---------------------------------------------------------------------------
+
+__global__ void hist_kernel(const int64_t* __restrict__ ids, int* __restrict__ counts,
+                            int T, int top_k, int n_shared, int E) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  int routed = T * top_k;
+  if (i < routed) {
+    atomicAdd(counts + (int)ids[i], 1);
+  } else if (n_shared > 0 && i == routed) {
+    for (int s = 0; s < n_shared; s++) counts[E + s] = T;
+  }
+}
+
+// parallel block scan over counts (E_TOT <= ~260): offsets + block starts
+__global__ void scan_kernel(const int* __restrict__ counts, int* __restrict__ offsets,
+                            int* __restrict__ bstart, int E_TOT, int BM1, int BM2) {
+  __shared__ int src[320];
+  __shared__ int scan[320];
+  int t = threadIdx.x;
+  int n = E_TOT;
+  for (int i = t; i < n; i += blockDim.x) src[i] = counts[i];
+  // exclusive-scan src -> dst (n+1 entries)
+  auto escan = [&](int* dst) {
+    for (int i = t; i < n; i += blockDim.x) scan[i] = src[i];
+    __syncthreads();
+    for (int d = 1; d < n; d <<= 1) {
+      int v = 0;
+      if (t >= d && t < n) v = scan[t - d];
+      __syncthreads();
+      if (t < n) scan[t] += v;
+      __syncthreads();
+    }
+    if (t == 0) dst[0] = 0;
+    for (int i = t; i < n; i += blockDim.x) dst[i + 1] = scan[i];
+    __syncthreads();
+  };
+  escan(offsets);
+  for (int i = t; i < n; i += blockDim.x) src[i] = (src[i] + BM1 - 1) / BM1;
+  escan(bstart);
+  for (int i = t; i < n; i += blockDim.x) src[i] = (counts[i] + BM2 - 1) / BM2;
+  escan(bstart + (E_TOT + 1));
+}
+
+__global__ void fill_kernel(const int64_t* __restrict__ ids, int* __restrict__ fill_pos,
+                            const int* __restrict__ offsets, int* __restrict__ row_token,
+                            int* __restrict__ inv_slot, int T, int top_k, int n_shared, int E) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  int routed = T * top_k;
+  int KS = top_k + n_shared;
+  if (i < routed) {
+    int t = i / top_k, k = i % top_k;
+    int e = (int)ids[i];
+    int slot = offsets[e] + atomicAdd(fill_pos + e, 1);
+    row_token[slot] = t;
+    inv_slot[t * KS + k] = slot;
+  } else if (i < routed + T * n_shared) {
+    int j = i - routed;
+    int s = j / T, t = j % T;
+    int slot = offsets[E + s] + t;
+    row_token[slot] = t;
+    inv_slot[t * KS + top_k + s] = slot;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Grouped GEMM1: H1 = silu(X @ gate^T) * (X @ up^T)
+//   rows grouped by expert; A gathered on the fly via row_token
+//   1D grid, m-block-major order (L = bm*ntiles + nt): consecutive blocks
+//   share the same A rows (L2 reuse) and expert weights stream sequentially.
+// ---------------------------------------------------------------------------
+
+template <int BM, int BNV, int BKV, int STAGES, int WM, int WN, int THREADS>
+__global__ void __launch_bounds__(THREADS) gemm1_kernel(
+    const __nv_bfloat16* __restrict__ X, const __nv_bfloat16* __restrict__ W1R,
+    const __nv_bfloat16* __restrict__ W1S, __nv_bfloat16* __restrict__ H1,
+    const int* __restrict__ offsets, const int* __restrict__ bstart,
+    const int* __restrict__ row_token, int E, int n_shared, int H, int I) {
+  constexpr int BN = BNV;
+  constexpr int BK = BKV;
+  constexpr int AROW = (BK == 64) ? BK * 2 : BK * 2 + 16;
+  constexpr int WTM = BM / WM;
+  constexpr int WTN = BN / WN;
+  constexpr int MT = WTM / 16;
+  constexpr int NT = WTN / 8;
+  constexpr int A_STAGE = BM * AROW;
+  constexpr int B_STAGE = BN * AROW;
+  constexpr int CHUNKS = BK / 8;  // 16B chunks per row
+  constexpr int KH = BK / 16;     // k16 steps per stage
+  int KITERS = H / BK;
+  int ntiles = I / BN;
+
+  // m-block-major 1D order (L = bm*ntiles + nt): the n-tiles of one m-block
+  // are consecutive so its A rows stay hot in L2, and all m-blocks of one
+  // expert stay within a short span so weight re-reads hit L2 too.
+  int E_TOT = E + n_shared;
+  int bx = blockIdx.x / ntiles;
+  int nt = blockIdx.x - bx * ntiles;
+  int total_blk = bstart[E_TOT];
+  if (bx >= total_blk) return;
+  int lo = 0, hi = E_TOT;
+  while (lo < hi) {
+    int mid = (lo + hi) >> 1;
+    if (bstart[mid + 1] > bx) hi = mid; else lo = mid + 1;
+  }
+  int e = lo;
+  int row0 = offsets[e] + (bx - bstart[e]) * BM;
+  int row_end = offsets[e + 1];
+  const __nv_bfloat16* W1 =
+      (e < E) ? (W1R + (size_t)e * 2 * I * H) : (W1S + (size_t)(e - E) * 2 * I * H);
+  int n0 = nt * BN;
+
+  extern __shared__ char smem[];
+  char* sA = smem;
+  char* sBg = smem + STAGES * A_STAGE;
+  char* sBu = sBg + STAGES * B_STAGE;
+
+  int tid = threadIdx.x;
+  int warp = tid >> 5, lane = tid & 31;
+  int wm = warp / WN, wn = warp % WN;
+
+  // prefetch token ids for this tile into smem (placed after B stages)
+  int* sTok = (int*)(sBu + STAGES * B_STAGE);
+  if (tid < BM) {
+    int gr = row0 + tid;
+    sTok[tid] = (gr < row_end) ? row_token[gr] : 0;
+  }
+  __syncthreads();
+
+  auto load_stage = [&](int s, int k0) {
+    for (int idx = tid; idx < BM * CHUNKS; idx += THREADS) {
+      int r = idx / CHUNKS, ch = idx % CHUNKS;
+      char* dst = sA + s * A_STAGE + soff_fn<BK>(r, ch * 16);
+      if (row0 + r < row_end) {
+        int tok = sTok[r];
+        cp_async16(smem_u32(dst), X + (size_t)tok * H + k0 + ch * 8);
+      } else {
+        *(uint4*)dst = make_uint4(0u, 0u, 0u, 0u);
+      }
+    }
+    for (int idx = tid; idx < BN * CHUNKS; idx += THREADS) {
+      int r = idx / CHUNKS, ch = idx % CHUNKS;
+      const __nv_bfloat16* srcg = W1 + (size_t)(n0 + r) * H + k0 + ch * 8;
+      cp_async16(smem_u32(sBg + s * B_STAGE + soff_fn<BK>(r, ch * 16)), srcg);
+      cp_async16(smem_u32(sBu + s * B_STAGE + soff_fn<BK>(r, ch * 16)), srcg + (size_t)I * H);
+    }
+    cp_commit();
+  };
+
+  #pragma unroll
+  for (int s = 0; s < STAGES - 1; s++) load_stage(s, s * BK);
+
+  float accg[MT][NT][4], accu[MT][NT][4];
+  #pragma unroll
+  for (int mi = 0; mi < MT; mi++)
+    #pragma unroll
+    for (int nt = 0; nt < NT; nt++)
+      #pragma unroll
+      for (int q = 0; q < 4; q++) { accg[mi][nt][q] = 0.f; accu[mi][nt][q] = 0.f; }
+
+  for (int it = 0; it < KITERS; it++) {
+    cp_wait<STAGES - 2>();
+    __syncthreads();
+    int s = it % STAGES;
+    int itn = it + STAGES - 1;
+    if (itn < KITERS) load_stage(itn % STAGES, itn * BK); else cp_commit();
+
+    char* baseA = sA + s * A_STAGE;
+    char* baseG = sBg + s * B_STAGE;
+    char* baseU = sBu + s * B_STAGE;
+
+    #pragma unroll
+    for (int kh = 0; kh < KH; kh++) {
+      unsigned af[MT][4];
+      #pragma unroll
+      for (int mi = 0; mi < MT; mi++) {
+        int row = wm * WTM + mi * 16 + (lane & 7) + 8 * ((lane >> 3) & 1);
+        unsigned addr = smem_u32(baseA + soff_fn<BK>(row, kh * 32 + (((lane >> 3) & 2) ? 16 : 0)));
+        ldm_x4(af[mi][0], af[mi][1], af[mi][2], af[mi][3], addr);
+      }
+      #pragma unroll
+      for (int g = 0; g < WTN / 32; g++) {
+        unsigned bg0[4], bg1[4], bu0[4], bu1[4];
+        int row = wn * WTN + g * 32 + (lane & 7) + 8 * ((lane >> 3) & 3);
+        unsigned addr = smem_u32(baseG + soff_fn<BK>(row, kh * 32));
+        ldm_x4(bg0[0], bg0[1], bg0[2], bg0[3], addr);
+        ldm_x4(bg1[0], bg1[1], bg1[2], bg1[3], smem_u32(baseG + soff_fn<BK>(row, kh * 32 + 16)));
+        unsigned addru = smem_u32(baseU + soff_fn<BK>(row, kh * 32));
+        ldm_x4(bu0[0], bu0[1], bu0[2], bu0[3], addru);
+        ldm_x4(bu1[0], bu1[1], bu1[2], bu1[3], smem_u32(baseU + soff_fn<BK>(row, kh * 32 + 16)));
+        #pragma unroll
+        for (int j = 0; j < 4; j++) {
+          int nt = g * 4 + j;
+          #pragma unroll
+          for (int mi = 0; mi < MT; mi++) {
+            mma16816(accg[mi][nt], af[mi], bg0[j], bg1[j]);
+            mma16816(accu[mi][nt], af[mi], bu0[j], bu1[j]);
+          }
+        }
+      }
+    }
+  }
+  __syncthreads();
+
+  // epilogue: h = silu(g)*u -> smem -> coalesced bf16 store
+  __nv_bfloat16* ebuf = (__nv_bfloat16*)smem;
+  constexpr int EROW = BN + 8;
+  #pragma unroll
+  for (int mi = 0; mi < MT; mi++) {
+    #pragma unroll
+    for (int nt = 0; nt < NT; nt++) {
+      int r0 = wm * WTM + mi * 16 + (lane >> 2);
+      int c0 = wn * WTN + nt * 8 + 2 * (lane & 3);
+      float g0 = accg[mi][nt][0], g1 = accg[mi][nt][1];
+      float g2 = accg[mi][nt][2], g3 = accg[mi][nt][3];
+      float u0 = accu[mi][nt][0], u1 = accu[mi][nt][1];
+      float u2 = accu[mi][nt][2], u3 = accu[mi][nt][3];
+      __nv_bfloat162 p0 = __floats2bfloat162_rn(silu_f(g0) * u0, silu_f(g1) * u1);
+      __nv_bfloat162 p1 = __floats2bfloat162_rn(silu_f(g2) * u2, silu_f(g3) * u3);
+      *(unsigned*)(ebuf + r0 * EROW + c0) = *(unsigned*)&p0;
+      *(unsigned*)(ebuf + (r0 + 8) * EROW + c0) = *(unsigned*)&p1;
+    }
+  }
+  __syncthreads();
+  constexpr int CH_ROW = BN * 2 / 16;
+  for (int idx = tid; idx < BM * CH_ROW; idx += THREADS) {
+    int r = idx / CH_ROW, ch = idx % CH_ROW;
+    int gr = row0 + r;
+    if (gr < row_end) {
+      __stcs((uint4*)(H1 + (size_t)gr * I + n0 + ch * 8), *(uint4*)(ebuf + r * EROW + ch * 8));
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Grouped GEMM2: Y' = H1 @ W2^T
+//   grid: x = n-tile (fastest), y = m-block (expert-ordered): each H1
+//   row-block stays in L2 across all n-tiles; W2[expert] reused across the
+//   expert's m-blocks from L2.
+// ---------------------------------------------------------------------------
+
+template <int BM, int BNV, int BKV, int STAGES, int WM, int WN, int THREADS>
+__global__ void __launch_bounds__(THREADS) gemm2_kernel(
+    const __nv_bfloat16* __restrict__ H1, const __nv_bfloat16* __restrict__ W2R,
+    const __nv_bfloat16* __restrict__ W2S, __nv_bfloat16* __restrict__ Y1,
+    const int* __restrict__ offsets, const int* __restrict__ bstart,
+    int E, int n_shared, int H, int I) {
+  constexpr int BN = BNV;
+  constexpr int BK = BKV;
+  constexpr int AROW = (BK == 64) ? BK * 2 : BK * 2 + 16;
+  constexpr int WTM = BM / WM;
+  constexpr int WTN = BN / WN;
+  constexpr int MT = WTM / 16;
+  constexpr int NT = WTN / 8;
+  constexpr int A_STAGE = BM * AROW;
+  constexpr int B_STAGE = BN * AROW;
+  constexpr int CHUNKS = BK / 8;
+  constexpr int KH = BK / 16;
+  int KITERS = I / BK;
+
+  int E_TOT = E + n_shared;
+  int bx = blockIdx.y;
+  int total_blk = bstart[E_TOT];
+  if (bx >= total_blk) return;
+  int lo = 0, hi = E_TOT;
+  while (lo < hi) {
+    int mid = (lo + hi) >> 1;
+    if (bstart[mid + 1] > bx) hi = mid; else lo = mid + 1;
+  }
+  int e = lo;
+  int row0 = offsets[e] + (bx - bstart[e]) * BM;
+  int row_end = offsets[e + 1];
+  const __nv_bfloat16* W2 =
+      (e < E) ? (W2R + (size_t)e * H * I) : (W2S + (size_t)(e - E) * H * I);
+  int n0 = blockIdx.x * BN;
+
+  extern __shared__ char smem[];
+  char* sA = smem;
+  char* sB = smem + STAGES * A_STAGE;
+
+  int tid = threadIdx.x;
+  int warp = tid >> 5, lane = tid & 31;
+  int wm = warp / WN, wn = warp % WN;
+
+  auto load_stage = [&](int s, int k0) {
+    for (int idx = tid; idx < BM * CHUNKS; idx += THREADS) {
+      int r = idx / CHUNKS, ch = idx % CHUNKS;
+      char* dst = sA + s * A_STAGE + soff_fn<BK>(r, ch * 16);
+      if (row0 + r < row_end) {
+        cp_async16(smem_u32(dst), H1 + (size_t)(row0 + r) * I + k0 + ch * 8);
+      } else {
+        *(uint4*)dst = make_uint4(0u, 0u, 0u, 0u);
+      }
+    }
+    for (int idx = tid; idx < BN * CHUNKS; idx += THREADS) {
+      int r = idx / CHUNKS, ch = idx % CHUNKS;
+      cp_async16(smem_u32(sB + s * B_STAGE + soff_fn<BK>(r, ch * 16)),
+                 W2 + (size_t)(n0 + r) * I + k0 + ch * 8);
+    }
+    cp_commit();
+  };
+
+  #pragma unroll
+  for (int s = 0; s < STAGES - 1; s++) load_stage(s, s * BK);
+
+  float acc[MT][NT][4];
+  #pragma unroll
+  for (int mi = 0; mi < MT; mi++)
+    #pragma unroll
+    for (int nt = 0; nt < NT; nt++)
+      #pragma unroll
+      for (int q = 0; q < 4; q++) acc[mi][nt][q] = 0.f;
+
+  for (int it = 0; it < KITERS; it++) {
+    cp_wait<STAGES - 2>();
+    __syncthreads();
+    int s = it % STAGES;
+    int itn = it + STAGES - 1;
+    if (itn < KITERS) load_stage(itn % STAGES, itn * BK); else cp_commit();
+
+    char* baseA = sA + s * A_STAGE;
+    char* baseB = sB + s * B_STAGE;
+
+    #pragma unroll
+    for (int kh = 0; kh < KH; kh++) {
+      unsigned af[MT][4];
+      #pragma unroll
+      for (int mi = 0; mi < MT; mi++) {
+        int row = wm * WTM + mi * 16 + (lane & 7) + 8 * ((lane >> 3) & 1);
+        unsigned addr = smem_u32(baseA + soff_fn<BK>(row, kh * 32 + (((lane >> 3) & 2) ? 16 : 0)));
+        ldm_x4(af[mi][0], af[mi][1], af[mi][2], af[mi][3], addr);
+      }
+      #pragma unroll
+      for (int g = 0; g < WTN / 32; g++) {
+        unsigned b0[4], b1[4];
+        int row = wn * WTN + g * 32 + (lane & 7) + 8 * ((lane >> 3) & 3);
+        unsigned addr = smem_u32(baseB + soff_fn<BK>(row, kh * 32));
+        ldm_x4(b0[0], b0[1], b0[2], b0[3], addr);
+        ldm_x4(b1[0], b1[1], b1[2], b1[3], smem_u32(baseB + soff_fn<BK>(row, kh * 32 + 16)));
+        #pragma unroll
+        for (int j = 0; j < 4; j++) {
+          int nt = g * 4 + j;
+          #pragma unroll
+          for (int mi = 0; mi < MT; mi++) mma16816(acc[mi][nt], af[mi], b0[j], b1[j]);
+        }
+      }
+    }
+  }
+  __syncthreads();
+
+  __nv_bfloat16* ebuf = (__nv_bfloat16*)smem;
+  constexpr int EROW = BN + 8;
+  #pragma unroll
+  for (int mi = 0; mi < MT; mi++) {
+    #pragma unroll
+    for (int nt = 0; nt < NT; nt++) {
+      int r0 = wm * WTM + mi * 16 + (lane >> 2);
+      int c0 = wn * WTN + nt * 8 + 2 * (lane & 3);
+      __nv_bfloat162 p0 = __floats2bfloat162_rn(acc[mi][nt][0], acc[mi][nt][1]);
+      __nv_bfloat162 p1 = __floats2bfloat162_rn(acc[mi][nt][2], acc[mi][nt][3]);
+      *(unsigned*)(ebuf + r0 * EROW + c0) = *(unsigned*)&p0;
+      *(unsigned*)(ebuf + (r0 + 8) * EROW + c0) = *(unsigned*)&p1;
+    }
+  }
+  __syncthreads();
+  constexpr int CH_ROW = BN * 2 / 16;
+  for (int idx = tid; idx < BM * CH_ROW; idx += THREADS) {
+    int r = idx / CH_ROW, ch = idx % CH_ROW;
+    int gr = row0 + r;
+    if (gr < row_end) {
+      __stcs((uint4*)(Y1 + (size_t)gr * H + n0 + ch * 8), *(uint4*)(ebuf + r * EROW + ch * 8));
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Finalize: out[t] = sum_j w[t,j] * Y'[slot_j]  (shared experts unweighted)
+// ---------------------------------------------------------------------------
+
+__global__ void finalize_kernel(const __nv_bfloat16* __restrict__ Y1,
+                                const __nv_bfloat16* __restrict__ ew,
+                                const int* __restrict__ inv_slot,
+                                __nv_bfloat16* __restrict__ out,
+                                int T, int top_k, int n_shared, int H) {
+  int t = blockIdx.x;
+  int KS = top_k + n_shared;
+  const int* slots = inv_slot + t * KS;
+  float w[16];
+  int sslot[16];
+  for (int j = 0; j < KS; j++) {
+    sslot[j] = slots[j];
+    w[j] = (j < top_k) ? __bfloat162float(ew[t * top_k + j]) : 1.0f;
+  }
+  int chunks = H * 2 / 16;
+  for (int c = threadIdx.x; c < chunks; c += blockDim.x) {
+    float acc[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+    for (int j = 0; j < KS; j++) {
+      uint4 v = __ldcs((const uint4*)(Y1 + (size_t)sslot[j] * H + c * 8));
+      const __nv_bfloat16* pv = (const __nv_bfloat16*)&v;
+      float wj = w[j];
+      #pragma unroll
+      for (int q = 0; q < 8; q++) acc[q] += wj * __bfloat162float(pv[q]);
+    }
+    __nv_bfloat162 p0 = __floats2bfloat162_rn(acc[0], acc[1]);
+    __nv_bfloat162 p1 = __floats2bfloat162_rn(acc[2], acc[3]);
+    __nv_bfloat162 p2 = __floats2bfloat162_rn(acc[4], acc[5]);
+    __nv_bfloat162 p3 = __floats2bfloat162_rn(acc[6], acc[7]);
+    uint4 o;
+    unsigned* po = (unsigned*)&o;
+    po[0] = *(unsigned*)&p0; po[1] = *(unsigned*)&p1;
+    po[2] = *(unsigned*)&p2; po[3] = *(unsigned*)&p3;
+    *(uint4*)(out + (size_t)t * H + c * 8) = o;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Host orchestration
+// ---------------------------------------------------------------------------
+
+// cfg1: 0 = (BM64,BN64,BK64,S4,WM2,WN2,T128), 1 = (BM128,BN128,BK64,S2,WM4,WN2,T256)
+template <int BM, int BNV, int BKV, int STAGES, int WM, int WN, int THREADS>
+void launch_gemm1(const at::cuda::CUDAStream& stream,
+                  const __nv_bfloat16* X, const __nv_bfloat16* W1R, const __nv_bfloat16* W1S,
+                  __nv_bfloat16* H1, const int* offsets, const int* bstart,
+                  const int* row_token, int E, int n_shared, int H, int I, int max_blocks) {
+  constexpr int AROW = (BKV == 64) ? BKV * 2 : BKV * 2 + 16;
+  constexpr int SMEM = STAGES * (BM + 2 * BNV) * AROW + BM * sizeof(int);
+  auto kfn = gemm1_kernel<BM, BNV, BKV, STAGES, WM, WN, THREADS>;
+  cudaFuncSetAttribute(kfn, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM);
+  kfn<<<dim3((unsigned)max_blocks * (I / BNV)), THREADS, SMEM, stream>>>(
+      X, W1R, W1S, H1, offsets, bstart, row_token, E, n_shared, H, I);
+}
+
+// cfg2: 0 = (BM64,BN128,BK64,S4,WM2,WN4,T256), 1 = (BM128,BN128,BK64,S3,WM4,WN2,T256)
+template <int BM, int BNV, int BKV, int STAGES, int WM, int WN, int THREADS>
+void launch_gemm2(const at::cuda::CUDAStream& stream,
+                  const __nv_bfloat16* H1, const __nv_bfloat16* W2R, const __nv_bfloat16* W2S,
+                  __nv_bfloat16* Y1, const int* offsets, const int* bstart,
+                  int E, int n_shared, int H, int I, int max_blocks) {
+  constexpr int AROW = (BKV == 64) ? BKV * 2 : BKV * 2 + 16;
+  constexpr int SMEM = STAGES * (BM + BNV) * AROW;
+  auto kfn = gemm2_kernel<BM, BNV, BKV, STAGES, WM, WN, THREADS>;
+  cudaFuncSetAttribute(kfn, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM);
+  kfn<<<dim3(H / BNV, max_blocks), THREADS, SMEM, stream>>>(
+      H1, W2R, W2S, Y1, offsets, bstart, E, n_shared, H, I);
+}
+
+void moe_forward(
+    torch::Tensor x, torch::Tensor expert_ids, torch::Tensor expert_weights,
+    torch::Tensor w1_routed, torch::Tensor w2_routed,
+    torch::Tensor w1_shared, torch::Tensor w2_shared,
+    torch::Tensor out,
+    torch::Tensor cnt_fill, torch::Tensor offsets, torch::Tensor bstart,
+    torch::Tensor row_token, torch::Tensor inv_slot,
+    torch::Tensor h1, torch::Tensor y1,
+    int64_t T, int64_t E, int64_t top_k, int64_t n_shared,
+    int64_t H, int64_t I, int64_t cfg1, int64_t cfg2) {
+  auto stream = at::cuda::getCurrentCUDAStream();
+  int E_TOT = (int)(E + n_shared);
+  int R = (int)(T * (top_k + n_shared));
+
+  int BM1 = 128;
+  int BM2 = (cfg2 == 0) ? 64 : 128;
+
+  cudaMemsetAsync(cnt_fill.data_ptr<int>(), 0, 2 * E_TOT * sizeof(int), stream);
+  hist_kernel<<<(R + 1 + 255) / 256, 256, 0, stream>>>(
+      expert_ids.data_ptr<int64_t>(), cnt_fill.data_ptr<int>(), (int)T, (int)top_k,
+      (int)n_shared, (int)E);
+  scan_kernel<<<1, 512, 0, stream>>>(
+      cnt_fill.data_ptr<int>(), offsets.data_ptr<int>(), bstart.data_ptr<int>(),
+      E_TOT, BM1, BM2);
+  fill_kernel<<<(R + 255) / 256, 256, 0, stream>>>(
+      expert_ids.data_ptr<int64_t>(), cnt_fill.data_ptr<int>() + E_TOT,
+      offsets.data_ptr<int>(), row_token.data_ptr<int>(), inv_slot.data_ptr<int>(),
+      (int)T, (int)top_k, (int)n_shared, (int)E);
+
+  const __nv_bfloat16* X = (const __nv_bfloat16*)x.data_ptr();
+  const __nv_bfloat16* W1R = (const __nv_bfloat16*)w1_routed.data_ptr();
+  const __nv_bfloat16* W2R = (const __nv_bfloat16*)w2_routed.data_ptr();
+  const __nv_bfloat16* W1S = (const __nv_bfloat16*)w1_shared.data_ptr();
+  const __nv_bfloat16* W2S = (const __nv_bfloat16*)w2_shared.data_ptr();
+  __nv_bfloat16* H1p = (__nv_bfloat16*)h1.data_ptr();
+  __nv_bfloat16* Y1p = (__nv_bfloat16*)y1.data_ptr();
+  const int* offs = offsets.data_ptr<int>();
+  const int* bs = bstart.data_ptr<int>();
+  const int* rt = row_token.data_ptr<int>();
+
+  int maxb1 = (R + BM1 - 1) / BM1 + E_TOT;
+  int maxb2 = (R + BM2 - 1) / BM2 + E_TOT;
+
+  // gemm1: (BM128, BN128, BK64, S2, WM4, WN2, T256) — best across all shapes.
+  (void)cfg1;
+  launch_gemm1<128, 128, 64, 2, 4, 2, 256>(stream, X, W1R, W1S, H1p, offs, bs, rt,
+                                           (int)E, (int)n_shared, (int)H, (int)I, maxb1);
+  switch (cfg2) {
+    case 0:
+      launch_gemm2<64, 128, 64, 4, 2, 4, 256>(stream, H1p, W2R, W2S, Y1p, offs, bs + (E_TOT + 1),
+                                              (int)E, (int)n_shared, (int)H, (int)I, maxb2);
+      break;
+    default:
+      launch_gemm2<128, 128, 64, 3, 4, 2, 256>(stream, H1p, W2R, W2S, Y1p, offs, bs + (E_TOT + 1),
+                                               (int)E, (int)n_shared, (int)H, (int)I, maxb2);
+      break;
+  }
+
+  finalize_kernel<<<(int)T, 256, 0, stream>>>(
+      Y1p, (const __nv_bfloat16*)expert_weights.data_ptr(), inv_slot.data_ptr<int>(),
+      (__nv_bfloat16*)out.data_ptr(), (int)T, (int)top_k, (int)n_shared, (int)H);
+}
+"""
+
+_ext = load_inline(
+    name="glm52_fused_moe_v3",
+    cpp_sources=_CPP,
+    cuda_sources=_CU,
+    functions=["moe_forward"],
+    extra_cuda_cflags=[
+        "-O3",
+        "--use_fast_math",
+        "-gencode=arch=compute_120a,code=sm_120a",
+    ],
+    verbose=False,
+)
+
+
+def _pick_cfg2(t: int) -> int:
+    # wide-tile config wins for the big prefill shapes
+    return 1 if t >= 6000 else 0
+
+
+class Model(nn.Module):
+    def __init__(self, T: int, E: int, top_k: int, n_shared: int, H: int, I: int):
+        super().__init__()
+        self.T, self.E, self.top_k = T, E, top_k
+        self.n_shared, self.H, self.I = n_shared, H, I
+        self.w1_routed = nn.Parameter(torch.empty(E, 2 * I, H, dtype=torch.bfloat16))
+        self.w2_routed = nn.Parameter(torch.empty(E, H, I, dtype=torch.bfloat16))
+        self.w1_shared = nn.Parameter(torch.empty(n_shared, 2 * I, H, dtype=torch.bfloat16))
+        self.w2_shared = nn.Parameter(torch.empty(n_shared, H, I, dtype=torch.bfloat16))
+        for p in self.parameters():
+            nn.init.normal_(p, std=0.02)
+
+        R = T * (top_k + n_shared)
+        E_TOT = E + n_shared
+        self._cfg1 = 1
+        self._cfg2 = _pick_cfg2(T)
+
+        def buf(name, shape, dtype):
+            self.register_buffer(name, torch.empty(shape, dtype=dtype), persistent=False)
+            return getattr(self, name)
+
+        self._cnt_fill = buf("_cnt_fill", (2 * E_TOT,), torch.int32)
+        self._offsets = buf("_offsets", (E_TOT + 1,), torch.int32)
+        self._bstart = buf("_bstart", (2 * (E_TOT + 1),), torch.int32)
+        self._row_token = buf("_row_token", (R,), torch.int32)
+        self._inv_slot = buf("_inv_slot", (R,), torch.int32)
+        self._h1 = buf("_h1", (R, I), torch.bfloat16)
+        self._y1 = buf("_y1", (R, H), torch.bfloat16)
+        self._out = buf("_out", (T, H), torch.bfloat16)
+
+    def forward(self, x, expert_ids, expert_weights):
+        x = x.contiguous()
+        expert_ids = expert_ids.contiguous()
+        expert_weights = expert_weights.contiguous()
+        _ext.moe_forward(
+            x, expert_ids, expert_weights,
+            self.w1_routed, self.w2_routed, self.w1_shared, self.w2_shared,
+            self._out,
+            self._cnt_fill, self._offsets, self._bstart,
+            self._row_token, self._inv_slot,
+            self._h1, self._y1,
+            self.T, self.E, self.top_k, self.n_shared, self.H, self.I,
+            self._cfg1, self._cfg2,
+        )
+        return self._out

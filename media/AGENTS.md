@@ -12,7 +12,7 @@ One file. Future agents write model posts and articles from this. Do not invent 
 - Redaction scan before any HF push, `public/runs` commit, or deploy: `uv run python scripts/redaction.py runs public/runs`, then block if this finds anything:
   `rg -n "# AGENTS\\.md instructions|<proactive-behavior>|~/.codex/AGENTS\\.md|~/.claude/CLAUDE\\.md|GOG_KEYRING_PASSWORD=|[A-Z0-9_]*(API_KEY|TOKEN|SECRET|PASSWORD)=" runs public/runs`
 - Post drafts (`X-*.md`/`.txt`) and rendered PNGs are throwaway: drafts are never committed, PNGs are gitignored and regenerate from the tracked `media/*.py`. Ask when the post went live, then delete the drafts and PNGs. Never delete the generators.
-- Transcript viewers: the canonical extractor is `scripts/transcript-extraction/` (see its `VENDORED.md`); the per-bench `src/viewer/parsers/*` under-extract. Native `claude` and `codex` encrypt chain-of-thought, so an empty reasoning trace for Opus or GPT is the API, not a viewer bug; the `*-claude` routes to open providers return full thinking.
+- Transcript viewers: the per-bench `src/viewer/parsers/*` under-extract vs a full-harness dump (reference: https://github.com/0xSero/ai-data-extraction). Native `claude` and `codex` encrypt chain-of-thought, so an empty reasoning trace for Opus or GPT is the API, not a viewer bug; the `*-claude` routes to open providers return full thinking.
 
 ## Names — never freestyle
 

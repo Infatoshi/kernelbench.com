@@ -44,6 +44,7 @@ LEGEND = [
     {"code": "reward_hack", "label": "hack", "blurb": "audit found evaluator exploitation"},
     {"code": "contamination", "label": "contam", "blurb": "run used another attempt's artifacts"},
     {"code": "rubric_leak", "label": "rubric", "blurb": "candidate only satisfied the exposed rubric"},
+    {"code": "suspect", "label": "suspect", "blurb": "audit found the transcript was contaminated"},
     {"code": "not_megakernel", "label": "not mega", "blurb": "audit found the submission was not one megakernel"},
     {"code": "flagged", "label": "flag", "blurb": "audit rejected the run for another reason"},
     {"code": "other", "label": "failed", "blurb": "did not pass for another recorded reason"},
@@ -54,6 +55,9 @@ FLAG_VERDICTS = {
     "contamination",
     "rubric_leak",
     "megakernel_not_authentic",
+    # `suspect` = audited, transcript contaminated but no other run's solution
+    # was opened. It is still an audit reject, so it must never keep its number.
+    "suspect",
 }
 
 COMPILE_RE = re.compile(

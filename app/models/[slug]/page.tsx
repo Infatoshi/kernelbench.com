@@ -59,16 +59,55 @@ function nativeScore(bench: Bench, block: GpuBlock): number | null {
   return vals.reduce((s, c) => s + c.score!, 0) / vals.length
 }
 
+/** A cell whose measurement came off a different GPU SKU than the board it is
+ *  filed under (annotation `board_eligible: false`, projected by
+ *  build_model_index as outcome "hardware"). It is not a result on this board,
+ *  so it never renders as a scored row in a ranked grid — the number would read
+ *  as an H100 PCIe (or RTX PRO 6000) score that was never measured there. */
+function isOffBoardHardware(cell: ModelCell | undefined): boolean {
+  return cell?.outcome === "hardware"
+}
+
+/** Split one board view into the cells that belong to it and the off-board
+ *  hardware-mismatch cells, which get their own unranked block. */
+function splitOffBoard(
+  problems: string[],
+  block: GpuBlock,
+): { ranked: GpuBlock; offBoard: string[] } {
+  const offBoard = problems.filter((p) => isOffBoardHardware(block.cells[p]))
+  if (offBoard.length === 0) return { ranked: block, offBoard }
+  const cells: Record<string, ModelCell> = {}
+  for (const [p, c] of Object.entries(block.cells)) {
+    if (!isOffBoardHardware(c)) cells[p] = c
+  }
+  return { ranked: { ...block, cells }, offBoard }
+}
+
+/** True when an audited attempt was measured on a different SKU than the board
+ *  namespace it maps onto. `board_eligible: false` is the explicit marker; the
+ *  SXM/PCIe split is implicit in the label (identify.py keys H100 SXM5 as
+ *  H100_SXM, while the site's "h100" tab is the PCIe board). */
+function isHardwareMismatch(outcome: AuditOutcome): boolean {
+  if (outcome.board_eligible === false) return true
+  return /\bSXM/i.test(outcome.gpu ?? "")
+}
+
 function CellCard({
   bench,
   gpu,
   probKey,
   cell,
+  /** false = this card is outside the ranked grid (wrong GPU SKU): show the
+   *  run and its links, never a number that would read as a board score. */
+  ranked = true,
+  hardwareNote,
 }: {
   bench: Bench
   gpu: string
   probKey: string
   cell: ModelCell | undefined
+  ranked?: boolean
+  hardwareNote?: string | null
 }) {
   if (!cell) {
     return (
@@ -81,9 +120,11 @@ function CellCard({
     )
   }
   const flagged = FLAG_VERDICTS.has(cell.verdict)
-  const outcome = cell.outcome_label ?? cell.failure_reason?.replace(/_/g, " ")
-  const status = cell.valid ? "pass" : outcome || "failed"
-  const pill = cell.valid
+  const outcome = ranked
+    ? cell.outcome_label ?? cell.failure_reason?.replace(/_/g, " ")
+    : "wrong GPU SKU"
+  const status = cell.valid && ranked ? "pass" : outcome || "failed"
+  const pill = cell.valid && ranked
     ? "status-pill-good"
     : flagged
       ? "status-pill-warn"
@@ -99,7 +140,7 @@ function CellCard({
         <span className={`status-pill ${pill}`}>{status}</span>
       </div>
       <div className="cell-card-metrics">
-        {bench !== "mega" && cell.score != null && (
+        {ranked && bench !== "mega" && cell.score != null && (
           <span
             className={`cell-card-score tabular${cell.valid ? "" : " cell-card-score-dim"}`}
             title="peak fraction of roofline"
@@ -107,15 +148,22 @@ function CellCard({
             {benchValue(bench, cell.score)}
           </span>
         )}
-        <span className={auditChipClass(cell.verdict)}>{cell.verdict.replace(/_/g, " ")}</span>
+        {!ranked && <span className="cell-card-score tabular cell-card-score-dim">—</span>}
+        <span className={ranked ? auditChipClass(cell.verdict) : "audit-chip audit-chip-muted"}>
+          {ranked ? cell.verdict.replace(/_/g, " ") : "hardware mismatch"}
+        </span>
       </div>
       {bench === "mega" && (
-        <div className={`mega-result${cell.valid ? "" : " mega-result-invalid"}`}>
+        <div className={`mega-result${cell.valid && ranked ? "" : " mega-result-invalid"}`}>
           <span className="mega-result-value tabular">
-            {cell.valid && cell.score != null ? `${cell.score.toFixed(2)}x` : "no result"}
+            {cell.valid && ranked && cell.score != null
+              ? `${cell.score.toFixed(2)}x`
+              : "no result"}
           </span>
           <span className="mega-result-label">
-            {cell.valid ? "full-model speedup vs torch" : outcome || "no publishable speedup"}
+            {cell.valid && ranked
+              ? "full-model speedup vs torch"
+              : outcome || "no publishable speedup"}
           </span>
         </div>
       )}
@@ -133,8 +181,14 @@ function CellCard({
           {cell.elapsed_seconds != null && <span>session {fmtDur(cell.elapsed_seconds)}</span>}
         </div>
       ) : null}
-      {!cell.valid && outcome && bench !== "mega" && (
-        <p className="cell-card-cause">{outcome}</p>
+      {!ranked ? (
+        <p className="cell-card-cause">
+          measured on {hardwareNote ?? "another GPU SKU"} — not a result on this board
+        </p>
+      ) : (
+        !cell.valid && outcome && bench !== "mega" && (
+          <p className="cell-card-cause">{outcome}</p>
+        )
       )}
       <div className="cell-card-links">
         {cell.run_id && (
@@ -162,17 +216,62 @@ function CellGrid({
   gpu,
   problems,
   block,
+  ranked = true,
+  hardwareNotes,
 }: {
   bench: Bench
   gpu: string
   problems: string[]
   block: GpuBlock
+  ranked?: boolean
+  hardwareNotes?: Record<string, string | null>
 }) {
   return (
     <div className="cell-grid">
       {problems.map((p) => (
-        <CellCard key={p} bench={bench} gpu={gpu} probKey={p} cell={block.cells[p]} />
+        <CellCard
+          key={p}
+          bench={bench}
+          gpu={gpu}
+          probKey={p}
+          cell={block.cells[p]}
+          ranked={ranked}
+          hardwareNote={hardwareNotes?.[block.cells[p]?.run_id ?? ""] ?? null}
+        />
       ))}
+    </div>
+  )
+}
+
+/** Unranked block for cells whose measurement came off another GPU SKU. Run
+ *  pages, solutions, and traces stay reachable; the number does not. */
+function OffBoardGrid({
+  bench,
+  gpu,
+  problems,
+  block,
+  hardwareNotes,
+}: {
+  bench: Bench
+  gpu: string
+  problems: string[]
+  block: GpuBlock
+  hardwareNotes: Record<string, string | null>
+}) {
+  return (
+    <div className="board-extra">
+      <p className="board-kicker">
+        other hardware
+        <span className="board-kicker-dim">· not ranked on this board</span>
+      </p>
+      <CellGrid
+        bench={bench}
+        gpu={gpu}
+        problems={problems}
+        block={block}
+        ranked={false}
+        hardwareNotes={hardwareNotes}
+      />
     </div>
   )
 }
@@ -186,7 +285,7 @@ function AuditOutcomeCard({ outcome, bench }: { outcome: AuditOutcome; bench: Be
         ? "b200"
         : CANONICAL_GPU
   const flagged = FLAG_VERDICTS.has(outcome.verdict)
-  const hardwareMismatch = outcome.board_eligible === false
+  const hardwareMismatch = isHardwareMismatch(outcome)
   const status = hardwareMismatch
     ? "wrong GPU SKU"
     : flagged
@@ -254,6 +353,12 @@ function BenchPanel({
   const attempts = (block.outcomes ?? []).filter(
     (outcome) => !block.harness || outcome.harness?.startsWith(block.harness),
   )
+  // run_id -> the SKU the annotation recorded, for the off-board note.
+  const hardwareNotes: Record<string, string | null> = {}
+  for (const outcome of block.outcomes ?? []) {
+    hardwareNotes[outcome.run_id] = outcome.gpu ?? null
+  }
+  const canonical = splitOffBoard(problems, block)
   return (
     <section className="chart-panel board-panel">
       <div className="chart-panel-head">
@@ -284,14 +389,41 @@ function BenchPanel({
         {canonicalLabel}
         <span className="board-kicker-dim">· canonical board</span>
       </p>
-      <CellGrid bench={bench} gpu={CANONICAL_GPU} problems={problems} block={block} />
+      <CellGrid
+        bench={bench}
+        gpu={CANONICAL_GPU}
+        problems={problems}
+        block={canonical.ranked}
+      />
+      {canonical.offBoard.length > 0 && (
+        <OffBoardGrid
+          bench={bench}
+          gpu={CANONICAL_GPU}
+          problems={canonical.offBoard}
+          block={block}
+          hardwareNotes={hardwareNotes}
+        />
+      )}
 
-      {gpuKeys.map((g) => (
-        <div key={g} className="board-extra">
-          <p className="board-kicker">{meta?.gpu_labels?.[g] ?? g}</p>
-          <CellGrid bench={bench} gpu={g} problems={problems} block={block.gpus[g]!} />
-        </div>
-      ))}
+      {gpuKeys.map((g) => {
+        const view = block.gpus[g]!
+        const split = splitOffBoard(problems, view)
+        return (
+          <div key={g} className="board-extra">
+            <p className="board-kicker">{meta?.gpu_labels?.[g] ?? g}</p>
+            <CellGrid bench={bench} gpu={g} problems={problems} block={split.ranked} />
+            {split.offBoard.length > 0 && (
+              <OffBoardGrid
+                bench={bench}
+                gpu={g}
+                problems={split.offBoard}
+                block={view}
+                hardwareNotes={hardwareNotes}
+              />
+            )}
+          </div>
+        )
+      })}
 
       {attempts.length > 0 && (
         <div className="mega-outcomes">

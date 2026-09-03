@@ -1,0 +1,851 @@
+"""Fast DeepSeek NSA-inspired sparse attention (CUDA, SM90).
+
+Semantics (bench-simplified NSA, matches reference.nsa_attend):
+  For each query t (causal):
+    1. Keys split into blocks of 64.
+    2. Block importance = mean of (q.k / sqrt(D)) over causal keys in block.
+    3. Select top-8 blocks by importance, union with sliding window of last
+       64 tokens (causal only).
+    4. Softmax attention over the selected key indices only.
+
+Design:
+  * mean_j (q.k_j) == q . mean_j(k_j): block scoring is O(S*n_blocks*D),
+    done against fp32 block-mean keys (+ prefix sums for the partial block).
+  * "Scatter" attention: one CTA per key block loads its K/V tile into smem
+    once, then serves every row that needs those keys (rows that selected the
+    block, plus the causal-diagonal window rows of this and the next block).
+    Each (row, block) hit produces a softmax partial which is merged into a
+    per-row running state (m, l, acc) guarded by a per-row spinlock; a
+    finalize kernel divides acc by l.  This keeps K/V traffic at one touch and
+    the state (S*(D+2) floats per head) L2-resident.
+  * Top-8 selection runs in-warp with the reference tie-break (equal
+    importance -> larger block index first).
+"""
+from __future__ import annotations
+
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+BLOCK_SIZE = 64
+TOP_N_BLOCKS = 8
+SLIDING_WINDOW = 64
+
+_CPP_DECL = r"""
+#include <torch/extension.h>
+void nsa_forward(const torch::Tensor& q, const torch::Tensor& k, const torch::Tensor& v,
+                 torch::Tensor& o, torch::Tensor& ws, int64_t S);
+"""
+
+_CUDA_SRC = r"""
+#include <torch/extension.h>
+#include <ATen/cuda/CUDAContext.h>
+#include <cuda_bf16.h>
+#include <cuda_runtime.h>
+
+#define NSA_BLOCK 64
+#define NSA_TOPN 8
+#define NSA_WINDOW 64
+#define FULL_MASK 0xffffffffu
+
+// ---------------------------------------------------------------------------
+// Prep kernel: one warp per key block.
+//   kmean[bh, bi, :] = mean of the keys of block bi (fp32)
+//   psum [bh, t,  :] = prefix sum of keys from block start through t (fp32)
+// ---------------------------------------------------------------------------
+template <int D>
+__global__ void __launch_bounds__(256) nsa_prep_kernel(
+    const __nv_bfloat16* __restrict__ K,  // (BH, S, D)
+    float* __restrict__ kmean,            // (BH, nb, D)
+    float* __restrict__ psum,             // (BH, S, D)
+    int S, int nb, int BH) {
+  constexpr int VECD = D / 32;  // elems per lane: 2 (D=64) or 4 (D=128)
+  int gwarp = blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
+  if (gwarp >= BH * nb) return;
+  int bh = gwarp / nb;
+  int bi = gwarp % nb;
+  int lane = threadIdx.x & 31;
+  int t0 = bi * NSA_BLOCK;
+  int len = min(NSA_BLOCK, S - t0);
+
+  float acc[VECD];
+#pragma unroll
+  for (int c = 0; c < VECD; ++c) acc[c] = 0.f;
+
+  const __nv_bfloat16* Kb = K + ((long)bh * S + t0) * D;
+  float* Pb = psum + ((long)bh * S + t0) * D;
+  for (int j = 0; j < len; ++j) {
+#pragma unroll
+    for (int c = 0; c < VECD; c += 2) {
+      __nv_bfloat162 x =
+          *reinterpret_cast<const __nv_bfloat162*>(Kb + j * D + lane * VECD + c);
+      float2 f = __bfloat1622float2(x);
+      acc[c] += f.x;
+      acc[c + 1] += f.y;
+    }
+#pragma unroll
+    for (int c = 0; c < VECD; c += 2) {
+      *reinterpret_cast<float2*>(Pb + j * D + lane * VECD + c) =
+          make_float2(acc[c], acc[c + 1]);
+    }
+  }
+  float inv = 1.0f / (float)len;
+  float* Km = kmean + ((long)bh * nb + bi) * D;
+#pragma unroll
+  for (int c = 0; c < VECD; c += 2) {
+    *reinterpret_cast<float2*>(Km + lane * VECD + c) =
+        make_float2(acc[c] * inv, acc[c + 1] * inv);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Top-k kernel: one CTA per 64-row query tile.
+//   - computes per-row block importances (q . kmean, prefix mean for the
+//     query's own block), selects top-8 with tie -> larger block index
+//   - writes sel[bh, t, 0..7] (short), initializes row state (m=-inf, l=0,
+//     acc=0), and counts selections per block.
+// ---------------------------------------------------------------------------
+template <int D>
+__global__ void __launch_bounds__(256) nsa_topk_kernel(
+    const __nv_bfloat16* __restrict__ Q, const float* __restrict__ kmean,
+    const float* __restrict__ psum, short* __restrict__ sel,
+    float* __restrict__ stM, float* __restrict__ stL,
+    float* __restrict__ stACC, int* __restrict__ counts, int S, int nb,
+    float scale) {
+  extern __shared__ float smem[];
+  float* kt_s = smem;                 // D x (nb+1)
+  float* p_s = kt_s + D * (nb + 1);   // 64 x D
+  float* q_s = p_s + NSA_BLOCK * D;   // 8 x D
+
+  int bh = blockIdx.y;
+  int q0 = blockIdx.x * NSA_BLOCK;
+  int tile_len = min(NSA_BLOCK, S - q0);
+  int qt = q0 / NSA_BLOCK;
+  int tid = threadIdx.x;
+  int warp = tid >> 5;
+  int lane = tid & 31;
+
+  {
+    int total = D * nb;
+    const float* src = kmean + (long)bh * nb * D;
+    for (int idx = tid; idx < total; idx += 256) {
+      int bi = idx / D;
+      int d = idx % D;
+      kt_s[d * (nb + 1) + bi] = src[idx];
+    }
+  }
+  {
+    int total = tile_len * D;
+    const float* src = psum + ((long)bh * S + q0) * D;
+    for (int idx = tid; idx < total; idx += 256) p_s[idx] = src[idx];
+  }
+  __syncthreads();
+
+  const __nv_bfloat16* Qb = Q + (long)bh * S * D;
+
+  for (int r = warp; r < tile_len; r += 8) {
+    int t = q0 + r;
+
+    float* qs = q_s + warp * D;
+    {
+      constexpr int VECD = D / 32;
+      const __nv_bfloat16* qr = Qb + (long)t * D;
+#pragma unroll
+      for (int c = 0; c < VECD; c += 2) {
+        __nv_bfloat162 x =
+            *reinterpret_cast<const __nv_bfloat162*>(qr + lane * VECD + c);
+        float2 f = __bfloat1622float2(x);
+        qs[lane * VECD + c] = f.x * scale;
+        qs[lane * VECD + c + 1] = f.y * scale;
+      }
+    }
+    __syncwarp();
+
+    // importances
+    float imp[4];
+    {
+      float v[4];
+      bool act[4];
+#pragma unroll
+      for (int ii = 0; ii < 4; ++ii) {
+        int bi = lane + 32 * ii;
+        act[ii] = (bi < nb) && (bi <= qt);
+        v[ii] = 0.f;
+        imp[ii] = -INFINITY;
+      }
+      int diag_ii = ((qt & 31) == lane) ? (qt >> 5) : -1;
+      const float* pr = p_s + r * D;
+#pragma unroll 4
+      for (int d = 0; d < D; ++d) {
+        float qd = qs[d];
+#pragma unroll
+        for (int ii = 0; ii < 4; ++ii) {
+          if (act[ii]) {
+            float kv = (ii == diag_ii) ? pr[d]
+                                       : kt_s[d * (nb + 1) + lane + 32 * ii];
+            v[ii] = fmaf(qd, kv, v[ii]);
+          }
+        }
+      }
+#pragma unroll
+      for (int ii = 0; ii < 4; ++ii) {
+        if (act[ii]) imp[ii] = (ii == diag_ii) ? v[ii] / (float)(r + 1) : v[ii];
+      }
+    }
+
+    // top-8 with tie -> larger bi (8 rounds of warp argmax)
+    int selr[NSA_TOPN];
+#pragma unroll
+    for (int s = 0; s < NSA_TOPN; ++s) selr[s] = -1;
+#pragma unroll
+    for (int s = 0; s < NSA_TOPN; ++s) {
+      float bv = -INFINITY;
+      int bbi = -1;
+#pragma unroll
+      for (int ii = 0; ii < 4; ++ii) {
+        int bi = lane + 32 * ii;
+        if (bi < nb && imp[ii] != -INFINITY && imp[ii] >= bv) {
+          bv = imp[ii];
+          bbi = bi;
+        }
+      }
+#pragma unroll
+      for (int off = 16; off > 0; off >>= 1) {
+        float ov = __shfl_xor_sync(FULL_MASK, bv, off);
+        int ob = __shfl_xor_sync(FULL_MASK, bbi, off);
+        if (ov > bv || (ov == bv && ob > bbi)) {
+          bv = ov;
+          bbi = ob;
+        }
+      }
+      if (bv == -INFINITY) break;
+      selr[s] = bbi;
+      if ((bbi & 31) == lane) imp[bbi >> 5] = -INFINITY;
+    }
+
+    if (lane == 0) {
+      short* srow = sel + ((long)bh * S + t) * NSA_TOPN;
+#pragma unroll
+      for (int s = 0; s < NSA_TOPN; ++s) srow[s] = (short)selr[s];
+#pragma unroll
+      for (int s = 0; s < NSA_TOPN; ++s) {
+        if (selr[s] >= 0) atomicAdd(&counts[bh * nb + selr[s]], 1);
+      }
+      stM[(long)bh * S + t] = -INFINITY;
+      stL[(long)bh * S + t] = 0.f;
+    }
+    // zero the acc state row
+    {
+      float* arow = stACC + ((long)bh * S + t) * D;
+#pragma unroll
+      for (int c = 0; c < D / 32; ++c) arow[lane + 32 * c] = 0.f;
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Scan kernel: exclusive prefix over per-block counts; seeds fill cursors.
+// One CTA per (bh).
+// ---------------------------------------------------------------------------
+__global__ void nsa_scan_kernel(const int* __restrict__ counts,
+                                int* __restrict__ offsets,
+                                int* __restrict__ cursor, int nb, int BH) {
+  int bh = blockIdx.x;
+  if (threadIdx.x == 0) {
+    int run = 0;
+    for (int bi = 0; bi < nb; ++bi) {
+      offsets[bh * (nb + 1) + bi] = run;
+      cursor[bh * nb + bi] = run;
+      run += counts[bh * nb + bi];
+    }
+    offsets[bh * (nb + 1) + nb] = run;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Fill kernel: append each row id into the buckets of its selected blocks.
+// ---------------------------------------------------------------------------
+__global__ void nsa_fill_kernel(const short* __restrict__ sel,
+                                int* __restrict__ cursor,
+                                int* __restrict__ bucket, int S, int nb,
+                                int BH) {
+  long idx = (long)blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= (long)BH * S) return;
+  int bh = (int)(idx / S);
+  int t = (int)(idx % S);
+  const short* srow = sel + idx * NSA_TOPN;
+#pragma unroll
+  for (int s = 0; s < NSA_TOPN; ++s) {
+    int bi = srow[s];
+    if (bi >= 0) {
+      int pos = atomicAdd(&cursor[bh * nb + bi], 1);
+      bucket[(long)bh * 8 * S + pos] = t;
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Scatter attention kernel (tensor-core version): one CTA (128 threads, 4
+// warps) per key block.  Loads the block's K/V tile into smem; serves all
+// hits in 16-row tiles:
+//   bucket tiles : rows that selected this block   keys [0, w0(t)-q0)
+//   own tiles    : rows of this block              keys [0, r+1)
+//   next tiles   : rows of the next block          keys [r'+1, 64)
+// Per tile: QK^T via m16n8k16 bf16 MMAs, masked softmax, PV via MMAs, then a
+// per-row merge into the running state under a per-row spinlock.
+// ---------------------------------------------------------------------------
+
+#define NSA_MMA_OP                                                             \
+  "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "                     \
+  "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+
+__device__ __forceinline__ void mma_m16n8k16(float& c0, float& c1, float& c2,
+                                             float& c3, unsigned a0,
+                                             unsigned a1, unsigned a2,
+                                             unsigned a3, unsigned b0,
+                                             unsigned b1) {
+  asm volatile(NSA_MMA_OP
+               : "+f"(c0), "+f"(c1), "+f"(c2), "+f"(c3)
+               : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+}
+
+__device__ __forceinline__ unsigned pack_bf16x2(float x, float y) {
+  __nv_bfloat162 h = __floats2bfloat162_rn(x, y);
+  return *reinterpret_cast<unsigned*>(&h);
+}
+
+__device__ __forceinline__ unsigned smem_u32(const void* p) {
+  return (unsigned)__cvta_generic_to_shared(p);
+}
+
+template <int D>
+__global__ void __launch_bounds__(128) nsa_scatter_mma_kernel(
+    const __nv_bfloat16* __restrict__ Q, const __nv_bfloat16* __restrict__ K,
+    const __nv_bfloat16* __restrict__ V, const int* __restrict__ bucket,
+    const int* __restrict__ counts, const int* __restrict__ offsets,
+    float* __restrict__ stM, float* __restrict__ stL,
+    float* __restrict__ stACC, int* __restrict__ locks, int S, int nb,
+    float scale) {
+  constexpr int KD = D / 16;         // 16-dim k-chunks for QK
+  constexpr int NT = NSA_BLOCK / 8;  // 8 score n-tiles (64 keys)
+  constexpr int JT = D / 8;          // output-dim n-tiles for PV
+  constexpr int STRIDE = D + 8;      // smem row stride in bf16 (bank padding)
+
+  extern __shared__ char smem_raw[];
+  __nv_bfloat16* k_s = reinterpret_cast<__nv_bfloat16*>(smem_raw);  // 64*STRIDE
+  __nv_bfloat16* v_s = k_s + NSA_BLOCK * STRIDE;                    // 64*STRIDE
+  __nv_bfloat16* q_s = v_s + NSA_BLOCK * STRIDE;  // 4 warps*16 rows*STRIDE
+  int* rid_s = reinterpret_cast<int*>(q_s + 4 * 16 * STRIDE);  // 4 warps*16
+
+  int bh = blockIdx.y;
+  int bi = blockIdx.x;
+  int q0 = bi * NSA_BLOCK;
+  int len = min(NSA_BLOCK, S - q0);
+  int tid = threadIdx.x;
+  int warp = tid >> 5;
+  int lane = tid & 31;
+  int ql = lane & 3;   // lane within quad
+  int quad = lane >> 2;  // quad id 0..7
+
+  // ---- cooperative K/V tile load (zero-fill tail rows of partial blocks:
+  //      masked columns multiply p=0 by these values, so they must be 0) ----
+  {
+    constexpr int NC = D / 8;  // 16B chunks per row
+    int total = NSA_BLOCK * NC;
+    const float4* Kg = reinterpret_cast<const float4*>(K + ((long)bh * S + q0) * D);
+    const float4* Vg = reinterpret_cast<const float4*>(V + ((long)bh * S + q0) * D);
+    float4 z = make_float4(0.f, 0.f, 0.f, 0.f);
+    for (int idx = tid; idx < total; idx += 128) {
+      int row = idx / NC;
+      int ch = idx % NC;
+      bool ok = row < len;
+      reinterpret_cast<float4*>(k_s + row * STRIDE)[ch] = ok ? Kg[idx] : z;
+      reinterpret_cast<float4*>(v_s + row * STRIDE)[ch] = ok ? Vg[idx] : z;
+    }
+  }
+  __syncthreads();
+
+  int bcnt = counts[bh * nb + bi];
+  int own_cnt = len;
+  int next_len = (bi + 1 < nb) ? min(NSA_BLOCK, S - (q0 + NSA_BLOCK)) : 0;
+  int next_cnt = min(next_len, NSA_BLOCK - 1);
+  int nb_tiles_b = (bcnt + 15) / 16;
+  int nb_tiles_o = (own_cnt + 15) / 16;
+  int nb_tiles_n = (next_cnt + 15) / 16;
+  int total_tiles = nb_tiles_b + nb_tiles_o + nb_tiles_n;
+
+  unsigned salt = ((unsigned)bi * 2654435761u + (unsigned)bh * 97u) %
+                  (unsigned)max(bcnt, 1);
+
+  for (int tile = warp; tile < total_tiles; tile += 4) {
+    // ---- tile decode ----
+    int ttype;  // 0 bucket, 1 own, 2 next
+    int tbase;  // row-start within the class
+    if (tile < nb_tiles_b) {
+      ttype = 0;
+      tbase = tile * 16;
+    } else if (tile < nb_tiles_b + nb_tiles_o) {
+      ttype = 1;
+      tbase = (tile - nb_tiles_b) * 16;
+    } else {
+      ttype = 2;
+      tbase = (tile - nb_tiles_b - nb_tiles_o) * 16;
+    }
+
+    // ---- row ids for this tile (per-warp smem) ----
+    int* wr = rid_s + warp * 16;
+    if (lane < 16) {
+      int i = tbase + lane;
+      int r = -1;
+      if (ttype == 0) {
+        if (i < bcnt) {
+          int hh = i + (int)salt;
+          if (hh >= bcnt) hh -= bcnt;
+          r = bucket[(long)bh * 8 * S + offsets[bh * (nb + 1) + bi] + hh];
+        }
+      } else {
+        int cnt = (ttype == 1) ? own_cnt : next_cnt;
+        if (i < cnt) r = q0 + ((ttype == 2) ? NSA_BLOCK : 0) + i;
+      }
+      wr[lane] = r;
+    }
+    __syncwarp();
+
+    // ---- gather q rows into q_s ----
+    {
+      constexpr int NV2 = D / 64;  // bf16x2 per lane
+      for (int i = 0; i < 16; ++i) {
+        int r = wr[i];
+        __nv_bfloat162* dst =
+            reinterpret_cast<__nv_bfloat162*>(q_s + (warp * 16 + i) * STRIDE);
+        if (r >= 0) {
+          const __nv_bfloat162* src =
+              reinterpret_cast<const __nv_bfloat162*>(Q + ((long)bh * S + r) * D);
+#pragma unroll
+          for (int c = 0; c < NV2; ++c) dst[lane * NV2 + c] = src[lane * NV2 + c];
+        } else {
+          __nv_bfloat162 z = __floats2bfloat162_rn(0.f, 0.f);
+#pragma unroll
+          for (int c = 0; c < NV2; ++c) dst[lane * NV2 + c] = z;
+        }
+      }
+    }
+    __syncwarp();
+
+    // ---- per-row key ranges (lo, hi) for this lane's two rows ----
+    int ra = quad;      // tile row a (0..7)
+    int rb = quad + 8;  // tile row b (8..15)
+    int lo_a = 0, hi_a = 0, lo_b = 0, hi_b = 0;
+    long rowid_a = wr[ra];
+    long rowid_b = wr[rb];
+    if (ttype == 0) {
+      if (rowid_a >= 0) {
+        int w0 = max(0, (int)rowid_a + 1 - NSA_WINDOW);
+        hi_a = min(NSA_BLOCK, w0 - q0);
+      }
+      if (rowid_b >= 0) {
+        int w0 = max(0, (int)rowid_b + 1 - NSA_WINDOW);
+        hi_b = min(NSA_BLOCK, w0 - q0);
+      }
+    } else if (ttype == 1) {
+      if (rowid_a >= 0) hi_a = tbase + ra + 1;
+      if (rowid_b >= 0) hi_b = tbase + rb + 1;
+    } else {
+      if (rowid_a >= 0) {
+        lo_a = tbase + ra + 1;
+        hi_a = NSA_BLOCK;
+      }
+      if (rowid_b >= 0) {
+        lo_b = tbase + rb + 1;
+        hi_b = NSA_BLOCK;
+      }
+    }
+
+    // ---- QK^T MMA: scores 16 x 64 ----
+    float sc[NT][4];
+#pragma unroll
+    for (int nt = 0; nt < NT; ++nt) {
+      sc[nt][0] = 0.f;
+      sc[nt][1] = 0.f;
+      sc[nt][2] = 0.f;
+      sc[nt][3] = 0.f;
+    }
+    {
+      const __nv_bfloat16* qs = q_s + warp * 16 * STRIDE;
+      for (int kc = 0; kc < KD; ++kc) {
+        unsigned a0, a1, a2, a3;
+        {
+          const __nv_bfloat16* p0 = qs + (lane >> 2) * STRIDE + 16 * kc + 2 * ql;
+          const __nv_bfloat16* p1 = p0 + 8 * STRIDE;
+          a0 = *reinterpret_cast<const unsigned*>(p0);
+          a1 = *reinterpret_cast<const unsigned*>(p1);
+          a2 = *reinterpret_cast<const unsigned*>(p0 + 8);
+          a3 = *reinterpret_cast<const unsigned*>(p1 + 8);
+        }
+#pragma unroll
+        for (int nt = 0; nt < NT; ++nt) {
+          const __nv_bfloat16* pk =
+              k_s + (8 * nt + (lane >> 2)) * STRIDE + 16 * kc + 2 * ql;
+          unsigned b0 = *reinterpret_cast<const unsigned*>(pk);
+          unsigned b1 = *reinterpret_cast<const unsigned*>(pk + 8);
+          mma_m16n8k16(sc[nt][0], sc[nt][1], sc[nt][2], sc[nt][3], a0, a1, a2,
+                       a3, b0, b1);
+        }
+      }
+    }
+
+    // apply softmax scale to scores
+#pragma unroll
+    for (int nt = 0; nt < NT; ++nt) {
+      sc[nt][0] *= scale;
+      sc[nt][1] *= scale;
+      sc[nt][2] *= scale;
+      sc[nt][3] *= scale;
+    }
+
+    // ---- mask + softmax over the two rows this quad owns ----
+    float m_a = -INFINITY, m_b = -INFINITY;
+#pragma unroll
+    for (int nt = 0; nt < NT; ++nt) {
+      int c0 = 8 * nt + 2 * ql;
+      sc[nt][0] = ((c0 >= lo_a) && (c0 < hi_a)) ? sc[nt][0] : -INFINITY;
+      sc[nt][1] = ((c0 + 1 >= lo_a) && (c0 + 1 < hi_a)) ? sc[nt][1] : -INFINITY;
+      sc[nt][2] = ((c0 >= lo_b) && (c0 < hi_b)) ? sc[nt][2] : -INFINITY;
+      sc[nt][3] = ((c0 + 1 >= lo_b) && (c0 + 1 < hi_b)) ? sc[nt][3] : -INFINITY;
+      m_a = fmaxf(m_a, fmaxf(sc[nt][0], sc[nt][1]));
+      m_b = fmaxf(m_b, fmaxf(sc[nt][2], sc[nt][3]));
+    }
+#pragma unroll
+    for (int off = 1; off <= 2; off <<= 1) {
+      m_a = fmaxf(m_a, __shfl_xor_sync(FULL_MASK, m_a, off));
+      m_b = fmaxf(m_b, __shfl_xor_sync(FULL_MASK, m_b, off));
+    }
+    float l_a = 0.f, l_b = 0.f;
+#pragma unroll
+    for (int nt = 0; nt < NT; ++nt) {
+      sc[nt][0] = expf(sc[nt][0] - m_a);
+      sc[nt][1] = expf(sc[nt][1] - m_a);
+      sc[nt][2] = expf(sc[nt][2] - m_b);
+      sc[nt][3] = expf(sc[nt][3] - m_b);
+      l_a += sc[nt][0] + sc[nt][1];
+      l_b += sc[nt][2] + sc[nt][3];
+    }
+#pragma unroll
+    for (int off = 1; off <= 2; off <<= 1) {
+      l_a += __shfl_xor_sync(FULL_MASK, l_a, off);
+      l_b += __shfl_xor_sync(FULL_MASK, l_b, off);
+    }
+
+    // ---- PV MMA: out 16 x D ----
+    float ov[JT][4];
+#pragma unroll
+    for (int j = 0; j < JT; ++j) {
+      ov[j][0] = 0.f;
+      ov[j][1] = 0.f;
+      ov[j][2] = 0.f;
+      ov[j][3] = 0.f;
+    }
+    {
+      for (int kc = 0; kc < NSA_BLOCK / 16; ++kc) {
+        unsigned a0 = pack_bf16x2(sc[2 * kc][0], sc[2 * kc][1]);
+        unsigned a1 = pack_bf16x2(sc[2 * kc][2], sc[2 * kc][3]);
+        unsigned a2 = pack_bf16x2(sc[2 * kc + 1][0], sc[2 * kc + 1][1]);
+        unsigned a3 = pack_bf16x2(sc[2 * kc + 1][2], sc[2 * kc + 1][3]);
+#pragma unroll
+        for (int jj = 0; jj < JT / 2; ++jj) {
+          unsigned r0, r1, r2, r3;
+          int key = 16 * kc + (lane & 7) + ((lane & 8) ? 8 : 0);
+          const __nv_bfloat16* addr =
+              v_s + key * STRIDE + 16 * jj + ((lane & 16) ? 8 : 0);
+          asm volatile(
+              "ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 "
+              "{%0,%1,%2,%3}, [%4];\n"
+              : "=r"(r0), "=r"(r1), "=r"(r2), "=r"(r3)
+              : "r"(smem_u32(addr)));
+          mma_m16n8k16(ov[2 * jj][0], ov[2 * jj][1], ov[2 * jj][2],
+                       ov[2 * jj][3], a0, a1, a2, a3, r0, r1);
+          mma_m16n8k16(ov[2 * jj + 1][0], ov[2 * jj + 1][1],
+                       ov[2 * jj + 1][2], ov[2 * jj + 1][3], a0, a1, a2, a3,
+                       r2, r3);
+        }
+      }
+    }
+
+    // ---- merge rows ra, rb into global state ----
+    // Quads merge independently (quad-scoped barriers only): a warp-wide
+    // barrier here would couple quads' lock acquisitions and can deadlock
+    // (warp A holding locks while spinning on one held by warp B, whose
+    // barrier waits on a quad spinning on a lock held by warp A).
+    unsigned qmask = 0xFu << (quad * 4);
+#pragma unroll
+    for (int half = 0; half < 2; ++half) {
+      long rowid = (half == 0) ? rowid_a : rowid_b;
+      float m_h = (half == 0) ? m_a : m_b;
+      float l_h = (half == 0) ? l_a : l_b;
+      bool active = (rowid >= 0) && (m_h != -INFINITY);
+      long rid = (long)bh * S + ((rowid >= 0) ? rowid : 0);
+      if (active) {
+        // Single-lane RMW: ql==0 owns all state loads/stores; the other quad
+        // lanes hand over their fragment values via shuffles.  (Multi-lane
+        // RMW under one lane's lock races: only the acquiring lane has
+        // acquire-ordering on the state.)
+        if (ql == 0) {
+          while (atomicCAS(&locks[rid], 0, 1) != 0) {
+          }
+          __threadfence();
+        }
+        __syncwarp(qmask);
+        float corr_s = 0.f, corr_h = 0.f;
+        if (ql == 0) {
+          float Ms = *((volatile float*)&stM[rid]);
+          float Ls = *((volatile float*)&stL[rid]);
+          float M_new = fmaxf(Ms, m_h);
+          corr_s = expf(Ms - M_new);
+          corr_h = expf(m_h - M_new);
+          *((volatile float*)&stM[rid]) = M_new;
+          *((volatile float*)&stL[rid]) = fmaf(Ls, corr_s, l_h * corr_h);
+        }
+        corr_s = __shfl_sync(qmask, corr_s, quad * 4);
+        corr_h = __shfl_sync(qmask, corr_h, quad * 4);
+#pragma unroll
+        for (int j = 0; j < JT; ++j) {
+          float my0 = (half == 0) ? ov[j][0] : ov[j][2];
+          float my1 = (half == 0) ? ov[j][1] : ov[j][3];
+          float c0 = __shfl_sync(qmask, my0, quad * 4 + 0);
+          float c1 = __shfl_sync(qmask, my0, quad * 4 + 1);
+          float c2 = __shfl_sync(qmask, my0, quad * 4 + 2);
+          float c3 = __shfl_sync(qmask, my0, quad * 4 + 3);
+          float d0 = __shfl_sync(qmask, my1, quad * 4 + 0);
+          float d1 = __shfl_sync(qmask, my1, quad * 4 + 1);
+          float d2 = __shfl_sync(qmask, my1, quad * 4 + 2);
+          float d3 = __shfl_sync(qmask, my1, quad * 4 + 3);
+          if (ql == 0) {
+            volatile float* arow = stACC + rid * D + 8 * j;
+            float av0 = arow[0];
+            float av1 = arow[1];
+            float av2 = arow[2];
+            float av3 = arow[3];
+            float av4 = arow[4];
+            float av5 = arow[5];
+            float av6 = arow[6];
+            float av7 = arow[7];
+            arow[0] = fmaf(av0, corr_s, c0 * corr_h);
+            arow[1] = fmaf(av1, corr_s, d0 * corr_h);
+            arow[2] = fmaf(av2, corr_s, c1 * corr_h);
+            arow[3] = fmaf(av3, corr_s, d1 * corr_h);
+            arow[4] = fmaf(av4, corr_s, c2 * corr_h);
+            arow[5] = fmaf(av5, corr_s, d2 * corr_h);
+            arow[6] = fmaf(av6, corr_s, c3 * corr_h);
+            arow[7] = fmaf(av7, corr_s, d3 * corr_h);
+          }
+        }
+        if (ql == 0) {
+          __threadfence();
+          atomicExch(&locks[rid], 0);
+        }
+        __syncwarp(qmask);
+      }
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Finalize: o = acc / l, bf16.
+// ---------------------------------------------------------------------------
+template <int D>
+__global__ void nsa_finalize_kernel(const float* __restrict__ stACC,
+                                    const float* __restrict__ stL,
+                                    __nv_bfloat16* __restrict__ O, int S,
+                                    int BH) {
+  long row = ((long)blockIdx.x * blockDim.x + threadIdx.x) >> 5;
+  int lane = threadIdx.x & 31;
+  if (row >= (long)BH * S) return;
+  float inv_l = 1.0f / stL[row];
+  const float* arow = stACC + row * D;
+  __nv_bfloat16* orow = O + row * D;
+#pragma unroll
+  for (int c = 0; c < D / 32; ++c) {
+    int d = lane + 32 * c;
+    orow[d] = __float2bfloat16_rn(arow[d] * inv_l);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Workspace layout (int32 elements, allocated by python as one fp32 tensor):
+//   kmean : BH*nb*D floats
+//   psum  : BH*S*D floats
+//   stACC : BH*S*D floats
+//   stM   : BH*S floats
+//   stL   : BH*S floats
+//   counts: BH*nb ints
+//   offsets: BH*(nb+1) ints
+//   cursor: BH*nb ints
+//   locks : BH*S ints
+//   bucket: BH*8*S ints
+//   sel   : BH*S*8 shorts
+// ---------------------------------------------------------------------------
+template <int D>
+static void launch_nsa(const torch::Tensor& q, const torch::Tensor& k,
+                       const torch::Tensor& v, torch::Tensor& o,
+                       torch::Tensor& ws, int64_t S64, cudaStream_t stream) {
+  int B = q.size(0), H = q.size(1), S = (int)S64;
+  int nb = (S + NSA_BLOCK - 1) / NSA_BLOCK;
+  int BH = B * H;
+  float scale = rsqrtf((float)D);
+
+  float* base = ws.data_ptr<float>();
+  long off = 0;
+  float* kmean = base + off; off += (long)BH * nb * D;
+  float* psum = base + off; off += (long)BH * S * D;
+  float* stACC = base + off; off += (long)BH * S * D;
+  float* stM = base + off; off += (long)BH * S;
+  float* stL = base + off; off += (long)BH * S;
+  int* counts = reinterpret_cast<int*>(base + off); off += (long)BH * nb;
+  int* offsets = reinterpret_cast<int*>(base + off); off += (long)BH * (nb + 1);
+  int* cursor = reinterpret_cast<int*>(base + off); off += (long)BH * nb;
+  int* locks = reinterpret_cast<int*>(base + off); off += (long)BH * S;
+  int* bucket = reinterpret_cast<int*>(base + off); off += (long)BH * 8 * S;
+  short* sel = reinterpret_cast<short*>(base + off);
+
+  cudaMemsetAsync(counts, 0, (long)BH * nb * sizeof(int), stream);
+  cudaMemsetAsync(locks, 0, (long)BH * S * sizeof(int), stream);
+
+  // 1. prep
+  {
+    int warps_total = BH * nb;
+    int blocks = (warps_total + 7) / 8;
+    nsa_prep_kernel<D><<<blocks, 256, 0, stream>>>(
+        reinterpret_cast<const __nv_bfloat16*>(k.data_ptr()), kmean, psum, S,
+        nb, BH);
+  }
+  // 2. topk + state init + counts
+  {
+    dim3 grid((S + NSA_BLOCK - 1) / NSA_BLOCK, BH);
+    int smem = (D * (nb + 1) + NSA_BLOCK * D + 8 * D) * (int)sizeof(float);
+    static bool a1 = false;
+    if (!a1) {
+      cudaFuncSetAttribute(nsa_topk_kernel<D>,
+                           cudaFuncAttributeMaxDynamicSharedMemorySize, 231424);
+      a1 = true;
+    }
+    nsa_topk_kernel<D><<<grid, 256, smem, stream>>>(
+        reinterpret_cast<const __nv_bfloat16*>(q.data_ptr()), kmean, psum, sel,
+        stM, stL, stACC, counts, S, nb, scale);
+  }
+  // 3. scan
+  nsa_scan_kernel<<<BH, 32, 0, stream>>>(counts, offsets, cursor, nb, BH);
+  // 4. fill
+  {
+    long total = (long)BH * S;
+    int threads = 256;
+    long blocks = (total + threads - 1) / threads;
+    nsa_fill_kernel<<<(int)blocks, threads, 0, stream>>>(sel, cursor, bucket, S,
+                                                         nb, BH);
+  }
+  // 5. scatter attention (tensor cores)
+  {
+    dim3 grid(nb, BH);
+    int stride = D + 8;
+    int smem = 3 * NSA_BLOCK * stride * (int)sizeof(__nv_bfloat16) + 4 * 16 * (int)sizeof(int);
+    static bool a2 = false;
+    if (!a2) {
+      cudaFuncSetAttribute(nsa_scatter_mma_kernel<D>,
+                           cudaFuncAttributeMaxDynamicSharedMemorySize, 231424);
+      a2 = true;
+    }
+    nsa_scatter_mma_kernel<D><<<grid, 128, smem, stream>>>(
+        reinterpret_cast<const __nv_bfloat16*>(q.data_ptr()),
+        reinterpret_cast<const __nv_bfloat16*>(k.data_ptr()),
+        reinterpret_cast<const __nv_bfloat16*>(v.data_ptr()), bucket, counts,
+        offsets, stM, stL, stACC, locks, S, nb, scale);
+  }
+  // 6. finalize
+  {
+    long rows = (long)BH * S;
+    long threads_total = rows * 32;
+    int threads = 256;
+    long blocks = (threads_total + threads - 1) / threads;
+    nsa_finalize_kernel<D><<<(int)blocks, threads, 0, stream>>>(
+        stACC, stL, reinterpret_cast<__nv_bfloat16*>(o.data_ptr()), S, BH);
+  }
+}
+
+void nsa_forward(const torch::Tensor& q, const torch::Tensor& k,
+                 const torch::Tensor& v, torch::Tensor& o, torch::Tensor& ws,
+                 int64_t S) {
+  auto stream = at::cuda::getCurrentCUDAStream();
+  int D = q.size(3);
+  if (D == 64) {
+    launch_nsa<64>(q, k, v, o, ws, S, stream);
+  } else if (D == 128) {
+    launch_nsa<128>(q, k, v, o, ws, S, stream);
+  } else {
+    TORCH_CHECK(false, "unsupported head dim: ", D);
+  }
+}
+"""
+
+_ext = load_inline(
+    name="nsa_sparse_attn_v3",
+    cpp_sources=_CPP_DECL,
+    cuda_sources=_CUDA_SRC,
+    functions=["nsa_forward"],
+    extra_cuda_cflags=[
+        "-O3",
+        "--use_fast_math",
+        "-std=c++17",
+        "-gencode",
+        "arch=compute_90,code=sm_90",
+    ],
+    verbose=False,
+)
+
+
+def _workspace_elems(B: int, H: int, S: int, D: int) -> int:
+    nb = (S + BLOCK_SIZE - 1) // BLOCK_SIZE
+    BH = B * H
+    elems = 0
+    elems += BH * nb * D          # kmean
+    elems += BH * S * D           # psum
+    elems += BH * S * D           # stACC
+    elems += BH * S               # stM
+    elems += BH * S               # stL
+    elems += BH * nb              # counts
+    elems += BH * (nb + 1)        # offsets
+    elems += BH * nb              # cursor
+    elems += BH * S               # locks
+    elems += BH * 8 * S           # bucket
+    elems += (BH * S * 8 * 2 + 3) // 4  # sel (int16), rounded up to floats
+    return elems
+
+
+class Model(nn.Module):
+    def __init__(self, B: int, H: int, S: int, D: int):
+        super().__init__()
+        self.B, self.H, self.S, self.D = B, H, S, D
+        self.register_buffer("_dummy", torch.zeros(1, dtype=torch.bfloat16))
+        self._ws: torch.Tensor | None = None
+
+    def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+        B, H, S, D = q.shape
+        q = q.contiguous()
+        k = k.contiguous()
+        v = v.contiguous()
+        o = torch.empty_like(q)
+        if self._ws is None:
+            self._ws = torch.empty(_workspace_elems(B, H, S, D),
+                                   dtype=torch.float32, device=q.device)
+        _ext.nsa_forward(q, k, v, o, self._ws, S)
+        return o
+
+
+def get_init_inputs():
+    return [1, 16, 1024, 64]
+
+
+def get_inputs():
+    B, H, S, D = get_init_inputs()
+    q = torch.randn(B, H, S, D, dtype=torch.bfloat16)
+    k = torch.randn(B, H, S, D, dtype=torch.bfloat16)
+    v = torch.randn(B, H, S, D, dtype=torch.bfloat16)
+    return [q, k, v]

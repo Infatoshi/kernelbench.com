@@ -65,6 +65,7 @@ function LabMark({ row }: { row: ReportRow }) {
  */
 function failTone(chip: ProblemChip): "blank" | "miss" | "warn" | "hack" {
   if (chip.kind === "no_kernel" || chip.label === "empty") return "blank"
+  if (chip.label === "unaudited") return "blank"
   if (chip.kind === "hack" || chip.label === "flag") return "hack"
   // wrong answers are the hard fail; everything else that actually ran is warn
   if (chip.label === "wrong") return "miss"
