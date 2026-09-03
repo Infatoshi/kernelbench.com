@@ -1,0 +1,475 @@
+"""GLM-5.2 fused MoE: countsort + ragged grouped GEMM + fused CUDA epilogues.
+
+Strategy (routing is given)
+---------------------------
+1. One custom CUDA kernel stable-partitions the T*top_k (token, slot) pairs
+   by expert (counting sort) and builds the inverse pair->row map.
+2. Tokens are gathered once into expert-contiguous order; a single
+   cuBLAS ragged grouped GEMM covers all experts for gate|up, then a fused
+   SiLU-mul kernel, then a second grouped GEMM for the down projection.
+   Empty experts are skipped, so decode microbatches only touch the
+   experts they use and no padding or weight copies are ever needed.
+3. One fused CUDA kernel accumulates every token's top_k rows into the
+   fp32 output (race-free: each thread owns one output tile).
+The shared expert is dense and uses the same fused kernels.
+"""
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.cpp_extension import load_inline
+
+_CUDA_SRC = r"""
+#include <cuda_bf16.h>
+#include <cuda_runtime.h>
+
+__device__ __forceinline__ float b2f_bits(uint16_t h) {
+  uint32_t u = (uint32_t)h << 16;
+  return *reinterpret_cast<float*>(&u);
+}
+__device__ __forceinline__ uint16_t f2b_bits(float v) {
+  uint32_t u = *reinterpret_cast<uint32_t*>(&v);
+  u += 0x7FFFu + ((u >> 16) & 1u);  // round-to-nearest-even
+  return (uint16_t)(u >> 16);
+}
+
+// h[r, i] = silu(gu[r, i]) * gu[r, I + i], fp32 math, bf16 I/O.
+// gu: (rows, 2*I) contiguous bf16, h: (rows, I) contiguous bf16. I % 8 == 0.
+__global__ void silu_mul_kernel(const __nv_bfloat16* __restrict__ gu,
+                                __nv_bfloat16* __restrict__ h,
+                                int64_t rows, int64_t I) {
+  int64_t cols8 = I >> 3;
+  int64_t total = rows * cols8;
+  int64_t tid = (int64_t)blockIdx.x * (int64_t)blockDim.x + (int64_t)threadIdx.x;
+  int64_t stride = (int64_t)gridDim.x * (int64_t)blockDim.x;
+  int64_t twoI = I << 1;
+  for (int64_t c = tid; c < total; c += stride) {
+    int64_t r = c / cols8;
+    int64_t k = (c - r * cols8) << 3;
+    const uint16_t* g = reinterpret_cast<const uint16_t*>(gu + r * twoI + k);
+    const uint16_t* u = g + I;
+    uint16_t* o = reinterpret_cast<uint16_t*>(h + r * I + k);
+    uint4 g4 = reinterpret_cast<const uint4*>(g)[0];
+    uint4 u4 = reinterpret_cast<const uint4*>(u)[0];
+    const uint16_t* gb = reinterpret_cast<const uint16_t*>(&g4);
+    const uint16_t* ub = reinterpret_cast<const uint16_t*>(&u4);
+    uint16_t ob[8];
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+      float gf = b2f_bits(gb[j]);
+      float sig = 1.0f / (1.0f + expf(-gf));
+      ob[j] = f2b_bits(gf * sig * b2f_bits(ub[j]));
+    }
+    reinterpret_cast<uint4*>(o)[0] = *reinterpret_cast<uint4*>(ob);
+  }
+}
+
+// Stable counting-sort of pairs by expert + inverse map, one kernel.
+// ids: (N,) int64 flat expert ids (N = T*K pairs).
+// base: (E,) int64 exclusive offsets per expert; ctr: (E,) int32 zeroed.
+// tok: (N,) int64, tok[row] = pair_row / K.
+// inv: (N,) int32, inv[pair] = row.
+__global__ void countsort_kernel(const int64_t* __restrict__ ids,
+                                 const int64_t* __restrict__ base,
+                                 int* __restrict__ ctr, int64_t* __restrict__ tok,
+                                 int* __restrict__ inv, int64_t N, int K) {
+  int64_t tid = (int64_t)blockIdx.x * (int64_t)blockDim.x + (int64_t)threadIdx.x;
+  int64_t stride = (int64_t)gridDim.x * (int64_t)blockDim.x;
+  for (int64_t i = tid; i < N; i += stride) {
+    int e = (int)ids[i];
+    int row = (int)base[e] + atomicAdd(&ctr[e], 1);
+    tok[row] = i / K;
+    inv[i] = row;
+  }
+}
+
+// Fused routed accumulate: one launch, no races.
+// y: (N,H) bf16 rows in expert-sorted order; inv: (N,) int32 pair->row;
+// fw: (N,) bf16 flat routed weights (pair order); out: (T,H) fp32.
+// Thread (t, h-chunk) owns out[t, h-chunk] and reduces its K rows.
+__global__ void fused_accum_kernel(float* __restrict__ out,
+                                   const __nv_bfloat16* __restrict__ y,
+                                   const int* __restrict__ inv,
+                                   const __nv_bfloat16* __restrict__ fw,
+                                   int64_t T, int64_t H, int K) {
+  int64_t cols8 = H >> 3;
+  int64_t total = T * cols8;
+  int64_t tid = (int64_t)blockIdx.x * (int64_t)blockDim.x + (int64_t)threadIdx.x;
+  int64_t stride = (int64_t)gridDim.x * (int64_t)blockDim.x;
+  const uint16_t* Y = reinterpret_cast<const uint16_t*>(y);
+  const uint16_t* FW = reinterpret_cast<const uint16_t*>(fw);
+  for (int64_t c = tid; c < total; c += stride) {
+    int64_t t = c / cols8;
+    int64_t k8 = (c - t * cols8) << 3;
+    float acc[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+    int64_t base = t * (int64_t)K;
+#pragma unroll 1
+    for (int s = 0; s < K; ++s) {
+      int r = inv[base + s];
+      float wgt = b2f_bits(FW[base + s]);
+      const uint16_t* yy = Y + (int64_t)r * H + k8;
+#pragma unroll
+      for (int j = 0; j < 8; ++j) acc[j] += wgt * b2f_bits(yy[j]);
+    }
+    float* o = out + t * H + k8;
+    float4 o0 = reinterpret_cast<float4*>(o)[0];
+    float4 o1 = reinterpret_cast<float4*>(o)[1];
+    float* of = reinterpret_cast<float*>(&o0);
+    float* of1 = reinterpret_cast<float*>(&o1);
+#pragma unroll
+    for (int j = 0; j < 4; ++j) of[j] += acc[j];
+#pragma unroll
+    for (int j = 0; j < 4; ++j) of1[j] += acc[4 + j];
+    reinterpret_cast<float4*>(o)[0] = o0;
+    reinterpret_cast<float4*>(o)[1] = o1;
+  }
+}
+
+// out[tok] += w * y  (fp32 accumulate).
+// out: (T, H) fp32, y: (M, H) bf16, idx: (M,) int64, w: (M,) bf16.
+// Rows of one launch touch distinct out rows (unique tokens per expert).
+__global__ void row_accum_kernel(float* __restrict__ out,
+                                 const __nv_bfloat16* __restrict__ y,
+                                 const int64_t* __restrict__ idx,
+                                 const __nv_bfloat16* __restrict__ w,
+                                 int64_t rows, int64_t H) {
+  int64_t cols8 = H >> 3;
+  int64_t total = rows * cols8;
+  int64_t tid = (int64_t)blockIdx.x * (int64_t)blockDim.x + (int64_t)threadIdx.x;
+  int64_t stride = (int64_t)gridDim.x * (int64_t)blockDim.x;
+  for (int64_t c = tid; c < total; c += stride) {
+    int64_t r = c / cols8;
+    int64_t k = (c - r * cols8) << 3;
+    float wgt = b2f_bits(reinterpret_cast<const uint16_t*>(w)[r]);
+    float* o = out + idx[r] * H + k;
+    const uint16_t* yy = reinterpret_cast<const uint16_t*>(y + r * H + k);
+    uint4 y4 = reinterpret_cast<const uint4*>(yy)[0];
+    const uint16_t* yb = reinterpret_cast<const uint16_t*>(&y4);
+    float4 o0 = reinterpret_cast<float4*>(o)[0];
+    float4 o1 = reinterpret_cast<float4*>(o)[1];
+    float* of = reinterpret_cast<float*>(&o0);
+    float* of1 = reinterpret_cast<float*>(&o1);
+#pragma unroll
+    for (int j = 0; j < 4; ++j) of[j] += wgt * b2f_bits(yb[j]);
+#pragma unroll
+    for (int j = 0; j < 4; ++j) of1[j] += wgt * b2f_bits(yb[4 + j]);
+    reinterpret_cast<float4*>(o)[0] = o0;
+    reinterpret_cast<float4*>(o)[1] = o1;
+  }
+}
+"""
+
+_CPP_SRC = r"""
+#include <torch/extension.h>
+
+void silu_mul_forward(torch::Tensor gu, torch::Tensor h);
+void row_accum_forward(torch::Tensor out, torch::Tensor y, torch::Tensor idx,
+                       torch::Tensor w);
+void grouped_linear(torch::Tensor xs, torch::Tensor W, torch::Tensor out,
+                    std::vector<int64_t> starts, std::vector<int64_t> lens,
+                    int64_t R, int64_t H);
+void countsort_forward(torch::Tensor ids, torch::Tensor base, torch::Tensor ctr,
+                       torch::Tensor tok, torch::Tensor inv, int64_t K);
+void fused_accum_forward(torch::Tensor out, torch::Tensor y, torch::Tensor inv,
+                         torch::Tensor fw, int64_t K);
+"""
+
+_CPP_IMPL = r"""
+#include <torch/extension.h>
+#include <c10/cuda/CUDAStream.h>
+
+void silu_mul_kernel_launcher(const void* gu, void* h, int64_t rows, int64_t I);
+void row_accum_kernel_launcher(void* out, const void* y, const void* idx,
+                               const void* w, int64_t rows, int64_t H);
+void countsort_launcher(const void* ids, const void* base, void* ctr, void* tok,
+                        void* inv, int64_t N, int K, int E);
+void fused_accum_launcher(void* out, const void* y, const void* inv,
+                          const void* fw, int64_t T, int64_t H, int K);
+
+void silu_mul_forward(torch::Tensor gu, torch::Tensor h) {
+  int64_t rows = gu.size(0);
+  int64_t I = h.size(1);
+  if (rows == 0) return;
+  silu_mul_kernel_launcher(gu.data_ptr(), h.data_ptr(), rows, I);
+}
+
+void row_accum_forward(torch::Tensor out, torch::Tensor y, torch::Tensor idx,
+                       torch::Tensor w) {
+  int64_t rows = y.size(0);
+  int64_t H = y.size(1);
+  if (rows == 0) return;
+  row_accum_kernel_launcher(out.data_ptr(), y.data_ptr(), idx.data_ptr(),
+                            w.data_ptr(), rows, H);
+}
+
+void grouped_gemm_launcher(torch::Tensor xs, torch::Tensor W, torch::Tensor out,
+                           std::vector<int64_t> starts, std::vector<int64_t> lens,
+                           int64_t R, int64_t H);
+
+void grouped_linear(torch::Tensor xs, torch::Tensor W, torch::Tensor out,
+                    std::vector<int64_t> starts, std::vector<int64_t> lens,
+                    int64_t R, int64_t H) {
+  if (xs.size(0) == 0) return;
+  grouped_gemm_launcher(xs, W, out, starts, lens, R, H);
+}
+
+void countsort_forward(torch::Tensor ids, torch::Tensor base, torch::Tensor ctr,
+                       torch::Tensor tok, torch::Tensor inv, int64_t K) {
+  int64_t N = ids.size(0);
+  int E = (int)base.size(0);
+  if (N == 0) return;
+  countsort_launcher(ids.data_ptr(), base.data_ptr(), ctr.data_ptr(),
+                     tok.data_ptr(), inv.data_ptr(), N, (int)K, E);
+}
+
+void fused_accum_forward(torch::Tensor out, torch::Tensor y, torch::Tensor inv,
+                         torch::Tensor fw, int64_t K) {
+  int64_t T = out.size(0);
+  int64_t H = out.size(1);
+  if (T == 0) return;
+  fused_accum_launcher(out.data_ptr(), y.data_ptr(), inv.data_ptr(),
+                       fw.data_ptr(), T, H, (int)K);
+}
+"""
+
+_LAUNCH_SRC = r"""
+#include <c10/cuda/CUDAStream.h>
+#include <cuda_bf16.h>
+
+__global__ void silu_mul_kernel(const __nv_bfloat16* __restrict__ gu,
+                                __nv_bfloat16* __restrict__ h,
+                                int64_t rows, int64_t I);
+__global__ void row_accum_kernel(float* __restrict__ out,
+                                 const __nv_bfloat16* __restrict__ y,
+                                 const int64_t* __restrict__ idx,
+                                 const __nv_bfloat16* __restrict__ w,
+                                 int64_t rows, int64_t H);
+__global__ void countsort_kernel(const int64_t* __restrict__ ids,
+                                 const int64_t* __restrict__ base,
+                                 int* __restrict__ ctr, int64_t* __restrict__ tok,
+                                 int* __restrict__ inv, int64_t N, int K);
+__global__ void fused_accum_kernel(float* __restrict__ out,
+                                   const __nv_bfloat16* __restrict__ y,
+                                   const int* __restrict__ inv,
+                                   const __nv_bfloat16* __restrict__ fw,
+                                   int64_t T, int64_t H, int K);
+
+static int64_t grid_for(int64_t total) {
+  int64_t b = (total + 255) / 256;
+  if (b < 1) b = 1;
+  if (b > 65536) b = 65536;
+  return b;
+}
+
+void silu_mul_kernel_launcher(const void* gu, void* h, int64_t rows, int64_t I) {
+  auto stream = c10::cuda::getCurrentCUDAStream().stream();
+  int64_t total = rows * (I >> 3);
+  silu_mul_kernel<<<grid_for(total), 256, 0, stream>>>(
+      reinterpret_cast<const __nv_bfloat16*>(gu),
+      reinterpret_cast<__nv_bfloat16*>(h), rows, I);
+}
+
+void row_accum_kernel_launcher(void* out, const void* y, const void* idx,
+                               const void* w, int64_t rows, int64_t H) {
+  auto stream = c10::cuda::getCurrentCUDAStream().stream();
+  int64_t total = rows * (H >> 3);
+  row_accum_kernel<<<grid_for(total), 256, 0, stream>>>(
+      reinterpret_cast<float*>(out),
+      reinterpret_cast<const __nv_bfloat16*>(y),
+      reinterpret_cast<const int64_t*>(idx),
+      reinterpret_cast<const __nv_bfloat16*>(w), rows, H);
+}
+
+void countsort_launcher(const void* ids, const void* base, void* ctr, void* tok,
+                        void* inv, int64_t N, int K, int E) {
+  auto stream = c10::cuda::getCurrentCUDAStream().stream();
+  cudaMemsetAsync(ctr, 0, (size_t)E * 4, stream);
+  countsort_kernel<<<grid_for(N), 256, 0, stream>>>(
+      reinterpret_cast<const int64_t*>(ids),
+      reinterpret_cast<const int64_t*>(base), reinterpret_cast<int*>(ctr),
+      reinterpret_cast<int64_t*>(tok), reinterpret_cast<int*>(inv), N, K);
+}
+
+void fused_accum_launcher(void* out, const void* y, const void* inv,
+                          const void* fw, int64_t T, int64_t H, int K) {
+  auto stream = c10::cuda::getCurrentCUDAStream().stream();
+  int64_t total = T * (H >> 3);
+  fused_accum_kernel<<<grid_for(total), 256, 0, stream>>>(
+      reinterpret_cast<float*>(out),
+      reinterpret_cast<const __nv_bfloat16*>(y),
+      reinterpret_cast<const int*>(inv),
+      reinterpret_cast<const __nv_bfloat16*>(fw), T, H, K);
+}
+"""
+
+# Ragged grouped GEMM for the routed experts: one cuBLAS call covers all
+# experts. Row-major O(MxR) = X(MxH) @ W^T  ==  col-major Oc = W @ Xc with
+# transa=T (A is the W buffer, col view (H,R), lda=H), transb=N.
+# Experts are grouped by row count M (= n per group). Pointer arrays must
+# live on-device: the grouped kernel dereferences them from the GPU.
+_GROUPED_SRC = r"""
+#include <c10/cuda/CUDAStream.h>
+#include <cublas_v2.h>
+#include <map>
+#include <vector>
+
+static cublasHandle_t g_grouped_handle = nullptr;
+
+void grouped_gemm_launcher(torch::Tensor xs, torch::Tensor W, torch::Tensor out,
+                           std::vector<int64_t> starts, std::vector<int64_t> lens,
+                           int64_t R, int64_t H) {
+  if (g_grouped_handle == nullptr) cublasCreate(&g_grouped_handle);
+  auto stream = c10::cuda::getCurrentCUDAStream().stream();
+  cublasSetStream(g_grouped_handle, stream);
+  const int E = (int)starts.size();
+  std::map<int64_t, std::vector<int>> groups;
+  for (int e = 0; e < E; ++e)
+    if (lens[e] > 0) groups[lens[e]].push_back(e);
+  const int G = (int)groups.size();
+  if (G == 0) return;
+  char* xs_p = (char*)xs.data_ptr();
+  char* w_p = (char*)W.data_ptr();
+  char* o_p = (char*)out.data_ptr();
+  std::vector<cublasOperation_t> transa(G, CUBLAS_OP_T), transb(G, CUBLAS_OP_N);
+  std::vector<int> m(G), n(G), k(G), lda(G), ldb(G), ldc(G), gsize(G);
+  std::vector<float> ones(G, 1.0f), zeros(G, 0.0f);
+  std::vector<const void*> Avec;
+  std::vector<const void*> Bvec;
+  std::vector<void*> Cvec;
+  Avec.reserve(E); Bvec.reserve(E); Cvec.reserve(E);
+  int gi = 0;
+  for (auto& kv : groups) {
+    int64_t M = kv.first;
+    auto& lst = kv.second;
+    m[gi] = (int)R; n[gi] = (int)M; k[gi] = (int)H;
+    lda[gi] = (int)H; ldb[gi] = (int)H; ldc[gi] = (int)R;
+    gsize[gi] = (int)lst.size();
+    for (int e : lst) {
+      Avec.push_back(w_p + ((int64_t)e * R * H) * 2);
+      Bvec.push_back(xs_p + (starts[e] * H) * 2);
+      Cvec.push_back(o_p + (starts[e] * R) * 2);
+    }
+    ++gi;
+  }
+  auto opt = torch::TensorOptions().dtype(torch::kInt64).device(torch::kCUDA);
+  torch::Tensor d_A = torch::empty({(int64_t)Avec.size()}, opt);
+  torch::Tensor d_B = torch::empty({(int64_t)Bvec.size()}, opt);
+  torch::Tensor d_C = torch::empty({(int64_t)Cvec.size()}, opt);
+  cudaMemcpyAsync(d_A.data_ptr(), Avec.data(), Avec.size() * 8,
+                  cudaMemcpyHostToDevice, stream);
+  cudaMemcpyAsync(d_B.data_ptr(), Bvec.data(), Bvec.size() * 8,
+                  cudaMemcpyHostToDevice, stream);
+  cudaMemcpyAsync(d_C.data_ptr(), Cvec.data(), Cvec.size() * 8,
+                  cudaMemcpyHostToDevice, stream);
+  cublasStatus_t st = cublasGemmGroupedBatchedEx(
+      g_grouped_handle, transa.data(), transb.data(), m.data(), n.data(),
+      k.data(), ones.data(), (const void**)d_A.data_ptr(), CUDA_R_16BF,
+      lda.data(), (const void**)d_B.data_ptr(), CUDA_R_16BF, ldb.data(),
+      zeros.data(), (void**)d_C.data_ptr(), CUDA_R_16BF, ldc.data(), G,
+      gsize.data(), CUBLAS_COMPUTE_32F);
+  TORCH_CHECK(st == CUBLAS_STATUS_SUCCESS, "grouped gemm failed", (int)st);
+}
+"""
+
+# NOTE: _CUDA_SRC holds the __global__ kernels; _LAUNCH_SRC re-declares and
+# launches them; _CPP_SRC/_CPP_IMPL hold the pybind wrappers.
+_mod = load_inline(
+    name="glm52_moe_kernels",
+    cpp_sources=[_CPP_SRC, _CPP_IMPL],
+    cuda_sources=[_CUDA_SRC, _LAUNCH_SRC, _GROUPED_SRC],
+    functions=["silu_mul_forward", "row_accum_forward", "grouped_linear",
+               "countsort_forward", "fused_accum_forward"],
+    extra_cflags=["-O3"],
+    extra_cuda_cflags=["-O3"],
+)
+
+
+def _silu_mul(gu: torch.Tensor) -> torch.Tensor:
+    """(N, 2I) bf16 -> (N, I) bf16 fused silu(gate)*up."""
+    n, two_i = gu.shape
+    if n == 0:
+        return torch.empty((0, two_i // 2), device=gu.device, dtype=gu.dtype)
+    h = torch.empty((n, two_i // 2), device=gu.device, dtype=gu.dtype)
+    _mod.silu_mul_forward(gu, h)
+    return h
+
+
+def _row_accum(out: torch.Tensor, y: torch.Tensor, idx: torch.Tensor,
+               w: torch.Tensor) -> None:
+    """out[idx[r]] += w[r] * y[r] in fp32. No-op for empty."""
+    if y.shape[0] == 0:
+        return
+    _mod.row_accum_forward(out, y, idx, w)
+
+
+def _countsort(ids: torch.Tensor, base: torch.Tensor, ctr: torch.Tensor,
+               n_pairs: int, top_k: int):
+    """One-kernel counting sort of pairs by expert.
+
+    Returns (tok_sorted int64 (N,), inv int32 (N,)) with
+    tok_sorted[row] = pair // top_k and inv[pair] = row.
+    """
+    dev = ids.device
+    tok = torch.empty(n_pairs, device=dev, dtype=torch.int64)
+    inv = torch.empty(n_pairs, device=dev, dtype=torch.int32)
+    _mod.countsort_forward(ids, base, ctr, tok, inv, top_k)
+    return tok, inv
+
+
+class Model(nn.Module):
+    def __init__(self, T: int, E: int, top_k: int, n_shared: int, H: int, I: int):
+        super().__init__()
+        self.T, self.E, self.top_k = T, E, top_k
+        self.n_shared, self.H, self.I = n_shared, H, I
+        self.w1_routed = nn.Parameter(torch.empty(E, 2 * I, H, dtype=torch.bfloat16))
+        self.w2_routed = nn.Parameter(torch.empty(E, H, I, dtype=torch.bfloat16))
+        self.w1_shared = nn.Parameter(torch.empty(n_shared, 2 * I, H, dtype=torch.bfloat16))
+        self.w2_shared = nn.Parameter(torch.empty(n_shared, H, I, dtype=torch.bfloat16))
+        for p in self.parameters():
+            nn.init.normal_(p, std=0.02)
+
+    def forward(self, x: torch.Tensor, expert_ids: torch.Tensor,
+                expert_weights: torch.Tensor) -> torch.Tensor:
+        dev = x.device
+        T = x.shape[0]
+        K = self.top_k
+        E = self.E
+
+        # --- shared experts (dense, always on) ---
+        out = None
+        for s in range(self.n_shared):
+            h = _silu_mul(F.linear(x, self.w1_shared[s]))
+            y = F.linear(h, self.w2_shared[s])
+            out = y.float() if out is None else out + y.float()
+
+        # --- routed experts: countsort by expert, grouped GEMMs, fuse accum ---
+        flat_ids = expert_ids.reshape(-1)
+        counts = torch.bincount(flat_ids, minlength=E)
+        base = torch.cumsum(counts, 0) - counts
+        ends = (base + counts).tolist()
+
+        if out is None:
+            out = torch.zeros(T, self.H, device=dev, dtype=torch.float32)
+        n_pairs = T * K
+        if n_pairs > 0:
+            H, I = self.H, self.I
+            ctr = torch.empty(E, device=dev, dtype=torch.int32)
+            tok_sorted, inv = _countsort(flat_ids, base, ctr, n_pairs, K)
+            x_sorted = x[tok_sorted]
+            starts = [0] * E
+            lens = [0] * E
+            prev = 0
+            for e in range(E):
+                end = ends[e]
+                starts[e] = prev
+                lens[e] = end - prev
+                prev = end
+            gu = torch.empty(n_pairs, 2 * I, device=dev, dtype=x.dtype)
+            _mod.grouped_linear(x_sorted, self.w1_routed, gu, starts, lens,
+                                2 * I, H)
+            h = _silu_mul(gu)
+            del gu
+            y = torch.empty(n_pairs, H, device=dev, dtype=x.dtype)
+            _mod.grouped_linear(h, self.w2_routed, y, starts, lens, H, I)
+            _mod.fused_accum_forward(out, y, inv, expert_weights.reshape(-1), K)
+        return out.to(torch.bfloat16)

@@ -1,0 +1,1678 @@
+"""Fused single-launch W4A16 decode for the Kimi-Linear hybrid unit.
+
+One decode step (4 blocks: KDA x3 + MLA, each with MoE) runs as exactly ONE
+GPU kernel launch (one grid of 32 x 256 threads; a full decode needs the whole
+GPU's bandwidth, which a single threadblock cannot deliver). The grid streams
+every int4 weight once, fusing unpack + per-group dequant directly into the
+GEMV, and fuses all of the surrounding math: RMSNorms (with fused residuals),
+KDA short-conv / gate / recurrent-state update, MLA RoPE + absorbed
+latent-cache attention (the kv_b up-projection is absorbed into the query
+instead of materializing per-token keys/values), the MoE router + top-8 +
+shared-expert GEMVs, and the cache appends. Sequential phases rendezvous on a
+ticket-based grid-wide barrier; small vectors live in one persistent global
+scratch buffer.
+
+Buffer / parameter names mirror the oracle exactly so that
+``load_state_dict(ref_state_dict, strict=True)`` works.
+"""
+
+import os
+
+os.environ.setdefault("TORCH_CUDA_ARCH_LIST", "12.0")
+
+import torch
+import torch.nn as nn
+from pathlib import Path
+from torch.utils.cpp_extension import load
+
+GROUP = 128
+P_ROWS = 32768  # persistent score-scratch rows (covers ctx 16384 + chained steps)
+# The persistent scratch is one flat fp32 buffer: a 65536-float fixed region
+# (hidden/norm/acc/qkv/pred/misc/gate carve, see the S_* offsets in the kernel)
+# followed by P_ROWS x 32 floats for the MLA attention weights.
+SCRATCH_FIXED = 65536
+
+
+class QuantLinear(nn.Module):
+    def __init__(self, in_f: int, out_f: int, group: int = GROUP):
+        super().__init__()
+        assert in_f % group == 0 and in_f % 2 == 0
+        self.in_f, self.out_f, self.group = in_f, out_f, group
+        self.register_buffer("w_q", torch.zeros(in_f // 2, out_f, dtype=torch.uint8))
+        self.register_buffer("scales", torch.zeros(in_f // group, out_f, dtype=torch.bfloat16))
+        self.register_buffer("zeros", torch.zeros(in_f // group, out_f, dtype=torch.bfloat16))
+
+
+class QuantExperts(nn.Module):
+    def __init__(self, n: int, in_f: int, out_f: int, group: int = GROUP):
+        super().__init__()
+        self.n, self.in_f, self.out_f, self.group = n, in_f, out_f, group
+        self.register_buffer("w_q", torch.zeros(n, in_f // 2, out_f, dtype=torch.uint8))
+        self.register_buffer("scales", torch.zeros(n, in_f // group, out_f, dtype=torch.bfloat16))
+        self.register_buffer("zeros", torch.zeros(n, in_f // group, out_f, dtype=torch.bfloat16))
+
+
+class KDA(nn.Module):
+    def __init__(self, cfg):
+        super().__init__()
+        H, Dk, d = cfg.kda_heads, cfg.kda_head_dim, cfg.hidden
+        self.q_proj = QuantLinear(d, H * Dk)
+        self.k_proj = QuantLinear(d, H * Dk)
+        self.v_proj = QuantLinear(d, H * Dk)
+        self.g_proj = QuantLinear(d, H * Dk)
+        self.o_proj = QuantLinear(H * Dk, d)
+        self.beta_proj = nn.Linear(d, H, bias=False, dtype=torch.bfloat16)
+        self.conv_w = nn.Parameter(torch.empty(3, H * Dk, cfg.short_conv, dtype=torch.bfloat16))
+
+
+class MLA(nn.Module):
+    def __init__(self, cfg):
+        super().__init__()
+        H, d = cfg.mla_heads, cfg.hidden
+        self.q_proj = QuantLinear(d, H * (cfg.qk_nope + cfg.qk_rope))
+        self.kv_a = QuantLinear(d, cfg.kv_lora + cfg.qk_rope)
+        self.kv_b = QuantLinear(cfg.kv_lora, H * (cfg.qk_nope + cfg.v_head))
+        self.o_proj = QuantLinear(H * cfg.v_head, d)
+
+
+class MoE(nn.Module):
+    def __init__(self, cfg):
+        super().__init__()
+        d, m, E = cfg.hidden, cfg.moe_inter, cfg.n_experts
+        self.router = nn.Linear(d, E, bias=False, dtype=torch.bfloat16)
+        self.gate = QuantExperts(E, d, m)
+        self.up = QuantExperts(E, d, m)
+        self.down = QuantExperts(E, m, d)
+        self.s_gate = QuantExperts(cfg.n_shared, d, m)
+        self.s_up = QuantExperts(cfg.n_shared, d, m)
+        self.s_down = QuantExperts(cfg.n_shared, m, d)
+
+
+class Block(nn.Module):
+    def __init__(self, cfg, kind: str):
+        super().__init__()
+        self.kind = kind
+        self.attn_norm = nn.Parameter(torch.ones(cfg.hidden, dtype=torch.bfloat16))
+        self.moe_norm = nn.Parameter(torch.ones(cfg.hidden, dtype=torch.bfloat16))
+        self.attn = KDA(cfg) if kind == "K" else MLA(cfg)
+        self.moe = MoE(cfg)
+
+
+class Model(nn.Module):
+    def __init__(self, cfg):
+        super().__init__()
+        assert tuple(cfg.pattern) == ("K", "K", "K", "M")
+        assert cfg.hidden == 2304 and cfg.kda_heads == 32 and cfg.kda_head_dim == 128
+        assert cfg.short_conv == 4 and cfg.mla_heads == 32 and cfg.kv_lora == 512
+        assert cfg.qk_nope == 128 and cfg.qk_rope == 64 and cfg.v_head == 128
+        assert cfg.rope_theta == 10000.0 and cfg.n_experts == 64 and cfg.n_active == 8
+        assert cfg.n_shared == 1 and cfg.moe_inter == 1024 and cfg.group == 128
+        self.cfg = cfg
+        self.blocks = nn.ModuleList(Block(cfg, k) for k in cfg.pattern)
+        self._routed = float(cfg.routed_scaling)
+        self._theta = float(cfg.rope_theta)
+        self._kscale = float(cfg.kda_head_dim) ** -0.5
+        self._mscale = float(cfg.qk_nope + cfg.qk_rope) ** -0.5
+        self._out = None
+        self._sP = None
+        self._sS = None
+    def _collect(self, state, hidden, ckv_out, kr_out):
+        T = []
+        ap = T.append
+        for bi in range(4):
+            blk = self.blocks[bi]
+            ap(blk.attn_norm)
+            ap(blk.moe_norm)
+            a = blk.attn
+            if bi < 3:
+                for m in (a.q_proj, a.k_proj, a.v_proj, a.g_proj, a.o_proj):
+                    ap(m.w_q)
+                    ap(m.scales)
+                    ap(m.zeros)
+                ap(a.beta_proj.weight)
+                ap(a.conv_w)
+            else:
+                for m in (a.q_proj, a.kv_a, a.kv_b, a.o_proj):
+                    ap(m.w_q)
+                    ap(m.scales)
+                    ap(m.zeros)
+            ap(blk.moe.router.weight)
+            mo = blk.moe
+            for m in (mo.gate, mo.up, mo.down, mo.s_gate, mo.s_up, mo.s_down):
+                ap(m.w_q)
+                ap(m.scales)
+                ap(m.zeros)
+        for bi in (0, 1, 2):
+            s = state[bi]
+            ap(s["S"])
+            ap(s["cq"])
+            ap(s["ck"])
+            ap(s["cv"])
+        ms = state[3]
+        ap(ms["c_kv"])
+        ap(ms["k_rope"])
+        ap(ckv_out)
+        ap(kr_out)
+        ap(hidden)
+        ap(self._out)
+        ap(self._sP)
+        ap(self._sS)
+        assert len(T) == 167, len(T)
+        return T
+
+    @torch.no_grad()
+    def step(self, hidden, state):
+        dev = hidden.device
+        if self._out is None or self._out.device != dev:
+            self._out = torch.empty(2304, dtype=torch.bfloat16, device=dev)
+            self._sP = torch.empty(SCRATCH_FIXED + P_ROWS * 32, dtype=torch.float32, device=dev)
+            self._sS = torch.empty(32, 512, dtype=torch.float32, device=dev)
+        L = state[3]["c_kv"].shape[0]
+        ckv_out = torch.empty((L + 1, 512), dtype=torch.bfloat16, device=dev)
+        kr_out = torch.empty((L + 1, 64), dtype=torch.bfloat16, device=dev)
+        # THE single GPU kernel launch of this decode step. Everything else
+        # here is host-side pointer gathering / allocation (no device work).
+        _EXT.decode_step(
+            self._collect(state, hidden, ckv_out, kr_out),
+            L, self._routed, self._theta, self._kscale, self._mscale,
+        )
+        state[3]["c_kv"] = ckv_out
+        state[3]["k_rope"] = kr_out
+        return self._out, state
+
+_CUDA_SRC = r"""
+#include <torch/extension.h>
+#include <ATen/cuda/CUDAContext.h>
+
+// bf16 bit-cast helpers via PTX (the torch build defines
+// __CUDA_NO_BFLOAT16_CONVERSIONS__, so the cuda_bf16.h converters are off).
+__device__ __forceinline__ float bf2f(uint16_t b) {
+  float f; asm("{ cvt.f32.bf16 %0, %1; }" : "=f"(f) : "h"(b)); return f;
+}
+__device__ __forceinline__ uint16_t f2bf(float f) {
+  uint16_t b; asm("{ cvt.rn.bf16.f32 %0, %1; }" : "=h"(b) : "f"(f)); return b;
+}
+// Streaming (non-L2-allocating) int4 byte load for read-once weights.
+// Keeps the 128MB L2 for re-read data (x, scales, states, caches).
+__device__ __forceinline__ uint8_t ldcs(const uint8_t* p) {
+  uint32_t v; asm("ld.global.cs.u8 %0, [%1];" : "=r"(v) : "l"(p)); return (uint8_t)v;
+}
+__device__ __forceinline__ uint16_t ldcs16(const uint16_t* p) {
+  uint32_t v; asm("ld.global.cs.u16 %0, [%1];" : "=r"(v) : "l"(p)); return (uint16_t)v;
+}
+
+// ---- model dims (asserted against cfg on the host side) ----
+#define HD 2304
+#define KHC 4096
+#define MQQ 6144
+#define KVAO 576
+#define KLR 512
+#define KRQ 64
+#define NH 32
+#define DK 128
+#define NHE 1024
+#define NRT 64
+
+// ---- grid: NB blocks x NT threads, flat worker id GID over NWK workers ----
+#define NB 128
+#define NT 256
+#define BID (blockIdx.x)
+#define TID (threadIdx.x)
+#define GID (blockIdx.x * blockDim.x + threadIdx.x)
+#define NWK (gridDim.x * blockDim.x)
+
+// ---- scratch carve (float offsets into the persistent scratch; the absorbed
+// attention weights p[l,h] live at PSB, above the fixed region) ----
+#define S_H 0
+#define S_N 2304
+#define S_ACC 8448
+#define S_QKV 10752
+#define S_PRD 27136
+#define S_BETA 31232
+#define S_MISC 31264
+#define S_GATE 39456
+#define S_UP 48672
+#define S_PSB 65536
+// MISC layout: [0:NB] block staging, [64] norm mean, [128:192] router probs,
+// [192:208] topk idx/w, [1024:2048] MLA max/sum block staging (NB*32)
+#define M_STAGE 0
+#define M_MEAN 64
+#define M_PROB 128
+#define M_TOPK 192
+#define M_MAX 256
+#define M_SUM 288
+#define M_MSTAGE 1024
+
+// ---- MoE expert strides (bytes for wq, bf16 elems for scales/zeros) ----
+#define GQS 1179648
+#define GSS 18432
+#define DQS 1179648
+#define DSS 18432
+
+// ---- reusable ticket barrier over the whole grid (no reset needed;
+// counters are zero-initialized once and grow monotonically) ----
+__device__ unsigned gbar_cnt = 0;
+__device__ unsigned gbar_done = 0;
+__device__ void gbar() {
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    unsigned NBx = (unsigned)gridDim.x;
+    unsigned my = atomicAdd(&gbar_cnt, 1);
+    unsigned round = my / NBx;
+    if (my - round * NBx == NBx - 1) {
+      __threadfence();
+      atomicExch(&gbar_done, round + 1);
+    } else {
+      while (atomicAdd(&gbar_done, 0) < round + 1) {}
+    }
+  }
+  __syncthreads();
+  __threadfence();
+}
+
+// One dequantized dot product: output column n of an int4 (K,N) weight.
+__device__ float qdot(const float* __restrict__ x,
+                      const uint8_t* __restrict__ wq,
+                      const uint16_t* __restrict__ sc,
+                      const uint16_t* __restrict__ ze,
+                      int K, int N, int n) {
+  const int K2 = K >> 1;
+  const int Q = K2 >> 2;
+  float a0 = 0.f, a1 = 0.f, a2 = 0.f, a3 = 0.f;
+  #pragma unroll 4
+  for (int i = 0; i < Q; ++i) {
+    int k0 = i, k1 = i + Q, k2 = i + (Q << 1), k3 = i + Q * 3;
+    uint8_t b0 = ldcs(wq + k0 * N + n), b1 = ldcs(wq + k1 * N + n);
+    uint8_t b2 = ldcs(wq + k2 * N + n), b3 = ldcs(wq + k3 * N + n);
+    float s0 = bf2f(ldcs16(sc + (k0 >> 6) * N + n)), s1 = bf2f(ldcs16(sc + (k1 >> 6) * N + n));
+    float s2 = bf2f(ldcs16(sc + (k2 >> 6) * N + n)), s3 = bf2f(ldcs16(sc + (k3 >> 6) * N + n));
+    float z0 = bf2f(ldcs16(ze + (k0 >> 6) * N + n)), z1 = bf2f(ldcs16(ze + (k1 >> 6) * N + n));
+    float z2 = bf2f(ldcs16(ze + (k2 >> 6) * N + n)), z3 = bf2f(ldcs16(ze + (k3 >> 6) * N + n));
+    float x00 = x[k0 << 1], x01 = x[(k0 << 1) + 1];
+    float x10 = x[k1 << 1], x11 = x[(k1 << 1) + 1];
+    float x20 = x[k2 << 1], x21 = x[(k2 << 1) + 1];
+    float x30 = x[k3 << 1], x31 = x[(k3 << 1) + 1];
+    a0 += (x00 * ((b0 & 0xF) - z0) + x01 * ((b0 >> 4) - z0)) * s0;
+    a1 += (x10 * ((b1 & 0xF) - z1) + x11 * ((b1 >> 4) - z1)) * s1;
+    a2 += (x20 * ((b2 & 0xF) - z2) + x21 * ((b2 >> 4) - z2)) * s2;
+    a3 += (x30 * ((b3 & 0xF) - z3) + x31 * ((b3 >> 4) - z3)) * s3;
+  }
+  return a0 + a1 + a2 + a3;
+}
+
+// Fused int4 dequant GEMV, output-sharded over the grid.
+__device__ void gemv_qg(const float* __restrict__ x,
+                        const uint8_t* __restrict__ wq,
+                        const uint16_t* __restrict__ sc,
+                        const uint16_t* __restrict__ ze,
+                        int K, int N, float* __restrict__ y) {
+  int gid = GID, nw = NWK;
+  for (int n = gid; n < N; n += nw) y[n] = qdot(x, wq, sc, ze, K, N, n);
+}
+
+// bf16 row-major (out,in) GEMV, output-sharded (also used single-block).
+__device__ void gemv_bg(const float* __restrict__ x,
+                        const uint16_t* __restrict__ w,
+                        int K, int N, float* __restrict__ y) {
+  int gid = GID, nw = NWK;
+  const int Q = K >> 2;
+  for (int h = gid; h < N; h += nw) {
+    float a0 = 0.f, a1 = 0.f, a2 = 0.f, a3 = 0.f;
+    const uint16_t* row = w + h * K;
+    #pragma unroll 4
+    for (int i = 0; i < Q; ++i) {
+      int k0 = i, k1 = i + Q, k2 = i + (Q << 1), k3 = i + Q * 3;
+      a0 += x[k0] * bf2f(row[k0]);
+      a1 += x[k1] * bf2f(row[k1]);
+      a2 += x[k2] * bf2f(row[k2]);
+      a3 += x[k3] * bf2f(row[k3]);
+    }
+    y[h] = a0 + a1 + a2 + a3;
+  }
+}
+
+// RMSNorm with fused residual-add from ACC (use_acc=0 for the first norm).
+// Block 0 reduces the mean alone; the whole grid then scales, and the summed
+// residual is written back to SRC (always the G_H stream) for the next block.
+__device__ void rmsnorm_fused(float* SRC,
+                              const float* __restrict__ ACC, int use_acc,
+                              const uint16_t* __restrict__ W,
+                              float* __restrict__ DST, float* SCR) {
+  extern __shared__ float sh[];
+  int tid = TID, bid = BID;
+  if (bid == 0) {
+    float s = 0.f;
+    for (int i = tid; i < HD; i += NT) {
+      float v = SRC[i] + (use_acc ? ACC[i] : 0.f);
+      // Round the residual stream to bf16 exactly like the eager hidden, so
+      // downstream values track the reference to last-ulp (fewer tie flips).
+      if (use_acc) { v = bf2f(f2bf(v)); SRC[i] = v; }
+      s += v * v;
+    }
+    #pragma unroll
+    for (int o = 16; o > 0; o >>= 1) s += __shfl_xor_sync(0xFFFFFFFF, s, o);
+    if ((tid & 31) == 0) sh[tid >> 5] = s;
+    __syncthreads();
+    float m = (tid < 8) ? sh[tid] : 0.f;
+    if (tid < 8) {
+      #pragma unroll
+      for (int o = 4; o > 0; o >>= 1) m += __shfl_xor_sync(0xFF, m, o);
+      if (tid == 0) SCR[S_MISC + M_MEAN] = m / HD;
+    }
+  }
+  gbar();
+  float rms = rsqrtf(SCR[S_MISC + M_MEAN] + 1e-6f);
+  int gid = GID, nw = NWK;
+  for (int i = gid; i < HD; i += nw) {
+    float v = SRC[i];  // residual already added (+rounded) by the mean pass
+    DST[i] = bf2f(f2bf(v * rms * bf2f(W[i])));
+  }
+  gbar();
+}
+
+// Gated-delta (KDA) attention for one layer. x: normed input; out -> ACC.
+__device__ void kda_attn(
+    const float* __restrict__ x,
+    const uint8_t* qq, const uint16_t* qs, const uint16_t* qz,
+    const uint8_t* kq, const uint16_t* ks, const uint16_t* kz,
+    const uint8_t* vq, const uint16_t* vs, const uint16_t* vz,
+    const uint8_t* gq, const uint16_t* gs, const uint16_t* gz,
+    const uint8_t* oq, const uint16_t* os, const uint16_t* oz,
+    const uint16_t* __restrict__ betaw, const uint16_t* __restrict__ convw,
+    float* __restrict__ S, uint16_t* cq, uint16_t* ck, uint16_t* cv,
+    float* SCR, float kscale) {
+  float* QKV = SCR + S_QKV;
+  float* PRD = SCR + S_PRD;
+  float* ACC = SCR + S_ACC;
+  float* BETA = SCR + S_BETA;
+  int gid = GID, nw = NWK;
+  float* q = QKV;
+  float* k = QKV + KHC;
+  float* v = QKV + 2 * KHC;
+  float* g = QKV + 3 * KHC;
+  gemv_qg(x, qq, qs, qz, HD, KHC, q);
+  gemv_qg(x, kq, ks, kz, HD, KHC, k);
+  gemv_qg(x, vq, vs, vz, HD, KHC, v);
+  gemv_qg(x, gq, gs, gz, HD, KHC, g);
+  gbar();
+  // round + causal depthwise conv + SiLU + log-decay gate, fused per channel.
+  for (int c = gid; c < KHC; c += nw) {
+    float qr = bf2f(f2bf(q[c])), kr = bf2f(f2bf(k[c]));
+    float vr = bf2f(f2bf(v[c])), gr = bf2f(f2bf(g[c]));
+    float w0 = bf2f(cq[c]), w1 = bf2f(cq[KHC + c]), w2 = bf2f(cq[2 * KHC + c]);
+    float a = w0 * bf2f(convw[c * 4]) + w1 * bf2f(convw[c * 4 + 1])
+            + w2 * bf2f(convw[c * 4 + 2]) + qr * bf2f(convw[c * 4 + 3]);
+    float sq = a / (1.f + expf(-a));
+    q[c] = bf2f(f2bf(sq));
+    cq[c] = f2bf(w1); cq[KHC + c] = f2bf(w2); cq[2 * KHC + c] = f2bf(qr);
+    w0 = bf2f(ck[c]); w1 = bf2f(ck[KHC + c]); w2 = bf2f(ck[2 * KHC + c]);
+    a = w0 * bf2f(convw[KHC * 4 + c * 4]) + w1 * bf2f(convw[KHC * 4 + c * 4 + 1])
+      + w2 * bf2f(convw[KHC * 4 + c * 4 + 2]) + kr * bf2f(convw[KHC * 4 + c * 4 + 3]);
+    float sk = a / (1.f + expf(-a));
+    k[c] = bf2f(f2bf(sk));
+    ck[c] = f2bf(w1); ck[KHC + c] = f2bf(w2); ck[2 * KHC + c] = f2bf(kr);
+    w0 = bf2f(cv[c]); w1 = bf2f(cv[KHC + c]); w2 = bf2f(cv[2 * KHC + c]);
+    a = w0 * bf2f(convw[2 * KHC * 4 + c * 4]) + w1 * bf2f(convw[2 * KHC * 4 + c * 4 + 1])
+      + w2 * bf2f(convw[2 * KHC * 4 + c * 4 + 2]) + vr * bf2f(convw[2 * KHC * 4 + c * 4 + 3]);
+    float sv = a / (1.f + expf(-a));
+    v[c] = bf2f(f2bf(sv));
+    cv[c] = f2bf(w1); cv[KHC + c] = f2bf(w2); cv[2 * KHC + c] = f2bf(vr);
+    float sp = (gr > 20.f) ? gr : log1pf(expf(gr));
+    g[c] = -sp;
+  }
+  // per-head write strength on block 0 (x is still intact).
+  if (BID == 0) {
+    gemv_bg(x, betaw, HD, NH, BETA);
+    for (int i = TID; i < NH; i += NT) {
+      float t = bf2f(f2bf(BETA[i]));
+      BETA[i] = 1.f / (1.f + expf(-t));
+    }
+  }
+  gbar();
+  // S[h,i,j] *= exp(g[h,i])
+  const int NS = NH * DK * DK;
+  for (int s0 = gid; s0 < NS; s0 += nw) {
+    int h = s0 >> 14, i = (s0 >> 7) & 127;
+    S[s0] *= expf(g[(h << 7) + i]);
+  }
+  gbar();
+  // pred[h,j] = sum_i S[h,i,j] * k[h,i]
+  for (int hj = gid; hj < KHC; hj += nw) {
+    int h = hj >> 7, j = hj & 127;
+    float a = 0.f;
+    #pragma unroll 8
+    for (int i = 0; i < DK; ++i) a += S[(h << 14) + (i << 7) + j] * k[(h << 7) + i];
+    PRD[hj] = a;
+  }
+  gbar();
+  // S += beta[h] * k[h,i] * (v[h,j] - pred[h,j])
+  for (int s0 = gid; s0 < NS; s0 += nw) {
+    int h = s0 >> 14, i = (s0 >> 7) & 127, j = s0 & 127;
+    int hi = (h << 7) + i, hj = (h << 7) + j;
+    S[s0] += BETA[h] * k[hi] * (v[hj] - PRD[hj]);
+  }
+  gbar();
+  // o[h,j] = sum_i S[h,i,j] * q[h,i], bf16-rounded (reuses PRD).
+  for (int hj = gid; hj < KHC; hj += nw) {
+    int h = hj >> 7, j = hj & 127;
+    float a = 0.f;
+    #pragma unroll 8
+    for (int i = 0; i < DK; ++i) a += S[(h << 14) + (i << 7) + j] * q[(h << 7) + i];
+    PRD[hj] = bf2f(f2bf(a * kscale));
+  }
+  gbar();
+  // o_proj -> ACC (overwrite) with fused bf16 rounding.
+  for (int n = gid; n < HD; n += nw)
+    ACC[n] = bf2f(f2bf(qdot(PRD, oq, os, oz, KHC, HD, n)));
+  gbar();
+}
+
+// One absorbed MLA score row: sc[h] = (q_nope[h].Wk[h]'.C[l] + q_rope[h].K[l]) * mscale
+__device__ void mla_row_scores(int l, const float* __restrict__ qabs,
+                               const float* __restrict__ qr,
+                               const uint16_t* __restrict__ ckv,
+                               const uint16_t* __restrict__ kr,
+                               float mscale, float* sc) {
+  float s[NH];
+  #pragma unroll
+  for (int h = 0; h < NH; ++h) s[h] = 0.f;
+  for (int r = 0; r < KLR; ++r) {
+    float c = bf2f(ckv[l * KLR + r]);
+    #pragma unroll
+    for (int h = 0; h < NH; ++h) s[h] += c * qabs[(h << 9) + r];
+  }
+  for (int d = 0; d < KRQ; ++d) {
+    float c = bf2f(kr[l * KRQ + d]);
+    #pragma unroll
+    for (int h = 0; h < NH; ++h) s[h] += qr[(h << 6) + d] * c;
+  }
+  #pragma unroll
+  for (int h = 0; h < NH; ++h) sc[h] = s[h] * mscale;
+}
+
+// MLA layer with absorbed latent attention. x: normed input; out -> ACC.
+__device__ void mla_attn(
+    const float* __restrict__ x,
+    const uint8_t* qq, const uint16_t* qs, const uint16_t* qz,
+    const uint8_t* aq, const uint16_t* as, const uint16_t* az,
+    const uint8_t* bq, const uint16_t* bs, const uint16_t* bz,
+    const uint8_t* oq, const uint16_t* os, const uint16_t* oz,
+    const uint16_t* __restrict__ ckv_in, const uint16_t* __restrict__ kr_in,
+    uint16_t* ckv_out, uint16_t* kr_out, int L,
+    float* SCR, float* gS, float theta, float mscale) {
+  extern __shared__ float sh[];
+  float* Q = SCR + S_QKV;    // q (6144), then absorbed query qabs (16384)
+  float* KV = SCR + S_PRD;   // c_new (512) + k_rope_new (64)
+  float* QN = SCR + S_N;     // compact qn (4096) + qr (2048); x is dead
+  float* ACC = SCR + S_ACC;
+  float* MISC = SCR + S_MISC;
+  float* gP = SCR + S_PSB;
+  int gid = GID, nw = NWK;
+  gemv_qg(x, qq, qs, qz, HD, MQQ, Q);
+  gemv_qg(x, aq, as, az, HD, KVAO, KV);
+  gbar();
+  for (int i = gid; i < MQQ; i += nw) Q[i] = bf2f(f2bf(Q[i]));
+  for (int i = gid; i < KVAO; i += nw) KV[i] = bf2f(f2bf(KV[i]));
+  // q is per-head (nope 128, rope 64); gather compact qn/qr into QN.
+  for (int t = gid; t < NH * 192; t += nw) {
+    int h = t / 192, j = t % 192;
+    float v = Q[h * 192 + j];
+    QN[(j < DK) ? (h * DK + j) : (KHC + h * KRQ + (j - DK))] = v;
+  }
+  gbar();
+  float* qn = QN;
+  float* qr = QN + KHC;
+  // RoPE on q_rope (32 heads x 32 pairs) and on the new rope key, position L.
+  for (int p = gid; p < NH * 32; p += nw) {
+    int h = p >> 5, pair = p & 31;
+    float ang = (float)L * powf(theta, -(pair / 32.f));
+    float c = cosf(ang), s = sinf(ang);
+    float x0 = qr[(h << 6) + pair * 2], x1 = qr[(h << 6) + pair * 2 + 1];
+    qr[(h << 6) + pair * 2] = bf2f(f2bf(x0 * c - x1 * s));
+    qr[(h << 6) + pair * 2 + 1] = bf2f(f2bf(x0 * s + x1 * c));
+  }
+  for (int p = gid; p < 32; p += nw) {
+    float ang = (float)L * powf(theta, -(p / 32.f));
+    float c = cosf(ang), s = sinf(ang);
+    float x0 = KV[KLR + p * 2], x1 = KV[KLR + p * 2 + 1];
+    KV[KLR + p * 2] = bf2f(f2bf(x0 * c - x1 * s));
+    KV[KLR + p * 2 + 1] = bf2f(f2bf(x0 * s + x1 * c));
+  }
+  gbar();
+  // Append the new latent + rope rows to the caches.
+  const int Lp1 = L + 1;
+  for (int f = gid; f < L * KLR; f += nw) ckv_out[f] = ckv_in[f];
+  for (int f = gid; f < L * KRQ; f += nw) kr_out[f] = kr_in[f];
+  for (int r = gid; r < KLR; r += nw) ckv_out[L * KLR + r] = f2bf(KV[r]);
+  for (int r = gid; r < KRQ; r += nw) kr_out[L * KRQ + r] = f2bf(KV[KLR + r]);
+  gbar();
+  // Absorbed query: qabs[h,r] = sum_d qn[h,d] * Wk[r, h*256+d] -> Q.
+  for (int t = gid; t < NH * KLR; t += nw) {
+    int h = t >> 9, r = t & 511;
+    float a = 0.f;
+    #pragma unroll 8
+    for (int d = 0; d < DK; ++d) {
+      int n = (h << 8) + d;
+      uint8_t b = bq[(r >> 1) * 8192 + n];
+      float s = bf2f(bs[(r >> 7) * 8192 + n]);
+      float z = bf2f(bz[(r >> 7) * 8192 + n]);
+      float w = ((r & 1) ? (b >> 4) : (b & 0xF)) - z;
+      a += qn[(h << 7) + d] * w * s;
+    }
+    Q[t] = a;
+  }
+  gbar();
+  const float* qabs = Q;
+  // Pass 0: raw scores sc[l,h] -> gP (fp32, exact). Later passes read the
+  // buffer instead of recomputing (identical values, 1/3 of the FLOPs).
+  for (int l = gid; l < Lp1; l += nw) {
+    float sc[NH];
+    mla_row_scores(l, qabs, qr, ckv_out, kr_out, mscale, sc);
+    #pragma unroll
+    for (int h = 0; h < NH; ++h) gP[l * NH + h] = sc[h];
+  }
+  gbar();
+  // Pass 1a: per-head max over rows (rows sharded; two-level reduction).
+  {
+    float mx[NH];
+    #pragma unroll
+    for (int h = 0; h < NH; ++h) mx[h] = -1e30f;
+    for (int l = gid; l < Lp1; l += nw) {
+      #pragma unroll
+      for (int h = 0; h < NH; ++h) mx[h] = fmaxf(mx[h], gP[l * NH + h]);
+    }
+    for (int h = 0; h < NH; ++h) {
+      float v = mx[h];
+      #pragma unroll
+      for (int o = 16; o > 0; o >>= 1) v = fmaxf(v, __shfl_xor_sync(0xFFFFFFFF, v, o));
+      if ((TID & 31) == 0) sh[(TID >> 5) * NH + h] = v;
+    }
+    __syncthreads();
+    if (TID < NH) {
+      float v = -1e30f;
+      for (int w = 0; w < 8; ++w) v = fmaxf(v, sh[w * NH + TID]);
+      MISC[M_MSTAGE + BID * NH + TID] = v;
+    }
+  }
+  gbar();
+  if (BID == 0) {
+    for (int h = TID; h < NH; h += NT) {
+      float v = -1e30f;
+      for (int b = 0; b < NB; ++b) v = fmaxf(v, MISC[M_MSTAGE + b * NH + h]);
+      MISC[M_MAX + h] = v;
+    }
+  }
+  gbar();
+  // Pass 1b: per-head denominator.
+  {
+    float sm[NH];
+    #pragma unroll
+    for (int h = 0; h < NH; ++h) sm[h] = 0.f;
+    for (int l = gid; l < Lp1; l += nw) {
+      #pragma unroll
+      for (int h = 0; h < NH; ++h) sm[h] += expf(gP[l * NH + h] - MISC[M_MAX + h]);
+    }
+    for (int h = 0; h < NH; ++h) {
+      float v = sm[h];
+      #pragma unroll
+      for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xFFFFFFFF, v, o);
+      if ((TID & 31) == 0) sh[(TID >> 5) * NH + h] = v;
+    }
+    __syncthreads();
+    if (TID < NH) {
+      float v = 0.f;
+      for (int w = 0; w < 8; ++w) v += sh[w * NH + TID];
+      MISC[M_MSTAGE + BID * NH + TID] = v;
+    }
+  }
+  gbar();
+  if (BID == 0) {
+    for (int h = TID; h < NH; h += NT) {
+      float v = 0.f;
+      for (int b = 0; b < NB; ++b) v += MISC[M_MSTAGE + b * NH + h];
+      MISC[M_SUM + h] = v;
+    }
+  }
+  gbar();
+  // Pass 1c: normalize scores to weights p[l,h], in place in gP.
+  for (int l = gid; l < Lp1; l += nw) {
+    #pragma unroll
+    for (int h = 0; h < NH; ++h) {
+      float s = gP[l * NH + h];
+      gP[l * NH + h] = expf(s - MISC[M_MAX + h]) / MISC[M_SUM + h];
+    }
+  }
+  gbar();
+  // Pass 2: absorbed state s[h,r] = sum_l p[l,h] * C[l,r]. Threads are mapped
+  // r-major (t = r*32+h) so each warp shares one r: the C[l,r] load broadcasts
+  // and the gP row is contiguous (was: strided 2GB re-read of the cache).
+  for (int t = gid; t < NH * KLR; t += nw) {
+    int h = t & 31, r = t >> 5;
+    float a = 0.f;
+    #pragma unroll 4
+    for (int l = 0; l < Lp1; ++l) a += gP[l * NH + h] * bf2f(ckv_out[l * KLR + r]);
+    gS[(h << 9) + r] = a;
+  }
+  gbar();
+  // o[h,d] = sum_r gS[h,r] * Wv[r, h*256+128+d] -> QN (qn/qr dead), rounded.
+  for (int t = gid; t < NH * DK; t += nw) {
+    int h = t >> 7, d = t & 127;
+    float a = 0.f;
+    int n = (h << 8) + 128 + d;
+    #pragma unroll 8
+    for (int r = 0; r < KLR; ++r) {
+      uint8_t b = bq[(r >> 1) * 8192 + n];
+      float s = bf2f(bs[(r >> 7) * 8192 + n]);
+      float z = bf2f(bz[(r >> 7) * 8192 + n]);
+      float w = ((r & 1) ? (b >> 4) : (b & 0xF)) - z;
+      a += gS[(h << 9) + r] * w * s;
+    }
+    QN[t] = bf2f(f2bf(a));
+  }
+  gbar();
+  // o_proj -> ACC (overwrite) with fused rounding.
+  for (int n = gid; n < HD; n += nw)
+    ACC[n] = bf2f(f2bf(qdot(QN, oq, os, oz, KHC, HD, n)));
+  gbar();
+}
+
+// Top-8 routed MoE + 1 shared expert. x: normed input. ACC zeroed here.
+__device__ void moe_run(
+    const float* __restrict__ x,
+    const uint16_t* __restrict__ routerw,
+    const uint8_t* gq, const uint16_t* gs, const uint16_t* gz,
+    const uint8_t* uq, const uint16_t* us, const uint16_t* uz,
+    const uint8_t* dq, const uint16_t* ds, const uint16_t* dz,
+    const uint8_t* sgq, const uint16_t* sgs, const uint16_t* sgz,
+    const uint8_t* suq, const uint16_t* sus, const uint16_t* suz,
+    const uint8_t* sdq, const uint16_t* sds, const uint16_t* sdz,
+    float routed, float* SCR) {
+  float* MISC = SCR + S_MISC;
+  float* GATE = SCR + S_GATE;
+  float* ACC = SCR + S_ACC;
+  int gid = GID, nw = NWK;
+  // Router (+softmax/topk on block 0) concurrent with zeroing ACC.
+  if (BID == 0) {
+    gemv_bg(x, routerw, HD, NRT, MISC + M_PROB);
+    for (int i = TID; i < NRT; i += NT) MISC[M_PROB + i] = bf2f(f2bf(MISC[M_PROB + i]));
+    __syncthreads();
+    if (TID == 0) {
+      float* pr = MISC + M_PROB;
+      float mx = -1e30f;
+      for (int e = 0; e < NRT; ++e) mx = fmaxf(mx, pr[e]);
+      float s = 0.f;
+      for (int e = 0; e < NRT; ++e) { float v = expf(pr[e] - mx); pr[e] = v; s += v; }
+      for (int e = 0; e < NRT; ++e) pr[e] /= s;
+      int idx[8];
+      float wv[8];
+      #pragma unroll
+      for (int j = 0; j < 8; ++j) { idx[j] = -1; wv[j] = -1.f; }
+      for (int e = 0; e < NRT; ++e) {
+        float p = pr[e];
+        for (int j = 0; j < 8; ++j) {
+          if (p > wv[j]) {
+            for (int k = 7; k > j; --k) { wv[k] = wv[k - 1]; idx[k] = idx[k - 1]; }
+            wv[j] = p; idx[j] = e;
+            break;
+          }
+        }
+      }
+      float ws = 1e-9f;
+      for (int j = 0; j < 8; ++j) ws += wv[j];
+      for (int j = 0; j < 8; ++j) {
+        MISC[M_TOPK + j] = (float)idx[j];
+        MISC[M_TOPK + 8 + j] = wv[j] / ws * routed;
+      }
+    }
+  }
+  for (int i = gid; i < HD; i += nw) ACC[i] = 0.f;
+  gbar();
+  // Gates + ups + SiLU for the 8 routed experts and the shared one, fused.
+  const float* topk = MISC + M_TOPK;
+  for (int t = gid; t < 9 * NHE; t += nw) {
+    int r = (t < 8 * NHE);
+    int e = r ? (int)topk[t >> 10] : 0;
+    const uint8_t* gqb = r ? gq : sgq;
+    const uint16_t* gsb = r ? gs : sgs;
+    const uint16_t* gzb = r ? gz : sgz;
+    const uint8_t* uqb = r ? uq : suq;
+    const uint16_t* usb = r ? us : sus;
+    const uint16_t* uzb = r ? uz : suz;
+    int j = t & (NHE - 1);
+    int eo = r ? e * GQS : 0;
+    int es = r ? e * GSS : 0;
+    float gg = qdot(x, gqb + eo, gsb + es, gzb + es, HD, NHE, j);
+    float uu = qdot(x, uqb + eo, usb + es, uzb + es, HD, NHE, j);
+    GATE[t] = (gg / (1.f + expf(-gg))) * uu;
+  }
+  gbar();
+  // Down projections: all 9 experts (8 routed + shared) in parallel over the
+  // grid (9x workers), partials in PSB staging, then the SAME sequential
+  // j-order reduction -> bit-identical to the sequential version.
+  float* PART = SCR + S_PSB;
+  for (int t = gid; t < 9 * HD; t += nw) {
+    int j = t / HD, n = t % HD;
+    if (j < 8) {
+      int e = (int)topk[j];
+      PART[t] = qdot(GATE + j * NHE, dq + e * DQS, ds + e * DSS, dz + e * DSS,
+                     NHE, HD, n);
+    } else {
+      PART[t] = qdot(GATE + 8 * NHE, sdq, sds, sdz, NHE, HD, n);
+    }
+  }
+  gbar();
+  for (int j = 0; j < 8; ++j) {
+    float w = topk[8 + j];
+    const float* pj = PART + j * HD;
+    for (int n = gid; n < HD; n += nw) ACC[n] += w * pj[n];
+  }
+  {
+    const float* pj = PART + 8 * HD;
+    for (int n = gid; n < HD; n += nw) ACC[n] += pj[n];
+  }
+  gbar();
+}
+
+// ---- pointer-table indices (host gather order; 167 entries) ----
+#define KDA_SZ 38
+#define F_AN 0
+#define F_MN 1
+#define F_Q 2
+#define F_K 5
+#define F_V 8
+#define F_G 11
+#define F_O 14
+#define F_BETA 17
+#define F_CONV 18
+#define F_RT 19
+#define F_EG 20
+#define F_EU 23
+#define F_ED 26
+#define F_SG 29
+#define F_SU 32
+#define F_SD 35
+#define M_AN 114
+#define M_MN 115
+#define M_Q 116
+#define M_A 119
+#define M_B 122
+#define M_O 125
+#define M_RT 128
+#define M_EG 129
+#define M_EU 132
+#define M_ED 135
+#define M_SG 138
+#define M_SU 141
+#define M_SD 144
+#define D_S0 147
+#define D_S1 151
+#define D_S2 155
+#define D_CKVIN 159
+#define D_KRIN 160
+#define D_CKVOUT 161
+#define D_KROUT 162
+#define D_HIN 163
+#define D_HOUT 164
+#define D_SCP 165
+#define D_SCS 166
+
+struct PtrTable { const void* p[167]; };
+
+#define U16(i) ((const uint16_t*)T.p[i])
+#define U8(i) ((const uint8_t*)T.p[i])
+#define F32(i) ((float*)T.p[i])
+#define W16(i) ((uint16_t*)T.p[i])
+
+// The entire per-token decode: 3x (KDA + MoE) + 1x (MLA + MoE), one grid.
+__global__ void megakernel(PtrTable T, int L, float routed, float theta,
+                           float kscale, float mscale) {
+  float* SCR = F32(D_SCP);
+  float* gS = F32(D_SCS);
+  float* G_H = SCR + S_H;
+  float* G_N = SCR + S_N;
+  float* ACC = SCR + S_ACC;
+  int gid = GID, nw = NWK;
+  const uint16_t* h_in = U16(D_HIN);
+  for (int i = gid; i < HD; i += nw) G_H[i] = bf2f(h_in[i]);
+  gbar();
+
+  // ---- block 0 (KDA) ----
+  rmsnorm_fused(G_H, ACC, 0, U16(F_AN), G_N, SCR);
+  kda_attn(G_N,
+      U8(2), U16(3), U16(4), U8(5), U16(6), U16(7), U8(8), U16(9), U16(10),
+      U8(11), U16(12), U16(13), U8(14), U16(15), U16(16),
+      U16(17), U16(18), F32(D_S0), W16(D_S0 + 1), W16(D_S0 + 2), W16(D_S0 + 3),
+      SCR, kscale);
+  rmsnorm_fused(G_H, ACC, 1, U16(F_MN), G_N, SCR);
+  moe_run(G_N, U16(F_RT),
+      U8(20), U16(21), U16(22), U8(23), U16(24), U16(25), U8(26), U16(27), U16(28),
+      U8(29), U16(30), U16(31), U8(32), U16(33), U16(34), U8(35), U16(36), U16(37),
+      routed, SCR);
+
+  // ---- block 1 (KDA) ----
+  rmsnorm_fused(G_H, ACC, 1, U16(38 + F_AN), G_N, SCR);
+  kda_attn(G_N,
+      U8(38 + 2), U16(38 + 3), U16(38 + 4), U8(38 + 5), U16(38 + 6), U16(38 + 7),
+      U8(38 + 8), U16(38 + 9), U16(38 + 10), U8(38 + 11), U16(38 + 12), U16(38 + 13),
+      U8(38 + 14), U16(38 + 15), U16(38 + 16),
+      U16(38 + 17), U16(38 + 18), F32(D_S1), W16(D_S1 + 1), W16(D_S1 + 2), W16(D_S1 + 3),
+      SCR, kscale);
+  rmsnorm_fused(G_H, ACC, 1, U16(38 + F_MN), G_N, SCR);
+  moe_run(G_N, U16(38 + F_RT),
+      U8(38 + 20), U16(38 + 21), U16(38 + 22), U8(38 + 23), U16(38 + 24), U16(38 + 25),
+      U8(38 + 26), U16(38 + 27), U16(38 + 28), U8(38 + 29), U16(38 + 30), U16(38 + 31),
+      U8(38 + 32), U16(38 + 33), U16(38 + 34), U8(38 + 35), U16(38 + 36), U16(38 + 37),
+      routed, SCR);
+
+  // ---- block 2 (KDA) ----
+  rmsnorm_fused(G_H, ACC, 1, U16(76 + F_AN), G_N, SCR);
+  kda_attn(G_N,
+      U8(76 + 2), U16(76 + 3), U16(76 + 4), U8(76 + 5), U16(76 + 6), U16(76 + 7),
+      U8(76 + 8), U16(76 + 9), U16(76 + 10), U8(76 + 11), U16(76 + 12), U16(76 + 13),
+      U8(76 + 14), U16(76 + 15), U16(76 + 16),
+      U16(76 + 17), U16(76 + 18), F32(D_S2), W16(D_S2 + 1), W16(D_S2 + 2), W16(D_S2 + 3),
+      SCR, kscale);
+  rmsnorm_fused(G_H, ACC, 1, U16(76 + F_MN), G_N, SCR);
+  moe_run(G_N, U16(76 + F_RT),
+      U8(76 + 20), U16(76 + 21), U16(76 + 22), U8(76 + 23), U16(76 + 24), U16(76 + 25),
+      U8(76 + 26), U16(76 + 27), U16(76 + 28), U8(76 + 29), U16(76 + 30), U16(76 + 31),
+      U8(76 + 32), U16(76 + 33), U16(76 + 34), U8(76 + 35), U16(76 + 36), U16(76 + 37),
+      routed, SCR);
+
+  // ---- block 3 (MLA) ----
+  rmsnorm_fused(G_H, ACC, 1, U16(M_AN), G_N, SCR);
+  mla_attn(G_N,
+      U8(M_Q), U16(M_Q + 1), U16(M_Q + 2),
+      U8(M_A), U16(M_A + 1), U16(M_A + 2),
+      U8(M_B), U16(M_B + 1), U16(M_B + 2),
+      U8(M_O), U16(M_O + 1), U16(M_O + 2),
+      U16(D_CKVIN), U16(D_KRIN), W16(D_CKVOUT), W16(D_KROUT), L,
+      SCR, gS, theta, mscale);
+  rmsnorm_fused(G_H, ACC, 1, U16(M_MN), G_N, SCR);
+  moe_run(G_N, U16(M_RT),
+      U8(M_EG), U16(M_EG + 1), U16(M_EG + 2),
+      U8(M_EU), U16(M_EU + 1), U16(M_EU + 2),
+      U8(M_ED), U16(M_ED + 1), U16(M_ED + 2),
+      U8(M_SG), U16(M_SG + 1), U16(M_SG + 2),
+      U8(M_SU), U16(M_SU + 1), U16(M_SU + 2),
+      U8(M_SD), U16(M_SD + 1), U16(M_SD + 2),
+      routed, SCR);
+
+  uint16_t* h_out = W16(D_HOUT);
+  for (int i = gid; i < HD; i += nw) h_out[i] = f2bf(G_H[i] + ACC[i]);
+}
+
+void decode_step(std::vector<torch::Tensor> v, int64_t L, double routed,
+                 double theta, double kscale, double mscale) {
+  PtrTable T;
+  for (int i = 0; i < 167; ++i) T.p[i] = v[i].data_ptr();
+  megakernel<<<NB, NT, 4096, at::cuda::getCurrentCUDAStream().stream()>>>(
+      T, (int)L, (float)routed, (float)theta, (float)kscale, (float)mscale);
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+  m.def("decode_step", &decode_step);
+}
+"""
+
+
+def _build():
+    root = Path(__file__).parent
+    src = root / "mega_kernel.cu"
+    if not src.exists() or src.read_text() != _CUDA_SRC:
+        src.write_text(_CUDA_SRC)
+    build_dir = root / "mk_build"
+    build_dir.mkdir(exist_ok=True)
+    return load(
+        name="mega_decode",
+        sources=[str(src)],
+        build_directory=str(build_dir),
+        extra_cflags=["-O3"],
+        extra_cuda_cflags=["-O3", "-lineinfo", "-gencode=arch=compute_120,code=sm_120",
+                             # Cache globals in L2 only: blocks exchange data through
+                             # global memory, which needs L2 coherence (no stale L1).
+                             "-Xptxas", "-dlcm=cg"],
+    )
+
+
+_EXT = _build()
+
+
+
+# ==================================================================
+# ===== sidecar: mega_kernel.cu (27045 bytes, loaded by solution.py) =====
+# ==================================================================
+
+
+#include <torch/extension.h>
+#include <ATen/cuda/CUDAContext.h>
+
+// bf16 bit-cast helpers via PTX (the torch build defines
+// __CUDA_NO_BFLOAT16_CONVERSIONS__, so the cuda_bf16.h converters are off).
+__device__ __forceinline__ float bf2f(uint16_t b) {
+  float f; asm("{ cvt.f32.bf16 %0, %1; }" : "=f"(f) : "h"(b)); return f;
+}
+__device__ __forceinline__ uint16_t f2bf(float f) {
+  uint16_t b; asm("{ cvt.rn.bf16.f32 %0, %1; }" : "=h"(b) : "f"(f)); return b;
+}
+// Streaming (non-L2-allocating) int4 byte load for read-once weights.
+// Keeps the 128MB L2 for re-read data (x, scales, states, caches).
+__device__ __forceinline__ uint8_t ldcs(const uint8_t* p) {
+  uint32_t v; asm("ld.global.cs.u8 %0, [%1];" : "=r"(v) : "l"(p)); return (uint8_t)v;
+}
+__device__ __forceinline__ uint16_t ldcs16(const uint16_t* p) {
+  uint32_t v; asm("ld.global.cs.u16 %0, [%1];" : "=r"(v) : "l"(p)); return (uint16_t)v;
+}
+
+// ---- model dims (asserted against cfg on the host side) ----
+#define HD 2304
+#define KHC 4096
+#define MQQ 6144
+#define KVAO 576
+#define KLR 512
+#define KRQ 64
+#define NH 32
+#define DK 128
+#define NHE 1024
+#define NRT 64
+
+// ---- grid: NB blocks x NT threads, flat worker id GID over NWK workers ----
+#define NB 128
+#define NT 256
+#define BID (blockIdx.x)
+#define TID (threadIdx.x)
+#define GID (blockIdx.x * blockDim.x + threadIdx.x)
+#define NWK (gridDim.x * blockDim.x)
+
+// ---- scratch carve (float offsets into the persistent scratch; the absorbed
+// attention weights p[l,h] live at PSB, above the fixed region) ----
+#define S_H 0
+#define S_N 2304
+#define S_ACC 8448
+#define S_QKV 10752
+#define S_PRD 27136
+#define S_BETA 31232
+#define S_MISC 31264
+#define S_GATE 39456
+#define S_UP 48672
+#define S_PSB 65536
+// MISC layout: [0:NB] block staging, [64] norm mean, [128:192] router probs,
+// [192:208] topk idx/w, [1024:2048] MLA max/sum block staging (NB*32)
+#define M_STAGE 0
+#define M_MEAN 64
+#define M_PROB 128
+#define M_TOPK 192
+#define M_MAX 256
+#define M_SUM 288
+#define M_MSTAGE 1024
+
+// ---- MoE expert strides (bytes for wq, bf16 elems for scales/zeros) ----
+#define GQS 1179648
+#define GSS 18432
+#define DQS 1179648
+#define DSS 18432
+
+// ---- reusable ticket barrier over the whole grid (no reset needed;
+// counters are zero-initialized once and grow monotonically) ----
+__device__ unsigned gbar_cnt = 0;
+__device__ unsigned gbar_done = 0;
+__device__ void gbar() {
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    unsigned NBx = (unsigned)gridDim.x;
+    unsigned my = atomicAdd(&gbar_cnt, 1);
+    unsigned round = my / NBx;
+    if (my - round * NBx == NBx - 1) {
+      __threadfence();
+      atomicExch(&gbar_done, round + 1);
+    } else {
+      while (atomicAdd(&gbar_done, 0) < round + 1) {}
+    }
+  }
+  __syncthreads();
+  __threadfence();
+}
+
+// One dequantized dot product: output column n of an int4 (K,N) weight.
+__device__ float qdot(const float* __restrict__ x,
+                      const uint8_t* __restrict__ wq,
+                      const uint16_t* __restrict__ sc,
+                      const uint16_t* __restrict__ ze,
+                      int K, int N, int n) {
+  const int K2 = K >> 1;
+  const int Q = K2 >> 2;
+  float a0 = 0.f, a1 = 0.f, a2 = 0.f, a3 = 0.f;
+  #pragma unroll 4
+  for (int i = 0; i < Q; ++i) {
+    int k0 = i, k1 = i + Q, k2 = i + (Q << 1), k3 = i + Q * 3;
+    uint8_t b0 = ldcs(wq + k0 * N + n), b1 = ldcs(wq + k1 * N + n);
+    uint8_t b2 = ldcs(wq + k2 * N + n), b3 = ldcs(wq + k3 * N + n);
+    float s0 = bf2f(ldcs16(sc + (k0 >> 6) * N + n)), s1 = bf2f(ldcs16(sc + (k1 >> 6) * N + n));
+    float s2 = bf2f(ldcs16(sc + (k2 >> 6) * N + n)), s3 = bf2f(ldcs16(sc + (k3 >> 6) * N + n));
+    float z0 = bf2f(ldcs16(ze + (k0 >> 6) * N + n)), z1 = bf2f(ldcs16(ze + (k1 >> 6) * N + n));
+    float z2 = bf2f(ldcs16(ze + (k2 >> 6) * N + n)), z3 = bf2f(ldcs16(ze + (k3 >> 6) * N + n));
+    float x00 = x[k0 << 1], x01 = x[(k0 << 1) + 1];
+    float x10 = x[k1 << 1], x11 = x[(k1 << 1) + 1];
+    float x20 = x[k2 << 1], x21 = x[(k2 << 1) + 1];
+    float x30 = x[k3 << 1], x31 = x[(k3 << 1) + 1];
+    a0 += (x00 * ((b0 & 0xF) - z0) + x01 * ((b0 >> 4) - z0)) * s0;
+    a1 += (x10 * ((b1 & 0xF) - z1) + x11 * ((b1 >> 4) - z1)) * s1;
+    a2 += (x20 * ((b2 & 0xF) - z2) + x21 * ((b2 >> 4) - z2)) * s2;
+    a3 += (x30 * ((b3 & 0xF) - z3) + x31 * ((b3 >> 4) - z3)) * s3;
+  }
+  return a0 + a1 + a2 + a3;
+}
+
+// Fused int4 dequant GEMV, output-sharded over the grid.
+__device__ void gemv_qg(const float* __restrict__ x,
+                        const uint8_t* __restrict__ wq,
+                        const uint16_t* __restrict__ sc,
+                        const uint16_t* __restrict__ ze,
+                        int K, int N, float* __restrict__ y) {
+  int gid = GID, nw = NWK;
+  for (int n = gid; n < N; n += nw) y[n] = qdot(x, wq, sc, ze, K, N, n);
+}
+
+// bf16 row-major (out,in) GEMV, output-sharded (also used single-block).
+__device__ void gemv_bg(const float* __restrict__ x,
+                        const uint16_t* __restrict__ w,
+                        int K, int N, float* __restrict__ y) {
+  int gid = GID, nw = NWK;
+  const int Q = K >> 2;
+  for (int h = gid; h < N; h += nw) {
+    float a0 = 0.f, a1 = 0.f, a2 = 0.f, a3 = 0.f;
+    const uint16_t* row = w + h * K;
+    #pragma unroll 4
+    for (int i = 0; i < Q; ++i) {
+      int k0 = i, k1 = i + Q, k2 = i + (Q << 1), k3 = i + Q * 3;
+      a0 += x[k0] * bf2f(row[k0]);
+      a1 += x[k1] * bf2f(row[k1]);
+      a2 += x[k2] * bf2f(row[k2]);
+      a3 += x[k3] * bf2f(row[k3]);
+    }
+    y[h] = a0 + a1 + a2 + a3;
+  }
+}
+
+// RMSNorm with fused residual-add from ACC (use_acc=0 for the first norm).
+// Block 0 reduces the mean alone; the whole grid then scales, and the summed
+// residual is written back to SRC (always the G_H stream) for the next block.
+__device__ void rmsnorm_fused(float* SRC,
+                              const float* __restrict__ ACC, int use_acc,
+                              const uint16_t* __restrict__ W,
+                              float* __restrict__ DST, float* SCR) {
+  extern __shared__ float sh[];
+  int tid = TID, bid = BID;
+  if (bid == 0) {
+    float s = 0.f;
+    for (int i = tid; i < HD; i += NT) {
+      float v = SRC[i] + (use_acc ? ACC[i] : 0.f);
+      // Round the residual stream to bf16 exactly like the eager hidden, so
+      // downstream values track the reference to last-ulp (fewer tie flips).
+      if (use_acc) { v = bf2f(f2bf(v)); SRC[i] = v; }
+      s += v * v;
+    }
+    #pragma unroll
+    for (int o = 16; o > 0; o >>= 1) s += __shfl_xor_sync(0xFFFFFFFF, s, o);
+    if ((tid & 31) == 0) sh[tid >> 5] = s;
+    __syncthreads();
+    float m = (tid < 8) ? sh[tid] : 0.f;
+    if (tid < 8) {
+      #pragma unroll
+      for (int o = 4; o > 0; o >>= 1) m += __shfl_xor_sync(0xFF, m, o);
+      if (tid == 0) SCR[S_MISC + M_MEAN] = m / HD;
+    }
+  }
+  gbar();
+  float rms = rsqrtf(SCR[S_MISC + M_MEAN] + 1e-6f);
+  int gid = GID, nw = NWK;
+  for (int i = gid; i < HD; i += nw) {
+    float v = SRC[i];  // residual already added (+rounded) by the mean pass
+    DST[i] = bf2f(f2bf(v * rms * bf2f(W[i])));
+  }
+  gbar();
+}
+
+// Gated-delta (KDA) attention for one layer. x: normed input; out -> ACC.
+__device__ void kda_attn(
+    const float* __restrict__ x,
+    const uint8_t* qq, const uint16_t* qs, const uint16_t* qz,
+    const uint8_t* kq, const uint16_t* ks, const uint16_t* kz,
+    const uint8_t* vq, const uint16_t* vs, const uint16_t* vz,
+    const uint8_t* gq, const uint16_t* gs, const uint16_t* gz,
+    const uint8_t* oq, const uint16_t* os, const uint16_t* oz,
+    const uint16_t* __restrict__ betaw, const uint16_t* __restrict__ convw,
+    float* __restrict__ S, uint16_t* cq, uint16_t* ck, uint16_t* cv,
+    float* SCR, float kscale) {
+  float* QKV = SCR + S_QKV;
+  float* PRD = SCR + S_PRD;
+  float* ACC = SCR + S_ACC;
+  float* BETA = SCR + S_BETA;
+  int gid = GID, nw = NWK;
+  float* q = QKV;
+  float* k = QKV + KHC;
+  float* v = QKV + 2 * KHC;
+  float* g = QKV + 3 * KHC;
+  gemv_qg(x, qq, qs, qz, HD, KHC, q);
+  gemv_qg(x, kq, ks, kz, HD, KHC, k);
+  gemv_qg(x, vq, vs, vz, HD, KHC, v);
+  gemv_qg(x, gq, gs, gz, HD, KHC, g);
+  gbar();
+  // round + causal depthwise conv + SiLU + log-decay gate, fused per channel.
+  for (int c = gid; c < KHC; c += nw) {
+    float qr = bf2f(f2bf(q[c])), kr = bf2f(f2bf(k[c]));
+    float vr = bf2f(f2bf(v[c])), gr = bf2f(f2bf(g[c]));
+    float w0 = bf2f(cq[c]), w1 = bf2f(cq[KHC + c]), w2 = bf2f(cq[2 * KHC + c]);
+    float a = w0 * bf2f(convw[c * 4]) + w1 * bf2f(convw[c * 4 + 1])
+            + w2 * bf2f(convw[c * 4 + 2]) + qr * bf2f(convw[c * 4 + 3]);
+    float sq = a / (1.f + expf(-a));
+    q[c] = bf2f(f2bf(sq));
+    cq[c] = f2bf(w1); cq[KHC + c] = f2bf(w2); cq[2 * KHC + c] = f2bf(qr);
+    w0 = bf2f(ck[c]); w1 = bf2f(ck[KHC + c]); w2 = bf2f(ck[2 * KHC + c]);
+    a = w0 * bf2f(convw[KHC * 4 + c * 4]) + w1 * bf2f(convw[KHC * 4 + c * 4 + 1])
+      + w2 * bf2f(convw[KHC * 4 + c * 4 + 2]) + kr * bf2f(convw[KHC * 4 + c * 4 + 3]);
+    float sk = a / (1.f + expf(-a));
+    k[c] = bf2f(f2bf(sk));
+    ck[c] = f2bf(w1); ck[KHC + c] = f2bf(w2); ck[2 * KHC + c] = f2bf(kr);
+    w0 = bf2f(cv[c]); w1 = bf2f(cv[KHC + c]); w2 = bf2f(cv[2 * KHC + c]);
+    a = w0 * bf2f(convw[2 * KHC * 4 + c * 4]) + w1 * bf2f(convw[2 * KHC * 4 + c * 4 + 1])
+      + w2 * bf2f(convw[2 * KHC * 4 + c * 4 + 2]) + vr * bf2f(convw[2 * KHC * 4 + c * 4 + 3]);
+    float sv = a / (1.f + expf(-a));
+    v[c] = bf2f(f2bf(sv));
+    cv[c] = f2bf(w1); cv[KHC + c] = f2bf(w2); cv[2 * KHC + c] = f2bf(vr);
+    float sp = (gr > 20.f) ? gr : log1pf(expf(gr));
+    g[c] = -sp;
+  }
+  // per-head write strength on block 0 (x is still intact).
+  if (BID == 0) {
+    gemv_bg(x, betaw, HD, NH, BETA);
+    for (int i = TID; i < NH; i += NT) {
+      float t = bf2f(f2bf(BETA[i]));
+      BETA[i] = 1.f / (1.f + expf(-t));
+    }
+  }
+  gbar();
+  // S[h,i,j] *= exp(g[h,i])
+  const int NS = NH * DK * DK;
+  for (int s0 = gid; s0 < NS; s0 += nw) {
+    int h = s0 >> 14, i = (s0 >> 7) & 127;
+    S[s0] *= expf(g[(h << 7) + i]);
+  }
+  gbar();
+  // pred[h,j] = sum_i S[h,i,j] * k[h,i]
+  for (int hj = gid; hj < KHC; hj += nw) {
+    int h = hj >> 7, j = hj & 127;
+    float a = 0.f;
+    #pragma unroll 8
+    for (int i = 0; i < DK; ++i) a += S[(h << 14) + (i << 7) + j] * k[(h << 7) + i];
+    PRD[hj] = a;
+  }
+  gbar();
+  // S += beta[h] * k[h,i] * (v[h,j] - pred[h,j])
+  for (int s0 = gid; s0 < NS; s0 += nw) {
+    int h = s0 >> 14, i = (s0 >> 7) & 127, j = s0 & 127;
+    int hi = (h << 7) + i, hj = (h << 7) + j;
+    S[s0] += BETA[h] * k[hi] * (v[hj] - PRD[hj]);
+  }
+  gbar();
+  // o[h,j] = sum_i S[h,i,j] * q[h,i], bf16-rounded (reuses PRD).
+  for (int hj = gid; hj < KHC; hj += nw) {
+    int h = hj >> 7, j = hj & 127;
+    float a = 0.f;
+    #pragma unroll 8
+    for (int i = 0; i < DK; ++i) a += S[(h << 14) + (i << 7) + j] * q[(h << 7) + i];
+    PRD[hj] = bf2f(f2bf(a * kscale));
+  }
+  gbar();
+  // o_proj -> ACC (overwrite) with fused bf16 rounding.
+  for (int n = gid; n < HD; n += nw)
+    ACC[n] = bf2f(f2bf(qdot(PRD, oq, os, oz, KHC, HD, n)));
+  gbar();
+}
+
+// One absorbed MLA score row: sc[h] = (q_nope[h].Wk[h]'.C[l] + q_rope[h].K[l]) * mscale
+__device__ void mla_row_scores(int l, const float* __restrict__ qabs,
+                               const float* __restrict__ qr,
+                               const uint16_t* __restrict__ ckv,
+                               const uint16_t* __restrict__ kr,
+                               float mscale, float* sc) {
+  float s[NH];
+  #pragma unroll
+  for (int h = 0; h < NH; ++h) s[h] = 0.f;
+  for (int r = 0; r < KLR; ++r) {
+    float c = bf2f(ckv[l * KLR + r]);
+    #pragma unroll
+    for (int h = 0; h < NH; ++h) s[h] += c * qabs[(h << 9) + r];
+  }
+  for (int d = 0; d < KRQ; ++d) {
+    float c = bf2f(kr[l * KRQ + d]);
+    #pragma unroll
+    for (int h = 0; h < NH; ++h) s[h] += qr[(h << 6) + d] * c;
+  }
+  #pragma unroll
+  for (int h = 0; h < NH; ++h) sc[h] = s[h] * mscale;
+}
+
+// MLA layer with absorbed latent attention. x: normed input; out -> ACC.
+__device__ void mla_attn(
+    const float* __restrict__ x,
+    const uint8_t* qq, const uint16_t* qs, const uint16_t* qz,
+    const uint8_t* aq, const uint16_t* as, const uint16_t* az,
+    const uint8_t* bq, const uint16_t* bs, const uint16_t* bz,
+    const uint8_t* oq, const uint16_t* os, const uint16_t* oz,
+    const uint16_t* __restrict__ ckv_in, const uint16_t* __restrict__ kr_in,
+    uint16_t* ckv_out, uint16_t* kr_out, int L,
+    float* SCR, float* gS, float theta, float mscale) {
+  extern __shared__ float sh[];
+  float* Q = SCR + S_QKV;    // q (6144), then absorbed query qabs (16384)
+  float* KV = SCR + S_PRD;   // c_new (512) + k_rope_new (64)
+  float* QN = SCR + S_N;     // compact qn (4096) + qr (2048); x is dead
+  float* ACC = SCR + S_ACC;
+  float* MISC = SCR + S_MISC;
+  float* gP = SCR + S_PSB;
+  int gid = GID, nw = NWK;
+  gemv_qg(x, qq, qs, qz, HD, MQQ, Q);
+  gemv_qg(x, aq, as, az, HD, KVAO, KV);
+  gbar();
+  for (int i = gid; i < MQQ; i += nw) Q[i] = bf2f(f2bf(Q[i]));
+  for (int i = gid; i < KVAO; i += nw) KV[i] = bf2f(f2bf(KV[i]));
+  // q is per-head (nope 128, rope 64); gather compact qn/qr into QN.
+  for (int t = gid; t < NH * 192; t += nw) {
+    int h = t / 192, j = t % 192;
+    float v = Q[h * 192 + j];
+    QN[(j < DK) ? (h * DK + j) : (KHC + h * KRQ + (j - DK))] = v;
+  }
+  gbar();
+  float* qn = QN;
+  float* qr = QN + KHC;
+  // RoPE on q_rope (32 heads x 32 pairs) and on the new rope key, position L.
+  for (int p = gid; p < NH * 32; p += nw) {
+    int h = p >> 5, pair = p & 31;
+    float ang = (float)L * powf(theta, -(pair / 32.f));
+    float c = cosf(ang), s = sinf(ang);
+    float x0 = qr[(h << 6) + pair * 2], x1 = qr[(h << 6) + pair * 2 + 1];
+    qr[(h << 6) + pair * 2] = bf2f(f2bf(x0 * c - x1 * s));
+    qr[(h << 6) + pair * 2 + 1] = bf2f(f2bf(x0 * s + x1 * c));
+  }
+  for (int p = gid; p < 32; p += nw) {
+    float ang = (float)L * powf(theta, -(p / 32.f));
+    float c = cosf(ang), s = sinf(ang);
+    float x0 = KV[KLR + p * 2], x1 = KV[KLR + p * 2 + 1];
+    KV[KLR + p * 2] = bf2f(f2bf(x0 * c - x1 * s));
+    KV[KLR + p * 2 + 1] = bf2f(f2bf(x0 * s + x1 * c));
+  }
+  gbar();
+  // Append the new latent + rope rows to the caches.
+  const int Lp1 = L + 1;
+  for (int f = gid; f < L * KLR; f += nw) ckv_out[f] = ckv_in[f];
+  for (int f = gid; f < L * KRQ; f += nw) kr_out[f] = kr_in[f];
+  for (int r = gid; r < KLR; r += nw) ckv_out[L * KLR + r] = f2bf(KV[r]);
+  for (int r = gid; r < KRQ; r += nw) kr_out[L * KRQ + r] = f2bf(KV[KLR + r]);
+  gbar();
+  // Absorbed query: qabs[h,r] = sum_d qn[h,d] * Wk[r, h*256+d] -> Q.
+  for (int t = gid; t < NH * KLR; t += nw) {
+    int h = t >> 9, r = t & 511;
+    float a = 0.f;
+    #pragma unroll 8
+    for (int d = 0; d < DK; ++d) {
+      int n = (h << 8) + d;
+      uint8_t b = bq[(r >> 1) * 8192 + n];
+      float s = bf2f(bs[(r >> 7) * 8192 + n]);
+      float z = bf2f(bz[(r >> 7) * 8192 + n]);
+      float w = ((r & 1) ? (b >> 4) : (b & 0xF)) - z;
+      a += qn[(h << 7) + d] * w * s;
+    }
+    Q[t] = a;
+  }
+  gbar();
+  const float* qabs = Q;
+  // Pass 0: raw scores sc[l,h] -> gP (fp32, exact). Later passes read the
+  // buffer instead of recomputing (identical values, 1/3 of the FLOPs).
+  for (int l = gid; l < Lp1; l += nw) {
+    float sc[NH];
+    mla_row_scores(l, qabs, qr, ckv_out, kr_out, mscale, sc);
+    #pragma unroll
+    for (int h = 0; h < NH; ++h) gP[l * NH + h] = sc[h];
+  }
+  gbar();
+  // Pass 1a: per-head max over rows (rows sharded; two-level reduction).
+  {
+    float mx[NH];
+    #pragma unroll
+    for (int h = 0; h < NH; ++h) mx[h] = -1e30f;
+    for (int l = gid; l < Lp1; l += nw) {
+      #pragma unroll
+      for (int h = 0; h < NH; ++h) mx[h] = fmaxf(mx[h], gP[l * NH + h]);
+    }
+    for (int h = 0; h < NH; ++h) {
+      float v = mx[h];
+      #pragma unroll
+      for (int o = 16; o > 0; o >>= 1) v = fmaxf(v, __shfl_xor_sync(0xFFFFFFFF, v, o));
+      if ((TID & 31) == 0) sh[(TID >> 5) * NH + h] = v;
+    }
+    __syncthreads();
+    if (TID < NH) {
+      float v = -1e30f;
+      for (int w = 0; w < 8; ++w) v = fmaxf(v, sh[w * NH + TID]);
+      MISC[M_MSTAGE + BID * NH + TID] = v;
+    }
+  }
+  gbar();
+  if (BID == 0) {
+    for (int h = TID; h < NH; h += NT) {
+      float v = -1e30f;
+      for (int b = 0; b < NB; ++b) v = fmaxf(v, MISC[M_MSTAGE + b * NH + h]);
+      MISC[M_MAX + h] = v;
+    }
+  }
+  gbar();
+  // Pass 1b: per-head denominator.
+  {
+    float sm[NH];
+    #pragma unroll
+    for (int h = 0; h < NH; ++h) sm[h] = 0.f;
+    for (int l = gid; l < Lp1; l += nw) {
+      #pragma unroll
+      for (int h = 0; h < NH; ++h) sm[h] += expf(gP[l * NH + h] - MISC[M_MAX + h]);
+    }
+    for (int h = 0; h < NH; ++h) {
+      float v = sm[h];
+      #pragma unroll
+      for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xFFFFFFFF, v, o);
+      if ((TID & 31) == 0) sh[(TID >> 5) * NH + h] = v;
+    }
+    __syncthreads();
+    if (TID < NH) {
+      float v = 0.f;
+      for (int w = 0; w < 8; ++w) v += sh[w * NH + TID];
+      MISC[M_MSTAGE + BID * NH + TID] = v;
+    }
+  }
+  gbar();
+  if (BID == 0) {
+    for (int h = TID; h < NH; h += NT) {
+      float v = 0.f;
+      for (int b = 0; b < NB; ++b) v += MISC[M_MSTAGE + b * NH + h];
+      MISC[M_SUM + h] = v;
+    }
+  }
+  gbar();
+  // Pass 1c: normalize scores to weights p[l,h], in place in gP.
+  for (int l = gid; l < Lp1; l += nw) {
+    #pragma unroll
+    for (int h = 0; h < NH; ++h) {
+      float s = gP[l * NH + h];
+      gP[l * NH + h] = expf(s - MISC[M_MAX + h]) / MISC[M_SUM + h];
+    }
+  }
+  gbar();
+  // Pass 2: absorbed state s[h,r] = sum_l p[l,h] * C[l,r]. Threads are mapped
+  // r-major (t = r*32+h) so each warp shares one r: the C[l,r] load broadcasts
+  // and the gP row is contiguous (was: strided 2GB re-read of the cache).
+  for (int t = gid; t < NH * KLR; t += nw) {
+    int h = t & 31, r = t >> 5;
+    float a = 0.f;
+    #pragma unroll 4
+    for (int l = 0; l < Lp1; ++l) a += gP[l * NH + h] * bf2f(ckv_out[l * KLR + r]);
+    gS[(h << 9) + r] = a;
+  }
+  gbar();
+  // o[h,d] = sum_r gS[h,r] * Wv[r, h*256+128+d] -> QN (qn/qr dead), rounded.
+  for (int t = gid; t < NH * DK; t += nw) {
+    int h = t >> 7, d = t & 127;
+    float a = 0.f;
+    int n = (h << 8) + 128 + d;
+    #pragma unroll 8
+    for (int r = 0; r < KLR; ++r) {
+      uint8_t b = bq[(r >> 1) * 8192 + n];
+      float s = bf2f(bs[(r >> 7) * 8192 + n]);
+      float z = bf2f(bz[(r >> 7) * 8192 + n]);
+      float w = ((r & 1) ? (b >> 4) : (b & 0xF)) - z;
+      a += gS[(h << 9) + r] * w * s;
+    }
+    QN[t] = bf2f(f2bf(a));
+  }
+  gbar();
+  // o_proj -> ACC (overwrite) with fused rounding.
+  for (int n = gid; n < HD; n += nw)
+    ACC[n] = bf2f(f2bf(qdot(QN, oq, os, oz, KHC, HD, n)));
+  gbar();
+}
+
+// Top-8 routed MoE + 1 shared expert. x: normed input. ACC zeroed here.
+__device__ void moe_run(
+    const float* __restrict__ x,
+    const uint16_t* __restrict__ routerw,
+    const uint8_t* gq, const uint16_t* gs, const uint16_t* gz,
+    const uint8_t* uq, const uint16_t* us, const uint16_t* uz,
+    const uint8_t* dq, const uint16_t* ds, const uint16_t* dz,
+    const uint8_t* sgq, const uint16_t* sgs, const uint16_t* sgz,
+    const uint8_t* suq, const uint16_t* sus, const uint16_t* suz,
+    const uint8_t* sdq, const uint16_t* sds, const uint16_t* sdz,
+    float routed, float* SCR) {
+  float* MISC = SCR + S_MISC;
+  float* GATE = SCR + S_GATE;
+  float* ACC = SCR + S_ACC;
+  int gid = GID, nw = NWK;
+  // Router (+softmax/topk on block 0) concurrent with zeroing ACC.
+  if (BID == 0) {
+    gemv_bg(x, routerw, HD, NRT, MISC + M_PROB);
+    for (int i = TID; i < NRT; i += NT) MISC[M_PROB + i] = bf2f(f2bf(MISC[M_PROB + i]));
+    __syncthreads();
+    if (TID == 0) {
+      float* pr = MISC + M_PROB;
+      float mx = -1e30f;
+      for (int e = 0; e < NRT; ++e) mx = fmaxf(mx, pr[e]);
+      float s = 0.f;
+      for (int e = 0; e < NRT; ++e) { float v = expf(pr[e] - mx); pr[e] = v; s += v; }
+      for (int e = 0; e < NRT; ++e) pr[e] /= s;
+      int idx[8];
+      float wv[8];
+      #pragma unroll
+      for (int j = 0; j < 8; ++j) { idx[j] = -1; wv[j] = -1.f; }
+      for (int e = 0; e < NRT; ++e) {
+        float p = pr[e];
+        for (int j = 0; j < 8; ++j) {
+          if (p > wv[j]) {
+            for (int k = 7; k > j; --k) { wv[k] = wv[k - 1]; idx[k] = idx[k - 1]; }
+            wv[j] = p; idx[j] = e;
+            break;
+          }
+        }
+      }
+      float ws = 1e-9f;
+      for (int j = 0; j < 8; ++j) ws += wv[j];
+      for (int j = 0; j < 8; ++j) {
+        MISC[M_TOPK + j] = (float)idx[j];
+        MISC[M_TOPK + 8 + j] = wv[j] / ws * routed;
+      }
+    }
+  }
+  for (int i = gid; i < HD; i += nw) ACC[i] = 0.f;
+  gbar();
+  // Gates + ups + SiLU for the 8 routed experts and the shared one, fused.
+  const float* topk = MISC + M_TOPK;
+  for (int t = gid; t < 9 * NHE; t += nw) {
+    int r = (t < 8 * NHE);
+    int e = r ? (int)topk[t >> 10] : 0;
+    const uint8_t* gqb = r ? gq : sgq;
+    const uint16_t* gsb = r ? gs : sgs;
+    const uint16_t* gzb = r ? gz : sgz;
+    const uint8_t* uqb = r ? uq : suq;
+    const uint16_t* usb = r ? us : sus;
+    const uint16_t* uzb = r ? uz : suz;
+    int j = t & (NHE - 1);
+    int eo = r ? e * GQS : 0;
+    int es = r ? e * GSS : 0;
+    float gg = qdot(x, gqb + eo, gsb + es, gzb + es, HD, NHE, j);
+    float uu = qdot(x, uqb + eo, usb + es, uzb + es, HD, NHE, j);
+    GATE[t] = (gg / (1.f + expf(-gg))) * uu;
+  }
+  gbar();
+  // Down projections: all 9 experts (8 routed + shared) in parallel over the
+  // grid (9x workers), partials in PSB staging, then the SAME sequential
+  // j-order reduction -> bit-identical to the sequential version.
+  float* PART = SCR + S_PSB;
+  for (int t = gid; t < 9 * HD; t += nw) {
+    int j = t / HD, n = t % HD;
+    if (j < 8) {
+      int e = (int)topk[j];
+      PART[t] = qdot(GATE + j * NHE, dq + e * DQS, ds + e * DSS, dz + e * DSS,
+                     NHE, HD, n);
+    } else {
+      PART[t] = qdot(GATE + 8 * NHE, sdq, sds, sdz, NHE, HD, n);
+    }
+  }
+  gbar();
+  for (int j = 0; j < 8; ++j) {
+    float w = topk[8 + j];
+    const float* pj = PART + j * HD;
+    for (int n = gid; n < HD; n += nw) ACC[n] += w * pj[n];
+  }
+  {
+    const float* pj = PART + 8 * HD;
+    for (int n = gid; n < HD; n += nw) ACC[n] += pj[n];
+  }
+  gbar();
+}
+
+// ---- pointer-table indices (host gather order; 167 entries) ----
+#define KDA_SZ 38
+#define F_AN 0
+#define F_MN 1
+#define F_Q 2
+#define F_K 5
+#define F_V 8
+#define F_G 11
+#define F_O 14
+#define F_BETA 17
+#define F_CONV 18
+#define F_RT 19
+#define F_EG 20
+#define F_EU 23
+#define F_ED 26
+#define F_SG 29
+#define F_SU 32
+#define F_SD 35
+#define M_AN 114
+#define M_MN 115
+#define M_Q 116
+#define M_A 119
+#define M_B 122
+#define M_O 125
+#define M_RT 128
+#define M_EG 129
+#define M_EU 132
+#define M_ED 135
+#define M_SG 138
+#define M_SU 141
+#define M_SD 144
+#define D_S0 147
+#define D_S1 151
+#define D_S2 155
+#define D_CKVIN 159
+#define D_KRIN 160
+#define D_CKVOUT 161
+#define D_KROUT 162
+#define D_HIN 163
+#define D_HOUT 164
+#define D_SCP 165
+#define D_SCS 166
+
+struct PtrTable { const void* p[167]; };
+
+#define U16(i) ((const uint16_t*)T.p[i])
+#define U8(i) ((const uint8_t*)T.p[i])
+#define F32(i) ((float*)T.p[i])
+#define W16(i) ((uint16_t*)T.p[i])
+
+// The entire per-token decode: 3x (KDA + MoE) + 1x (MLA + MoE), one grid.
+__global__ void megakernel(PtrTable T, int L, float routed, float theta,
+                           float kscale, float mscale) {
+  float* SCR = F32(D_SCP);
+  float* gS = F32(D_SCS);
+  float* G_H = SCR + S_H;
+  float* G_N = SCR + S_N;
+  float* ACC = SCR + S_ACC;
+  int gid = GID, nw = NWK;
+  const uint16_t* h_in = U16(D_HIN);
+  for (int i = gid; i < HD; i += nw) G_H[i] = bf2f(h_in[i]);
+  gbar();
+
+  // ---- block 0 (KDA) ----
+  rmsnorm_fused(G_H, ACC, 0, U16(F_AN), G_N, SCR);
+  kda_attn(G_N,
+      U8(2), U16(3), U16(4), U8(5), U16(6), U16(7), U8(8), U16(9), U16(10),
+      U8(11), U16(12), U16(13), U8(14), U16(15), U16(16),
+      U16(17), U16(18), F32(D_S0), W16(D_S0 + 1), W16(D_S0 + 2), W16(D_S0 + 3),
+      SCR, kscale);
+  rmsnorm_fused(G_H, ACC, 1, U16(F_MN), G_N, SCR);
+  moe_run(G_N, U16(F_RT),
+      U8(20), U16(21), U16(22), U8(23), U16(24), U16(25), U8(26), U16(27), U16(28),
+      U8(29), U16(30), U16(31), U8(32), U16(33), U16(34), U8(35), U16(36), U16(37),
+      routed, SCR);
+
+  // ---- block 1 (KDA) ----
+  rmsnorm_fused(G_H, ACC, 1, U16(38 + F_AN), G_N, SCR);
+  kda_attn(G_N,
+      U8(38 + 2), U16(38 + 3), U16(38 + 4), U8(38 + 5), U16(38 + 6), U16(38 + 7),
+      U8(38 + 8), U16(38 + 9), U16(38 + 10), U8(38 + 11), U16(38 + 12), U16(38 + 13),
+      U8(38 + 14), U16(38 + 15), U16(38 + 16),
+      U16(38 + 17), U16(38 + 18), F32(D_S1), W16(D_S1 + 1), W16(D_S1 + 2), W16(D_S1 + 3),
+      SCR, kscale);
+  rmsnorm_fused(G_H, ACC, 1, U16(38 + F_MN), G_N, SCR);
+  moe_run(G_N, U16(38 + F_RT),
+      U8(38 + 20), U16(38 + 21), U16(38 + 22), U8(38 + 23), U16(38 + 24), U16(38 + 25),
+      U8(38 + 26), U16(38 + 27), U16(38 + 28), U8(38 + 29), U16(38 + 30), U16(38 + 31),
+      U8(38 + 32), U16(38 + 33), U16(38 + 34), U8(38 + 35), U16(38 + 36), U16(38 + 37),
+      routed, SCR);
+
+  // ---- block 2 (KDA) ----
+  rmsnorm_fused(G_H, ACC, 1, U16(76 + F_AN), G_N, SCR);
+  kda_attn(G_N,
+      U8(76 + 2), U16(76 + 3), U16(76 + 4), U8(76 + 5), U16(76 + 6), U16(76 + 7),
+      U8(76 + 8), U16(76 + 9), U16(76 + 10), U8(76 + 11), U16(76 + 12), U16(76 + 13),
+      U8(76 + 14), U16(76 + 15), U16(76 + 16),
+      U16(76 + 17), U16(76 + 18), F32(D_S2), W16(D_S2 + 1), W16(D_S2 + 2), W16(D_S2 + 3),
+      SCR, kscale);
+  rmsnorm_fused(G_H, ACC, 1, U16(76 + F_MN), G_N, SCR);
+  moe_run(G_N, U16(76 + F_RT),
+      U8(76 + 20), U16(76 + 21), U16(76 + 22), U8(76 + 23), U16(76 + 24), U16(76 + 25),
+      U8(76 + 26), U16(76 + 27), U16(76 + 28), U8(76 + 29), U16(76 + 30), U16(76 + 31),
+      U8(76 + 32), U16(76 + 33), U16(76 + 34), U8(76 + 35), U16(76 + 36), U16(76 + 37),
+      routed, SCR);
+
+  // ---- block 3 (MLA) ----
+  rmsnorm_fused(G_H, ACC, 1, U16(M_AN), G_N, SCR);
+  mla_attn(G_N,
+      U8(M_Q), U16(M_Q + 1), U16(M_Q + 2),
+      U8(M_A), U16(M_A + 1), U16(M_A + 2),
+      U8(M_B), U16(M_B + 1), U16(M_B + 2),
+      U8(M_O), U16(M_O + 1), U16(M_O + 2),
+      U16(D_CKVIN), U16(D_KRIN), W16(D_CKVOUT), W16(D_KROUT), L,
+      SCR, gS, theta, mscale);
+  rmsnorm_fused(G_H, ACC, 1, U16(M_MN), G_N, SCR);
+  moe_run(G_N, U16(M_RT),
+      U8(M_EG), U16(M_EG + 1), U16(M_EG + 2),
+      U8(M_EU), U16(M_EU + 1), U16(M_EU + 2),
+      U8(M_ED), U16(M_ED + 1), U16(M_ED + 2),
+      U8(M_SG), U16(M_SG + 1), U16(M_SG + 2),
+      U8(M_SU), U16(M_SU + 1), U16(M_SU + 2),
+      U8(M_SD), U16(M_SD + 1), U16(M_SD + 2),
+      routed, SCR);
+
+  uint16_t* h_out = W16(D_HOUT);
+  for (int i = gid; i < HD; i += nw) h_out[i] = f2bf(G_H[i] + ACC[i]);
+}
+
+void decode_step(std::vector<torch::Tensor> v, int64_t L, double routed,
+                 double theta, double kscale, double mscale) {
+  PtrTable T;
+  for (int i = 0; i < 167; ++i) T.p[i] = v[i].data_ptr();
+  megakernel<<<NB, NT, 4096, at::cuda::getCurrentCUDAStream().stream()>>>(
+      T, (int)L, (float)routed, (float)theta, (float)kscale, (float)mscale);
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+  m.def("decode_step", &decode_step);
+}
