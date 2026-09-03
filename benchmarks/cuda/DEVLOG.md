@@ -152,3 +152,28 @@ columns (`framework`, `triton_cheat`).
 
 Rsynced from Hard (scripts + src + kbh CLI). Package renamed
 `kernelbench-cuda`. Do not edit Hard/Mega prompts from this workstream.
+
+## 2026-09-03 — gemini-3.8-flash-high on RTX PRO 6000 (published) and H100 SXM (held)
+
+agy (Antigravity CLI) cells, all isolated-regraded and overwrite-probed on the
+box. RTX PRO 6000 board: 02_deepseek_nsa 0.0958 clean, 03_megaqwen_decode 0.0426
+clean, 04_grid_mingru_sps 0.3637 interesting (exact-fp32 path only for the
+num_envs <= 256 shape check.py runs, TF32 on graded shapes, but the strict
+oracle matches positions/rewards/logits at every graded shape and seed, same
+bar as the qwen3.8-max 0.2848 cell). 01_glm52_fused_moe 0.0918 is
+`verdict: contamination` and unpublished: the agent grepped every prior
+peak_fraction in results/annotations for the problem and opened the 0.2787
+top-scorer's annotation before coding. Root cause: scripts/lib/run_harness.sh
+has no bwrap sandbox (mega's run_hard.sh does), and `kb contamination` only
+looks for outputs/runs references, so annotation reads pass it. Mitigation on
+the boxes was moving results/ and DEVLOG.md out of the tree and pulled run dirs
+out of outputs/runs before the later cells; repo fix pending (port the KBH_SBX
+block, extend kb contamination to results/annotations reads). Publish commit
+deeea1f (manifest published_runs.json += the three clean run ids); traces on
+Infatoshi/kernelbench-cuda-traces. H100 SXM5 cells (deck problems-h100sxm,
+archives in outputs/runs-h100sxm, gitignored): 01 0.0805 contamination (same
+annotation reads), 02 0.0417, 03 0.049, 04 0.3645; there is no H100 SXM cuda
+board, so these stay unpublished until one is decided. Bench-level fixes noted:
+check.py should exercise a long-ctx shape for 03 (both gemini cells fill the KV
+cache with noise above 8192, like the deepseek-v4-pro cell) and a graded-shape
+fidelity check for 04.

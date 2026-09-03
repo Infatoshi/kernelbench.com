@@ -352,3 +352,35 @@ timed region — or grade time-to-threshold instead of steps-per-second.
 checked that PPO (clip/GAE/stochastic sampling) was used; on a learnable enough
 env a greedy controller could clear the band faster. A throughput metric
 structurally rewards doing less.
+
+## 2026-09-02 — agy (Antigravity CLI) harness, gemini-3.8-flash-high on Verda RTX PRO 6000
+
+New harness `agy` in run_hard.sh + scripts/lib/run_harness.sh and a stream-json
+parser (src/viewer/parsers/agy.py, events init/step_update/result; completion
+marker `"event":"result"`). Flag-order trap: a bare `--print` swallows the next
+flag as the prompt, so `-p "$PROMPT"` goes last. Auth is OS-keyring OAuth; on a
+headless box run the sign-in inside tmux, capture the URL with a 1200-col pane,
+paste the user's code. The GEMINI_API_KEY provider path is dead (project quota
+0). Box: Verda kb-agy-rtx (default profile, 1x RTX PRO 6000 Blackwell Server
+Edition, driver 580, cu130 torch 2.11). Run 20260902_201226_agy_gemini-3.8-flash-high_02_kimi_linear_decode
+launched 20:12Z, unlimited budget, bwrap sandbox; ~/cuda_queue.sh then runs the
+four cuda problems in sequence on the same GPU. Results pending.
+
+## 2026-09-03 — gemini-3.8-flash-high cells published (RTX PRO 6000 + H100), muse-spark-1.3 queued
+
+Both agy mega cells are on the board after isolated regrade and a same-buffer
+overwrite probe on the box: RTX PRO 6000 Blackwell 2.7406 (in-run 2.752) and
+H100 SXM5 2.0676 (in-run 2.1075), both `verdict: clean`,
+`megakernel_authentic: true` (one cooperative launch per step, 31 and 14
+grid.sync sites). The H100 run carries gpu marker `H100` so it lands on the
+existing H100 tab (the board self-normalises against baseline.py on the same
+box; the annotation says SXM5). Sandbox gap seen in the H100 trace: bwrap
+hides results/, outputs/runs and DEVLOG but not src/ or scripts/, and the agent
+read src/eval/megakernel.py and ran scripts/megakernel_evidence.py on itself.
+Not gaming (PROMPT.txt announces the judge), but those paths should be
+tmpfs-hidden too. The problem prompt is worded for the RTX PRO 6000 even on the
+H100 box, as for every H100 mega cell. Publish commit deeea1f; traces pushed to
+Infatoshi/kernelbench-mega-traces. New harness `muse` (Meta Muse Code CLI,
+`muse exec --json --yolo ... --model muse-spark-1.3 --reasoning-effort ultra`,
+parser src/viewer/parsers/muse.py) runs 02_kimi_linear_decode on both boxes
+after the gemini queues; results pending.
