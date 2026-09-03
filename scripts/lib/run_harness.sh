@@ -2508,7 +2508,8 @@ case "$HARNESS" in
             "${MUSE_EFFORT_ARG[@]}" \
             "$PROMPT" ) \
             </dev/null > "$LOG_FILE" 2> "$STDERR_FILE" || HARNESS_EXIT=$?
-        MUSE_SESSION_ID="$(grep -o '"stream": *{"kind": *"session", *"id": *"[^"]*"' "$LOG_FILE" 2>/dev/null | head -1 | sed 's/.*"id": *"//; s/"$//')"
+        # grep -m1 (not | head -1): with pipefail a SIGPIPE'd grep exits 141 and set -e kills the run before grading.
+        MUSE_SESSION_ID="$({ grep -m1 -o '"stream": *{"kind": *"session", *"id": *"[^"]*"' "$LOG_FILE" 2>/dev/null || true; } | sed 's/.*"id": *"//; s/"$//')"
         if [ -n "$MUSE_SESSION_ID" ]; then
             ( cd "$PROBLEM_DIR" && "${MUSE_BIN:-$HOME/.local/bin/muse}" export --session "$MUSE_SESSION_ID" --out "$RUN_DIR/muse_export.json" ) >> "$STDERR_FILE" 2>&1 || true
         fi
