@@ -70,6 +70,8 @@ MODEL_NAMES = {
     "composer-2.5-fast": "Composer 2.5 Fast",
     "composer-2.5": "Composer 2.5",
     "gemini-3.5-flash": "Gemini 3.5 Flash",
+    "gemini-3.8-flash-high": "Gemini 3.8 Flash (High)",
+    "muse-spark-1.3": "Muse Spark 1.3",
     "gemini-3.1-pro-preview": "Gemini 3.1 Pro",
     "deepseek-v4-pro": "DeepSeek V4 Pro",
     "deepseek-v4-flash": "DeepSeek V4 Flash",
@@ -102,6 +104,7 @@ LAB_BY_PREFIX = [
     ("hy3", "Tencent"),
     ("qwen", "Alibaba"),
     ("mimo", "Xiaomi"),
+    ("muse", "Meta"),
     ("nemotron", "NVIDIA"),
     ("fugu", "Sakana AI"),
 ]

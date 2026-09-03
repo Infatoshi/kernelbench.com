@@ -12,10 +12,12 @@ const LIVE_MODEL_SLUGS = new Set([
   "claude-fable-5-1",
   "claude-opus-5",
   "deepseek-v4-flash-0731",
+  "gemini-3.8-flash-high",
   "glm-5.3",
   "gpt-5.6-sol",
   "grok-4.6",
   "kinetic-0715",
+  "muse-spark-1.3",
   "ox-alpha",
   "qwen3.8-max",
 ])

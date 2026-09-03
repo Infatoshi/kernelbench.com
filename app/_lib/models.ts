@@ -896,8 +896,8 @@ function correctnessOf(index: ModelIndex, m: ModelEntry): {
  *   Cursor     composer-2.5-fast                 Meituan  longcat-2.0
  *   Moonshot   kinetic-0715 / 1m (k2.6/k2.7 dropped)
  *   Tencent    hy3 (hy3-preview removed)
- *   Google     none — both gemini models removed site-wide (see
- *              REMOVED_MODEL_SLUGS in models.server.ts)
+ *   Google     gemini-3.8-flash-high (3.5-flash and 3.1-pro dropped)
+ *   Meta       muse-spark-1.3
  */
 export const CHART_HIDDEN_SLUGS = new Set([
   "claude-opus-4-6",
