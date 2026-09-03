@@ -1,10 +1,11 @@
 """Cross-run contamination audit for KernelBench runs (any bench).
 
-The harness does NOT sandbox the agent filesystem: an agent has bash + absolute
-paths, so it can read the shared `outputs/runs/` archive -- every prior winning
-solution -- and reverse-engineer a known answer instead of writing its own
-kernel. A run is CONTAMINATED if its agent transcript references another run's
-archive (`outputs/runs/<other_ts>`).
+The host harness sandboxes the agent with bwrap when available, but a run is
+still CONTAMINATED if its agent transcript references another run's archive
+(`outputs/runs/<other_ts>`). A separate "audit-corpus read" category flags
+transcripts that mention results/annotations, leaderboards, DEVLOG.md, or
+public/runs (prior scores and audit recipes), with matching line numbers.
+That category does not change this command's exit code.
 
 This is the audit `kb lint` does NOT do (lint only scans a single solution.py
 for in-solution reward-hacks). Run it before publishing; the leaderboard
@@ -37,6 +38,16 @@ _CP_FOREIGN = re.compile(
 # e.g. "20260715_212751_grok_grok-4.5_01_glm52_fused_moe".
 _RUN_DIR_ID = re.compile(r"\b(\d{8}_\d{6})_[a-z]")
 _TOKEN_TYPES = ("thought", "text")
+# Prior scores / audit recipes. Separate from archive-path contamination.
+_AUDIT_CORPUS = (
+    "results/annotations",
+    "results/leaderboard",
+    "leaderboard.h100.json",
+    "leaderboard.b200.json",
+    "leaderboard_v2.json",
+    "DEVLOG.md",
+    "public/runs",
+)
 
 
 def _token_stream_text(raw: str) -> str | None:
@@ -170,6 +181,23 @@ def other_archives(run_dir: Path) -> set[str]:
     return seen
 
 
+def audit_corpus_hits(run_dir: Path) -> list[tuple[str, int, str]]:
+    """(file, 1-indexed line, needle) for audit-corpus paths in the agent transcript.
+
+    Only transcript.jsonl / codex_session.jsonl, same as other_archives.
+    """
+    hits: list[tuple[str, int, str]] = []
+    for fn in ("transcript.jsonl", "codex_session.jsonl"):
+        p = run_dir / fn
+        if not p.exists():
+            continue
+        for i, line in enumerate(p.read_text(errors="ignore").splitlines(), 1):
+            for needle in _AUDIT_CORPUS:
+                if needle in line:
+                    hits.append((fn, i, needle))
+    return hits
+
+
 def run(argv: list[str] | None = None, repo_root: Path | None = None) -> int:
     ap = argparse.ArgumentParser(prog="kb contamination")
     ap.add_argument(
@@ -188,6 +216,7 @@ def run(argv: list[str] | None = None, repo_root: Path | None = None) -> int:
         return 1
 
     dirty: dict[str, int] = {}
+    corpus: dict[str, list[tuple[str, int, str]]] = {}
     total = 0
     for d in sorted(runs.iterdir()):
         if not d.is_dir():
@@ -196,10 +225,22 @@ def run(argv: list[str] | None = None, repo_root: Path | None = None) -> int:
         n = other_archives(d)
         if n:
             dirty[d.name] = len(n)
+        hits = audit_corpus_hits(d)
+        if hits:
+            corpus[d.name] = hits
 
     print(f"=== contamination audit: {len(dirty)} / {total} runs read other archives ===")
     for name, cnt in sorted(dirty.items(), key=lambda x: -x[1]):
         print(f"  {cnt:>3} other archives  {name}")
+
+    print(
+        f"=== audit-corpus read: {len(corpus)} / {total} runs referenced "
+        "annotations/leaderboard/DEVLOG/public ==="
+    )
+    for name, hits in sorted(corpus.items(), key=lambda x: -len(x[1])):
+        print(f"  {len(hits):>3} hits  {name}")
+        for fn, lineno, needle in hits:
+            print(f"       {fn}:{lineno}  {needle}")
 
     if args.published:
         lb = json.loads(Path(args.published).read_text())

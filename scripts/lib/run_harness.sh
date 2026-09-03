@@ -12,8 +12,10 @@
 # This file is the SHARED runner for the single-GPU benches (hard, cuda,
 # mini). Do not invoke it directly: each bench's scripts/run_hard.sh is a
 # thin wrapper that pins the bench identity (KB_BENCH_DIR, KB_BENCH_BANNER,
-# KB_BUDGET_SECONDS_DEFAULT) and execs this. Mega keeps its own deliberate
-# fork (bwrap sandbox + legacy anvil lock machinery) — see benchmarks/mega/.
+# KB_BUDGET_SECONDS_DEFAULT) and execs this. Host agent launches run under
+# a bwrap sandbox (KBH_SBX) that hides prior archives, annotations, and
+# public/ solutions. Mega keeps a deliberate fork (legacy anvil lock
+# machinery) — see benchmarks/mega/.
 #
 # Archives everything to outputs/runs/<ts>_<harness>_<model>_<problem>/.
 
@@ -192,6 +194,59 @@ is_template() {
 WORKSPACE_ROOT="$RUN_DIR/repo"
 PROBLEM_DIR="$WORKSPACE_ROOT/problems/$PROBLEM_NAME"
 mkdir -p "$PROBLEM_DIR"
+
+# Contamination sandbox: run the agent under bwrap with EVERY source of a prior
+# solution or the optimization recipe hidden, while the toolchain (src, .venv,
+# GPU, outputs/gpu.lock) passes through via --dev-bind.
+#
+# Leak sources (all must be blanked — 2026-07-09 Grok 4.5 kimi-decode proved
+# that hiding only outputs/runs is not enough; 2026-09-02 gemini read
+# results/annotations/*.yaml on unsandboxed hard/cuda host launches):
+#   - this bench's run archive (outputs/runs)
+#   - sibling hard/mega/cuda/v3 trees (other benches' archives + annotations)
+#   - monorepo public/ (published solution.py.txt)
+#   - results/ (annotations + leaderboard scores named as targets)
+#   - monorepo runs/ HF staging
+#   - DEVLOG (optimization journey == the recipe)
+#   - ~/.claude/projects memory
+# Own run dir stays writable. KBH_SANDBOX=0 to disable; auto-off if bwrap is
+# absent (macOS dev boxes). Container launches are already namespaced; do not
+# wrap those, and do not wrap check.py / benchmark.py / trusted_entrypoint.
+RUNS_DIR="$REPO_ROOT/outputs/runs"
+SIB_PARENT="$(dirname "$REPO_ROOT")"   # benchmarks/ on anvil, $HOME on a cloud box
+MONOREPO_ROOT="$(cd "$REPO_ROOT/../.." && pwd)"  # kernelbench.com monorepo root
+KBH_EMPTY="$RUN_DIR/.kbh_empty"; : > "$KBH_EMPTY"
+KBH_SBX=()
+if [ "${KBH_SANDBOX:-1}" = "1" ] && command -v bwrap >/dev/null 2>&1; then
+    KBH_SBX=(bwrap --dev-bind / / --tmpfs "$RUNS_DIR")
+    [ -e "$REPO_ROOT/DEVLOG.md" ] && KBH_SBX+=(--ro-bind "$KBH_EMPTY" "$REPO_ROOT/DEVLOG.md")
+    [ -d "$REPO_ROOT/results" ] && KBH_SBX+=(--tmpfs "$REPO_ROOT/results")
+    CURRENT_BENCH="$(basename "$REPO_ROOT")"
+    for _sib in hard mega cuda v3; do
+        if [ "$_sib" != "$CURRENT_BENCH" ] && [ -d "$SIB_PARENT/$_sib" ]; then
+            KBH_SBX+=(--tmpfs "$SIB_PARENT/$_sib")
+        fi
+    done
+    [ -d "$MONOREPO_ROOT/public" ] && KBH_SBX+=(--tmpfs "$MONOREPO_ROOT/public")
+    [ -d "$MONOREPO_ROOT/runs" ] && KBH_SBX+=(--tmpfs "$MONOREPO_ROOT/runs")
+    [ -d "$HOME/.claude/projects" ] && KBH_SBX+=(--tmpfs "$HOME/.claude/projects")
+    # Extra paths to hide: KBH_SANDBOX_HIDE (colon-separated) and/or one path per
+    # line in $REPO_ROOT/.kbh_sandbox_hide (cloud boxes keep pulled archives,
+    # hidden results/ and replay sources next to the bench tree).
+    _hide_list="${KBH_SANDBOX_HIDE:-}"
+    if [ -f "$REPO_ROOT/.kbh_sandbox_hide" ]; then
+        while IFS= read -r _h; do
+            [ -n "$_h" ] && _hide_list="${_hide_list:+$_hide_list:}$_h"
+        done < "$REPO_ROOT/.kbh_sandbox_hide"
+    fi
+    IFS=: read -r -a _hide_arr <<< "$_hide_list"
+    for _h in "${_hide_arr[@]}"; do
+        [ -n "$_h" ] && [ -d "$_h" ] && KBH_SBX+=(--tmpfs "$_h")
+    done
+    # Own archive + problem workspace must remain visible/writable after tmpfs hides.
+    KBH_SBX+=(--bind "$RUN_DIR" "$RUN_DIR" --chdir "$PROBLEM_DIR")
+    echo "agent sandbox: bwrap (hidden: runs archives, public/ solutions, results/, DEVLOG, ~/.claude memory)"
+fi
 
 if [ "$KBH_AGENT_CONTAINER" = "1" ]; then
     PROMPT_WORKSPACE_DIR="/workspace/problems/$PROBLEM_NAME"
@@ -516,8 +571,10 @@ run_host_with_stall_watch() {
     # GNU timeout creates a separate process group even with a zero duration
     # (which means unlimited). That lets the watchdog terminate the complete
     # command tree without touching this harness process group.
+    # KBH_SBX prefixes the agent CLI (empty when bwrap is absent), matching
+    # the host `"${KBH_SBX[@]}" timeout "$BUDGET_SECONDS"` launches below.
     "$REAL_TIMEOUT" --kill-after="${KBH_TIMEOUT_KILL_AFTER_SECONDS:-30}s" \
-        "${timeout_seconds}s" "$@" &
+        "${timeout_seconds}s" "${KBH_SBX[@]}" "$@" &
     cmd_pid=$!
     stall_marker="$RUN_DIR/host_stall_watchdog.$cmd_pid"
     rm -f "$stall_marker"
@@ -1591,7 +1648,7 @@ case "$HARNESS" in
             run_claude_container "$REASONING_EFFORT" \
                 > "$LOG_FILE" 2> "$STDERR_FILE" || HARNESS_EXIT=$?
         else
-            ( cd "$PROBLEM_DIR" && timeout "$BUDGET_SECONDS" claude \
+            ( cd "$PROBLEM_DIR" && "${KBH_SBX[@]}" timeout "$BUDGET_SECONDS" claude \
                 --dangerously-skip-permissions \
                 --print --verbose \
                 --output-format stream-json \
@@ -1608,7 +1665,7 @@ case "$HARNESS" in
         # Claude Code routed via ccr-rust to a non-Anthropic provider.
         # Assumes ccr-rust is running locally and ANTHROPIC_BASE_URL points at it.
         # Model name is the upstream lab's model ID (glm-5.1, deepseek-v4-flash, etc.).
-        ( cd "$PROBLEM_DIR" && timeout "$BUDGET_SECONDS" \
+        ( cd "$PROBLEM_DIR" && "${KBH_SBX[@]}" timeout "$BUDGET_SECONDS" \
             env ANTHROPIC_BASE_URL="${CCR_BASE_URL:-http://127.0.0.1:3456}" \
             claude \
                 --dangerously-skip-permissions \
@@ -1665,7 +1722,7 @@ case "$HARNESS" in
             export ANTHROPIC_DEFAULT_HAIKU_MODEL="$ZAI_CLAUDE_HAIKU_MODEL" && \
             export ANTHROPIC_DEFAULT_SONNET_MODEL="$MODEL" && \
             export ANTHROPIC_DEFAULT_OPUS_MODEL="$MODEL" && \
-            timeout "$BUDGET_SECONDS" claude \
+            "${KBH_SBX[@]}" timeout "$BUDGET_SECONDS" claude \
                 --dangerously-skip-permissions \
                 --print --verbose \
                 --output-format stream-json \
@@ -1724,7 +1781,7 @@ case "$HARNESS" in
             export ANTHROPIC_DEFAULT_HAIKU_MODEL="$MINIMAX_CLAUDE_HAIKU_MODEL" && \
             export ANTHROPIC_DEFAULT_SONNET_MODEL="$MODEL" && \
             export ANTHROPIC_DEFAULT_OPUS_MODEL="$MODEL" && \
-            timeout "$BUDGET_SECONDS" claude \
+            "${KBH_SBX[@]}" timeout "$BUDGET_SECONDS" claude \
                 --dangerously-skip-permissions \
                 --print --verbose \
                 --output-format stream-json \
@@ -1784,7 +1841,7 @@ case "$HARNESS" in
             export ANTHROPIC_DEFAULT_HAIKU_MODEL="$KIMI_CLAUDE_HAIKU_MODEL" && \
             export ANTHROPIC_DEFAULT_SONNET_MODEL="$MODEL" && \
             export ANTHROPIC_DEFAULT_OPUS_MODEL="$MODEL" && \
-            timeout "$BUDGET_SECONDS" claude \
+            "${KBH_SBX[@]}" timeout "$BUDGET_SECONDS" claude \
                 --dangerously-skip-permissions \
                 --print --verbose \
                 --output-format stream-json \
@@ -1862,7 +1919,7 @@ case "$HARNESS" in
                 export ENABLE_TOOL_SEARCH="${ENABLE_TOOL_SEARCH:-false}" && \
                 export CLAUDE_CODE_EFFORT_LEVEL="${CLAUDE_CODE_EFFORT_LEVEL:-max}" && \
                 export CLAUDE_CODE_SUBAGENT_MODEL="$MODEL" && \
-            timeout "$BUDGET_SECONDS" claude \
+            "${KBH_SBX[@]}" timeout "$BUDGET_SECONDS" claude \
                 --dangerously-skip-permissions \
                 --print --verbose \
                 --output-format stream-json \
@@ -2005,7 +2062,7 @@ case "$HARNESS" in
             export ANTHROPIC_DEFAULT_HAIKU_MODEL="$OR_FABLE_MODEL" && \
             export ANTHROPIC_DEFAULT_SONNET_MODEL="$OR_FABLE_MODEL" && \
             export ANTHROPIC_DEFAULT_OPUS_MODEL="$OR_FABLE_MODEL" && \
-            timeout "$BUDGET_SECONDS" claude \
+            "${KBH_SBX[@]}" timeout "$BUDGET_SECONDS" claude \
                 --dangerously-skip-permissions \
                 --print --verbose \
                 --output-format stream-json \
@@ -2067,7 +2124,7 @@ case "$HARNESS" in
             export ANTHROPIC_DEFAULT_HAIKU_MODEL="$LONGCAT_CLAUDE_HAIKU_MODEL" && \
             export ANTHROPIC_DEFAULT_SONNET_MODEL="$MODEL" && \
             export ANTHROPIC_DEFAULT_OPUS_MODEL="$MODEL" && \
-            timeout "$BUDGET_SECONDS" claude \
+            "${KBH_SBX[@]}" timeout "$BUDGET_SECONDS" claude \
                 --dangerously-skip-permissions \
                 --print --verbose \
                 --output-format stream-json \
@@ -2304,7 +2361,7 @@ case "$HARNESS" in
             export ANTHROPIC_DEFAULT_HAIKU_MODEL="$DEEPSEEK_CLAUDE_HAIKU_MODEL" && \
             export ANTHROPIC_DEFAULT_SONNET_MODEL="$MODEL" && \
             export ANTHROPIC_DEFAULT_OPUS_MODEL="$MODEL" && \
-            timeout "$BUDGET_SECONDS" claude \
+            "${KBH_SBX[@]}" timeout "$BUDGET_SECONDS" claude \
                 --dangerously-skip-permissions \
                 --print --verbose \
                 --output-format stream-json \
@@ -2381,7 +2438,7 @@ case "$HARNESS" in
             export ENABLE_TOOL_SEARCH="${ENABLE_TOOL_SEARCH:-false}" && \
             export CLAUDE_CODE_EFFORT_LEVEL="${CLAUDE_CODE_EFFORT_LEVEL:-xhigh}" && \
             export CLAUDE_CODE_SUBAGENT_MODEL="$MODEL" && \
-            timeout "$BUDGET_SECONDS" claude \
+            "${KBH_SBX[@]}" timeout "$BUDGET_SECONDS" claude \
                 --dangerously-skip-permissions \
                 --print --verbose \
                 --output-format stream-json \
@@ -2403,7 +2460,7 @@ case "$HARNESS" in
             run_codex_container "$REASONING_EFFORT" \
                 > "$LOG_FILE" 2> "$STDERR_FILE" || HARNESS_EXIT=$?
         else
-            timeout "$BUDGET_SECONDS" codex exec \
+            "${KBH_SBX[@]}" timeout "$BUDGET_SECONDS" codex exec \
                 -m "$MODEL" \
                 "${EFFORT_ARG[@]}" \
                 --dangerously-bypass-approvals-and-sandbox \
@@ -2437,7 +2494,7 @@ case "$HARNESS" in
         ;;
 
     kimi)
-        echo "$PROMPT" | timeout "$BUDGET_SECONDS" kimi \
+        echo "$PROMPT" | "${KBH_SBX[@]}" timeout "$BUDGET_SECONDS" kimi \
             -w "$PROBLEM_DIR" \
             --print \
             --output-format stream-json \
@@ -2453,7 +2510,7 @@ case "$HARNESS" in
             run_droid_container "$REASONING_EFFORT" \
                 > "$LOG_FILE" 2> "$STDERR_FILE" || HARNESS_EXIT=$?
         else
-            timeout "$BUDGET_SECONDS" droid exec \
+            "${KBH_SBX[@]}" timeout "$BUDGET_SECONDS" droid exec \
                 --output-format stream-json \
                 --skip-permissions-unsafe \
                 --cwd "$PROBLEM_DIR" \
@@ -2470,7 +2527,7 @@ case "$HARNESS" in
             run_gemini_container \
                 > "$LOG_FILE" 2> "$STDERR_FILE" || HARNESS_EXIT=$?
         else
-        ( cd "$PROBLEM_DIR" && timeout "$BUDGET_SECONDS" gemini \
+        ( cd "$PROBLEM_DIR" && "${KBH_SBX[@]}" timeout "$BUDGET_SECONDS" gemini \
             --skip-trust \
             -m "$MODEL" \
             --approval-mode yolo \
@@ -2497,7 +2554,7 @@ case "$HARNESS" in
         if [ -n "$REASONING_EFFORT" ]; then
             MUSE_EFFORT_ARG=(--reasoning-effort "$REASONING_EFFORT")
         fi
-        ( cd "$PROBLEM_DIR" && timeout "$BUDGET_SECONDS" "${MUSE_BIN:-$HOME/.local/bin/muse}" exec \
+        ( cd "$PROBLEM_DIR" && "${KBH_SBX[@]}" timeout "$BUDGET_SECONDS" "${MUSE_BIN:-$HOME/.local/bin/muse}" exec \
             --json \
             --yolo \
             --disable-web-tools \
@@ -2527,7 +2584,7 @@ case "$HARNESS" in
         if [ -n "$REASONING_EFFORT" ]; then
             AGY_EFFORT_ARG=(--effort "$REASONING_EFFORT")
         fi
-        ( cd "$PROBLEM_DIR" && timeout "$BUDGET_SECONDS" "${AGY_BIN:-$HOME/.local/bin/agy}" \
+        ( cd "$PROBLEM_DIR" && "${KBH_SBX[@]}" timeout "$BUDGET_SECONDS" "${AGY_BIN:-$HOME/.local/bin/agy}" \
             --dangerously-skip-permissions \
             --print-timeout 168h \
             --output-format stream-json \
@@ -2544,7 +2601,7 @@ case "$HARNESS" in
             run_cursor_container \
                 > "$LOG_FILE" 2> "$STDERR_FILE" || HARNESS_EXIT=$?
         else
-            timeout "$BUDGET_SECONDS" agent \
+            "${KBH_SBX[@]}" timeout "$BUDGET_SECONDS" agent \
                 --trust \
                 --yolo \
                 --print \
@@ -2567,7 +2624,7 @@ case "$HARNESS" in
             run_grok_container "$REASONING_EFFORT" \
                 > "$LOG_FILE" 2> "$STDERR_FILE" || HARNESS_EXIT=$?
         else
-        timeout "$BUDGET_SECONDS" grok \
+        "${KBH_SBX[@]}" timeout "$BUDGET_SECONDS" grok \
             --cwd "$PROBLEM_DIR" \
             --always-approve \
             --permission-mode bypassPermissions \
@@ -2588,7 +2645,7 @@ case "$HARNESS" in
             run_opencode_container \
                 > "$LOG_FILE" 2> "$STDERR_FILE" || HARNESS_EXIT=$?
         else
-            ( cd "$PROBLEM_DIR" && timeout "$BUDGET_SECONDS" opencode run \
+            ( cd "$PROBLEM_DIR" && "${KBH_SBX[@]}" timeout "$BUDGET_SECONDS" opencode run \
                 --pure --format json -m "$MODEL" "$PROMPT" \
                 </dev/null > "$LOG_FILE" 2> "$STDERR_FILE" ) || HARNESS_EXIT=$?
         fi
@@ -2597,7 +2654,7 @@ case "$HARNESS" in
     lfm-opencode)
         # OpenCode against the locally served LFM (archive-local config).
         LFM_OPENCODE_CONFIG_HOME="$(write_lfm_opencode_config "$MODEL")"
-        ( cd "$PROBLEM_DIR" && timeout "$BUDGET_SECONDS" \
+        ( cd "$PROBLEM_DIR" && "${KBH_SBX[@]}" timeout "$BUDGET_SECONDS" \
             env XDG_CONFIG_HOME="$LFM_OPENCODE_CONFIG_HOME" \
             opencode run --pure --format json -m "lfm/$MODEL" "$PROMPT" \
             </dev/null > "$LOG_FILE" 2> "$STDERR_FILE" ) || HARNESS_EXIT=$?
@@ -2606,7 +2663,7 @@ case "$HARNESS" in
     lfm-claude)
         # Claude Code -> ccr-rust -> local vLLM. Start ccr with
         # scripts/ccr-lfm.config.json before the sweep; CCR_BASE_URL overrides.
-        ( cd "$PROBLEM_DIR" && timeout "$BUDGET_SECONDS" \
+        ( cd "$PROBLEM_DIR" && "${KBH_SBX[@]}" timeout "$BUDGET_SECONDS" \
             env ANTHROPIC_BASE_URL="${CCR_BASE_URL:-http://127.0.0.1:3456}" \
                 ANTHROPIC_API_KEY="$KBMINI_API_KEY" \
             claude \
@@ -2624,7 +2681,7 @@ case "$HARNESS" in
         # Nous Hermes Agent, headless (-q single query, --yolo auto-approve,
         # -Q programmatic quiet). Local endpoint via OPENAI_BASE_URL env with
         # the openai provider; override provider/model form via KBMINI_ vars.
-        ( cd "$PROBLEM_DIR" && timeout "$BUDGET_SECONDS" \
+        ( cd "$PROBLEM_DIR" && "${KBH_SBX[@]}" timeout "$BUDGET_SECONDS" \
             env OPENAI_BASE_URL="$KBMINI_BASE_URL" \
                 OPENAI_API_KEY="$KBMINI_API_KEY" \
             hermes chat \
@@ -2640,7 +2697,7 @@ case "$HARNESS" in
         # ~/.pi/agent/models.json (no per-run config dir support).
         # --no-session is required: session persistence hangs headless runs.
         ensure_pi_lfm_provider "$MODEL"
-        ( cd "$PROBLEM_DIR" && timeout "$BUDGET_SECONDS" \
+        ( cd "$PROBLEM_DIR" && "${KBH_SBX[@]}" timeout "$BUDGET_SECONDS" \
             env PATH="$HOME/.bun/bin:$PATH" \
             pi --provider lfm --model "$MODEL" --api-key "$KBMINI_API_KEY" \
                --mode json --no-session -p "$PROMPT" ) \
@@ -2651,7 +2708,7 @@ case "$HARNESS" in
         # Grok Build CLI against the local endpoint via a config.toml
         # [model."<id>"] block (same mechanism as its stock glm-5.2 route).
         ensure_grok_lfm_model "$MODEL"
-        timeout "$BUDGET_SECONDS" grok \
+        "${KBH_SBX[@]}" timeout "$BUDGET_SECONDS" grok \
             --cwd "$PROBLEM_DIR" \
             --always-approve \
             --permission-mode bypassPermissions \
@@ -2671,7 +2728,7 @@ case "$HARNESS" in
         if [ "$KBH_AGENT_CONTAINER" = "1" ]; then
             KBH_OPENCODE_CONFIG_FILE="$OPENCODE_NEMOTRON_CONFIG_HOME/opencode/opencode.json"                 run_opencode_container "$OPENCODE_NEMOTRON_MODEL"                 > "$LOG_FILE" 2> "$STDERR_FILE" || HARNESS_EXIT=$?
         else
-            ( cd "$PROBLEM_DIR" && timeout "$BUDGET_SECONDS" env XDG_CONFIG_HOME="$OPENCODE_NEMOTRON_CONFIG_HOME"                 opencode run --pure --format json -m "$OPENCODE_NEMOTRON_MODEL" "$PROMPT"                 </dev/null > "$LOG_FILE" 2> "$STDERR_FILE" ) || HARNESS_EXIT=$?
+            ( cd "$PROBLEM_DIR" && "${KBH_SBX[@]}" timeout "$BUDGET_SECONDS" env XDG_CONFIG_HOME="$OPENCODE_NEMOTRON_CONFIG_HOME"                 opencode run --pure --format json -m "$OPENCODE_NEMOTRON_MODEL" "$PROMPT"                 </dev/null > "$LOG_FILE" 2> "$STDERR_FILE" ) || HARNESS_EXIT=$?
         fi
         ;;
 
@@ -2681,7 +2738,7 @@ case "$HARNESS" in
         # point an archive-local OpenCode config at it.
         start_nvcf_proxy
         NVCF_OPENCODE_CONFIG_HOME="$(write_nvcf_opencode_config "$NVCF_PROXY_BASE_URL")"
-        ( cd "$PROBLEM_DIR" && timeout "$BUDGET_SECONDS" \
+        ( cd "$PROBLEM_DIR" && "${KBH_SBX[@]}" timeout "$BUDGET_SECONDS" \
             env XDG_CONFIG_HOME="$NVCF_OPENCODE_CONFIG_HOME" \
             opencode run --pure --format json -m "nvcf-nemotron/$MODEL" "$PROMPT" \
             </dev/null > "$LOG_FILE" 2> "$STDERR_FILE" ) || HARNESS_EXIT=$?

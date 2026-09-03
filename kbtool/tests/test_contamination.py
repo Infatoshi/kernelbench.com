@@ -7,7 +7,7 @@ looked clean to the raw `outputs/runs/<ts>` regex. See kb/contamination.py.
 import json
 from pathlib import Path
 
-from kb.contamination import copied_foreign_solution, other_archives
+from kb.contamination import audit_corpus_hits, copied_foreign_solution, other_archives, run
 
 
 def _write_tokens(path: Path, tokens: list[str], kind: str = "thought") -> None:
@@ -165,3 +165,37 @@ def test_sibling_score_after_run_finished_does_not_fire(tmp_path):
     _mk_run(tmp_path, "20260716_091251_kinetic-claude_kinetic-0715_05_topk_bitonic",
             "05_topk_bitonic", 0.0296)
     assert other_archives(run) == set()
+
+
+def test_audit_corpus_annotations_path_is_reported(tmp_path, capsys):
+    """A transcript that reads results/annotations is a separate category.
+
+    2026-09-02 gemini host runs did this; archive-path contamination did not
+    fire. Exit code of the existing archive check stays 0.
+    """
+    d = _mk_run(tmp_path, "20260902_181500_gemini_gemini-3-pro_01_fp8_gemm",
+                "01_fp8_gemm", 0.12)
+    (d / "transcript.jsonl").write_text(
+        json.dumps({"type": "assistant", "message": "looking at the problem"})
+        + "\n"
+        + json.dumps({
+            "type": "tool_call",
+            "rawInput": {
+                "command": (
+                    "cat benchmarks/hard/results/annotations/"
+                    "20260901_120000_claude_claude-opus-4-7_01_fp8_gemm.yaml"
+                ),
+            },
+        })
+        + "\n"
+    )
+    hits = audit_corpus_hits(d)
+    assert hits == [("transcript.jsonl", 2, "results/annotations")]
+    assert other_archives(d) == set()
+
+    rc = run([str(tmp_path)])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "=== contamination audit: 0 / 1 runs read other archives ===" in out
+    assert "=== audit-corpus read: 1 / 1 runs referenced" in out
+    assert "transcript.jsonl:2  results/annotations" in out

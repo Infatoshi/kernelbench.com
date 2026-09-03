@@ -166,6 +166,19 @@ if [ "${KBH_SANDBOX:-1}" = "1" ] && command -v bwrap >/dev/null 2>&1; then
     [ -d "$MONOREPO_ROOT/public" ] && KBH_SBX+=(--tmpfs "$MONOREPO_ROOT/public")
     [ -d "$MONOREPO_ROOT/runs" ] && KBH_SBX+=(--tmpfs "$MONOREPO_ROOT/runs")
     [ -d "$HOME/.claude/projects" ] && KBH_SBX+=(--tmpfs "$HOME/.claude/projects")
+    # Extra paths to hide: KBH_SANDBOX_HIDE (colon-separated) and/or one path per
+    # line in $REPO_ROOT/.kbh_sandbox_hide (cloud boxes keep pulled archives,
+    # hidden results/ and replay sources next to the bench tree).
+    _hide_list="${KBH_SANDBOX_HIDE:-}"
+    if [ -f "$REPO_ROOT/.kbh_sandbox_hide" ]; then
+        while IFS= read -r _h; do
+            [ -n "$_h" ] && _hide_list="${_hide_list:+$_hide_list:}$_h"
+        done < "$REPO_ROOT/.kbh_sandbox_hide"
+    fi
+    IFS=: read -r -a _hide_arr <<< "$_hide_list"
+    for _h in "${_hide_arr[@]}"; do
+        [ -n "$_h" ] && [ -d "$_h" ] && KBH_SBX+=(--tmpfs "$_h")
+    done
     # Own archive + problem workspace must remain visible/writable after tmpfs hides.
     KBH_SBX+=(--bind "$RUN_DIR" "$RUN_DIR" --chdir "$PROBLEM_DIR")
     echo "agent sandbox: bwrap (hidden: runs archives, public/ solutions, results/, DEVLOG, ~/.claude memory)"
