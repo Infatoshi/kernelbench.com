@@ -216,7 +216,10 @@ def extract(run_dir: Path, harness: str) -> dict:
     # Match the -claude suffix so every Claude-Code-routed provider
     # (zai/minimax/kimi/deepseek/qwen-claude, ccr-claude) is covered, not just a
     # hardcoded list that silently drops new routes (e.g. deepseek-claude) to null.
-    if harness == "claude" or harness == "kimi" or harness.endswith("-claude"):
+    # or-fable / or-opus / openrouter-* are Claude Code pointed at OpenRouter:
+    # same terminal {"type":"result"} shape, so the same extractor applies.
+    if (harness == "claude" or harness == "kimi" or harness.endswith("-claude")
+            or harness in ("or-fable", "openrouter-fable", "or-opus", "openrouter-opus")):
         return _claude_or_kimi(transcript)
     if harness == "droid":
         return _droid(transcript)

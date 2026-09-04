@@ -1,0 +1,986 @@
+"""GLM-5.2-class fused MoE layer -- hand-written CUDA for SM120 (RTX PRO 6000 Blackwell).
+
+All device code lives in CUDA_SRC below and is built with torch.utils.cpp_extension.load_inline
+(mma.sync / ldmatrix / cp.async inline PTX; no Triton, no vendor MoE libraries).
+
+Pipeline for a forward call (T tokens, E routed experts, top_k, 1 shared expert):
+  1. alignment      moe_align_kernel (one block) or, for T*top_k >= 16K, hist -> scan -> scatter
+                    kernels: histogram of expert_ids, pad each expert's token group to BM=128
+                    rows, scatter (token, routing weight) into the sorted order.  The shared
+                    expert is appended as a pseudo-expert holding every token with weight 1.0.
+  2. GEMM1          moe_grouped_gemm_kernel<0>: h = silu(x @ gate.T) * (x @ up.T) -> bf16 Hbuf.
+                    Persistent CTAs (one per SM) pull (m-block, n-tile) tiles from an atomic
+                    counter.  Tile 128x256x64, 8 warps (2x4, 64x64 warp tiles), 2-stage cp.async
+                    pipeline (96 KB smem), ldmatrix + mma.sync.m16n8k16 bf16 -> fp32.  The N tile
+                    interleaves 128 gate rows and the matching 128 up rows of w1 so silu*up fuses
+                    in registers.  The main loop is specialized on the number of valid m16
+                    fragments per warp, so padded rows cost no tensor-pipe time.  Each tile's
+                    cp.async prologue is issued before the previous tile's epilogue.
+  3. GEMM2          moe_grouped_gemm_kernel<1>: y = (h @ down.T) * routing_weight.  For small
+                    outputs (T*H*4 <= 20 MB) rows are accumulated in place with vector fp32
+                    red.global.add into an L2-resident buffer and converted to bf16; otherwise
+                    y rows go to a bf16 buffer and moe_reduce_kernel sums shared + top_k rows.
+  4. decode path    T <= 8: CUDA-core GEMV kernels (warp per 4 weight rows, activations staged
+                    in shared memory, shuffle reduction) replace the tensor-core tiles.
+Kernels are launched eagerly on the current stream (a CUDA-graph replay variant gave no gain
+in the harness and added launch latency for the decode shape, so it was dropped).
+"""
+from __future__ import annotations
+
+import os
+
+import torch
+import torch.nn as nn
+
+try:  # ninja ships in the venv but its bin dir is not always on PATH
+    import ninja  # type: ignore
+
+    os.environ["PATH"] = ninja.BIN_DIR + os.pathsep + os.environ.get("PATH", "")
+except Exception:  # pragma: no cover
+    pass
+
+from torch.utils.cpp_extension import load_inline  # noqa: E402
+
+CUDA_SRC = r"""
+#include <torch/extension.h>
+#include <ATen/cuda/CUDAContext.h>
+#include <cuda_runtime.h>
+#include <cuda_bf16.h>
+#include <cstdint>
+#include <type_traits>
+#include <cstdlib>
+
+namespace {
+
+using bf16 = __nv_bfloat16;
+
+#ifndef MOE_ATOMIC_MAX_MB_DEFAULT
+#define MOE_ATOMIC_MAX_MB_DEFAULT 20
+#endif
+#ifndef MOE_BK
+#define MOE_BK 64
+#endif
+#ifndef MOE_STAGES
+#define MOE_STAGES 2
+#endif
+constexpr int BM = 128;
+constexpr int BN = 256;
+constexpr int BK = MOE_BK;                 // 32 or 64
+constexpr int STAGES = MOE_STAGES;         // 4 (BK=32) or 2 (BK=64): 96 KB of smem either way
+constexpr int THREADS = 256;
+constexpr int KS = BK / 16;                // k16 steps per stage
+constexpr int CHUNKS = BK / 8;             // 16 B chunks per row per stage
+constexpr int ROW_BYTES = BK * 2;
+constexpr int RPP = THREADS / CHUNKS;      // rows covered per load pass
+constexpr int A_PASSES = BM / RPP;
+constexpr int B_PASSES = BN / RPP;
+constexpr int A_STAGE_BYTES = BM * BK * 2;
+constexpr int B_STAGE_BYTES = BN * BK * 2;
+constexpr int STAGE_BYTES = A_STAGE_BYTES + B_STAGE_BYTES;
+constexpr int SMEM_BYTES = STAGES * STAGE_BYTES;         // 96 KB
+static_assert(SMEM_BYTES <= 96 * 1024, "smem budget");
+static_assert(BK == 32 || BK == 64, "BK");
+
+__device__ __forceinline__ uint32_t smem_u32(const void* p) {
+    return (uint32_t)__cvta_generic_to_shared(p);
+}
+
+__device__ __forceinline__ void cp_async_16(uint32_t dst, const void* src, bool pred) {
+    const int sz = pred ? 16 : 0;   // src-size 0 -> zero fill, nothing read
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" :: "r"(dst), "l"(src), "r"(sz));
+}
+__device__ __forceinline__ void bar_sync() { asm volatile("bar.sync 0;\n" ::: "memory"); }
+__device__ __forceinline__ uint64_t policy_evict_last() {
+    uint64_t p; asm volatile("createpolicy.fractional.L2::evict_last.b64 %0, 1.0;\n" : "=l"(p)); return p;
+}
+__device__ __forceinline__ void red_add_v2_hint(float* addr, float a, float b, uint64_t pol) {
+#ifdef MOE_NO_RED_HINT
+    asm volatile("red.global.add.v2.f32 [%0], {%1, %2};\n" :: "l"(addr), "f"(a), "f"(b) : "memory");
+#else
+    asm volatile("red.global.add.L2::cache_hint.v2.f32 [%0], {%1, %2}, %3;\n" :: "l"(addr), "f"(a), "f"(b), "l"(pol) : "memory");
+#endif
+}
+__device__ __forceinline__ void cp_async_commit() { asm volatile("cp.async.commit_group;\n" ::); }
+template <int N>
+__device__ __forceinline__ void cp_async_wait() { asm volatile("cp.async.wait_group %0;\n" :: "n"(N)); }
+
+__device__ __forceinline__ void ldmatrix_x4(uint32_t addr, uint32_t& r0, uint32_t& r1, uint32_t& r2, uint32_t& r3) {
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+                 : "=r"(r0), "=r"(r1), "=r"(r2), "=r"(r3) : "r"(addr));
+}
+
+__device__ __forceinline__ void mma_bf16_16816(float* c, const uint32_t* a, uint32_t b0, uint32_t b1) {
+    asm volatile(
+        "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+        : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
+        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+}
+
+// Byte offset of 16-byte chunk `chunk` of `row` inside a [rows][BK] bf16 tile (64 B rows),
+// XOR-swizzled so ldmatrix (8 rows, same logical chunk) and cp.async writes are conflict-free.
+__device__ __forceinline__ uint32_t swz(int row, int chunk) {
+    if (BK == 32) return (uint32_t)(row * 64 + ((chunk ^ ((row >> 1) & 3)) << 4));
+    else          return (uint32_t)(row * 128 + ((chunk ^ (row & 7)) << 4));
+}
+
+__device__ __forceinline__ void bulk_prefetch_l2(const void* p, uint32_t bytes) {
+    asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;\n" :: "l"(p), "r"(bytes) : "memory");
+}
+#ifdef MOE_PF_LOAD
+// real load with 128 B L2 prefetch size (not a droppable hint); result intentionally unused
+__device__ __forceinline__ void prefetch_l2(const void* p) { unsigned v; asm volatile("ld.global.L2::128B.b32 %0, [%1];\n" : "=r"(v) : "l"(p)); }
+#else
+__device__ __forceinline__ void prefetch_l2(const void* p) { asm volatile("prefetch.global.L2 [%0];\n" :: "l"(p)); }
+#endif
+#ifndef MOE_PF_DIST
+#define MOE_PF_DIST (256 / MOE_BK)     // 8 k-tiles for BK=32, 4 for BK=64 (~512 B ahead per row)
+#endif
+// With BK=64 every cp.async row segment is a full 128 B line, which streams GDDR7 at full rate
+// without software prefetch; prefetch hints only cost L2 tag bandwidth there.
+#if (MOE_BK == 64) && !defined(MOE_FORCE_PF)
+#define MOE_NO_PF 1
+#endif
+constexpr int PF_DIST = MOE_PF_DIST;   // k-tiles of look-ahead for L2 prefetch (one 128 B line = 2 k-tiles)
+
+__device__ __forceinline__ float silu_f(float g) { return g * __fdividef(1.f, 1.f + __expf(-g)); }
+
+// ------------------------------------------------------------------------------------
+// Kernel 1: routing alignment (single block).
+// ------------------------------------------------------------------------------------
+__global__ void moe_align_kernel(const int64_t* __restrict__ expert_ids,
+                                 const bf16* __restrict__ expert_weights,
+                                 int T, int top_k, int E, int n_shared,
+                                 int* __restrict__ sorted_token, float* __restrict__ sorted_weight,
+                                 int* __restrict__ block_expert, int* __restrict__ block_valid,
+                                 int* __restrict__ pos, int* __restrict__ counters)
+{
+    extern __shared__ int sm[];
+    const int Etot = E + n_shared;
+    int* count = sm;               // [Etot]
+    int* start = sm + Etot;        // [Etot + 1]
+    int* cursor = start + Etot + 1; // [Etot]
+    const int tid = threadIdx.x, nth = blockDim.x;
+    const int n = T * top_k;
+
+    for (int e = tid; e < Etot; e += nth) { count[e] = (e < E) ? 0 : T; cursor[e] = 0; }
+    __syncthreads();
+    for (int i = tid; i < n; i += nth) {
+        int e = (int)expert_ids[i];
+        e = min(max(e, 0), E - 1);
+        atomicAdd(&count[e], 1);
+    }
+    __syncthreads();
+    if (tid == 0) {
+        int run = 0;
+        for (int e = 0; e < Etot; ++e) {
+            start[e] = run;
+            run += ((count[e] + BM - 1) / BM) * BM;
+        }
+        start[Etot] = run;
+        counters[0] = run / BM;   // number of m-blocks
+        counters[1] = start[E];   // first shared-expert row
+        counters[2] = run;        // total padded rows
+        counters[3] = 0;          // GEMM1 tile counter
+        counters[4] = 0;          // GEMM2 tile counter
+    }
+    __syncthreads();
+    const int total = start[Etot];
+    for (int r = tid; r < total; r += nth) { sorted_token[r] = -1; sorted_weight[r] = 0.f; }
+    for (int e = tid; e < Etot; e += nth) {
+        const int nb = (count[e] + BM - 1) / BM;
+        const int b0 = start[e] / BM;
+        for (int b = 0; b < nb; ++b) {
+            block_expert[b0 + b] = e;
+            block_valid[b0 + b] = min(BM, count[e] - b * BM);
+        }
+    }
+    __syncthreads();
+    for (int i = tid; i < n; i += nth) {
+        int e = (int)expert_ids[i];
+        e = min(max(e, 0), E - 1);
+        const int slot = atomicAdd(&cursor[e], 1);
+        const int p = start[e] + slot;
+        sorted_token[p] = i / top_k;
+        sorted_weight[p] = __bfloat162float(expert_weights[i]);
+        pos[i] = p;
+    }
+    for (int s = 0; s < n_shared; ++s) {
+        const int base = start[E + s];
+        for (int t = tid; t < T; t += nth) { sorted_token[base + t] = t; sorted_weight[base + t] = 1.f; }
+    }
+}
+
+// ------------------------------------------------------------------------------------
+// Multi-block variant of the alignment for large T*top_k: histogram (grid) -> scan/metadata
+// (one block) -> scatter (grid).  Same outputs as moe_align_kernel.
+// ------------------------------------------------------------------------------------
+__global__ void moe_hist_kernel(const int64_t* __restrict__ expert_ids, int n, int E, int* __restrict__ counts)
+{
+    extern __shared__ int sh[];
+    for (int e = threadIdx.x; e < E; e += blockDim.x) sh[e] = 0;
+    __syncthreads();
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x) {
+        int e = (int)expert_ids[i];
+        e = min(max(e, 0), E - 1);
+        atomicAdd(&sh[e], 1);
+    }
+    __syncthreads();
+    for (int e = threadIdx.x; e < E; e += blockDim.x) if (sh[e]) atomicAdd(&counts[e], sh[e]);
+}
+
+__global__ void moe_scan_kernel(const int* __restrict__ counts, int T, int E, int n_shared,
+                                int* __restrict__ start /*[Etot+1]*/, int* __restrict__ cursor /*[E]*/,
+                                int* __restrict__ sorted_token, float* __restrict__ sorted_weight,
+                                int* __restrict__ block_expert, int* __restrict__ block_valid,
+                                int* __restrict__ counters)
+{
+    extern __shared__ int sm[];
+    const int Etot = E + n_shared;
+    int* cnt = sm;             // [Etot]
+    int* st = sm + Etot;       // [Etot+1]
+    const int tid = threadIdx.x, nth = blockDim.x;
+    for (int e = tid; e < Etot; e += nth) cnt[e] = (e < E) ? counts[e] : T;
+    __syncthreads();
+    if (tid == 0) {
+        int run = 0;
+        for (int e = 0; e < Etot; ++e) { st[e] = run; run += ((cnt[e] + BM - 1) / BM) * BM; }
+        st[Etot] = run;
+        counters[0] = run / BM;
+        counters[1] = st[E];
+        counters[2] = run;
+        counters[3] = 0;
+        counters[4] = 0;
+    }
+    __syncthreads();
+    for (int e = tid; e <= Etot; e += nth) start[e] = st[e];
+    for (int e = tid; e < E; e += nth) cursor[e] = st[e];
+    for (int e = tid; e < Etot; e += nth) {
+        const int nb = (cnt[e] + BM - 1) / BM;
+        const int b0 = st[e] / BM;
+        for (int b = 0; b < nb; ++b) {
+            block_expert[b0 + b] = e;
+            block_valid[b0 + b] = min(BM, cnt[e] - b * BM);
+        }
+    }
+    // padding rows only (valid rows are written by the scatter kernel)
+    for (int e = 0; e < Etot; ++e) {
+        const int lo = st[e] + cnt[e], hi = st[e + 1];
+        for (int r = lo + tid; r < hi; r += nth) { sorted_token[r] = -1; sorted_weight[r] = 0.f; }
+    }
+}
+
+__global__ void moe_scatter_kernel(const int64_t* __restrict__ expert_ids, const bf16* __restrict__ expert_weights,
+                                   int T, int top_k, int E, int n_shared,
+                                   const int* __restrict__ start, int* __restrict__ cursor,
+                                   int* __restrict__ sorted_token, float* __restrict__ sorted_weight,
+                                   int* __restrict__ pos)
+{
+    const int n = T * top_k;
+    const int gtid = blockIdx.x * blockDim.x + threadIdx.x, gsz = gridDim.x * blockDim.x;
+    for (int i = gtid; i < n; i += gsz) {
+        int e = (int)expert_ids[i];
+        e = min(max(e, 0), E - 1);
+        const int p = atomicAdd(&cursor[e], 1);
+        sorted_token[p] = i / top_k;
+        sorted_weight[p] = __bfloat162float(expert_weights[i]);
+        pos[i] = p;
+    }
+    for (int i = gtid; i < T * n_shared; i += gsz) {
+        const int sidx = i / T, t = i - sidx * T;
+        const int p = start[E + sidx] + t;
+        sorted_token[p] = t;
+        sorted_weight[p] = 1.f;
+    }
+}
+
+// ------------------------------------------------------------------------------------
+// Kernel 2/3: persistent grouped GEMM over padded token blocks.
+//   MODE 0: A = x (T,K=H) gathered by sorted_token; W = w1 (E, 2*Nout, K), Nout = I.
+//           N tile = 128 gate rows [n0,n0+128) + 128 up rows [I+n0, I+n0+128) -> 128 h cols.
+//   MODE 1: A = Hbuf (rows, K=I) contiguous; W = w2 (E, Nout=H, K); N tile = 256 cols.
+//   Tiles (m-block major, n-tile minor) are handed out through an atomic counter so
+//   concurrently running CTAs share A rows / B slabs in L2.  The next tile's cp.async
+//   prologue is issued before the current tile's epilogue.
+// ------------------------------------------------------------------------------------
+template <int MODE>
+__global__ void __launch_bounds__(THREADS, 1)
+moe_grouped_gemm_kernel(const bf16* __restrict__ A, const bf16* __restrict__ Wr, const bf16* __restrict__ Ws,
+                        bf16* __restrict__ Out,
+                        const int* __restrict__ sorted_token, const float* __restrict__ sorted_weight,
+                        const int* __restrict__ block_expert, const int* __restrict__ block_valid,
+                        int* __restrict__ counters, int K, int Nout, int E, int n_tiles,
+                        float* __restrict__ OutF)
+{
+    extern __shared__ __align__(1024) unsigned char smem_raw[];
+    __shared__ int s_next[2];
+    const uint64_t pol_keep = policy_evict_last();   // fp32 accumulator lines should stay in L2
+    const int total_tiles = counters[0] * n_tiles;
+    int tile = blockIdx.x;
+    if (tile >= total_tiles) return;
+
+    const uint32_t smem_base = smem_u32(smem_raw);
+    const int tid = threadIdx.x;
+    const int lane = tid & 31;
+    const int warp = tid >> 5;
+    const int wm = warp >> 2;   // 0..1  (64 rows each)
+    const int wn = warp & 3;    // 0..3  (64 cols each)
+    const int lrow = tid / CHUNKS;    // row within a load pass
+    const int lchunk = tid % CHUNKS;  // 16 B chunk along K
+    const int KT = K / BK;
+    const size_t w_per_expert = (size_t)((MODE == 0) ? 2 * Nout : Nout) * (size_t)K;
+    const size_t b_pass_stride = (size_t)RPP * K;          // elements between consecutive B pass rows (MODE 1)
+
+    // ---- ldmatrix lane offsets (stage 0, k16-step 0); k16 step ks => XOR (ks << 5) ----
+    uint32_t a_ld[4], b_ld[4];
+    #pragma unroll
+    for (int mi = 0; mi < 4; ++mi) {
+        const int row = wm * 64 + mi * 16 + ((lane >> 3) & 1) * 8 + (lane & 7);
+        a_ld[mi] = swz(row, lane >> 4);
+    }
+    #pragma unroll
+    for (int p = 0; p < 4; ++p) {
+        const int row = wn * 64 + p * 16 + (lane >> 4) * 8 + (lane & 7);
+        b_ld[p] = A_STAGE_BYTES + swz(row, (lane >> 3) & 1);
+    }
+    uint32_t a_dst[A_PASSES], b_dst[B_PASSES];
+    #pragma unroll
+    for (int j = 0; j < A_PASSES; ++j) a_dst[j] = swz(lrow + RPP * j, lchunk);
+    #pragma unroll
+    for (int j = 0; j < B_PASSES; ++j) b_dst[j] = A_STAGE_BYTES + swz(lrow + RPP * j, lchunk);
+
+    // ---- per-tile state ----
+    const bf16* a_src[A_PASSES];
+    bool a_ok[A_PASSES];
+    const bf16* b_base0;      // MODE 0: gate rows base; MODE 1: rows base
+    const bf16* b_base1;      // MODE 0: up rows base
+    int nt = 0, valid = 0, row0 = 0, nmf = 0;
+    bool pf_b = true;
+
+    auto b_ptr = [&](int j) -> const bf16* {
+        if (MODE == 0) {
+            // smem B row r = lrow + RPP*j ; warp quarter q = r / 64 ; w = r % 64 ; gate if w < 32
+            const int r = lrow + RPP * j;
+            const int q = r >> 6, w = r & 63;
+            return ((w < 32) ? b_base0 : b_base1) + (size_t)(q * 32 + (w & 31)) * K;
+        } else {
+            return b_base0 + (size_t)j * b_pass_stride;
+        }
+    };
+
+    auto setup_tile = [&](int t) {
+        const int mb = t / n_tiles;
+        nt = t - mb * n_tiles;
+        valid = block_valid[mb];
+        const int expert = block_expert[mb];
+        row0 = mb * BM;
+        const bf16* W = (expert < E) ? (Wr + (size_t)expert * w_per_expert)
+                                     : (Ws + (size_t)(expert - E) * w_per_expert);
+        #pragma unroll
+        for (int j = 0; j < A_PASSES; ++j) {
+            const int r = lrow + RPP * j;
+            if (MODE == 0) {
+                const int tok = sorted_token[row0 + r];
+                a_ok[j] = tok >= 0;
+                a_src[j] = A + (size_t)(a_ok[j] ? tok : 0) * K + lchunk * 8;
+            } else {
+                a_ok[j] = r < valid;
+                a_src[j] = A + (size_t)(row0 + r) * K + lchunk * 8;
+            }
+        }
+        if (MODE == 0) {
+            const int n0 = nt * 128;
+            b_base0 = W + (size_t)n0 * K + lchunk * 8;
+            b_base1 = W + (size_t)(Nout + n0) * K + lchunk * 8;
+        } else {
+            b_base0 = W + (size_t)(nt * BN + lrow) * K + lchunk * 8;
+            b_base1 = b_base0;
+        }
+        nmf = min(4, max(0, (valid - wm * 64 + 15) >> 4));
+#ifdef MOE_B_PF_FIRST
+        pf_b = (mb == 0) || (block_expert[mb - 1] != expert);
+#else
+        pf_b = true;
+#endif
+    };
+    auto load_stage = [&](int stage, int kt) {
+#ifdef MOE_NO_LOADS
+        if (kt >= 0) return;
+#endif
+        const uint32_t s = smem_base + stage * STAGE_BYTES;
+        const int koff = kt * BK;
+        #pragma unroll
+        for (int j = 0; j < A_PASSES; ++j) cp_async_16(s + a_dst[j], a_src[j] + koff, a_ok[j]);
+        #pragma unroll
+        // NOTE: cp.async with an L2::cache_hint policy operand faults (illegal instruction) inside
+        // this kernel on sm_120 although it works standalone; plain cp.async is used for B.
+        for (int j = 0; j < B_PASSES; ++j) cp_async_16(s + b_dst[j], b_ptr(j) + koff, true);
+    };
+    // L2 prefetch of whole 128 B lines ahead of the cp.async stream (one line per row per 128 B of K).
+    auto prefetch_k = [&](int kt) {
+#ifdef MOE_NO_LOADS
+        return;
+#endif
+#ifndef MOE_NO_PF
+        if (lchunk == 0) {
+            const int koff = kt * BK;
+            if (pf_b) {
+                #pragma unroll
+                for (int j = 0; j < B_PASSES; ++j) prefetch_l2(b_ptr(j) + koff);
+            }
+#ifndef MOE_NO_A_PF
+            #pragma unroll
+            for (int j = 0; j < A_PASSES; ++j) if (a_ok[j]) prefetch_l2(a_src[j] + koff);
+#endif
+        }
+#endif
+    };
+    constexpr int PF_STEP = (BK == 32) ? 2 : 1;   // k-tiles per 128 B line
+    auto issue_prologue = [&]() {
+        for (int k = 0; k < PF_DIST && k < KT; k += PF_STEP) prefetch_k(k);
+        #pragma unroll
+        for (int s = 0; s < STAGES; ++s) {
+            if (s < KT) load_stage(s, s);
+            cp_async_commit();
+        }
+    };
+
+    // Main loop specialized on the number of valid m16 fragments of this warp (NMF):
+    // padded rows generate no ldmatrix/MMA instructions at all (predicated-off HMMAs
+    // would still occupy the tensor pipe).
+    auto run_mainloop = [&](float (&acc)[4][8][4], auto nmf_tag) {
+        constexpr int NMF = decltype(nmf_tag)::value;
+        uint32_t fa0[4][4], fb0[4][4], fa1[4][4], fb1[4][4];
+        auto load_frags = [&](uint32_t (&fa)[4][4], uint32_t (&fb)[4][4], int stage, int ks) {
+            if (NMF == 0) return;
+            const uint32_t s = smem_base + stage * STAGE_BYTES;
+            const uint32_t x = (uint32_t)ks << 5;
+            #pragma unroll
+            for (int p = 0; p < 4; ++p) ldmatrix_x4(s + (b_ld[p] ^ x), fb[p][0], fb[p][1], fb[p][2], fb[p][3]);
+            #pragma unroll
+            for (int mi = 0; mi < NMF; ++mi) ldmatrix_x4(s + (a_ld[mi] ^ x), fa[mi][0], fa[mi][1], fa[mi][2], fa[mi][3]);
+        };
+        auto mma_all = [&](const uint32_t (&fa)[4][4], const uint32_t (&fb)[4][4]) {
+#ifdef MOE_NO_MMA
+            if (fa[0][0] != 0x7fc00001u) return;
+#endif
+            #pragma unroll
+            for (int mi = 0; mi < NMF; ++mi) {
+                #pragma unroll
+                for (int nf = 0; nf < 8; ++nf)
+                    mma_bf16_16816(acc[mi][nf], fa[mi], fb[nf >> 1][(nf & 1) * 2], fb[nf >> 1][(nf & 1) * 2 + 1]);
+            }
+        };
+        // stage 0 landed: STAGES groups committed, need group 0 complete
+        cp_async_wait<STAGES - 1>();
+        bar_sync();
+        load_frags(fa0, fb0, 0, 0);
+        for (int kt = 0; kt < KT; ++kt) {
+            const int st = kt % STAGES;
+            #pragma unroll
+            for (int ks = 0; ks < KS; ++ks) {
+                uint32_t (&fa_cur)[4][4] = (ks & 1) ? fa1 : fa0;
+                uint32_t (&fb_cur)[4][4] = (ks & 1) ? fb1 : fb0;
+                uint32_t (&fa_nxt)[4][4] = (ks & 1) ? fa0 : fa1;
+                uint32_t (&fb_nxt)[4][4] = (ks & 1) ? fb0 : fb1;
+                if (ks + 1 < KS) {
+                    load_frags(fa_nxt, fb_nxt, st, ks + 1);
+                } else if (kt + 1 < KT) {
+                    // all fragments of stage kt are in registers: wait for stage kt+1, then reuse
+                    // this stage's buffer for stage kt+STAGES (all warps passed the barrier).
+                    cp_async_wait<STAGES - 2>();
+                    bar_sync();
+                    const int nk = kt + STAGES;
+                    if (nk < KT) load_stage(st, nk);
+                    cp_async_commit();
+                    if (((kt % PF_STEP) == 0) && (kt + PF_DIST < KT)) prefetch_k(kt + PF_DIST);
+                    load_frags(fa_nxt, fb_nxt, (kt + 1) % STAGES, 0);
+                }
+                mma_all(fa_cur, fb_cur);
+            }
+        }
+    };
+
+    setup_tile(tile);
+    issue_prologue();
+    int par = 0;
+    if (tid == 0) s_next[1] = atomicAdd(&counters[3 + MODE], 1) + (int)gridDim.x;
+
+    while (true) {
+        float acc[4][8][4];
+        #pragma unroll
+        for (int mi = 0; mi < 4; ++mi)
+            #pragma unroll
+            for (int nf = 0; nf < 8; ++nf)
+                #pragma unroll
+                for (int q = 0; q < 4; ++q) acc[mi][nf][q] = 0.f;
+
+        switch (nmf) {
+            case 0: run_mainloop(acc, std::integral_constant<int, 0>{}); break;
+            case 1: run_mainloop(acc, std::integral_constant<int, 1>{}); break;
+            case 2: run_mainloop(acc, std::integral_constant<int, 2>{}); break;
+            case 3: run_mainloop(acc, std::integral_constant<int, 3>{}); break;
+            default: run_mainloop(acc, std::integral_constant<int, 4>{}); break;
+        }
+
+        // ---- hand-off: fetch next tile, start its loads, then run this tile's epilogue ----
+        const int e_row0 = row0, e_valid = valid, e_nt = nt, e_nmf = nmf;
+        cp_async_wait<0>();
+        bar_sync();
+        const int next = s_next[par ^ 1];
+        par ^= 1;
+        const bool has_next = next < total_tiles;
+        if (has_next) {
+            setup_tile(next);
+            issue_prologue();
+            if (tid == 0) s_next[par ^ 1] = atomicAdd(&counters[3 + MODE], 1) + (int)gridDim.x;
+        }
+
+        if (MODE == 0) {
+            const int n0 = e_nt * 128;
+            #pragma unroll
+            for (int mi = 0; mi < 4; ++mi) {
+                if (mi < e_nmf) {
+                    #pragma unroll
+                    for (int half = 0; half < 2; ++half) {
+                        const int r = wm * 64 + mi * 16 + (lane >> 2) + half * 8;
+                        if (r < e_valid) {
+                            bf16* o = Out + (size_t)(e_row0 + r) * Nout + n0 + wn * 32 + (lane & 3) * 2;
+                            #pragma unroll
+                            for (int nf = 0; nf < 4; ++nf) {
+                                const float g0 = acc[mi][nf][half * 2], g1 = acc[mi][nf][half * 2 + 1];
+                                const float u0 = acc[mi][nf + 4][half * 2], u1 = acc[mi][nf + 4][half * 2 + 1];
+                                *reinterpret_cast<__nv_bfloat162*>(o + nf * 8) =
+                                    __floats2bfloat162_rn(silu_f(g0) * u0, silu_f(g1) * u1);
+                            }
+                        }
+                    }
+                }
+            }
+        } else {
+            const int n0 = e_nt * BN;
+            #pragma unroll
+            for (int mi = 0; mi < 4; ++mi) {
+                if (mi < e_nmf) {
+                    #pragma unroll
+                    for (int half = 0; half < 2; ++half) {
+                        const int r = wm * 64 + mi * 16 + (lane >> 2) + half * 8;
+                        if (r < e_valid) {
+                            const float w = sorted_weight[e_row0 + r];
+                            if (OutF != nullptr) {
+                                const int tok = sorted_token[e_row0 + r];
+                                float* o = OutF + (size_t)tok * Nout + n0 + wn * 64 + (lane & 3) * 2;
+                                #pragma unroll
+                                for (int nf = 0; nf < 8; ++nf)
+                                    red_add_v2_hint(o + nf * 8, acc[mi][nf][half * 2] * w, acc[mi][nf][half * 2 + 1] * w, pol_keep);
+                            } else {
+                                bf16* o = Out + (size_t)(e_row0 + r) * Nout + n0 + wn * 64 + (lane & 3) * 2;
+                                #pragma unroll
+                                for (int nf = 0; nf < 8; ++nf) {
+                                    *reinterpret_cast<__nv_bfloat162*>(o + nf * 8) =
+                                        __floats2bfloat162_rn(acc[mi][nf][half * 2] * w, acc[mi][nf][half * 2 + 1] * w);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if (!has_next) break;
+        tile = next;
+    }
+}
+
+// ------------------------------------------------------------------------------------
+// Decode path (T <= DEC_MAX_T): blocks hold only a handful of rows, so tensor-core tiles
+// would waste the machine.  CUDA-core GEMV: each warp streams 4 weight rows with 16 B
+// loads, dots them against up to 8 activation rows staged in shared memory, and reduces
+// with shuffles.  Same buffers / layouts as the tensor-core path.
+// ------------------------------------------------------------------------------------
+constexpr int DEC_MAX_T = 8;
+constexpr int DEC_THREADS = 256;         // 8 warps
+constexpr int DEC_NW = 4;                // weight rows per warp
+constexpr int DEC_MMAX = 8;              // activation rows per pass
+
+__device__ __forceinline__ void fma8_bf16(float& acc, const uint4& a, const uint4& w) {
+    const __nv_bfloat162* a2 = reinterpret_cast<const __nv_bfloat162*>(&a);
+    const __nv_bfloat162* w2 = reinterpret_cast<const __nv_bfloat162*>(&w);
+    #pragma unroll
+    for (int q = 0; q < 4; ++q) {
+        const float2 fa = __bfloat1622float2(a2[q]);
+        const float2 fw = __bfloat1622float2(w2[q]);
+        acc = fmaf(fa.x, fw.x, acc);
+        acc = fmaf(fa.y, fw.y, acc);
+    }
+}
+
+// MODE 0: unit = 8 h-cols (each warp: 1 h-col -> gate row + up row ... see below), K = H.
+//   To keep 4 rows per warp we give each warp 2 h-cols: W rows {gate c, up c, gate c+1, up c+1}.
+//   => 16 h-cols per CTA, n_units = Nout / 16.
+// MODE 1: each warp 4 output cols (4 W2 rows) => 32 cols per CTA, n_units = Nout / 32.
+template <int MODE, int M>
+__device__ __forceinline__ void decode_gemv_pass(const bf16* __restrict__ sA, int K, const bf16* const (&wrow)[DEC_NW],
+                                                 float (&acc)[DEC_NW][DEC_MMAX], int lane)
+{
+    const int steps = K / 256;   // 32 lanes x 8 elems per step
+    #pragma unroll 4
+    for (int st = 0; st < steps; ++st) {
+        const int k = (st * 32 + lane) * 8;
+        uint4 wv[DEC_NW];
+        #pragma unroll
+        for (int r = 0; r < DEC_NW; ++r) wv[r] = __ldcs(reinterpret_cast<const uint4*>(wrow[r] + k));
+        #pragma unroll
+        for (int m = 0; m < M; ++m) {
+            const uint4 av = *reinterpret_cast<const uint4*>(sA + (size_t)m * K + k);
+            #pragma unroll
+            for (int r = 0; r < DEC_NW; ++r) fma8_bf16(acc[r][m], av, wv[r]);
+        }
+    }
+}
+
+template <int MODE>
+__global__ void __launch_bounds__(DEC_THREADS)
+moe_decode_gemv_kernel(const bf16* __restrict__ A, const bf16* __restrict__ Wr, const bf16* __restrict__ Ws,
+                       bf16* __restrict__ Out,
+                       const int* __restrict__ sorted_token, const float* __restrict__ sorted_weight,
+                       const int* __restrict__ block_expert, const int* __restrict__ block_valid,
+                       const int* __restrict__ counters, int K, int Nout, int E, int mpass)
+{
+    extern __shared__ __align__(16) unsigned char smem_raw[];   // mpass x K bf16
+    bf16* sA = reinterpret_cast<bf16*>(smem_raw);
+    constexpr int COLS_PER_CTA = (MODE == 0) ? 16 : 32;
+    const int n_units = Nout / COLS_PER_CTA;
+    const int mb = blockIdx.x / n_units;
+    if (mb >= counters[0]) return;
+    const int unit = blockIdx.x - mb * n_units;
+    const int valid = block_valid[mb];
+    const int expert = block_expert[mb];
+    const int row0 = mb * BM;
+    const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
+    const size_t w_per_expert = (size_t)((MODE == 0) ? 2 * Nout : Nout) * (size_t)K;
+    const bf16* W = (expert < E) ? (Wr + (size_t)expert * w_per_expert) : (Ws + (size_t)(expert - E) * w_per_expert);
+
+    const bf16* wrow[DEC_NW];
+    int col[DEC_NW];
+    if (MODE == 0) {
+        const int c0 = unit * 16 + warp * 2;
+        col[0] = c0; col[1] = c0; col[2] = c0 + 1; col[3] = c0 + 1;
+        wrow[0] = W + (size_t)c0 * K;            // gate c0
+        wrow[1] = W + (size_t)(Nout + c0) * K;   // up   c0
+        wrow[2] = W + (size_t)(c0 + 1) * K;      // gate c0+1
+        wrow[3] = W + (size_t)(Nout + c0 + 1) * K;
+    } else {
+        #pragma unroll
+        for (int r = 0; r < DEC_NW; ++r) { col[r] = unit * 32 + warp * 4 + r; wrow[r] = W + (size_t)col[r] * K; }
+    }
+
+    for (int m0 = 0; m0 < valid; m0 += mpass) {
+        const int mcnt = min(mpass, valid - m0);
+        const int mpad = (mcnt <= 1) ? 1 : (mcnt <= 2) ? 2 : (mcnt <= 4) ? 4 : 8;
+        if (m0 > 0) __syncthreads();
+        // stage activation rows (zero-fill padded rows)
+        const int chunks = K / 8;
+        for (int i = tid; i < mpad * chunks; i += DEC_THREADS) {
+            const int m = i / chunks, c = i - m * chunks;
+            uint4 v = make_uint4(0u, 0u, 0u, 0u);
+            if (m < mcnt) {
+                const int r = row0 + m0 + m;
+                const bf16* src = (MODE == 0) ? (A + (size_t)sorted_token[r] * K) : (A + (size_t)r * K);
+                v = *reinterpret_cast<const uint4*>(src + (size_t)c * 8);
+            }
+            *reinterpret_cast<uint4*>(sA + (size_t)m * K + (size_t)c * 8) = v;
+        }
+        __syncthreads();
+
+        float acc[DEC_NW][DEC_MMAX];
+        #pragma unroll
+        for (int r = 0; r < DEC_NW; ++r)
+            #pragma unroll
+            for (int m = 0; m < DEC_MMAX; ++m) acc[r][m] = 0.f;
+        switch (mpad) {
+            case 1: decode_gemv_pass<MODE, 1>(sA, K, wrow, acc, lane); break;
+            case 2: decode_gemv_pass<MODE, 2>(sA, K, wrow, acc, lane); break;
+            case 4: decode_gemv_pass<MODE, 4>(sA, K, wrow, acc, lane); break;
+            default: decode_gemv_pass<MODE, 8>(sA, K, wrow, acc, lane); break;
+        }
+        // warp reduction
+        #pragma unroll
+        for (int r = 0; r < DEC_NW; ++r)
+            #pragma unroll
+            for (int m = 0; m < DEC_MMAX; ++m) {
+                float v = acc[r][m];
+                v += __shfl_xor_sync(0xffffffffu, v, 16);
+                v += __shfl_xor_sync(0xffffffffu, v, 8);
+                v += __shfl_xor_sync(0xffffffffu, v, 4);
+                v += __shfl_xor_sync(0xffffffffu, v, 2);
+                v += __shfl_xor_sync(0xffffffffu, v, 1);
+                acc[r][m] = v;
+            }
+        if (lane < mcnt) {
+            const int m = lane;      // one lane per activation row
+            const int r_out = row0 + m0 + m;
+            float vals[DEC_MMAX * DEC_NW];
+            // gather this lane's row values from acc (acc is uniform across lanes after the reduction)
+            #pragma unroll
+            for (int r = 0; r < DEC_NW; ++r) {
+                float v = 0.f;
+                #pragma unroll
+                for (int mm = 0; mm < DEC_MMAX; ++mm) v = (mm == m) ? acc[r][mm] : v;
+                vals[r] = v;
+            }
+            if (MODE == 0) {
+                const float h0 = silu_f(vals[0]) * vals[1];
+                const float h1 = silu_f(vals[2]) * vals[3];
+                *reinterpret_cast<__nv_bfloat162*>(Out + (size_t)r_out * Nout + col[0]) = __floats2bfloat162_rn(h0, h1);
+            } else {
+                const float w = sorted_weight[r_out];
+                bf16* o = Out + (size_t)r_out * Nout + col[0];
+                *reinterpret_cast<__nv_bfloat162*>(o) = __floats2bfloat162_rn(vals[0] * w, vals[1] * w);
+                *reinterpret_cast<__nv_bfloat162*>(o + 2) = __floats2bfloat162_rn(vals[2] * w, vals[3] * w);
+            }
+        }
+    }
+}
+
+// ------------------------------------------------------------------------------------
+// Reduction kernel: out[t] = shared row(s) + sum_k routed rows (bf16 Y path).
+// ------------------------------------------------------------------------------------
+__global__ void moe_reduce_kernel(const bf16* __restrict__ Y, const int* __restrict__ pos,
+                                  const int* __restrict__ counters, bf16* __restrict__ out,
+                                  int T, int top_k, int n_shared, int H)
+{
+    const int t = blockIdx.x;
+    const int shared_start = counters[1];
+    const int shared_stride = ((T + BM - 1) / BM) * BM;
+    for (int c = threadIdx.x * 8; c < H; c += blockDim.x * 8) {
+        float acc[8];
+        #pragma unroll
+        for (int q = 0; q < 8; ++q) acc[q] = 0.f;
+        for (int s = 0; s < n_shared; ++s) {
+            const size_t row = (size_t)(shared_start + s * shared_stride + t);
+            const uint4 v = *reinterpret_cast<const uint4*>(Y + row * H + c);
+            const __nv_bfloat162* h2 = reinterpret_cast<const __nv_bfloat162*>(&v);
+            #pragma unroll
+            for (int q = 0; q < 4; ++q) { const float2 f = __bfloat1622float2(h2[q]); acc[2*q] += f.x; acc[2*q+1] += f.y; }
+        }
+        for (int k = 0; k < top_k; ++k) {
+            const size_t row = (size_t)pos[t * top_k + k];
+            const uint4 v = *reinterpret_cast<const uint4*>(Y + row * H + c);
+            const __nv_bfloat162* h2 = reinterpret_cast<const __nv_bfloat162*>(&v);
+            #pragma unroll
+            for (int q = 0; q < 4; ++q) { const float2 f = __bfloat1622float2(h2[q]); acc[2*q] += f.x; acc[2*q+1] += f.y; }
+        }
+        uint4 o;
+        __nv_bfloat162* o2 = reinterpret_cast<__nv_bfloat162*>(&o);
+        #pragma unroll
+        for (int q = 0; q < 4; ++q) o2[q] = __floats2bfloat162_rn(acc[2*q], acc[2*q+1]);
+        *reinterpret_cast<uint4*>(out + (size_t)t * H + c) = o;
+    }
+}
+
+__global__ void f32_to_bf16_kernel(const float* __restrict__ in, bf16* __restrict__ out, size_t n8) {
+    const size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n8) return;
+    const float4 a = reinterpret_cast<const float4*>(in)[2 * i];
+    const float4 b = reinterpret_cast<const float4*>(in)[2 * i + 1];
+    uint4 o;
+    __nv_bfloat162* o2 = reinterpret_cast<__nv_bfloat162*>(&o);
+    o2[0] = __floats2bfloat162_rn(a.x, a.y); o2[1] = __floats2bfloat162_rn(a.z, a.w);
+    o2[2] = __floats2bfloat162_rn(b.x, b.y); o2[3] = __floats2bfloat162_rn(b.z, b.w);
+    reinterpret_cast<uint4*>(out)[i] = o;
+}
+
+}  // namespace
+
+torch::Tensor moe_forward(torch::Tensor x, torch::Tensor expert_ids, torch::Tensor expert_weights,
+                          torch::Tensor w1r, torch::Tensor w2r, torch::Tensor w1s, torch::Tensor w2s)
+{
+    TORCH_CHECK(x.is_cuda() && x.dtype() == torch::kBFloat16 && x.is_contiguous(), "x must be contiguous bf16 cuda");
+    TORCH_CHECK(expert_ids.dtype() == torch::kInt64 && expert_ids.is_contiguous(), "expert_ids int64 contiguous");
+    TORCH_CHECK(expert_weights.dtype() == torch::kBFloat16 && expert_weights.is_contiguous(), "expert_weights bf16 contiguous");
+    TORCH_CHECK(w1r.is_contiguous() && w2r.is_contiguous() && w1s.is_contiguous() && w2s.is_contiguous(), "weights contiguous");
+    TORCH_CHECK(w1r.dtype() == torch::kBFloat16 && w2r.dtype() == torch::kBFloat16 &&
+                w1s.dtype() == torch::kBFloat16 && w2s.dtype() == torch::kBFloat16, "weights bf16");
+
+    const int T = (int)x.size(0);
+    const int H = (int)x.size(1);
+    const int top_k = (int)expert_ids.size(1);
+    const int E = (int)w1r.size(0);
+    const int I = (int)w1r.size(1) / 2;
+    const int n_shared = (int)w1s.size(0);
+    TORCH_CHECK((int)w1r.size(2) == H && (int)w2r.size(1) == H && (int)w2r.size(2) == I, "w1/w2 routed shape");
+    TORCH_CHECK((int)w1s.size(1) == 2 * I && (int)w1s.size(2) == H && (int)w2s.size(1) == H && (int)w2s.size(2) == I, "shared shape");
+    TORCH_CHECK(H % 256 == 0 && I % 256 == 0, "H and I must be multiples of 256");
+    TORCH_CHECK((int)expert_ids.size(0) == T && expert_weights.sizes() == expert_ids.sizes(), "routing shapes");
+
+    auto stream = at::cuda::getCurrentCUDAStream();
+    const int n = T * top_k;
+    const int64_t max_blocks = ((int64_t)n + (int64_t)E * (BM - 1)) / BM + (int64_t)n_shared * ((T + BM - 1) / BM);
+    const int64_t max_rows = max_blocks * BM;
+
+    // One workspace allocation (int32 rows / fp32 weights / bf16 H,Y) carved up manually.
+    auto align_up = [](int64_t v, int64_t a) { return (v + a - 1) / a * a; };
+    const int64_t n_alloc = std::max(n, 1);
+    const int64_t off_sorted_token = 0;
+    const int64_t off_sorted_weight = align_up(off_sorted_token + max_rows * 4, 256);
+    const int64_t off_block_expert = align_up(off_sorted_weight + max_rows * 4, 256);
+    const int64_t off_block_valid = align_up(off_block_expert + max_blocks * 4, 256);
+    const int64_t off_pos = align_up(off_block_valid + max_blocks * 4, 256);
+    const int64_t off_counters = align_up(off_pos + n_alloc * 4, 256);
+    const int64_t off_counts = align_up(off_counters + 8 * 4, 256);          // [E]
+    const int64_t off_cursor = align_up(off_counts + (int64_t)E * 4, 256);   // [E]
+    const int64_t off_start = align_up(off_cursor + (int64_t)E * 4, 256);    // [E + n_shared + 1]
+    const int64_t off_H = align_up(off_start + (int64_t)(E + n_shared + 1) * 4, 256);
+    const int64_t off_Y = align_up(off_H + max_rows * (int64_t)I * 2, 256);
+    // fp32 accumulate-in-place path (no Y round trip) when the accumulator can live in L2
+    const int64_t outf_bytes = (int64_t)T * H * 4;
+    static int64_t atomic_max_bytes = -1;
+    if (atomic_max_bytes < 0) {
+        const char* env = std::getenv("MOE_ATOMIC_MAX_MB");
+        atomic_max_bytes = (env ? std::atoll(env) : MOE_ATOMIC_MAX_MB_DEFAULT) * (int64_t)1024 * 1024;
+    }
+    const bool use_atomic = (T > DEC_MAX_T) && (outf_bytes <= atomic_max_bytes);
+    const int64_t y_bytes = use_atomic ? outf_bytes : max_rows * (int64_t)H * 2;
+    const int64_t ws_bytes = align_up(off_Y + y_bytes, 256);
+    auto ws = torch::empty({ws_bytes}, x.options().dtype(torch::kUInt8));
+    unsigned char* wsp = ws.data_ptr<unsigned char>();
+    int* sorted_token_p = reinterpret_cast<int*>(wsp + off_sorted_token);
+    float* sorted_weight_p = reinterpret_cast<float*>(wsp + off_sorted_weight);
+    int* block_expert_p = reinterpret_cast<int*>(wsp + off_block_expert);
+    int* block_valid_p = reinterpret_cast<int*>(wsp + off_block_valid);
+    int* pos_p = reinterpret_cast<int*>(wsp + off_pos);
+    int* counters_p = reinterpret_cast<int*>(wsp + off_counters);
+    int* counts_p = reinterpret_cast<int*>(wsp + off_counts);
+    int* cursor_p = reinterpret_cast<int*>(wsp + off_cursor);
+    int* start_p = reinterpret_cast<int*>(wsp + off_start);
+    bf16* Hbuf_p = reinterpret_cast<bf16*>(wsp + off_H);
+    bf16* Y_p = reinterpret_cast<bf16*>(wsp + off_Y);
+    float* OutF_p = reinterpret_cast<float*>(wsp + off_Y);   // aliases Y (only one of them is used)
+    auto out = torch::empty({(int64_t)T, (int64_t)H}, x.options());
+
+    const int Etot = E + n_shared;
+    if (n < 16384) {
+        const size_t align_smem = (size_t)(3 * Etot + 1) * sizeof(int);
+        moe_align_kernel<<<1, 1024, align_smem, stream>>>(
+            expert_ids.data_ptr<int64_t>(), reinterpret_cast<const bf16*>(expert_weights.data_ptr()),
+            T, top_k, E, n_shared, sorted_token_p, sorted_weight_p,
+            block_expert_p, block_valid_p, pos_p, counters_p);
+    } else {
+        cudaMemsetAsync(counts_p, 0, (size_t)E * sizeof(int), stream);
+        const int hist_blocks = std::min(256, (n + 4095) / 4096);
+        moe_hist_kernel<<<hist_blocks, 256, (size_t)E * sizeof(int), stream>>>(
+            expert_ids.data_ptr<int64_t>(), n, E, counts_p);
+        moe_scan_kernel<<<1, 1024, (size_t)(2 * Etot + 1) * sizeof(int), stream>>>(
+            counts_p, T, E, n_shared, start_p, cursor_p, sorted_token_p, sorted_weight_p,
+            block_expert_p, block_valid_p, counters_p);
+        const int scat_blocks = std::min(512, (std::max(n, T * n_shared) + 255) / 256);
+        moe_scatter_kernel<<<scat_blocks, 256, 0, stream>>>(
+            expert_ids.data_ptr<int64_t>(), reinterpret_cast<const bf16*>(expert_weights.data_ptr()),
+            T, top_k, E, n_shared, start_p, cursor_p, sorted_token_p, sorted_weight_p, pos_p);
+    }
+
+    static bool attr_done = false;
+    static int num_sms = 0;
+    if (!attr_done) {
+        cudaFuncSetAttribute(moe_grouped_gemm_kernel<0>, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_BYTES);
+        cudaFuncSetAttribute(moe_grouped_gemm_kernel<1>, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_BYTES);
+        cudaDeviceGetAttribute(&num_sms, cudaDevAttrMultiProcessorCount, x.get_device());
+        attr_done = true;
+    }
+    if (T <= DEC_MAX_T) {
+        // decode path: CUDA-core GEMV kernels
+        const int units1 = I / 16, units2 = H / 32;
+        int mpass = 1;                                                // activation rows staged per pass (pow2 <= 8)
+        while (mpass < std::min(T, DEC_MMAX)) mpass *= 2;
+        const size_t smem1 = (size_t)mpass * H * sizeof(bf16);
+        const size_t smem2 = (size_t)mpass * I * sizeof(bf16);
+        static bool dec_attr = false;
+        if (!dec_attr) {
+            cudaFuncSetAttribute(moe_decode_gemv_kernel<0>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)(DEC_MMAX * H * sizeof(bf16)));
+            cudaFuncSetAttribute(moe_decode_gemv_kernel<1>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)(DEC_MMAX * I * sizeof(bf16)));
+            dec_attr = true;
+        }
+        // every block holds >= 1 row, so blocks <= routed pairs + shared pseudo-experts
+        const int64_t dec_blocks = std::min<int64_t>(max_blocks, (int64_t)n + n_shared);
+        moe_decode_gemv_kernel<0><<<(unsigned)(dec_blocks * units1), DEC_THREADS, smem1, stream>>>(
+            reinterpret_cast<const bf16*>(x.data_ptr()), reinterpret_cast<const bf16*>(w1r.data_ptr()),
+            reinterpret_cast<const bf16*>(w1s.data_ptr()), Hbuf_p,
+            sorted_token_p, sorted_weight_p, block_expert_p,
+            block_valid_p, counters_p, H, I, E, mpass);
+        moe_decode_gemv_kernel<1><<<(unsigned)(dec_blocks * units2), DEC_THREADS, smem2, stream>>>(
+            Hbuf_p, reinterpret_cast<const bf16*>(w2r.data_ptr()),
+            reinterpret_cast<const bf16*>(w2s.data_ptr()), Y_p,
+            sorted_token_p, sorted_weight_p, block_expert_p,
+            block_valid_p, counters_p, I, H, E, mpass);
+        moe_reduce_kernel<<<T, 128, 0, stream>>>(
+            Y_p, pos_p, counters_p,
+            reinterpret_cast<bf16*>(out.data_ptr()), T, top_k, n_shared, H);
+        return out;
+    }
+    const int n_tiles1 = I / 128, n_tiles2 = H / BN;
+    const int grid1 = (int)std::min<int64_t>((int64_t)num_sms, max_blocks * n_tiles1);
+    const int grid2 = (int)std::min<int64_t>((int64_t)num_sms, max_blocks * n_tiles2);
+    moe_grouped_gemm_kernel<0><<<grid1, THREADS, SMEM_BYTES, stream>>>(
+        reinterpret_cast<const bf16*>(x.data_ptr()), reinterpret_cast<const bf16*>(w1r.data_ptr()),
+        reinterpret_cast<const bf16*>(w1s.data_ptr()), Hbuf_p,
+        sorted_token_p, sorted_weight_p, block_expert_p,
+        block_valid_p, counters_p, H, I, E, n_tiles1, nullptr);
+    if (use_atomic) cudaMemsetAsync(OutF_p, 0, (size_t)outf_bytes, stream);
+    moe_grouped_gemm_kernel<1><<<grid2, THREADS, SMEM_BYTES, stream>>>(
+        Hbuf_p, reinterpret_cast<const bf16*>(w2r.data_ptr()),
+        reinterpret_cast<const bf16*>(w2s.data_ptr()), Y_p,
+        sorted_token_p, sorted_weight_p, block_expert_p,
+        block_valid_p, counters_p, I, H, E, n_tiles2, use_atomic ? OutF_p : nullptr);
+    if (use_atomic) {
+        const size_t n8 = (size_t)T * H / 8;
+        f32_to_bf16_kernel<<<(unsigned)((n8 + 255) / 256), 256, 0, stream>>>(OutF_p, reinterpret_cast<bf16*>(out.data_ptr()), n8);
+    } else {
+        moe_reduce_kernel<<<T, 128, 0, stream>>>(
+            Y_p, pos_p, counters_p,
+            reinterpret_cast<bf16*>(out.data_ptr()), T, top_k, n_shared, H);
+    }
+    return out;
+}
+"""
+
+CPP_SRC = r"""
+#include <torch/extension.h>
+torch::Tensor moe_forward(torch::Tensor x, torch::Tensor expert_ids, torch::Tensor expert_weights,
+                          torch::Tensor w1r, torch::Tensor w2r, torch::Tensor w1s, torch::Tensor w2s);
+"""
+
+_ext = load_inline(
+    name="glm52_fused_moe_cuda_v13",
+    cpp_sources=CPP_SRC,
+    cuda_sources=CUDA_SRC,
+    functions=["moe_forward"],
+    extra_cuda_cflags=["-O3", "-std=c++17", "--expt-relaxed-constexpr"],
+    verbose=False,
+)
+
+
+class Model(nn.Module):
+    def __init__(self, T: int, E: int, top_k: int, n_shared: int, H: int, I: int):
+        super().__init__()
+        self.T, self.E, self.top_k = T, E, top_k
+        self.n_shared, self.H, self.I = n_shared, H, I
+        self.w1_routed = nn.Parameter(torch.empty(E, 2 * I, H, dtype=torch.bfloat16))
+        self.w2_routed = nn.Parameter(torch.empty(E, H, I, dtype=torch.bfloat16))
+        self.w1_shared = nn.Parameter(torch.empty(n_shared, 2 * I, H, dtype=torch.bfloat16))
+        self.w2_shared = nn.Parameter(torch.empty(n_shared, H, I, dtype=torch.bfloat16))
+        for p in self.parameters():
+            nn.init.normal_(p, std=0.02)
+
+    def forward(self, x: torch.Tensor, expert_ids: torch.Tensor, expert_weights: torch.Tensor) -> torch.Tensor:
+        x = x.contiguous()
+        if x.dtype != torch.bfloat16:
+            x = x.to(torch.bfloat16)
+        expert_ids = expert_ids.contiguous()
+        if expert_ids.dtype != torch.int64:
+            expert_ids = expert_ids.to(torch.int64)
+        expert_weights = expert_weights.contiguous()
+        if expert_weights.dtype != torch.bfloat16:
+            expert_weights = expert_weights.to(torch.bfloat16)
+        return _ext.moe_forward(
+            x, expert_ids, expert_weights,
+            self.w1_routed.data, self.w2_routed.data, self.w1_shared.data, self.w2_shared.data,
+        )

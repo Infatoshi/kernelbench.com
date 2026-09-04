@@ -217,7 +217,10 @@ def extract(run_dir: Path, harness: str) -> dict:
     # ccr-claude, native claude) and bare kimi emit the Anthropic-shape terminal
     # {"type":"result"} with cumulative usage. Match the -claude suffix so a newly
     # added provider route is never silently dropped to null tokens.
-    if harness == "claude" or harness == "kimi" or harness.endswith("-claude"):
+    # or-fable / or-opus / openrouter-* are Claude Code pointed at OpenRouter:
+    # same terminal {"type":"result"} shape, so the same extractor applies.
+    if (harness == "claude" or harness == "kimi" or harness.endswith("-claude")
+            or harness in ("or-fable", "openrouter-fable", "or-opus", "openrouter-opus")):
         return _claude_or_kimi(transcript)
     if harness == "droid":
         return _droid(transcript)

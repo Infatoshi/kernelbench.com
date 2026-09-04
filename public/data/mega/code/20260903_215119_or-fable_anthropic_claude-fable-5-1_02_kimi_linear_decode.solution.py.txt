@@ -1,0 +1,1697 @@
+"""Kimi-Linear W4A16 hybrid decode -- single persistent CUDA megakernel.
+
+The whole per-token forward (3x KDA + 1x MLA, each followed by a 64-expert MoE)
+runs as ONE cooperative kernel launch per `step()`:
+
+* 188 persistent blocks (one per SM, 512 threads) pull tasks from a global
+  atomic queue.  Tasks are ordered by phase; every task spins on a dependency
+  counter (release/acquire) before consuming activations produced by other
+  blocks, so the dataflow of the entire forward lives inside one launch.
+* Every projection is a fused int4 dequant-GEMV: the packed nibbles are
+  streamed once from HBM in a repacked (K/8, N/4, 16B) layout, unpacked with
+  the 2^23 magic-number trick and accumulated in fp32 with the per-group
+  asymmetric (scale, zero) applied at group boundaries.  No bf16 weight is ever
+  materialised.
+* KDA: conv + SiLU + gate are fused into the q/k/v/g GEMV epilogue; the
+  gated-delta recurrence updates S in place (task = head x 32-column slice).
+* MLA: weight-absorbed latent attention (q is absorbed through kv_b's k-part,
+  attention runs over the 576-d latent cache shared by all heads, the output is
+  mapped back through kv_b's v-part), flash-decoding style split over tokens
+  with an in-kernel combine.  The latent cache lives in a capacity buffer so the
+  append is a single in-kernel row write.
+* MoE: router logits + top-8 + normalisation in-kernel, expert GEMVs with
+  per-expert dependency counters (down projections start as soon as their
+  expert's gate/up finished), fp32 atomics for the K-split / expert reductions.
+
+Numerics follow reference.py's bf16 rounding points, so the outputs match at
+cosine >= 0.99 typically.
+"""
+from __future__ import annotations
+
+import math
+import os
+import sys
+from dataclasses import dataclass, field
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.cpp_extension import load_inline
+
+OP_TYPE = "kimi_linear_w4a16_decode"
+HARDWARE_REQUIRED = ["RTX_PRO_6000"]
+EPS = 1.0e-6
+GROUP_SIZE = 128
+
+
+# --------------------------------------------------------------------------- #
+# Config / module structure (identical names + init to reference.py)
+# --------------------------------------------------------------------------- #
+@dataclass(frozen=True)
+class Config:
+    hidden: int = 2304
+    kda_heads: int = 32
+    kda_head_dim: int = 128
+    short_conv: int = 4
+    mla_heads: int = 32
+    kv_lora: int = 512
+    qk_nope: int = 128
+    qk_rope: int = 64
+    v_head: int = 128
+    rope_theta: float = 10000.0
+    n_experts: int = 64
+    n_active: int = 8
+    n_shared: int = 1
+    moe_inter: int = 1024
+    routed_scaling: float = 2.446
+    group: int = 128
+    pattern: tuple = ("K", "K", "K", "M")
+    dtype: torch.dtype = field(default=torch.bfloat16)
+
+
+def build_config(shape: dict) -> Config:
+    return Config(n_experts=int(shape.get("n_experts", 64)))
+
+
+def _pack_int4(w_q: torch.Tensor) -> torch.Tensor:
+    lo = w_q[0::2] & 0xF
+    hi = w_q[1::2] & 0xF
+    return (lo | (hi << 4)).contiguous()
+
+
+def quantize(w_io: torch.Tensor, group: int = GROUP_SIZE):
+    K, N = w_io.shape
+    ng = K // group
+    wg = w_io.view(ng, group, N).float()
+    wmin = wg.min(dim=1, keepdim=True).values
+    wmax = wg.max(dim=1, keepdim=True).values
+    scales = (wmax - wmin).clamp_min(1e-8) / 15.0
+    zeros = (-wmin / scales).round().clamp(0, 15)
+    w_q = ((wg / scales) + zeros).round().clamp(0, 15).to(torch.uint8).view(K, N)
+    return _pack_int4(w_q), scales.squeeze(1).to(torch.bfloat16), zeros.squeeze(1).to(torch.bfloat16)
+
+
+class QuantLinear(nn.Module):
+    def __init__(self, in_f: int, out_f: int, group: int = GROUP_SIZE):
+        super().__init__()
+        assert in_f % group == 0 and in_f % 2 == 0
+        self.in_f, self.out_f, self.group = in_f, out_f, group
+        ng = in_f // group
+        self.register_buffer("w_q", torch.zeros(in_f // 2, out_f, dtype=torch.uint8))
+        self.register_buffer("scales", torch.zeros(ng, out_f, dtype=torch.bfloat16))
+        self.register_buffer("zeros", torch.zeros(ng, out_f, dtype=torch.bfloat16))
+
+    def init_random(self, gen: torch.Generator, std: float = 0.02) -> None:
+        w = torch.randn(self.in_f, self.out_f, generator=gen) * std
+        wq, s, z = quantize(w, self.group)
+        self.w_q.copy_(wq)
+        self.scales.copy_(s)
+        self.zeros.copy_(z)
+
+
+class QuantExperts(nn.Module):
+    def __init__(self, n: int, in_f: int, out_f: int, group: int = GROUP_SIZE):
+        super().__init__()
+        self.n, self.in_f, self.out_f, self.group = n, in_f, out_f, group
+        ng = in_f // group
+        self.register_buffer("w_q", torch.zeros(n, in_f // 2, out_f, dtype=torch.uint8))
+        self.register_buffer("scales", torch.zeros(n, ng, out_f, dtype=torch.bfloat16))
+        self.register_buffer("zeros", torch.zeros(n, ng, out_f, dtype=torch.bfloat16))
+
+    def init_random(self, gen: torch.Generator, std: float = 0.02) -> None:
+        for e in range(self.n):
+            w = torch.randn(self.in_f, self.out_f, generator=gen) * std
+            wq, s, z = quantize(w, self.group)
+            self.w_q[e].copy_(wq)
+            self.scales[e].copy_(s)
+            self.zeros[e].copy_(z)
+
+
+class KDA(nn.Module):
+    def __init__(self, cfg: Config):
+        super().__init__()
+        self.cfg = cfg
+        H, Dk, d = cfg.kda_heads, cfg.kda_head_dim, cfg.hidden
+        self.q_proj = QuantLinear(d, H * Dk, cfg.group)
+        self.k_proj = QuantLinear(d, H * Dk, cfg.group)
+        self.v_proj = QuantLinear(d, H * Dk, cfg.group)
+        self.g_proj = QuantLinear(d, H * Dk, cfg.group)
+        self.beta_proj = nn.Linear(d, H, bias=False, dtype=cfg.dtype)
+        self.conv_w = nn.Parameter(torch.empty(3, H * Dk, cfg.short_conv, dtype=cfg.dtype))
+        self.o_proj = QuantLinear(H * Dk, d, cfg.group)
+        self.scale = Dk ** -0.5
+
+
+class MLA(nn.Module):
+    def __init__(self, cfg: Config):
+        super().__init__()
+        self.cfg = cfg
+        H, d = cfg.mla_heads, cfg.hidden
+        self.q_proj = QuantLinear(d, H * (cfg.qk_nope + cfg.qk_rope), cfg.group)
+        self.kv_a = QuantLinear(d, cfg.kv_lora + cfg.qk_rope, cfg.group)
+        self.kv_b = QuantLinear(cfg.kv_lora, H * (cfg.qk_nope + cfg.v_head), cfg.group)
+        self.o_proj = QuantLinear(H * cfg.v_head, d, cfg.group)
+        self.scale = (cfg.qk_nope + cfg.qk_rope) ** -0.5
+
+
+class MoE(nn.Module):
+    def __init__(self, cfg: Config):
+        super().__init__()
+        self.cfg = cfg
+        d, m, E = cfg.hidden, cfg.moe_inter, cfg.n_experts
+        self.router = nn.Linear(d, E, bias=False, dtype=cfg.dtype)
+        self.gate = QuantExperts(E, d, m, cfg.group)
+        self.up = QuantExperts(E, d, m, cfg.group)
+        self.down = QuantExperts(E, m, d, cfg.group)
+        self.s_gate = QuantExperts(cfg.n_shared, d, m, cfg.group)
+        self.s_up = QuantExperts(cfg.n_shared, d, m, cfg.group)
+        self.s_down = QuantExperts(cfg.n_shared, m, d, cfg.group)
+
+
+class Block(nn.Module):
+    def __init__(self, cfg: Config, kind: str):
+        super().__init__()
+        self.kind = kind
+        self.attn_norm = nn.Parameter(torch.ones(cfg.hidden, dtype=cfg.dtype))
+        self.moe_norm = nn.Parameter(torch.ones(cfg.hidden, dtype=cfg.dtype))
+        self.attn = KDA(cfg) if kind == "K" else MLA(cfg)
+        self.moe = MoE(cfg)
+
+
+# --------------------------------------------------------------------------- #
+# CUDA megakernel
+# --------------------------------------------------------------------------- #
+CUDA_SRC = r"""
+#include <torch/extension.h>
+#include <ATen/cuda/CUDAContext.h>
+#include <cuda_runtime.h>
+#include <cuda_bf16.h>
+#include <cuda_fp16.h>
+#include <stdint.h>
+#include <vector>
+
+namespace {
+
+typedef __nv_bfloat16 bf16;
+
+constexpr int NT = 512;
+constexpr int NWARP = 16;
+constexpr int D = 2304;
+constexpr int CKDA = 4096;
+constexpr int TOPK = 8;
+constexpr int MINTER = 1024;
+constexpr int KV_LORA = 512;
+constexpr int QK_ROPE = 64;
+constexpr int QK_NOPE = 128;
+constexpr int QDIM = 192;
+constexpr int QPROJ_N = 6144;
+constexpr int KVA_N = 576;
+constexpr int KEYD = 576;
+constexpr float EPS = 1e-6f;
+constexpr float ROUTED_SCALING = 2.446f;
+constexpr float KDA_SCALE = 0.08838834764831845f;
+constexpr float MLA_SCALE = 0.07216878364870322f;
+
+// K-splits (tasks per column tile); must split at group (128) boundaries
+constexpr int KS1 = KS1_VAL;    // KDA q/k/v/g (K=2304: 36 kblocks)
+constexpr int KS1M = KS1M_VAL;  // MLA q_proj / kv_a
+constexpr int KS3 = KS3_VAL;    // o_proj (K=4096: 64 kblocks)
+constexpr int KS5 = 1;          // down (K=1024)
+
+constexpr int N_P1K = 4 * 32 * KS1 + 1;
+constexpr int N_P1M = (48 + 5) * KS1M;
+constexpr int N_REC = 128;
+constexpr int N_OPROJ = 18 * KS3;
+constexpr int N_LOGIT = 4;
+constexpr int N_SHARED = 16;
+constexpr int N_ROUTED = 128;
+constexpr int N_DOWN = 9 * 18 * KS5;
+constexpr int N_COMB = 128;
+constexpr int GU_PER_EXPERT = 16;
+
+constexpr int CNT_PER_PARITY = 16384;
+constexpr int C_QUEUE = 0;
+constexpr int C_COPY = 8;
+
+enum {
+  W_ATTN_NORM = 0, W_MOE_NORM, W_ROUTER,
+  W_GATE, W_GATE_SZ, W_UP, W_UP_SZ, W_DOWN, W_DOWN_SZ,
+  W_SGATE, W_SGATE_SZ, W_SUP, W_SUP_SZ, W_SDOWN, W_SDOWN_SZ,
+  W_OPROJ, W_OPROJ_SZ,
+  W_Q, W_Q_SZ, W_K, W_K_SZ, W_V, W_V_SZ, W_G, W_G_SZ, W_BETA, W_CONV,
+  W_QP, W_QP_SZ, W_KVA, W_KVA_SZ, W_KT, W_KT_S, W_KT_Z, W_KT_SZ1, W_WV, W_WV_SZ,
+  W_NSLOT = 64
+};
+
+enum { K_COPY = 0, K_P1K, K_P1M, K_REC, K_OPROJ, K_LOGIT, K_SHARED, K_ROUTED, K_DOWN, K_ATTN, K_COMB };
+
+// mma layout sizes: W (Ntiles, 8, K/64, 32, 16B) -> bytes = K*Np/2 ; SZ (Ntiles, 8, K/128, 8, 4 bf16)
+constexpr size_t GU_W_STRIDE = (size_t)D * MINTER / 2;                 // per expert bytes
+constexpr size_t GU_SZ_ELEMS = (size_t)(MINTER / 128) * 8 * (D / 128) * 32;   // bf16 elements per expert
+constexpr size_t DN_W_STRIDE = (size_t)MINTER * D / 2;
+constexpr size_t DN_SZ_ELEMS = (size_t)(D / 128) * 8 * (MINTER / 128) * 32;
+constexpr size_t KT_STRIDE = (size_t)128 * 512 / 2;                    // per head bytes (K=128, N=512)
+constexpr size_t WV_STRIDE = (size_t)512 * 128 / 2;                    // per head bytes (K=512, N=128)
+constexpr size_t WV_SZ_ELEMS = (size_t)1 * 8 * 4 * 32;
+
+struct StepArgs {
+  const unsigned long long* wtab;
+  float* S[3];
+  bf16* cq[3]; bf16* ck[3]; bf16* cv[3];
+  bf16* ckv; bf16* krope;
+  const bf16* copy_ckv; const bf16* copy_krope;
+  const bf16* hin; bf16* hout;
+  float *res_a, *res_b, *y_attn, *y_moe, *acc_p1, *acc_gu, *qkv, *gbuf, *beta, *obuf, *logits;
+  float *qn, *qabs, *qrope, *attn_o, *attn_ml, *olat;
+  unsigned* counters;
+  unsigned long long* trace;
+  int L; int parity; int n_attn; int T_task; int copy_len; int n_copy; int grid;
+};
+
+struct Smem {
+  union {
+    struct {
+      float xs[4096];              // fp32 staging (absolute k)
+      uint2 xfrag[256 * 4];        // fp16 B-fragments per (k-step, lane&3)
+      float xsum_kb[64];           // per-kblock sums of fp16-rounded x
+      float red[NWARP * 128];
+    } g;
+    struct {
+      float key[16 * KEYD];
+      float part[NWARP * 16 * 32];
+      float sc[16 * 32];
+      float p[16 * 32];
+      float alpha[32];
+    } at;
+  };
+  float misc[64];
+  int ph_start[48], ph_kind[48], ph_layer[48], ph_count[48];
+  int n_phases, total_tasks, task_next, stage_key, topk_layer, bcast;
+  unsigned long long t_wait;
+  unsigned long long tm[8];
+  int eidx[8];
+  float ew[8];
+  unsigned long long wtab[4 * W_NSLOT];
+  StepArgs args;
+};
+
+// ------------------------------------------------------------------ helpers
+__device__ __forceinline__ float bf2f(bf16 v) { return __bfloat162float(v); }
+__device__ __forceinline__ bf16 f2bf(float v) { return __float2bfloat16(v); }
+__device__ __forceinline__ float bfround(float v) { return __bfloat162float(__float2bfloat16(v)); }
+__device__ __forceinline__ float bflo(uint32_t w) { return __uint_as_float(w << 16); }
+__device__ __forceinline__ float bfhi(uint32_t w) { return __uint_as_float(w & 0xFFFF0000u); }
+__device__ __forceinline__ void bf16x8_to_f32(uint4 v, float* o) {
+  o[0] = bflo(v.x); o[1] = bfhi(v.x); o[2] = bflo(v.y); o[3] = bfhi(v.y);
+  o[4] = bflo(v.z); o[5] = bfhi(v.z); o[6] = bflo(v.w); o[7] = bfhi(v.w);
+}
+__device__ __forceinline__ uint4 ldg16(const void* p) { return __ldg(reinterpret_cast<const uint4*>(p)); }
+__device__ __forceinline__ uint4 ldcg16(const void* p) { return __ldcg(reinterpret_cast<const uint4*>(p)); }
+__device__ __forceinline__ float ldcg(const float* p) { return __ldcg(p); }
+__device__ __forceinline__ float warp_sum(float v) {
+  #pragma unroll
+  for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
+  return v;
+}
+__device__ __forceinline__ float warp_max(float v) {
+  #pragma unroll
+  for (int o = 16; o > 0; o >>= 1) v = fmaxf(v, __shfl_xor_sync(0xffffffffu, v, o));
+  return v;
+}
+__device__ __forceinline__ float block_sum(float v, float* scratch) {
+  v = warp_sum(v);
+  const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+  __syncthreads();
+  if (lane == 0) scratch[warp] = v;
+  __syncthreads();
+  float r = 0.f;
+  #pragma unroll
+  for (int i = 0; i < NWARP; ++i) r += scratch[i];
+  return r;
+}
+__device__ __forceinline__ unsigned ld_acquire(const unsigned* p) {
+  unsigned v;
+  asm volatile("ld.acquire.gpu.global.u32 %0, [%1];" : "=r"(v) : "l"(p) : "memory");
+  return v;
+}
+__device__ __forceinline__ unsigned long long gtimer() {
+  unsigned long long t; asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t)); return t;
+}
+#define TMARK(sm, i) do { if (threadIdx.x == 0) (sm).tm[i] = gtimer(); } while (0)
+struct Dep { const unsigned* cnt; unsigned tgt; };
+// deferred release of the previous task's counter: one lane, no barrier (caller must have synced after the writes)
+__device__ __forceinline__ void red_release_add(unsigned* p) {
+  asm volatile("red.release.gpu.global.add.u32 [%0], %1;" :: "l"(p), "r"(1u) : "memory");
+}
+__device__ __forceinline__ void deferred_signal(unsigned* pending) {
+  if (pending != nullptr && threadIdx.x == NT - 32) red_release_add(pending);
+}
+__device__ __forceinline__ unsigned atom_add_acqrel(unsigned* p) {
+  unsigned old;
+  asm volatile("atom.acq_rel.gpu.global.add.u32 %0, [%1], %2;" : "=r"(old) : "l"(p), "r"(1u) : "memory");
+  return old;
+}
+// Wait for a dependency; when `qcnt` is given, thread 0 also grabs the block's next task index
+// (returned raw; only meaningful in thread 0). Grabbing after the wait keeps waiting blocks from
+// holding a second task hostage.
+__device__ __forceinline__ unsigned wait_dep(Smem& sm, const Dep& d, unsigned* qcnt) {
+  unsigned g = 0;
+  if (threadIdx.x == 0) {
+    if (d.cnt != nullptr) { while (ld_acquire(d.cnt) < d.tgt) { __nanosleep(32); } }
+    if (qcnt != nullptr) g = atomicAdd(qcnt, 1u);
+    sm.t_wait = gtimer();
+  }
+  __syncthreads();
+  return g;
+}
+// synchronous release + increment; returns old value in thread 0
+__device__ __forceinline__ unsigned signal_now(unsigned* cnt) {
+  __syncthreads();
+  unsigned old = 0;
+  if (threadIdx.x == 0) old = atom_add_acqrel(cnt);
+  return old;
+}
+__device__ __forceinline__ float silu_f(float x) { return x / (1.f + expf(-x)); }
+__device__ __forceinline__ float softplus_f(float x) { return x > 20.f ? x : log1pf(expf(x)); }
+
+// weight table lives in smem (copied at kernel start); `a` kept for signature symmetry
+template <typename T>
+__device__ __forceinline__ const T* WTS(const Smem& sm, int layer, int slot) {
+  return reinterpret_cast<const T*>(sm.wtab[layer * W_NSLOT + slot]);
+}
+
+
+__device__ __forceinline__ uint32_t lop3_andor(uint32_t w, uint32_t magic, uint32_t mask) {
+  uint32_t d; asm("lop3.b32 %0, %1, %2, %3, 0xEC;" : "=r"(d) : "r"(w), "r"(magic), "r"(mask)); return d;
+}
+__device__ __forceinline__ void mma16816(float* d, const uint32_t* a, const uint32_t* b) {
+  asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+               : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
+               : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
+}
+
+// ------------------------------------------------------------ x staging
+// xs[0..K) fp32 (already visible to all threads) -> fp16 fragments + per-kblock sums; ends with __syncthreads
+__device__ __forceinline__ void finalize_x(Smem& sm, int K) {
+  for (int i = threadIdx.x; i < (K / 16) * 4; i += NT) {
+    const int ks = i >> 2, q = i & 3;
+    const int k0 = ks * 16 + 2 * q;
+    __half2 lo = __floats2half2_rn(sm.g.xs[k0], sm.g.xs[k0 + 1]);
+    __half2 hi = __floats2half2_rn(sm.g.xs[k0 + 8], sm.g.xs[k0 + 9]);
+    sm.g.xfrag[i] = make_uint2(*reinterpret_cast<uint32_t*>(&lo), *reinterpret_cast<uint32_t*>(&hi));
+  }
+  for (int kb = threadIdx.x; kb < K / 64; kb += NT) {
+    float s = 0.f;
+    #pragma unroll 8
+    for (int i = 0; i < 64; ++i) s += __half2float(__float2half_rn(sm.g.xs[kb * 64 + i]));
+    sm.g.xsum_kb[kb] = s;
+  }
+  __syncthreads();
+}
+
+// ------------------------------------------------------ fused int4 GEMV (mma)
+// W layout: (tiles, 8 mtiles, K/64 kblocks, 32 lanes, 16 B); SZ: (tiles, 8, K/128, 8, 4 bf16)
+// Task: column tile `tile`, kblocks [kb0, kb1) (even boundaries). Warp w: mtile w>>1, k-half w&1.
+// x fragments in sm.g.xfrag (kblock index offset xoff_kb), sums in sm.g.xsum_kb.
+// `stage()` runs after the prologue loads were issued; it must end with __syncthreads().
+// Returns the column sum for threads < 128 (column = tile*128 + tid).
+// ------------------------------------------------------------ staging steps
+// attention-input staging: h_in -> rmsnorm(attn_norm) -> xs -> fragments. Single dependent round trip.
+__device__ __forceinline__ void stage_attn_in(const StepArgs& a, Smem& sm, int layer, bool write_res) {
+  const int key = layer * 16 + 1;
+  if (sm.stage_key == key) return;
+  const bf16* nw = WTS<bf16>(sm, layer, W_ATTN_NORM);
+  float hv[5], wv[5];
+  #pragma unroll
+  for (int i = 0; i < 5; ++i) {
+    const int n = threadIdx.x + i * NT;
+    if (n < D) {
+      if (layer == 0) hv[i] = bf2f(a.hin[n]);
+      else hv[i] = bfround(ldcg(a.res_b + n) + bfround(ldcg(a.y_moe + n)));
+      wv[i] = bf2f(nw[n]);
+    } else { hv[i] = 0.f; wv[i] = 0.f; }
+  }
+  float local = 0.f;
+  #pragma unroll
+  for (int i = 0; i < 5; ++i) { local += hv[i] * hv[i]; const int n = threadIdx.x + i * NT; if (write_res && n < D) a.res_a[n] = hv[i]; }
+  const float ss = block_sum(local, sm.misc);
+  const float rstd = rsqrtf(ss / (float)D + EPS);
+  #pragma unroll
+  for (int i = 0; i < 5; ++i) { const int n = threadIdx.x + i * NT; if (n < D) sm.g.xs[n] = bfround((hv[i] * rstd) * wv[i]); }
+  __syncthreads();
+  finalize_x(sm, D);
+  if (threadIdx.x == 0) sm.stage_key = key;
+  __syncthreads();
+}
+__device__ __forceinline__ void stage_moe_in(const StepArgs& a, Smem& sm, int layer, bool write_res) {
+  const int key = layer * 16 + 2;
+  if (sm.stage_key == key) return;
+  const bf16* nw = WTS<bf16>(sm, layer, W_MOE_NORM);
+  float hv[5], wv[5];
+  #pragma unroll
+  for (int i = 0; i < 5; ++i) {
+    const int n = threadIdx.x + i * NT;
+    if (n < D) { hv[i] = bfround(ldcg(a.res_a + n) + bfround(ldcg(a.y_attn + n))); wv[i] = bf2f(nw[n]); }
+    else { hv[i] = 0.f; wv[i] = 0.f; }
+  }
+  float local = 0.f;
+  #pragma unroll
+  for (int i = 0; i < 5; ++i) { local += hv[i] * hv[i]; const int n = threadIdx.x + i * NT; if (write_res && n < D) a.res_b[n] = hv[i]; }
+  const float ss = block_sum(local, sm.misc);
+  const float rstd = rsqrtf(ss / (float)D + EPS);
+  #pragma unroll
+  for (int i = 0; i < 5; ++i) { const int n = threadIdx.x + i * NT; if (n < D) sm.g.xs[n] = bfround((hv[i] * rstd) * wv[i]); }
+  __syncthreads();
+  finalize_x(sm, D);
+  if (threadIdx.x == 0) sm.stage_key = key;
+  __syncthreads();
+}
+__device__ __forceinline__ void stage_o_in(const StepArgs& a, Smem& sm, int layer) {
+  const int key = layer * 16 + 3;
+  if (sm.stage_key == key) return;
+  for (int n = threadIdx.x * 4; n < CKDA; n += NT * 4)
+    *reinterpret_cast<float4*>(sm.g.xs + n) = __ldcg(reinterpret_cast<const float4*>(a.obuf + n));
+  __syncthreads();
+  finalize_x(sm, CKDA);
+  if (threadIdx.x == 0) sm.stage_key = key;
+  __syncthreads();
+}
+__device__ __forceinline__ void ensure_topk(const StepArgs& a, Smem& sm, int layer) {
+  if (sm.topk_layer == layer) return;
+  if (threadIdx.x < 32) {
+    const int lane = threadIdx.x;
+    float v0 = ldcg(a.logits + lane), v1 = ldcg(a.logits + lane + 32);
+    const float m = warp_max(fmaxf(v0, v1));
+    float e0 = expf(v0 - m), e1 = expf(v1 - m);
+    const float ssum = warp_sum(e0 + e1);
+    float p0 = e0 / ssum, p1 = e1 / ssum;
+    float wsum = 0.f;
+    #pragma unroll
+    for (int j = 0; j < TOPK; ++j) {
+      float cand = fmaxf(p0, p1);
+      int cidx = (p0 >= p1) ? lane : lane + 32;
+      const float mx = warp_max(cand);
+      int idx = (cand == mx) ? cidx : 1000;
+      #pragma unroll
+      for (int o = 16; o > 0; o >>= 1) idx = min(idx, __shfl_xor_sync(0xffffffffu, idx, o));
+      if (lane == 0) { sm.eidx[j] = idx; sm.ew[j] = mx; }
+      wsum += mx;
+      if (idx == lane) p0 = -1.f;
+      if (idx == lane + 32) p1 = -1.f;
+    }
+    __syncwarp();
+    if (lane < TOPK) sm.ew[lane] = sm.ew[lane] / (wsum + 1e-9f) * ROUTED_SCALING;
+    if (lane == 0) sm.topk_layer = layer;
+  }
+  __syncthreads();
+}
+__device__ __forceinline__ void stage_down_in(const StepArgs& a, Smem& sm, int layer, int slot) {
+  const int key = layer * 16 + 4 + slot;
+  if (sm.stage_key == key) return;
+  const float w = (slot < TOPK) ? sm.ew[slot] : 1.f;
+  const float* g = a.acc_gu + slot * 2048;
+  const float* u = g + MINTER;
+  for (int k = threadIdx.x; k < MINTER; k += NT) {
+    const float gv = ldcg(g + k), uv = ldcg(u + k);
+    sm.g.xs[k] = silu_f(gv) * uv * w;
+  }
+  __syncthreads();
+  finalize_x(sm, MINTER);
+  if (threadIdx.x == 0) sm.stage_key = key;
+  __syncthreads();
+}
+
+enum { ST_NONE = 0, ST_ATTN_IN, ST_O, ST_MOE, ST_DOWN, ST_OLAT };
+struct StageReq { int kind; int layer; int slot; int first; Dep dep; unsigned* pending; unsigned* qcnt; };
+__device__ __forceinline__ unsigned run_stage(const StepArgs& a, Smem& sm, const StageReq& st);
+
+template <int UNROLL>
+__device__ __noinline__ float gemv_mma(const uint8_t* __restrict__ W, const bf16* __restrict__ SZ, int K,
+                                       int tile, int kb0, int kb1, int xoff_kb, Smem& sm, StageReq st, unsigned* nxt_out) {
+  constexpr int NSZ = UNROLL / 2 + 1;
+  const StepArgs& a = sm.args;          // groups touched by one batch
+  const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+  const int mt = warp >> 1, kh = warp & 1;
+  const int nkb = kb1 - kb0;
+  const int per = (nkb + 1) >> 1;
+  const int wb = kb0 + kh * per;
+  const int we = min(wb + per, kb1);
+  const int KB = K >> 6, NG = K >> 7;
+  const uint8_t* wp = W + (((size_t)tile * 8 + mt) * KB + wb) * 512 + lane * 16;
+  const bf16* szp = SZ + (((size_t)tile * 8 + mt) * NG) * 32 + (lane >> 2) * 4;   // + g*32
+  const uint32_t MAGIC = 0x64006400u, MLO = 0x000F000Fu, MHI = 0x00F000F0u;
+  // prologue: two batches of weights + their (s,z) pairs
+  uint4 buf[UNROLL], nbuf[UNROLL];
+  uint2 szb[NSZ], nszb[NSZ];
+  #pragma unroll
+  for (int u = 0; u < UNROLL; ++u) { buf[u] = make_uint4(0u, 0u, 0u, 0u); if (wb + u < we) buf[u] = ldg16(wp + (size_t)u * 512); }
+  #pragma unroll
+  for (int u = 0; u < UNROLL; ++u) { nbuf[u] = make_uint4(0u, 0u, 0u, 0u); if (wb + UNROLL + u < we) nbuf[u] = ldg16(wp + (size_t)(UNROLL + u) * 512); }
+  #pragma unroll
+  for (int i = 0; i < NSZ; ++i) {
+    const int g = (wb >> 1) + i;
+    szb[i] = make_uint2(0u, 0u); if (g * 2 < we && g <= ((wb + UNROLL - 1) >> 1)) szb[i] = __ldg(reinterpret_cast<const uint2*>(szp + g * 32));
+    const int g2 = ((wb + UNROLL) >> 1) + i;
+    nszb[i] = make_uint2(0u, 0u); if (g2 * 2 < we && wb + UNROLL < we && g2 <= ((wb + 2 * UNROLL - 1) >> 1)) nszb[i] = __ldg(reinterpret_cast<const uint2*>(szp + g2 * 32));
+  }
+  TMARK(sm, 0);
+  const unsigned grab = run_stage(a, sm, st);
+  TMARK(sm, 1);
+  float d[4] = {0.f, 0.f, 0.f, 0.f};
+  float out_m = 0.f, out_m8 = 0.f, xsum = 0.f;
+  const uint2* xf = sm.g.xfrag + (lane & 3);
+  const bool par = (wb & 1) != 0;      // batch starts keep the parity of wb (UNROLL even)
+  for (int kb = wb; kb < we; kb += UNROLL) {
+    #pragma unroll
+    for (int u = 0; u < UNROLL; ++u) {
+      const int k = kb + u;
+      if (k < we) {
+        const uint32_t wv[4] = {buf[u].x, buf[u].y, buf[u].z, buf[u].w};
+        const int kx = k + xoff_kb;
+        #pragma unroll
+        for (int j = 0; j < 4; ++j) {
+          const uint32_t w = wv[j], w8 = w >> 8;
+          uint32_t av[4];
+          av[0] = lop3_andor(w, MAGIC, MLO); av[1] = lop3_andor(w, MAGIC, MHI);
+          av[2] = lop3_andor(w8, MAGIC, MLO); av[3] = lop3_andor(w8, MAGIC, MHI);
+          const uint2 bx = xf[(kx * 4 + j) * 4];
+          const uint32_t bv[2] = {bx.x, bx.y};
+          mma16816(d, av, bv);
+        }
+        xsum += sm.g.xsum_kb[kx];
+        if ((k & 1) || (k == we - 1)) {
+          const uint2 szv = par ? szb[(u + 1) >> 1] : szb[u >> 1];
+          const float s_m = bflo(szv.x), z_m = bfhi(szv.x), s_m8 = bflo(szv.y), z_m8 = bfhi(szv.y);
+          out_m = fmaf(s_m, d[0] - (1024.f + z_m) * xsum, out_m);
+          out_m8 = fmaf(s_m8, (d[2] - 1024.f * xsum) * 0.0625f - z_m8 * xsum, out_m8);
+          d[0] = d[1] = d[2] = d[3] = 0.f; xsum = 0.f;
+        }
+      }
+    }
+    // rotate buffers, issue loads for the batch after next
+    #pragma unroll
+    for (int u = 0; u < UNROLL; ++u) buf[u] = nbuf[u];
+    #pragma unroll
+    for (int i = 0; i < NSZ; ++i) szb[i] = nszb[i];
+    const int kn = kb + 2 * UNROLL;
+    if (kn < we) {
+      #pragma unroll
+      for (int u = 0; u < UNROLL; ++u) { nbuf[u] = make_uint4(0u, 0u, 0u, 0u); if (kn + u < we) nbuf[u] = ldg16(wp + (size_t)(kn + u - wb) * 512); }
+      #pragma unroll
+      for (int i = 0; i < NSZ; ++i) {
+        const int g2 = (kn >> 1) + i;
+        nszb[i] = make_uint2(0u, 0u); if (g2 * 2 < we && g2 <= ((kn + UNROLL - 1) >> 1)) nszb[i] = __ldg(reinterpret_cast<const uint2*>(szp + g2 * 32));
+      }
+    }
+  }
+  float* red = sm.g.red;
+  if ((lane & 3) == 0) { red[warp * 128 + (lane >> 2)] = out_m; red[warp * 128 + (lane >> 2) + 8] = out_m8; }
+  __syncthreads();
+  TMARK(sm, 2);
+  float r = 0.f;
+  if (threadIdx.x < 128) {
+    const int mtt = threadIdx.x >> 4, col = threadIdx.x & 15;
+    r = red[(mtt * 2) * 128 + col] + red[(mtt * 2 + 1) * 128 + col];
+  }
+  if (threadIdx.x == 0 && st.qcnt != nullptr) *nxt_out = grab;
+  return r;
+}
+
+
+__device__ __forceinline__ unsigned run_stage(const StepArgs& a, Smem& sm, const StageReq& st) {
+  unsigned g = 0;
+  switch (st.kind) {
+    case ST_ATTN_IN:
+      deferred_signal(st.pending); g = wait_dep(sm, st.dep, st.qcnt);
+      if (st.first) { for (int n = threadIdx.x; n < D; n += NT) a.y_attn[n] = 0.f; }
+      stage_attn_in(a, sm, st.layer, st.first != 0);
+      break;
+    case ST_O:
+      deferred_signal(st.pending); g = wait_dep(sm, st.dep, st.qcnt);
+      stage_o_in(a, sm, st.layer);
+      break;
+    case ST_MOE:
+      stage_moe_in(a, sm, st.layer, false);
+      __syncthreads();
+      break;
+    case ST_DOWN:
+      deferred_signal(st.pending); g = wait_dep(sm, st.dep, st.qcnt);
+      stage_down_in(a, sm, st.layer, st.slot);
+      break;
+    case ST_OLAT:
+      for (int k = threadIdx.x; k < KV_LORA; k += NT) sm.g.xs[k] = a.olat[st.slot * KV_LORA + k];
+      __syncthreads();
+      finalize_x(sm, KV_LORA);
+      break;
+    default:
+      __syncthreads();
+      break;
+  }
+  return g;
+}
+
+// --------------------------------------------------------------- counters
+__device__ __forceinline__ unsigned* cnt_phase(unsigned* cnt, int l, int which) { return cnt + 64 + l * 128 + which * 8; }
+constexpr int PH_P1 = 0, PH_REC = 1, PH_OPROJ = 2, PH_LOGIT = 3, PH_HEADS = 4, PH_DOWN = 5, PH_GU0 = 6;
+__device__ __forceinline__ unsigned* cnt_tile(unsigned* cnt, int l, int slot, int t) { return cnt + 1024 + (l * 8 + slot) * 256 + t; }
+constexpr int TS_P1 = 0, TS_HEAD = 1, TS_HP = 4, TS_COMB = 5;
+
+struct TaskDesc { int kind; int layer; int sub; };
+struct TaskRet { unsigned* sig; unsigned nxt; };
+
+__device__ __forceinline__ Dep task_dep(const StepArgs& a, unsigned* cnt, const TaskDesc& td) {
+  Dep d; d.cnt = nullptr; d.tgt = 0;
+  switch (td.kind) {
+    case K_P1K: case K_P1M:
+      if (td.layer == 0) { if (a.n_copy > 0) { d.cnt = cnt + C_COPY; d.tgt = a.n_copy; } }
+      else { d.cnt = cnt_phase(cnt, td.layer - 1, PH_DOWN); d.tgt = N_DOWN; }
+      break;
+    case K_REC: d.cnt = cnt_tile(cnt, td.layer, TS_HEAD, td.sub >> 2); d.tgt = 4 * KS1 + 1; break;
+    case K_ATTN: d.cnt = cnt_phase(cnt, 3, PH_P1); d.tgt = N_P1M; break;
+    case K_COMB: d.cnt = cnt_phase(cnt, 3, PH_REC); d.tgt = a.n_attn; break;
+    case K_OPROJ:
+      if (td.layer < 3) { d.cnt = cnt_phase(cnt, td.layer, PH_REC); d.tgt = N_REC; }
+      else { d.cnt = cnt_phase(cnt, 3, PH_HEADS); d.tgt = 32; }
+      break;
+    case K_LOGIT: case K_SHARED: d.cnt = cnt_phase(cnt, td.layer, PH_OPROJ); d.tgt = N_OPROJ; break;
+    case K_ROUTED: d.cnt = cnt_phase(cnt, td.layer, PH_LOGIT); d.tgt = N_LOGIT; break;
+    case K_DOWN: { const int qq = (td.sub / KS5) / 18; const int slot = (qq == 0) ? TOPK : (qq - 1); d.cnt = cnt_phase(cnt, td.layer, PH_GU0 + slot); d.tgt = GU_PER_EXPERT; } break;
+    default: break;
+  }
+  return d;
+}
+
+// ------------------------------------------------------------------ tasks
+// each task returns the counter to be signaled (deferred) or nullptr if it signaled synchronously
+__device__ TaskRet task_copy(const StepArgs& a, Smem& sm, unsigned* cnt, int sub, const Dep& dp, unsigned* pending, unsigned* qcnt) {
+  deferred_signal(pending);
+  const unsigned grab = wait_dep(sm, dp, qcnt);
+  const long nck = (long)a.copy_len * 64;
+  const long nkr = (long)a.copy_len * 8;
+  const long base = (long)sub * 4096;
+  for (int i = 0; i < 8; ++i) {
+    const long ci = base + i * NT + threadIdx.x;
+    if (ci < nck) {
+      const long row = ci >> 6, part = ci & 63;
+      uint4 v = ldcg16(a.copy_ckv + row * KV_LORA + part * 8);
+      *reinterpret_cast<uint4*>(a.ckv + row * KV_LORA + part * 8) = v;
+    } else if (ci < nck + nkr) {
+      const long cj = ci - nck; const long row = cj >> 3, part = cj & 7;
+      uint4 v = ldcg16(a.copy_krope + row * QK_ROPE + part * 8);
+      *reinterpret_cast<uint4*>(a.krope + row * QK_ROPE + part * 8) = v;
+    }
+  }
+  return TaskRet{cnt + C_COPY, grab};
+}
+
+__device__ __forceinline__ void p1_zero(const StepArgs& a) {
+  for (int n = threadIdx.x; n < D; n += NT) a.y_attn[n] = 0.f;
+}
+
+__device__ TaskRet task_p1_kda(const StepArgs& a, Smem& sm, unsigned* cnt, int layer, int sub, const Dep& dp, unsigned* pending, unsigned* qcnt) {
+  unsigned grab = 0;
+  if (sub == 4 * 32 * KS1) {
+    deferred_signal(pending);
+    grab = wait_dep(sm, dp, qcnt);
+    stage_attn_in(a, sm, layer, false);
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const bf16* Wb = WTS<bf16>(sm, layer, W_BETA);
+    for (int hh = 0; hh < 2; ++hh) {
+      const int h = warp * 2 + hh;
+      const bf16* row = Wb + (size_t)h * D;
+      float s = 0.f;
+      #pragma unroll
+      for (int k = lane * 8; k < D; k += 256) {
+        float f[8]; bf16x8_to_f32(ldg16(row + k), f);
+        const float4 xa = *reinterpret_cast<const float4*>(sm.g.xs + k);
+        const float4 xb = *reinterpret_cast<const float4*>(sm.g.xs + k + 4);
+        s += f[0] * xa.x + f[1] * xa.y + f[2] * xa.z + f[3] * xa.w + f[4] * xb.x + f[5] * xb.y + f[6] * xb.z + f[7] * xb.w;
+      }
+      s = warp_sum(s);
+      if (lane == 0) a.beta[h] = 1.f / (1.f + expf(-bfround(s)));
+    }
+    __syncthreads();
+    if (threadIdx.x < 32) red_release_add(cnt_tile(cnt, layer, TS_HEAD, threadIdx.x));
+    return TaskRet{nullptr, grab};
+  }
+  const int ks = sub % KS1;
+  const int tg = sub / KS1;
+  const int m = tg >> 5, tile = tg & 31;
+  const int slotW = (m == 0) ? W_Q : (m == 1) ? W_K : (m == 2) ? W_V : W_G;
+  const uint8_t* W = WTS<uint8_t>(sm, layer, slotW);
+  const bf16* SZ = WTS<bf16>(sm, layer, slotW + 1);
+  const int kb_per = (D / 64) / KS1;
+  const bool first = (sub == 0);
+  const int t = threadIdx.x;
+  const int n = tile * 128 + t;
+  // prefetch epilogue operands (conv window + conv taps) -- only this task touches them
+  bf16* win = (m == 0) ? a.cq[layer] : (m == 1) ? a.ck[layer] : a.cv[layer];
+  float w0 = 0.f, w1 = 0.f, w2 = 0.f; uint2 cwv = make_uint2(0u, 0u);
+  if (m < 3 && t < 128) {
+    w0 = bf2f(win[n]); w1 = bf2f(win[CKDA + n]); w2 = bf2f(win[2 * CKDA + n]);
+    cwv = __ldg(reinterpret_cast<const uint2*>(WTS<bf16>(sm, layer, W_CONV) + ((size_t)m * CKDA + n) * 4));
+  }
+  StageReq st; st.kind = ST_ATTN_IN; st.layer = layer; st.slot = 0; st.first = first ? 1 : 0; st.dep = dp; st.pending = pending; st.qcnt = qcnt;
+  float r = gemv_mma<UNROLL_BIG>(W, SZ, D, tile, ks * kb_per, (ks + 1) * kb_per, 0, sm, st, &grab);
+  bool fin = true;
+  if (KS1 > 1) {
+    if (t < 128) atomicAdd(a.acc_p1 + m * CKDA + n, r);
+    unsigned old = signal_now(cnt_tile(cnt, layer, TS_P1, tg));
+    if (t == 0) sm.bcast = (old == KS1 - 1) ? 1 : 0;
+    __syncthreads();
+    fin = sm.bcast != 0;
+    if (fin && t < 128) { __threadfence(); r = ldcg(a.acc_p1 + m * CKDA + n); }
+  }
+  if (fin && t < 128) {
+    const float v = bfround(r);
+    if (m < 3) {
+      const float c0 = bflo(cwv.x), c1 = bfhi(cwv.x), c2 = bflo(cwv.y), c3 = bfhi(cwv.y);
+      const float out = ((w0 * c0 + w1 * c1) + w2 * c2) + v * c3;
+      float sv = bfround(silu_f(out));
+      if (m == 0) sv *= KDA_SCALE;
+      a.qkv[m * CKDA + n] = sv;
+      win[n] = f2bf(w1); win[CKDA + n] = f2bf(w2); win[2 * CKDA + n] = f2bf(v);
+    } else {
+      a.gbuf[n] = -softplus_f(v);
+    }
+  }
+  __syncthreads();
+  return TaskRet{cnt_tile(cnt, layer, TS_HEAD, tile), grab};
+}
+
+// k-absorb for head h: q_nope (128 values in sm.g.red[0..128)) -> qabs (transposed [c][h], scaled)
+// WkT[h]: K=128 (d), N=512 (c) in fragment layout (4 tiles, 8 mtiles, 2 kblocks). Scale folded into x per c-group.
+__device__ __noinline__ void absorb_k(const StepArgs& a, Smem& sm, int h) {
+  const int t = threadIdx.x, warp = t >> 5, lane = t & 31;
+  const float* sk = WTS<float>(sm, 3, W_KT_S) + h * 512;
+  const float* zk = WTS<float>(sm, 3, W_KT_Z) + h * 512;
+  const int g = t >> 7, dd = t & 127;
+  const float q = sm.g.red[dd];
+  const float s = sk[g * 128 + dd];
+  const float zp = warp_sum(q * s * zk[g * 128 + dd]);
+  // prefetch this warp's weights: tile gt = warp>>2, mtiles m0 = 2*(warp&3), m0+1; kblocks 0,1
+  const int gt = warp >> 2, m0 = 2 * (warp & 3);
+  const uint8_t* W = WTS<uint8_t>(sm, 3, W_KT) + (size_t)h * KT_STRIDE + (((size_t)gt * 8 + m0) * 2) * 512 + lane * 16;
+  uint4 wv[4];
+  #pragma unroll
+  for (int i = 0; i < 4; ++i) wv[i] = ldg16(W + (size_t)i * 512);   // (m0,kb0),(m0,kb1),(m0+1,kb0),(m0+1,kb1)
+  __syncthreads();                        // everyone has read red (q values)
+  sm.g.xs[g * 128 + dd] = q * s;
+  if (lane == 0) sm.misc[32 + warp] = zp;
+  __syncthreads();
+  finalize_x(sm, 512);
+  const uint32_t MAGIC = 0x64006400u, MLO = 0x000F000Fu, MHI = 0x00F000F0u;
+  const uint2* xf = sm.g.xfrag + (lane & 3);
+  float outs[4];
+  #pragma unroll
+  for (int mi = 0; mi < 2; ++mi) {
+    float d[4] = {0.f, 0.f, 0.f, 0.f};
+    float xsum = 0.f;
+    #pragma unroll
+    for (int kb = 0; kb < 2; ++kb) {
+      const uint4 wq = wv[mi * 2 + kb];
+      const uint32_t wvv[4] = {wq.x, wq.y, wq.z, wq.w};
+      const int kx = gt * 2 + kb;
+      #pragma unroll
+      for (int j = 0; j < 4; ++j) {
+        const uint32_t w = wvv[j], w8 = w >> 8;
+        uint32_t av[4];
+        av[0] = lop3_andor(w, MAGIC, MLO); av[1] = lop3_andor(w, MAGIC, MHI);
+        av[2] = lop3_andor(w8, MAGIC, MLO); av[3] = lop3_andor(w8, MAGIC, MHI);
+        const uint2 bx = xf[(kx * 4 + j) * 4];
+        const uint32_t bv[2] = {bx.x, bx.y};
+        mma16816(d, av, bv);
+      }
+      xsum += sm.g.xsum_kb[kx];
+    }
+    outs[mi * 2] = d[0] - 1024.f * xsum;              // row n = 16*(m0+mi) + lane/4   (s=1, z=0)
+    outs[mi * 2 + 1] = (d[2] - 1024.f * xsum) * 0.0625f;   // row n + 8
+  }
+  const float zs = sm.misc[32 + gt * 4] + sm.misc[32 + gt * 4 + 1] + sm.misc[32 + gt * 4 + 2] + sm.misc[32 + gt * 4 + 3];
+  if ((lane & 3) == 0) {
+    #pragma unroll
+    for (int mi = 0; mi < 2; ++mi) {
+      const int c = gt * 128 + 16 * (m0 + mi) + (lane >> 2);
+      a.qabs[h * KV_LORA + c] = (outs[mi * 2] - zs) * MLA_SCALE;
+      a.qabs[h * KV_LORA + c + 8] = (outs[mi * 2 + 1] - zs) * MLA_SCALE;
+    }
+  }
+  if (t == 0) sm.stage_key = -1;
+  __syncthreads();
+}
+
+__device__ TaskRet task_p1_mla(const StepArgs& a, Smem& sm, unsigned* cnt, int layer, int sub, const Dep& dp, unsigned* pending, unsigned* qcnt) {
+  const int ks = sub % KS1M;
+  const int tg = sub / KS1M;
+  const bool isq = tg < 48;
+  const int tile = isq ? tg : tg - 48;
+  const uint8_t* W = WTS<uint8_t>(sm, layer, isq ? W_QP : W_KVA);
+  const bf16* SZ = WTS<bf16>(sm, layer, isq ? W_QP_SZ : W_KVA_SZ);
+  const int kb_per = (D / 64) / KS1M;
+  const bool first = (sub == 0);
+  unsigned grab = 0;
+  StageReq st; st.kind = ST_ATTN_IN; st.layer = layer; st.slot = 0; st.first = first ? 1 : 0; st.dep = dp; st.pending = pending; st.qcnt = qcnt;
+  float r = gemv_mma<UNROLL_BIG>(W, SZ, D, tile, ks * kb_per, (ks + 1) * kb_per, 0, sm, st, &grab);
+  const int t = threadIdx.x;
+  const int nloc = tile * 128 + t;
+  const int accn = (isq ? 0 : QPROJ_N) + nloc;
+  const int N = isq ? QPROJ_N : KVA_N;
+  bool fin = true;
+  if (KS1M > 1) {
+    if (t < 128 && nloc < N) atomicAdd(a.acc_p1 + accn, r);
+    unsigned old = signal_now(cnt_tile(cnt, layer, TS_P1, tg));
+    if (t == 0) sm.bcast = (old == KS1M - 1) ? 1 : 0;
+    __syncthreads();
+    fin = sm.bcast != 0;
+    if (fin && t < 128 && nloc < N) { __threadfence(); r = ldcg(a.acc_p1 + accn); }
+  }
+  if (fin) {
+    float v = (t < 128 && nloc < N) ? bfround(r) : 0.f;
+    __syncthreads();
+    if (t < 128) sm.g.red[t] = v;
+    __syncthreads();
+    if (isq) {
+      if (t < 128) {
+        const int head = nloc / QDIM, rr = nloc % QDIM;
+        if (rr < QK_NOPE) {
+          a.qn[head * QK_NOPE + rr] = v;
+        } else {
+          const int ri = rr - QK_NOPE;
+          const int pi = ri >> 1;
+          const float inv = 1.0f / powf(10000.f, (float)(2 * pi) / 64.f);
+          const float ang = (float)a.L * inv;
+          float c, s; sincosf(ang, &s, &c);
+          const float partner = sm.g.red[t ^ 1];
+          const float o = ((ri & 1) == 0) ? (v * c - partner * s) : (v * c + partner * s);
+          a.qrope[head * QK_ROPE + ri] = bfround(o) * MLA_SCALE;
+        }
+      }
+      if (tile % 3 == 0) {
+        absorb_k(a, sm, 2 * (tile / 3));
+      } else {
+        const int m = tile / 3;
+        const int h = 2 * m + 1;
+        unsigned old = signal_now(cnt_tile(cnt, layer, TS_HP, m));
+        if (t == 0) sm.bcast = (old == 1) ? 1 : 0;
+        __syncthreads();
+        if (sm.bcast) {
+          __threadfence();
+          if (t < 128) sm.g.red[t] = a.qn[h * QK_NOPE + t];
+          __syncthreads();
+          absorb_k(a, sm, h);
+        }
+      }
+    } else {
+      if (t < 128 && nloc < N) {
+        if (nloc < KV_LORA) {
+          a.ckv[(size_t)a.L * KV_LORA + nloc] = f2bf(v);
+        } else {
+          const int ri = nloc - KV_LORA;
+          const int pi = ri >> 1;
+          const float inv = 1.0f / powf(10000.f, (float)(2 * pi) / 64.f);
+          const float ang = (float)a.L * inv;
+          float c, s; sincosf(ang, &s, &c);
+          const float partner = sm.g.red[t ^ 1];
+          const float o = ((ri & 1) == 0) ? (v * c - partner * s) : (v * c + partner * s);
+          a.krope[(size_t)a.L * QK_ROPE + ri] = f2bf(o);
+        }
+      }
+    }
+  }
+  __syncthreads();
+  return TaskRet{cnt_phase(cnt, layer, PH_P1), grab};
+}
+
+__device__ TaskRet task_rec(const StepArgs& a, Smem& sm, unsigned* cnt, int layer, int sub, const Dep& dp, unsigned* pending, unsigned* qcnt) {
+  const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+  const int h = sub >> 2, js = sub & 3;
+  const int j = js * 32 + lane;
+  const int r0 = warp * 8;
+  float* S = a.S[layer] + (size_t)h * 128 * 128;
+  float s[8];
+  #pragma unroll
+  for (int r = 0; r < 8; ++r) s[r] = S[(r0 + r) * 128 + j];
+  deferred_signal(pending);
+  const unsigned grab = wait_dep(sm, dp, qcnt);
+  if (sub == 0) {
+    for (int n = threadIdx.x; n < D; n += NT) a.y_moe[n] = 0.f;
+    for (int n = threadIdx.x; n < 4 * CKDA; n += NT) a.acc_p1[n] = 0.f;
+  }
+  const float* qb = a.qkv + h * 128;
+  const float* kb = a.qkv + CKDA + h * 128;
+  const float* vb = a.qkv + 2 * CKDA + h * 128;
+  const float* gb = a.gbuf + h * 128;
+  const float beta = ldcg(a.beta + h);
+  const float vj = ldcg(vb + j);
+  float kk[8], qq[8], gg[8];
+  #pragma unroll
+  for (int r = 0; r < 8; ++r) { gg[r] = ldcg(gb + r0 + r); kk[r] = ldcg(kb + r0 + r); qq[r] = ldcg(qb + r0 + r); }
+  float pp = 0.f;
+  #pragma unroll
+  for (int r = 0; r < 8; ++r) { s[r] *= expf(gg[r]); pp += s[r] * kk[r]; }
+  float* red = sm.g.red;
+  red[warp * 32 + lane] = pp;
+  __syncthreads();
+  float pred = 0.f;
+  #pragma unroll
+  for (int w = 0; w < NWARP; ++w) pred += red[w * 32 + lane];
+  const float dv = vj - pred;
+  float oo = 0.f;
+  #pragma unroll
+  for (int r = 0; r < 8; ++r) {
+    const float bk = beta * kk[r];
+    s[r] += bk * dv;
+    oo += s[r] * qq[r];
+    S[(r0 + r) * 128 + j] = s[r];
+  }
+  red[512 + warp * 32 + lane] = oo;
+  __syncthreads();
+  if (warp == 0) {
+    float o = 0.f;
+    #pragma unroll
+    for (int w = 0; w < NWARP; ++w) o += red[512 + w * 32 + lane];
+    a.obuf[h * 128 + j] = bfround(o);
+  }
+  __syncthreads();
+  return TaskRet{cnt_phase(cnt, layer, PH_REC), grab};
+}
+
+__device__ TaskRet task_oproj(const StepArgs& a, Smem& sm, unsigned* cnt, int layer, int sub, const Dep& dp, unsigned* pending, unsigned* qcnt) {
+  const int ks = sub % KS3, tile = sub / KS3;
+  const uint8_t* W = WTS<uint8_t>(sm, layer, W_OPROJ);
+  const bf16* SZ = WTS<bf16>(sm, layer, W_OPROJ_SZ);
+  const int kb_per = (CKDA / 64) / KS3;
+  unsigned grab = 0;
+  StageReq st; st.kind = ST_O; st.layer = layer; st.slot = 0; st.first = 0; st.dep = dp; st.pending = pending; st.qcnt = qcnt;
+  float r = gemv_mma<UNROLL_BIG>(W, SZ, CKDA, tile, ks * kb_per, (ks + 1) * kb_per, 0, sm, st, &grab);
+  if (threadIdx.x < 128) atomicAdd(a.y_attn + tile * 128 + threadIdx.x, r);
+  __syncthreads();
+  return TaskRet{cnt_phase(cnt, layer, PH_OPROJ), grab};
+}
+
+__device__ TaskRet task_logit(const StepArgs& a, Smem& sm, unsigned* cnt, int layer, int sub, const Dep& dp, unsigned* pending, unsigned* qcnt) {
+  const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+  const int e = sub * 16 + warp;
+  // prefetch this warp's router row (2304 bf16) into registers: lane holds chunks lane, lane+32, ... (9 x 16 B)
+  const bf16* row = WTS<bf16>(sm, layer, W_ROUTER) + (size_t)e * D;
+  uint4 pre[9];
+  #pragma unroll
+  for (int i = 0; i < 9; ++i) pre[i] = ldg16(row + (size_t)(i * 32 + lane) * 8);
+  deferred_signal(pending);
+  const unsigned grab = wait_dep(sm, dp, qcnt);
+  stage_moe_in(a, sm, layer, sub == 0);
+  float s = 0.f;
+  #pragma unroll
+  for (int i = 0; i < 9; ++i) {
+    float f[8]; bf16x8_to_f32(pre[i], f);
+    const int k = (i * 32 + lane) * 8;
+    const float4 xa = *reinterpret_cast<const float4*>(sm.g.xs + k);
+    const float4 xb = *reinterpret_cast<const float4*>(sm.g.xs + k + 4);
+    s += f[0] * xa.x + f[1] * xa.y + f[2] * xa.z + f[3] * xa.w + f[4] * xb.x + f[5] * xb.y + f[6] * xb.z + f[7] * xb.w;
+  }
+  s = warp_sum(s);
+  if (lane == 0) a.logits[e] = bfround(s);
+  __syncthreads();
+  return TaskRet{cnt_phase(cnt, layer, PH_LOGIT), grab};
+}
+
+__device__ TaskRet task_gu(const StepArgs& a, Smem& sm, unsigned* cnt, int layer, int sub, bool shared, const Dep& dp, unsigned* pending, unsigned* qcnt) {
+  const int tile = sub & 7, isup = (sub >> 3) & 1;
+  const int slot = shared ? TOPK : (sub >> 4);
+  deferred_signal(pending);
+  if (!shared) {
+    Dep d0; d0.cnt = cnt_phase(cnt, layer, PH_OPROJ); d0.tgt = N_OPROJ;
+    wait_dep(sm, d0, nullptr);
+    stage_moe_in(a, sm, layer, false);
+  }
+  const unsigned grab = wait_dep(sm, dp, qcnt);
+  int e = 0;
+  if (!shared) { ensure_topk(a, sm, layer); e = sm.eidx[slot]; }
+  const uint8_t* W; const bf16* SZ;
+  if (shared) { W = WTS<uint8_t>(sm, layer, isup ? W_SUP : W_SGATE); SZ = WTS<bf16>(sm, layer, isup ? W_SUP_SZ : W_SGATE_SZ); }
+  else {
+    W = WTS<uint8_t>(sm, layer, isup ? W_UP : W_GATE) + (size_t)e * GU_W_STRIDE;
+    SZ = WTS<bf16>(sm, layer, isup ? W_UP_SZ : W_GATE_SZ) + (size_t)e * GU_SZ_ELEMS;
+  }
+  StageReq st; st.kind = ST_MOE; st.layer = layer; st.slot = 0; st.first = 0; st.dep = dp; st.pending = nullptr; st.qcnt = nullptr;
+  unsigned dummy = 0;
+  float r = gemv_mma<UNROLL_BIG>(W, SZ, D, tile, 0, D / 64, 0, sm, st, &dummy);
+  if (threadIdx.x < 128) a.acc_gu[slot * 2048 + isup * MINTER + tile * 128 + threadIdx.x] = r;
+  __syncthreads();
+  return TaskRet{cnt_phase(cnt, layer, PH_GU0 + slot), grab};
+}
+
+__device__ TaskRet task_down(const StepArgs& a, Smem& sm, unsigned* cnt, int layer, int sub, const Dep& dp, unsigned* pending, unsigned* qcnt) {
+  const int q = sub / KS5;
+  const int tile = q % 18;
+  const int slot = (q / 18 == 0) ? TOPK : (q / 18 - 1);      // shared expert's down tiles first
+  int e = 0;
+  if (slot < TOPK) {
+    Dep dl; dl.cnt = cnt_phase(cnt, layer, PH_LOGIT); dl.tgt = N_LOGIT;
+    deferred_signal(pending); pending = nullptr;
+    wait_dep(sm, dl, nullptr);
+    ensure_topk(a, sm, layer); e = sm.eidx[slot];
+  }
+  const uint8_t* W; const bf16* SZ;
+  if (slot == TOPK) { W = WTS<uint8_t>(sm, layer, W_SDOWN); SZ = WTS<bf16>(sm, layer, W_SDOWN_SZ); }
+  else { W = WTS<uint8_t>(sm, layer, W_DOWN) + (size_t)e * DN_W_STRIDE; SZ = WTS<bf16>(sm, layer, W_DOWN_SZ) + (size_t)e * DN_SZ_ELEMS; }
+  unsigned grab = 0;
+  StageReq st; st.kind = ST_DOWN; st.layer = layer; st.slot = slot; st.first = 0; st.dep = dp; st.pending = pending; st.qcnt = qcnt;
+  float r = gemv_mma<UNROLL_BIG>(W, SZ, MINTER, tile, 0, MINTER / 64, 0, sm, st, &grab);
+  if (threadIdx.x < 128) atomicAdd(a.y_moe + tile * 128 + threadIdx.x, r);
+  if (layer == 3) {
+    unsigned old = signal_now(cnt_phase(cnt, layer, PH_DOWN));
+    if (threadIdx.x == 0) sm.bcast = (old == N_DOWN - 1) ? 1 : 0;
+    __syncthreads();
+    if (sm.bcast) {
+      __threadfence();
+      for (int n = threadIdx.x; n < D; n += NT)
+        a.hout[n] = f2bf(ldcg(a.res_b + n) + bfround(ldcg(a.y_moe + n)));
+    }
+    __syncthreads();
+    return TaskRet{nullptr, grab};
+  }
+  __syncthreads();
+  return TaskRet{cnt_phase(cnt, layer, PH_DOWN), grab};
+}
+
+__device__ TaskRet task_attn(const StepArgs& a, Smem& sm, unsigned* cnt, int sub, const Dep& dp, unsigned* pending, unsigned* qcnt) {
+  const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+  const int t0 = sub * a.T_task;
+  const int t1 = min(t0 + a.T_task, a.L + 1);
+  deferred_signal(pending);
+  const unsigned grab = wait_dep(sm, dp, qcnt);
+  if (threadIdx.x == 0) sm.stage_key = -1;
+  if (sub == 0) {
+    for (int n = threadIdx.x; n < D; n += NT) a.y_moe[n] = 0.f;
+    for (int n = threadIdx.x; n < 4 * CKDA; n += NT) a.acc_p1[n] = 0.f;
+  }
+  // warp handles heads h0 = 2*warp, h1 = 2*warp+1.
+  // key dims: lane covers d = lane + 32*i (i < 18; i >= 16 -> rope dims); value dims: c = lane + 32*i (i < 16)
+  const int h0 = 2 * warp, h1 = h0 + 1;
+  float q0[18], q1[18];
+  {
+    const float* qa0 = a.qabs + h0 * KV_LORA + lane;
+    const float* qa1 = a.qabs + h1 * KV_LORA + lane;
+    #pragma unroll
+    for (int i = 0; i < 16; ++i) { q0[i] = qa0[32 * i]; q1[i] = qa1[32 * i]; }
+    const float* qr0 = a.qrope + h0 * QK_ROPE + lane;
+    const float* qr1 = a.qrope + h1 * QK_ROPE + lane;
+    q0[16] = qr0[0]; q0[17] = qr0[32]; q1[16] = qr1[0]; q1[17] = qr1[32];
+  }
+  float m0 = -INFINITY, m1 = -INFINITY, l0 = 0.f, l1 = 0.f;
+  float acc0[16], acc1[16];
+  #pragma unroll
+  for (int i = 0; i < 16; ++i) { acc0[i] = 0.f; acc1[i] = 0.f; }
+  TMARK(sm, 0);
+  float* key = sm.at.key;
+  for (int c0 = t0; c0 < t1; c0 += 16) {
+    const int nt = min(16, t1 - c0);
+    __syncthreads();
+    for (int ci = threadIdx.x; ci < 16 * 72; ci += NT) {
+      const int tok = ci / 72, pt = ci - tok * 72;
+      uint4 v = make_uint4(0u, 0u, 0u, 0u); int off;
+      if (tok < nt) {
+        if (pt < 64) { v = *reinterpret_cast<const uint4*>(a.ckv + (size_t)(c0 + tok) * KV_LORA + pt * 8); }
+        else { v = *reinterpret_cast<const uint4*>(a.krope + (size_t)(c0 + tok) * QK_ROPE + (pt - 64) * 8); }
+      }
+      off = (pt < 64) ? pt * 8 : KV_LORA + (pt - 64) * 8;
+      float f[8]; bf16x8_to_f32(v, f);
+      float* dst = key + tok * KEYD + off;
+      *reinterpret_cast<float4*>(dst) = make_float4(f[0], f[1], f[2], f[3]);
+      *reinterpret_cast<float4*>(dst + 4) = make_float4(f[4], f[5], f[6], f[7]);
+    }
+    __syncthreads();
+    TMARK(sm, 1);
+    float sc0[16], sc1[16];
+    #pragma unroll
+    for (int l = 0; l < 16; ++l) {
+      const float* kr = key + l * KEYD + lane;
+      float s0 = 0.f, s1 = 0.f;
+      #pragma unroll
+      for (int i = 0; i < 18; ++i) { const float kv = kr[32 * i]; s0 = fmaf(q0[i], kv, s0); s1 = fmaf(q1[i], kv, s1); }
+      sc0[l] = s0; sc1[l] = s1;
+    }
+    // 32 independent butterfly reductions (ILP hides shuffle latency)
+    #pragma unroll
+    for (int o = 16; o > 0; o >>= 1) {
+      #pragma unroll
+      for (int l = 0; l < 16; ++l) { sc0[l] += __shfl_xor_sync(0xffffffffu, sc0[l], o); sc1[l] += __shfl_xor_sync(0xffffffffu, sc1[l], o); }
+    }
+    #pragma unroll
+    for (int l = 0; l < 16; ++l) { if (l >= nt) { sc0[l] = -INFINITY; sc1[l] = -INFINITY; } }
+    TMARK(sm, 2);
+    float mloc0 = -INFINITY, mloc1 = -INFINITY;
+    #pragma unroll
+    for (int l = 0; l < 16; ++l) { mloc0 = fmaxf(mloc0, sc0[l]); mloc1 = fmaxf(mloc1, sc1[l]); }
+    const float mn0 = fmaxf(m0, mloc0), mn1 = fmaxf(m1, mloc1);
+    const float al0 = expf(m0 - mn0), al1 = expf(m1 - mn1);
+    float ls0 = 0.f, ls1 = 0.f;
+    #pragma unroll
+    for (int l = 0; l < 16; ++l) {
+      const float e0 = (l < nt) ? expf(sc0[l] - mn0) : 0.f;
+      const float e1 = (l < nt) ? expf(sc1[l] - mn1) : 0.f;
+      sc0[l] = e0; sc1[l] = e1; ls0 += e0; ls1 += e1;
+    }
+    l0 = l0 * al0 + ls0; l1 = l1 * al1 + ls1; m0 = mn0; m1 = mn1;
+    #pragma unroll
+    for (int i = 0; i < 16; ++i) { acc0[i] *= al0; acc1[i] *= al1; }
+    #pragma unroll
+    for (int l = 0; l < 16; ++l) {
+      const float* kr = key + l * KEYD + lane;
+      const float p0 = sc0[l], p1 = sc1[l];      // zero for l >= nt (rows zero-filled)
+      #pragma unroll
+      for (int i = 0; i < 16; ++i) { const float kv = kr[32 * i]; acc0[i] = fmaf(p0, kv, acc0[i]); acc1[i] = fmaf(p1, kv, acc1[i]); }
+    }
+  }
+  TMARK(sm, 3);
+  float* dst0 = a.attn_o + ((size_t)sub * 32 + h0) * KV_LORA + lane;
+  float* dst1 = a.attn_o + ((size_t)sub * 32 + h1) * KV_LORA + lane;
+  #pragma unroll
+  for (int i = 0; i < 16; ++i) { dst0[32 * i] = acc0[i]; dst1[32 * i] = acc1[i]; }
+  if (lane == 0) {
+    a.attn_ml[(sub * 32 + h0) * 2] = m0; a.attn_ml[(sub * 32 + h0) * 2 + 1] = l0;
+    a.attn_ml[(sub * 32 + h1) * 2] = m1; a.attn_ml[(sub * 32 + h1) * 2 + 1] = l1;
+  }
+  __syncthreads();
+  return TaskRet{cnt_phase(cnt, 3, PH_REC), grab};
+}
+
+__device__ TaskRet task_comb(const StepArgs& a, Smem& sm, unsigned* cnt, int sub, const Dep& dp, unsigned* pending, unsigned* qcnt) {
+  const int h = sub >> 2, cc = sub & 3;
+  const int t = threadIdx.x;
+  deferred_signal(pending);
+  const unsigned grab = wait_dep(sm, dp, qcnt);
+  if (t == 0) sm.stage_key = -1;
+  const int na = a.n_attn;
+  float* wgt = sm.g.xs;    // [na]
+  float mv = -INFINITY;
+  for (int i = t; i < na; i += NT) mv = fmaxf(mv, a.attn_ml[(i * 32 + h) * 2]);
+  mv = warp_max(mv);
+  __syncthreads();
+  if ((t & 31) == 0) sm.misc[t >> 5] = mv;
+  __syncthreads();
+  float M = -INFINITY;
+  #pragma unroll
+  for (int i = 0; i < NWARP; ++i) M = fmaxf(M, sm.misc[i]);
+  float lsum = 0.f;
+  for (int i = t; i < na; i += NT) {
+    const float m = a.attn_ml[(i * 32 + h) * 2];
+    const float l = a.attn_ml[(i * 32 + h) * 2 + 1];
+    const float w = expf(m - M);
+    wgt[i] = w;
+    lsum += l * w;
+  }
+  lsum = block_sum(lsum, sm.misc + 16);
+  __syncthreads();
+  {
+    const int dd = t & 127, tg = t >> 7;
+    float acc = 0.f;
+    const float* src = a.attn_o + (size_t)h * KV_LORA + cc * 128 + dd;
+    int i = tg;
+    for (; i + 28 < na; i += 32) {
+      float v[8];
+      #pragma unroll
+      for (int u = 0; u < 8; ++u) v[u] = src[(size_t)(i + 4 * u) * 32 * KV_LORA];
+      #pragma unroll
+      for (int u = 0; u < 8; ++u) acc += wgt[i + 4 * u] * v[u];
+    }
+    for (; i < na; i += 4) acc += wgt[i] * src[(size_t)i * 32 * KV_LORA];
+    sm.g.red[tg * 128 + dd] = acc;
+  }
+  __syncthreads();
+  if (t < 128) {
+    const float o = (sm.g.red[t] + sm.g.red[128 + t] + sm.g.red[256 + t] + sm.g.red[384 + t]) / lsum;
+    a.olat[h * KV_LORA + cc * 128 + t] = o;
+  }
+  unsigned old = signal_now(cnt_tile(cnt, 3, TS_COMB, h));
+  if (t == 0) sm.bcast = (old == 3) ? 1 : 0;
+  __syncthreads();
+  if (sm.bcast) {
+    __threadfence();
+    const uint8_t* W = WTS<uint8_t>(sm, 3, W_WV) + (size_t)h * WV_STRIDE;
+    const bf16* SZ = WTS<bf16>(sm, 3, W_WV_SZ) + (size_t)h * WV_SZ_ELEMS;
+    StageReq st; st.kind = ST_OLAT; st.layer = 3; st.slot = h; st.first = 0; st.dep = dp; st.pending = nullptr; st.qcnt = nullptr;
+    unsigned dummy = 0;
+    float r = gemv_mma<UNROLL_BIG>(W, SZ, KV_LORA, 0, 0, KV_LORA / 64, 0, sm, st, &dummy);
+    if (t < 128) a.obuf[h * 128 + t] = bfround(r);
+    __syncthreads();
+    return TaskRet{cnt_phase(cnt, 3, PH_HEADS), grab};
+  }
+  return TaskRet{nullptr, grab};
+}
+
+// ------------------------------------------------------------- scheduler
+__device__ __forceinline__ TaskDesc decode_task(const Smem& sm, int idx) {
+  TaskDesc td; td.kind = -1; td.layer = 0; td.sub = 0;
+  for (int p = 0; p < sm.n_phases; ++p) {
+    if (idx < sm.ph_start[p] + sm.ph_count[p]) { td.kind = sm.ph_kind[p]; td.layer = sm.ph_layer[p]; td.sub = idx - sm.ph_start[p]; break; }
+  }
+  return td;
+}
+
+__global__ void __launch_bounds__(NT, 1) mega_kernel(const StepArgs a_param) {
+  extern __shared__ __align__(16) unsigned char smem_raw[];
+  Smem& sm = *reinterpret_cast<Smem*>(smem_raw);
+  const int tid = threadIdx.x;
+  if (tid == 0) sm.args = a_param;
+  for (int i = tid; i < 4 * W_NSLOT; i += NT) sm.wtab[i] = a_param.wtab[i];
+  __syncthreads();
+  const StepArgs& a = sm.args;
+  if (blockIdx.x == 0) {
+    unsigned* oc = a.counters + (a.parity ^ 1) * CNT_PER_PARITY;
+    for (int i = tid; i < CNT_PER_PARITY; i += NT) oc[i] = 0u;
+  }
+  unsigned* cnt = a.counters + a.parity * CNT_PER_PARITY;
+  if (tid == 0) {
+    int p = 0, start = 0;
+    auto add = [&](int kind, int layer, int count) {
+      sm.ph_kind[p] = kind; sm.ph_layer[p] = layer; sm.ph_start[p] = start; sm.ph_count[p] = count; start += count; ++p;
+    };
+    if (a.n_copy > 0) add(K_COPY, 0, a.n_copy);
+    for (int l = 0; l < 4; ++l) {
+      if (l < 3) { add(K_P1K, l, N_P1K); add(K_REC, l, N_REC); add(K_OPROJ, l, N_OPROJ); }
+      else { add(K_P1M, l, N_P1M); add(K_ATTN, l, a.n_attn); add(K_COMB, l, N_COMB); add(K_OPROJ, l, N_OPROJ); }
+      add(K_LOGIT, l, N_LOGIT); add(K_SHARED, l, N_SHARED); add(K_ROUTED, l, N_ROUTED); add(K_DOWN, l, N_DOWN);
+    }
+    sm.n_phases = p; sm.total_tasks = start;
+    sm.stage_key = -1; sm.topk_layer = -1;
+  }
+  __syncthreads();
+  int task = blockIdx.x;                       // static first assignment
+  const int total = sm.total_tasks;
+  unsigned* qcnt = cnt + C_QUEUE;
+  unsigned* pending = nullptr;
+  while (task < total) {
+    const TaskDesc td = decode_task(sm, task);
+    const Dep dp = task_dep(a, cnt, td);
+    const unsigned long long t0 = (a.trace != nullptr && tid == 0) ? gtimer() : 0ull;
+    TaskRet tr; tr.sig = nullptr; tr.nxt = 0;
+    switch (td.kind) {
+      case K_COPY: tr = task_copy(a, sm, cnt, td.sub, dp, pending, qcnt); break;
+      case K_P1K: tr = task_p1_kda(a, sm, cnt, td.layer, td.sub, dp, pending, qcnt); break;
+      case K_P1M: tr = task_p1_mla(a, sm, cnt, td.layer, td.sub, dp, pending, qcnt); break;
+      case K_REC: tr = task_rec(a, sm, cnt, td.layer, td.sub, dp, pending, qcnt); break;
+      case K_OPROJ: tr = task_oproj(a, sm, cnt, td.layer, td.sub, dp, pending, qcnt); break;
+      case K_LOGIT: tr = task_logit(a, sm, cnt, td.layer, td.sub, dp, pending, qcnt); break;
+      case K_SHARED: tr = task_gu(a, sm, cnt, td.layer, td.sub, true, dp, pending, qcnt); break;
+      case K_ROUTED: tr = task_gu(a, sm, cnt, td.layer, td.sub, false, dp, pending, qcnt); break;
+      case K_DOWN: tr = task_down(a, sm, cnt, td.layer, td.sub, dp, pending, qcnt); break;
+      case K_ATTN: tr = task_attn(a, sm, cnt, td.sub, dp, pending, qcnt); break;
+      case K_COMB: tr = task_comb(a, sm, cnt, td.sub, dp, pending, qcnt); break;
+      default: break;
+    }
+    // all task bodies end with __syncthreads(); the previous pending signal was consumed inside the task
+    pending = tr.sig;
+    if (tid == 0) {
+      if (a.trace != nullptr) {
+        unsigned long long* rr = a.trace + (size_t)task * 12;
+        rr[0] = blockIdx.x; rr[1] = (unsigned long long)td.kind | ((unsigned long long)td.layer << 8) | ((unsigned long long)td.sub << 16);
+        rr[2] = t0; rr[3] = sm.t_wait; rr[4] = gtimer(); rr[5] = 0;
+        for (int q = 0; q < 6; ++q) { rr[6 + q] = sm.tm[q]; sm.tm[q] = 0; }
+      }
+      sm.task_next = (int)tr.nxt + a.grid;
+    }
+    __syncthreads();
+    task = sm.task_next;
+  }
+  if (pending != nullptr) { __syncthreads(); deferred_signal(pending); }
+}
+
+}  // namespace
+
+void mega_step(std::vector<int64_t> p, std::vector<int64_t> iv) {
+  StepArgs a;
+  int i = 0;
+  a.wtab = reinterpret_cast<const unsigned long long*>(p[i++]);
+  for (int l = 0; l < 3; ++l) a.S[l] = reinterpret_cast<float*>(p[i++]);
+  for (int l = 0; l < 3; ++l) a.cq[l] = reinterpret_cast<bf16*>(p[i++]);
+  for (int l = 0; l < 3; ++l) a.ck[l] = reinterpret_cast<bf16*>(p[i++]);
+  for (int l = 0; l < 3; ++l) a.cv[l] = reinterpret_cast<bf16*>(p[i++]);
+  a.ckv = reinterpret_cast<bf16*>(p[i++]);
+  a.krope = reinterpret_cast<bf16*>(p[i++]);
+  a.copy_ckv = reinterpret_cast<const bf16*>(p[i++]);
+  a.copy_krope = reinterpret_cast<const bf16*>(p[i++]);
+  a.hin = reinterpret_cast<const bf16*>(p[i++]);
+  a.hout = reinterpret_cast<bf16*>(p[i++]);
+  a.res_a = reinterpret_cast<float*>(p[i++]);
+  a.res_b = reinterpret_cast<float*>(p[i++]);
+  a.y_attn = reinterpret_cast<float*>(p[i++]);
+  a.y_moe = reinterpret_cast<float*>(p[i++]);
+  a.acc_p1 = reinterpret_cast<float*>(p[i++]);
+  a.acc_gu = reinterpret_cast<float*>(p[i++]);
+  a.qkv = reinterpret_cast<float*>(p[i++]);
+  a.gbuf = reinterpret_cast<float*>(p[i++]);
+  a.beta = reinterpret_cast<float*>(p[i++]);
+  a.obuf = reinterpret_cast<float*>(p[i++]);
+  a.logits = reinterpret_cast<float*>(p[i++]);
+  a.qn = reinterpret_cast<float*>(p[i++]);
+  a.qabs = reinterpret_cast<float*>(p[i++]);
+  a.qrope = reinterpret_cast<float*>(p[i++]);
+  a.attn_o = reinterpret_cast<float*>(p[i++]);
+  a.attn_ml = reinterpret_cast<float*>(p[i++]);
+  a.olat = reinterpret_cast<float*>(p[i++]);
+  a.counters = reinterpret_cast<unsigned*>(p[i++]);
+  a.trace = reinterpret_cast<unsigned long long*>(p[i++]);
+  a.L = (int)iv[0]; a.parity = (int)iv[1]; a.n_attn = (int)iv[2]; a.T_task = (int)iv[3];
+  a.copy_len = (int)iv[4]; a.n_copy = (int)iv[5]; a.grid = (int)iv[6];
+  const int smem = (int)sizeof(Smem);
+  static bool inited = false;
+  if (!inited) {
+    cudaFuncSetAttribute((const void*)mega_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+    inited = true;
+  }
+  void* args[] = { (void*)&a };
+  auto stream = at::cuda::getCurrentCUDAStream();
+  cudaError_t err = cudaLaunchCooperativeKernel((const void*)mega_kernel, dim3(a.grid), dim3(NT), args, (size_t)smem, stream.stream());
+  TORCH_CHECK(err == cudaSuccess, "mega_kernel launch failed: ", cudaGetErrorString(err));
+}
+
+int64_t mega_smem_bytes() { return (int64_t)sizeof(Smem); }
+"""
+
+CPP_SRC = r"""
+#include <torch/extension.h>
+#include <vector>
+void mega_step(std::vector<int64_t> p, std::vector<int64_t> iv);
+int64_t mega_smem_bytes();
+"""
+
+# tunables baked into the kernel source
+KS1 = 1       # K-split for KDA q/k/v/g tiles
+KS1M = 2      # K-split for MLA q_proj / kv_a tiles
+KS3 = 4       # K-split for o_proj tiles
+UNROLL_BIG = 6
+
+_EXT = None
+
+
+def _ensure_ninja_on_path():
+    # torch's load_inline shells out to `ninja`; make sure the venv's copy is visible.
+    dirs = [os.path.dirname(sys.executable)]
+    try:
+        import ninja  # noqa: F401
+        dirs.append(ninja.BIN_DIR)
+    except Exception:
+        pass
+    path = os.environ.get("PATH", "")
+    for d in dirs:
+        if d and d not in path.split(os.pathsep):
+            path = d + os.pathsep + path
+    os.environ["PATH"] = path
+
+
+def _cuda_source() -> str:
+    return (CUDA_SRC.replace("KS1_VAL", str(KS1)).replace("KS1M_VAL", str(KS1M))
+            .replace("KS3_VAL", str(KS3)).replace("UNROLL_BIG", str(UNROLL_BIG)))
+
+
+def _ext():
+    global _EXT
+    if _EXT is None:
+        _ensure_ninja_on_path()
+        _EXT = load_inline(
+            name=f"kimi_linear_megakernel_v10_{KS1}{KS1M}{KS3}{UNROLL_BIG}",
+            cpp_sources=CPP_SRC,
+            cuda_sources=_cuda_source(),
+            functions=["mega_step", "mega_smem_bytes"],
+            extra_cuda_cflags=["-O3", "-std=c++17", "-lineinfo",
+                               "-gencode=arch=compute_120,code=sm_120"],
+            verbose=False,
+        )
+    return _EXT
+
+
+# --------------------------------------------------------------------------- #
+# weight repacking into the tensor-core fragment layout (offline, once per model)
+#   W  : (tiles=Np/128, 8 mtiles, K/64 kblocks, 32 lanes, 16 B) -- one 16 B load per lane
+#        gives the A-fragments (m16n8k16) of 4 consecutive k-steps for rows (n, n+8)
+#   SZ : (tiles, 8, K/128 groups, 8, 4 bf16) = [s(n), z(n), s(n+8), z(n+8)] per lane>>2
+# --------------------------------------------------------------------------- #
+def _unpack_int4(w_packed: torch.Tensor, K: int) -> torch.Tensor:
+    """(..., K/2, N) packed -> (..., K, N) nibble values (uint8)."""
+    shp = w_packed.shape[:-2] + (K, w_packed.shape[-1])
+    out = torch.empty(shp, dtype=torch.uint8, device=w_packed.device)
+    out[..., 0::2, :] = w_packed & 0xF
+    out[..., 1::2, :] = (w_packed >> 4) & 0xF
+    return out
+
+
+def _mma_pack_nibbles(Wn: torch.Tensor) -> torch.Tensor:
+    """(E, K, Np) nibbles -> (E, Np/128, 8, K/64, 32, 16) uint8 fragment layout."""
+    E, K, Np = Wn.shape
+    assert K % 64 == 0 and Np % 128 == 0
+    t = Wn.reshape(E, K // 64, 4, 2, 4, 2, Np // 128, 8, 2, 8)      # (E, KB, j, h, q, e, T, M, m8, r)
+    t = t.permute(0, 6, 7, 1, 9, 4, 2, 5, 3, 8).contiguous()         # (E, T, M, KB, r, q, j, e, h, m8)
+    b = (t[..., 0] | (t[..., 1] << 4)).contiguous()                 # (E, T, M, KB, r, q, j, e, h)
+    return b.reshape(E, Np // 128, 8, K // 64, 32, 16)
+
+
+def _mma_pack_sz(s: torch.Tensor, z: torch.Tensor) -> torch.Tensor:
+    """(E, K/128, Np) bf16 scales/zeros -> (E, Np/128, 8, K/128, 8, 4) bf16."""
+    E, G, Np = s.shape
+    s5 = s.reshape(E, G, Np // 128, 8, 2, 8)
+    z5 = z.reshape(E, G, Np // 128, 8, 2, 8)
+    st = torch.stack([s5, z5], dim=-1)                               # (E, g, T, M, m8, r, 2)
+    st = st.permute(0, 2, 3, 1, 5, 4, 6).contiguous()                 # (E, T, M, g, r, m8, 2)
+    return st.reshape(E, Np // 128, 8, G, 8, 4)
+
+
+def _repack_batched(w_q: torch.Tensor, s: torch.Tensor, z: torch.Tensor, K: int, N: int):
+    """w_q (E, K/2, N) uint8; s, z (E, K/128, N) bf16 -> fragment-layout weights + sz tables."""
+    Np = ((N + 127) // 128) * 128
+    Wn = _unpack_int4(w_q, K)
+    if Np != N:
+        Wn = F.pad(Wn, (0, Np - N))
+        s = F.pad(s, (0, Np - N))
+        z = F.pad(z, (0, Np - N))
+    return _mma_pack_nibbles(Wn), _mma_pack_sz(s.contiguous(), z.contiguous())
+
+
+def _repack_single(ql) -> tuple:
+    w, sz = _repack_batched(ql.w_q[None], ql.scales[None], ql.zeros[None], ql.in_f, ql.out_f)
+    return w[0].contiguous(), sz[0].contiguous()
+
+
+# --------------------------------------------------------------------------- #
+# Model
+# --------------------------------------------------------------------------- #
+class Model(nn.Module):
+    def __init__(self, cfg: Config):
+        super().__init__()
+        self.cfg = cfg
+        self.blocks = nn.ModuleList(Block(cfg, k) for k in cfg.pattern)
+        self.reset_parameters()
+        self._prepared = False
+        self._keep = []
+        self._parity = 0
+        self._ckv_buf = None
+        self._kr_buf = None
+        self._trace = None
+
+    def reset_parameters(self):
+        g = torch.Generator(device="cpu").manual_seed(1234)
+        for mod in self.modules():
+            if isinstance(mod, (QuantLinear, QuantExperts)):
+                mod.init_random(g)
+            elif isinstance(mod, nn.Linear):
+                nn.init.normal_(mod.weight, 0.0, 0.02, generator=g)
+            elif isinstance(mod, KDA):
+                nn.init.normal_(mod.conv_w, 0.0, 0.1, generator=g)
+
+    def load_state_dict(self, *args, **kwargs):
+        r = super().load_state_dict(*args, **kwargs)
+        self._prepared = False
+        return r
+
+    # -------------------------------------------------------------- prepare
+    @torch.no_grad()
+    def _prepare(self):
+        cfg = self.cfg
+        dev = self.blocks[0].attn_norm.device
+        assert dev.type == "cuda"
+        W_NSLOT = 64
+        names = ["W_ATTN_NORM", "W_MOE_NORM", "W_ROUTER",
+                 "W_GATE", "W_GATE_SZ", "W_UP", "W_UP_SZ", "W_DOWN", "W_DOWN_SZ",
+                 "W_SGATE", "W_SGATE_SZ", "W_SUP", "W_SUP_SZ", "W_SDOWN", "W_SDOWN_SZ",
+                 "W_OPROJ", "W_OPROJ_SZ",
+                 "W_Q", "W_Q_SZ", "W_K", "W_K_SZ", "W_V", "W_V_SZ", "W_G", "W_G_SZ", "W_BETA", "W_CONV",
+                 "W_QP", "W_QP_SZ", "W_KVA", "W_KVA_SZ", "W_KT", "W_KT_S", "W_KT_Z", "W_KT_SZ1", "W_WV", "W_WV_SZ"]
+        slot = {n: i for i, n in enumerate(names)}
+        keep = []
+        tab = [0] * (4 * W_NSLOT)
+
+        def put(l, name, t):
+            t = t.contiguous()
+            keep.append(t)
+            tab[l * W_NSLOT + slot[name]] = t.data_ptr()
+
+        def ql(l, name, q: QuantLinear):
+            w, sz = _repack_single(q)
+            put(l, name, w)
+            put(l, name + "_SZ", sz)
+
+        def qe(l, name, q: QuantExperts):
+            w, sz = _repack_batched(q.w_q, q.scales, q.zeros, q.in_f, q.out_f)
+            put(l, name, w)
+            put(l, name + "_SZ", sz)
+
+        H = cfg.mla_heads
+        for l, blk in enumerate(self.blocks):
+            put(l, "W_ATTN_NORM", blk.attn_norm.data)
+            put(l, "W_MOE_NORM", blk.moe_norm.data)
+            put(l, "W_ROUTER", blk.moe.router.weight.data)
+            qe(l, "W_GATE", blk.moe.gate)
+            qe(l, "W_UP", blk.moe.up)
+            qe(l, "W_DOWN", blk.moe.down)
+            qe(l, "W_SGATE", blk.moe.s_gate)
+            qe(l, "W_SUP", blk.moe.s_up)
+            qe(l, "W_SDOWN", blk.moe.s_down)
+            ql(l, "W_OPROJ", blk.attn.o_proj)
+            if blk.kind == "K":
+                ql(l, "W_Q", blk.attn.q_proj)
+                ql(l, "W_K", blk.attn.k_proj)
+                ql(l, "W_V", blk.attn.v_proj)
+                ql(l, "W_G", blk.attn.g_proj)
+                put(l, "W_BETA", blk.attn.beta_proj.weight.data)
+                put(l, "W_CONV", blk.attn.conv_w.data)
+            else:
+                ql(l, "W_QP", blk.attn.q_proj)
+                ql(l, "W_KVA", blk.attn.kv_a)
+                # kv_b split for weight absorption: k-part transposed per head (in=d, out=c), v-part per head (in=c, out=e)
+                kvb = blk.attn.kv_b
+                Wn = _unpack_int4(kvb.w_q, kvb.in_f).reshape(kvb.in_f, H, cfg.qk_nope + cfg.v_head)   # (512, H, 256)
+                Wk = Wn[:, :, : cfg.qk_nope]                                  # (512 c, H, 128 d)
+                Wv = Wn[:, :, cfg.qk_nope:]                                   # (512 c, H, 128 e)
+                WkT = Wk.permute(1, 2, 0).contiguous()                        # (H, 128 d, 512 c)
+                put(l, "W_KT", _mma_pack_nibbles(WkT))                        # (H, 4, 8, 2, 32, 16)
+                s = kvb.scales.reshape(4, H, cfg.qk_nope + cfg.v_head)
+                z = kvb.zeros.reshape(4, H, cfg.qk_nope + cfg.v_head)
+                put(l, "W_KT_S", s[:, :, : cfg.qk_nope].permute(1, 0, 2).float().contiguous())   # (H, 4 groups of c, 128 d)
+                put(l, "W_KT_Z", z[:, :, : cfg.qk_nope].permute(1, 0, 2).float().contiguous())
+                sz1 = torch.tensor([1.0, 0.0, 1.0, 0.0], dtype=torch.bfloat16, device=dev).repeat(4 * 8 * 8).reshape(4, 8, 1, 8, 4)
+                put(l, "W_KT_SZ1", sz1)                                        # identity (s=1, z=0) table for K=128, N=512
+                Wvh = Wv.permute(1, 0, 2).contiguous()                        # (H, 512 c, 128 e)
+                put(l, "W_WV", _mma_pack_nibbles(Wvh))                        # (H, 1, 8, 8, 32, 16)
+                sv = s[:, :, cfg.qk_nope:].permute(1, 0, 2).contiguous()      # (H, 4, 128)
+                zv = z[:, :, cfg.qk_nope:].permute(1, 0, 2).contiguous()
+                put(l, "W_WV_SZ", _mma_pack_sz(sv, zv))                       # (H, 1, 8, 4, 8, 4)
+        self._wtab = torch.tensor(tab, dtype=torch.int64, device=dev)
+        keep.append(self._wtab)
+        self._keep = keep
+        f32 = dict(dtype=torch.float32, device=dev)
+        self._res_a = torch.zeros(2304, **f32)
+        self._res_b = torch.zeros(2304, **f32)
+        self._y_attn = torch.zeros(2304, **f32)
+        self._y_moe = torch.zeros(2304, **f32)
+        self._acc_p1 = torch.zeros(4 * 4096, **f32)
+        self._acc_gu = torch.zeros(9 * 2048, **f32)
+        self._qkv = torch.zeros(3 * 4096, **f32)
+        self._gbuf = torch.zeros(4096, **f32)
+        self._beta = torch.zeros(32, **f32)
+        self._obuf = torch.zeros(4096, **f32)
+        self._logits = torch.zeros(64, **f32)
+        self._qn = torch.zeros(32 * 128, **f32)
+        self._qabs = torch.zeros(32 * 512, **f32)
+        self._qrope = torch.zeros(32 * 64, **f32)
+        self._na_max = 512
+        self._attn_o = torch.zeros(self._na_max * 32 * 512, **f32)
+        self._attn_ml = torch.zeros(self._na_max * 32 * 2, **f32)
+        self._olat = torch.zeros(32 * 512, **f32)
+        self._counters = torch.zeros(2 * 16384, dtype=torch.int32, device=dev)
+        self._parity = 0
+        self._grid = torch.cuda.get_device_properties(dev).multi_processor_count
+        _ext()
+        torch.cuda.synchronize()
+        self._prepared = True
+        self._prep_ptr = self.blocks[0].attn_norm.data_ptr()
+
+    # ------------------------------------------------------------------ step
+    def step(self, hidden: torch.Tensor, state: list):
+        if not self._prepared or self._prep_ptr != self.blocks[0].attn_norm.data_ptr():
+            self._prepare()
+        cfg = self.cfg
+        mla_idx = cfg.pattern.index("M")
+        st = state[mla_idx]
+        ckv, kr = st["c_kv"], st["k_rope"]
+        L = int(ckv.shape[0])
+        dev = hidden.device
+        copy_len = 0
+        copy_src_ckv = ckv
+        copy_src_kr = kr
+        if (self._ckv_buf is None or ckv.data_ptr() != self._ckv_buf.data_ptr()
+                or kr.data_ptr() != self._kr_buf.data_ptr() or L + 1 > self._ckv_buf.shape[0]):
+            cap = L + 4096
+            self._ckv_buf = torch.empty(cap, cfg.kv_lora, dtype=torch.bfloat16, device=dev)
+            self._kr_buf = torch.empty(cap, cfg.qk_rope, dtype=torch.bfloat16, device=dev)
+            assert ckv.is_contiguous() and kr.is_contiguous()
+            copy_len = L
+        n_copy = (copy_len * 72 + 4095) // 4096 if copy_len > 0 else 0
+        ntok = L + 1
+        T = max(16, ((ntok + self._grid - 1) // self._grid + 15) // 16 * 16)
+        n_attn = (ntok + T - 1) // T
+        assert n_attn <= self._na_max
+        out = torch.empty_like(hidden)
+        kda_layers = [i for i, k in enumerate(cfg.pattern) if k == "K"]
+        ptrs = [self._wtab.data_ptr()]
+        ptrs += [state[i]["S"].data_ptr() for i in kda_layers]
+        ptrs += [state[i]["cq"].data_ptr() for i in kda_layers]
+        ptrs += [state[i]["ck"].data_ptr() for i in kda_layers]
+        ptrs += [state[i]["cv"].data_ptr() for i in kda_layers]
+        ptrs += [self._ckv_buf.data_ptr(), self._kr_buf.data_ptr(), copy_src_ckv.data_ptr(), copy_src_kr.data_ptr(),
+                 hidden.data_ptr(), out.data_ptr(),
+                 self._res_a.data_ptr(), self._res_b.data_ptr(), self._y_attn.data_ptr(), self._y_moe.data_ptr(),
+                 self._acc_p1.data_ptr(), self._acc_gu.data_ptr(), self._qkv.data_ptr(), self._gbuf.data_ptr(),
+                 self._beta.data_ptr(), self._obuf.data_ptr(), self._logits.data_ptr(), self._qn.data_ptr(),
+                 self._qabs.data_ptr(), self._qrope.data_ptr(), self._attn_o.data_ptr(), self._attn_ml.data_ptr(),
+                 self._olat.data_ptr(), self._counters.data_ptr(),
+                 (self._trace.data_ptr() if self._trace is not None else 0)]
+        ints = [L, self._parity, n_attn, T, copy_len, n_copy, self._grid]
+        _ext().mega_step(ptrs, ints)
+        self._parity ^= 1
+        st["c_kv"] = self._ckv_buf[: L + 1]
+        st["k_rope"] = self._kr_buf[: L + 1]
+        return out, state
+
+
+# --------------------------------------------------------------------------- #
+# state / inputs (same as reference)
+# --------------------------------------------------------------------------- #
+def init_state(cfg: Config, context_len: int, seed: int) -> list:
+    dev = torch.device("cuda:0")
+    g = torch.Generator(device=dev).manual_seed(seed)
+    H, Dk = cfg.kda_heads, cfg.kda_head_dim
+    C = H * Dk
+    state = []
+    for kind in cfg.pattern:
+        if kind == "K":
+            state.append({
+                "S": torch.randn(H, Dk, Dk, device=dev, generator=g) * 0.05,
+                "cq": torch.randn(cfg.short_conv - 1, C, device=dev, generator=g, dtype=cfg.dtype) * 0.1,
+                "ck": torch.randn(cfg.short_conv - 1, C, device=dev, generator=g, dtype=cfg.dtype) * 0.1,
+                "cv": torch.randn(cfg.short_conv - 1, C, device=dev, generator=g, dtype=cfg.dtype) * 0.1,
+            })
+        else:
+            state.append({
+                "c_kv": torch.randn(context_len, cfg.kv_lora, device=dev, generator=g, dtype=cfg.dtype) * 0.1,
+                "k_rope": torch.randn(context_len, cfg.qk_rope, device=dev, generator=g, dtype=cfg.dtype) * 0.1,
+            })
+    return state
+
+
+def init_token(cfg: Config, seed: int) -> torch.Tensor:
+    dev = torch.device("cuda:0")
+    g = torch.Generator(device=dev).manual_seed(seed + 1)
+    return torch.randn(cfg.hidden, device=dev, generator=g, dtype=cfg.dtype) * 0.25
+
+
+if __name__ == "__main__":
+    cfg = build_config({"n_experts": 64})
+    m = Model(cfg).cuda().eval()
+    st = init_state(cfg, context_len=2048, seed=0)
+    h = init_token(cfg, seed=0)
+    with torch.no_grad():
+        for _ in range(4):
+            h, st = m.step(h, st)
+    torch.cuda.synchronize()
+    print(f"ok: out {tuple(h.shape)} finite {torch.isfinite(h).all().item()} | MLA cache {st[3]['c_kv'].shape[0]}")
