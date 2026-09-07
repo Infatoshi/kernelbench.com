@@ -30,6 +30,7 @@ def mega(subject: str, out: Path, keep: set[str]) -> None:
 
 
 def main() -> None:
+    gpt6()
     for d in ("fable51-mega", "fable51-cuda", "gemini38flash-mega", "gemini38flash-cuda",
               "musespark13-mega", "musespark13-cuda"):
         (A / d).mkdir(parents=True, exist_ok=True)
@@ -65,6 +66,31 @@ def main() -> None:
          ("Fable 5", 0.0804, False), ("Opus 4.8", 0.0653, False), ("K3 (256k)", 0.0595, False),
          ("V4 Flash", 0.0411, False)],
         "GLM-5.2 Fused MoE · peak fraction · RTX PRO 6000", "{:.3f}",
+    )
+
+
+def gpt6() -> None:
+    """GPT-6 Astra Pro: published RTX fields verified 2026-09-07."""
+    for bench in ("mega", "cuda"):
+        (A / f"gpt6astra-{bench}").mkdir(parents=True, exist_ok=True)
+
+    # Preserve the Fable 5.1 chart's eight selected peers plus Fable 5.1.
+    keep = {"Fable 5", "Fable 5.1", "GLM-5.3", "K3 (256k)", "Opus 4.8",
+            "5.3 Flash", "GLM-5.2", "K3 (1M)", "DeepSeek"}
+    save_rank(
+        A / "gpt6astra-mega" / "01.png",
+        [("GPT-6 Astra", 24.804, True)] + [(n, s, False) for n, s in MEGA if n in keep],
+        "Kimi-Linear Decode · x over PyTorch baseline · RTX PRO 6000", "{:.2f}x",
+    )
+    save_rank(
+        A / "gpt6astra-cuda" / "01.png",
+        [("Opus 5", 1.961, False), ("Fable 5.1", 0.7093, False),
+         ("GPT-6 Astra", 0.6837, True), ("Gemini 3.8", 0.3637, False),
+         ("Opus 4.8", 0.3269, False), ("Qwen 3.8", 0.2848, False),
+         ("K3 (1M)", 0.2238, False), ("Muse 1.3", 0.2056, False),
+         ("Fable 5", 0.1909, False), ("K3 (256k)", 0.1738, False),
+         ("V4 Flash", 0.1453, False), ("Grok 4.5", 0.002, False)],
+        "Grid + MinGRU · peak fraction · RTX PRO 6000", "{:.3f}",
     )
 
 
