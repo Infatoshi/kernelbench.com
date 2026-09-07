@@ -343,6 +343,9 @@ def cmd_publish(root: Path, args: list[str], bench: str = "hard") -> int:
     rc = _rebuild_model_index(root)
     if rc != 0:
         return rc
+    rc = _publish_gates(root)
+    if rc != 0:
+        return rc
     if not push:
         return 0
     # --push: publish, then upload the published runs' traces to HF.
@@ -386,6 +389,17 @@ def _rebuild_model_index(root: Path) -> int:
         ["uv", "run", "--with", "pyyaml", "python", str(script)],
         cwd=root,
     ).returncode
+
+
+def _publish_gates(root: Path) -> int:
+    """Fail the publish when the site would not show it: model roster tables,
+    mega `gpu` marker, cuda published_runs.json manifest, untracked
+    annotations. See scripts/check_publish_gates.py for the exact rules."""
+    script = root / "scripts" / "check_publish_gates.py"
+    if not script.exists():
+        return 0
+    sys.stdout.flush()
+    return subprocess.run(["uv", "run", "python", str(script)], cwd=root).returncode
 
 
 def _leaderboard_run_ids(bench_dir: Path) -> list[str]:
@@ -599,6 +613,9 @@ def cmd_deploy(root: Path, args: list[str], bench: str = "hard") -> int:
         [str(_bench_dir(root, "mega") / "scripts" / "publish_mega.sh")], check=True
     )
     rc = _rebuild_model_index(root)
+    if rc != 0:
+        return rc
+    rc = _publish_gates(root)
     if rc != 0:
         return rc
     os.chdir(root)

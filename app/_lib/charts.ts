@@ -98,6 +98,7 @@ export const MODEL_NAMES: Record<string, string> = {
   hy3: "Tencent Hy3",
   "tencent/hy3-preview": "Tencent Hy3",
   "qwen3.8-max-preview": "Qwen 3.8 Max (preview)",
+  "qwen3.8-max": "Qwen 3.8 Max",
   "qwen/qwen3.8-max": "Qwen 3.8 Max",
 }
 
@@ -122,6 +123,7 @@ const LIVE_MODEL_IDS = new Set([
   "kinetic-0715",
   "muse-spark-1.3",
   "ox-alpha",
+  "qwen3.8-max",
   "qwen/qwen3.8-max",
   "stealth/ox-alpha",
 ])
@@ -282,6 +284,7 @@ const SHORT_NAMES: Record<string, string> = {
   hy3: "Hy3",
   "tencent/hy3-preview": "Hy3",
   "qwen3.8-max-preview": "Qwen 3.8",
+  "qwen3.8-max": "Qwen 3.8",
   "qwen/qwen3.8-max": "Qwen 3.8",
 }
 

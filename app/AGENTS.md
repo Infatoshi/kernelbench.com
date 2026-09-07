@@ -16,7 +16,7 @@ Transcripts go to HF (`Infatoshi/kernelbench-<bench>-traces`) via `kb push-runs 
 
 ## Adding a model or a lab
 
-- New model: `LIVE_MODEL_SLUGS` in `app/_lib/models.server.ts` (homepage and /models roster), `MODEL_NAMES` and `SHORT_NAMES` in `app/_lib/charts.ts` (display name, chart label). Bench and problem labels are `BENCH_LABELS` / `PROBLEM_LABELS` there; GPU tabs are `HOME_GPU_TABS` in `app/_lib/models.ts`.
+- New model, four tables, all enforced by `scripts/check_publish_gates.py` at `kb publish` / `kb deploy`: `LIVE_MODEL_SLUGS` in `app/_lib/models.server.ts` (homepage and /models roster; `RETIRED_MODEL_SLUGS` there for models kept off it), `MODEL_NAMES` in `scripts/build_model_index.py` (display name in `models.json`), and `MODEL_NAMES`, `SHORT_NAMES`, `LIVE_MODEL_IDS` in `app/_lib/charts.ts` keyed by every board `model` id the model ships under (bare slug and provider-prefixed both occur, e.g. `qwen3.8-max` and `qwen/qwen3.8-max`). Bench and problem labels are `BENCH_LABELS` / `PROBLEM_LABELS` there; GPU tabs are `HOME_GPU_TABS` in `app/_lib/models.ts`.
 - New lab: `LAB_BRANDS` in `app/_lib/models.ts` plus `public/logos/labs/<lab>.svg`.
 - Mini is a homepage `HomeDecks` scroll category on `/` when it debuts, not a `/mini` route. Multi is unpublished.
 - Old external links land on bench sections via the redirects noted at the top of `app/{hard,cuda,multi}/page.tsx`; keep them working.

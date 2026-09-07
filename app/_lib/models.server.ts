@@ -23,6 +23,25 @@ const LIVE_MODEL_SLUGS = new Set([
   "qwen3.8-max",
 ])
 
+/** Models with published cells that are deliberately off the homepage and
+ * /models roster (superseded or historical). Every slug in models.json must be
+ * here or in LIVE_MODEL_SLUGS; scripts/check_publish_gates.py fails the
+ * publish otherwise, so a fresh model cannot ship invisible again. */
+export const RETIRED_MODEL_SLUGS = new Set([
+  "claude-opus-4-8",
+  "claude-sonnet-5",
+  "composer-2.5-fast",
+  "deepseek-v4-pro",
+  "glm-5.2",
+  "grok-4.5",
+  "hy3",
+  "inkling",
+  "kinetic-0715-1m",
+  "longcat-2.0",
+  "minimax-m3",
+  "qwen3.8-max-preview",
+])
+
 // No module-level cache: Next dev (and prod workers) keep one module graph per
 // route segment, so a `cached ??=` here pins each page to whatever models.json
 // said at that segment's first request — the roster visibly desyncs across
