@@ -112,6 +112,10 @@ Tweet 1 is that skeleton plus the image. Keep the board URL there. Tweet 2 is th
 
 `kb publish` then commit + push (`kb deploy` only when the tree is clean enough to ship). Prove these three live 200s before any X post: `https://kernelbench.com/{bench}`, the kernel file, this-run HF trace. A local `public/data` write is not synced.
 
+## Scheduling instead of live posting
+
+`media/posts/scheduled/<post>/` holds a post that is queued in X but not yet public: `00_post.txt` (tweet 1), `01.png`, `02_links.txt` (tweet 2), and `GOAL.md`, the receipt (account, scheduled time in MDT and UTC, what went in tweet 1 and the reply, queue URL `https://x.com/compose/post/unsent/scheduled`, "verified in the saved Scheduled queue"). Scheduling is done through the X compose UI with desktop computer use; `x-cli` has no schedule command. Same gates as posting: FILL-IN present, site and links live 200, explicit go from Elliot for the schedule. After it publishes, ask for the live URL, then move the folder to `posted/` with the tweet id.
+
 ## FILL-IN
 
 Stop and ask. Paste the draft. Wait. After they type the paragraph, put it in the FILL-IN slot. Then wait for "post".
