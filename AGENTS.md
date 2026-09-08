@@ -64,14 +64,4 @@ kb lambda ... | kb brev ... | kb contamination <bench> | kb push-runs <bench> | 
 
 ## Publish
 
-`kb publish <bench>` regenerates `results/leaderboard.json` (mega: `public/data/mega/results.csv`), the redacted `public/runs/*_solution.py.txt` kernels, and `public/data/models.json`; never hand-edit them. It then runs `scripts/check_publish_gates.py` and exits non-zero when the site would not show what was just published; `kb deploy` runs the same gates before committing. The gate message names the exact file and key to add. Do not bypass it by editing generated files or committing around `kb deploy`.
-
-After every finished run, in this order (the gates check 2, 4, 5 and 6; nothing checks 1, 3 or 7 for you):
-
-1. Pull the archive to `benchmarks/<bench>/outputs/runs/<run_id>` and regrade in isolation (see the rules above).
-2. Mega only: write the GPU label to `outputs/runs/<run_id>/gpu` (`RTX PRO 6000 Blackwell`, `H100`, `B200`); `build_mega_leaderboard.py` drops rows without it.
-3. Write and `git add` the audit YAML in `results/annotations/`.
-4. Cuda RTX only: append the run_id to `benchmarks/cuda/results/published_runs.json` `run_ids` (or to its `excluded` map with a reason); the RTX cuda board publishes only what is listed.
-5. New model: add its slug to `LIVE_MODEL_SLUGS` (`app/_lib/models.server.ts`), its display name to `MODEL_NAMES` in `scripts/build_model_index.py`, and every board model id it ships under (bare and provider-prefixed, as they appear as `model` in `public/data/catalog.json`) to `MODEL_NAMES`, `SHORT_NAMES` and `LIVE_MODEL_IDS` in `app/_lib/charts.ts`. A model deliberately off the homepage goes in `RETIRED_MODEL_SLUGS` instead. New lab: `app/AGENTS.md`.
-6. `kb publish <bench>` (add `--push` or run `kb push-runs <bench>` for the HF transcripts). If the gate fails, fix what it names and rerun; the commit and deploy do not happen until it passes.
-7. `kb deploy`, then open the live homepage and confirm the model is in the roster and the new cell is on the board for that GPU tab. The push is on `master` and Vercel builds it; the commit email must be `elliot@arledge.net` or nothing deploys. Write-ups lead with what the traces show (`media/AGENTS.md`).
+`kb publish <bench>` regenerates the leaderboard, the redacted `public/runs/*_solution.py.txt` kernels and `public/data/models.json` (never hand-edit them), then runs `scripts/check_publish_gates.py` and exits non-zero when the site would not show the run; `kb deploy` runs the same gates before committing. The gate names the exact file and key to fix. Never bypass it by editing generated files or committing around `kb deploy`. The after-every-run checklist, ending with you checking the live homepage, is `app/AGENTS.md` "After every finished run".

@@ -24,3 +24,15 @@ Transcripts go to HF (`Infatoshi/kernelbench-<bench>-traces`) via `kb push-runs 
 ## Before `kb deploy`
 
 Skim the homepage chart and `/hard` (dark mode, look at the actual render). Run the redaction scan (`media/AGENTS.md`) before any `public/runs` commit. Site palette tokens live in `app/globals.css`; `media/kbh_theme.py` copies them, so a palette change updates both.
+
+## After every finished run
+
+In this order. The publish gates check steps 2, 4, 5 and 6; nothing checks 1, 3 or 7 for you.
+
+1. Pull the archive to `benchmarks/<bench>/outputs/runs/<run_id>` and regrade in isolation (rules in root `AGENTS.md`).
+2. Mega only: write the GPU label to `outputs/runs/<run_id>/gpu` (`RTX PRO 6000 Blackwell`, `H100`, `B200`); `build_mega_leaderboard.py` drops rows without it.
+3. Write and `git add` the audit YAML in `results/annotations/`.
+4. Cuda RTX only: append the run_id to `benchmarks/cuda/results/published_runs.json` `run_ids` (or to its `excluded` map with a reason); the RTX cuda board publishes only what is listed.
+5. New model: add its slug to `LIVE_MODEL_SLUGS` (`app/_lib/models.server.ts`), its display name to `MODEL_NAMES` in `scripts/build_model_index.py`, and every board model id it ships under (bare and provider-prefixed, as they appear as `model` in `public/data/catalog.json`) to `MODEL_NAMES`, `SHORT_NAMES` and `LIVE_MODEL_IDS` in `app/_lib/charts.ts`. A model deliberately off the homepage goes in `RETIRED_MODEL_SLUGS` instead. New lab: `app/AGENTS.md`.
+6. `kb publish <bench>` (add `--push` or run `kb push-runs <bench>` for the HF transcripts). If the gate fails, fix what it names and rerun; the commit and deploy do not happen until it passes.
+7. `kb deploy`, then open the live homepage and confirm the model is in the roster and the new cell is on the board for that GPU tab. The push is on `master` and Vercel builds it; the commit email must be `elliot@arledge.net` or nothing deploys. Write-ups lead with what the traces show (`media/AGENTS.md`).
