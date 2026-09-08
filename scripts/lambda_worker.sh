@@ -314,10 +314,12 @@ explicit = true
 torch = { index = \"pytorch-cu128\" }
 TOML
 rm -f uv.lock; fi; export PATH=\"\$HOME/.local/bin:\$PATH\"; uv sync"
+    # codex pinned to 0.140.0: newer builds send no inline tools to OpenRouter-style
+    # providers (see benchmarks/mega/scripts/cloud_bootstrap.sh and kbtool/AGENTS.md).
     if [ "$AGENTS" = 1 ]; then
       ssh_to "$NAME" 'command -v node >/dev/null 2>&1 || { curl -fsSL https://deb.nodesource.com/setup_22.x | sudo -E bash - >/dev/null 2>&1 && sudo apt-get install -y nodejs >/dev/null 2>&1; }
         command -v bwrap >/dev/null 2>&1 || sudo apt-get install -y -qq bubblewrap >/dev/null 2>&1
-        command -v codex >/dev/null 2>&1 || sudo npm i -g @openai/codex >/dev/null 2>&1
+        codex --version 2>/dev/null | grep -q "codex-cli 0.140.0$" || sudo npm i -g @openai/codex@0.140.0 >/dev/null 2>&1
         command -v claude >/dev/null 2>&1 || sudo npm i -g @anthropic-ai/claude-code >/dev/null 2>&1'
       ssh_to "$NAME" 'mkdir -p .codex .claude'
       IP="$(instance_ip "$NAME")"

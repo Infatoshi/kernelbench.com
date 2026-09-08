@@ -28,7 +28,14 @@ if ! command -v node >/dev/null 2>&1; then
   curl -fsSL https://deb.nodesource.com/setup_22.x | sudo -E bash - >/dev/null 2>&1
   sudo apt-get install -y nodejs >/dev/null 2>&1
 fi
-command -v codex >/dev/null 2>&1 || sudo npm i -g @openai/codex >/dev/null 2>&1
+# codex is PINNED. 0.141+ (verified on 0.153.2, still true through 0.153.4) sends no
+# inline `tools` array to third-party Responses providers (OpenRouter): its exec tool is
+# a server-side namespaced tool, so every call fails with "tool exec invoked with
+# incompatible payload" and the run ends no_solution. 0.140.0 still sends the 10 inline
+# function tools. Raise KB_CODEX_VERSION only after a logging-proxy check shows `tools`
+# in the request body (kbtool/AGENTS.md, codex row). Native api.openai.com is unaffected.
+KB_CODEX_VERSION="${KB_CODEX_VERSION:-0.140.0}"
+codex --version 2>/dev/null | grep -q "codex-cli ${KB_CODEX_VERSION}$" || sudo npm i -g "@openai/codex@${KB_CODEX_VERSION}" >/dev/null 2>&1
 command -v claude >/dev/null 2>&1 || sudo npm i -g @anthropic-ai/claude-code >/dev/null 2>&1
 # gemini CLI (gemini-3.5-flash harness; key via GEMINI_API_KEY in ~/.env_vars)
 command -v gemini >/dev/null 2>&1 || sudo npm i -g @google/gemini-cli >/dev/null 2>&1
