@@ -2318,7 +2318,11 @@ case "$HARNESS" in
     deepseek-claude)
         # Claude Code routed to DeepSeek Anthropic-compatible endpoint.
         # Requires DEEPSEEK_API_KEY. Pass MODEL=deepseek-v4-pro (claude-opus
-        # alias maps to v4-pro server-side) or deepseek-v4-flash.
+        # alias maps to v4-pro server-side) or deepseek-flash (V4.1 Flash,
+        # 2026-09-10; the old deepseek-v4-flash name is an alias for it now).
+        # DeepSeek serves deepseek-v4-pro AS V4.1 Flash from 2026-09-14 12:00
+        # Beijing until V4.1 Pro ships: a "v4-pro" run after that date is Flash.
+        # Unknown model names silently route to deepseek-flash.
         if [ -z "${DEEPSEEK_API_KEY:-}" ]; then
             echo "DEEPSEEK_API_KEY is required for deepseek-claude" >&2
             exit 1
