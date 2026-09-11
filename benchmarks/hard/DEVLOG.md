@@ -4,6 +4,40 @@ A running record of decisions, dead ends, and lessons. Newest entries on top. Th
 
 ---
 
+## 2026-09-10 — DeepSeek V4.1 Flash sweep box (kb-ds41)
+
+DeepSeek shipped V4.1 Flash as `deepseek-flash` (1M ctx, 384k out, thinking default, $0.30/$1.20 per M peak). Sweep runs through `deepseek-claude deepseek-flash` (first-party Anthropic-compatible endpoint, same route as the V4 Pro rows). Box: Verda `kb-ds41` (default profile, id ed2abdee-bd4e-4d44-928a-2c3c956b2d24, 31.22.104.88, FIN-03, `1RTXPRO6000.30V.CC` spot at 0.96 EUR/h, image 24.04.cuda13.1, driver 595.71). Brev was out of credits and Lambda has no RTX PRO 6000 type; the only single-GPU RTX PRO in stock anywhere was this CC spot SKU. Spot can be preempted: the queue (`~/queue.sh`, log `~/queue.log`) stashes each finished run into `~/pulled/<bench>/`, so a relaunch resumes from the next cell. Order: mega 02, cuda 01-04, hard 01/02/03/05/06/07. Also this day: a 4x RTX PRO Brev box (`glm53-nvfp4-marlin`, idle 14 days) was deleted on the user's word. Trap recorded in the harness: from 2026-09-14 DeepSeek serves `deepseek-v4-pro` as V4.1 Flash. Two box quirks worth keeping: (1) the CC SKU boots with `CC State: ON` and CUDA returns error 802 "system not yet initialized" until the guest runs `nvidia-smi conf-compute -srs 1` (pipeline.sh does it at start; persistenced is active). (2) On the 24.04.cuda13.1 image, bare `nvcc x.cu` fails with "declaration of double rsqrt(double) has a different exception specifier" (CUDA 13.1 `math_functions.h` line 629 has `noexcept (true)`, the host-only `__func__` definition at 6046 does not, gcc 13 rejects it). Torch cpp_extension passes because it adds `-isystem /usr/local/cuda/include`, which mutes the diagnostic; the box exports `NVCC_PREPEND_FLAGS="-isystem /usr/local/cuda/include"` (/etc/environment, ~/.bashrc, pipeline.sh) so the agent's own nvcc calls work too. Whether CC mode moves on-device kernel timings is unmeasured; the regrade numbers carry that caveat.
+
+Restructured 20:21Z the same day: the sequential queue was 2 of 11 cells in after 11.5 h (unlimited per-cell budget, ~3 h each), and the user's intent was parallel agents on the one GPU with the isolation coming from the regrade afterwards, not from the run. `~/parallel.sh` killed the orchestrator shells only (the in-flight cuda 02 harness kept running, reparented), launched the other 8 cells at once, waits on all nine, then moves everything into `~/pulled/` and runs the per-bench sequential regrade. Within a bench the harness's per-bench `gpu.lock` still serializes GPU commands across the concurrent runs; across the three benches they overlap. In-run timings from the parallel wave are contended and must not be published: the timing floor on this box under load is large and additive, which is why the small-kernel cells collapse. Measured with `probe_floor.py` through `src/eval/timing.time_fn` while 8 agents ran: null kernel 43.6 us, bare event pair 22.3 us, wall per launch 7.9 us. The hard 07 agent independently measured 45 us loaded; the hard 02 agent measured the same null kernel at 2.6 us quiet at 21:36Z before the wave. Consequence for the 07 board specifically: with 5 to 20 us roofline times per shape, the RTX PRO 6000 07 column is ordered substantially by each box's launch floor, not kernel quality (kinetic 0.3733 implies ~10 us, V4 Pro 0.3103 ~22 us). The isolated floor reading is taken again before the regrade and recorded on every annotation from this box. Two bench-side findings from the audits, not fixed mid-wave: `06_sonic_moe_swiglu/problem.yaml` credits FLOPs at one expert per token while every correct solution processes all K routed rows, so peak_fraction is capped near 0.145 and the OK/LOW line at 0.1 sits in the noise band; `07_w4a16_gemm/check.py` is the one hard check that never imports `property_stress`, so the same-buffer overwrite gate is absent there and the probe has to be run by hand.
+
+Closed out 2026-09-11 (03:27Z). All 11 cells finished and were pulled, audited,
+probed and regraded twice. The CC-box isolated regrade did not recover the
+small-kernel cells because the floor is the box, not the load: the harness's own
+`time_fn` on a null kernel read 42.4 us quiet and 43.6 us loaded on
+`1RTXPRO6000.30V.CC` (bare event pair 21.7 us, wall per launch 7.9 us), against
+8.3 us / 3.5 us / 3.3 us on a plain `1RTXPRO6000.30V` on-demand box
+(kb-ds41-rg, 1.89 EUR/h, FIN-02, `ubuntu-24.04-cuda-13.0-open`, driver
+580.126.09) rented for 45 minutes just to regrade. Confidential-computing mode
+also blocks ncu. Rule from this: never grade or regrade on a `.CC` SKU; every CC
+number is board-ineligible, and the published DeepSeek V4.1 Flash cells are the
+non-CC regrade. Three numbers per cell (in-run / CC isolated / non-CC isolated,
+all PASS): mega 02 19.67 / 19.95 / 17.10x (the baseline is faster on the non-CC
+board, the solution is not); cuda 01 0.0923 / 0.0923 / 0.0946, 02 0.4879 /
+0.4870 / 0.5019, 03 0.0510 / 0.0511 / 0.0539, 04 0.2761 / 0.2786 / 0.2856; hard
+01 0.3228 / 0.3188 / 0.3310, 02 0.0354 / 0.0357 / 0.0374, 03 0.3359 / 0.3396 /
+0.3622, 05 0.0129 / 0.0164 / 0.0425, 06 0.0709 / 0.1070 / 0.1081, 07 0.1791 /
+0.1771 / 0.2491. The floor bit hardest exactly where the audit predicted: hard
+05 and 07 more than tripled and 1.4x'd off the CC box. Verdicts: 9 clean, 2
+interesting (mega 02 P.raw carryover, hard 03), contamination clean on all 11,
+real DeepSeek spend $9.6 across the sweep. Probes (scratch `ds41/probes`, logs
+`ds41/probe_out`): the mega same-buffer overwrite is honoured (an earlier probe
+revision compared the solution's persistent output buffer to itself and printed
+a false cos=1.000000, fixed by cloning); cuda 03's five SUSPECT lines are all
+non-bitwise repeat noise inside the 0.08 gate; cuda 04 has a latent packed-weight
+cache keyed on `(_version, data_ptr)` that misses `.data.copy_` (not reachable
+from check.py); hard 07 returns a persistent output buffer at M=1. Both boxes
+deleted by 03:31Z, `vm list` empty.
+
 ## 2026-09-02 — environments/ and benchmarks/v3 removed
 
 The Prime Intellect `verifiers` mirrors (`environments/kernel_hard`,
