@@ -6,6 +6,26 @@ Numbering note: entries before 2026-07-21 say "Problem 03" for the Kimi-Linear d
 
 ---
 
+## 2026-09-11 — the 39 published mega cells have no run archive (migrated from Claude auto-memory)
+
+Found 2026-07-28 while relocating `anvil:~/kb-remote-archives`. The 39 run_ids in
+`public/data/mega/results.csv`, all `02_kimi_linear_decode` and dated 2026-06-18
+onward, have no run archive anywhere local: not in the Mac's four mega run dirs
+(`runs`, `runs-h100`, `runs-b200`, `runs-inkling-hold`), not in anvil's checkout,
+not in the relocated remote archives.
+
+What survives: all 39 solutions are tracked in-repo at
+`public/data/mega/code/<run_id>.solution.py.txt`, and the transcripts should be on
+HuggingFace (`kernelbench-mega-traces`). Verify that before relying on it.
+
+Why it matters: the mandatory sequential isolated re-grade rebuilds a cell from
+its archive workspace. With no archive those 39 cells cannot be re-graded or
+contamination-checked from local data; they would have to be reconstructed from
+the published solution text plus the HF trace, or re-run outright.
+
+hard and cuda are fine by contrast: all 65 published hard and 24 published cuda
+run_ids are present on the Mac with a non-empty `result.json`.
+
 ## 2026-09-02 — claude-fable-5-1 max on 02_kimi_linear_decode, RTX PRO 6000 (anvil GPU 1)
 
 Cell: 15.84x after sequential isolated regrade (in-run 15.82x; regraded

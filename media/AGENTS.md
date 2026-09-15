@@ -13,6 +13,7 @@ One file. Future agents write model posts and articles from this. Do not invent 
   `rg -n "# AGENTS\\.md instructions|<proactive-behavior>|~/.codex/AGENTS\\.md|~/.claude/CLAUDE\\.md|GOG_KEYRING_PASSWORD=|[A-Z0-9_]*(API_KEY|TOKEN|SECRET|PASSWORD)=" runs public/runs`
 - Post drafts (`X-*.md`/`.txt`) and rendered PNGs are throwaway: drafts are never committed, PNGs are gitignored and regenerate from the tracked `media/*.py`. Ask when the post went live, then delete the drafts and PNGs. Never delete the generators.
 - Transcript viewers: the per-bench `src/viewer/parsers/*` under-extract vs a full-harness dump (reference: https://github.com/0xSero/ai-data-extraction). Native `claude` and `codex` encrypt chain-of-thought, so an empty reasoning trace for Opus or GPT is the API, not a viewer bug; the `*-claude` routes to open providers return full thinking.
+- Public trace privacy: scan the exact staged files with `scripts.redaction.scan_file` and require no findings. Remove private configuration/environment tool calls AND their paired results; stop if a private call cannot be paired. Preserve raw archives privately. After upload, download public files and verify their SHA256 against the scanned exports. A public viewer trace is a lossy export, never a full archive backup.
 
 ## Names — never freestyle
 
