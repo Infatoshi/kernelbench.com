@@ -122,7 +122,7 @@ probes were still on GPU 1; `pkill -f` on tetra matches its own ssh session and
 returns 255, kill by pid. `*.contended.log` survives a rerun because the script
 only renames when the contended file is absent.
 
-Posts drafted, not posted: `media/posts/audited/grok47-cuda/` (headline cell 04)
+Traces: the five HF jsonl exports were converted on tetra, scanned with `scripts.redaction.scan_file` (zero findings) and the rg tripwire, uploaded to `kernelbench-mega-traces` and `kernelbench-cuda-traces`, then downloaded back and SHA256-matched against the staged files. Posts drafted, not posted: `media/posts/audited/grok47-cuda/` (headline cell 04)
 and `media/posts/audited/grok47-mega/`, FILL-IN left open. Trajectory charts for
 all five runs are in the session scratchpad and regenerate from the annotations.
 
