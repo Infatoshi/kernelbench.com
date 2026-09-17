@@ -230,8 +230,10 @@ if [ -x "$REPO_ROOT/.venv/bin/python" ]; then
     REAL_PYTHON="$REPO_ROOT/.venv/bin/python"
 fi
 REAL_NVIDIA_SMI="$(command -v nvidia-smi || true)"
-REAL_NCU="$(command -v ncu || true)"
-REAL_NSYS="$(command -v nsys || true)"
+# KBH_NCU_BIN / KBH_NSYS_BIN: host-mode override for a narrow sudo shim on boxes
+# where RmProfilingAdminOnly=1 cannot be cleared without a driver reload.
+REAL_NCU="${KBH_NCU_BIN:-$(command -v ncu || true)}"
+REAL_NSYS="${KBH_NSYS_BIN:-$(command -v nsys || true)}"
 REAL_NVCC="$(command -v nvcc || true)"
 REAL_TIMEOUT="$(command -v timeout)"
 REAL_UV_FALLBACK="$REAL_UV"
