@@ -68,6 +68,64 @@ possible later.
 
 ---
 
+## 2026-09-17 - Grok 4.7 (xhigh) on tetra: first sweep on the home rig
+
+First KernelBench cells graded on tetra, the bare-metal box with two RTX PRO 6000
+Blackwell Workstation Edition cards (driver 610.57.04, CUDA 13.3). Everything ran
+on GPU 1 under an `overnight-compute` lease (`--resource gpu1`); GPU 0 carried an
+unrelated fine-tuning job the whole night and was never touched. Grok 4.7 smoke
+test at `--reasoning-effort xhigh` answered in 3.9 s; the harness route is the
+native Grok CLI (`grok` harness, model `grok-4.7`, served as `grok-4.7-build`
+through cli-chat-proxy.grok.com on the Grok Build subscription, so there is no
+per-token dollar cost to record).
+
+Five cells in parallel on GPU 1 (mega 02, cuda 01-04, unlimited budget), all
+correct, all stopped on their own inside 100 minutes, then the isolated sequential
+regrade on GPU 1 with the canonical decks (in-run / isolated):
+
+- mega 02 Kimi-Linear Decode 5.652 / 6.3791x, clean, authentic single-launch
+  cooperative megakernel (72 grid barriers per token, fidelity 1.0000 everywhere).
+  Grok 4.5 was 0.816x on this cell.
+- cuda 01 GLM-5.2 Fused MoE 0.0944 / 0.0948, interesting: cuBLAS strided-batched
+  expert GEMMs, the Grok 4.6 / V4 Pro class, not an authored GEMM.
+- cuda 02 Native Sparse Attention 0.1002 / 0.1002, clean, hand-written WMMA; the
+  exact-tie block ordering is flipped relative to the reference but cannot fire on
+  bf16 randn inputs (probe-verified, non-scoring).
+- cuda 03 MegaQwen Decode 0.0454 / 0.0455, clean, seven hand-written kernels.
+- cuda 04 Grid + MinGRU 0.6542 / 0.6398, interesting: the rollout runs in fp16 on
+  a problem declared fp32, chosen after the agent measured fp32 / bf16 / fp16 at
+  the graded shapes; the strict oracle matches at every graded shape and seed
+  (positions exact, rewards bitwise, logits within 2.5e-6) and no torch precision
+  flag is touched. Same call as the Gemini 3.8 Flash cell, fourth on the board.
+
+Audits were trace-level and submission-level with same-buffer overwrite probes on
+the quiet GPU 1 for every cell; contamination clean on all five (the only foreign
+run ids in any transcript are `find` output that was never followed). None of the
+five agents ran ncu or nsys even though both were available.
+
+Two pieces of plumbing landed for this box. (1) `RmProfilingAdminOnly=1` cannot be
+cleared without a driver reload, which the fine-tune on GPU 0 forbids, so ncu goes
+through `~/kb-bin/ncu-sudo` (sudoers limited to `ncu`, `nsys` and a path-locked
+`kb-chown-run`) and the harness gained `KBH_NCU_BIN` / `KBH_NSYS_BIN` to point the
+per-run lock wrappers at it; proven with a real `smsp__cycles_elapsed.avg` on
+GPU 1. `/etc/modprobe.d/nvidia-ncu.conf` is staged for the next reboot, after
+which the shim is unnecessary. (2) Grok's full tool timeline lives in
+`~/.grok/sessions/<url-encoded cwd>/<uuid>/chat_history.jsonl`, not in the
+harness transcript, and host-mode runs do not archive it; each run's session
+store was copied into `<run>/agent_home/.grok/sessions/` by hand so the viewer,
+the HF trace and the trajectory chart see the tools. `media/trajectory.py` now
+drops its auto checkpoints when the trace carries no timestamps (Grok rows have
+none) and reads the session `usage.json` for the token axis.
+
+Regrade hygiene note: the first cuda regrade was killed mid-cell because audit
+probes were still on GPU 1; `pkill -f` on tetra matches its own ssh session and
+returns 255, kill by pid. `*.contended.log` survives a rerun because the script
+only renames when the contended file is absent.
+
+Posts drafted, not posted: `media/posts/audited/grok47-cuda/` (headline cell 04)
+and `media/posts/audited/grok47-mega/`, FILL-IN left open. Trajectory charts for
+all five runs are in the session scratchpad and regenerate from the annotations.
+
 ## 2026-09-11 - DeepSeek V4.1 Flash: two posts scheduled, annotations closed
 
 Two short posts for `deepseek-claude/deepseek-flash` were drafted from the

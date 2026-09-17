@@ -51,6 +51,7 @@ from kbh_theme import C, apply  # noqa: E402
 
 PEAK_RE = re.compile(r"peak_fraction:\s*([0-9]+\.[0-9]+)")
 PASS_RE = re.compile(r"(?:^|\\n|\n)PASS\b")
+RUN_DIR_HINT: Path | None = None
 BASELINE_RE = re.compile(r"baseline[^\n]*?([0-9]+\.[0-9]+)\s*ms(?:/tok)?", re.I)
 
 
@@ -127,6 +128,14 @@ def extract(session, result: dict) -> tuple[list[Point], float, int, list[tuple[
     if t0 is None:
         t0 = next((e.timestamp for e in session.events if e.timestamp), None)
     total_tokens = int(((result.get("usage") or {}).get("output_tokens")) or 0)
+    if not total_tokens:
+        # Grok leaves result.json usage empty; its archived session store has it.
+        for uj in sorted(RUN_DIR_HINT.glob("agent_home/.grok/sessions/*/*/usage.json")) if RUN_DIR_HINT else []:
+            try:
+                total_tokens = int(json.loads(uj.read_text())["session"]["outputTokens"])
+                break
+            except (OSError, KeyError, ValueError, TypeError):
+                continue
     elapsed_min = float(result.get("elapsed_seconds") or 0) / 60
 
     # Token proxy: characters the agent emitted, scaled to the billed total.
@@ -173,6 +182,12 @@ def extract(session, result: dict) -> tuple[list[Point], float, int, list[tuple[
 
     if elapsed_min <= 0:
         elapsed_min = last_t
+    if not any(e.timestamp for e in session.events):
+        # No clock in the trace (Grok chat_history rows carry none): every auto
+        # point would land at t=0. Keep only the annotation's checkpoints.
+        print(f"note: trace has no timestamps, dropping {len(raw)} auto checkpoints", file=sys.stderr)
+        raw = []
+        curve = [(0.0, 0), (elapsed_min or 1.0, chars)]  # linear-in-time token estimate
     scale = (total_tokens / chars) if (total_tokens and chars) else 0.25
     pts = [Point(t, s, int(c * scale), k, lbl) for (t, s, k, c, lbl) in raw]
     tok_curve = [(t, int(c * scale)) for t, c in curve]
@@ -403,6 +418,8 @@ def main(argv=None) -> int:
     run_id = run_dir.name
 
     session, tp = load_session(run_dir, bench_dir)
+    global RUN_DIR_HINT
+    RUN_DIR_HINT = run_dir
     auto, session_min, total_tokens, tok_curve = extract(session, result)
     curve_t = np.array([t for t, _ in tok_curve] or [0.0])
     curve_tok = np.array([n for _, n in tok_curve] or [0])
