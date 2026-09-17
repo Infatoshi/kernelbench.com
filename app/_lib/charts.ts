@@ -123,7 +123,6 @@ const LIVE_MODEL_IDS = new Set([
   "gpt-6-astra-pro",
   "openai/gpt-6-astra-pro",
   "grok-4.6",
-  "grok-4.7",
   "kinetic-0715",
   "muse-spark-1.3",
   "ox-alpha",
