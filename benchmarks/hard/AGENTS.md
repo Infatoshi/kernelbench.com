@@ -72,7 +72,7 @@ Mega is driven from inside `benchmarks/mega/` with `./scripts/run_hard.sh <harne
 
 ## Correctness
 
-`check.py` validates nominal canonical shapes and seeds, then reruns them under problem-specific numeric stress from `src/eval/numeric_stress.py` (rescaled activations or weights; no hidden shapes). Integer outputs are exact; floating outputs use explicit per-dtype tolerances and report max abs/rel error, bad element count, worst index, and tolerance on failure. This catches zero-output, cached-nominal, and loose-tolerance cheats. `KBH_NUMERIC_STRESS=0` is for local debugging only, never official checks or backfills. `benchmark.py` does not import numeric stress and times the canonical deck only, so scores stay comparable.
+`check.py` validates nominal canonical shapes and seeds, then reruns them under problem-specific numeric stress from `src/eval/numeric_stress.py` (rescaled activations or weights; no hidden shapes). Integer outputs are exact; floating outputs use explicit per-dtype tolerances and report max abs/rel error, bad element count, worst index, and tolerance on failure. Catches zero-output, cached-nominal, and loose-tolerance cheats. `KBH_NUMERIC_STRESS=0` is for local debugging only, never official checks or backfills. `benchmark.py` does not import numeric stress and times the canonical deck only, so scores stay comparable.
 
 ## Results
 
@@ -80,7 +80,7 @@ Mega is driven from inside `benchmarks/mega/` with `./scripts/run_hard.sh <harne
 
 ## Tests
 
-On the GPU box, `uv run pytest` covers `src/hardware/` peak lookup, `src/eval/roofline.py`, `src/eval/correctness.py`, and `src/eval/numeric_stress.py` against the classic cheats (the bench venv exists only there; the Mac keeps none). Problem files are validated by running a real agent or a disposable smoke workspace, not by unit tests. Repo-wide guards run on the Mac: `uv run --project kbtool pytest kbtool/tests/`.
+On the GPU box, `uv run pytest` covers `src/hardware/` peak lookup, `src/eval/{roofline,correctness,numeric_stress}.py` against the classic cheats (the bench venv exists only there; the Mac keeps none). Problem files are validated by a real agent or a disposable smoke workspace, not unit tests. Repo-wide guards on the Mac: `uv run --project kbtool pytest kbtool/tests/`.
 
 ## When a sweep fails
 
@@ -107,7 +107,7 @@ What DOES matter about torch, and is enforced elsewhere:
 
 ## Audit YAML schema (hard, cuda, mini, mega)
 
-Annotations attach the audit verdict and human commentary to one run. They live in `results/annotations/<run_id>.yaml`, where `<run_id>` matches the directory name of a run under `outputs/runs/` (e.g. `20260428_040539_claude_claude-opus-4-7_01_fp8_gemm`). The site (`app/_lib/data.ts`) reads them alongside `leaderboard.json` and the per-run `result.json` to add side-margin notes, callouts, and pull quotes; `kb publish` only joins annotations that git tracks.
+Annotations attach the audit verdict and human commentary to one run, in `results/annotations/<run_id>.yaml` where `<run_id>` matches a directory under `outputs/runs/`. The site (`app/_lib/data.ts`) reads them with `leaderboard.json` and per-run `result.json` for side-margin notes, callouts, and pull quotes; `kb publish` joins only git-tracked annotations.
 
 ```yaml
 run_id: <matches outputs/runs/ directory name>
@@ -147,7 +147,7 @@ Verdicts:
 - **interesting** — neither leak nor hack, but worth surfacing: novel algorithm choice, surprising failure mode, unique approach, etc.
 - **bug** — harness/infra issue distorting the result (timeout, sandbox failure, library missing on test rig). Cell number is unreliable.
 
-Conventions: quotes are VERBATIM from the source file at the specified lines, including indentation, 1-indexed; `summary` is one paragraph, ideally under 60 words; `implication` is optional for `clean`, required for everything else; one YAML document per run, multiple aspects go under `quotes`. Write the YAML by hand; if a tool gets built it should generate this schema, not replace it.
+Conventions: quotes are VERBATIM from the source file at the stated lines, including indentation, 1-indexed; `summary` is one paragraph, ideally under 60 words; `implication` is optional for `clean`, required otherwise; one YAML document per run, multiple aspects under `quotes`. Write the YAML by hand; a future tool should generate this schema, not replace it.
 
 Optional `trajectory` (highlight chart checkpoints): `media/trajectory.py <run_dir>` draws the annotated optimization trajectory for one run (the Fable 5 Mega 18.7x chart). It pulls every in-session `benchmark.py` result, the baseline timing, and wall clock from the transcript by itself. The moves between those points are what the audit already read; list them here so the chart can label them:
 
@@ -191,6 +191,7 @@ trajectory:
 | `KBH_CONTAINER_GPUS` | `benchmarks/{hard,cuda,mini}/scripts/run_hard.sh` | `all` | Supplies Docker's `--gpus` selector for agent containers. | Container mode only. |
 | `KBH_CUDA_HOME` | `benchmarks/{hard,cuda,mini,mega}/scripts/{run_hard,regrade_sequential}.sh` | `/usr/local/cuda-13` | Selects the host CUDA toolkit and exports it as `CUDA_HOME` when present. | Changes compiler/toolkit selection. |
 | `KBH_GPU` | `scripts/lib/run_harness.sh`; `benchmarks/mega/scripts/run_hard.sh` | `0` | Pins `CUDA_VISIBLE_DEVICES` to one physical index and stamps `gpu_index` / `gpu_name` / `gpu_uuid` into `result.json`. | Must match the deck hardware key. Empty hide is illegal. |
+| `KBH_BACKFILL_DECK` | `benchmarks/cuda/scripts/backfill_graded_shape_check.sh` | `problems-rtxpro6000` | Deck whose `check.py` is restored when re-checking cells after a check widening. | A cell that fails is withdrawn, not re-benchmarked. |
 | `KBH_NCU_BIN` / `KBH_NSYS_BIN` | `scripts/lib/run_harness.sh`; `benchmarks/mega/scripts/run_hard.sh` | `command -v` | Profiler binary behind the lock wrappers; a `sudo -n` shim where `RmProfilingAdminOnly=1` needs a reload. | Root profiles; shim chowns the run dir back. |
 | `KBH_GPU_LOCK` | `benchmarks/{hard,cuda,mini,mega}/scripts/run_hard.sh` | `<lock-dir>/gpu.lock`; Mega uses `<bench>/outputs/gpu.lock` | Selects the lock file used by GPU-facing wrappers. | Normally derive it via `KBH_GPU_LOCK_DIR`. |
 | `KBH_GPU_LOCK_DIR` | `benchmarks/{hard,cuda,mini}/scripts/run_hard.sh`; `benchmarks/mini/scripts/launch_matrix.sh` | `<bench>/outputs/gpu_lock` | Selects the lock domain and therefore which sessions serialize. | A wrong domain permits benchmark contention. |
@@ -223,7 +224,7 @@ trajectory:
 | `KBH_PROPERTY_SEED` | `benchmarks/hard/src/eval/property_stress.py` | random 64-bit integer | Replays the fixed-plus-generated structural correctness plan from a prior `PROPERTY_SEED` log line. | Accepts decimal or `0x` notation. Leave unset for a fresh official check; set only to reproduce a failure. |
 | `KBH_PUBLISHED_MANIFEST` | `benchmarks/{hard,cuda,mini}/scripts/build_v2_leaderboard.py` | `results/published_runs.json` | Selects the allowlist of run IDs used for leaderboard construction; empty disables it. | Changes which cells can be published. |
 | `KBH_REGRADE_ALLOW_BUSY` | `benchmarks/{hard,cuda,mini,mega}/scripts/regrade_sequential.sh` | `0` | Skips the idle-GPU precondition when `1`. | Debug only; contaminated timing is not publishable. |
-| `KBH_REGRADE_DECK` | `benchmarks/{hard,cuda,mega}/scripts/regrade_sequential.sh` | unset | Selects a canonical deck root whose immutable files, `src/`, and locked project environment replace the archived grading surface before grading. | Changes the validation surface and dependencies; fails closed if any canonical component is missing. Mini's regrader does not read it. |
+| `KBH_REGRADE_DECK` | `benchmarks/{hard,cuda,mega}/scripts/regrade_sequential.sh` | unset | Canonical deck root whose immutable files, `src/`, and locked environment replace the archived grading surface. | Changes the validation surface and dependencies; fails closed if incomplete. Mini does not read it. |
 | `KBH_REGRADE_DRY_RUN` | `benchmarks/{hard,cuda,mini,mega}/scripts/regrade_sequential.sh` | `0` | Prints planned regrades without running checks, benchmarks, or writes when `1`. | Operational safety control. |
 | `KBH_REGRADE_GPU` | same | `0` | Selects the physical GPU for sequential regrading and idle checks. | Must match the run's hardware/deck. |
 | `KBH_RETRY_LABEL` | `benchmarks/{hard,cuda,mini,mega}/scripts/launch_infra_retries.sh` | `retry1` | Sets the suffix/label for an infrastructure retry wave. | Classification/organization only. |
