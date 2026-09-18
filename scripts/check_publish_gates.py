@@ -28,6 +28,7 @@ Usage: uv run python scripts/check_publish_gates.py   (exit 1 on any failure)
 from __future__ import annotations
 
 import json
+import os
 import re
 import subprocess
 import sys
@@ -178,19 +179,86 @@ def gate_tracked(fail: list[str]) -> None:
         fail.append(f"[D tracked] {f} is not git-tracked; models.json ships it as unaudited. `git add` it and rerun kb publish.")
 
 
+def gate_graded_surface(fail: list[str]) -> None:
+    """E: every published cell must carry the stamp of the deck that graded it.
+
+    A cell whose `graded_surface_sha` is missing or does not match the current
+    deck was scored by a different surface than the one shipping now, so its
+    number no longer means what the board says. This is how a widened check.py
+    used to be able to ship while the board kept serving older numbers.
+
+    Kill switch: KBH_GATE_GRADED_SURFACE=0. Set it ONLY while backfilling a
+    board whose cells predate the stamp; leaving it off defeats the gate.
+    """
+    if os.environ.get("KBH_GATE_GRADED_SURFACE", "1") == "0":
+        return
+    sys.path.insert(0, str(REPO / "scripts" / "lib"))
+    import graded_surface  # noqa: E402
+
+    # (bench, leaderboard, deck root, runs dir) -- only benches whose cells this
+    # repo grades locally; mega's board is built by its own script.
+    boards = [
+        ("hard", REPO / "benchmarks/hard/results/leaderboard.json",
+         REPO / "benchmarks/hard/problems-rtxpro6000", REPO / "benchmarks/hard/outputs/runs"),
+        ("cuda", REPO / "benchmarks/cuda/results/leaderboard.json",
+         REPO / "benchmarks/cuda/problems-rtxpro6000", REPO / "benchmarks/cuda/outputs/runs"),
+    ]
+    stale: dict[str, list[str]] = {}
+    for bench, lb_path, deck_root, runs_root in boards:
+        if not lb_path.exists():
+            continue
+        src = REPO / f"benchmarks/{bench}/src"
+        if not deck_root.is_dir() or not src.is_dir():
+            continue
+        # Digest each problem once.
+        expect: dict[str, str] = {}
+        for prob_dir in sorted(deck_root.iterdir()):
+            if prob_dir.is_dir():
+                try:
+                    expect[prob_dir.name] = graded_surface.graded_surface_digest(prob_dir, src)
+                except SystemExit:
+                    continue
+        lb = json.loads(lb_path.read_text())
+        for model in lb.get("models", []):
+            for prob, cell in (model.get("results") or {}).items():
+                rid = cell.get("run_id")
+                if not rid or prob not in expect:
+                    continue
+                rj = runs_root / rid / "result.json"
+                if not rj.exists():
+                    continue
+                try:
+                    got = json.loads(rj.read_text()).get("graded_surface_sha")
+                except (OSError, json.JSONDecodeError):
+                    continue
+                if got != expect[prob]:
+                    stale.setdefault(bench, []).append(f"{rid} ({prob})")
+    for bench, cells in stale.items():
+        shown = ", ".join(sorted(cells)[:5])
+        more = f" (+{len(cells) - 5} more)" if len(cells) > 5 else ""
+        fail.append(
+            f"[E graded surface] {bench}: {len(cells)} published cell(s) were graded by a "
+            f"different deck than the one shipping now: {shown}{more}. Re-grade them "
+            f"(`scripts/regrade_sequential.sh` with KBH_REGRADE_DECK), which stamps the "
+            f"current surface, or withdraw them. Do not grandfather by editing generated "
+            f"files. Set KBH_GATE_GRADED_SURFACE=0 only while a backfill is in flight."
+        )
+
+
 def main() -> int:
     fail: list[str] = []
     gate_roster(fail)
     gate_mega_marker(fail)
     gate_cuda_manifest(fail)
     gate_tracked(fail)
+    gate_graded_surface(fail)
     if fail:
         print("PUBLISH GATES FAILED (the site would not show what you just published):", file=sys.stderr)
         for f in fail:
             print("  - " + f, file=sys.stderr)
         print(f"{len(fail)} gate failure(s). Fix, then rerun kb publish.", file=sys.stderr)
         return 1
-    print("kb: publish gates OK (roster, mega gpu marker, cuda manifest, tracked annotations)")
+    print("kb: publish gates OK (roster, mega gpu marker, cuda manifest, tracked annotations, graded surface)")
     return 0
 
 

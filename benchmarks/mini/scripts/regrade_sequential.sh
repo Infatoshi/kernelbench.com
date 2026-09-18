@@ -45,6 +45,16 @@ GPU="${KBH_REGRADE_GPU:-0}"
 DRY="${KBH_REGRADE_DRY_RUN:-0}"
 CHECK_TIMEOUT="${KBH_CHECK_TIMEOUT_SECONDS:-1800}"
 
+# Shared graded-surface digest (scripts/lib/graded_surface.py at the monorepo
+# root, or shipped into the bench dir on a thin-synced worker). Resolved with
+# the same two-path fallback the runner uses.
+GRADED_SURFACE_PY=""
+for _gs in "$REPO_ROOT/../../scripts/lib/graded_surface.py" \
+           "$REPO_ROOT/scripts/lib/graded_surface.py"; do
+    [ -f "$_gs" ] && { GRADED_SURFACE_PY="$_gs"; break; }
+done
+unset _gs
+
 KBH_CUDA_HOME="${KBH_CUDA_HOME:-/usr/local/cuda-13}"
 [ -d "$KBH_CUDA_HOME" ] && export CUDA_HOME="$KBH_CUDA_HOME"
 
@@ -106,6 +116,13 @@ for RUN_DIR in "$@"; do
     fi
 
     PROBLEM=$(python3 -c "import json,sys;print(json.load(open(sys.argv[1]))['problem'])" "$RUN_DIR/result.json")
+    # The surface that will actually grade: the canonical deck when we restore
+    # from one, otherwise whatever the archived workspace holds.
+    if [ -n "${KBH_REGRADE_DECK:-}" ]; then
+        GRADE_DECK_DIR="$REPO_ROOT/$KBH_REGRADE_DECK/$PROBLEM"
+    else
+        GRADE_DECK_DIR="$RUN_DIR/repo/problems/$PROBLEM"
+    fi
     PROBLEM_DIR="$RUN_DIR/repo/problems/$PROBLEM"
     if [ ! -d "$PROBLEM_DIR" ]; then
         echo "[skip] $RID: archive workspace missing ($PROBLEM_DIR)"; SKIP=$((SKIP+1)); continue
@@ -183,6 +200,9 @@ for RUN_DIR in "$@"; do
 
     RID="$RID" CORRECT="$CORRECT" SCORE="$SCORE" CEXIT="$CEXIT" CEL="$CEL" \
     BEXIT="$BEXIT" BEL="$BEL" GPU="$GPU" \
+    REGRADE_DECK_PROBLEM_DIR="$GRADE_DECK_DIR" \
+    REGRADE_SRC_DIR="$REPO_ROOT/src" \
+    REGRADE_GRADED_SURFACE_PY="$GRADED_SURFACE_PY" \
     python3 - "$RUN_DIR/result.json" <<'PY'
 import json, os, socket, subprocess, sys
 
@@ -219,6 +239,23 @@ r["regrade"] = {
     "mode": "sequential_isolated",
     "contended": contended,
 }
+
+# Stamp the surface this re-grade actually used, via the shared digest module
+# (same implementation the runner and the publish gate call), so a re-grade
+# under a corrected deck produces a NEW stamp and stale cells stay findable.
+deck_rel = os.environ.get("REGRADE_DECK_PROBLEM_DIR")
+src_rel = os.environ.get("REGRADE_SRC_DIR")
+if deck_rel and src_rel:
+    import importlib.util
+    gs = os.environ.get("REGRADE_GRADED_SURFACE_PY")
+    if gs and os.path.exists(gs):
+        spec = importlib.util.spec_from_file_location("graded_surface", gs)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        try:
+            r["graded_surface_sha"] = mod.graded_surface_digest(deck_rel, src_rel)
+        except SystemExit:
+            r["graded_surface_sha"] = None
 
 with open(path, "w") as f:
     json.dump(r, f, indent=4)
