@@ -463,6 +463,25 @@ chmod +x "$LOCK_WRAPPER_DIR"/uv "$LOCK_WRAPPER_DIR"/python \
     "$LOCK_WRAPPER_DIR"/ncu "$LOCK_WRAPPER_DIR"/nsys "$LOCK_WRAPPER_DIR"/nvcc
 export PATH="$LOCK_WRAPPER_DIR:$PATH"
 
+# --- Contamination sandbox (host-mode agent sessions) ----------------------
+# Hide-the-tree bwrap + honeytoken + refuse-closed launch canary, built by the
+# ONE shared helper (scripts/lib/sandbox.sh — mega's fork sources the same
+# file). Container mode already runs the agent against /workspace only and
+# skips this. `--dev-bind / /` stays so ncu/nsys/CUPTI/driver work: hygiene
+# (no foreign archive visible), not containment.
+KBH_SBX=()
+KBH_SANDBOX_ACTIVE=0
+if [ "$KBH_AGENT_CONTAINER" != "1" ]; then
+    KBH_SANDBOX_LIB="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/sandbox.sh"
+    if [ ! -f "$KBH_SANDBOX_LIB" ]; then
+        echo "STOP: sandbox.sh not found next to run_harness.sh ($KBH_SANDBOX_LIB)" >&2
+        exit 3
+    fi
+    # shellcheck source=scripts/lib/sandbox.sh
+    . "$KBH_SANDBOX_LIB"
+    kbh_sandbox_init
+fi
+
 # Container-side lock wrappers. Mounted at /kbh/bin (first on PATH) inside
 # agent containers so in-container GPU-facing commands take the same host
 # flock per-command. Real binaries resolve lazily from a PATH that excludes
@@ -2483,6 +2502,10 @@ case "$HARNESS" in
         CODEX_SID=$(grep -h -oP 'session id: \K[0-9a-f-]+' "$STDERR_FILE" "$LOG_FILE" 2>/dev/null | head -1)
         if [ -n "$CODEX_SID" ]; then
             if [ "$KBH_AGENT_CONTAINER" = "1" ]; then
+                CODEX_SEARCH_ROOT="$RUN_DIR/agent_home/.codex/sessions"
+            elif [ "${KBH_SANDBOX_ACTIVE:-0}" = "1" ]; then
+                # Sandbox overlays ~/.codex/sessions with the archive-local
+                # agent_home dir; the session JSONL landed there.
                 CODEX_SEARCH_ROOT="$RUN_DIR/agent_home/.codex/sessions"
             else
                 CODEX_SEARCH_ROOT="$HOME/.codex/sessions"

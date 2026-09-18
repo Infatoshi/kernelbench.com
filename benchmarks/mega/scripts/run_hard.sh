@@ -136,53 +136,12 @@ WORKSPACE_ROOT="$RUN_DIR/repo"
 PROBLEM_DIR="$WORKSPACE_ROOT/problems/$PROBLEM_NAME"
 mkdir -p "$PROBLEM_DIR"
 
-# Contamination sandbox: run the agent under bwrap with EVERY source of a prior
-# solution or the optimization recipe hidden, while the toolchain (src, .venv,
-# GPU, outputs/gpu.lock) passes through via --dev-bind.
-#
-# Leak sources (all must be blanked — 2026-07-09 Grok 4.5 kimi-decode proved
-# that hiding only outputs/runs is not enough):
-#   - this bench's run archive (outputs/runs)
-#   - sibling hard/v3 run archives
-#   - monorepo public/ (published solution.py.txt for Fable/etc — the actual
-#     path Grok used: public/data/mega/code/* and public/runs/*_solution.py.txt)
-#   - results/ (annotations + leaderboard scores named as targets)
-#   - monorepo runs/ HF staging
-#   - DEVLOG (optimization journey == the recipe)
-#   - ~/.claude/projects memory
-# Own run dir stays writable. KBH_SANDBOX=0 to disable; auto-off if bwrap is
-# absent (e.g. verda B200 userns denied — blank public/ + DEVLOG on the box).
-RUNS_DIR="$REPO_ROOT/outputs/runs"
-SIB_PARENT="$(dirname "$REPO_ROOT")"   # benchmarks/ on anvil, $HOME on a cloud box
-MONOREPO_ROOT="$(cd "$REPO_ROOT/../.." && pwd)"  # kernelbench.com monorepo root
-KBH_EMPTY="$RUN_DIR/.kbh_empty"; : > "$KBH_EMPTY"
-KBH_SBX=()
-if [ "${KBH_SANDBOX:-1}" = "1" ] && command -v bwrap >/dev/null 2>&1; then
-    KBH_SBX=(bwrap --dev-bind / / --tmpfs "$RUNS_DIR")
-    [ -e "$REPO_ROOT/DEVLOG.md" ] && KBH_SBX+=(--ro-bind "$KBH_EMPTY" "$REPO_ROOT/DEVLOG.md")
-    [ -d "$REPO_ROOT/results" ] && KBH_SBX+=(--tmpfs "$REPO_ROOT/results")
-    [ -d "$SIB_PARENT/hard" ]     && KBH_SBX+=(--tmpfs "$SIB_PARENT/hard")
-    [ -d "$SIB_PARENT/v3" ]       && KBH_SBX+=(--tmpfs "$SIB_PARENT/v3")
-    [ -d "$MONOREPO_ROOT/public" ] && KBH_SBX+=(--tmpfs "$MONOREPO_ROOT/public")
-    [ -d "$MONOREPO_ROOT/runs" ] && KBH_SBX+=(--tmpfs "$MONOREPO_ROOT/runs")
-    [ -d "$HOME/.claude/projects" ] && KBH_SBX+=(--tmpfs "$HOME/.claude/projects")
-    # Extra paths to hide: KBH_SANDBOX_HIDE (colon-separated) and/or one path per
-    # line in $REPO_ROOT/.kbh_sandbox_hide (cloud boxes keep pulled archives,
-    # hidden results/ and replay sources next to the bench tree).
-    _hide_list="${KBH_SANDBOX_HIDE:-}"
-    if [ -f "$REPO_ROOT/.kbh_sandbox_hide" ]; then
-        while IFS= read -r _h; do
-            [ -n "$_h" ] && _hide_list="${_hide_list:+$_hide_list:}$_h"
-        done < "$REPO_ROOT/.kbh_sandbox_hide"
-    fi
-    IFS=: read -r -a _hide_arr <<< "$_hide_list"
-    for _h in "${_hide_arr[@]}"; do
-        [ -n "$_h" ] && [ -d "$_h" ] && KBH_SBX+=(--tmpfs "$_h")
-    done
-    # Own archive + problem workspace must remain visible/writable after tmpfs hides.
-    KBH_SBX+=(--bind "$RUN_DIR" "$RUN_DIR" --chdir "$PROBLEM_DIR")
-    echo "agent sandbox: bwrap (hidden: runs archives, public/ solutions, results/, DEVLOG, ~/.claude memory)"
-fi
+# Contamination sandbox: bwrap hide-the-tree, built by the SHARED helper
+# scripts/lib/sandbox.sh (same file the hard/cuda/mini shared runner uses —
+# do not re-fork the hide list here; the 2026-08-13 grok-4.6 copy of Fable's
+# 24.6x came through outputs/runs-remote-pro, a path the old denylist missed).
+# kbh_sandbox_init is called below, after the GPU lock and REAL_PYTHON are
+# resolved (it needs both for the lock-dir bind-back and the launch canary).
 
 PROMPT="${PROMPT}
 
@@ -200,7 +159,10 @@ strip_python_bytecode() {
     /usr/bin/find "$1" -type f \( -name '*.pyc' -o -name '*.pyo' \) -delete
 }
 
-ln -s "$REPO_ROOT/src" "$WORKSPACE_ROOT/src"
+# Copy src/ (a symlink would dangle once the sandbox tmpfs hides the repo,
+# and a writable symlink lets candidates modify the trusted checker helpers).
+cp -a "$REPO_ROOT/src" "$WORKSPACE_ROOT/src"
+strip_python_bytecode "$WORKSPACE_ROOT/src"
 cp -p "$REPO_ROOT/pyproject.toml" "$WORKSPACE_ROOT/pyproject.toml"
 cp -p "$REPO_ROOT/uv.lock" "$WORKSPACE_ROOT/uv.lock"
 if [ -e "$REPO_ROOT/.python-version" ]; then
@@ -242,7 +204,13 @@ LOCK_WRAPPER_DIR="$RUN_DIR/bin"
 mkdir -p "$LOCK_WRAPPER_DIR" "$RUN_DIR/cache/torch_extensions" \
     "$RUN_DIR/cache/triton" "$RUN_DIR/cache/cuda" "$RUN_DIR/tmp"
 
-export KBH_GPU_LOCK="${KBH_GPU_LOCK:-$REPO_ROOT/outputs/gpu.lock}"
+# The lock lives in its own directory (NOT bare outputs/) so the sandbox can
+# bind just the lock dir back without re-exposing outputs/runs. Matches the
+# shared runner's default. flock is on the inode, so old-path and new-path
+# runs must not overlap a sweep (same-version launches only).
+KBH_GPU_LOCK_DIR="${KBH_GPU_LOCK_DIR:-$REPO_ROOT/outputs/gpu_lock}"
+mkdir -p "$KBH_GPU_LOCK_DIR"
+export KBH_GPU_LOCK="${KBH_GPU_LOCK:-$KBH_GPU_LOCK_DIR/gpu.lock}"
 export KBH_GPU_LOCK_LOG="$RUN_DIR/gpu_lock.log"
 export TORCH_EXTENSIONS_DIR="$RUN_DIR/cache/torch_extensions"
 export TRITON_CACHE_DIR="$RUN_DIR/cache/triton"
@@ -252,6 +220,27 @@ export TEMP="$RUN_DIR/tmp"
 export TMP="$RUN_DIR/tmp"
 export RUN_DIR REAL_UV REAL_PYTHON REAL_NVIDIA_SMI REAL_NCU REAL_NSYS REAL_NVCC \
     REAL_UV_FALLBACK REAL_PYTHON_FALLBACK
+
+# --- Contamination sandbox (shared helper; see comment above) --------------
+# Monorepo layout first; a thin-synced remote worker ships the lib INTO the
+# bench dir at scripts/lib/ (same resolution as hard's wrapper).
+KBH_SBX=()
+KBH_SANDBOX_ACTIVE=0
+KBH_SANDBOX_LIB=""
+for _sbx_lib in "$REPO_ROOT/../../scripts/lib/sandbox.sh" \
+                "$REPO_ROOT/scripts/lib/sandbox.sh"; do
+    if [ -f "$_sbx_lib" ]; then
+        KBH_SANDBOX_LIB="$_sbx_lib"
+        break
+    fi
+done
+if [ -z "$KBH_SANDBOX_LIB" ]; then
+    echo "STOP: shared sandbox helper scripts/lib/sandbox.sh not found (monorepo or bench-local)" >&2
+    exit 3
+fi
+# shellcheck source=../../../scripts/lib/sandbox.sh
+. "$KBH_SANDBOX_LIB"
+kbh_sandbox_init
 
 cat > "$LOCK_WRAPPER_DIR/gpu-lock-exec" <<'EOF'
 #!/bin/bash
@@ -1056,7 +1045,14 @@ JSON
         # files when scanning its thread state DB and that's misleading.
         CODEX_SID=$(grep -oP 'session id: \K[0-9a-f-]+' "$STDERR_FILE" | head -1)
         if [ -n "$CODEX_SID" ]; then
-            CODEX_SESS=$(find "$HOME/.codex/sessions" -name "*${CODEX_SID}*.jsonl" 2>/dev/null | head -1)
+            if [ "${KBH_SANDBOX_ACTIVE:-0}" = "1" ]; then
+                # Sandbox overlays ~/.codex/sessions with the archive-local
+                # agent_home dir; the session JSONL landed there.
+                CODEX_SEARCH_ROOT="$RUN_DIR/agent_home/.codex/sessions"
+            else
+                CODEX_SEARCH_ROOT="$HOME/.codex/sessions"
+            fi
+            CODEX_SESS=$(find "$CODEX_SEARCH_ROOT" -name "*${CODEX_SID}*.jsonl" 2>/dev/null | head -1)
             if [ -n "$CODEX_SESS" ]; then
                 cp "$CODEX_SESS" "$RUN_DIR/codex_session.jsonl"
                 echo "archived codex session: $CODEX_SESS -> $RUN_DIR/codex_session.jsonl"

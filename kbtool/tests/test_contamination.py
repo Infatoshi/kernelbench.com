@@ -7,7 +7,15 @@ looked clean to the raw `outputs/runs/<ts>` regex. See kb/contamination.py.
 import json
 from pathlib import Path
 
-from kb.contamination import audit_corpus_hits, copied_foreign_solution, other_archives, run
+from kb.contamination import (
+    HONEYTOKEN_BEACON,
+    audit_corpus_hits,
+    copied_foreign_solution,
+    honeytoken_hit,
+    other_archives,
+    own_artifact_urls,
+    run,
+)
 
 
 def _write_tokens(path: Path, tokens: list[str], kind: str = "thought") -> None:
@@ -196,6 +204,104 @@ def test_audit_corpus_annotations_path_is_reported(tmp_path, capsys):
     rc = run([str(tmp_path)])
     assert rc == 0
     out = capsys.readouterr().out
-    assert "=== contamination audit: 0 / 1 runs read other archives ===" in out
+    assert "=== contamination audit: 0 / 1 runs contaminated ===" in out
     assert "=== audit-corpus read: 1 / 1 runs referenced" in out
     assert "transcript.jsonl:2  results/annotations" in out
+def test_runs_lambda_path_is_flagged(tmp_path):
+    """Lambda pull trees live at outputs/runs-lambda-<name>."""
+    run = _mk_run(tmp_path, "20260818_101112_claude_claude-opus-5_01_fp8_gemm",
+                  "01_fp8_gemm", 0.5)
+    (run / "transcript.jsonl").write_text(json.dumps({
+        "type": "assistant",
+        "message": "cat outputs/runs-lambda-h100a/20260719_121747_or-fable_x_01_fp8_gemm/result.json",
+    }) + "\n")
+    assert other_archives(run) == {"20260719_121747"}
+
+
+def test_multi_segment_remote_root_is_flagged(tmp_path):
+    """runs-remote-b200-x style multi-segment roots must match (_TS and _CP_FOREIGN)."""
+    run = _mk_run(tmp_path, "20260818_101112_grok_grok-4.6_02_kimi_linear_decode",
+                  "02_kimi_linear_decode", 21.0)
+    cmd = (
+        "cp outputs/runs-remote-b200-x/"
+        "20260719_121747_or-fable_anthropic_claude-fable-5_02_kimi_linear_decode/"
+        "solution.py ./solution.py"
+    )
+    (run / "transcript.jsonl").write_text(json.dumps({
+        "type": "tool_call", "rawInput": {"command": cmd},
+    }) + "\n")
+    assert other_archives(run) == {"20260719_121747"}
+    assert copied_foreign_solution(run) is True
+
+
+def test_honeytoken_beacon_in_solution_is_flagged(tmp_path):
+    run = _mk_run(tmp_path, "20260818_101112_grok_grok-4.6_02_kimi_linear_decode",
+                  "02_kimi_linear_decode", 21.0)
+    (run / "solution.py").write_text(
+        f'import torch\n_TUNE_KEY = "{HONEYTOKEN_BEACON}"\n'
+    )
+    assert honeytoken_hit(run) is True
+
+    clean = _mk_run(tmp_path, "20260818_121314_claude_claude-opus-5_02_kimi_linear_decode",
+                    "02_kimi_linear_decode", 14.0)
+    (clean / "solution.py").write_text("import torch\n# honest kernel\n")
+    assert honeytoken_hit(clean) is False
+
+
+def test_honeytoken_beacon_in_workspace_sidecar_is_flagged(tmp_path):
+    run = _mk_run(tmp_path, "20260818_101112_codex_gpt-5.5_01_fp8_gemm",
+                  "01_fp8_gemm", 0.4)
+    ws = run / "repo" / "problems" / "01_fp8_gemm"
+    ws.mkdir(parents=True)
+    (ws / "fast_kernel.cu").write_text(f"// autotune cache id: {HONEYTOKEN_BEACON}\n")
+    assert honeytoken_hit(run) is True
+
+
+def test_honeytoken_beacon_matches_sandbox_helper():
+    """The beacon literal must stay identical in scripts/lib/sandbox.sh, or the
+    planted decoy and the grade-time check silently diverge."""
+    sandbox_sh = Path(__file__).resolve().parents[2] / "scripts/lib/sandbox.sh"
+    text = sandbox_sh.read_text()
+    assert f'KBH_SANDBOX_BEACON="{HONEYTOKEN_BEACON}"' in text
+
+
+def test_own_artifact_url_tripwire(tmp_path):
+    run = _mk_run(tmp_path, "20260818_101112_gemini_gemini-3.5_01_fp8_gemm",
+                  "01_fp8_gemm", 0.4)
+    (run / "transcript.jsonl").write_text(json.dumps({
+        "type": "assistant",
+        "message": (
+            "curl https://kernelbench.com/hard then "
+            "https://huggingface.co/datasets/Infatoshi/kernelbench-mega-traces/blob/main/x.html and "
+            "https://raw.githubusercontent.com/Infatoshi/kernelbench.com/master/public/runs/x_solution.py.txt"
+        ),
+    }) + "\n")
+    urls = own_artifact_urls(run)
+    assert any("kernelbench.com/hard" in u for u in urls)
+    assert any("huggingface.co/datasets/Infatoshi/kernelbench-mega-traces" in u for u in urls)
+    assert any("raw.githubusercontent.com" in u for u in urls)
+
+
+def test_sota_fetches_are_not_url_tripwire(tmp_path):
+    """Agents legitimately pull SOTA sources from raw.githubusercontent.com."""
+    run = _mk_run(tmp_path, "20260818_101112_claude_claude-opus-5_01_fp8_gemm",
+                  "01_fp8_gemm", 0.4)
+    (run / "transcript.jsonl").write_text(json.dumps({
+        "type": "assistant",
+        "message": (
+            "fetch https://raw.githubusercontent.com/flashinfer-ai/flashinfer/main/include/gemm.cuh "
+            "and https://github.com/NVIDIA/cutlass"
+        ),
+    }) + "\n")
+    assert own_artifact_urls(run) == set()
+
+
+def test_grok_fragmented_url_tripwire(tmp_path):
+    """Own-artifact URL split across grok token-delta lines still trips."""
+    run = _mk_run(tmp_path, "20260818_101112_grok_grok-4.6_02_kimi_linear_decode",
+                  "02_kimi_linear_decode", 21.0)
+    _write_tokens(run / "transcript.jsonl", [
+        "let me fetch https://kernel", "bench.com/mega", " for the board",
+    ])
+    assert any("kernelbench.com/mega" in u for u in own_artifact_urls(run))
+
