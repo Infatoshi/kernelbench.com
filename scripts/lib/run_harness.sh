@@ -89,6 +89,25 @@ KBH_AGENT_CONTAINER_UV_CACHE="${KBH_AGENT_CONTAINER_UV_CACHE:-$REPO_ROOT/outputs
 KBH_OPENCODE_HOME_TEMPLATE="${KBH_OPENCODE_HOME_TEMPLATE:-$REPO_ROOT/outputs/opencode_home_template}"
 PROBLEM_NAME="$(basename "$SOURCE_PROBLEM_DIR")"
 
+# --- Graded-surface stamp -------------------------------------------------
+# The deck files + src/ that produced this cell's number. Without it nothing
+# records which grader scored a cell, so a widened check.py can ship while the
+# board keeps serving older numbers (see DEVLOG 2026-09-17). One digest
+# implementation, shared with regrade_sequential.sh and check_publish_gates.py:
+# scripts/lib/graded_surface.py. Empty when the surface cannot be read; publish
+# gate E then treats the cell as unstamped and refuses it.
+GRADED_SURFACE_SHA=""
+for _gs in "$REPO_ROOT/../../scripts/lib/graded_surface.py" \
+           "$REPO_ROOT/scripts/lib/graded_surface.py"; do
+    if [ -f "$_gs" ]; then
+        GRADED_SURFACE_SHA="$(
+            "$REAL_PYTHON" "$_gs" "$SOURCE_PROBLEM_DIR" "$REPO_ROOT/src" 2>/dev/null || true
+        )"
+        break
+    fi
+done
+unset _gs
+
 TIMESTAMP="$(date +%Y%m%d_%H%M%S)"
 MODEL_SLUG="$(echo "$MODEL" | tr '/:[] ' '_')"
 RUN_DIR_BASE="${REPO_ROOT}/outputs/runs/${TIMESTAMP}_${HARNESS}_${MODEL_SLUG}_${PROBLEM_NAME}"
@@ -2997,6 +3016,7 @@ cat > "$RUN_DIR/result.json" <<JSON
     "minimum_useful_output_tokens": $MIN_USEFUL_OUTPUT_TOKENS,
     "peak_fraction": $SCORE,
     "template_mutated": $TEMPLATE_MUTATED,
+    "graded_surface_sha": "$GRADED_SURFACE_SHA",
     "elapsed_seconds": $ELAPSED,
     "total_elapsed_seconds": $TOTAL_ELAPSED,
     "check_elapsed_seconds": $CHECK_ELAPSED,
