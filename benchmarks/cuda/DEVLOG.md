@@ -39,21 +39,27 @@ from an earlier, slower reference rather than a live constraint.
 
 **Backfill required.** 15 published 01 cells and 14 published 02 cells were
 scored under the old check. Re-run each archived `solution.py` through the
-current `check.py` with the deck-restoring path:
+current `check.py` in check-only mode, on an idle RTX PRO 6000 (the hardware
+the numbers were produced on):
 
 ```
 cd benchmarks/cuda
-KBH_REGRADE_DECK=problems-rtxpro6000 scripts/regrade_sequential.sh \
-    outputs/runs/<run_id> [<run_id> ...]
+KBH_REGRADE_CHECK_ONLY=1 KBH_REGRADE_DECK=problems-rtxpro6000 \
+    scripts/regrade_sequential.sh $(python3 ../../scripts/check_publish_gates.py --list-stale cuda)
 ```
 
 `regrade_sequential.sh` restores `reference.py sota.py shapes.py problem.yaml
 check.py benchmark.py PROMPT.txt` plus `src/` and the locked project from the
 canonical deck, so the corrected check applies and any agent edit to the graded
-surface is reverted and reported. Run one run at a time on an idle GPU: the
-in-run numbers during concurrent agents are timing-contaminated (standing rule,
-2026-07-19). A cell that now FAILs is withdrawn, not re-run, and gets an
-annotation explaining which shape broke it.
+surface is reverted and reported. `KBH_REGRADE_CHECK_ONLY` matters: without it
+the regrade also replays `benchmark.py` and overwrites `peak_fraction` from the
+fresh timing, so a "re-check" on any other box or thermal state would silently
+re-rank the board. In check-only mode the published timing and `benchmark.log`
+are kept, `graded_surface_sha` is stamped, and a cell that now FAILs has its
+`peak_fraction` voided: it is withdrawn, not re-run, and gets an annotation
+explaining which shape broke it. `--list-stale` enumerates exactly the cells
+publish gate E refuses, so the same command also stamps the cells whose check
+did not change.
 
 ## 2026-07-16 — Pre-debut deck repairs: torch 2.13 init fixes, numeric stress, 03 long-ctx
 
