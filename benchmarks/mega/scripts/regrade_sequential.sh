@@ -156,8 +156,19 @@ for RUN_DIR in "$@"; do
     fi
     WORKSPACE_ROOT="$RUN_DIR/repo"
     PROBLEM_DIR="$WORKSPACE_ROOT/problems/$PROBLEM"
+    THIN=0
     if [ ! -d "$PROBLEM_DIR" ]; then
-        echo "[skip] $RID: archive workspace missing ($PROBLEM_DIR)"; SKIP=$((SKIP+1)); continue
+        if [ -n "${KBH_REGRADE_DECK:-}" ]; then
+            # Thin archive (solution.py, logs, result.json, sidecars; no repo/).
+            # Under KBH_REGRADE_DECK every workspace file is replaced from the
+            # canonical deck anyway, so an empty problem dir is a complete
+            # starting point and the restore loop below fills it.
+            echo "    thin archive: workspace rebuilt from $KBH_REGRADE_DECK"
+            [ "$DRY" = "1" ] || mkdir -p "$PROBLEM_DIR" || exit 3
+            THIN=1
+        else
+            echo "[skip] $RID: archive workspace missing ($PROBLEM_DIR)"; SKIP=$((SKIP+1)); continue
+        fi
     fi
 
     echo "=== $RID ($PROBLEM) ==="
@@ -212,6 +223,13 @@ for RUN_DIR in "$@"; do
     cp "$RUN_DIR/solution.py" "$PROBLEM_DIR/solution.py"
     if [ -d "$RUN_DIR/scratch" ]; then
         cp -r "$RUN_DIR/scratch/." "$PROBLEM_DIR/" 2>/dev/null || true
+    fi
+    if [ "$THIN" = "1" ]; then
+        # Thin archives keep sidecars beside solution.py (loaded via
+        # Path(__file__).parent / "x.cu"); put them where the solution expects.
+        for sc in "$RUN_DIR"/*.cu "$RUN_DIR"/*.cuh "$RUN_DIR"/*.h; do
+            [ -f "$sc" ] && cp -p "$sc" "$PROBLEM_DIR/"
+        done
     fi
     # The archived problem and scratch tree are candidate-controlled. Purge
     # bytecode only after every restore so timestamp-matched pyc files cannot
