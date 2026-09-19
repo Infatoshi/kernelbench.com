@@ -347,3 +347,21 @@ def test_graded_surface_stamp_is_emitted_by_both_graders():
         )
     gate = (REPO / "scripts" / "check_publish_gates.py").read_text()
     assert "graded_surface_sha" in gate, "publish gate E does not read the stamp"
+
+
+def test_regrade_check_only_mode_in_every_copy():
+    """Backfilling a deck correction must not re-time on other hardware.
+
+    Every regrade copy honours KBH_REGRADE_CHECK_ONLY: benchmark.py is skipped,
+    peak_fraction is only voided (never rewritten) and benchmark.log is kept,
+    since the cuda headline is extracted from it downstream. The publish gate
+    feeds the backfill, so it must name the switch and list the stale cells.
+    """
+    for b in BENCHES:
+        text = (REPO / f"benchmarks/{b}/scripts/regrade_sequential.sh").read_text()
+        assert 'CHECK_ONLY="${KBH_REGRADE_CHECK_ONLY:-0}"' in text, b
+        assert '"mode": "check_only"' in text or 'mode="check_only"' in text, b
+        assert 'PARK_LOGS="check"' in text, f"{b}: check-only must keep benchmark.log"
+        assert "benchmark.py skipped" in text, b
+    gate = (REPO / "scripts/check_publish_gates.py").read_text()
+    assert "--list-stale" in gate and "KBH_REGRADE_CHECK_ONLY" in gate

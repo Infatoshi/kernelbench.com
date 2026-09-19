@@ -21,6 +21,14 @@
 #   KBH_REGRADE_GPU=0            GPU index to grade on (default 0)
 #   KBH_REGRADE_ALLOW_BUSY=1     skip the idle-GPU precondition (debug only)
 #   KBH_REGRADE_DRY_RUN=1        show what would run, touch nothing
+#   KBH_REGRADE_CHECK_ONLY=1     replay check.py only and stamp the surface;
+#                                benchmark.py is skipped and the published
+#                                peak_fraction / benchmark.log are kept (or
+#                                peak_fraction voided if the check now fails).
+#                                For a deck-correction backfill, where the
+#                                timing must not move to other hardware or
+#                                thermal state. Provenance lands in `recheck`,
+#                                leaving the timing's own `regrade` record.
 #   KBH_REGRADE_DECK=<dir>       canonical deck root to restore template files
 #                                from, e.g. problems-h100. Grading against the
 #                                deck rather than whatever the workspace holds
@@ -52,6 +60,7 @@ fi
 
 GPU="${KBH_REGRADE_GPU:-0}"
 DRY="${KBH_REGRADE_DRY_RUN:-0}"
+CHECK_ONLY="${KBH_REGRADE_CHECK_ONLY:-0}"
 CHECK_TIMEOUT="${KBH_CHECK_TIMEOUT_SECONDS:-1800}"
 
 # Shared graded-surface digest (scripts/lib/graded_surface.py at the monorepo
@@ -226,7 +235,10 @@ for RUN_DIR in "$@"; do
     # names so every downstream consumer (ms/speedup extraction, viewers) reads
     # single-owner data. Guarded so a second re-grade cannot clobber the true
     # in-session original.
-    for L in check benchmark; do
+    PARK_LOGS="check benchmark"
+    # Check-only keeps benchmark.log: the cuda headline is extracted from it.
+    [ "$CHECK_ONLY" = "1" ] && PARK_LOGS="check"
+    for L in $PARK_LOGS; do
         if [ -f "$RUN_DIR/$L.log" ] && [ ! -f "$RUN_DIR/$L.contended.log" ]; then
             mv "$RUN_DIR/$L.log" "$RUN_DIR/$L.contended.log"
         fi
@@ -246,6 +258,9 @@ for RUN_DIR in "$@"; do
     CPASS_COUNT=$(grep -axc 'PASS' "$CLOG" || true)
     if [ "$CEXIT" -eq 0 ] && [ "$CPASS_COUNT" -eq 1 ]; then
         CORRECT=true
+        if [ "$CHECK_ONLY" = "1" ]; then
+        echo "    check-only: benchmark.py skipped, published timing kept"
+        else
         echo "    benchmark.py..."
         # solution.py ran in the checker and may have written a forged import
         # cache for the next process. Never carry problem bytecode across the
@@ -264,12 +279,13 @@ for RUN_DIR in "$@"; do
             SCORE=null
             echo "    benchmark FAILED (exit $BEXIT, score markers $SCORE_COUNT) -- see $BLOG"
         fi
+        fi
     else
         echo "    check FAILED (exit $CEXIT) -- see $CLOG"
     fi
 
     RID="$RID" CORRECT="$CORRECT" SCORE="$SCORE" CEXIT="$CEXIT" CEL="$CEL" \
-    BEXIT="$BEXIT" BEL="$BEL" GPU="$GPU" \
+    BEXIT="$BEXIT" BEL="$BEL" GPU="$GPU" CHECK_ONLY="$CHECK_ONLY" \
     REGRADE_DECK_PROBLEM_DIR="$GRADE_DECK_DIR" \
     REGRADE_SRC_DIR="$REPO_ROOT/src" \
     REGRADE_GRADED_SURFACE_PY="$GRADED_SURFACE_PY" \
@@ -295,20 +311,30 @@ try:
 except Exception:
     gpu_name = None
 
-r["correct"] = os.environ["CORRECT"] == "true"
-r["peak_fraction"] = num(os.environ["SCORE"])
-r["check_exit_code"] = num(os.environ["CEXIT"])
-r["benchmark_exit_code"] = num(os.environ["BEXIT"])
-r["check_elapsed_seconds"] = num(os.environ["CEL"])
-r["benchmark_elapsed_seconds"] = num(os.environ["BEL"])
-r["regrade"] = {
+check_only = os.environ.get("CHECK_ONLY") == "1"
+provenance = {
     "at": subprocess.check_output(["date", "-Is"], text=True).strip(),
     "host": socket.gethostname(),
     "gpu_index": int(os.environ["GPU"]),
     "gpu_name": gpu_name,
-    "mode": "sequential_isolated",
-    "contended": contended,
 }
+r["correct"] = os.environ["CORRECT"] == "true"
+r["check_exit_code"] = num(os.environ["CEXIT"])
+r["check_elapsed_seconds"] = num(os.environ["CEL"])
+if check_only:
+    # Check-only replay: the published timing stands unless the corrected
+    # check now rejects the kernel, in which case there is no valid number.
+    # The timing's own `regrade` record is left intact; this pass gets its own.
+    if not r["correct"]:
+        r["peak_fraction"] = None
+    r["recheck"] = dict(provenance, mode="check_only", prior={
+        k: contended[k] for k in (
+            "correct", "peak_fraction", "check_exit_code", "check_elapsed_seconds")})
+else:
+    r["peak_fraction"] = num(os.environ["SCORE"])
+    r["benchmark_exit_code"] = num(os.environ["BEXIT"])
+    r["benchmark_elapsed_seconds"] = num(os.environ["BEL"])
+    r["regrade"] = dict(provenance, mode="sequential_isolated", contended=contended)
 
 # Stamp the surface this re-grade actually used, via the shared digest module
 # (same implementation the runner and the publish gate call). A re-grade under
@@ -336,7 +362,8 @@ old, new = contended["peak_fraction"], r["peak_fraction"]
 delta = ""
 if isinstance(old, (int, float)) and isinstance(new, (int, float)) and old:
     delta = "  (%+.1f%%)" % ((new - old) / old * 100)
-print("    correct=%s  peak %s -> %s%s" % (r["correct"], old, new, delta))
+print("    correct=%s  peak %s -> %s%s%s" % (
+    r["correct"], old, new, delta, "  [check-only]" if check_only else ""))
 PY
 
     # uv run recreates repo/.venv during regrade; drop it again so archives stay thin.

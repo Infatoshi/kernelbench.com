@@ -179,19 +179,12 @@ def gate_tracked(fail: list[str]) -> None:
         fail.append(f"[D tracked] {f} is not git-tracked; models.json ships it as unaudited. `git add` it and rerun kb publish.")
 
 
-def gate_graded_surface(fail: list[str]) -> None:
-    """E: every published cell must carry the stamp of the deck that graded it.
+def stale_cells() -> list[tuple[str, str, str, Path]]:
+    """Every published hard/cuda cell whose stamp is missing or not the current deck.
 
-    A cell whose `graded_surface_sha` is missing or does not match the current
-    deck was scored by a different surface than the one shipping now, so its
-    number no longer means what the board says. This is how a widened check.py
-    used to be able to ship while the board kept serving older numbers.
-
-    Kill switch: KBH_GATE_GRADED_SURFACE=0. Set it ONLY while backfilling a
-    board whose cells predate the stamp; leaving it off defeats the gate.
+    Shared by gate E and `--list-stale`, so the backfill regrades exactly the set
+    the gate would refuse, nothing enumerated a second way.
     """
-    if os.environ.get("KBH_GATE_GRADED_SURFACE", "1") == "0":
-        return
     sys.path.insert(0, str(REPO / "scripts" / "lib"))
     import graded_surface  # noqa: E402
 
@@ -203,7 +196,7 @@ def gate_graded_surface(fail: list[str]) -> None:
         ("cuda", REPO / "benchmarks/cuda/results/leaderboard.json",
          REPO / "benchmarks/cuda/problems-rtxpro6000", REPO / "benchmarks/cuda/outputs/runs"),
     ]
-    stale: dict[str, list[str]] = {}
+    out: list[tuple[str, str, str, Path]] = []
     for bench, lb_path, deck_root, runs_root in boards:
         if not lb_path.exists():
             continue
@@ -232,20 +225,47 @@ def gate_graded_surface(fail: list[str]) -> None:
                 except (OSError, json.JSONDecodeError):
                     continue
                 if got != expect[prob]:
-                    stale.setdefault(bench, []).append(f"{rid} ({prob})")
+                    out.append((bench, rid, prob, runs_root / rid))
+    return out
+
+
+def gate_graded_surface(fail: list[str]) -> None:
+    """E: every published cell must carry the stamp of the deck that graded it.
+
+    A cell whose `graded_surface_sha` is missing or does not match the current
+    deck was scored by a different surface than the one shipping now, so its
+    number no longer means what the board says. This is how a widened check.py
+    used to be able to ship while the board kept serving older numbers.
+
+    Kill switch: KBH_GATE_GRADED_SURFACE=0. Set it ONLY while backfilling a
+    board whose cells predate the stamp; leaving it off defeats the gate.
+    """
+    if os.environ.get("KBH_GATE_GRADED_SURFACE", "1") == "0":
+        return
+    stale: dict[str, list[str]] = {}
+    for bench, rid, prob, _ in stale_cells():
+        stale.setdefault(bench, []).append(f"{rid} ({prob})")
     for bench, cells in stale.items():
         shown = ", ".join(sorted(cells)[:5])
         more = f" (+{len(cells) - 5} more)" if len(cells) > 5 else ""
         fail.append(
             f"[E graded surface] {bench}: {len(cells)} published cell(s) were graded by a "
             f"different deck than the one shipping now: {shown}{more}. Re-grade them "
-            f"(`scripts/regrade_sequential.sh` with KBH_REGRADE_DECK), which stamps the "
+            f"(`scripts/regrade_sequential.sh` with KBH_REGRADE_DECK and KBH_REGRADE_CHECK_ONLY=1; `--list-stale <bench>` prints the run dirs), which stamps the "
             f"current surface, or withdraw them. Do not grandfather by editing generated "
             f"files. Set KBH_GATE_GRADED_SURFACE=0 only while a backfill is in flight."
         )
 
 
 def main() -> int:
+    if len(sys.argv) >= 2 and sys.argv[1] == "--list-stale":
+        # Backfill feed: one run dir per line, relative to the bench root, so
+        # `scripts/regrade_sequential.sh $(...)` in that bench consumes it as is.
+        want = set(sys.argv[2:]) or {"hard", "cuda"}
+        for bench, _, _, run_dir in stale_cells():
+            if bench in want:
+                print(run_dir.relative_to(REPO / "benchmarks" / bench))
+        return 0
     fail: list[str] = []
     gate_roster(fail)
     gate_mega_marker(fail)
