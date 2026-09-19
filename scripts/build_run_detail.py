@@ -193,7 +193,11 @@ def build_cell(
         cu, mu = s.get("compute_util", 0), s.get("mem_util", 0)
         if cu or mu:
             s["bound"] = "compute" if cu >= mu else "memory"
-            s["util"] = max(cu, mu)
+            # Unclamped, a kernel that skips inactive work (sparse MoE at T=1)
+            # reports >2000% of HBM and the run page prints it verbatim. The
+            # ratio against a dense-equivalent bytes_formula is not a bound, so
+            # cap the display value; `frac` stays the graded number.
+            s["util"] = min(max(cu, mu), 1.0)
 
     usage = result.get("usage") or {}
     detail = {
@@ -209,7 +213,12 @@ def build_cell(
         "peak_bw_gb_s": bw,
         "correct": result.get("correct", cell.get("correct")),
         "failure_reason": result.get("failure_reason"),
-        "peak_fraction": result.get("peak_fraction", cell.get("peak_fraction")),
+        # Prefer the board cell's score: the leaderboard builder applies
+        # _rescale_pf for pre-2026-06-14 compute-regime runs, and reading the
+        # raw archive here made rundetail (0.138) contradict the board (0.0552)
+        # while the page blamed "repeated isolated re-benchmark passes".
+        "peak_fraction": cell.get("peak_fraction", result.get("peak_fraction")),
+        "peak_fraction_raw": result.get("peak_fraction"),
         "annotation_verdict": cell.get("annotation_verdict"),
         "stats": {
             "agent_s": result.get("elapsed_seconds"),
