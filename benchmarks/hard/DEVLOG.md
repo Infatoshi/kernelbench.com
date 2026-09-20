@@ -4,6 +4,58 @@ A running record of decisions, dead ends, and lessons. Newest entries on top. Th
 
 ---
 
+## 2026-09-20 — graded-surface backfill: 97 cells re-checked against today's deck, 17 withdrawn
+
+Publish gate E (PR #12) refuses any board cell whose `result.json` lacks the
+digest of the deck plus `src/` that graded it. None of the 97 RTX PRO 6000
+cells had one, so every cell was replayed through the current `check.py`
+with `KBH_REGRADE_CHECK_ONLY=1 KBH_REGRADE_DECK=problems-rtxpro6000` on tetra
+(RTX PRO 6000 Blackwell Workstation, one process per GPU, `benchmark.py`
+skipped, `peak_fraction` and `benchmark.log` untouched). A pass stamps the
+cell; a fail voids the timing and the cell is withdrawn, never re-timed.
+
+**Result: 78 pass, 17 withdrawn, 2 were already incorrect and stay so.**
+Every withdrawal is a property-stress case from the 2026-08-07 hardening
+(`src/eval/property_stress.py`), all on the canonical seed-independent
+example, and each reproduces under two host toolchains (clang 21, then gcc
+15 with nvcc in C++20 mode):
+
+- `02_kda_cutlass`, `KDALongMemoryCase` (8 chunks, 800% q/v scale, decay
+  3000 micro-units): Opus 4.8, GPT-5.6, Fable 5, DeepSeek V4 Flash, Qwen 3.8
+  Max, GLM 5.3, ox-alpha. Overflow to 1e5..1e24 on the long-memory path.
+- `06_sonic_moe_swiglu`, `SonicRaggedMixedCase` (one expert donates 129
+  rows, 64-row prefix, 8x suffix scale): Opus 4.8, GLM 5.2, MiniMax M3, Grok
+  4.5, GPT-5.6, DeepSeek V4 Flash, Grok 4.6, DeepSeek V4 Pro, GLM 5.3. Nine
+  of sixteen published 06 cells; the ragged-row path is where the shortcut
+  lives, not one model's bug.
+- `03_paged_attention`, `PagedShortSequenceCase` (1-row tail in a 16-row
+  page): GPT-5.6 returns NaN. That was the 0.5655 cell.
+
+Why they stood: the 2026-06 to 2026-07 cells predate the property checks;
+the 2026-08-22 cells (GLM 5.3, ox-alpha) were graded by a worker whose
+`src/` never ran them (`PROPERTY_SEED` absent from the archived check.log).
+The stamp is what makes that visible now.
+
+Not a verdict on the kernel, fixed before any cell was voided for it:
+
+- torch 2.11's `ATen/core/List_inl.h:202` does not compile under tetra's
+  nvcc 13.3 with gcc 14 or 15 in C++17 mode ("need typename before
+  decltype"). clang 21 builds it but mangles `enable_if` NTTPs unlike the
+  gcc-built libtorch (undefined `const_data_ptr<float>` on import; GLM 5.3
+  topk was the casualty). `NVCC_APPEND_FLAGS=-std=c++20` with plain gcc is
+  the working combination and is what the final verdicts come from.
+- An archived `cache/torch_extensions/*.so` from another box is an ABI
+  gamble; check-only now builds into `cache/torch_extensions_recheck`.
+- 20 thin archives (no `repo/`) are rebuilt from the canonical deck.
+- The qwen `01_fp8_gemm` cell is a symlink into `runs-brev-kbcm-rtx`; an
+  rsync pull replaced it with a directory and it was restored by hand.
+  Pull with an explicit file list, never `--include='*/'`.
+
+Provenance lands in `recheck` (host, GPU, mode, prior values) beside the
+timing's own `regrade` record. Annotations for the 17 carry `verdict: fail`
+and a `withdrawn:` block naming the case, the diff and the seed.
+
+
 ## 2026-09-10 — DeepSeek V4.1 Flash sweep box (kb-ds41)
 
 DeepSeek shipped V4.1 Flash as `deepseek-flash` (1M ctx, 384k out, thinking default, $0.30/$1.20 per M peak). Sweep runs through `deepseek-claude deepseek-flash` (first-party Anthropic-compatible endpoint, same route as the V4 Pro rows). Box: Verda `kb-ds41` (default profile, id ed2abdee-bd4e-4d44-928a-2c3c956b2d24, 31.22.104.88, FIN-03, `1RTXPRO6000.30V.CC` spot at 0.96 EUR/h, image 24.04.cuda13.1, driver 595.71). Brev was out of credits and Lambda has no RTX PRO 6000 type; the only single-GPU RTX PRO in stock anywhere was this CC spot SKU. Spot can be preempted: the queue (`~/queue.sh`, log `~/queue.log`) stashes each finished run into `~/pulled/<bench>/`, so a relaunch resumes from the next cell. Order: mega 02, cuda 01-04, hard 01/02/03/05/06/07. Also this day: a 4x RTX PRO Brev box (`glm53-nvfp4-marlin`, idle 14 days) was deleted on the user's word. Trap recorded in the harness: from 2026-09-14 DeepSeek serves `deepseek-v4-pro` as V4.1 Flash. Two box quirks worth keeping: (1) the CC SKU boots with `CC State: ON` and CUDA returns error 802 "system not yet initialized" until the guest runs `nvidia-smi conf-compute -srs 1` (pipeline.sh does it at start; persistenced is active). (2) On the 24.04.cuda13.1 image, bare `nvcc x.cu` fails with "declaration of double rsqrt(double) has a different exception specifier" (CUDA 13.1 `math_functions.h` line 629 has `noexcept (true)`, the host-only `__func__` definition at 6046 does not, gcc 13 rejects it). Torch cpp_extension passes because it adds `-isystem /usr/local/cuda/include`, which mutes the diagnostic; the box exports `NVCC_PREPEND_FLAGS="-isystem /usr/local/cuda/include"` (/etc/environment, ~/.bashrc, pipeline.sh) so the agent's own nvcc calls work too. Whether CC mode moves on-device kernel timings is unmeasured; the regrade numbers carry that caveat.
