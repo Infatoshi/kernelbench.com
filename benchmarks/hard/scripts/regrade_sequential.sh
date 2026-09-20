@@ -241,6 +241,12 @@ for RUN_DIR in "$@"; do
     # Same isolated caches the original run used, so a compiled extension
     # resolves the way it did in-session.
     export TORCH_EXTENSIONS_DIR="$RUN_DIR/cache/torch_extensions"
+    # Check-only is a deck-correction backfill and may run on a different box
+    # than the one that graded the cell. A prebuilt extension .so in the
+    # archived cache is then an ABI gamble (2026-09-20: a GLM 5.3 topk cell
+    # imported the 08-22 box's .so and died on an undefined torch symbol), so
+    # rebuild from the archived source instead. The original cache is kept.
+    [ "$CHECK_ONLY" = "1" ] && export TORCH_EXTENSIONS_DIR="$RUN_DIR/cache/torch_extensions_recheck"
     export TRITON_CACHE_DIR="$RUN_DIR/cache/triton"
     export CUDA_CACHE_PATH="$RUN_DIR/cache/cuda"
     export TMPDIR="$RUN_DIR/tmp" TEMP="$RUN_DIR/tmp" TMP="$RUN_DIR/tmp"
