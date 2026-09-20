@@ -1,5 +1,30 @@
 # KernelBench-CUDA — DEVLOG
 
+## 2026-09-20 — graded-surface backfill: 59 cells re-checked at the graded shapes, none withdrawn
+
+Publish gate E (PR #12) needs every board cell stamped with the digest of
+the deck plus `src/` that graded it. All 59 RTX PRO 6000 cells were
+replayed check-only on tetra (`KBH_REGRADE_CHECK_ONLY=1
+KBH_REGRADE_DECK=problems-rtxpro6000`, one process on GPU 0, `benchmark.py`
+skipped, timing and `benchmark.log` untouched). This is also the backfill
+PR #11 demands: the 15 published `01_glm52_fused_moe` and 14
+`02_deepseek_nsa` cells now carry a pass under the widened `check.py` (all
+six graded shapes, D = 128 and S = 8191 included).
+
+**Result: 58 pass, 0 withdrawn, 1 already-incorrect cell (Qwen 3.8 Max 02)
+still fails to build on its own `atomicAdd` overloads.** No published cuda
+number changes.
+
+One false start, caught before it became a verdict: `benchmarks/cuda/uv.lock`
+was gitignored, so the "locked project environment" the regrade restores was
+whatever the box had resolved. tetra had torch 2.14.0; every one of the 42
+archived workspaces was graded under 2.13.0, and under 2.14 the DeepSeek V4.1
+Flash 01 cell fails to build ("C++20 or later compatible compiler is required
+to use ATen", the solution passes `-std=c++17`). The lock is tracked now (PR
+#12) and that cell passes under it. Thin archives (17 of 59, no `repo/`) are
+rebuilt from the canonical deck. Provenance is in `recheck` beside the
+timing's `regrade` record.
+
 ## 2026-07-16 — Pre-debut deck repairs: torch 2.13 init fixes, numeric stress, 03 long-ctx
 
 Caught by the Grok 4.5 cell audits before the first publish (legal because the
