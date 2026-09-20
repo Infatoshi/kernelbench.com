@@ -342,19 +342,23 @@ provenance = {
     "gpu_index": int(os.environ["GPU"]),
     "gpu_name": gpu_name,
 }
-r["correct"] = os.environ["CORRECT"] == "true"
+check_passed = os.environ["CORRECT"] == "true"
 r["check_exit_code"] = num(os.environ["CEXIT"])
 r["check_elapsed_seconds"] = num(os.environ["CEL"])
 if check_only:
-    # Check-only replay: the published timing stands unless the corrected
-    # check now rejects the kernel, in which case there is no valid number.
-    # The timing's own `regrade` record is left intact; this pass gets its own.
+    # Check-only replay certifies an existing number; it never creates one.
+    # A cell that was incorrect stays incorrect even if the current check
+    # passes (it has no timing to certify), and a cell that was correct is
+    # voided if the corrected check rejects it. The timing's own `regrade`
+    # record is left intact; this pass gets its own, with the raw outcome.
+    r["correct"] = bool(contended["correct"]) and check_passed
     if not r["correct"]:
         r["peak_fraction"] = None
-    r["recheck"] = dict(provenance, mode="check_only", prior={
+    r["recheck"] = dict(provenance, mode="check_only", check_passed=check_passed, prior={
         k: contended[k] for k in (
             "correct", "peak_fraction", "check_exit_code", "check_elapsed_seconds")})
 else:
+    r["correct"] = check_passed
     r["peak_fraction"] = num(os.environ["SCORE"])
     r["benchmark_exit_code"] = num(os.environ["BEXIT"])
     r["benchmark_elapsed_seconds"] = num(os.environ["BEL"])
