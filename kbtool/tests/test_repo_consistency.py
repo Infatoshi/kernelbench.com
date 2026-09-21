@@ -287,3 +287,81 @@ def test_top_level_tree_stays_closed():
     assert not banned, f"deleted path came back: {banned}"
     cli = (REPO / "kbtool/kb/cli.py").read_text()
     assert "build_catalog.py" in cli, "kb publish no longer rebuilds catalog.json"
+
+
+def test_graded_surface_digest_is_shared_and_importable():
+    """One digest implementation, three callers.
+
+    A published number is only meaningful if the gate can recompute the stamp
+    the grader wrote. If any caller grew its own copy of the hashing, a
+    widened check.py could ship without the gate noticing -- which is the
+    failure this whole mechanism exists to prevent.
+    """
+    import importlib.util
+
+    mod_path = REPO / "scripts" / "lib" / "graded_surface.py"
+    assert mod_path.is_file(), "scripts/lib/graded_surface.py is missing"
+    spec = importlib.util.spec_from_file_location("graded_surface", mod_path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+
+    # Stability: same inputs, same digest.
+    deck = REPO / "benchmarks" / "cuda" / "problems-rtxpro6000" / "01_glm52_fused_moe"
+    src = REPO / "benchmarks" / "cuda" / "src"
+    if deck.is_dir() and src.is_dir():
+        first = mod.graded_surface_digest(deck, src)
+        assert first == mod.graded_surface_digest(deck, src)
+        # Discrimination: a different problem must not collide.
+        other = REPO / "benchmarks" / "cuda" / "problems-rtxpro6000" / "02_deepseek_nsa"
+        if other.is_dir():
+            assert first != mod.graded_surface_digest(other, src)
+
+    # Every emitter and the gate must reference the shared module rather than
+    # reimplementing the hash.
+    # ALL FOUR regrade copies, not just hard's: they are separate files that
+    # have already diverged once, and a cell graded through any of them must
+    # still carry a stamp or publish gate E cannot see it.
+    callers = {
+        "scripts/lib/run_harness.sh": "graded_surface.py",
+        "scripts/check_publish_gates.py": "graded_surface",
+    }
+    for bench in BENCHES:
+        callers[f"benchmarks/{bench}/scripts/regrade_sequential.sh"] = "graded_surface.py"
+    for rel, needle in callers.items():
+        text = (REPO / rel).read_text()
+        assert needle in text, f"{rel} must call the shared digest ({needle})"
+        assert "sha256" not in text or "graded_surface" in text, (
+            f"{rel} looks like it reimplements hashing instead of delegating"
+        )
+
+
+def test_graded_surface_stamp_is_emitted_by_both_graders():
+    """Both paths that can produce a published number must write the stamp."""
+    emitters = ["scripts/lib/run_harness.sh"]
+    emitters += [f"benchmarks/{b}/scripts/regrade_sequential.sh" for b in BENCHES]
+    for rel in emitters:
+        text = (REPO / rel).read_text()
+        assert "graded_surface_sha" in text, (
+            f"{rel} does not emit graded_surface_sha; cells it grades would be "
+            f"refused by publish gate E"
+        )
+    gate = (REPO / "scripts" / "check_publish_gates.py").read_text()
+    assert "graded_surface_sha" in gate, "publish gate E does not read the stamp"
+
+
+def test_regrade_check_only_mode_in_every_copy():
+    """Backfilling a deck correction must not re-time on other hardware.
+
+    Every regrade copy honours KBH_REGRADE_CHECK_ONLY: benchmark.py is skipped,
+    peak_fraction is only voided (never rewritten) and benchmark.log is kept,
+    since the cuda headline is extracted from it downstream. The publish gate
+    feeds the backfill, so it must name the switch and list the stale cells.
+    """
+    for b in BENCHES:
+        text = (REPO / f"benchmarks/{b}/scripts/regrade_sequential.sh").read_text()
+        assert 'CHECK_ONLY="${KBH_REGRADE_CHECK_ONLY:-0}"' in text, b
+        assert '"mode": "check_only"' in text or 'mode="check_only"' in text, b
+        assert 'PARK_LOGS="check"' in text, f"{b}: check-only must keep benchmark.log"
+        assert "benchmark.py skipped" in text, b
+    gate = (REPO / "scripts/check_publish_gates.py").read_text()
+    assert "--list-stale" in gate and "KBH_REGRADE_CHECK_ONLY" in gate
