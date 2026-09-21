@@ -1,29 +1,55 @@
 # KernelBench-CUDA — DEVLOG
 
-## 2026-09-20 — graded-surface backfill: 59 cells re-checked at the graded shapes, none withdrawn
+## 2026-09-21 — graded-surface backfill: 59 cells stamped, 30 re-checked at the graded shapes, 7 withdrawn
 
 Publish gate E (PR #12) needs every board cell stamped with the digest of
-the deck plus `src/` that graded it. All 59 RTX PRO 6000 cells were
-replayed check-only on tetra (`KBH_REGRADE_CHECK_ONLY=1
-KBH_REGRADE_DECK=problems-rtxpro6000`, one process on GPU 0, `benchmark.py`
-skipped, timing and `benchmark.log` untouched). This is also the backfill
-PR #11 demands: the 15 published `01_glm52_fused_moe` and 14
-`02_deepseek_nsa` cells now carry a pass under the widened `check.py` (all
-six graded shapes, D = 128 and S = 8191 included).
+the deck plus `src/` that graded it. Two passes on tetra (RTX PRO 6000
+Blackwell), both `KBH_REGRADE_CHECK_ONLY=1 KBH_REGRADE_DECK=problems-rtxpro6000`:
+`benchmark.py` skipped, timing and `benchmark.log` untouched, provenance in
+`recheck` beside the timing's `regrade` record.
 
-**Result: 58 pass, 0 withdrawn, 1 already-incorrect cell (Qwen 3.8 Max 02)
-still fails to build on its own `atomicAdd` overloads.** No published cuda
-number changes.
+1. 2026-09-20, all 59 cells against the deck *before* PR #11: 58 pass, 1
+   already-incorrect cell (Qwen 3.8 Max 02) still fails to build on its own
+   `atomicAdd` overloads. That pass stamped the 29 cells of 03 and 04 for
+   good; for 01 and 02 it only proved the old narrow check still held.
+2. 2026-09-21, after PR #11 merged and re-digested 01 and 02: the 30
+   published 01/02 cells re-checked at every graded shape (01 at T = 4096,
+   4127, 1, 8192, 512, 1000 with three seeds; 02 at all six shapes including
+   S = 8191, D = 128). **22 pass, 7 withdrawn, 1 already incorrect.**
 
-One false start, caught before it became a verdict: `benchmarks/cuda/uv.lock`
-was gitignored, so the "locked project environment" the regrade restores was
-whatever the box had resolved. tetra had torch 2.14.0; every one of the 42
-archived workspaces was graded under 2.13.0, and under 2.14 the DeepSeek V4.1
-Flash 01 cell fails to build ("C++20 or later compatible compiler is required
-to use ATen", the solution passes `-std=c++17`). The lock is tracked now (PR
-#12) and that cell passes under it. Thin archives (17 of 59, no `repo/`) are
-rebuilt from the canonical deck. Provenance is in `recheck` beside the
-timing's `regrade` record.
+The seven withdrawals are three different things and the annotations say
+which:
+
+- **Wrong at long context (1):** DeepSeek V4 Flash 02, nominal case at
+  S = 2048: 96,577 bad of 2,097,152, max_abs_diff 0.64, first bad row 2007.
+  The old check stopped at S = 384.
+- **One element over tolerance (2):** Opus 5 01 (1 of 16,777,216, diff 3.0
+  vs atol 1.5, `large_hidden` at T = 4096, seed 456) and Opus 5 02 (1 of
+  2,097,152, diff 0.000554 vs atol 0.0005, `small_qkv` at S = 2048). The
+  1.0367 headline cell is the second one. Tolerance calibration at long
+  sequence, not a wrong kernel; withdrawn because the deck says so.
+- **Identical signature across four kernels (4):** Grok 4.5, Grok 4.6, Fable
+  5.1 (the 1.0627 cell) and GPT-6 Astra Pro on 02, shape 3 (S = 8191,
+  D = 128), `large_qkv`: every one fails with 126 bad of 8,387,584,
+  max_abs_diff 28.75, worst index (0, 6, 4835, 33). Different code (66-line
+  Triton plus a .cu, 534-line CUDA, ...) does not produce identical error
+  statistics by accident. D = 128 was never verified before PR #11 and the
+  widened check shipped without a kernel known to pass it; the likely
+  explanation is a block-selection tie or boundary rule the reference
+  resolves one way and these four the other. Withdrawn per the deck as
+  shipping. **Open deck decision:** validate the reference at D = 128
+  against a known-good kernel before treating these as kernel bugs.
+
+No published timing was rerun. False starts, none of which became a
+verdict: `benchmarks/cuda/uv.lock` was gitignored, so the "locked
+environment" the regrade restores was box-dependent (tetra had torch 2.14;
+every archive was graded under 2.13; the DeepSeek V4.1 Flash 01 cell fails
+to build under 2.14 with "C++20 or later compatible compiler is required to
+use ATen"); it is tracked now. One cell (Grok 4.5 01) was voided by a CUDA
+OOM when a co-tenant on GPU 0 grew to 64 GB; reset and re-checked clean.
+The 2026-09-20 entry's claim that the 01/02 cells passed the widened check
+was wrong (the deck on the box predated #11) and is superseded by this one.
+Thin archives (17 of 59, no `repo/`) are rebuilt from the canonical deck.
 
 ## 2026-09-17 — check 01/02 at the shapes they are graded on (deck correction, cells stale)
 
