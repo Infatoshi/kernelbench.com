@@ -52,7 +52,26 @@ LOCAL_INSTRUCTION_MARKERS = (
 PEM_RE = re.compile(r"-----BEGIN (?:[A-Z0-9]+ )*PRIVATE KEY-----.*?(?:-----END (?:[A-Z0-9]+ )*PRIVATE KEY-----|\Z)", re.S)
 URL_AUTH_RE = re.compile(r"\b[a-z][a-z0-9+.-]*://[^\s/@]+(?::[^\s/@]*)?@", re.I)
 EMAIL_RE = re.compile(r"(?<![\w.+-])[\w.+-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+")
-HOME_RE = re.compile(r"(?<![\w])(?:/(?:Users|home)/[^/\s\"'<>:]+|/root)(?=/|\b)")
+# Home paths must be matched after a flag too: `-L/home/user/...` (a linker -L
+# path) slipped through the old `(?<![\w])` because `L` is a word char, and that
+# exact string was live in a published transcript viewer. Anchor on a token
+# boundary or a short flag instead, so `foo/home/x` and `see:homepage` stay clear.
+_HOME_PATH = r"(?:/(?:Users|home)/[^/\s\"'<>:]+|/root)(?=/|\b)"
+HOME_RE = re.compile(
+    r"(?:"
+    + "|".join(
+        [
+            r"(?<=^)",
+            r"(?<=[\s\"'`=(:,])",
+            r"(?<=-[\w])",
+            r"(?<=-[\w][\w])",
+            r"(?<=-[\w][\w][\w])",
+            r"(?<=-[\w][\w][\w][\w])",
+        ]
+    )
+    + r")"
+    + _HOME_PATH
+)
 IPV4_RE = re.compile(r"(?<![\w.])(?:\d{1,3}\.){3}\d{1,3}(?![\w.])")
 IPV6_RE = re.compile(r"(?<![\w:])(?:[0-9a-fA-F]{0,4}:){2,}[0-9a-fA-F:.]*(?![\w:])")
 # A file dump containing these paths can expose personal configuration beyond tokens.
