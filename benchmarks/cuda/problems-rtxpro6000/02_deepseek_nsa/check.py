@@ -26,6 +26,7 @@ from src.eval.numeric_stress import (  # noqa: E402
 def main():
     try:
         import reference
+        import shapes
         import solution
     except Exception as e:
         print(f"FAIL: import error: {e}")
@@ -53,11 +54,15 @@ def main():
     device = torch.device("cuda:0")
     tol = meta.get("tolerance") or {"bfloat16": 0.1}
 
-    # Cheap correctness shapes (full deck is for benchmark).
-    check_shapes = [
-        {"B": 1, "H": 4, "S": 256, "D": 64},
-        {"B": 1, "H": 2, "S": 384, "D": 64},
-    ]
+    # Check at the GRADED shapes, not a cheap subset. These two used to be
+    # hardcoded at S=256/384 with D=64 only, which meant: (a) D=128 was never
+    # verified anywhere, and (b) every block was selected at both sizes, so the
+    # block-selection path that IS the op at long context was never exercised.
+    # No benchmark.py compares outputs, so the graded number rested on shapes
+    # the benchmark never times. Use each graded shape at one seed; the
+    # reference is fp32 and cheap relative to the 1800s check budget.
+    check_shapes = [dict(s) for s in shapes.SHAPES]
+    check_seeds = (42,)
     for shape_idx, shape in enumerate(check_shapes):
         reference.B = shape["B"]
         reference.H = shape["H"]
@@ -72,7 +77,7 @@ def main():
             print(f"FAIL: state_dict mismatch: {e}")
             sys.exit(1)
 
-        for seed in (42, 123):
+        for seed in check_seeds:
             torch.manual_seed(seed)
             torch.cuda.manual_seed_all(seed)
             base_inputs = [t.to(device) for t in reference.get_inputs()]
