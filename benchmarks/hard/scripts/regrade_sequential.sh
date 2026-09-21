@@ -21,6 +21,14 @@
 #   KBH_REGRADE_GPU=0            GPU index to grade on (default 0)
 #   KBH_REGRADE_ALLOW_BUSY=1     skip the idle-GPU precondition (debug only)
 #   KBH_REGRADE_DRY_RUN=1        show what would run, touch nothing
+#   KBH_REGRADE_CHECK_ONLY=1     replay check.py only and stamp the surface;
+#                                benchmark.py is skipped and the published
+#                                peak_fraction / benchmark.log are kept (or
+#                                peak_fraction voided if the check now fails).
+#                                For a deck-correction backfill, where the
+#                                timing must not move to other hardware or
+#                                thermal state. Provenance lands in `recheck`,
+#                                leaving the timing's own `regrade` record.
 #   KBH_REGRADE_DECK=<dir>       canonical deck root to restore template files
 #                                from, e.g. problems-h100. Grading against the
 #                                deck rather than whatever the workspace holds
@@ -52,7 +60,18 @@ fi
 
 GPU="${KBH_REGRADE_GPU:-0}"
 DRY="${KBH_REGRADE_DRY_RUN:-0}"
+CHECK_ONLY="${KBH_REGRADE_CHECK_ONLY:-0}"
 CHECK_TIMEOUT="${KBH_CHECK_TIMEOUT_SECONDS:-1800}"
+
+# Shared graded-surface digest (scripts/lib/graded_surface.py at the monorepo
+# root, or shipped into the bench dir on a thin-synced worker). Resolved with
+# the same two-path fallback the runner uses.
+GRADED_SURFACE_PY=""
+for _gs in "$REPO_ROOT/../../scripts/lib/graded_surface.py" \
+           "$REPO_ROOT/scripts/lib/graded_surface.py"; do
+    [ -f "$_gs" ] && { GRADED_SURFACE_PY="$_gs"; break; }
+done
+unset _gs
 
 KBH_CUDA_HOME="${KBH_CUDA_HOME:-/usr/local/cuda-13}"
 [ -d "$KBH_CUDA_HOME" ] && export CUDA_HOME="$KBH_CUDA_HOME"
@@ -128,10 +147,28 @@ for RUN_DIR in "$@"; do
     fi
 
     PROBLEM=$(python3 -c "import json,sys;print(json.load(open(sys.argv[1]))['problem'])" "$RUN_DIR/result.json")
+    # The surface that will actually grade: the canonical deck when we restore
+    # from one, otherwise whatever the archived workspace holds.
+    if [ -n "${KBH_REGRADE_DECK:-}" ]; then
+        GRADE_DECK_DIR="$REPO_ROOT/$KBH_REGRADE_DECK/$PROBLEM"
+    else
+        GRADE_DECK_DIR="$RUN_DIR/repo/problems/$PROBLEM"
+    fi
     WORKSPACE_ROOT="$RUN_DIR/repo"
     PROBLEM_DIR="$WORKSPACE_ROOT/problems/$PROBLEM"
+    THIN=0
     if [ ! -d "$PROBLEM_DIR" ]; then
-        echo "[skip] $RID: archive workspace missing ($PROBLEM_DIR)"; SKIP=$((SKIP+1)); continue
+        if [ -n "${KBH_REGRADE_DECK:-}" ]; then
+            # Thin archive (solution.py, logs, result.json, sidecars; no repo/).
+            # Under KBH_REGRADE_DECK every workspace file is replaced from the
+            # canonical deck anyway, so an empty problem dir is a complete
+            # starting point and the restore loop below fills it.
+            echo "    thin archive: workspace rebuilt from $KBH_REGRADE_DECK"
+            [ "$DRY" = "1" ] || mkdir -p "$PROBLEM_DIR" || exit 3
+            THIN=1
+        else
+            echo "[skip] $RID: archive workspace missing ($PROBLEM_DIR)"; SKIP=$((SKIP+1)); continue
+        fi
     fi
 
     echo "=== $RID ($PROBLEM) ==="
@@ -187,6 +224,13 @@ for RUN_DIR in "$@"; do
     if [ -d "$RUN_DIR/scratch" ]; then
         cp -r "$RUN_DIR/scratch/." "$PROBLEM_DIR/" 2>/dev/null || true
     fi
+    if [ "$THIN" = "1" ]; then
+        # Thin archives keep sidecars beside solution.py (loaded via
+        # Path(__file__).parent / "x.cu"); put them where the solution expects.
+        for sc in "$RUN_DIR"/*.cu "$RUN_DIR"/*.cuh "$RUN_DIR"/*.h; do
+            [ -f "$sc" ] && cp -p "$sc" "$PROBLEM_DIR/"
+        done
+    fi
     # The archived problem and scratch tree are candidate-controlled. Purge
     # bytecode only after every restore so timestamp-matched pyc files cannot
     # shadow the canonical checker, benchmark, reference, or helper sources.
@@ -197,6 +241,12 @@ for RUN_DIR in "$@"; do
     # Same isolated caches the original run used, so a compiled extension
     # resolves the way it did in-session.
     export TORCH_EXTENSIONS_DIR="$RUN_DIR/cache/torch_extensions"
+    # Check-only is a deck-correction backfill and may run on a different box
+    # than the one that graded the cell. A prebuilt extension .so in the
+    # archived cache is then an ABI gamble (2026-09-20: a GLM 5.3 topk cell
+    # imported the 08-22 box's .so and died on an undefined torch symbol), so
+    # rebuild from the archived source instead. The original cache is kept.
+    [ "$CHECK_ONLY" = "1" ] && export TORCH_EXTENSIONS_DIR="$RUN_DIR/cache/torch_extensions_recheck"
     export TRITON_CACHE_DIR="$RUN_DIR/cache/triton"
     export CUDA_CACHE_PATH="$RUN_DIR/cache/cuda"
     export TMPDIR="$RUN_DIR/tmp" TEMP="$RUN_DIR/tmp" TMP="$RUN_DIR/tmp"
@@ -209,7 +259,10 @@ for RUN_DIR in "$@"; do
     # names so every downstream consumer (ms/speedup extraction, viewers) reads
     # single-owner data. Guarded so a second re-grade cannot clobber the true
     # in-session original.
-    for L in check benchmark; do
+    PARK_LOGS="check benchmark"
+    # Check-only keeps benchmark.log: the cuda headline is extracted from it.
+    [ "$CHECK_ONLY" = "1" ] && PARK_LOGS="check"
+    for L in $PARK_LOGS; do
         if [ -f "$RUN_DIR/$L.log" ] && [ ! -f "$RUN_DIR/$L.contended.log" ]; then
             mv "$RUN_DIR/$L.log" "$RUN_DIR/$L.contended.log"
         fi
@@ -229,6 +282,9 @@ for RUN_DIR in "$@"; do
     CPASS_COUNT=$(grep -axc 'PASS' "$CLOG" || true)
     if [ "$CEXIT" -eq 0 ] && [ "$CPASS_COUNT" -eq 1 ]; then
         CORRECT=true
+        if [ "$CHECK_ONLY" = "1" ]; then
+        echo "    check-only: benchmark.py skipped, published timing kept"
+        else
         echo "    benchmark.py..."
         # solution.py ran in the checker and may have written a forged import
         # cache for the next process. Never carry problem bytecode across the
@@ -247,12 +303,16 @@ for RUN_DIR in "$@"; do
             SCORE=null
             echo "    benchmark FAILED (exit $BEXIT, score markers $SCORE_COUNT) -- see $BLOG"
         fi
+        fi
     else
         echo "    check FAILED (exit $CEXIT) -- see $CLOG"
     fi
 
     RID="$RID" CORRECT="$CORRECT" SCORE="$SCORE" CEXIT="$CEXIT" CEL="$CEL" \
-    BEXIT="$BEXIT" BEL="$BEL" GPU="$GPU" \
+    BEXIT="$BEXIT" BEL="$BEL" GPU="$GPU" CHECK_ONLY="$CHECK_ONLY" \
+    REGRADE_DECK_PROBLEM_DIR="$GRADE_DECK_DIR" \
+    REGRADE_SRC_DIR="$REPO_ROOT/src" \
+    REGRADE_GRADED_SURFACE_PY="$GRADED_SURFACE_PY" \
     python3 - "$RUN_DIR/result.json" <<'PY'
 import json, os, socket, subprocess, sys
 
@@ -275,20 +335,53 @@ try:
 except Exception:
     gpu_name = None
 
-r["correct"] = os.environ["CORRECT"] == "true"
-r["peak_fraction"] = num(os.environ["SCORE"])
-r["check_exit_code"] = num(os.environ["CEXIT"])
-r["benchmark_exit_code"] = num(os.environ["BEXIT"])
-r["check_elapsed_seconds"] = num(os.environ["CEL"])
-r["benchmark_elapsed_seconds"] = num(os.environ["BEL"])
-r["regrade"] = {
+check_only = os.environ.get("CHECK_ONLY") == "1"
+provenance = {
     "at": subprocess.check_output(["date", "-Is"], text=True).strip(),
     "host": socket.gethostname(),
     "gpu_index": int(os.environ["GPU"]),
     "gpu_name": gpu_name,
-    "mode": "sequential_isolated",
-    "contended": contended,
 }
+check_passed = os.environ["CORRECT"] == "true"
+r["check_exit_code"] = num(os.environ["CEXIT"])
+r["check_elapsed_seconds"] = num(os.environ["CEL"])
+if check_only:
+    # Check-only replay certifies an existing number; it never creates one.
+    # A cell that was incorrect stays incorrect even if the current check
+    # passes (it has no timing to certify), and a cell that was correct is
+    # voided if the corrected check rejects it. The timing's own `regrade`
+    # record is left intact; this pass gets its own, with the raw outcome.
+    r["correct"] = bool(contended["correct"]) and check_passed
+    if not r["correct"]:
+        r["peak_fraction"] = None
+    r["recheck"] = dict(provenance, mode="check_only", check_passed=check_passed, prior={
+        k: contended[k] for k in (
+            "correct", "peak_fraction", "check_exit_code", "check_elapsed_seconds")})
+else:
+    r["correct"] = check_passed
+    r["peak_fraction"] = num(os.environ["SCORE"])
+    r["benchmark_exit_code"] = num(os.environ["BEXIT"])
+    r["benchmark_elapsed_seconds"] = num(os.environ["BEL"])
+    r["regrade"] = dict(provenance, mode="sequential_isolated", contended=contended)
+
+# Stamp the surface this re-grade actually used, via the shared digest module
+# (same implementation the runner and the publish gate call). A re-grade under
+# a corrected deck therefore produces a NEW stamp, which is how
+# `kb regrade --stale` can find cells still carrying an older one.
+deck_rel = os.environ.get("REGRADE_DECK_PROBLEM_DIR")
+src_rel = os.environ.get("REGRADE_SRC_DIR")
+if deck_rel and src_rel:
+    import importlib.util
+    gs = os.environ.get("REGRADE_GRADED_SURFACE_PY")
+    if gs and os.path.exists(gs):
+        spec = importlib.util.spec_from_file_location("graded_surface", gs)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        try:
+            r["graded_surface_sha"] = mod.graded_surface_digest(
+                deck_rel, src_rel)
+        except SystemExit:
+            r["graded_surface_sha"] = None
 
 with open(path, "w") as f:
     json.dump(r, f, indent=4)
@@ -297,7 +390,8 @@ old, new = contended["peak_fraction"], r["peak_fraction"]
 delta = ""
 if isinstance(old, (int, float)) and isinstance(new, (int, float)) and old:
     delta = "  (%+.1f%%)" % ((new - old) / old * 100)
-print("    correct=%s  peak %s -> %s%s" % (r["correct"], old, new, delta))
+print("    correct=%s  peak %s -> %s%s%s" % (
+    r["correct"], old, new, delta, "  [check-only]" if check_only else ""))
 PY
 
     # uv run recreates repo/.venv during regrade; drop it again so archives stay thin.
