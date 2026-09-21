@@ -57,6 +57,43 @@ reference-side MoE router near-ties (seeds 2 and 10 are exact ties, seed 5
 reads 0.977 for a correct kernel); expect dips in future 02 audits.
 
 ---
+## 2026-08-19 - sandbox v2: hide-the-tree, shared helper, honeytoken, refuse-closed canary
+
+The 2026-08-13 grok-4.6 incident (below) got through because the sandbox was a
+DENYLIST: `outputs/runs-remote-pro` was a pull tree nobody added to the hide
+list. Denylists lose to the next stray directory, so the sandbox is now the
+inverse — tmpfs the entire monorepo (or thin bench root), bind back only this
+run's `$RUN_DIR`, the dedicated gpu-lock dir (`outputs/gpu_lock/`, moved from
+bare `outputs/gpu.lock` so the bind cannot re-expose `outputs/runs`), and one
+deliberate honeytoken decoy. Construction lives in ONE shared helper,
+`scripts/lib/sandbox.sh`, sourced by both the shared runner
+(hard/cuda/mini host mode) and this fork — the fork keeps only its harness
+set and lock legacy, not a third copy of the hide list. `src/` is now copied
+into the run workspace (the old repo symlink would dangle under tmpfs).
+Session-history dirs (`~/.claude/projects`, `~/.grok/sessions`,
+`~/.codex/sessions`, `~/.gemini/tmp`, opencode storage) are overlaid per-run
+into `$RUN_DIR/agent_home/` — prior transcripts (which quote old runs) are
+unreadable, auth files stay visible via the host bind, and this run's history
+lands in the archive for the audit. Before the model starts,
+`scripts/lib/sandbox_canary.py` sweeps the visible tree INSIDE the same bwrap
+for anything run-dir/result.json/solution.py/`runs-remote-*`-shaped that is
+not this run and refuses the launch on any hit (exit 4, refuse-closed). The
+honeytoken (`20260601_030405_or-fable_..._<problem>`, fake juicy score,
+beacon `kbh7f3a9c1e5d2b` — canonical in `kbtool/kb/contamination.py`) turns a
+copy into an automatic `verdict: contamination`. `kb contamination` also grew
+the beacon check, `runs-lambda-*`/multi-segment `runs-remote-*` path
+matching, and an own-artifact URL tripwire (kernelbench.com / HF traces /
+kernelbench raw.githubusercontent paths) since the sandbox deliberately does
+NOT `--unshare-net` (provider APIs and the localhost proxies must work).
+
+Honest scope: bwrap still runs `--dev-bind / /` so ncu/nsys/CUPTI/driver and
+CLI auth keep working. That full-root bind means this is HYGIENE — a live
+agent cannot SEE a foreign archive — not containment: docker.sock, ssh keys,
+and the network remain reachable, and a hostile agent is not confined. The
+property defended is "no foreign archive visible"; authorship verdicts stay
+with the refuse-closed audit. Linux smoke (no GPU):
+`scripts/smoke_sandbox_linux.sh`. Unit tests (no bwrap, run on the Mac):
+`kbtool/tests/test_sandbox_canary.py`, `test_contamination.py`.
 
 ## 2026-08-17 - retracted grok-4.6 21x (copied Fable)
 

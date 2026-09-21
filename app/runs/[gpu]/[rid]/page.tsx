@@ -294,8 +294,8 @@ function ShapeStrip({ d, official }: { d: RunDetailData; official: number | null
           {official != null && Math.abs(gm - official) > 0.002 && (
             <>
               {" "}
-              · published {(official * 100).toFixed(1)}% (lower of repeated
-              isolated re-benchmark passes)
+              · published {(official * 100).toFixed(1)}% (board value, after the
+              2026-06-14 roofline rescale)
             </>
           )}
         </p>
@@ -320,7 +320,9 @@ export default async function RunPage({
     : null
 
   const gpuName = GPU_NAMES[gpu] ?? gpu
-  const isSpeedup = (cell.score ?? 0) > 1.5
+  // Mega scores ARE speedups regardless of magnitude; a magnitude guess renders
+  // a 1.96x cuda cell as "196% of roofline". Mirror app/_lib/models.ts.
+  const isSpeedup = bench === "mega"
   const headline =
     cell.valid && cell.score != null
       ? isSpeedup

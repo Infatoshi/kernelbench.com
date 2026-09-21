@@ -1,29 +1,65 @@
 # KernelBench-CUDA — DEVLOG
 
-## 2026-09-20 — graded-surface backfill: 59 cells re-checked at the graded shapes, none withdrawn
+## 2026-09-17 — check 01/02 at the shapes they are graded on (deck correction, cells stale)
 
-Publish gate E (PR #12) needs every board cell stamped with the digest of
-the deck plus `src/` that graded it. All 59 RTX PRO 6000 cells were
-replayed check-only on tetra (`KBH_REGRADE_CHECK_ONLY=1
-KBH_REGRADE_DECK=problems-rtxpro6000`, one process on GPU 0, `benchmark.py`
-skipped, timing and `benchmark.log` untouched). This is also the backfill
-PR #11 demands: the 15 published `01_glm52_fused_moe` and 14
-`02_deepseek_nsa` cells now carry a pass under the widened `check.py` (all
-six graded shapes, D = 128 and S = 8191 included).
+**This changes `check.py` on a published deck, so every cell below is stale
+until re-checked. The numbers on the board for 01 and 02 were produced under
+the old, narrower check and must be re-validated or withdrawn.**
 
-**Result: 58 pass, 0 withdrawn, 1 already-incorrect cell (Qwen 3.8 Max 02)
-still fails to build on its own `atomicAdd` overloads.** No published cuda
-number changes.
+A review of the grading surface found that neither problem verified the shapes
+it scores:
 
-One false start, caught before it became a verdict: `benchmarks/cuda/uv.lock`
-was gitignored, so the "locked project environment" the regrade restores was
-whatever the box had resolved. tetra had torch 2.14.0; every one of the 42
-archived workspaces was graded under 2.13.0, and under 2.14 the DeepSeek V4.1
-Flash 01 cell fails to build ("C++20 or later compatible compiler is required
-to use ATen", the solution passes `-std=c++17`). The lock is tracked now (PR
-#12) and that cell passes under it. Thin archives (17 of 59, no `repo/`) are
-rebuilt from the canonical deck. Provenance is in `recheck` beside the
-timing's `regrade` record.
+- `01_glm52_fused_moe` capped the check at `T = min(T, 256)` while `benchmark.py`
+  times T = 4096, 4127, 1, 8192, 512, 1000. The tile-config branches the kernel
+  uses at prefill sizes never ran under `check.py`.
+- `02_deepseek_nsa` hardcoded two check shapes at S = 256/384, both D = 64,
+  while the graded sweep runs S to 8192 and includes `{S: 8191, D: 128}`. D = 128
+  was never verified anywhere, and at those short lengths every block is
+  selected, so the block-selection path that *is* the operation at long context
+  was never exercised.
+- No `benchmark.py` in this deck (or hard's) calls `allclose` or
+  `check_correctness` — verified: 0 hits across 10 files. So a graded number
+  proved "correct at T<=256" and "fast at T=8192" as two separate facts, with
+  nothing tying them together. A shape-conditional fast path is exactly the
+  branch `reward_hack_lint.py`'s regexes cannot see.
+
+Both checks now iterate the graded `shapes.SHAPES`:
+- 01: all 6 shapes at their own T, 3 seeds each (42/123/456), as before.
+- 02: all 6 shapes, one seed (42). One shape at one seed, not six at two, is
+  the same trade 03's long-ctx spot check made; the reason here is cost, not
+  correctness. The reference loops `B*H*S` tokens in Python with a per-token
+  block loop and sort — 310,632 iterations across the six shapes, ~250s at a
+  pessimistic 800us/iteration against the 1800s `KBH_CHECK_TIMEOUT_SECONDS`
+  budget. If a box measures it over budget, drop to the three longest shapes
+  rather than reinstating a short-shape cap.
+
+Affordability for 01 was measured, not assumed: dense-equivalent work at
+T = 8192 is ~3.7 TFLOP and the reference is fp32, so the cap was a leftover
+from an earlier, slower reference rather than a live constraint.
+
+**Backfill required.** 15 published 01 cells and 14 published 02 cells were
+scored under the old check. Re-run each archived `solution.py` through the
+current `check.py` in check-only mode, on an idle RTX PRO 6000 (the hardware
+the numbers were produced on):
+
+```
+cd benchmarks/cuda
+KBH_REGRADE_CHECK_ONLY=1 KBH_REGRADE_DECK=problems-rtxpro6000 \
+    scripts/regrade_sequential.sh $(python3 ../../scripts/check_publish_gates.py --list-stale cuda)
+```
+
+`regrade_sequential.sh` restores `reference.py sota.py shapes.py problem.yaml
+check.py benchmark.py PROMPT.txt` plus `src/` and the locked project from the
+canonical deck, so the corrected check applies and any agent edit to the graded
+surface is reverted and reported. `KBH_REGRADE_CHECK_ONLY` matters: without it
+the regrade also replays `benchmark.py` and overwrites `peak_fraction` from the
+fresh timing, so a "re-check" on any other box or thermal state would silently
+re-rank the board. In check-only mode the published timing and `benchmark.log`
+are kept, `graded_surface_sha` is stamped, and a cell that now FAILs has its
+`peak_fraction` voided: it is withdrawn, not re-run, and gets an annotation
+explaining which shape broke it. `--list-stale` enumerates exactly the cells
+publish gate E refuses, so the same command also stamps the cells whose check
+did not change.
 
 ## 2026-07-16 — Pre-debut deck repairs: torch 2.13 init fixes, numeric stress, 03 long-ctx
 

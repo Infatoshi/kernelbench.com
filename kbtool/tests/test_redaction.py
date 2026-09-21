@@ -120,3 +120,30 @@ def test_embedded_json_triton_decorator_is_not_email():
     assert r.scan_text(encoded) == {}
     assert json.loads(r.redact_text(encoded))['output'] == code
     assert r.scan_text(json.dumps({'output': 'contact alice@example.org'})) == {'email': 1}
+
+
+@pytest.mark.parametrize('text', [
+    '-L/home/infatoshi/kernelbench.com/repo/.venv/lib',   # linker -L path
+    '-I/Users/bob/include',
+    'export LD_LIBRARY_PATH=/home/bob/lib',
+    '"cat /home/bob/.env"',
+    '-L/root/x',
+])
+def test_home_path_after_a_flag_is_redacted(text):
+    """A home path preceded by a short flag letter must still be redacted.
+
+    The old word-char lookbehind let `-L/home/user/...` through because `L`
+    is a word character; one such string was live in a published viewer.
+    """
+    assert r.HOME_RE.search(text), f'{text!r} should match a home path'
+    red = r.redact_text(text)
+    assert '/home/' not in red, f'{text!r} left a home path: {red!r}'
+
+
+@pytest.mark.parametrize('text', [
+    'foo/home/x',        # path segment, not a home dir
+    'see:homepage',
+    'x/home/y',
+])
+def test_relative_segments_are_not_treated_as_home_paths(text):
+    assert not r.HOME_RE.search(text), f'{text!r} should not match'

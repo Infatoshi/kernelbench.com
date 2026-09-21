@@ -51,10 +51,15 @@ def main():
     device = torch.device("cuda:0")
     tol_override = meta.get("tolerance") or None
 
+    # Every graded shape is checked at its OWN T. This used to cap T at 256
+    # ("full T in benchmark"), which meant correctness was verified only in a
+    # size regime the benchmark never times: the tile-config branches that run
+    # at T>=4096 were never checked, and no benchmark.py compares outputs, so a
+    # shape-conditional bug could score. The reference is fp32 and cheap at
+    # these sizes (dense-equivalent work at T=8192 is ~3.7 TFLOP, well under
+    # the 1800s check budget), so the cap is not needed.
     for shape_idx, shape in enumerate(shapes.SHAPES):
-        # Cap T for check wall-clock / memory; full T in benchmark.
         check_shape = dict(shape)
-        check_shape["T"] = min(int(shape["T"]), 256)
 
         reference.T = check_shape["T"]
         reference.E = check_shape["E"]
