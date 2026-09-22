@@ -113,7 +113,25 @@ MODEL_SLUG="$(echo "$MODEL" | tr '/:[] ' '_')"
 RUN_DIR_BASE="${REPO_ROOT}/outputs/runs/${TIMESTAMP}_${HARNESS}_${MODEL_SLUG}_${PROBLEM_NAME}"
 mkdir -p "$REPO_ROOT/outputs/runs"
 RUN_DIR=""
+# Resume mode (host mode, claude harness only): continue an interrupted session in
+# its own archive instead of starting a new cell. KBH_RESUME_RUN_DIR names the run
+# dir, KBH_RESUME_SESSION the claude session id stored under its agent_home, and
+# KBH_RESUME_PROMPT the first message of the continuation. The prior transcript is
+# kept as transcript.part1.jsonl. Workspace files the agent wrote are untouched;
+# the canonical grading files are recopied exactly as on a fresh launch.
+if [ -n "${KBH_RESUME_RUN_DIR:-}" ]; then
+    if [ "$HARNESS" != "claude" ] || [ -z "${KBH_RESUME_SESSION:-}" ] || [ ! -d "$KBH_RESUME_RUN_DIR/repo" ]; then
+        echo "STOP: resume needs HARNESS=claude, KBH_RESUME_SESSION and an existing run dir" >&2; exit 2
+    fi
+    RUN_DIR="$(cd "$KBH_RESUME_RUN_DIR" && pwd)"
+    for _f in transcript stderr; do
+        _ext=jsonl; [ "$_f" = stderr ] && _ext=log
+        [ -f "$RUN_DIR/$_f.$_ext" ] && [ ! -f "$RUN_DIR/$_f.part1.$_ext" ] && mv "$RUN_DIR/$_f.$_ext" "$RUN_DIR/$_f.part1.$_ext"
+    done
+    echo "RESUME: $RUN_DIR session $KBH_RESUME_SESSION"
+fi
 for attempt in $(seq 0 999); do
+    [ -n "$RUN_DIR" ] && break
     if [ "$attempt" -eq 0 ]; then
         candidate="$RUN_DIR_BASE"
     else
@@ -1696,7 +1714,8 @@ case "$HARNESS" in
                 --model "$MODEL" \
                 "${EFFORT_ARG[@]}" \
                 --add-dir "$PROBLEM_DIR" \
-                -p "$PROMPT" ) \
+                ${KBH_RESUME_SESSION:+--resume "$KBH_RESUME_SESSION"} \
+                -p "${KBH_RESUME_PROMPT:-$PROMPT}" ) \
                 > "$LOG_FILE" 2> "$STDERR_FILE" || HARNESS_EXIT=$?
         fi
         ;;

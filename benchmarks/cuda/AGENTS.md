@@ -18,3 +18,7 @@ uv run kbh run grok grok-4.5 problems-rtxpro6000/01_glm52_fused_moe
 Deck is frozen at four; spec-decode tree attention was pitched as a fifth and rejected (2026-07-15), do not re-pitch it. The retired v0 problems (`01_rmsnorm_residual`, `02_online_softmax`) stay retired.
 
 Everything else is shared with Hard and lives in `benchmarks/hard/AGENTS.md`: layout, adding a problem, correctness and numeric stress, results and thin archives, tests, torch policy, the audit YAML schema (`results/annotations/`), and the `KBH_` variables. Harness routes, the shared runner, rented workers: `kbtool/AGENTS.md`. Methodology, including the latency-anchored scoring for `02_deepseek_nsa`: `SPEC.md`. History: `DEVLOG.md`. Publish gates: root `AGENTS.md`.
+
+## Resuming an interrupted claude cell
+
+`KBH_RESUME_RUN_DIR`, `KBH_RESUME_SESSION` and `KBH_RESUME_PROMPT` (read by `scripts/lib/run_harness.sh`, claude harness, host mode only) continue a session that died for infrastructure reasons (GPU off the bus, box reboot) inside its own archive: same run dir and sandbox, the session store under `agent_home`, `claude --resume <session>` with the prompt as the first new message. The old transcript stays as `transcript.part1.jsonl`. Grading, regrade and the publish gates then run unchanged. Record the interruption in the cell's annotation.
