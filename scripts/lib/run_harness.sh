@@ -101,7 +101,7 @@ for _gs in "$REPO_ROOT/../../scripts/lib/graded_surface.py" \
            "$REPO_ROOT/scripts/lib/graded_surface.py"; do
     if [ -f "$_gs" ]; then
         GRADED_SURFACE_SHA="$(
-            "$REAL_PYTHON" "$_gs" "$SOURCE_PROBLEM_DIR" "$REPO_ROOT/src" 2>/dev/null || true
+            "${REAL_PYTHON:-python3}" "$_gs" "$SOURCE_PROBLEM_DIR" "$REPO_ROOT/src" 2>/dev/null || true
         )"
         break
     fi
