@@ -81,7 +81,15 @@ def main():
             torch.manual_seed(seed)
             torch.cuda.manual_seed_all(seed)
             base_inputs = [t.to(device) for t in reference.get_inputs()]
-            for case in numeric_stress_cases(meta.get("name", "")):
+            # large_qkv (q,k,v x8) is skipped here: x8 on q and k makes logits 64x,
+            # the softmax a hardmax, and top-8 block selection a sub-ULP tie
+            # detector. At (1,8,8191,128) row (h=6,t=4835) the 8th/9th block
+            # importances differ by 0.47 fp32 ULP, so the winner depends on
+            # accumulation order, which the spec does not fix; an independent
+            # oracle agreed with the four "failing" kernels (DEVLOG 2026-09-22).
+            # small_qkv and nominal still run at every graded shape.
+            cases = [c for c in numeric_stress_cases(meta.get("name", "")) if c.name != "large_qkv"]
+            for case in cases:
                 with numeric_stress_context(ref_model, sol_model, base_inputs, case) as inputs:
                     with torch.no_grad():
                         ref_out = ref_model(*inputs)

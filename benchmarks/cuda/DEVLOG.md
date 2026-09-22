@@ -1,5 +1,25 @@
 # KernelBench-CUDA — DEVLOG
 
+## 2026-09-22 — 02_deepseek_nsa: large_qkv dropped from the RTX PRO 6000 check
+
+The widened check (#11) withdrew four independent kernels on 02 (Grok 4.5, Grok 4.6,
+Fable 5.1 at 1.0627, GPT-6 Astra) with byte-identical stats (126 bad, max 28.75) at
+(1,8,8191,128) under `large_qkv`. An oracle written from PROMPT.txt, not from
+reference.py, matched the reference at (1,1,2048,64) and (1,1,8191,128) and agreed
+with the four kernels, not the reference, at the failing config. Every bad element
+is one row, (b=0,h=6,t=4835): key blocks 49 and 35 tie for the 8th top-k slot with
+fp64 importances 9.014908865 vs 9.014908415, a gap of 0.47 fp32 ULP. The reference's
+per-token mat-vec picks 49, any batched GEMM over a query tile picks 35, and Grok
+4.7's block-sum route makes them bit-identical and resolves on its tie-break. x8 on
+q and k makes logits 64x and the softmax a hardmax, so the swapped block flips the
+row from +17.25 to -11.50. At nominal scale the same row diverges by 0.082 inside
+tolerance. The spec fixes no accumulation order, so neither side is wrong; the case
+was a selection-tie detector, not a numerics test. check.py now skips `large_qkv`
+(problems-rtxpro6000 only; the H100 decks are untouched). This changes the graded
+surface for 02 only, so every published RTX 02 cell needs a check-only restamp.
+The DeepSeek V4 Flash 02 withdrawal (96,577 bad elements past row 2007) is a real
+failure and is not affected.
+
 ## 2026-09-17 — check 01/02 at the shapes they are graded on (deck correction, cells stale)
 
 **This changes `check.py` on a published deck, so every cell below is stale
