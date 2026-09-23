@@ -12,6 +12,9 @@ export interface ModelCell {
   /** false when the agent never wrote a solution (or harness recorded none) */
   has_solution?: boolean
   score: number | null
+  /** CUDA Native Sparse Attention: measured geomean latency, lower is better. */
+  latency_ms?: number | null
+  resumed_segment?: boolean
   verdict: string
   valid: boolean
   /** short outcome from public/data/catalog.json (pass|wrong|build|slow|…) */
@@ -51,6 +54,7 @@ export interface AuditOutcome {
   retryable_infra_failure?: boolean | null
   session_complete?: boolean | null
   score: number | null
+  latency_ms?: number | null
   summary: string
   solution_url: string | null
   trace_url: string | null
@@ -511,6 +515,17 @@ function chipFromCell(
   const outcome = c.outcome
   const kind = kindFromOutcome(outcome, c)
   if (kind === "pass" && c.score != null) {
+    if (bench === "cuda" && prob === "02_deepseek_nsa" && c.latency_ms != null) {
+      return {
+        problem: prob,
+        short,
+        kind,
+        label: `${c.latency_ms.toFixed(3)}ms`,
+        title: `${c.latency_ms.toFixed(3)} ms geomean latency across six shapes · lower is better`,
+        score: c.score,
+        ...links,
+      }
+    }
     // Mega scores ARE speedups regardless of magnitude -- the old >1.5
     // magnitude guess rendered a 1.38x mega cell as "138" (percent-points
     // path). Fall back to the heuristic only when the bench is unknown.

@@ -243,6 +243,8 @@ def build_cell(
             / f"{run_id}_solution.py.txt"
         ).exists(),
     }
+    if (run_dir / "transcript.part1.jsonl").exists():
+        detail["stats"]["resumed_segment"] = True
     return detail
 
 

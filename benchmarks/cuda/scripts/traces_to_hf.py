@@ -33,6 +33,18 @@ def _redact(s):
     return redact_text(s) if isinstance(s, str) else s
 
 
+_PRIVATE_PATH = re.compile(r"(?:^|[/~])\.(?:claude|codex|ssh)(?:/|$)|\.env_vars\b|/proc/\S+/environ\b")
+_PRIVATE_SHELL = re.compile(r"(?:^|[;&|])\s*(?:env\s*\||printenv\b|(?:cat|ls|find)\s+~(?:/|\s|$))")
+
+
+def _private_tool_call(call) -> bool:
+    """Keep private config/environment calls and their results out of HF."""
+    args = call.args or {}
+    target = str(args.get("file_path") or "")
+    command = str(args.get("command") or "")
+    return bool(_PRIVATE_PATH.search(target) or _PRIVATE_PATH.search(command) or _PRIVATE_SHELL.search(command))
+
+
 def _new_uuid() -> str:
     return str(uuidlib.uuid4())
 
@@ -55,6 +67,22 @@ def _pick_transcript(run_dir: Path) -> Path | None:
         p = run_dir / name
         if p.exists() and p.stat().st_size > 0:
             return p
+    # A resumed Claude run can have transcript.part1.jsonl plus a later
+    # transcript.jsonl. Its native session store spans both, including the
+    # overlapping resumes that the stream files cannot represent in order.
+    result = run_dir / "result.json"
+    try:
+        harness = json.loads(result.read_text()).get("harness") if result.exists() else None
+    except (OSError, ValueError):
+        harness = None
+    if harness == "claude":
+        native = sorted(
+            (run_dir / "agent_home" / ".claude" / "projects").glob("*/*.jsonl"),
+            key=lambda p: p.stat().st_size,
+            reverse=True,
+        )
+        if native:
+            return native[0]
     grok_histories = sorted(
         (run_dir / "agent_home" / ".grok" / "sessions").rglob("chat_history.jsonl")
         if (run_dir / "agent_home" / ".grok" / "sessions").is_dir()
@@ -155,6 +183,17 @@ def convert(run_dir: Path, out_dir: Path) -> Path | None:
             return False
         return True
 
+    private_ids: set[str] = set()
+    for event in session.events:
+        for call in event.tool_calls:
+            if _private_tool_call(call):
+                if not call.call_id:
+                    raise ValueError(f"private tool call without pairable ID in {rid}")
+                private_ids.add(call.call_id)
+    paired_ids = {e.tool_result.call_id for e in session.events if e.tool_result is not None}
+    if private_ids - paired_ids:
+        raise ValueError(f"private tool call missing its paired result in {rid}")
+
     for e in session.events:
         if e.role == "assistant":
             blocks: list[dict] = []
@@ -163,6 +202,8 @@ def convert(run_dir: Path, out_dir: Path) -> Path | None:
             if e.text:
                 blocks.append({"type": "text", "text": _redact(e.text)})
             for tc in e.tool_calls:
+                if tc.call_id in private_ids:
+                    continue
                 args = json.loads(_redact(json.dumps(tc.args, default=str))) if tc.args else {}
                 blocks.append({
                     "type": "tool_use",
@@ -183,6 +224,8 @@ def convert(run_dir: Path, out_dir: Path) -> Path | None:
             emit("assistant", msg)
         elif e.role in ("user", "tool"):
             if e.tool_result is not None:
+                if e.tool_result.call_id in private_ids:
+                    continue
                 # Cap huge tool dumps so the HF viewer stays responsive
                 body = e.tool_result.content or ""
                 if len(body) > 80000:
@@ -211,6 +254,8 @@ def convert(run_dir: Path, out_dir: Path) -> Path | None:
     out_dir.mkdir(parents=True, exist_ok=True)
     out = out_dir / f"{rid}.jsonl"
     out.write_text("\n".join(json.dumps(ln) for ln in lines) + "\n")
+    if private_ids:
+        print(f"  {rid}: removed {len(private_ids)} paired private tool calls/results")
     return out
 
 

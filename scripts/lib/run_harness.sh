@@ -118,7 +118,9 @@ RUN_DIR=""
 # dir, KBH_RESUME_SESSION the claude session id stored under its agent_home, and
 # KBH_RESUME_PROMPT the first message of the continuation. The prior transcript is
 # kept as transcript.part1.jsonl. Workspace files the agent wrote are untouched;
-# the canonical grading files are recopied exactly as on a fresh launch.
+# the canonical problem files are recopied. The existing src/ and trusted
+# snapshot stay in place so mutations from before the interruption remain
+# detectable after the resumed agent exits.
 if [ -n "${KBH_RESUME_RUN_DIR:-}" ]; then
     if [ "$HARNESS" != "claude" ] || [ -z "${KBH_RESUME_SESSION:-}" ] || [ ! -d "$KBH_RESUME_RUN_DIR/repo" ]; then
         echo "STOP: resume needs HARNESS=claude, KBH_RESUME_SESSION and an existing run dir" >&2; exit 2
@@ -319,7 +321,12 @@ strip_python_bytecode() {
     /usr/bin/find "$1" -type f \( -name '*.pyc' -o -name '*.pyo' \) -delete
 }
 
-cp -a "$REPO_ROOT/src" "$WORKSPACE_ROOT/src"
+# `cp -a src existing/src` nests src/src on resume and causes a false mutation
+# flag. Keep the existing workspace copy so pre-interruption edits remain
+# visible to detect_template_mutation after the resumed agent exits.
+if [ ! -e "$WORKSPACE_ROOT/src" ]; then
+    cp -a "$REPO_ROOT/src" "$WORKSPACE_ROOT/src"
+fi
 strip_python_bytecode "$WORKSPACE_ROOT/src"
 cp -p "$REPO_ROOT/pyproject.toml" "$WORKSPACE_ROOT/pyproject.toml"
 cp -p "$REPO_ROOT/uv.lock" "$WORKSPACE_ROOT/uv.lock"
@@ -1454,7 +1461,11 @@ for t in "${TEMPLATE_FILES[@]}"; do
     fi
 done
 TRUSTED_SRC_BACKUP_DIR="$RUN_DIR/trusted_src"
-cp -a "$WORKSPACE_ROOT/src" "$TRUSTED_SRC_BACKUP_DIR"
+# Keep the original snapshot across a resume. Copying into this existing dir
+# would create trusted_src/src and wrongly report a template mutation.
+if [ ! -e "$TRUSTED_SRC_BACKUP_DIR" ]; then
+    cp -a "$WORKSPACE_ROOT/src" "$TRUSTED_SRC_BACKUP_DIR"
+fi
 TRUSTED_ENTRYPOINT="$TRUSTED_SRC_BACKUP_DIR/eval/trusted_entrypoint.py"
 if [ ! -f "$TRUSTED_ENTRYPOINT" ]; then
     echo "STOP: trusted grading entrypoint is missing" >&2

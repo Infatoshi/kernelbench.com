@@ -143,9 +143,13 @@ function CellCard({
         {ranked && bench !== "mega" && cell.score != null && (
           <span
             className={`cell-card-score tabular${cell.valid ? "" : " cell-card-score-dim"}`}
-            title="peak fraction of roofline"
+            title={bench === "cuda" && probKey === "02_deepseek_nsa"
+              ? "geomean latency across six shapes; lower is better"
+              : "peak fraction of roofline"}
           >
-            {benchValue(bench, cell.score)}
+            {bench === "cuda" && probKey === "02_deepseek_nsa" && cell.latency_ms != null
+              ? `${cell.latency_ms.toFixed(3)} ms`
+              : benchValue(bench, cell.score)}
           </span>
         )}
         {!ranked && <span className="cell-card-score tabular cell-card-score-dim">—</span>}
@@ -178,7 +182,9 @@ function CellCard({
               </span>
             ))}
           {bench === "mega" && cell.framework && <span>{cell.framework}</span>}
-          {cell.elapsed_seconds != null && <span>session {fmtDur(cell.elapsed_seconds)}</span>}
+          {cell.elapsed_seconds != null && (
+            <span>{cell.resumed_segment ? "last resume" : "session"} {fmtDur(cell.elapsed_seconds)}</span>
+          )}
         </div>
       ) : null}
       {!ranked ? (
@@ -298,6 +304,8 @@ function AuditOutcomeCard({ outcome, bench }: { outcome: AuditOutcome; bench: Be
   const metric =
     outcome.score == null
       ? "no score"
+      : bench === "cuda" && outcome.problem === "02_deepseek_nsa"
+        ? outcome.latency_ms != null ? `${outcome.latency_ms.toFixed(3)} ms` : "latency unavailable"
       : bench === "mega"
         ? `${outcome.score.toFixed(2)}x`
         : `${(outcome.score * 100).toFixed(2)}%`
@@ -509,8 +517,10 @@ export default async function ModelPage({
           <>
             <p>
               <strong>How to read.</strong> Cell scores are peak fraction of the
-              board roofline (Hard / CUDA) or best speedup vs the torch baseline
-              (Mega), over one unlimited agent session per cell. Audit chips come
+              board roofline (Hard / most CUDA), geomean milliseconds for CUDA
+              Native Sparse Attention, or speedup vs the torch baseline (Mega).
+              Each cell has an unlimited agent budget; interrupted or overlapping
+              resumes are documented in the audit. Audit chips come
               from the human/subagent reward-hack review of every published
               cell; scores from flagged sessions render dimmed — they don&apos;t
               count toward the charts.

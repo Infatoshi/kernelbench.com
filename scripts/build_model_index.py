@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import csv
 import json
+import math
 import re
 import subprocess
 from datetime import datetime, timezone
@@ -163,6 +164,33 @@ def slugify(model_field: str) -> str:
 
 def display_name(slug: str) -> str:
     return MODEL_NAMES.get(slug, slug)
+
+
+def cuda_nsa_latency_ms(run_id: str | None) -> float | None:
+    """Baked geomean latency from the published per-shape run detail."""
+    if not run_id:
+        return None
+    path = REPO / "public" / "data" / "rundetail" / f"{run_id}.json"
+    if not path.exists():
+        return None
+    try:
+        detail = json.loads(path.read_text())
+        values = [float(shape["ms"]) for shape in detail.get("shapes", [])]
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+    if len(values) != 6 or any(value <= 0 for value in values):
+        return None
+    return round(math.exp(sum(math.log(value) for value in values) / len(values)), 6)
+
+
+def resumed_segment_for_run(run_id: str | None) -> bool:
+    if not run_id:
+        return False
+    path = REPO / "public" / "data" / "rundetail" / f"{run_id}.json"
+    try:
+        return bool(json.loads(path.read_text()).get("stats", {}).get("resumed_segment"))
+    except (OSError, ValueError, TypeError):
+        return False
 
 
 def lab_for(slug: str) -> str:
@@ -329,6 +357,10 @@ def load_site_board(models: Models, bench: str, path: Path, gpu_key: str | None)
                 "trace_url": trace_url(bench, c.get("run_id") or "", gpu_key),
                 "detail_url": detail_url(bench, c.get("run_id") or "", gpu_key),
             }
+            if bench == "cuda" and prob == "02_deepseek_nsa":
+                cells[prob]["latency_ms"] = cuda_nsa_latency_ms(c.get("run_id"))
+            if resumed_segment_for_run(c.get("run_id")):
+                cells[prob]["resumed_segment"] = True
         block = {
             "label": m.get("label"),
             "harness": m.get("harness"),
@@ -651,6 +683,8 @@ def join_annotations(models: Models, bench: str, ann_dir: Path) -> tuple[list[st
                 "retryable_infra_failure": a.get("retryable_infra_failure"),
                 "session_complete": a.get("session_complete"),
                 "score": a.get("peak_fraction"),
+                **({"latency_ms": cuda_nsa_latency_ms(run_id)}
+                   if bench == "cuda" and a.get("problem") == "02_deepseek_nsa" else {}),
                 "summary": str(a.get("summary") or "").strip(),
                 "solution_url": (
                     mega_solution_url(run_id)
@@ -702,7 +736,7 @@ def join_annotations(models: Models, bench: str, ann_dir: Path) -> tuple[list[st
             )
             if replace:
                 has_solution = a.get("has_solution", True)
-                target.setdefault("cells", {})[problem] = {
+                candidate = {
                     "run_id": run_id,
                     "correct": bool(a.get("correct")),
                     "has_solution": has_solution,
@@ -718,6 +752,11 @@ def join_annotations(models: Models, bench: str, ann_dir: Path) -> tuple[list[st
                     "trace_url": trace_url(bench, run_id, gpu_key),
                     "detail_url": detail_url(bench, run_id, gpu_key),
                 }
+                if bench == "cuda" and problem == "02_deepseek_nsa":
+                    candidate["latency_ms"] = cuda_nsa_latency_ms(run_id)
+                if resumed_segment_for_run(run_id):
+                    candidate["resumed_segment"] = True
+                target.setdefault("cells", {})[problem] = candidate
         if bench == "mega" and a.get("problem") in ACTIVE_PROBLEMS.get("mega", set()):
             # The Mega CSV contains only publishable scores. Preserve audited
             # rejected/failed attempts as invalid cells so the public homepage

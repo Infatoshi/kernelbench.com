@@ -1,0 +1,1499 @@
+"""NSA-style block-sparse attention (bench semantics of reference.nsa_attend) in CUDA.
+
+Pipeline (three launches on the current stream):
+  1. select_kernel   : per (b,h,query block of 64), CTAs ordered by an atomic ticket. Each CTA
+                       publishes its key block's fp32 sum as an exact 3-term bf16 split, then scores
+                       q . kmean for all earlier blocks on tensor cores (error-free TwoSum across
+                       k-chunks, ~fp32 accuracy); the current block uses the causal prefix mean.
+                       Top-8 per query with the reference tie-break (higher block index wins).
+                       Selected blocks outside the local window's two blocks are appended to
+                       per-key-block query buckets; the last CTA turns bucket sizes into work units.
+  2. sparse_kernel   : key-block-major: one K/V block in smem, the gathered queries that selected
+                       it in dense 64-row tiles (mma.sync, next gather in flight); writes a
+                       normalized partial (m, l, O) per (query, slot).
+  3. window_merge    : per query block: local window (+ selected previous block) attention, then
+                       log-sum-exp merge of the sparse partials, bf16 output.
+"""
+import os
+
+import torch
+import torch.nn as nn
+
+BLOCK_SIZE = 64
+TOP_N_BLOCKS = 8
+SLIDING_WINDOW = 64
+
+CUDA_SRC = r"""
+#include <cuda_runtime.h>
+#include <cuda_bf16.h>
+#include <cstdint>
+#include <algorithm>
+#include <torch/extension.h>
+#include <ATen/cuda/CUDAContext.h>
+
+typedef __nv_bfloat16 bf16;
+#define DEVI __device__ __forceinline__
+
+DEVI uint32_t smem_u32(const void* p) { return (uint32_t)__cvta_generic_to_shared(p); }
+
+DEVI void cp_async16(uint32_t dst, const void* src, bool valid) {
+  int sz = valid ? 16 : 0;
+  asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" [REDACTED: IP] "r"(dst), "l"(src), "r"(sz));
+}
+DEVI void cp_async_commit() { asm volatile("cp.async.commit_group;\n" [REDACTED: IP]); }
+template <int N> DEVI void cp_async_wait() { asm volatile("cp.async.wait_group %0;\n" [REDACTED: IP] "n"(N)); }
+
+DEVI void ldsm_x4(uint32_t addr, uint32_t (&r)[4]) {
+  asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+               : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "r"(addr));
+}
+DEVI void ldsm_x4_t(uint32_t addr, uint32_t (&r)[4]) {
+  asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+               : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "r"(addr));
+}
+DEVI void mma16816(float (&c)[4], const uint32_t (&a)[4], uint32_t b0, uint32_t b1) {
+  asm volatile(
+      "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+      : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
+      : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+}
+DEVI uint32_t pack_bf16(float lo, float hi) {
+  __nv_bfloat162 v = __floats2bfloat162_rn(lo, hi);
+  return *reinterpret_cast<uint32_t*>(&v);
+}
+DEVI float fast_exp2(float x) { float y; asm("ex2.approx.ftz.f32 %0, %1;" : "=f"(y) : "f"(x)); return y; }
+
+// Swizzled byte offset of 16-byte chunk `ch` of row `row` in a [rows][D] bf16 tile.
+template <int D> DEVI uint32_t swz(int row, int ch) {
+  return (uint32_t)(row * (D * 2) + ((ch ^ (row & 7)) << 4));
+}
+
+// Load ROWS rows of a [*, D] bf16 matrix starting at global row `row0`; rows outside
+// [0, nrows) are zero-filled.
+template <int D, int ROWS, int NT>
+DEVI void load_rows(uint32_t sbase, const bf16* __restrict__ g, int row0, int nrows, int tid) {
+  constexpr int CPR = D / 8;
+#pragma unroll
+  for (int idx = tid; idx < ROWS * CPR; idx += NT) {
+    int row = idx / CPR, ch = idx % CPR;
+    int gr = row0 + row;
+    bool valid = (gr >= 0) && (gr < nrows);
+    const bf16* src = valid ? (g + (size_t)gr * D + ch * 8) : g;
+    cp_async16(sbase + swz<D>(row, ch), src, valid);
+  }
+}
+
+// A fragments (16 rows x D) for warp rows [r0, r0+16).
+template <int D>
+DEVI void load_a_frags(uint32_t sbase, int r0, int lane, uint32_t (&qf)[D / 16][4]) {
+#pragma unroll
+  for (int kk = 0; kk < D / 16; ++kk)
+    ldsm_x4(sbase + swz<D>(r0 + (lane & 15), 2 * kk + (lane >> 4)), qf[kk]);
+}
+
+// acc[8][4] += A(16 x D) * B^T where B is a 64-row tile [64][D] in smem (rows = n).
+template <int D>
+DEVI void mma_abt_64(uint32_t bbase, int lane, const uint32_t (&qf)[D / 16][4], float (&acc)[8][4]) {
+  const int mi = lane >> 3;
+#pragma unroll
+  for (int kk = 0; kk < D / 16; ++kk) {
+#pragma unroll
+    for (int np = 0; np < 4; ++np) {
+      uint32_t b[4];
+      ldsm_x4(bbase + swz<D>(np * 16 + (lane & 7) + ((mi >> 1) << 3), 2 * kk + (mi & 1)), b);
+      mma16816(acc[2 * np], qf[kk], b[0], b[1]);
+      mma16816(acc[2 * np + 1], qf[kk], b[2], b[3]);
+    }
+  }
+}
+
+// oacc[D/8][4] += P(16 x 64, from score accumulators) * V(64 x D) with V tile in smem.
+template <int D>
+DEVI void mma_pv_64(uint32_t vbase, int lane, const float (&p)[8][4], float (&oacc)[D / 8][4]) {
+  const int mi = lane >> 3;
+#pragma unroll
+  for (int ks = 0; ks < 4; ++ks) {
+    uint32_t a[4];
+    a[0] = pack_bf16(p[2 * ks][0], p[2 * ks][1]);
+    a[1] = pack_bf16(p[2 * ks][2], p[2 * ks][3]);
+    a[2] = pack_bf16(p[2 * ks + 1][0], p[2 * ks + 1][1]);
+    a[3] = pack_bf16(p[2 * ks + 1][2], p[2 * ks + 1][3]);
+#pragma unroll
+    for (int dp = 0; dp < D / 16; ++dp) {
+      uint32_t b[4];
+      ldsm_x4_t(vbase + swz<D>(ks * 16 + (lane & 7) + ((mi & 1) << 3), 2 * dp + (mi >> 1)), b);
+      mma16816(oacc[2 * dp], a, b[0], b[1]);
+      mma16816(oacc[2 * dp + 1], a, b[2], b[3]);
+    }
+  }
+}
+
+DEVI void two_sum(float a, float b, float& s, float& e) {
+  s = a + b;
+  float bb = s - a;
+  e = (a - (s - bb)) + (b - bb);
+}
+
+// res[2*NP][4] = A(16 x D) . (H + M + L)^T for a tile of 16*NP rows. The hi part is summed per
+// k16 chunk with error-free TwoSum so the result stays within ~1 ulp of the exact dot product.
+template <int D, int NP>
+DEVI void importance_tile(uint32_t sH, uint32_t sM, uint32_t sL, int lane, const uint32_t (&qf)[D / 16][4],
+                          float (&res)[2 * NP][4]) {
+  const int mi = lane >> 3;
+  float s[2 * NP][4], e[2 * NP][4], cl[2 * NP][4];
+#pragma unroll
+  for (int j = 0; j < 2 * NP; ++j)
+#pragma unroll
+    for (int i = 0; i < 4; ++i) s[j][i] = e[j][i] = cl[j][i] = 0.f;
+#pragma unroll
+  for (int kk = 0; kk < D / 16; ++kk) {
+#pragma unroll
+    for (int np = 0; np < NP; ++np) {
+      const uint32_t off = swz<D>(np * 16 + (lane & 7) + ((mi >> 1) << 3), 2 * kk + (mi & 1));
+      uint32_t bh[4], bm[4], bl[4];
+      ldsm_x4(sH + off, bh);
+      ldsm_x4(sM + off, bm);
+      ldsm_x4(sL + off, bl);
+      float c0[4] = {0.f, 0.f, 0.f, 0.f}, c1[4] = {0.f, 0.f, 0.f, 0.f};
+      mma16816(c0, qf[kk], bh[0], bh[1]);
+      mma16816(c1, qf[kk], bh[2], bh[3]);
+#pragma unroll
+      for (int i = 0; i < 4; ++i) {
+        float ss, ee;
+        two_sum(s[2 * np][i], c0[i], ss, ee);
+        s[2 * np][i] = ss;
+        e[2 * np][i] += ee;
+        two_sum(s[2 * np + 1][i], c1[i], ss, ee);
+        s[2 * np + 1][i] = ss;
+        e[2 * np + 1][i] += ee;
+      }
+      mma16816(cl[2 * np], qf[kk], bm[0], bm[1]);
+      mma16816(cl[2 * np + 1], qf[kk], bm[2], bm[3]);
+      mma16816(cl[2 * np], qf[kk], bl[0], bl[1]);
+      mma16816(cl[2 * np + 1], qf[kk], bl[2], bl[3]);
+    }
+  }
+#pragma unroll
+  for (int j = 0; j < 2 * NP; ++j)
+#pragma unroll
+    for (int i = 0; i < 4; ++i) res[j][i] = s[j][i] + (e[j][i] + cl[j][i]);
+}
+
+// ---------------------------------------------------------------------------------------
+// ---------------------------------------------------------------------------------------
+// ---------------------------------------------------------------------------------------
+DEVI bool better(float a, int ia, float b, int ib) { return a > b || (a == b && ia > ib); }
+
+DEVI void insert8(float (&v)[8], int (&id)[8], float x, int ix) {
+  if (better(x, ix, v[7], id[7])) {
+    v[7] = x;
+    id[7] = ix;
+#pragma unroll
+    for (int k = 7; k > 0; --k) {
+      if (better(v[k], id[k], v[k - 1], id[k - 1])) {
+        float tv = v[k]; v[k] = v[k - 1]; v[k - 1] = tv;
+        int ti = id[k]; id[k] = id[k - 1]; id[k - 1] = ti;
+      }
+    }
+  }
+}
+
+DEVI void merge_quad8(float (&v)[8], int (&id)[8]) {
+#pragma unroll
+  for (int off = 1; off <= 2; off <<= 1) {
+    float ov[8];
+    int oi[8];
+#pragma unroll
+    for (int k = 0; k < 8; ++k) {
+      ov[k] = __shfl_xor_sync(0xffffffffu, v[k], off);
+      oi[k] = __shfl_xor_sync(0xffffffffu, id[k], off);
+    }
+#pragma unroll
+    for (int k = 0; k < 8; ++k) {
+      bool t = better(v[k], id[k], ov[7 - k], oi[7 - k]);
+      if (!t) { v[k] = ov[7 - k]; id[k] = oi[7 - k]; }
+    }
+#pragma unroll
+    for (int d = 4; d >= 1; d >>= 1) {
+#pragma unroll
+      for (int k = 0; k < 8; ++k) {
+        if ((k & d) == 0) {
+          if (better(v[k + d], id[k + d], v[k], id[k])) {
+            float tv = v[k]; v[k] = v[k + d]; v[k + d] = tv;
+            int ti = id[k]; id[k] = id[k + d]; id[k + d] = ti;
+          }
+        }
+      }
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------------------
+// 2. selection
+DEVI int ld_acquire(const int* p) {
+  int v;
+  asm volatile("ld.acquire.gpu.global.b32 %0, [%1];\n" : "=r"(v) : "l"(p) : "memory");
+  return v;
+}
+DEVI void st_release(int* p, int v) {
+  asm volatile("st.release.gpu.global.b32 [%0], %1;\n" [REDACTED: IP] "l"(p), "r"(v) : "memory");
+}
+
+// value-only sorting networks (descending); indices are recovered afterwards from the threshold
+DEVI void cas_desc(float& a, float& b) {
+  const float hi = fmaxf(a, b), lo = fminf(a, b);
+  a = hi;
+  b = lo;
+}
+DEVI void sort8_desc(float (&x)[8]) {
+#pragma unroll
+  for (int k = 2; k <= 8; k <<= 1)
+#pragma unroll
+    for (int j = k >> 1; j > 0; j >>= 1)
+#pragma unroll
+      for (int i = 0; i < 8; ++i) {
+        const int l = i ^ j;
+        if (l > i) {
+          if ((i & k) == 0) cas_desc(x[i], x[l]);
+          else cas_desc(x[l], x[i]);
+        }
+      }
+}
+// a <- top 8 of (a U b), both sorted descending
+DEVI void merge8_desc(float (&a)[8], const float (&b)[8]) {
+#pragma unroll
+  for (int i = 0; i < 8; ++i) a[i] = fmaxf(a[i], b[7 - i]);
+#pragma unroll
+  for (int j = 4; j > 0; j >>= 1)
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+      const int l = i ^ j;
+      if (l > i) cas_desc(a[i], a[l]);
+    }
+}
+DEVI int quad_sum(int x) {
+  x += __shfl_xor_sync(0xffffffffu, x, 1);
+  return x + __shfl_xor_sync(0xffffffffu, x, 2);
+}
+DEVI int quad_max(int x) {
+  x = max(x, __shfl_xor_sync(0xffffffffu, x, 1));
+  return max(x, __shfl_xor_sync(0xffffffffu, x, 2));
+}
+// block index of register position p = 8*tile + 2*j + e held by quad lane tq
+DEVI int pos_blk(int p, int tq) { return 32 * (p >> 3) + 8 * ((p >> 1) & 3) + 2 * tq + (p & 1); }
+
+// Exact top-8 of one query row. The row's candidate importances are spread over the 4 lanes of a
+// quad: lane tq holds imp[t][2j+e] for block 32t + 8j + 2tq + e (-inf when not causal), lane 0 also
+// holds the current block's prefix mean `dg`. Returns this lane's selected positions as a bitmask
+// and whether the current block is selected. Ties at the threshold go to the higher block index,
+// like the reference's descending sort of (importance, index) tuples.
+template <int MAXT>
+DEVI unsigned select_top8(const float (&imp)[MAXT][8], float dg, int c, int tq, bool& dsel) {
+  float top[8];
+#pragma unroll
+  for (int i = 0; i < 8; ++i) top[i] = -INFINITY;
+  top[0] = dg;  // -inf on lanes 1..3
+#pragma unroll
+  for (int t = 0; t < MAXT; ++t) {
+    if (32 * t < c) {
+      float ch[8];
+#pragma unroll
+      for (int i = 0; i < 8; ++i) ch[i] = imp[t][i];
+      sort8_desc(ch);
+      merge8_desc(top, ch);
+    }
+  }
+#pragma unroll
+  for (int off = 1; off <= 2; off <<= 1) {
+    float o[8];
+#pragma unroll
+    for (int i = 0; i < 8; ++i) o[i] = __shfl_xor_sync(0xffffffffu, top[i], off);
+    merge8_desc(top, o);
+  }
+  const float v8 = top[7];  // 8th largest candidate (-inf if fewer than 8 candidates)
+  unsigned gt = 0u, eq = 0u;
+#pragma unroll
+  for (int t = 0; t < MAXT; ++t)
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+      const float v = imp[t][i];
+      if (v > v8) gt |= 1u << (8 * t + i);
+      else if (v == v8 && v8 != -INFINITY) eq |= 1u << (8 * t + i);
+    }
+  dsel = dg > v8;
+  bool deq = (dg == v8) && v8 != -INFINITY;
+  int need = 8 - quad_sum(__popc(gt) + (dsel ? 1 : 0));
+  // tie resolution: repeatedly take the highest tied block index across the quad
+  while (__any_sync(0xffffffffu, need > 0 && v8 != -INFINITY)) {
+    int mine = -1;
+    if (need > 0 && v8 != -INFINITY) {
+      if (deq) mine = c;
+      else if (eq) mine = pos_blk(31 - __clz(eq), tq);
+    }
+    const int best = quad_max(mine);
+    if (best >= 0 && best == mine) {
+      if (deq) {
+        deq = false;
+        dsel = true;
+      } else {
+        const unsigned bit = 1u << (31 - __clz(eq));
+        eq &= ~bit;
+        gt |= bit;
+      }
+    }
+    if (best < 0) need = 0;
+    else --need;
+  }
+  return gt;
+}
+
+constexpr int SEL_TILE = 32;  // key blocks per importance tile
+
+// Exclusive scan of per-(bh,kb) work units (ceil(count/R)) and emission of unit descriptors
+// (bh, kb, start, n) in (bh, kb) order. Executed by one CTA of NT threads.
+template <int NT>
+DEVI void build_desc_block(const int* counts, int4* desc, int* ndesc, int P, int nb, int R, int tid, int* wsum) {
+  const int lane = tid & 31, wid = tid >> 5;
+  const int per = (P + NT - 1) / NT;
+  const int i0 = min(P, tid * per), i1 = min(P, i0 + per);
+  int local = 0;
+  for (int i = i0; i < i1; ++i) local += (__ldcg(counts + i) + R - 1) / R;
+  int x = local;
+#pragma unroll
+  for (int off = 1; off < 32; off <<= 1) {
+    int y = __shfl_up_sync(0xffffffffu, x, off);
+    if (lane >= off) x += y;
+  }
+  if (lane == 31) wsum[wid] = x;
+  __syncthreads();
+  if (wid == 0) {
+    int s = lane < NT / 32 ? wsum[lane] : 0;
+#pragma unroll
+    for (int off = 1; off < 32; off <<= 1) {
+      int y = __shfl_up_sync(0xffffffffu, s, off);
+      if (lane >= off) s += y;
+    }
+    if (lane < NT / 32) wsum[lane] = s;
+  }
+  __syncthreads();
+  int off = x - local + (wid > 0 ? wsum[wid - 1] : 0);
+  if (tid == NT - 1) ndesc[P / nb] = off + local;  // hstart[BH] = total units
+  for (int i = i0; i < i1; ++i) {
+    if (i % nb == 0) ndesc[i / nb] = off;  // hstart[bh]: first unit of head bh
+    const int cnt = __ldcg(counts + i);
+    const int u = (cnt + R - 1) / R;
+    for (int j = 0; j < u; ++j) desc[off + j] = make_int4(i / nb, i % nb, j * R, min(R, cnt - j * R));
+    off += u;
+  }
+}
+
+// syncws layout (ints, zero between calls): [0] ticket, [1] done counter, [2 + bh*nb + kb] ksum-ready flags.
+// CTAs take tickets in (bh, c) order; each publishes its own block's key sum first, then waits only
+// on earlier tickets, so the spin-waits cannot deadlock.
+template <int D, int MAXT, bool DENSE>
+__global__ void __launch_bounds__(128) select_kernel(const bf16* __restrict__ Q, const bf16* __restrict__ K,
+                                                     const bf16* __restrict__ V, bf16* __restrict__ O,
+                                                     bf16* __restrict__ kparts, int* __restrict__ counts,
+                                                     int* __restrict__ lists, int* __restrict__ meta,
+                                                     int* __restrict__ syncws, int4* __restrict__ desc,
+                                                     int* __restrict__ ndesc, int S, int nb, int nbf, int BH,
+                                                     int R, float scale, float sl2) {
+  extern __shared__ __align__(128) uint8_t smem[];
+  __shared__ int s_w, s_last;
+  __shared__ int wsum[4];
+  constexpr int CP = D / 2, RG = 128 / CP;
+  __shared__ float red[RG][D];
+  __shared__ int recs[64][8];  // (kb << 8) | position-in-CTA-bucket, per (row, slot)
+  __shared__ int nrow[64];
+  __shared__ unsigned s_union;
+  const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+  if (tid == 0) {
+    s_w = atomicAdd(&syncws[0], 1);
+    s_union = 0u;
+  }
+  __syncthreads();
+  const int bh = s_w / nb, c = s_w % nb;
+  int* flags = syncws + 2 + bh * nb;
+  const int g = lane >> 2, tq = lane & 3;
+  const int t0 = c * 64;
+  const size_t bhS = (size_t)bh * S;
+  bf16* Qs = reinterpret_cast<bf16*>(smem);
+  bf16* Ks = Qs + 64 * D;
+  bf16* Hs = Qs;  // importance tiles reuse the Q / diagonal-K buffers once those are consumed
+  bf16* Ms = Hs + SEL_TILE * D;
+  bf16* Ls = Ms + SEL_TILE * D;
+  int* hist = reinterpret_cast<int*>(Qs + 128 * D);
+  int* base = hist + nb;
+  const uint32_t sQ = smem_u32(Qs), sK = smem_u32(Ks), sH = smem_u32(Hs), sM = smem_u32(Ms), sL = smem_u32(Ls);
+  const size_t plane = (size_t)BH * nb * D;
+  bf16* kh = kparts + (size_t)bh * nb * D;
+
+  load_rows<D, 64, 128>(sQ, Q + bhS * D, t0, S, tid);
+  load_rows<D, 64, 128>(sK, K + bhS * D, t0, S, tid);
+  cp_async_commit();
+  for (int i = tid; i < nb; i += 128) hist[i] = 0;
+  cp_async_wait<0>();
+  __syncthreads();
+
+  // publish this block's key sum (exact 3-term bf16 split) for later tickets
+  if (c < nbf) {
+    const int cp = tid % CP, rg = tid / CP;
+    float s0 = 0.f, s1 = 0.f;
+#pragma unroll 8
+    for (int r = rg; r < 64; r += RG) {
+      const __nv_bfloat162 x = *reinterpret_cast<const __nv_bfloat162*>(
+          reinterpret_cast<const uint8_t*>(Ks) + swz<D>(r, cp >> 2) + (cp & 3) * 4);
+      const float2 f = __bfloat1622float2(x);
+      s0 += f.x;
+      s1 += f.y;
+    }
+    red[rg][2 * cp] = s0;
+    red[rg][2 * cp + 1] = s1;
+    __syncthreads();
+    if (tid < D) {
+      float s = 0.f;
+#pragma unroll
+      for (int i = 0; i < RG; ++i) s += red[i][tid];
+      const bf16 h = __float2bfloat16_rn(s);
+      const float r1 = s - __bfloat162float(h);
+      const bf16 m = __float2bfloat16_rn(r1);
+      const float r2 = r1 - __bfloat162float(m);
+      const size_t o = (size_t)c * D + tid;
+      kh[o] = h;
+      kh[plane + o] = m;
+      kh[2 * plane + o] = __float2bfloat16_rn(r2);
+    }
+    __syncthreads();
+    if (tid == 0) {
+      __threadfence();
+      st_release(flags + c, 1);
+    }
+  }
+
+  uint32_t qf[D / 16][4];
+  load_a_frags<D>(sQ, warp * 16, lane, qf);
+
+  const int rA = warp * 16 + g, rB = rA + 8;
+  const int tA = t0 + rA, tB = t0 + rB;
+
+  // Earlier blocks' key sums stream in 16-block half tiles, double-buffered in the consumed Q/K
+  // region (half tile h uses rows [48*(h&1), +48) = hi | mid | lo). Each half tile waits only for
+  // its own blocks' ready flags, and its load overlaps the previous half tile's math.
+  // dense path with at most 8 causal blocks (c < 8): the top-8 is every candidate, skip importances
+  const bool take_all = DENSE && c < 8;
+  const int nh = take_all ? 0 : (c + 15) >> 4;
+  auto wait_flags = [&](int lo, int hi) {
+    for (int i = lo + tid; i < hi; i += 128)
+      while (ld_acquire(flags + i) == 0) __nanosleep(64);
+  };
+  auto issue_half = [&](int h) {
+    bf16* hb = Qs + (h & 1) * 48 * D;
+    load_rows<D, 16, 128>(smem_u32(hb), kh, 16 * h, c, tid);
+    load_rows<D, 16, 128>(smem_u32(hb + 16 * D), kh + plane, 16 * h, c, tid);
+    load_rows<D, 16, 128>(smem_u32(hb + 32 * D), kh + 2 * plane, 16 * h, c, tid);
+  };
+  if (nh > 0) {
+    wait_flags(0, min(c, 16));
+    __syncthreads();  // flags observed and every warp holds its Q fragments
+    issue_half(0);    // buffer 0 covers Q rows only; the diagonal K tile stays intact
+  }
+  cp_async_commit();
+
+  float dA, dB;  // current block: causal prefix mean (held by quad lane 0)
+  {
+    float acc[8][4];
+#pragma unroll
+    for (int j = 0; j < 8; ++j) acc[j][0] = acc[j][1] = acc[j][2] = acc[j][3] = 0.f;
+    mma_abt_64<D>(sK, lane, qf, acc);
+    float sa = 0.f, sb = 0.f;
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+#pragma unroll
+      for (int e = 0; e < 2; ++e) {
+        int col = 8 * j + 2 * tq + e;
+        if (col <= rA) sa += acc[j][e];
+        if (col <= rB) sb += acc[j][2 + e];
+      }
+    }
+    sa += __shfl_xor_sync(0xffffffffu, sa, 1);
+    sa += __shfl_xor_sync(0xffffffffu, sa, 2);
+    sb += __shfl_xor_sync(0xffffffffu, sb, 1);
+    sb += __shfl_xor_sync(0xffffffffu, sb, 2);
+    dA = tq == 0 ? sa * scale / (float)(rA + 1) : -INFINITY;
+    dB = tq == 0 ? sb * scale / (float)(rB + 1) : -INFINITY;
+  }
+
+  // importance of every full earlier block, kept in registers: impX[t][2j+e] <-> block 32t+8j+2tq+e
+  const float fscale = scale * (1.0f / 64.0f);
+  float impA[MAXT][8], impB[MAXT][8];
+#pragma unroll
+  for (int t = 0; t < MAXT; ++t)
+#pragma unroll
+    for (int i = 0; i < 8; ++i) impA[t][i] = impB[t][i] = -INFINITY;
+#pragma unroll
+  for (int h = 0; h < 2 * MAXT; ++h) {
+    if (h < nh) {
+      if (h + 1 < nh) {
+        wait_flags(16 * (h + 1), min(c, 16 * (h + 2)));
+        __syncthreads();  // flags observed; buffer (h+1)&1 is free and the diagonal tile is done
+        issue_half(h + 1);
+      }
+      cp_async_commit();
+      cp_async_wait<1>();
+      __syncthreads();
+      const bf16* hb = Qs + (h & 1) * 48 * D;
+      float acc[2][4];
+      importance_tile<D, 1>(smem_u32(hb), smem_u32(hb + 16 * D), smem_u32(hb + 32 * D), lane, qf, acc);
+      const int t = h >> 1, np = h & 1;
+#pragma unroll
+      for (int jj = 0; jj < 2; ++jj)
+#pragma unroll
+        for (int e = 0; e < 2; ++e) {
+          const int j = 2 * np + jj;
+          const bool ok = 16 * h + 8 * jj + 2 * tq + e < c;
+          impA[t][2 * j + e] = ok ? acc[jj][e] * fscale : -INFINITY;
+          impB[t][2 * j + e] = ok ? acc[jj][2 + e] * fscale : -INFINITY;
+        }
+      // no barrier here: buffer h&1 is refilled only after the next iteration's barrier
+    }
+  }
+  __syncthreads();  // importance tiles fully consumed before the region is reused
+  bool dselA = true, dselB = true;
+  unsigned gA, gB;
+  if (take_all) {  // lane tq owns blocks 2tq, 2tq+1 (register positions 0, 1)
+    gA = gB = (2 * tq < c ? 1u : 0u) | (2 * tq + 1 < c ? 2u : 0u);
+  } else {
+    gA = select_top8<MAXT>(impA, dA, c, tq, dselA);
+    gB = select_top8<MAXT>(impB, dB, c, tq, dselB);
+  }
+  if constexpr (DENSE) {
+    // Short sequence: attend every candidate block directly under a per-row block mask, so this
+    // CTA finishes its 64 queries without the sparse / merge kernels.
+    unsigned bmA = 0u, bmB = 0u;  // selected earlier blocks (bit b = block b), identical across the quad
+    for (unsigned m = gA; m; m &= m - 1) bmA |= 1u << pos_blk(__ffs(m) - 1, tq);
+    for (unsigned m = gB; m; m &= m - 1) bmB |= 1u << pos_blk(__ffs(m) - 1, tq);
+    bmA |= __shfl_xor_sync(0xffffffffu, bmA, 1);
+    bmA |= __shfl_xor_sync(0xffffffffu, bmA, 2);
+    bmB |= __shfl_xor_sync(0xffffffffu, bmB, 1);
+    bmB |= __shfl_xor_sync(0xffffffffu, bmB, 2);
+    if (tq == 0) atomicOr(&s_union, bmA | bmB);
+    __syncthreads();  // also: every warp is done with the importance tiles
+    // after block c: blocks <= c-2 that some row selected, then c-1 (window part at least)
+    unsigned rest = s_union & (c >= 2 ? ((1u << (c - 1)) - 1u) : 0u);
+    if (c >= 1) rest |= 1u << (c - 1);
+    bf16* Kb = Qs;  // double buffer: K0 V0 K1 V1, 64 x D each
+    float o[D / 8][4];
+#pragma unroll
+    for (int j = 0; j < D / 8; ++j) o[j][0] = o[j][1] = o[j][2] = o[j][3] = 0.f;
+    float wmA = -INFINITY, wmB = -INFINITY, wlA = 0.f, wlB = 0.f;
+    int kb = c, buf = 0;
+    load_rows<D, 64, 128>(smem_u32(Kb), K + bhS * D, kb * 64, S, tid);
+    load_rows<D, 64, 128>(smem_u32(Kb + 64 * D), V + bhS * D, kb * 64, S, tid);
+    cp_async_commit();
+#pragma unroll 1
+    for (;;) {
+      const int kn = rest ? __ffs(rest) - 1 : -1;
+      rest &= rest - 1;
+      if (kn >= 0) {
+        load_rows<D, 64, 128>(smem_u32(Kb + (2 * (buf ^ 1)) * 64 * D), K + bhS * D, kn * 64, S, tid);
+        load_rows<D, 64, 128>(smem_u32(Kb + (2 * (buf ^ 1) + 1) * 64 * D), V + bhS * D, kn * 64, S, tid);
+      }
+      cp_async_commit();
+      cp_async_wait<1>();
+      __syncthreads();
+      const uint32_t sKw = smem_u32(Kb + 2 * buf * 64 * D), sVw = smem_u32(Kb + (2 * buf + 1) * 64 * D);
+      float s[8][4];
+#pragma unroll
+      for (int j = 0; j < 8; ++j) s[j][0] = s[j][1] = s[j][2] = s[j][3] = 0.f;
+      mma_abt_64<D>(sKw, lane, qf, s);
+      const bool selA = (bmA >> kb) & 1u, selB = (bmB >> kb) & 1u;
+      float mxA = -INFINITY, mxB = -INFINITY;
+#pragma unroll
+      for (int j = 0; j < 8; ++j) {
+#pragma unroll
+        for (int e = 0; e < 2; ++e) {
+          const int col = 8 * j + 2 * tq + e;
+          const bool va = kb == c ? (col <= rA) : kb == c - 1 ? (selA || col > rA) : selA;
+          const bool vb = kb == c ? (col <= rB) : kb == c - 1 ? (selB || col > rB) : selB;
+          s[j][e] = va ? s[j][e] * sl2 : -INFINITY;
+          s[j][2 + e] = vb ? s[j][2 + e] * sl2 : -INFINITY;
+          mxA = fmaxf(mxA, s[j][e]);
+          mxB = fmaxf(mxB, s[j][2 + e]);
+        }
+      }
+      mxA = fmaxf(mxA, __shfl_xor_sync(0xffffffffu, mxA, 1));
+      mxA = fmaxf(mxA, __shfl_xor_sync(0xffffffffu, mxA, 2));
+      mxB = fmaxf(mxB, __shfl_xor_sync(0xffffffffu, mxB, 1));
+      mxB = fmaxf(mxB, __shfl_xor_sync(0xffffffffu, mxB, 2));
+      const float nmA = fmaxf(wmA, mxA), nmB = fmaxf(wmB, mxB);  // finite: block c comes first
+      const float aA = fast_exp2(wmA - nmA), aB = fast_exp2(wmB - nmB);
+      float sA = 0.f, sB = 0.f;
+#pragma unroll
+      for (int j = 0; j < 8; ++j) {
+        s[j][0] = fast_exp2(s[j][0] - nmA);
+        s[j][1] = fast_exp2(s[j][1] - nmA);
+        s[j][2] = fast_exp2(s[j][2] - nmB);
+        s[j][3] = fast_exp2(s[j][3] - nmB);
+        sA += s[j][0] + s[j][1];
+        sB += s[j][2] + s[j][3];
+      }
+      sA += __shfl_xor_sync(0xffffffffu, sA, 1);
+      sA += __shfl_xor_sync(0xffffffffu, sA, 2);
+      sB += __shfl_xor_sync(0xffffffffu, sB, 1);
+      sB += __shfl_xor_sync(0xffffffffu, sB, 2);
+      wlA = wlA * aA + sA;
+      wlB = wlB * aB + sB;
+      wmA = nmA;
+      wmB = nmB;
+#pragma unroll
+      for (int j = 0; j < D / 8; ++j) {
+        o[j][0] *= aA; o[j][1] *= aA;
+        o[j][2] *= aB; o[j][3] *= aB;
+      }
+      mma_pv_64<D>(sVw, lane, s, o);
+      __syncthreads();  // this buffer may be refilled next iteration
+      if (kn < 0) break;
+      kb = kn;
+      buf ^= 1;
+    }
+    // normalized output, staged through smem for coalesced stores
+    const float iA = 1.f / wlA, iB = 1.f / wlB;
+#pragma unroll
+    for (int j = 0; j < D / 8; ++j) {
+      *reinterpret_cast<uint32_t*>(reinterpret_cast<uint8_t*>(Kb) + swz<D>(rA, j) + 4 * tq) =
+          pack_bf16(o[j][0] * iA, o[j][1] * iA);
+      *reinterpret_cast<uint32_t*>(reinterpret_cast<uint8_t*>(Kb) + swz<D>(rB, j) + 4 * tq) =
+          pack_bf16(o[j][2] * iB, o[j][3] * iB);
+    }
+    __syncthreads();
+    constexpr int CPR = D / 8;
+#pragma unroll
+    for (int idx = tid; idx < 64 * CPR; idx += 128) {
+      const int row = idx / CPR, ch = idx % CPR;
+      if (t0 + row < S)
+        *reinterpret_cast<uint4*>(O + (bhS + t0 + row) * D + ch * 8) =
+            *reinterpret_cast<const uint4*>(reinterpret_cast<const uint8_t*>(Kb) + swz<D>(row, ch));
+    }
+    // the last CTA to finish resets the tickets and ready flags for the next call
+    __syncthreads();
+    if (tid == 0) {
+      __threadfence();
+      const int d = atomicAdd(&syncws[1], 1);
+      s_last = (d == (int)gridDim.x - 1);
+    }
+    __syncthreads();
+    if (s_last) {
+      __threadfence();
+      for (int i = tid; i < BH * nb; i += 128) syncws[2 + i] = 0;
+      if (tid == 0) {
+        syncws[0] = 0;
+        syncws[1] = 0;
+      }
+    }
+    return;
+  }
+
+
+  // Classify: block c is always inside the window; block c-1 is handled by the window kernel
+  // (flag); blocks <= c-2 go to the sparse buckets.
+  int prevA = 0, prevB = 0;
+  unsigned kmA = gA, kmB = gB;
+  if (c >= 1) {
+    const int b = c - 1;
+    if (((b >> 1) & 3) == tq) {
+      const unsigned bit = 1u << (8 * (b >> 5) + 2 * ((b >> 3) & 3) + (b & 1));
+      prevA = (gA & bit) ? 1 : 0;
+      prevB = (gB & bit) ? 1 : 0;
+      kmA &= ~bit;
+      kmB &= ~bit;
+    }
+  }
+  prevA = quad_max(prevA);
+  prevB = quad_max(prevB);
+  // padding rows past the sequence end contribute nothing
+  if (tA >= S) kmA = 0u;
+  if (tB >= S) kmB = 0u;
+  // slots: lanes 0..3 of the quad own consecutive slot ranges (exclusive prefix over the quad)
+  const int cA = __popc(kmA), cB = __popc(kmB);
+  int incA = cA, incB = cB;
+#pragma unroll
+  for (int off = 1; off <= 2; off <<= 1) {
+    const int yA = __shfl_up_sync(0xffffffffu, incA, off), yB = __shfl_up_sync(0xffffffffu, incB, off);
+    if (tq >= off) {
+      incA += yA;
+      incB += yB;
+    }
+  }
+  const int preA = incA - cA, preB = incB - cB;
+  const int totA = quad_sum(cA), totB = quad_sum(cB);
+  {
+    unsigned m = kmA;
+    int slot = preA;
+    while (m) {
+      const int p = __ffs(m) - 1;
+      m &= m - 1;
+      const int kb = pos_blk(p, tq);
+      const int pos = atomicAdd(&hist[kb], 1);
+      recs[rA][slot++] = (kb << 8) | pos;
+    }
+    m = kmB;
+    slot = preB;
+    while (m) {
+      const int p = __ffs(m) - 1;
+      m &= m - 1;
+      const int kb = pos_blk(p, tq);
+      const int pos = atomicAdd(&hist[kb], 1);
+      recs[rB][slot++] = (kb << 8) | pos;
+    }
+  }
+  if (tq == 0) {
+    nrow[rA] = tA < S ? totA : 0;
+    nrow[rB] = tB < S ? totB : 0;
+    if (tA < S) meta[bhS + tA] = totA | (prevA << 8);
+    if (tB < S) meta[bhS + tB] = totB | (prevB << 8);
+  }
+  __syncthreads();
+  for (int i = tid; i < c - 1; i += 128) {
+    int h = hist[i];
+    if (h > 0) base[i] = atomicAdd(&counts[bh * nb + i], h);
+  }
+  __syncthreads();
+#pragma unroll
+  for (int k = 0; k < 4; ++k) {
+    const int idx = tid + 128 * k;
+    const int row = idx >> 3, slot = idx & 7;
+    if (slot < nrow[row]) {
+      const int rc = recs[row][slot];
+      const int kb = rc >> 8;
+      lists[((size_t)bh * nb + kb) * S + base[kb] + (rc & 255)] = (t0 + row) * 8 + slot;
+    }
+  }
+
+  // the last CTA to finish turns the bucket sizes into work descriptors and resets the tickets
+  __syncthreads();
+  if (tid == 0) {
+    __threadfence();
+    const int d = atomicAdd(&syncws[1], 1);
+    s_last = (d == (int)gridDim.x - 1);
+  }
+  __syncthreads();
+  if (s_last) {
+    __threadfence();
+    build_desc_block<128>(counts, desc, ndesc, BH * nb, nb, R, tid, wsum);
+    if (tid == 0) {
+      syncws[0] = 0;
+      syncws[1] = 0;
+    }
+  }
+}
+
+// Generic selection for long sequences (more candidate blocks than the register-resident fast path
+// holds): per-lane sorted insertion + bitonic quad merge. Same outputs as select_kernel.
+template <int D>
+__global__ void __launch_bounds__(128) select_kernel_generic(const bf16* __restrict__ Q, const bf16* __restrict__ K,
+                                                     bf16* __restrict__ kparts, int* __restrict__ counts,
+                                                     int* __restrict__ lists, int* __restrict__ meta,
+                                                     int* __restrict__ syncws, int4* __restrict__ desc,
+                                                     int* __restrict__ ndesc, int S, int nb, int nbf, int BH,
+                                                     int R, float scale) {
+  extern __shared__ __align__(128) uint8_t smem[];
+  __shared__ int s_w, s_last;
+  __shared__ int wsum[4];
+  constexpr int CP = D / 2, RG = 128 / CP;
+  __shared__ float red[RG][D];
+  const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+  if (tid == 0) s_w = atomicAdd(&syncws[0], 1);
+  __syncthreads();
+  const int bh = s_w / nb, c = s_w % nb;
+  int* flags = syncws + 2 + bh * nb;
+  const int g = lane >> 2, tq = lane & 3;
+  const int t0 = c * 64;
+  const size_t bhS = (size_t)bh * S;
+  bf16* Qs = reinterpret_cast<bf16*>(smem);
+  bf16* Ks = Qs + 64 * D;
+  bf16* Hs = Qs;  // importance tiles reuse the Q / diagonal-K buffers once those are consumed
+  bf16* Ms = Hs + SEL_TILE * D;
+  bf16* Ls = Ms + SEL_TILE * D;
+  int* hist = reinterpret_cast<int*>(Qs + 128 * D);
+  int* base = hist + nb;
+  const uint32_t sQ = smem_u32(Qs), sK = smem_u32(Ks), sH = smem_u32(Hs), sM = smem_u32(Ms), sL = smem_u32(Ls);
+  const size_t plane = (size_t)BH * nb * D;
+  bf16* kh = kparts + (size_t)bh * nb * D;
+
+  load_rows<D, 64, 128>(sQ, Q + bhS * D, t0, S, tid);
+  load_rows<D, 64, 128>(sK, K + bhS * D, t0, S, tid);
+  cp_async_commit();
+  for (int i = tid; i < nb; i += 128) hist[i] = 0;
+  cp_async_wait<0>();
+  __syncthreads();
+
+  // publish this block's key sum (exact 3-term bf16 split) for later tickets
+  if (c < nbf) {
+    const int cp = tid % CP, rg = tid / CP;
+    float s0 = 0.f, s1 = 0.f;
+#pragma unroll 8
+    for (int r = rg; r < 64; r += RG) {
+      const __nv_bfloat162 x = *reinterpret_cast<const __nv_bfloat162*>(
+          reinterpret_cast<const uint8_t*>(Ks) + swz<D>(r, cp >> 2) + (cp & 3) * 4);
+      const float2 f = __bfloat1622float2(x);
+      s0 += f.x;
+      s1 += f.y;
+    }
+    red[rg][2 * cp] = s0;
+    red[rg][2 * cp + 1] = s1;
+    __syncthreads();
+    if (tid < D) {
+      float s = 0.f;
+#pragma unroll
+      for (int i = 0; i < RG; ++i) s += red[i][tid];
+      const bf16 h = __float2bfloat16_rn(s);
+      const float r1 = s - __bfloat162float(h);
+      const bf16 m = __float2bfloat16_rn(r1);
+      const float r2 = r1 - __bfloat162float(m);
+      const size_t o = (size_t)c * D + tid;
+      kh[o] = h;
+      kh[plane + o] = m;
+      kh[2 * plane + o] = __float2bfloat16_rn(r2);
+    }
+    __syncthreads();
+    if (tid == 0) {
+      __threadfence();
+      st_release(flags + c, 1);
+    }
+  }
+
+  uint32_t qf[D / 16][4];
+  load_a_frags<D>(sQ, warp * 16, lane, qf);
+
+  const int rA = warp * 16 + g, rB = rA + 8;
+  const int tA = t0 + rA, tB = t0 + rB;
+
+  float vA[8], vB[8];
+  int iA[8], iB[8];
+#pragma unroll
+  for (int k = 0; k < 8; ++k) { vA[k] = -INFINITY; vB[k] = -INFINITY; iA[k] = -1; iB[k] = -1; }
+
+  {  // current block: causal prefix mean
+    float acc[8][4];
+#pragma unroll
+    for (int j = 0; j < 8; ++j) acc[j][0] = acc[j][1] = acc[j][2] = acc[j][3] = 0.f;
+    mma_abt_64<D>(sK, lane, qf, acc);
+    float sa = 0.f, sb = 0.f;
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+#pragma unroll
+      for (int e = 0; e < 2; ++e) {
+        int col = 8 * j + 2 * tq + e;
+        if (col <= rA) sa += acc[j][e];
+        if (col <= rB) sb += acc[j][2 + e];
+      }
+    }
+    sa += __shfl_xor_sync(0xffffffffu, sa, 1);
+    sa += __shfl_xor_sync(0xffffffffu, sa, 2);
+    sb += __shfl_xor_sync(0xffffffffu, sb, 1);
+    sb += __shfl_xor_sync(0xffffffffu, sb, 2);
+    if (tq == 0) {
+      vA[0] = sa * scale / (float)(rA + 1); iA[0] = c;
+      vB[0] = sb * scale / (float)(rB + 1); iB[0] = c;
+    }
+  }
+
+  // wait until every earlier block's key sum is published
+  for (int i = tid; i < c; i += 128) {
+    while (ld_acquire(flags + i) == 0) __nanosleep(64);
+  }
+  __syncthreads();
+
+  const float fscale = scale * (1.0f / 64.0f);
+  for (int b0 = 0; b0 < c; b0 += SEL_TILE) {
+    if (b0 > 0) __syncthreads();
+    load_rows<D, SEL_TILE, 128>(sH, kh, b0, c, tid);
+    load_rows<D, SEL_TILE, 128>(sM, kh + plane, b0, c, tid);
+    load_rows<D, SEL_TILE, 128>(sL, kh + 2 * plane, b0, c, tid);
+    cp_async_commit();
+    cp_async_wait<0>();
+    __syncthreads();
+    float acc[SEL_TILE / 8][4];
+    importance_tile<D, SEL_TILE / 16>(sH, sM, sL, lane, qf, acc);
+#pragma unroll
+    for (int j = 0; j < SEL_TILE / 8; ++j) {
+#pragma unroll
+      for (int e = 0; e < 2; ++e) {
+        int blk = b0 + 8 * j + 2 * tq + e;
+        if (blk < c) {
+          insert8(vA, iA, acc[j][e] * fscale, blk);
+          insert8(vB, iB, acc[j][2 + e] * fscale, blk);
+        }
+      }
+    }
+  }
+  merge_quad8(vA, iA);
+  merge_quad8(vB, iB);
+
+  // Classify selections: block c is always inside the window; block c-1 is handled by the
+  // window kernel (flag); blocks <= c-2 go to the sparse buckets.
+  int prevA = 0, prevB = 0, mA = 0, mB = 0;
+#pragma unroll
+  for (int k = 0; k < 8; ++k) {
+    if (iA[k] == c - 1) prevA = 1;
+    if (iB[k] == c - 1) prevB = 1;
+    if (iA[k] >= 0 && iA[k] <= c - 2) mA |= 1 << k;
+    if (iB[k] >= 0 && iB[k] <= c - 2) mB |= 1 << k;
+  }
+  int pkb[2][2], ppos[2][2], pent[2][2];
+#pragma unroll
+  for (int k = 0; k < 8; ++k) {
+    if ((k >> 1) == tq) {
+      const int kk = k & 1;
+      pkb[0][kk] = -1;
+      pkb[1][kk] = -1;
+      if (((mA >> k) & 1) && tA < S) {
+        int slot = __popc(mA & ((1 << k) - 1));
+        pkb[0][kk] = iA[k];
+        ppos[0][kk] = atomicAdd(&hist[iA[k]], 1);
+        pent[0][kk] = tA * 8 + slot;
+      }
+      if (((mB >> k) & 1) && tB < S) {
+        int slot = __popc(mB & ((1 << k) - 1));
+        pkb[1][kk] = iB[k];
+        ppos[1][kk] = atomicAdd(&hist[iB[k]], 1);
+        pent[1][kk] = tB * 8 + slot;
+      }
+    }
+  }
+  if (tq == 0) {
+    if (tA < S) meta[bhS + tA] = __popc(mA) | (prevA << 8);
+    if (tB < S) meta[bhS + tB] = __popc(mB) | (prevB << 8);
+  }
+  __syncthreads();
+  for (int i = tid; i < c - 1; i += 128) {
+    int h = hist[i];
+    if (h > 0) base[i] = atomicAdd(&counts[bh * nb + i], h);
+  }
+  __syncthreads();
+#pragma unroll
+  for (int r = 0; r < 2; ++r) {
+#pragma unroll
+    for (int kk = 0; kk < 2; ++kk) {
+      int kb = pkb[r][kk];
+      if (kb >= 0) lists[((size_t)bh * nb + kb) * S + base[kb] + ppos[r][kk]] = pent[r][kk];
+    }
+  }
+
+  // the last CTA to finish turns the bucket sizes into work descriptors and resets the tickets
+  __syncthreads();
+  if (tid == 0) {
+    __threadfence();
+    const int d = atomicAdd(&syncws[1], 1);
+    s_last = (d == (int)gridDim.x - 1);
+  }
+  __syncthreads();
+  if (s_last) {
+    __threadfence();
+    build_desc_block<128>(counts, desc, ndesc, BH * nb, nb, R, tid, wsum);
+    if (tid == 0) {
+      syncws[0] = 0;
+      syncws[1] = 0;
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------------------
+// 4. sparse partials: one key block in smem, gathered query rows in (16*NW)-row chunks with the
+// next chunk's gather in flight while the current one computes.
+template <int D, int NW, typename ET>
+__global__ void __launch_bounds__(32 * NW) sparse_kernel(const bf16* __restrict__ Q, const bf16* __restrict__ K,
+                                                     const bf16* __restrict__ V, const int4* __restrict__ desc,
+                                                     const int* __restrict__ ndesc, const int* __restrict__ lists,
+                                                     bf16* __restrict__ part, float2* __restrict__ ml,
+                                                     int S, int nb, float sl2, int h0, int h1) {
+  extern __shared__ __align__(128) uint8_t smem[];
+  constexpr int NT = 32 * NW, CH = 16 * NW;
+  const int u = ndesc[h0] + (int)blockIdx.x;  // ndesc = per-head unit offsets (hstart)
+  if (u >= ndesc[h1]) return;
+  const int4 dsc = desc[u];
+  const int bh = dsc.x, kb = dsc.y, start = dsc.z, n = dsc.w;
+  const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, g = lane >> 2, tq = lane & 3;
+  const size_t bhS = (size_t)bh * S;
+  bf16* Ks = reinterpret_cast<bf16*>(smem);
+  bf16* Vs = Ks + 64 * D;
+  bf16* Qb = Vs + 64 * D;  // two CH-row buffers
+  ET* ent = reinterpret_cast<ET*>(Qb + 2 * CH * D);  // [2][CH] bucket entries t*8+slot (row < rows only)
+  const uint32_t sK = smem_u32(Ks), sV = smem_u32(Vs);
+  const int* lst = lists + ((size_t)bh * nb + kb) * S + start;
+  constexpr int CPR = D / 8;
+  const int nch = (n + CH - 1) / CH;
+
+  auto gather = [&](int ci) {
+    const int buf = ci & 1;
+    const uint32_t sQ = smem_u32(Qb + buf * CH * D);
+    const int c0 = ci * CH, rows = min(CH, n - c0);
+#pragma unroll
+    for (int idx = tid; idx < CH * CPR; idx += NT) {
+      const int row = idx / CPR, ch = idx % CPR;
+      const int e = row < rows ? __ldcg(lst + c0 + row) : -1;
+      if (ch == 0) ent[buf * CH + row] = (ET)e;
+      const bool valid = e >= 0;
+      cp_async16(sQ + swz<D>(row, ch), valid ? (Q + (bhS + (e >> 3)) * D + ch * 8) : Q, valid);
+    }
+  };
+
+  load_rows<D, 64, NT>(sK, K + bhS * D, kb * 64, S, tid);
+  load_rows<D, 64, NT>(sV, V + bhS * D, kb * 64, S, tid);
+  gather(0);
+  cp_async_commit();
+
+  for (int ci = 0; ci < nch; ++ci) {
+    __syncthreads();  // the other buffer's previous contents have been written out
+    if (ci + 1 < nch) gather(ci + 1);
+    cp_async_commit();
+    cp_async_wait<1>();
+    __syncthreads();
+    const int buf = ci & 1;
+    bf16* Qs = Qb + buf * CH * D;
+    const ET* en = ent + buf * CH;
+    const int rows = min(CH, n - ci * CH);
+
+    uint32_t qf[D / 16][4];
+    load_a_frags<D>(smem_u32(Qs), warp * 16, lane, qf);
+    float s[8][4];
+#pragma unroll
+    for (int j = 0; j < 8; ++j) s[j][0] = s[j][1] = s[j][2] = s[j][3] = 0.f;
+    mma_abt_64<D>(sK, lane, qf, s);
+
+    float mxA = -INFINITY, mxB = -INFINITY;
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+      mxA = fmaxf(mxA, fmaxf(s[j][0], s[j][1]));
+      mxB = fmaxf(mxB, fmaxf(s[j][2], s[j][3]));
+    }
+    mxA = fmaxf(mxA, __shfl_xor_sync(0xffffffffu, mxA, 1));
+    mxA = fmaxf(mxA, __shfl_xor_sync(0xffffffffu, mxA, 2));
+    mxB = fmaxf(mxB, __shfl_xor_sync(0xffffffffu, mxB, 1));
+    mxB = fmaxf(mxB, __shfl_xor_sync(0xffffffffu, mxB, 2));
+    const float mA = mxA * sl2, mB = mxB * sl2;
+    float lA = 0.f, lB = 0.f;
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+      s[j][0] = fast_exp2(s[j][0] * sl2 - mA);
+      s[j][1] = fast_exp2(s[j][1] * sl2 - mA);
+      s[j][2] = fast_exp2(s[j][2] * sl2 - mB);
+      s[j][3] = fast_exp2(s[j][3] * sl2 - mB);
+      lA += s[j][0] + s[j][1];
+      lB += s[j][2] + s[j][3];
+    }
+    lA += __shfl_xor_sync(0xffffffffu, lA, 1);
+    lA += __shfl_xor_sync(0xffffffffu, lA, 2);
+    lB += __shfl_xor_sync(0xffffffffu, lB, 1);
+    lB += __shfl_xor_sync(0xffffffffu, lB, 2);
+
+    float o[D / 8][4];
+#pragma unroll
+    for (int j = 0; j < D / 8; ++j) o[j][0] = o[j][1] = o[j][2] = o[j][3] = 0.f;
+    mma_pv_64<D>(sV, lane, s, o);
+
+    __syncthreads();  // all warps done reading this Q buffer
+    const float iA = 1.f / lA, iB = 1.f / lB;
+    const int rA = warp * 16 + g, rB = rA + 8;
+#pragma unroll
+    for (int j = 0; j < D / 8; ++j) {
+      *reinterpret_cast<uint32_t*>(reinterpret_cast<uint8_t*>(Qs) + swz<D>(rA, j) + 4 * tq) =
+          pack_bf16(o[j][0] * iA, o[j][1] * iA);
+      *reinterpret_cast<uint32_t*>(reinterpret_cast<uint8_t*>(Qs) + swz<D>(rB, j) + 4 * tq) =
+          pack_bf16(o[j][2] * iB, o[j][3] * iB);
+    }
+    if (tq == 0) {
+      if (rA < rows) {
+        const int eA = en[rA];
+        ml[(bhS + (eA >> 3)) * 8 + (eA & 7)] = make_float2(mA, lA);
+      }
+      if (rB < rows) {
+        const int eB = en[rB];
+        ml[(bhS + (eB >> 3)) * 8 + (eB & 7)] = make_float2(mB, lB);
+      }
+    }
+    __syncthreads();
+#pragma unroll
+    for (int idx = tid; idx < CH * CPR; idx += NT) {
+      const int row = idx / CPR, ch = idx % CPR;
+      if (row < rows) {
+        const int e = en[row];
+        const uint4 val = *reinterpret_cast<const uint4*>(reinterpret_cast<const uint8_t*>(Qs) + swz<D>(row, ch));
+        *reinterpret_cast<uint4*>(part + ((bhS + (e >> 3)) * 8 + (e & 7)) * D + ch * 8) = val;
+      }
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------------------
+// 5. window attention + merge
+template <int D>
+__global__ void __launch_bounds__(128) window_merge_kernel(const bf16* __restrict__ Q, const bf16* __restrict__ K,
+                                                           const bf16* __restrict__ V, const int* __restrict__ meta,
+                                                           const bf16* __restrict__ part,
+                                                           const float2* __restrict__ ml, bf16* __restrict__ O,
+                                                           int* __restrict__ syncws, int* __restrict__ counts,
+                                                           int S, int nb, float sl2, int h0) {
+  extern __shared__ __align__(128) uint8_t smem[];
+  const int c = blockIdx.x, bh = h0 + blockIdx.y, tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+  if (tid == 0) {  // reset per-call selection state for the next call
+    syncws[2 + bh * nb + c] = 0;
+    counts[bh * nb + c] = 0;
+  }
+  const int g = lane >> 2, tq = lane & 3;
+  const int t0 = c * 64;
+  const size_t bhS = (size_t)bh * S;
+  bf16* Qs = reinterpret_cast<bf16*>(smem);
+  bf16* Ks = Qs + 64 * D;   // one key block at a time: block c, then block c-1
+  bf16* Vs = Ks + 64 * D;
+  float* Os = reinterpret_cast<float*>(smem);  // reused after attention: [64][D + 4] fp32
+  float* mrow = reinterpret_cast<float*>(Vs + 64 * D);
+  float* lrow = mrow + 64;
+  int* nrow = reinterpret_cast<int*>(lrow + 64);
+  constexpr int OST = D + 4;
+  const uint32_t sQ = smem_u32(Qs), sK = smem_u32(Ks), sV = smem_u32(Vs);
+  load_rows<D, 64, 128>(sQ, Q + bhS * D, t0, S, tid);
+  load_rows<D, 64, 128>(sK, K + bhS * D, t0, S, tid);
+  load_rows<D, 64, 128>(sV, V + bhS * D, t0, S, tid);
+  cp_async_commit();
+
+  const int rA = warp * 16 + g, rB = rA + 8;
+  const int tA = t0 + rA, tB = t0 + rB;
+  const int metaA = tA < S ? meta[bhS + tA] : 0;
+  const int metaB = tB < S ? meta[bhS + tB] : 0;
+  const bool prevA = (metaA >> 8) & 1, prevB = (metaB >> 8) & 1;
+
+  cp_async_wait<0>();
+  __syncthreads();
+  uint32_t qf[D / 16][4];
+  load_a_frags<D>(sQ, warp * 16, lane, qf);
+
+  float o[D / 8][4];
+#pragma unroll
+  for (int j = 0; j < D / 8; ++j) o[j][0] = o[j][1] = o[j][2] = o[j][3] = 0.f;
+  float mA = -INFINITY, mB = -INFINITY, lA = 0.f, lB = 0.f;
+
+#pragma unroll 1
+  for (int pass = 0; pass < 2; ++pass) {
+    // pass 0: current block (always has key t itself), pass 1: previous block
+    if (pass == 1 && c == 0) break;
+    if (pass == 1) {  // previous block into the same buffers
+      __syncthreads();
+      load_rows<D, 64, 128>(sK, K + bhS * D, t0 - 64, S, tid);
+      load_rows<D, 64, 128>(sV, V + bhS * D, t0 - 64, S, tid);
+      cp_async_commit();
+      cp_async_wait<0>();
+      __syncthreads();
+    }
+    float s[8][4];
+#pragma unroll
+    for (int j = 0; j < 8; ++j) s[j][0] = s[j][1] = s[j][2] = s[j][3] = 0.f;
+    mma_abt_64<D>(sK, lane, qf, s);
+    float mxA = -INFINITY, mxB = -INFINITY;
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+#pragma unroll
+      for (int e = 0; e < 2; ++e) {
+        int col = 8 * j + 2 * tq + e;
+        bool va = pass == 0 ? (col <= rA) : (prevA || col > rA);
+        bool vb = pass == 0 ? (col <= rB) : (prevB || col > rB);
+        s[j][e] = va ? s[j][e] * sl2 : -INFINITY;
+        s[j][2 + e] = vb ? s[j][2 + e] * sl2 : -INFINITY;
+        mxA = fmaxf(mxA, s[j][e]);
+        mxB = fmaxf(mxB, s[j][2 + e]);
+      }
+    }
+    mxA = fmaxf(mxA, __shfl_xor_sync(0xffffffffu, mxA, 1));
+    mxA = fmaxf(mxA, __shfl_xor_sync(0xffffffffu, mxA, 2));
+    mxB = fmaxf(mxB, __shfl_xor_sync(0xffffffffu, mxB, 1));
+    mxB = fmaxf(mxB, __shfl_xor_sync(0xffffffffu, mxB, 2));
+    const float nmA = fmaxf(mA, mxA), nmB = fmaxf(mB, mxB);
+    const float aA = fast_exp2(mA - nmA), aB = fast_exp2(mB - nmB);
+    float sA = 0.f, sB = 0.f;
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+      s[j][0] = fast_exp2(s[j][0] - nmA);
+      s[j][1] = fast_exp2(s[j][1] - nmA);
+      s[j][2] = fast_exp2(s[j][2] - nmB);
+      s[j][3] = fast_exp2(s[j][3] - nmB);
+      sA += s[j][0] + s[j][1];
+      sB += s[j][2] + s[j][3];
+    }
+    sA += __shfl_xor_sync(0xffffffffu, sA, 1);
+    sA += __shfl_xor_sync(0xffffffffu, sA, 2);
+    sB += __shfl_xor_sync(0xffffffffu, sB, 1);
+    sB += __shfl_xor_sync(0xffffffffu, sB, 2);
+    lA = lA * aA + sA;
+    lB = lB * aB + sB;
+    mA = nmA;
+    mB = nmB;
+#pragma unroll
+    for (int j = 0; j < D / 8; ++j) {
+      o[j][0] *= aA; o[j][1] *= aA;
+      o[j][2] *= aB; o[j][3] *= aB;
+    }
+    mma_pv_64<D>(sV, lane, s, o);
+  }
+
+  // stage the (unnormalized) window accumulator and its stats in smem
+  __syncthreads();  // everyone done with Ks/Vs
+#pragma unroll
+  for (int j = 0; j < D / 8; ++j) {
+    *reinterpret_cast<float2*>(Os + rA * OST + 8 * j + 2 * tq) = make_float2(o[j][0], o[j][1]);
+    *reinterpret_cast<float2*>(Os + rB * OST + 8 * j + 2 * tq) = make_float2(o[j][2], o[j][3]);
+  }
+  if (tq == 0) {
+    mrow[rA] = mA; lrow[rA] = lA; nrow[rA] = metaA & 0xff;
+    mrow[rB] = mB; lrow[rB] = lB; nrow[rB] = metaB & 0xff;
+  }
+  __syncthreads();
+
+  // merge: each thread owns 8 contiguous output columns of one row
+  constexpr int CPR = D / 8;
+#pragma unroll 2
+  for (int idx = tid; idx < 64 * CPR; idx += 128) {
+    const int row = idx / CPR, ch = idx % CPR;
+    const int t = t0 + row;
+    if (t >= S) continue;
+    const int n = nrow[row];
+    float m = mrow[row], l = lrow[row];
+    float acc[8];
+    {
+      const float4 a0 = *reinterpret_cast<const float4*>(Os + row * OST + ch * 8);
+      const float4 a1 = *reinterpret_cast<const float4*>(Os + row * OST + ch * 8 + 4);
+      acc[0] = a0.x; acc[1] = a0.y; acc[2] = a0.z; acc[3] = a0.w;
+      acc[4] = a1.x; acc[5] = a1.y; acc[6] = a1.z; acc[7] = a1.w;
+    }
+    const size_t pb = (bhS + t) * 8;
+    float2 st[8];
+    uint4 pv[8];
+#pragma unroll
+    for (int sl = 0; sl < 8; ++sl) {
+      if (sl < n) {
+        st[sl] = ml[pb + sl];
+        pv[sl] = *reinterpret_cast<const uint4*>(part + (pb + sl) * D + ch * 8);
+      }
+    }
+    float mx = m;
+#pragma unroll
+    for (int sl = 0; sl < 8; ++sl) if (sl < n) mx = fmaxf(mx, st[sl].x);
+    const float a = fast_exp2(m - mx);
+    l *= a;
+#pragma unroll
+    for (int i = 0; i < 8; ++i) acc[i] *= a;
+#pragma unroll
+    for (int sl = 0; sl < 8; ++sl) {
+      if (sl < n) {
+        const float w = st[sl].y * fast_exp2(st[sl].x - mx);
+        l += w;
+        const __nv_bfloat162* p2 = reinterpret_cast<const __nv_bfloat162*>(&pv[sl]);
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+          float2 f = __bfloat1622float2(p2[i]);
+          acc[2 * i] += w * f.x;
+          acc[2 * i + 1] += w * f.y;
+        }
+      }
+    }
+    const float il = 1.f / l;
+    uint4 outv;
+    outv.x = pack_bf16(acc[0] * il, acc[1] * il);
+    outv.y = pack_bf16(acc[2] * il, acc[3] * il);
+    outv.z = pack_bf16(acc[4] * il, acc[5] * il);
+    outv.w = pack_bf16(acc[6] * il, acc[7] * il);
+    *reinterpret_cast<uint4*>(O + (bhS + t) * D + ch * 8) = outv;
+  }
+}
+
+
+constexpr int DENSE_MAX = 16;  // <= this many key blocks: select_kernel attends densely, one launch
+
+// Raise the dynamic-smem limit (and ask for the max shared carveout) only when a launch needs it.
+template <typename KernT>
+static void ensure_smem(KernT kern, int bytes, int& cur) {
+  if (bytes > cur) {
+    cudaFuncSetAttribute(kern, cudaFuncAttributeMaxDynamicSharedMemorySize, bytes);
+    cudaFuncSetAttribute(kern, cudaFuncAttributePreferredSharedMemoryCarveout, (int)cudaSharedmemCarveoutMaxShared);
+    cur = bytes;
+  }
+}
+
+template <int D, int MAXT, bool DENSE>
+static void launch_select(const bf16* q, const bf16* k, const bf16* v, bf16* o, bf16* kparts, int* counts,
+                          int* lists, int* meta, int* syncws, int4* desc, int* ndesc, int S, int nb, int nbf, int BH,
+                          int R, float scale, float sl2, int smem, cudaStream_t st) {
+  static int cur = -1;
+  ensure_smem(select_kernel<D, MAXT, DENSE>, smem, cur);
+  select_kernel<D, MAXT, DENSE><<<nb * BH, 128, smem, st>>>(q, k, v, o, kparts, counts, lists, meta, syncws, desc,
+                                                             ndesc, S, nb, nbf, BH, R, scale, sl2);
+}
+
+template <int D>
+static void launch_all(const bf16* q, const bf16* k, const bf16* v, bf16* o, int BH, int S, bf16* kparts,
+                       int* counts, int* lists, int* meta, int* syncws, int4* desc, int* ndesc, bf16* part,
+                       float2* ml, int max_units, cudaStream_t st) {
+  const int nb = (S + 63) / 64, nbf = S / 64;
+  const float scale = 1.0f / sqrtf((float)D);
+  const float sl2 = scale * 1.4426950408889634f;
+  (void)max_units;
+  if (nb <= DENSE_MAX) {
+    launch_select<D, 1, true>(q, k, v, o, kparts, counts, lists, meta, syncws, desc, ndesc, S, nb, nbf, BH, 1, scale,
+                              sl2, 4 * 64 * D * 2, st);
+    return;
+  }
+  // sparse kernel: D=64 -> 4 warps / 64-row chunks, D=128 -> 8 warps / 128-row chunks; units = 2 chunks
+  constexpr int SP_NW = D == 64 ? 4 : 8, SP_CH = 16 * SP_NW, SP_R = 2 * SP_CH;
+  const int sel_smem = 2 * 64 * D * 2 + 2 * nb * 4;
+  const bool narrow = (int64_t)S * 8 <= 65536;  // entries fit uint16: 256 B less smem -> 3 CTAs/SM at D=64
+  const int sp_smem = (2 * 64 + 2 * SP_CH) * D * 2 + 2 * SP_CH * (narrow ? 2 : 4);
+  const int wm_smem = 3 * 64 * D * 2 + 3 * 64 * 4;
+  static int cur_gen = -1, cur_sp = -1, cur_wm = -1;
+  static int cur_sp16 = -1;
+  if (narrow) ensure_smem(sparse_kernel<D, SP_NW, uint16_t>, sp_smem, cur_sp16);
+  else ensure_smem(sparse_kernel<D, SP_NW, int>, sp_smem, cur_sp);
+  ensure_smem(window_merge_kernel<D>, wm_smem, cur_wm);
+  // earlier-block importances held in registers: up to 32 per tile per row, c <= nb - 1
+  const int tiles = (nb - 1 + SEL_TILE - 1) / SEL_TILE;
+  if (tiles <= 1)
+    launch_select<D, 1, false>(q, k, v, o, kparts, counts, lists, meta, syncws, desc, ndesc, S, nb, nbf, BH, SP_R,
+                               scale, sl2, sel_smem, st);
+  else if (tiles <= 2)
+    launch_select<D, 2, false>(q, k, v, o, kparts, counts, lists, meta, syncws, desc, ndesc, S, nb, nbf, BH, SP_R,
+                               scale, sl2, sel_smem, st);
+  else if (tiles <= 4)
+    launch_select<D, 4, false>(q, k, v, o, kparts, counts, lists, meta, syncws, desc, ndesc, S, nb, nbf, BH, SP_R,
+                               scale, sl2, sel_smem, st);
+  else {
+    ensure_smem(select_kernel_generic<D>, sel_smem, cur_gen);
+    select_kernel_generic<D><<<nb * BH, 128, sel_smem, st>>>(q, k, kparts, counts, lists, meta, syncws, desc, ndesc,
+                                                             S, nb, nbf, BH, SP_R, scale);
+  }
+  // Heads are processed in groups sized so that a group's sparse partials (<= 8 slots per query)
+  // stay resident in L2 between the sparse kernel that writes them and the merge that reads them.
+  const size_t per_head = (size_t)S * 8 * (2 * D + 8);
+  int hg = (int)std::max<size_t>(1, std::min<size_t>(BH, (size_t)(96u << 20) / per_head));
+  const int ngroups = (BH + hg - 1) / hg;
+  hg = (BH + ngroups - 1) / ngroups;
+  for (int h0 = 0; h0 < BH; h0 += hg) {
+    const int h1 = std::min(BH, h0 + hg);
+    const int units_ub = (h1 - h0) * (S * 8 / SP_R + nb) + 1;
+    if (narrow)
+      sparse_kernel<D, SP_NW, uint16_t><<<units_ub, 32 * SP_NW, sp_smem, st>>>(q, k, v, desc, ndesc, lists, part, ml, S, nb, sl2,
+                                                                    h0, h1);
+    else
+      sparse_kernel<D, SP_NW, int><<<units_ub, 32 * SP_NW, sp_smem, st>>>(q, k, v, desc, ndesc, lists, part, ml, S, nb, sl2,
+                                                                    h0, h1);
+    window_merge_kernel<D><<<dim3(nb, h1 - h0), 128, wm_smem, st>>>(q, k, v, meta, part, ml, o, syncws, counts, S,
+                                                                    nb, sl2, h0);
+  }
+}
+
+// All per-shape scratch lives in one zero-initialized byte buffer; the counters and ready flags in
+// it are back at zero when every call finishes.
+struct WsLayout {
+  size_t kparts, counts, lists, meta, syncws, desc, ndesc, part, ml, total;
+};
+static WsLayout ws_layout(int64_t BH, int64_t S, int64_t D) {
+  const int64_t nb = (S + 63) / 64, max_units = BH * S * 8 / 128 + BH * nb + 1;
+  WsLayout L;
+  size_t off = 0;
+  auto take = [&](size_t bytes) { size_t o = off; off += (bytes + 255) & ~size_t(255); return o; };
+  L.kparts = take(3 * BH * nb * D * 2);
+  L.counts = take(BH * nb * 4);
+  L.lists = take(BH * nb * S * 4);
+  L.meta = take(BH * S * 4);
+  L.syncws = take((2 + BH * nb) * 4);
+  L.desc = take(max_units * 16);
+  L.ndesc = take((BH + 1) * 4);
+  L.part = take(BH * S * 8 * D * 2);
+  L.ml = take(BH * S * 8 * 8);
+  L.total = off;
+  return L;
+}
+
+int64_t nsa_ws_bytes(int64_t B, int64_t H, int64_t S, int64_t D) { return (int64_t)ws_layout(B * H, S, D).total; }
+
+torch::Tensor nsa_forward(torch::Tensor q, torch::Tensor k, torch::Tensor v, torch::Tensor ws) {
+  TORCH_CHECK(q.is_cuda() && q.scalar_type() == torch::kBFloat16 && q.dim() == 4, "q must be a 4-d bf16 CUDA tensor");
+  if (!q.is_contiguous()) q = q.contiguous();
+  if (!k.is_contiguous()) k = k.contiguous();
+  if (!v.is_contiguous()) v = v.contiguous();
+  const int B = q.size(0), H = q.size(1), S = q.size(2), D = q.size(3);
+  const WsLayout L = ws_layout((int64_t)B * H, S, D);
+  TORCH_CHECK(ws.numel() >= (int64_t)L.total, "workspace too small");
+  torch::Tensor o = torch::empty_like(q);
+  cudaStream_t st = at::cuda::getCurrentCUDAStream();
+  uint8_t* w = reinterpret_cast<uint8_t*>(ws.data_ptr());
+  auto P = [](torch::Tensor& t) { return reinterpret_cast<bf16*>(t.data_ptr()); };
+  bf16* kparts = reinterpret_cast<bf16*>(w + L.kparts);
+  int* counts = reinterpret_cast<int*>(w + L.counts);
+  int* lists = reinterpret_cast<int*>(w + L.lists);
+  int* meta = reinterpret_cast<int*>(w + L.meta);
+  int* syncws = reinterpret_cast<int*>(w + L.syncws);
+  int4* desc = reinterpret_cast<int4*>(w + L.desc);
+  int* ndesc = reinterpret_cast<int*>(w + L.ndesc);
+  bf16* part = reinterpret_cast<bf16*>(w + L.part);
+  float2* ml = reinterpret_cast<float2*>(w + L.ml);
+  if (D == 64)
+    launch_all<64>(P(q), P(k), P(v), P(o), B * H, S, kparts, counts, lists, meta, syncws, desc, ndesc, part, ml, 0, st);
+  else if (D == 128)
+    launch_all<128>(P(q), P(k), P(v), P(o), B * H, S, kparts, counts, lists, meta, syncws, desc, ndesc, part, ml, 0,
+                    st);
+  else
+    TORCH_CHECK(false, "unsupported head dim (64 or 128)");
+  return o;
+}
+"""
+
+CPP_SRC = r"""
+#include <torch/extension.h>
+int64_t nsa_ws_bytes(int64_t B, int64_t H, int64_t S, int64_t D);
+torch::Tensor nsa_forward(torch::Tensor q, torch::Tensor k, torch::Tensor v, torch::Tensor ws);
+"""
+
+_ext = None
+
+
+def _load_ext():
+    global _ext
+    if _ext is None:
+        from torch.utils.cpp_extension import load_inline
+
+        os.environ.setdefault("TORCH_CUDA_ARCH_LIST", "12.0")
+        _ext = load_inline(
+            name="nsa_sparse_ext_v23",
+            cpp_sources=CPP_SRC,
+            cuda_sources=CUDA_SRC,
+            functions=["nsa_forward", "nsa_ws_bytes"],
+            extra_cuda_cflags=["-O3", "--use_fast_math", "-lineinfo", "-gencode=arch=compute_120a,code=sm_120a"],
+            verbose=False,
+        )
+    return _ext
+
+
+class Model(nn.Module):
+    def __init__(self, B: int, H: int, S: int, D: int):
+        super().__init__()
+        self.B, self.H, self.S, self.D = B, H, S, D
+        self.register_buffer("_dummy", torch.zeros(1, dtype=torch.bfloat16))
+        self._ws = {}
+
+    def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+        key = (q.shape, q.device)
+        ws = self._ws.get(key)
+        if ws is None:  # per-shape scratch, zeroed once; every call leaves its counters at zero
+            B, H, S, D = q.shape
+            ws = torch.zeros(_load_ext().nsa_ws_bytes(B, H, S, D), dtype=torch.uint8, device=q.device)
+            self._ws[key] = ws
+        return _ext.nsa_forward(q, k, v, ws)
+
+
+def get_init_inputs():
+    return [1, 16, 1024, 64]
+
+
+def get_inputs():
+    q = torch.randn(1, 16, 1024, 64, dtype=torch.bfloat16)
+    k = torch.randn(1, 16, 1024, 64, dtype=torch.bfloat16)
+    v = torch.randn(1, 16, 1024, 64, dtype=torch.bfloat16)
+    return [q, k, v]

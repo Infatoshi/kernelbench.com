@@ -1,5 +1,52 @@
 # KernelBench-CUDA — DEVLOG
 
+## 2026-09-22 — Opus 5.5 CUDA sweep, audit, and resume failures
+
+Four Opus 5.5 `[xhigh]` cells on tetra were correct in sequential isolated
+regrades on RTX PRO 6000: 01 Fused MoE 0.1036, 02 Native Sparse Attention
+1.0957 (0.090 ms geomean across six shapes), 03 MegaQwen Decode 0.0739,
+04 Grid + MinGRU 0.7938. The four annotation YAMLs are the source for
+verdicts and details. 01 is clean; 02-04 are interesting because the operator
+resumed the same Claude sessions twice after GPU drops. Two copies overlapped
+in each workspace. 03's copies explicitly exchanged profiling findings;
+04's second copy touched scratch files but reported leaving the final
+solution untouched. Do not call the 02-04 development traces one agent's
+hill climb. Their final kernels are genuine and their isolated regrades are
+usable, with the operator overlap disclosed.
+
+The `template_mutated` flags on 02-04 were harness false positives. Resume
+mode copied `repo/src` into an existing `repo/src` and likewise copied into
+an existing `trusted_src`, creating nested `src/src`. The mutation logs name
+only those extra directories. The seven graded problem files, the top-level
+trusted source, and the archived final solutions matched their canonical
+copies byte for byte. The harness now preserves the existing workspace src
+and original trusted snapshot on resume, avoiding the nesting while retaining
+evidence of any pre-interruption edits. The original `result.json` flags remain
+as raw history; the annotations explain and override them for publication.
+
+Same-buffer overwrite probes on a quiet tetra GPU 0 passed the checker gate
+for all four final kernels: cos(out1,out2) was -0.0141, -0.4529, 0.4422 and
+-0.9821 for 01-04; cos(reference,solution) was at least 0.99998. In-place
+weight changes also invalidated 03's packed weights and 04's prepared weights.
+The first probe spent about 89 seconds compiling its saved CUDA extension;
+the other three completed in about 8, 10 and 3 seconds with their cached
+builds. Future audits should reuse the run's extension cache.
+
+The check-only NSA restamp under the revised RTX check finished 15 PASS,
+4 FAIL across 19 archives. All four FAIL cells were already incorrect before
+this pass, so no previously passing score was newly withdrawn. Only their
+46,371 bytes of updated `result.json` files were pulled from 11.18 GB of
+remote archives. The four new Opus archives were also pulled thin; their
+combined full size on tetra was 4.54 GB. Native Claude sessions and stream
+transcripts were retained for the audit and HF export. The CUDA trace
+converter now selects the complete native session across resumes and removes
+private home/config/environment tool calls together with their paired results
+before redaction. Four exact staged exports had zero redaction findings, were
+uploaded in HF dataset commit `e224d2df9f46de5af45d421bdb94fd8b63dbad95`,
+then downloaded and SHA256-matched. `kb publish cuda` and its site gates passed
+locally; the site now presents Native Sparse Attention in measured milliseconds
+because its dense-equivalent roofline is not a useful headline.
+
 ## 2026-09-22 — 02_deepseek_nsa: large_qkv dropped from the RTX PRO 6000 check
 
 The widened check (#11) withdrew four independent kernels on 02 (Grok 4.5, Grok 4.6,

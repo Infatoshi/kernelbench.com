@@ -51,6 +51,7 @@ interface RunDetailData {
   peak_bw_gb_s: number | null
   annotation_verdict: string | null
   stats: {
+    resumed_segment?: boolean
     agent_s: number | null
     total_s: number | null
     check_s: number | null
@@ -234,6 +235,26 @@ function geomean(vals: number[]): number | null {
   return Math.exp(pos.reduce((a, v) => a + Math.log(v), 0) / pos.length)
 }
 
+function LatencyStrip({ d }: { d: RunDetailData }) {
+  const ms = d.shapes.map((s) => s.ms ?? 0)
+  const gm = geomean(ms)
+  return (
+    <div className="rdetail-shapes">
+      {d.shapes.map((s) => (
+        <div key={s.idx} className="rdetail-shape rdetail-shape-latency">
+          <span className="rdetail-shape-dims tabular">{s.label ?? `shape ${s.idx}`}</span>
+          <span className="rdetail-shape-ms tabular">{s.ms != null ? `${s.ms.toFixed(3)} ms` : "—"}</span>
+        </div>
+      ))}
+      {gm != null && (
+        <p className="run-page-math tabular">
+          geomean({ms.map((v) => `${v.toFixed(3)} ms`).join(" · ")}) = <strong>{gm.toFixed(3)} ms</strong>
+        </p>
+      )}
+    </div>
+  )
+}
+
 function ShapeStrip({ d, official }: { d: RunDetailData; official: number | null }) {
   if (!d.shapes.length) {
     return (
@@ -323,15 +344,23 @@ export default async function RunPage({
   // Mega scores ARE speedups regardless of magnitude; a magnitude guess renders
   // a 1.96x cuda cell as "196% of roofline". Mirror app/_lib/models.ts.
   const isSpeedup = bench === "mega"
+  const isNsaLatency = bench === "cuda" && problem === "02_deepseek_nsa"
+  const latencyMs = isNsaLatency
+    ? (detail ? geomean(detail.shapes.map((s) => s.ms ?? 0)) : cell.latency_ms ?? null)
+    : null
   const headline =
     cell.valid && cell.score != null
-      ? isSpeedup
+      ? isNsaLatency
+        ? latencyMs != null ? `${latencyMs.toFixed(3)} ms` : "latency unavailable"
+        : isSpeedup
         ? `${cell.score.toFixed(2)}×`
         : `${(cell.score * 100).toFixed(cell.score >= 0.1 ? 1 : 2)}%`
       : (cell.outcome_label ?? cell.failure_reason ?? "no pass")
   const headlineSub =
     cell.valid && cell.score != null
-      ? isSpeedup
+      ? isNsaLatency
+        ? "geomean latency across six shapes · lower is better"
+        : isSpeedup
         ? "geomean speedup across shapes"
         : "geomean peak fraction across shapes"
       : "did not score"
@@ -364,11 +393,11 @@ export default async function RunPage({
         {harness && <Stat label="harness" value={harness} />}
         {detail ? (
           <>
-            <Stat label="agent session" value={fmtDuration(detail.stats.agent_s)} />
-            <Stat label="total wall" value={fmtDuration(detail.stats.total_s)} />
+            <Stat label={detail.stats.resumed_segment ? "last resume" : "agent session"} value={fmtDuration(detail.stats.agent_s)} />
+            <Stat label={detail.stats.resumed_segment ? "last resume wall" : "total wall"} value={fmtDuration(detail.stats.total_s)} />
             <Stat label="check" value={fmtDuration(detail.stats.check_s)} />
             <Stat label="benchmark" value={fmtDuration(detail.stats.benchmark_s)} />
-            <Stat label="output tokens" value={fmtInt(detail.stats.output_tokens)} />
+            <Stat label={detail.stats.resumed_segment ? "last resume tokens" : "output tokens"} value={fmtInt(detail.stats.output_tokens)} />
             {detail.stats.cost_usd != null && (
               <Stat label="cost" value={`$${detail.stats.cost_usd.toFixed(2)}`} />
             )}
@@ -390,16 +419,16 @@ export default async function RunPage({
       {detail && (
         <>
           <h2 className="rdetail-section">
-            Per-shape vs governing ceiling
+            {isNsaLatency ? "Per-shape latency" : "Per-shape vs governing ceiling"}
             <span className="rdetail-section-note">
-              each shape graded against whichever binds — {detail.dtype} compute or
-              HBM bandwidth
+              {isNsaLatency
+                ? "milliseconds are the measured result; the dense-equivalent roofline is not a useful ceiling"
+                : <>each shape graded against whichever binds — {detail.dtype} compute or HBM bandwidth</>}
             </span>
           </h2>
-          <ShapeStrip
-            d={detail}
-            official={cell.valid && !isSpeedup ? cell.score : null}
-          />
+          {isNsaLatency
+            ? <LatencyStrip d={detail} />
+            : <ShapeStrip d={detail} official={cell.valid && !isSpeedup ? cell.score : null} />}
         </>
       )}
 
