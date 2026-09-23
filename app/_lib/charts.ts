@@ -85,6 +85,7 @@ export const MODEL_NAMES: Record<string, string> = {
   "grok-4.5": "Grok 4.5",
   "grok-4.6": "Grok 4.6",
   "grok-4.7": "Grok 4.7",
+  "claude-opus-5-5": "Claude Opus 5.5",
   "MiniMax-M3": "MiniMax-M3",
   "kimi-k2.7-code": "Kimi K2.7-Code",
   "kinetic-0715": "Kimi K3 (256k)",
@@ -124,6 +125,7 @@ const LIVE_MODEL_IDS = new Set([
   "openai/gpt-6-astra-pro",
   "grok-4.6",
   "grok-4.7",
+  "claude-opus-5-5",
   "kinetic-0715",
   "muse-spark-1.3",
   "ox-alpha",
@@ -258,6 +260,7 @@ function markFrontier(points: EffPoint[]): EffPoint[] {
 const SHORT_NAMES: Record<string, string> = {
   "claude-opus-4-8": "Opus 4.8",
   "claude-opus-5": "Opus 5",
+  "claude-opus-5-5": "Opus 5.5",
   "anthropic/claude-opus-5": "Opus 5",
   "claude-fable-5": "Fable 5",
   "anthropic/claude-fable-5": "Fable 5",

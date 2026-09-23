@@ -1,0 +1,1677 @@
+"""Kimi-Linear W4A16 hybrid decode unit as ONE persistent CUDA megakernel.
+
+step(hidden, state) issues exactly one kernel launch (cudaLaunchCooperativeKernel of
+kimi_step_kernel, one 544-thread block per SM) that runs the whole per-token forward of
+[KDA, KDA, KDA, MLA], each followed by the 64-expert MoE, and updates the decode state in
+place (KDA recurrent state S + short-conv windows; MLA latent cache append). No CUDA
+graphs, no torch.compile, no per-op kernel loop.
+
+Inside the kernel, 26 phases are separated by a software grid barrier:
+  KDA layer:  RMSNorm + q/k/v/g/beta int4 GEMVs | conv + gated-delta recurrence |
+              o_proj (+ conv-window shift) | RMSNorm + router + shared expert gate/up |
+              top-8 + routed gate/up | SiLU*up + 9 expert down projections (+ residuals)
+  MLA layer:  RMSNorm + q_proj/kv_a | absorb W_uk into q, RoPE, cache append |
+              flash-decoding over the latent cache (bf16 mma.sync) | combine + W_uv |
+              o_proj ; then the same MoE phases.
+Every int4 projection is a fused unpack + group dequant GEMV on the packed weights (never
+materialized in bf16), split stream-K style over all SMs with fp32 atomics. The packed
+weights are re-laid out once at load time into contiguous 64-column x 128-k items.
+
+Memory side: 16 warps compute; a 17th "streamer" warp per SM walks this SM's future reads
+(weights, KDA state, MLA cache) and pulls them into L2 a few phases ahead, so DRAM keeps
+streaming across barriers. Routed experts are streamed as soon as a PREDICTION of the
+top-8 (router applied to the layer input in the layer's first phase) exists; the real
+routing is still computed exactly and any mispredicted expert is streamed on demand.
+"""
+from __future__ import annotations
+
+import hashlib
+import os
+from dataclasses import dataclass, field
+
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+EPS = 1.0e-6
+GROUP_SIZE = 128
+
+
+@dataclass(frozen=True)
+class Config:
+    hidden: int = 2304
+    kda_heads: int = 32
+    kda_head_dim: int = 128
+    short_conv: int = 4
+    mla_heads: int = 32
+    kv_lora: int = 512
+    qk_nope: int = 128
+    qk_rope: int = 64
+    v_head: int = 128
+    rope_theta: float = 10000.0
+    n_experts: int = 64
+    n_active: int = 8
+    n_shared: int = 1
+    moe_inter: int = 1024
+    routed_scaling: float = 2.446
+    group: int = 128
+    pattern: tuple = ("K", "K", "K", "M")
+    dtype: torch.dtype = field(default=torch.bfloat16)
+
+
+def build_config(shape: dict) -> Config:
+    return Config(n_experts=int(shape.get("n_experts", 64)))
+
+
+# --------------------------------------------------------------------------- #
+# Modules: same parameter / buffer names as reference.py so its state_dict loads.
+# --------------------------------------------------------------------------- #
+class QuantLinear(nn.Module):
+    def __init__(self, in_f: int, out_f: int, group: int = GROUP_SIZE):
+        super().__init__()
+        self.in_f, self.out_f, self.group = in_f, out_f, group
+        ng = in_f // group
+        self.register_buffer("w_q", torch.zeros(in_f // 2, out_f, dtype=torch.uint8))
+        self.register_buffer("scales", torch.zeros(ng, out_f, dtype=torch.bfloat16))
+        self.register_buffer("zeros", torch.zeros(ng, out_f, dtype=torch.bfloat16))
+
+
+class QuantExperts(nn.Module):
+    def __init__(self, n: int, in_f: int, out_f: int, group: int = GROUP_SIZE):
+        super().__init__()
+        self.n, self.in_f, self.out_f, self.group = n, in_f, out_f, group
+        ng = in_f // group
+        self.register_buffer("w_q", torch.zeros(n, in_f // 2, out_f, dtype=torch.uint8))
+        self.register_buffer("scales", torch.zeros(n, ng, out_f, dtype=torch.bfloat16))
+        self.register_buffer("zeros", torch.zeros(n, ng, out_f, dtype=torch.bfloat16))
+
+
+class KDA(nn.Module):
+    def __init__(self, cfg: Config):
+        super().__init__()
+        H, Dk, d = cfg.kda_heads, cfg.kda_head_dim, cfg.hidden
+        self.q_proj = QuantLinear(d, H * Dk, cfg.group)
+        self.k_proj = QuantLinear(d, H * Dk, cfg.group)
+        self.v_proj = QuantLinear(d, H * Dk, cfg.group)
+        self.g_proj = QuantLinear(d, H * Dk, cfg.group)
+        self.beta_proj = nn.Linear(d, H, bias=False, dtype=cfg.dtype)
+        self.conv_w = nn.Parameter(torch.zeros(3, H * Dk, cfg.short_conv, dtype=cfg.dtype))
+        self.o_proj = QuantLinear(H * Dk, d, cfg.group)
+
+
+class MLA(nn.Module):
+    def __init__(self, cfg: Config):
+        super().__init__()
+        H, d = cfg.mla_heads, cfg.hidden
+        self.q_proj = QuantLinear(d, H * (cfg.qk_nope + cfg.qk_rope), cfg.group)
+        self.kv_a = QuantLinear(d, cfg.kv_lora + cfg.qk_rope, cfg.group)
+        self.kv_b = QuantLinear(cfg.kv_lora, H * (cfg.qk_nope + cfg.v_head), cfg.group)
+        self.o_proj = QuantLinear(H * cfg.v_head, d, cfg.group)
+
+
+class MoE(nn.Module):
+    def __init__(self, cfg: Config):
+        super().__init__()
+        d, m, E = cfg.hidden, cfg.moe_inter, cfg.n_experts
+        self.router = nn.Linear(d, E, bias=False, dtype=cfg.dtype)
+        self.gate = QuantExperts(E, d, m, cfg.group)
+        self.up = QuantExperts(E, d, m, cfg.group)
+        self.down = QuantExperts(E, m, d, cfg.group)
+        self.s_gate = QuantExperts(cfg.n_shared, d, m, cfg.group)
+        self.s_up = QuantExperts(cfg.n_shared, d, m, cfg.group)
+        self.s_down = QuantExperts(cfg.n_shared, m, d, cfg.group)
+
+
+class Block(nn.Module):
+    def __init__(self, cfg: Config, kind: str):
+        super().__init__()
+        self.kind = kind
+        self.attn_norm = nn.Parameter(torch.ones(cfg.hidden, dtype=cfg.dtype))
+        self.moe_norm = nn.Parameter(torch.ones(cfg.hidden, dtype=cfg.dtype))
+        self.attn = KDA(cfg) if kind == "K" else MLA(cfg)
+        self.moe = MoE(cfg)
+
+
+# --------------------------------------------------------------------------- #
+# The megakernel
+# --------------------------------------------------------------------------- #
+CUDA_SRC = r"""
+#include <cuda_runtime.h>
+#include <cuda_bf16.h>
+#include <stdint.h>
+#include <vector>
+#include <string>
+#include <stdexcept>
+
+namespace {
+
+constexpr int NTH = 512;
+constexpr int NWARP = NTH / 32;
+constexpr int D = 2304;           // hidden
+constexpr int IB = 4352;          // bytes per repacked item: 64 cols x 128 k int4 + 64 scales + 64 zeros
+constexpr int EXPERT_ITEMS = 288; // items per expert matrix (gate/up: 16x18, down: 36x8)
+constexpr int LAYER_FLOATS = 65536;
+constexpr int ZERO_FLOATS = 51712;   // accumulator part of a layer region (zeroed each step)
+
+// arena offsets (floats) inside one layer region
+constexpr int O_ATT  = 0;       // KDA: q,k,v,g accumulators (4 x 4096)
+constexpr int O_MQ   = 0;       // MLA: q_proj acc (6144)
+constexpr int O_MKVA = 6144;    // MLA: kv_a acc (576)
+constexpr int O_OACC = 23296;   // MLA: attention output after W_uv (4096)
+constexpr int O_Y    = 28672;   // o_proj acc (2304)
+constexpr int O_GATE = 30976;   // 9 x 1024
+constexpr int O_UP   = 40192;   // 9 x 1024
+constexpr int O_MOE  = 49408;   // 2304
+constexpr int O_BETA = 51712;   // 32 (direct)
+constexpr int O_O    = 51744;   // 4096 (direct, KDA recurrence output, bf16-rounded)
+constexpr int O_LOGIT= 55840;   // 64 (direct)
+constexpr int O_QB   = 55904;   // MLA query [32][576] bf16 = 9216 floats (direct)
+constexpr int O_PLOGIT = 65152; // 64: router logits of the layer INPUT (routing prediction, direct)
+
+constexpr int PART_STRIDE = 64 + 32 * 512 / 2;   // floats: m[32], l[32], then O[32][512] as bf16
+constexpr int QS_STRIDE = 584;  // bf16 per smem row for 576-wide rows (1168 B, ldmatrix conflict free)
+constexpr int PS_STRIDE = 24;
+constexpr float MLA_SCALE = 0.07216878364870323f;   // 192^-0.5
+
+struct LayerW {
+  const uint8_t* a[5];              // KDA: q,k,v,g,o   MLA: q,kva,kvb,o
+  const __nv_bfloat16* beta_w;      // (32, 2304)
+  const __nv_bfloat16* conv_w;      // (3, 4096, 4)
+  const __nv_bfloat16* attn_norm;
+  const __nv_bfloat16* moe_norm;
+  const __nv_bfloat16* router_w;    // (64, 2304)
+  const uint8_t* eg; const uint8_t* eu; const uint8_t* ed;
+  const uint8_t* sg; const uint8_t* su; const uint8_t* sd;
+};
+
+struct Params {
+  LayerW lw[4];
+  const float* rope_inv;            // 32
+  float* S[3];
+  __nv_bfloat16* conv[3][3];
+  const __nv_bfloat16* ckv_src; const __nv_bfloat16* kr_src;
+  __nv_bfloat16* ckv_dst; __nv_bfloat16* kr_dst;
+  const __nv_bfloat16* x_in; __nv_bfloat16* x_out;
+  float* arena_cur; float* arena_next;
+  float* xbuf; float* part;
+  unsigned* bar;
+  unsigned long long* prof;
+  int L; int copy; int nb_attn; int chunk; int pf_la; int pf_spec; int pf_cache_gate; int pf_next_step;
+};
+
+struct Seg {
+  const uint8_t* items;
+  const float* x;
+  float* out;
+  const __nv_bfloat16* dense;
+  int ngroups;
+  int nitems;
+  float scale;
+  int kind;       // 0: int4 gemv, 1: dense bf16 row dot (K = D)
+};
+
+__device__ __forceinline__ float bf2f(__nv_bfloat16 v) { return __bfloat162float(v); }
+__device__ __forceinline__ float bfr(float v) { return __bfloat162float(__float2bfloat16(v)); }
+__device__ __forceinline__ float bflo(uint32_t w) { return __uint_as_float(w << 16); }
+__device__ __forceinline__ float bfhi(uint32_t w) { return __uint_as_float(w & 0xFFFF0000u); }
+
+__device__ __forceinline__ uint4 ldg_stream(const void* p) {
+  uint4 r;
+  asm("ld.global.nc.L1::no_allocate.v4.u32 {%0,%1,%2,%3}, [%4];"
+      : "=r"(r.x), "=r"(r.y), "=r"(r.z), "=r"(r.w) : "l"(p));
+  return r;
+}
+__device__ __forceinline__ uint4 ldg_nc(const void* p) {
+  uint4 r;
+  asm("ld.global.nc.v4.u32 {%0,%1,%2,%3}, [%4];"
+      : "=r"(r.x), "=r"(r.y), "=r"(r.z), "=r"(r.w) : "l"(p));
+  return r;
+}
+// fast sigmoid / silu (no IEEE-division slow-path call; exponent clamped so the divisor stays < 2^126)
+__device__ __forceinline__ float sigm(float x) { return __fdividef(1.f, 1.f + __expf(fminf(-x, 80.f))); }
+__device__ __forceinline__ float silu(float x) { return x * sigm(x); }
+__device__ __forceinline__ float4 ldcg4(const float* p) { return __ldcg(reinterpret_cast<const float4*>(p)); }
+__device__ __forceinline__ float4 bfr4(float4 v) { return make_float4(bfr(v.x), bfr(v.y), bfr(v.z), bfr(v.w)); }
+__device__ __forceinline__ float4 add4(float4 a, float4 b) { return make_float4(a.x + b.x, a.y + b.y, a.z + b.z, a.w + b.w); }
+__device__ __forceinline__ float sq4(float4 a) { return a.x * a.x + a.y * a.y + a.z * a.z + a.w * a.w; }
+__device__ __forceinline__ unsigned ld_acquire(const unsigned* p) {
+  unsigned v;
+  asm volatile("ld.acquire.gpu.global.u32 %0, [%1];" : "=r"(v) : "l"(p) : "memory");
+  return v;
+}
+__device__ __forceinline__ uint32_t smem_u32(const void* p) { return (uint32_t)__cvta_generic_to_shared(p); }
+__device__ __forceinline__ void cp_async16(void* smem, const void* gmem, int src_bytes) {
+  asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;" [REDACTED: IP] "r"(smem_u32(smem)), "l"(gmem), "r"(src_bytes) : "memory");
+}
+__device__ __forceinline__ void cp_async_commit() { asm volatile("cp.async.commit_group;" ::: "memory"); }
+template <int N> __device__ __forceinline__ void cp_async_wait() { asm volatile("cp.async.wait_group %0;" [REDACTED: IP] "n"(N) : "memory"); }
+__device__ __forceinline__ void ldsm_x4(uint32_t& r0, uint32_t& r1, uint32_t& r2, uint32_t& r3, const void* p) {
+  asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];"
+               : "=r"(r0), "=r"(r1), "=r"(r2), "=r"(r3) : "r"(smem_u32(p)));
+}
+__device__ __forceinline__ void ldsm_x4_t(uint32_t& r0, uint32_t& r1, uint32_t& r2, uint32_t& r3, const void* p) {
+  asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, [%4];"
+               : "=r"(r0), "=r"(r1), "=r"(r2), "=r"(r3) : "r"(smem_u32(p)));
+}
+__device__ __forceinline__ void ldsm_x2(uint32_t& r0, uint32_t& r1, const void* p) {
+  asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0,%1}, [%2];" : "=r"(r0), "=r"(r1) : "r"(smem_u32(p)));
+}
+__device__ __forceinline__ void mma_bf16(float c[4], uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3, uint32_t b0, uint32_t b1) {
+  asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+               : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
+               : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+}
+__device__ __forceinline__ void csync() { asm volatile("bar.sync 1, 512;" ::: "memory"); }
+__device__ __forceinline__ float warp_sum(float v) {
+#pragma unroll
+  for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
+  return v;
+}
+__device__ __forceinline__ float warp_max(float v) {
+#pragma unroll
+  for (int o = 16; o > 0; o >>= 1) v = fmaxf(v, __shfl_xor_sync(0xffffffffu, v, o));
+  return v;
+}
+
+struct Ctx {
+  unsigned base;
+  unsigned k;          // barriers passed
+  float* red;          // >= 64 floats
+  Seg* segs;           // current phase (24)
+  Seg* pseg;           // prefetch scratch (24)
+  int* sel;            // 8
+  float* wts;          // 8
+  float* xs;           // 4096
+  float* xr;           // 2304
+  unsigned char* big;  // phase-specific scratch
+  volatile int* phase_v;   // current compute phase (written by compute thread 0)
+  volatile int* sel_v;     // last layer whose top-k is published in sel
+  unsigned char* pfr;      // streamer range lists (40 x 16 B)
+  float* tk;               // 64 floats (router probabilities)
+  float* ptk;              // 64 floats + 32 ints: streamer's routing-prediction scratch
+};
+
+__device__ __forceinline__ void prof_mark(const Params& p, Ctx& c) {
+  if (p.prof && blockIdx.x == 0 && threadIdx.x == 0) {
+    unsigned long long t;
+    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
+    p.prof[c.k] = t;
+  }
+}
+
+__device__ __forceinline__ void prof_point(const Params& p, Ctx& c, int slot) {
+  if (p.prof && threadIdx.x == 0) {
+    unsigned long long t;
+    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
+    atomicMax(p.prof + slot * 32 + c.k, t);
+  }
+}
+__device__ __forceinline__ void grid_sync(const Params& p, Ctx& c) {
+  csync();
+  prof_point(p, c, 2);
+  c.k++;
+  if (threadIdx.x == 0) {
+    __threadfence();
+    atomicAdd(p.bar, 1u);
+    const unsigned target = c.base + c.k * gridDim.x;
+    while ((int)(ld_acquire(p.bar) - target) < 0) { }
+    __threadfence();
+  }
+  if (threadIdx.x == 0) *c.phase_v = (int)c.k;
+  csync();
+  prof_mark(p, c);
+}
+
+__device__ __forceinline__ float block_sum(float v, float* red) {
+  const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+  v = warp_sum(v);
+  if (lane == 0) red[warp] = v;
+  csync();
+  if (warp == 0) {
+    float t = (lane < NWARP) ? red[lane] : 0.f;
+    t = warp_sum(t);
+    if (lane == 0) red[32] = t;
+  }
+  csync();
+  const float r = red[32];
+  csync();
+  return r;
+}
+
+// ------------------------------------------------------------------------- //
+// fused int4 dequant GEMV on one repacked item (64 cols x 128 k) by one warp.
+// lane = rb*4 + cc: rows (k-pairs) rb*8..rb*8+7, columns cc*16..cc*16+15.
+// nibble -> float via byte_perm into mantissa bits 16..19 of 0.5f: q -> 0.5 + q/256,
+// so 256*x*f = 128*x + x*q ; the 128*sum(x) offset is folded into the zero-point term.
+// ------------------------------------------------------------------------- //
+struct ItemRegs { uint4 w[8]; };
+
+__device__ __forceinline__ void item_load(const uint8_t* item, ItemRegs& r, int lane) {
+#pragma unroll
+  for (int j = 0; j < 8; j++) r.w[j] = ldg_stream(item + lane * 16 + j * 512);
+}
+
+// r: the item's 8 weight vectors (already loaded); scales / zeros are loaded here
+__device__ __forceinline__ void item_compute(const ItemRegs& r, const uint8_t* item, const float* xg, float tot[16], int lane) {
+  const int rb = lane >> 2, cc = lane & 3;
+  const uint4 s0 = ldg_nc(item + 4096 + cc * 32), s1 = ldg_nc(item + 4096 + cc * 32 + 16);
+  const uint4 z0 = ldg_nc(item + 4224 + cc * 32), z1 = ldg_nc(item + 4224 + cc * 32 + 16);
+  const float2* xp = reinterpret_cast<const float2*>(xg + rb * 16);
+  float X = 0.f;
+  float acc[16];
+#pragma unroll
+  for (int n = 0; n < 16; n++) acc[n] = 0.f;
+#pragma unroll
+  for (int j = 0; j < 8; j++) {
+    const float2 xx = xp[j];
+    X += xx.x + xx.y;
+    const float xe = xx.x * 256.f, xo = xx.y * 256.f;
+    const uint32_t ws[4] = {r.w[j].x, r.w[j].y, r.w[j].z, r.w[j].w};
+#pragma unroll
+    for (int q = 0; q < 4; q++) {
+      const uint32_t lo = ws[q] & 0x0F0F0F0Fu, hi = (ws[q] >> 4) & 0x0F0F0F0Fu;
+#pragma unroll
+      for (int b = 0; b < 4; b++) {
+        const float fl = __uint_as_float(__byte_perm(lo, 0x3F000000u, 0x7044u | (b << 8)));
+        const float fh = __uint_as_float(__byte_perm(hi, 0x3F000000u, 0x7044u | (b << 8)));
+        acc[q * 4 + b] = fmaf(xe, fl, acc[q * 4 + b]);
+        acc[q * 4 + b] = fmaf(xo, fh, acc[q * 4 + b]);
+      }
+    }
+  }
+  const uint32_t ss[8] = {s0.x, s0.y, s0.z, s0.w, s1.x, s1.y, s1.z, s1.w};
+  const uint32_t zz[8] = {z0.x, z0.y, z0.z, z0.w, z1.x, z1.y, z1.z, z1.w};
+#pragma unroll
+  for (int n = 0; n < 16; n++) {
+    const float s = (n & 1) ? bfhi(ss[n >> 1]) : bflo(ss[n >> 1]);
+    const float z = (n & 1) ? bfhi(zz[n >> 1]) : bflo(zz[n >> 1]);
+    tot[n] = fmaf(s, fmaf(-(z + 128.f), X, acc[n]), tot[n]);
+  }
+}
+
+__device__ __forceinline__ void gemv_item(const uint8_t* item, const float* xg, float tot[16], int lane) {
+  ItemRegs r;
+  item_load(item, r, lane);
+  item_compute(r, item, xg, tot, lane);
+}
+
+// reduce the 8 row-blocks of a warp tile and add 64 column sums into out[0..64)
+__device__ __forceinline__ void flush_tile(float tot[16], float* out, float scale, int lane) {
+  const bool u1 = lane & 16, u2 = lane & 8, u3 = lane & 4;
+  float t8[8], t4[4], t2[2];
+#pragma unroll
+  for (int i = 0; i < 8; i++) {
+    const float send = u1 ? tot[i] : tot[i + 8];
+    const float keep = u1 ? tot[i + 8] : tot[i];
+    t8[i] = keep + __shfl_xor_sync(0xffffffffu, send, 16);
+  }
+#pragma unroll
+  for (int i = 0; i < 4; i++) {
+    const float send = u2 ? t8[i] : t8[i + 4];
+    const float keep = u2 ? t8[i + 4] : t8[i];
+    t4[i] = keep + __shfl_xor_sync(0xffffffffu, send, 8);
+  }
+#pragma unroll
+  for (int i = 0; i < 2; i++) {
+    const float send = u3 ? t4[i] : t4[i + 2];
+    const float keep = u3 ? t4[i + 2] : t4[i];
+    t2[i] = keep + __shfl_xor_sync(0xffffffffu, send, 4);
+  }
+  const int col = (lane & 3) * 16 + (u1 ? 8 : 0) + (u2 ? 4 : 0) + (u3 ? 2 : 0);
+  atomicAdd(reinterpret_cast<float2*>(out + col), make_float2(t2[0] * scale, t2[1] * scale));
+}
+
+// dense bf16 row (K = D) dot x; 9 x 16B per lane issued up front
+__device__ __forceinline__ void dense_row(const __nv_bfloat16* W, const float* x, int row, float* out, int lane) {
+  const uint8_t* wr = reinterpret_cast<const uint8_t*>(W + (size_t)row * D);
+  uint4 vv[9];
+#pragma unroll
+  for (int t = 0; t < 9; t++) vv[t] = ldg_stream(wr + (lane + 32 * t) * 16);
+  float acc = 0.f;
+#pragma unroll
+  for (int t = 0; t < 9; t++) {
+    const int i = lane + 32 * t;
+    const uint4 v = vv[t];
+    const float4 xa = *reinterpret_cast<const float4*>(x + i * 8);
+    const float4 xb = *reinterpret_cast<const float4*>(x + i * 8 + 4);
+    acc = fmaf(bflo(v.x), xa.x, acc); acc = fmaf(bfhi(v.x), xa.y, acc);
+    acc = fmaf(bflo(v.y), xa.z, acc); acc = fmaf(bfhi(v.y), xa.w, acc);
+    acc = fmaf(bflo(v.z), xb.x, acc); acc = fmaf(bfhi(v.z), xb.y, acc);
+    acc = fmaf(bflo(v.w), xb.z, acc); acc = fmaf(bfhi(v.w), xb.w, acc);
+  }
+  acc = warp_sum(acc);
+  if (lane == 0) out[row] = bfr(acc);
+}
+
+__device__ __forceinline__ void block_range(int total, int& i0, int& i1) {
+  // 32-bit math (total * gridDim < 2^31); 64-bit division would be an out-of-line call
+  i0 = (int)((unsigned)total * blockIdx.x / gridDim.x);
+  i1 = (int)((unsigned)total * (blockIdx.x + 1) / gridDim.x);
+}
+
+// stream-K style distribution of the concatenated item list over all blocks/warps
+__device__ __forceinline__ void warp_items(const Seg* segs, int nseg, int& w0, int& w1) {
+  int total = 0;
+  for (int s = 0; s < nseg; s++) total += segs[s].nitems;
+  int i0, i1;
+  block_range(total, i0, i1);
+  const int warp = threadIdx.x >> 5;
+  const int n = i1 - i0;
+  w0 = i0 + n * warp / NWARP;
+  w1 = i0 + n * (warp + 1) / NWARP;
+}
+
+__device__ __forceinline__ void run_items(const Seg* segs, int nseg) {
+  int w0, w1;
+  warp_items(segs, nseg, w0, w1);
+  const int lane = threadIdx.x & 31;
+  float tot[16];
+#pragma unroll
+  for (int i = 0; i < 16; i++) tot[i] = 0.f;
+  int cur_seg = -1, cur_tile = -1;
+  int s = 0, sbase = 0;
+  for (int it = w0; it < w1; it++) {
+    while (it >= sbase + segs[s].nitems) { sbase += segs[s].nitems; s++; }
+    const int local = it - sbase;
+    const Seg& sg = segs[s];
+    if (sg.kind == 1) { dense_row(sg.dense, sg.x, local, sg.out, lane); continue; }
+    const int tile = local / sg.ngroups, g = local - tile * sg.ngroups;
+    if (s != cur_seg || tile != cur_tile) {
+      if (cur_seg >= 0) {
+        flush_tile(tot, segs[cur_seg].out + cur_tile * 64, segs[cur_seg].scale, lane);
+#pragma unroll
+        for (int i = 0; i < 16; i++) tot[i] = 0.f;
+      }
+      cur_seg = s; cur_tile = tile;
+    }
+    gemv_item(sg.items + (size_t)local * IB, sg.x + g * 128, tot, lane);
+  }
+  if (cur_seg >= 0) flush_tile(tot, segs[cur_seg].out + cur_tile * 64, segs[cur_seg].scale, lane);
+}
+
+// ---------------------------- L2 prefetch --------------------------------- //
+// Real loads (one 4 B load per 128 B line, whole-line L2 fill). Hint-style prefetches are
+// mostly dropped on this part, so a dedicated streamer warp pulls lines into L2 itself.
+__device__ __forceinline__ unsigned ld_line(const void* p) {
+  unsigned v;
+  asm volatile("ld.global.cg.L2::128B.u32 %0, [%1];" : "=r"(v) : "l"(p));
+  return v;
+}
+struct PfRange { const uint8_t* p; unsigned lines; unsigned pad; };
+
+__device__ __forceinline__ void add_range(PfRange* r, int& n, const void* ptr, size_t bytes) {
+  if (bytes == 0) return;
+  const uintptr_t a = reinterpret_cast<uintptr_t>(ptr) & ~(uintptr_t)127;
+  const uintptr_t e = reinterpret_cast<uintptr_t>(ptr) + bytes;
+  r[n].p = reinterpret_cast<const uint8_t*>(a);
+  r[n].lines = (unsigned)((e - a + 127) / 128);
+  n++;
+}
+// this block's share of a flat buffer
+__device__ __forceinline__ void rng_slice(PfRange* r, int& n, const void* ptr, size_t bytes) {
+  const unsigned units = (unsigned)(bytes / 128);   // < 2^24 for every buffer here
+  const unsigned a = units * blockIdx.x / gridDim.x, b = units * (blockIdx.x + 1) / gridDim.x;
+  if (b > a) add_range(r, n, reinterpret_cast<const uint8_t*>(ptr) + (size_t)a * 128, (size_t)(b - a) * 128);
+}
+// this block's items of a phase
+__device__ void rng_segs(PfRange* r, int& n, const Seg* segs, int nseg) {
+  int total = 0;
+  for (int s = 0; s < nseg; s++) total += segs[s].nitems;
+  int i0, i1;
+  block_range(total, i0, i1);
+  int sbase = 0;
+  for (int s = 0; s < nseg; s++) {
+    const int lo = max(i0, sbase), hi = min(i1, sbase + segs[s].nitems);
+    if (hi > lo) {
+      if (segs[s].kind == 0) add_range(r, n, segs[s].items + (size_t)(lo - sbase) * IB, (size_t)(hi - lo) * IB);
+      else add_range(r, n, segs[s].dense + (size_t)(lo - sbase) * D, (size_t)(hi - lo) * D * 2);
+    }
+    sbase += segs[s].nitems;
+  }
+}
+// stream the next up-to 512 lines of a range list from cursor (ri, line); false when finished
+__device__ __forceinline__ bool stream_batch(const PfRange* r, int n, int& ri, unsigned& line, int lane, unsigned& acc) {
+  constexpr int U = 5;   // lines per lane in flight: saturates DRAM without inflating L2 latency
+  if (ri >= n) return false;
+  unsigned v[U];
+#pragma unroll
+  for (int u = 0; u < U; u++) {
+    unsigned off = line + u * 32 + lane;
+    int rr = ri;
+    while (rr < n && off >= r[rr].lines) { off -= r[rr].lines; rr++; }
+    v[u] = (rr < n) ? ld_line(r[rr].p + (size_t)off * 128) : 0u;
+  }
+#pragma unroll
+  for (int u = 0; u < U; u++) acc ^= v[u];
+  unsigned adv = U * 32;
+  while (ri < n && line + adv >= r[ri].lines) { adv -= r[ri].lines - line; line = 0; ri++; }
+  if (ri < n) line += adv;
+  return ri < n;
+}
+
+__device__ __forceinline__ void set_seg(Seg& s, const uint8_t* items, const float* x, float* out, int ngroups, int nitems, float scale) {
+  s.items = items; s.x = x; s.out = out; s.dense = nullptr; s.ngroups = ngroups; s.nitems = nitems; s.scale = scale; s.kind = 0;
+}
+__device__ __forceinline__ void set_dense(Seg& s, const __nv_bfloat16* W, const float* x, float* out, int rows) {
+  s.items = nullptr; s.x = x; s.out = out; s.dense = W; s.ngroups = D; s.nitems = rows; s.scale = 1.f; s.kind = 1;
+}
+
+__device__ __forceinline__ float* layer_arena(const Params& p, int l) { return p.arena_cur + (size_t)l * LAYER_FLOATS; }
+
+// ---- phase segment builders (single thread) ---- //
+__device__ int build_qkvg(const Params& p, Ctx& c, int l, Seg* sg) {
+  const LayerW& W = p.lw[l];
+  float* A = layer_arena(p, l);
+  for (int t = 0; t < 4; t++) set_seg(sg[t], W.a[t], c.xs, A + O_ATT + t * 4096, 18, 64 * 18, 1.f);
+  set_dense(sg[4], W.beta_w, c.xs, A + O_BETA, 32);
+  set_dense(sg[5], W.router_w, c.xr, A + O_PLOGIT, 64);     // routing prediction (prefetch only)
+  return 6;
+}
+__device__ int build_koproj(const Params& p, Ctx& c, int l, Seg* sg) {
+  set_seg(sg[0], p.lw[l].a[4], c.xs, layer_arena(p, l) + O_Y, 32, 36 * 32, 1.f);
+  return 1;
+}
+__device__ int build_shared(const Params& p, Ctx& c, int l, Seg* sg) {
+  const LayerW& W = p.lw[l];
+  float* A = layer_arena(p, l);
+  set_dense(sg[0], W.router_w, c.xs, A + O_LOGIT, 64);
+  set_seg(sg[1], W.sg, c.xs, A + O_GATE, 18, EXPERT_ITEMS, 1.f);
+  set_seg(sg[2], W.su, c.xs, A + O_UP, 18, EXPERT_ITEMS, 1.f);
+  return 3;
+}
+__device__ int build_gateup(const Params& p, Ctx& c, int l, Seg* sg, const int* sel) {
+  const LayerW& W = p.lw[l];
+  float* A = layer_arena(p, l);
+  for (int r = 0; r < 8; r++) {
+    const size_t off = (size_t)sel[r] * EXPERT_ITEMS * IB;
+    set_seg(sg[2 * r], W.eg + off, c.xs, A + O_GATE + (1 + r) * 1024, 18, EXPERT_ITEMS, 1.f);
+    set_seg(sg[2 * r + 1], W.eu + off, c.xs, A + O_UP + (1 + r) * 1024, 18, EXPERT_ITEMS, 1.f);
+  }
+  return 16;
+}
+__device__ int build_down(const Params& p, Ctx& c, int l, Seg* sg, const float* act, const int* sel, const float* wts) {
+  const LayerW& W = p.lw[l];
+  float* A = layer_arena(p, l);
+  set_seg(sg[0], W.sd, act, A + O_MOE, 8, EXPERT_ITEMS, 1.f);
+  for (int r = 0; r < 8; r++)
+    set_seg(sg[1 + r], W.ed + (size_t)sel[r] * EXPERT_ITEMS * IB, act + (1 + r) * 1024, A + O_MOE, 8, EXPERT_ITEMS, wts[r]);
+  return 9;
+}
+__device__ int build_mq(const Params& p, Ctx& c, Seg* sg) {
+  float* A = layer_arena(p, 3);
+  set_seg(sg[0], p.lw[3].a[0], c.xs, A + O_MQ, 18, 96 * 18, 1.f);
+  set_seg(sg[1], p.lw[3].a[1], c.xs, A + O_MKVA, 18, 9 * 18, 1.f);
+  set_dense(sg[2], p.lw[3].router_w, c.xr, A + O_PLOGIT, 64); // routing prediction (prefetch only)
+  return 3;
+}
+__device__ int build_moproj(const Params& p, Ctx& c, Seg* sg) {
+  set_seg(sg[0], p.lw[3].a[3], c.xs, layer_arena(p, 3) + O_Y, 32, 36 * 32, 1.f);
+  return 1;
+}
+
+// Byte ranges (this block's share) of the data phase P will read. Built by one lane.
+// Phases: l*6 + {0 qkvg, 1 recur, 2 oproj, 3 shared, 4 gateup, 5 down} for l < 3,
+// 18 mla proj, 19 absorb, 20 attn, 21 combine, 22 mla oproj, 23..25 layer-3 MoE.
+__device__ int pf_ranges(const Params& p, Ctx& c, int P, PfRange* r) {
+  int n = 0;
+  Seg* sg = c.pseg;
+  if (P < 18 || P >= 23) {
+    const int l = (P < 18) ? P / 6 : 3;
+    const int k = (P < 18) ? P % 6 : P - 20;
+    const LayerW& W = p.lw[l];
+    switch (k) {
+      case 0: rng_segs(r, n, sg, build_qkvg(p, c, l, sg)); break;
+      case 1:
+        rng_slice(r, n, p.S[l], (size_t)32 * 128 * 128 * 4);
+        rng_slice(r, n, W.conv_w, (size_t)3 * 4096 * 4 * 2);
+        for (int t = 0; t < 3; t++) rng_slice(r, n, p.conv[l][t], (size_t)3 * 4096 * 2);
+        break;
+      case 2: rng_segs(r, n, sg, build_koproj(p, c, l, sg)); break;
+      case 3: rng_segs(r, n, sg, build_shared(p, c, l, sg)); break;
+      case 4: rng_segs(r, n, sg, build_gateup(p, c, l, sg, c.sel)); break;
+      case 5: rng_segs(r, n, sg, build_down(p, c, l, sg, nullptr, c.sel, c.wts)); break;
+    }
+  } else if (P == 18) {
+    rng_segs(r, n, sg, build_mq(p, c, sg));
+  } else if (P == 19) {
+    rng_slice(r, n, p.lw[3].a[2], (size_t)128 * 4 * IB);          // kv_b (absorb + uv)
+  } else if (P == 20) {
+    rng_slice(r, n, p.ckv_src, (size_t)p.L * 512 * 2);             // latent cache
+    rng_slice(r, n, p.kr_src, (size_t)p.L * 64 * 2);
+  } else if (P == 22) {
+    rng_segs(r, n, sg, build_moproj(p, c, sg));
+  }
+  return n;
+}
+
+// routed gate/up + down ranges (this block's share) of layer l for expert selection sel
+__device__ int rng_count_dyn(const Params& p, Ctx& c, int l, const int* sel, PfRange* r) {
+  int n = 0;
+  rng_segs(r, n, c.pseg, build_gateup(p, c, l, c.pseg, sel));
+  rng_segs(r, n, c.pseg, build_down(p, c, l, c.pseg, nullptr, sel, c.wts));
+  return n;
+}
+
+__device__ __forceinline__ int dyn_layer(int P) {   // routed phases need that layer's top-k
+  if (P == 4 || P == 5) return 0;
+  if (P == 10 || P == 11) return 1;
+  if (P == 16 || P == 17) return 2;
+  if (P == 24 || P == 25) return 3;
+  return -1;
+}
+
+__device__ __forceinline__ int bcast(int v) { return __shfl_sync(0xffffffffu, v, 0); }
+
+// top-8 of 64 logits by one warp (rank based, ties -> lower index); probabilities in scratch
+__device__ __forceinline__ void warp_top8(const float* logits, float* scratch, int* sel, int lane) {
+  const float a = __ldcg(logits + lane), b = __ldcg(logits + 32 + lane);
+  scratch[lane] = a;
+  scratch[lane + 32] = b;
+  __syncwarp();
+  int ra = 0, rb = 0;
+#pragma unroll 16
+  for (int e = 0; e < 64; e++) {
+    const float q = scratch[e];
+    ra += (q > a) || (q == a && e < lane);
+    rb += (q > b) || (q == b && e < lane + 32);
+  }
+  if (ra < 8) sel[ra] = lane;
+  if (rb < 8) sel[rb] = lane + 32;
+  __syncwarp();
+}
+
+// The dedicated streamer warp walks a fixed schedule of this block's future reads:
+//   layer l static weights / state  ->  layer l routed experts (PREDICTED: router applied to the
+//   layer input during the layer's first phase)  ->  layer l+1 static ...
+// with each entry gated on how far the compute warps have progressed. When a layer's real
+// top-8 is published it is checked against the prediction and any expert that was not
+// predicted is streamed immediately. Prefetch only: the computation uses the exact routing.
+__device__ void prefetcher(const Params& p, Ctx& c) {
+  const int lane = threadIdx.x & 31;
+  PfRange* cur = reinterpret_cast<PfRange*>(c.pfr);
+  PfRange* dyr = cur + 16;
+  int* psel = reinterpret_cast<int*>(c.ptk + 64);   // [4][8] predicted selection per layer
+  unsigned acc = 0;
+  int streamed = 0;     // bit l: routed experts of layer l streamed (predicted or real)
+  int vl = 0;           // next layer whose real routing is still to be checked
+  auto stream_dyn = [&](int l, const int* sel) {
+    int n = 0;
+    if (lane == 0) n = rng_count_dyn(p, c, l, sel, dyr);
+    __syncwarp();
+    n = bcast(n);
+    int ri = 0; unsigned line = 0;
+    while (stream_batch(dyr, n, ri, line, lane, acc)) { }
+    __syncwarp();
+  };
+  auto verify = [&]() {
+    while (vl < 4 && bcast(*c.sel_v) >= vl) {
+      __threadfence();
+      int ok = 0;
+      if (lane == 0 && (streamed >> vl) & 1) {
+        ok = 1;
+        for (int r = 0; r < 8; r++) {
+          bool f = false;
+          for (int q = 0; q < 8; q++) f |= (psel[vl * 8 + q] == c.sel[r]);
+          ok &= f ? 1 : 0;
+        }
+      }
+      ok = bcast(ok);
+      if (!ok) stream_dyn(vl, c.sel);
+      streamed |= 1 << vl;
+      vl++;
+    }
+  };
+  // schedule: (P >= 0: static data of phase P) / (P < 0: routed experts of layer -P-1), gate phase
+  const int sched[22][2] = {
+      {0, 0}, {1, 0}, {2, 0}, {3, 1}, {-1, 1},
+      {6, 4}, {7, 5}, {8, 6}, {9, 7}, {-2, 7},
+      {12, 10}, {13, 11}, {14, 12}, {15, 13}, {-3, 13},
+      {20, -100}, {18, 16}, {19, 17}, {22, 17}, {23, 17}, {-4, 19}, {100, 24}};
+  // last entry (100): the NEXT step's first-phase weights, streamed during this step's tail
+  const int nsched = p.pf_next_step ? 22 : 21;
+  for (int si = 0; si < nsched; si++) {
+    const int P = sched[si][0];
+    const int gate = (P == 20) ? p.pf_cache_gate : sched[si][1];
+    while (bcast(*c.phase_v) < gate) { verify(); __nanosleep(200); }
+    verify();
+    if (P < 0) {
+      const int l = -P - 1;
+      if (!((streamed >> l) & 1) && p.pf_spec) {
+        __threadfence();
+        warp_top8(layer_arena(p, l) + O_PLOGIT, c.ptk, psel + l * 8, lane);
+        stream_dyn(l, psel + l * 8);
+        streamed |= 1 << l;
+      }
+      continue;
+    }
+    int n = 0;
+    if (lane == 0) n = pf_ranges(p, c, P == 100 ? 0 : P, cur);
+    __syncwarp();
+    n = bcast(n);
+    int ri = 0; unsigned line = 0;
+    while (stream_batch(cur, n, ri, line, lane, acc)) verify();
+    __syncwarp();
+  }
+  while (vl < 4) { verify(); if (vl < 4) __nanosleep(200); }
+  if (acc == 0x9e3779b9u) c.red[63] = 1.f;   // keep the loads alive
+}
+
+// Layer input (is_h = false: x_l, materialized by block 0 into xbuf[l]) or post-attention
+// residual (is_h = true: h_l = x_l + attn_out), RMS-normalized into xs with weight w.
+// All global loads (activations + norm weight) are issued before any is consumed.
+__device__ __forceinline__ void norm_input(const Params& p, Ctx& c, int l, bool is_h, const __nv_bfloat16* w,
+                                           const __nv_bfloat16* w2) {
+  constexpr int NV = D / 4;   // 576 float4 chunks: thread t owns t and t + 512
+  const int i0 = threadIdx.x, i1 = threadIdx.x + NTH;
+  const bool has1 = i1 < NV;
+  const uint2 w0 = *reinterpret_cast<const uint2*>(w + 4 * i0);
+  const uint2 w1 = has1 ? *reinterpret_cast<const uint2*>(w + 4 * i1) : w0;
+  float4 v0, v1;
+  if (is_h) {
+    const float* xp = p.xbuf + (size_t)l * D;
+    const float* A = layer_arena(p, l);
+    const float4 x0 = ldcg4(xp + 4 * i0), y0 = ldcg4(A + O_Y + 4 * i0);
+    float4 x1 = x0, y1 = y0;
+    if (has1) { x1 = ldcg4(xp + 4 * i1); y1 = ldcg4(A + O_Y + 4 * i1); }
+    v0 = bfr4(add4(x0, bfr4(y0)));
+    v1 = bfr4(add4(x1, bfr4(y1)));
+  } else if (l == 0) {
+    const uint2 a = *reinterpret_cast<const uint2*>(p.x_in + 4 * i0);
+    const uint2 b = has1 ? *reinterpret_cast<const uint2*>(p.x_in + 4 * i1) : a;
+    v0 = make_float4(bflo(a.x), bfhi(a.x), bflo(a.y), bfhi(a.y));
+    v1 = make_float4(bflo(b.x), bfhi(b.x), bflo(b.y), bfhi(b.y));
+  } else {
+    const float* xp = p.xbuf + (size_t)(l - 1) * D;
+    const float* A = layer_arena(p, l - 1);
+    const float4 x0 = ldcg4(xp + 4 * i0), y0 = ldcg4(A + O_Y + 4 * i0), m0 = ldcg4(A + O_MOE + 4 * i0);
+    float4 x1 = x0, y1 = y0, m1 = m0;
+    if (has1) { x1 = ldcg4(xp + 4 * i1); y1 = ldcg4(A + O_Y + 4 * i1); m1 = ldcg4(A + O_MOE + 4 * i1); }
+    v0 = bfr4(add4(bfr4(add4(x0, bfr4(y0))), bfr4(m0)));
+    v1 = bfr4(add4(bfr4(add4(x1, bfr4(y1))), bfr4(m1)));
+  }
+  if (!is_h && blockIdx.x == 0) {
+    float4* xb = reinterpret_cast<float4*>(p.xbuf + (size_t)l * D);
+    xb[i0] = v0;
+    if (has1) xb[i1] = v1;
+  }
+  float ss = sq4(v0) + (has1 ? sq4(v1) : 0.f);
+  ss = block_sum(ss, c.red);
+  const float r = rsqrtf(ss * (1.f / (float)D) + 1e-6f);
+  float4* xs4 = reinterpret_cast<float4*>(c.xs);
+  xs4[i0] = make_float4(bfr((v0.x * r) * bflo(w0.x)), bfr((v0.y * r) * bfhi(w0.x)),
+                        bfr((v0.z * r) * bflo(w0.y)), bfr((v0.w * r) * bfhi(w0.y)));
+  if (has1)
+    xs4[i1] = make_float4(bfr((v1.x * r) * bflo(w1.x)), bfr((v1.y * r) * bfhi(w1.x)),
+                          bfr((v1.z * r) * bflo(w1.y)), bfr((v1.w * r) * bfhi(w1.y)));
+  if (w2) {   // same normalization with a second weight (router-prediction input) -> xr
+    float4* xr4 = reinterpret_cast<float4*>(c.xr);
+    const uint2 u0 = *reinterpret_cast<const uint2*>(w2 + 4 * i0);
+    xr4[i0] = make_float4(v0.x * r * bflo(u0.x), v0.y * r * bfhi(u0.x), v0.z * r * bflo(u0.y), v0.w * r * bfhi(u0.y));
+    if (has1) {
+      const uint2 u1 = *reinterpret_cast<const uint2*>(w2 + 4 * i1);
+      xr4[i1] = make_float4(v1.x * r * bflo(u1.x), v1.y * r * bfhi(u1.x), v1.z * r * bflo(u1.y), v1.w * r * bfhi(u1.y));
+    }
+  }
+  csync();
+}
+
+// copy n floats (n % 2048 == 0 not required, multiple of 4) global -> smem with all loads in flight
+template <int NPER>
+__device__ __forceinline__ void load_vec(float* dst, const float* src, int n, bool round_bf16) {
+  float4 v[NPER];
+#pragma unroll
+  for (int k = 0; k < NPER; k++) {
+    const int i = threadIdx.x + k * NTH;
+    if (4 * i < n) v[k] = ldcg4(src + 4 * i);
+  }
+#pragma unroll
+  for (int k = 0; k < NPER; k++) {
+    const int i = threadIdx.x + k * NTH;
+    if (4 * i < n) reinterpret_cast<float4*>(dst)[i] = round_bf16 ? bfr4(v[k]) : v[k];
+  }
+}
+
+// softmax + top-8 of the router logits (every block, warp 0) -> c.sel / c.wts.
+// Rank-based selection: each candidate counts how many beat it (ties -> lower index).
+__device__ void topk_route(const Params& p, Ctx& c, int l) {
+  const float* A = layer_arena(p, l);
+  if (threadIdx.x < 32) {
+    const int lane = threadIdx.x;
+    const float a = __ldcg(A + O_LOGIT + lane), b = __ldcg(A + O_LOGIT + 32 + lane);
+    const float m = warp_max(fmaxf(a, b));
+    const float ea = expf(a - m), eb = expf(b - m);
+    const float sum = warp_sum(ea + eb);
+    const float pa = __fdividef(ea, sum), pb = __fdividef(eb, sum);
+    c.tk[lane] = pa;
+    c.tk[lane + 32] = pb;
+    __syncwarp();
+    int ra = 0, rb = 0;
+#pragma unroll 16
+    for (int e = 0; e < 64; e++) {
+      const float q = c.tk[e];
+      ra += (q > pa) || (q == pa && e < lane);
+      rb += (q > pb) || (q == pb && e < lane + 32);
+    }
+    const float wsum = warp_sum((ra < 8 ? pa : 0.f) + (rb < 8 ? pb : 0.f));
+    const float sc = __fdividef(2.446f, wsum + 1e-9f);
+    if (ra < 8) { c.sel[ra] = lane; c.wts[ra] = pa * sc; }
+    if (rb < 8) { c.sel[rb] = lane + 32; c.wts[rb] = pb * sc; }
+  }
+  csync();
+}
+
+// ------------------------------------------------------------------------- //
+// KDA layer
+// ------------------------------------------------------------------------- //
+__device__ void kda_qkvg(const Params& p, Ctx& c, int l) {
+  const LayerW& W = p.lw[l];
+  if (threadIdx.x == 0) build_qkvg(p, c, l, c.segs);
+  csync();
+  norm_input(p, c, l, false, W.attn_norm, W.moe_norm);
+  prof_point(p, c, 3);
+  run_items(c.segs, 6);
+}
+
+__device__ __forceinline__ float conv_silu(const __nv_bfloat16* win, const __nv_bfloat16* cw, int ch, float raw) {
+  // win: (3, 4096) ; cw: (4096, 4) for this projection
+  const float s = bf2f(win[ch]) * bf2f(cw[ch * 4 + 0]) + bf2f(win[4096 + ch]) * bf2f(cw[ch * 4 + 1])
+                + bf2f(win[8192 + ch]) * bf2f(cw[ch * 4 + 2]) + raw * bf2f(cw[ch * 4 + 3]);
+  return bfr(silu(s));
+}
+
+__device__ void kda_recur(const Params& p, Ctx& c, int l) {
+  const LayerW& W = p.lw[l];
+  float* A = layer_arena(p, l);
+  const int tid = threadIdx.x;
+  float* qs = reinterpret_cast<float*>(c.big);
+  float* ks = qs + 128; float* ds = ks + 128; float* vs = ds + 128; float* us = vs + 32;
+  float* bet = us + 32; float* pr = bet + 4;  // pr: 16 x 32
+  for (int item = blockIdx.x; item < 128; item += gridDim.x) {
+    const int h = item >> 2, j0 = (item & 3) * 32;
+    const int j = tid & 31, ib = tid >> 5;
+    float* Sp = p.S[l] + (size_t)h * 16384 + (size_t)(ib * 8) * 128 + j0 + j;
+    float s[8];
+#pragma unroll
+    for (int i = 0; i < 8; i++) s[i] = Sp[i * 128];
+    if (tid < 128) {
+      const int ch = h * 128 + tid;
+      const float qr = bfr(__ldcg(A + O_ATT + ch));
+      const float kr = bfr(__ldcg(A + O_ATT + 4096 + ch));
+      const float gr = bfr(__ldcg(A + O_ATT + 12288 + ch));
+      qs[tid] = conv_silu(p.conv[l][0], W.conv_w, ch, qr) * 0.08838834764831845f;
+      ks[tid] = conv_silu(p.conv[l][1], W.conv_w + 4096 * 4, ch, kr);
+      ds[tid] = sigm(-gr);
+    } else if (tid < 160) {
+      const int ch = h * 128 + j0 + (tid - 128);
+      const float vr = bfr(__ldcg(A + O_ATT + 8192 + ch));
+      vs[tid - 128] = conv_silu(p.conv[l][2], W.conv_w + 8192 * 4, ch, vr);
+    } else if (tid == 160) {
+      const float br = __ldcg(A + O_BETA + h);
+      bet[0] = sigm(br);
+    }
+    csync();
+    float pred = 0.f;
+#pragma unroll
+    for (int i = 0; i < 8; i++) {
+      s[i] *= ds[ib * 8 + i];
+      pred = fmaf(s[i], ks[ib * 8 + i], pred);
+    }
+    pr[ib * 32 + j] = pred;
+    csync();
+    if (tid < 32) {
+      float t = 0.f;
+#pragma unroll
+      for (int i = 0; i < 16; i++) t += pr[i * 32 + tid];
+      us[tid] = bet[0] * (vs[tid] - t);
+    }
+    csync();
+    const float u = us[j];
+    float o = 0.f;
+#pragma unroll
+    for (int i = 0; i < 8; i++) {
+      s[i] = fmaf(ks[ib * 8 + i], u, s[i]);
+      Sp[i * 128] = s[i];
+      o = fmaf(s[i], qs[ib * 8 + i], o);
+    }
+    pr[ib * 32 + j] = o;
+    csync();
+    if (tid < 32) {
+      float t = 0.f;
+#pragma unroll
+      for (int i = 0; i < 16; i++) t += pr[i * 32 + tid];
+      A[O_O + h * 128 + j0 + tid] = bfr(t);
+    }
+    csync();
+  }
+}
+
+__device__ void kda_oproj(const Params& p, Ctx& c, int l) {
+  float* A = layer_arena(p, l);
+  if (threadIdx.x == 0) build_koproj(p, c, l, c.segs);
+  csync();
+  load_vec<2>(c.xs, A + O_O, 4096, false);
+  csync();
+  run_items(c.segs, 1);
+  // shift the short-conv windows (all readers finished in the previous phase)
+  for (int idx = blockIdx.x * NTH + threadIdx.x; idx < 3 * 4096; idx += gridDim.x * NTH) {
+    const int t = idx >> 12, ch = idx & 4095;
+    __nv_bfloat16* win = p.conv[l][t];
+    const __nv_bfloat16 a1 = win[4096 + ch], a2 = win[8192 + ch];
+    win[ch] = a1; win[4096 + ch] = a2;
+    win[8192 + ch] = __float2bfloat16(__ldcg(A + O_ATT + t * 4096 + ch));
+  }
+}
+
+// ------------------------------------------------------------------------- //
+// MoE
+// ------------------------------------------------------------------------- //
+__device__ void moe_shared(const Params& p, Ctx& c, int l) {
+  const LayerW& W = p.lw[l];
+  if (threadIdx.x == 0) build_shared(p, c, l, c.segs);
+  csync();
+  // xs = normed h, kept in smem for the gate/up phase
+  norm_input(p, c, l, true, W.moe_norm, nullptr);
+  prof_point(p, c, 3);
+  run_items(c.segs, 3);
+}
+
+__device__ void moe_gateup(const Params& p, Ctx& c, int l) {
+  topk_route(p, c, l);
+  if (threadIdx.x == 0) { __threadfence_block(); *c.sel_v = l; }
+  prof_point(p, c, 3);
+  if (threadIdx.x == 0) build_gateup(p, c, l, c.segs, c.sel);
+  csync();
+  run_items(c.segs, 16);
+}
+
+__device__ void moe_down(const Params& p, Ctx& c, int l) {
+  float* A = layer_arena(p, l);
+  float* act = reinterpret_cast<float*>(c.big);   // 9 x 1024 (sel / wts persist from gate/up)
+  if (threadIdx.x == 0) build_down(p, c, l, c.segs, act, c.sel, c.wts);
+  csync();
+  {
+    const int total = 9 * EXPERT_ITEMS;
+    int i0, i1;
+    block_range(total, i0, i1);
+    if (i1 > i0) {
+      const int e0 = i0 / EXPERT_ITEMS, e1 = (i1 - 1) / EXPERT_ITEMS;
+      for (int e = e0; e <= e1; e += 2) {
+        // up to two experts (2 x 256 float4) per pass, all loads in flight
+        float4 g[2], u[2];
+        const int cnt = (e1 - e + 1 >= 2) ? 2 : 1;
+#pragma unroll
+        for (int k = 0; k < 2; k++) {
+          if (k < cnt && threadIdx.x < 256) {
+            g[k] = ldcg4(A + O_GATE + (e + k) * 1024 + 4 * threadIdx.x);
+            u[k] = ldcg4(A + O_UP + (e + k) * 1024 + 4 * threadIdx.x);
+          }
+        }
+#pragma unroll
+        for (int k = 0; k < 2; k++) {
+          if (k < cnt && threadIdx.x < 256) {
+            const float4 gg = g[k], uu = u[k];
+            reinterpret_cast<float4*>(act + (e + k) * 1024)[threadIdx.x] =
+                make_float4(silu(gg.x) * uu.x, silu(gg.y) * uu.y, silu(gg.z) * uu.z, silu(gg.w) * uu.w);
+          }
+        }
+      }
+    }
+    csync();
+  }
+  run_items(c.segs, 9);
+}
+
+// ------------------------------------------------------------------------- //
+// MLA layer (absorbed form)
+// ------------------------------------------------------------------------- //
+__device__ void mla_proj(const Params& p, Ctx& c) {
+  const LayerW& W = p.lw[3];
+  if (threadIdx.x == 0) build_mq(p, c, c.segs);
+  csync();
+  norm_input(p, c, 3, false, W.attn_norm, W.moe_norm);
+  run_items(c.segs, 3);
+}
+
+// partial q_lat[c] over one kv_b item: sum_d Wkvb[c, d] * qn[d]  (transposed int4 GEMV)
+__device__ __forceinline__ void absorb_item(const uint8_t* item, const float* qn, float r[16], int lane) {
+  const int cc = lane & 3;
+  uint4 w[8];
+#pragma unroll
+  for (int j = 0; j < 8; j++) w[j] = ldg_stream(item + lane * 16 + j * 512);
+  const uint4 s0 = ldg_nc(item + 4096 + cc * 32), s1 = ldg_nc(item + 4096 + cc * 32 + 16);
+  const uint4 z0 = ldg_nc(item + 4224 + cc * 32), z1 = ldg_nc(item + 4224 + cc * 32 + 16);
+  const uint32_t ss[8] = {s0.x, s0.y, s0.z, s0.w, s1.x, s1.y, s1.z, s1.w};
+  const uint32_t zz[8] = {z0.x, z0.y, z0.z, z0.w, z1.x, z1.y, z1.z, z1.w};
+  float qv[16];
+#pragma unroll
+  for (int i = 0; i < 4; i++) {
+    const float4 t = ldcg4(qn + cc * 16 + 4 * i);
+    qv[4 * i] = t.x; qv[4 * i + 1] = t.y; qv[4 * i + 2] = t.z; qv[4 * i + 3] = t.w;
+  }
+  float a[16];
+  float asum = 0.f, bsum = 0.f;
+#pragma unroll
+  for (int n = 0; n < 16; n++) {
+    const float s = (n & 1) ? bfhi(ss[n >> 1]) : bflo(ss[n >> 1]);
+    const float z = (n & 1) ? bfhi(zz[n >> 1]) : bflo(zz[n >> 1]);
+    const float an = s * bfr(qv[n]);
+    a[n] = an * 256.f;
+    asum += an;
+    bsum = fmaf(z, an, bsum);
+  }
+#pragma unroll
+  for (int j = 0; j < 8; j++) {
+    const uint32_t ws[4] = {w[j].x, w[j].y, w[j].z, w[j].w};
+    float ae = 0.f, ao = 0.f;
+#pragma unroll
+    for (int q = 0; q < 4; q++) {
+      const uint32_t lo = ws[q] & 0x0F0F0F0Fu, hi = (ws[q] >> 4) & 0x0F0F0F0Fu;
+#pragma unroll
+      for (int b = 0; b < 4; b++) {
+        const float fl = __uint_as_float(__byte_perm(lo, 0x3F000000u, 0x7044u | (b << 8)));
+        const float fh = __uint_as_float(__byte_perm(hi, 0x3F000000u, 0x7044u | (b << 8)));
+        ae = fmaf(a[q * 4 + b], fl, ae);
+        ao = fmaf(a[q * 4 + b], fh, ao);
+      }
+    }
+    r[2 * j] += ae - 128.f * asum - bsum;
+    r[2 * j + 1] += ao - 128.f * asum - bsum;
+  }
+}
+
+__device__ void mla_absorb(const Params& p, Ctx& c) {
+  const LayerW& W = p.lw[3];
+  float* A = layer_arena(p, 3);
+  __nv_bfloat16* QB = reinterpret_cast<__nv_bfloat16*>(A + O_QB);
+  const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+  float* red16 = reinterpret_cast<float*>(c.big);     // 32 lanes x 16
+  for (int u = blockIdx.x; u < 128; u += gridDim.x) {
+    const int h = u >> 2, gc = u & 3;
+    float r[16];
+#pragma unroll
+    for (int n = 0; n < 16; n++) r[n] = 0.f;
+    if (warp < 2) {
+      absorb_item(W.a[2] + (size_t)((4 * h + warp) * 4 + gc) * IB, A + O_MQ + h * 192 + warp * 64, r, lane);
+#pragma unroll
+      for (int n = 0; n < 16; n++) {
+        r[n] += __shfl_xor_sync(0xffffffffu, r[n], 1);
+        r[n] += __shfl_xor_sync(0xffffffffu, r[n], 2);
+      }
+      if (warp == 1) {
+#pragma unroll
+        for (int n = 0; n < 16; n++) red16[lane * 16 + n] = r[n];
+      }
+    }
+    csync();
+    if (warp == 0) {
+      const int rb = lane >> 2, cc = lane & 3;
+#pragma unroll
+      for (int n = 0; n < 16; n++)
+        if ((n >> 2) == cc) QB[h * 576 + gc * 128 + rb * 16 + n] = __float2bfloat16(r[n] + red16[lane * 16 + n]);
+    }
+    csync();
+  }
+  // rope + new cache row (last block)
+  if (blockIdx.x == gridDim.x - 1) {
+    const float pos = (float)p.L;
+    for (int t = threadIdx.x; t < 32 * 32; t += NTH) {
+      const int h = t >> 5, i = t & 31;
+      const float xe = bfr(__ldcg(A + O_MQ + h * 192 + 128 + 2 * i));
+      const float xo = bfr(__ldcg(A + O_MQ + h * 192 + 128 + 2 * i + 1));
+      const float ang = pos * p.rope_inv[i];
+      const float cs = cosf(ang), sn = sinf(ang);
+      QB[h * 576 + 512 + 2 * i] = __float2bfloat16(xe * cs - xo * sn);
+      QB[h * 576 + 512 + 2 * i + 1] = __float2bfloat16(xo * cs + xe * sn);
+    }
+    for (int t = threadIdx.x; t < 512; t += NTH)
+      p.ckv_dst[(size_t)p.L * 512 + t] = __float2bfloat16(__ldcg(A + O_MKVA + t));
+    if (threadIdx.x < 32) {
+      const int i = threadIdx.x;
+      const float xe = bfr(__ldcg(A + O_MKVA + 512 + 2 * i));
+      const float xo = bfr(__ldcg(A + O_MKVA + 512 + 2 * i + 1));
+      const float ang = pos * p.rope_inv[i];
+      const float cs = cosf(ang), sn = sinf(ang);
+      p.kr_dst[(size_t)p.L * 64 + 2 * i] = __float2bfloat16(xe * cs - xo * sn);
+      p.kr_dst[(size_t)p.L * 64 + 2 * i + 1] = __float2bfloat16(xo * cs + xe * sn);
+    }
+  }
+}
+
+// flash-decoding partial over this block's chunk of positions, bf16 tensor cores.
+// S^T[h][l] = Q[h] . K[l] (M = heads, N = positions, K = 576); O[h][c] += P[h][l] V[l][c]
+// Q A-fragments live in registers (each warp: 16 heads x its 144-wide k quarter), so the
+// shared memory holds a 4-deep ring of 16-position K/V tiles.
+constexpr int ATT_NST = 4;
+__device__ void mla_attn(const Params& p, Ctx& c) {
+  float* A = layer_arena(p, 3);
+  const int b = blockIdx.x;
+  if (b >= p.nb_attn) return;
+  const int Ltot = p.L + 1;
+  const int p0 = b * p.chunk, p1 = min(p0 + p.chunk, Ltot);
+  const int Lc = p1 - p0;
+  const int ntile = (Lc + 15) >> 4;
+  __nv_bfloat16* ring = reinterpret_cast<__nv_bfloat16*>(c.xs);           // ATT_NST x 16 x QS_STRIDE
+  float* Sp = reinterpret_cast<float*>(ring + ATT_NST * 16 * QS_STRIDE);   // 4 x 32 x 17
+  __nv_bfloat16* Ps = reinterpret_cast<__nv_bfloat16*>(Sp + 4 * 32 * 17);  // 32 x PS_STRIDE
+  float* al = reinterpret_cast<float*>(Ps + 32 * PS_STRIDE);               // 32
+  const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
+  const int mt = warp & 1, nt = (warp >> 1) & 1, kq = warp >> 2;
+  const int g = lane >> 2, tq = lane & 3;
+  const int lrow = (lane & 7) + ((lane >> 3) & 1) * 8, lcol = (lane >> 4) * 8;
+  // stage Q through the ring area, then keep this warp's A fragments in registers
+  {
+    const __nv_bfloat16* QB = reinterpret_cast<const __nv_bfloat16*>(A + O_QB);
+    for (int i = tid; i < 32 * 72; i += NTH) {
+      const int r = i / 72, ch = i - r * 72;
+      cp_async16(ring + r * QS_STRIDE + ch * 8, QB + r * 576 + ch * 8, 16);
+    }
+    cp_async_commit();
+    cp_async_wait<0>();
+    csync();
+  }
+  uint32_t qf[9][4];
+#pragma unroll
+  for (int kk = 0; kk < 9; kk++)
+    ldsm_x4(qf[kk][0], qf[kk][1], qf[kk][2], qf[kk][3], ring + (mt * 16 + lrow) * QS_STRIDE + (kq * 9 + kk) * 16 + lcol);
+  csync();
+  auto load_tile = [&](int t) {
+    if (t < ntile) {
+      __nv_bfloat16* dst = ring + (t % ATT_NST) * 16 * QS_STRIDE;
+      for (int i = tid; i < 16 * 72; i += NTH) {
+        const int r = i / 72, ch = i - r * 72;
+        const int l = p0 + t * 16 + r;
+        const __nv_bfloat16* src;
+        int bytes = 16;
+        if (l >= p1) { src = p.ckv_dst; bytes = 0; }
+        else if (ch < 64) src = ((l < p.L) ? p.ckv_src : p.ckv_dst) + (size_t)l * 512 + ch * 8;
+        else src = ((l < p.L) ? p.kr_src : p.kr_dst) + (size_t)l * 64 + (ch - 64) * 8;
+        cp_async16(dst + r * QS_STRIDE + ch * 8, src, bytes);
+      }
+    }
+    cp_async_commit();     // always commit (possibly empty) so group accounting stays uniform
+  };
+#pragma unroll
+  for (int t = 0; t < ATT_NST - 1; t++) load_tile(t);
+  float m_run = -INFINITY, l_run = 0.f;
+  float oacc[8][4];
+#pragma unroll
+  for (int j = 0; j < 8; j++) { oacc[j][0] = oacc[j][1] = oacc[j][2] = oacc[j][3] = 0.f; }
+  for (int t = 0; t < ntile; t++) {
+    load_tile(t + ATT_NST - 1);
+    cp_async_wait<ATT_NST - 1>();
+    csync();
+    const __nv_bfloat16* Kt = ring + (t % ATT_NST) * 16 * QS_STRIDE;
+    {
+      float cf[4] = {0.f, 0.f, 0.f, 0.f};
+#pragma unroll
+      for (int kk = 0; kk < 9; kk++) {
+        uint32_t b0, b1;
+        ldsm_x2(b0, b1, Kt + (nt * 8 + (lane & 7)) * QS_STRIDE + (kq * 9 + kk) * 16 + ((lane >> 3) & 1) * 8);
+        mma_bf16(cf, qf[kk][0], qf[kk][1], qf[kk][2], qf[kk][3], b0, b1);
+      }
+      float* sp = Sp + kq * 32 * 17;
+      sp[(mt * 16 + g) * 17 + nt * 8 + 2 * tq] = cf[0];
+      sp[(mt * 16 + g) * 17 + nt * 8 + 2 * tq + 1] = cf[1];
+      sp[(mt * 16 + g + 8) * 17 + nt * 8 + 2 * tq] = cf[2];
+      sp[(mt * 16 + g + 8) * 17 + nt * 8 + 2 * tq + 1] = cf[3];
+    }
+    csync();
+    {
+      const int h = 2 * warp + (lane >> 4), pos = lane & 15;
+      float s = (Sp[h * 17 + pos] + Sp[32 * 17 + h * 17 + pos] + Sp[64 * 17 + h * 17 + pos] + Sp[96 * 17 + h * 17 + pos]) * MLA_SCALE;
+      if (p0 + t * 16 + pos >= p1) s = -INFINITY;
+      float tm = s;
+#pragma unroll
+      for (int o = 8; o > 0; o >>= 1) tm = fmaxf(tm, __shfl_xor_sync(0xffffffffu, tm, o));
+      const float m_new = fmaxf(m_run, tm);
+      const float alpha = __expf(m_run - m_new);
+      const float pv = __expf(s - m_new);
+      float ps = pv;
+#pragma unroll
+      for (int o = 8; o > 0; o >>= 1) ps += __shfl_xor_sync(0xffffffffu, ps, o);
+      l_run = l_run * alpha + ps;
+      m_run = m_new;
+      Ps[h * PS_STRIDE + pos] = __float2bfloat16(pv);
+      if (pos == 0) al[h] = alpha;
+    }
+    csync();
+    {
+      const int cq = warp >> 1;
+      const float a_lo = al[mt * 16 + g], a_hi = al[mt * 16 + g + 8];
+#pragma unroll
+      for (int j = 0; j < 8; j++) { oacc[j][0] *= a_lo; oacc[j][1] *= a_lo; oacc[j][2] *= a_hi; oacc[j][3] *= a_hi; }
+      uint32_t a0, a1, a2, a3;
+      ldsm_x4(a0, a1, a2, a3, Ps + (mt * 16 + lrow) * PS_STRIDE + lcol);
+#pragma unroll
+      for (int jj = 0; jj < 4; jj++) {
+        const int cb = cq * 64 + jj * 16;
+        uint32_t b0, b1, b2, b3;
+        ldsm_x4_t(b0, b1, b2, b3, Kt + lrow * QS_STRIDE + cb + lcol);
+        mma_bf16(oacc[2 * jj], a0, a1, a2, a3, b0, b1);
+        mma_bf16(oacc[2 * jj + 1], a0, a1, a2, a3, b2, b3);
+      }
+    }
+    csync();
+  }
+  cp_async_wait<0>();
+  float* part = p.part + (size_t)b * PART_STRIDE;
+  {
+    const int h = 2 * warp + (lane >> 4);
+    if ((lane & 15) == 0) { part[h] = m_run; part[32 + h] = l_run; }
+  }
+  {
+    const int cq = warp >> 1;
+#pragma unroll
+    for (int j = 0; j < 8; j++) {
+      const int cidx = cq * 64 + j * 8 + 2 * tq;
+      const int h0 = mt * 16 + g;
+      __nv_bfloat162* po = reinterpret_cast<__nv_bfloat162*>(part + 64);
+      po[(h0 * 512 + cidx) >> 1] = __floats2bfloat162_rn(oacc[j][0], oacc[j][1]);
+      po[((h0 + 8) * 512 + cidx) >> 1] = __floats2bfloat162_rn(oacc[j][2], oacc[j][3]);
+    }
+  }
+  if (p.copy) {
+    const int pe = min(p1, p.L);
+    for (int i = tid; i < (pe - p0) * 72; i += NTH) {
+      const int r = i / 72, ch = i - r * 72;
+      const size_t l = (size_t)(p0 + r);
+      if (ch < 64) *reinterpret_cast<uint4*>(p.ckv_dst + l * 512 + ch * 8) = *reinterpret_cast<const uint4*>(p.ckv_src + l * 512 + ch * 8);
+      else *reinterpret_cast<uint4*>(p.kr_dst + l * 64 + (ch - 64) * 8) = *reinterpret_cast<const uint4*>(p.kr_src + l * 64 + (ch - 64) * 8);
+    }
+  }
+}
+
+// combine partials for (h, c-group) and apply W_uv (kv_b value half) -> o (4096).
+// All partial loads for the unit are issued in one round trip.
+__device__ void mla_combine_uv(const Params& p, Ctx& c) {
+  const LayerW& W = p.lw[3];
+  float* A = layer_arena(p, 3);
+  const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
+  float* wsc = reinterpret_cast<float*>(c.big);   // nb_attn scales
+  float* comb = wsc + 256;                         // 128
+  float* pr = comb + 128;                          // 4 x 128
+  const int nb = p.nb_attn;
+  constexpr int MAXK = 48;                         // nb <= 4 * MAXK
+  for (int u = blockIdx.x; u < 128; u += gridDim.x) {
+    const int h = u >> 2, gc = u & 3;
+    const int i = tid & 127, q = tid >> 7;
+    const float mb = (tid < nb) ? __ldcg(p.part + (size_t)tid * PART_STRIDE + h) : -INFINITY;
+    const float lb = (tid < nb) ? __ldcg(p.part + (size_t)tid * PART_STRIDE + 32 + h) : 0.f;
+    const unsigned short* src = reinterpret_cast<const unsigned short*>(p.part + 64) + h * 512 + gc * 128 + i;
+    float ov[MAXK];
+#pragma unroll
+    for (int k = 0; k < MAXK; k++) {
+      const int b = q + 4 * k;
+      ov[k] = (b < nb) ? __uint_as_float((uint32_t)__ldcg(src + (size_t)b * PART_STRIDE * 2) << 16) : 0.f;
+    }
+    float m = warp_max(mb);
+    if (lane == 0) c.red[warp] = m;
+    csync();
+    float M = c.red[0];
+#pragma unroll
+    for (int w = 1; w < NWARP; w++) M = fmaxf(M, c.red[w]);
+    csync();
+    const float e = (tid < nb) ? __expf(mb - M) : 0.f;
+    if (tid < nb) wsc[tid] = e;
+    const float ls = block_sum(e * lb, c.red);    // also publishes wsc
+    float acc = 0.f;
+#pragma unroll
+    for (int k = 0; k < MAXK; k++) {
+      const int b = q + 4 * k;
+      if (b < nb) acc = fmaf(wsc[b], ov[k], acc);
+    }
+    pr[q * 128 + i] = acc;
+    csync();
+    if (tid < 128) comb[tid] = __fdividef(pr[tid] + pr[128 + tid] + pr[256 + tid] + pr[384 + tid], ls);
+    csync();
+    if (warp < 2) {
+      float tot[16];
+#pragma unroll
+      for (int k = 0; k < 16; k++) tot[k] = 0.f;
+      gemv_item(W.a[2] + (size_t)((4 * h + 2 + warp) * 4 + gc) * IB, comb, tot, lane);
+      flush_tile(tot, A + O_OACC + h * 128 + warp * 64, 1.f, lane);
+    }
+    csync();
+  }
+}
+
+__device__ void mla_oproj(const Params& p, Ctx& c) {
+  float* A = layer_arena(p, 3);
+  if (threadIdx.x == 0) build_moproj(p, c, c.segs);
+  csync();
+  load_vec<2>(c.xs, A + O_OACC, 4096, true);
+  csync();
+  run_items(c.segs, 1);
+}
+
+__global__ void __launch_bounds__(NTH + 32, 1) kimi_step_kernel(const Params p) {
+  extern __shared__ __align__(16) unsigned char smem[];
+  Ctx c;
+  c.red = reinterpret_cast<float*>(smem);                 // 64 floats
+  c.sel = reinterpret_cast<int*>(smem + 256);             // 8
+  c.wts = reinterpret_cast<float*>(smem + 288);           // 8
+  c.segs = reinterpret_cast<Seg*>(smem + 320);            // 24 segs (48 B each)
+  c.pseg = reinterpret_cast<Seg*>(smem + 320 + 24 * 48);  // 24 segs
+  c.pfr = smem + 2688;                                    // 40 x 16 B streamer ranges
+  c.tk = reinterpret_cast<float*>(smem + 3328);           // 64 floats
+  c.ptk = reinterpret_cast<float*>(smem + 3584);          // 64 floats + 32 ints
+  c.xs = reinterpret_cast<float*>(smem + 3968);           // 4096 floats
+  c.xr = c.xs + 4096;                                     // 2304 floats
+  c.big = smem + 3968 + (4096 + 2304) * 4;                // rest
+  c.phase_v = reinterpret_cast<volatile int*>(smem + 2656);
+  c.sel_v = reinterpret_cast<volatile int*>(smem + 2660);
+  c.k = 0;
+  if (threadIdx.x == 0) {
+    c.red[40] = __uint_as_float(*((volatile unsigned*)(p.bar + 1)));
+    *c.phase_v = 0;
+    *c.sel_v = -1;
+  }
+  __syncthreads();
+  c.base = __float_as_uint(c.red[40]);
+  if (threadIdx.x >= NTH) {          // warp 16: L2 streamer
+    if (p.pf_la >= 0) prefetcher(p, c);
+    return;
+  }
+  csync();
+  prof_mark(p, c);
+
+  // zero the accumulators of the arena the NEXT step will use
+  {
+    float4* z = reinterpret_cast<float4*>(p.arena_next);
+    const float4 zero = make_float4(0.f, 0.f, 0.f, 0.f);
+    for (int l = 0; l < 4; l++)
+      for (int i = blockIdx.x * NTH + threadIdx.x; i < ZERO_FLOATS / 4; i += gridDim.x * NTH)
+        z[(size_t)l * (LAYER_FLOATS / 4) + i] = zero;
+  }
+
+  for (int l = 0; l < 3; l++) {
+    kda_qkvg(p, c, l);       grid_sync(p, c);
+    kda_recur(p, c, l);      grid_sync(p, c);
+    kda_oproj(p, c, l);      grid_sync(p, c);
+    moe_shared(p, c, l);     grid_sync(p, c);
+    moe_gateup(p, c, l);     grid_sync(p, c);
+    moe_down(p, c, l);       grid_sync(p, c);
+  }
+  mla_proj(p, c);            grid_sync(p, c);
+  mla_absorb(p, c);          grid_sync(p, c);
+  mla_attn(p, c);            grid_sync(p, c);
+  mla_combine_uv(p, c);      grid_sync(p, c);
+  mla_oproj(p, c);           grid_sync(p, c);
+  moe_shared(p, c, 3);       grid_sync(p, c);
+  moe_gateup(p, c, 3);       grid_sync(p, c);
+  moe_down(p, c, 3);
+
+  // last block to finish writes the output hidden
+  csync();
+  if (threadIdx.x == 0) {
+    __threadfence();
+    const unsigned old = atomicAdd(p.bar, 1u);
+    c.red[41] = (old == c.base + (c.k + 1) * gridDim.x - 1) ? 1.f : 0.f;
+  }
+  csync();
+  if (c.red[41] != 0.f) {
+    __threadfence();
+    const float* xp = p.xbuf + 3 * D;
+    const float* A = layer_arena(p, 3);
+    for (int i = threadIdx.x; i < D / 4; i += NTH) {
+      const float4 h = bfr4(add4(ldcg4(xp + 4 * i), bfr4(ldcg4(A + O_Y + 4 * i))));
+      const float4 o = add4(h, bfr4(ldcg4(A + O_MOE + 4 * i)));
+      __nv_bfloat162* dst = reinterpret_cast<__nv_bfloat162*>(p.x_out + 4 * i);
+      dst[0] = __floats2bfloat162_rn(o.x, o.y);
+      dst[1] = __floats2bfloat162_rn(o.z, o.w);
+    }
+    csync();
+    if (threadIdx.x == 0) {
+      *((volatile unsigned*)(p.bar + 1)) = c.base + (c.k + 1) * gridDim.x;
+      if (p.prof) {
+        unsigned long long t;
+        asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
+        p.prof[c.k + 1] = t;
+      }
+    }
+  }
+}
+
+std::vector<Params> g_models;   // one entry per Model instance (weights / scratch pointers)
+int g_nblocks = 0;
+size_t g_smem = 0;
+
+}  // namespace
+
+// one-time device setup: kernel smem attribute, co-residency check; returns the grid size
+int64_t init_device() {
+  if (g_nblocks) return g_nblocks;
+  int dev; cudaGetDevice(&dev);
+  cudaDeviceProp prop; cudaGetDeviceProperties(&prop, dev);
+  g_smem = prop.sharedMemPerBlockOptin;
+  cudaFuncSetAttribute(kimi_step_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)g_smem);
+  int per_sm = 0;
+  cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per_sm, kimi_step_kernel, NTH + 32, g_smem);
+  if (per_sm < 1) throw std::runtime_error("megakernel does not fit on an SM");
+  g_nblocks = prop.multiProcessorCount;     // one persistent block per SM (cooperative launch)
+  return g_nblocks;
+}
+
+// register a model's weight / scratch pointers; returns its handle
+int64_t setup(std::vector<int64_t> w, int64_t rope_inv, int64_t xbuf, int64_t part, int64_t bar) {
+  // w: per layer 16 pointers: a0..a4, beta_w, conv_w, attn_norm, moe_norm, router_w, eg, eu, ed, sg, su, sd
+  if (w.size() != 64) throw std::runtime_error("bad weight pointer list");
+  Params P{};
+  for (int l = 0; l < 4; l++) {
+    const int64_t* q = w.data() + l * 16;
+    LayerW& L = P.lw[l];
+    for (int i = 0; i < 5; i++) L.a[i] = reinterpret_cast<const uint8_t*>(q[i]);
+    L.beta_w = reinterpret_cast<const __nv_bfloat16*>(q[5]);
+    L.conv_w = reinterpret_cast<const __nv_bfloat16*>(q[6]);
+    L.attn_norm = reinterpret_cast<const __nv_bfloat16*>(q[7]);
+    L.moe_norm = reinterpret_cast<const __nv_bfloat16*>(q[8]);
+    L.router_w = reinterpret_cast<const __nv_bfloat16*>(q[9]);
+    L.eg = reinterpret_cast<const uint8_t*>(q[10]);
+    L.eu = reinterpret_cast<const uint8_t*>(q[11]);
+    L.ed = reinterpret_cast<const uint8_t*>(q[12]);
+    L.sg = reinterpret_cast<const uint8_t*>(q[13]);
+    L.su = reinterpret_cast<const uint8_t*>(q[14]);
+    L.sd = reinterpret_cast<const uint8_t*>(q[15]);
+  }
+  P.rope_inv = reinterpret_cast<const float*>(rope_inv);
+  P.xbuf = reinterpret_cast<float*>(xbuf);
+  P.part = reinterpret_cast<float*>(part);
+  P.bar = reinterpret_cast<unsigned*>(bar);
+  P.prof = nullptr;
+  // streamer schedule knobs (tuned): lookahead 2 phases, MLA latent cache streamed from
+  // phase 14, speculative routed-expert prefetch on, no cross-step prefetch
+  P.pf_la = 2; P.pf_spec = 1; P.pf_next_step = 0; P.pf_cache_gate = 14;
+  g_models.push_back(P);
+  return (int64_t)g_models.size() - 1;
+}
+
+// one decode step = one cooperative launch of the megakernel
+void step(int64_t handle, std::vector<int64_t> d, int64_t L, int64_t copy, int64_t nb_attn, int64_t chunk,
+          int64_t prof, int64_t stream_handle) {
+  // d: S0,S1,S2, conv(l,t) x9, ckv_src, kr_src, ckv_dst, kr_dst, x_in, x_out, arena_cur, arena_next
+  if (d.size() != 20) throw std::runtime_error("bad dynamic pointer list");
+  if (handle < 0 || handle >= (int64_t)g_models.size()) throw std::runtime_error("bad model handle");
+  Params p = g_models[handle];
+  for (int l = 0; l < 3; l++) p.S[l] = reinterpret_cast<float*>(d[l]);
+  for (int l = 0; l < 3; l++)
+    for (int t = 0; t < 3; t++) p.conv[l][t] = reinterpret_cast<__nv_bfloat16*>(d[3 + l * 3 + t]);
+  p.ckv_src = reinterpret_cast<const __nv_bfloat16*>(d[12]);
+  p.kr_src = reinterpret_cast<const __nv_bfloat16*>(d[13]);
+  p.ckv_dst = reinterpret_cast<__nv_bfloat16*>(d[14]);
+  p.kr_dst = reinterpret_cast<__nv_bfloat16*>(d[15]);
+  p.x_in = reinterpret_cast<const __nv_bfloat16*>(d[16]);
+  p.x_out = reinterpret_cast<__nv_bfloat16*>(d[17]);
+  p.arena_cur = reinterpret_cast<float*>(d[18]);
+  p.arena_next = reinterpret_cast<float*>(d[19]);
+  p.prof = reinterpret_cast<unsigned long long*>(prof);
+  p.L = (int)L; p.copy = (int)copy; p.nb_attn = (int)nb_attn; p.chunk = (int)chunk;
+  void* args[] = {(void*)&p};
+  cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_handle);
+  cudaError_t err = cudaLaunchCooperativeKernel((void*)kimi_step_kernel, dim3(g_nblocks), dim3(NTH + 32), args, g_smem, stream);
+  if (err != cudaSuccess) throw std::runtime_error(std::string("megakernel launch failed: ") + cudaGetErrorString(err));
+}
+"""
+
+CPP_SRC = r"""
+#include <vector>
+#include <cstdint>
+int64_t init_device();
+int64_t setup(std::vector<int64_t> w, int64_t rope_inv, int64_t xbuf, int64_t part, int64_t bar);
+void step(int64_t handle, std::vector<int64_t> d, int64_t L, int64_t copy, int64_t nb_attn, int64_t chunk,
+          int64_t prof, int64_t stream_handle);
+"""
+
+_EXT = None
+
+
+def _ext():
+    global _EXT
+    if _EXT is None:
+        tag = hashlib.sha1((CUDA_SRC + CPP_SRC).encode()).hexdigest()[:12]
+        build = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_build", tag)
+        os.makedirs(build, exist_ok=True)
+        _EXT = load_inline(
+            name="kimi_mk_" + tag,
+            cpp_sources=CPP_SRC,
+            cuda_sources=CUDA_SRC,
+            functions=["init_device", "setup", "step"],
+            extra_cuda_cflags=["-O3", "-gencode=arch=compute_120a,code=sm_120a", "-lineinfo", "-std=c++20"],
+            build_directory=build,
+            verbose=False,
+        )
+    return _EXT
+
+
+# --------------------------------------------------------------------------- #
+# one-time weight repack: (K/2, N) packed-int4 + group params -> contiguous
+# 4352-byte items (64 cols x 128 k), ordered tile-major then k-group.
+# --------------------------------------------------------------------------- #
+def _repack(w_q: torch.Tensor, scales: torch.Tensor, zeros: torch.Tensor) -> torch.Tensor:
+    lead = w_q.shape[:-2]
+    K2, N = w_q.shape[-2:]
+    ng, nt = K2 // 64, N // 64
+    nb = int(torch.tensor(lead).prod().item()) if len(lead) else 1
+    w = w_q.reshape(nb, ng, 8, 8, nt, 4, 16).permute(0, 4, 1, 3, 2, 5, 6).reshape(nb, nt, ng, 4096)
+    s = scales.reshape(nb, ng, nt, 64).permute(0, 2, 1, 3).contiguous().view(torch.uint8).reshape(nb, nt, ng, 128)
+    z = zeros.reshape(nb, ng, nt, 64).permute(0, 2, 1, 3).contiguous().view(torch.uint8).reshape(nb, nt, ng, 128)
+    return torch.cat([w, s, z], dim=3).contiguous().reshape(-1)
+
+
+LAYER_FLOATS = 65536
+PART_STRIDE = 64 + 32 * 512 // 2
+MAX_ATTN_SPLITS = 192          # the combine phase reads at most this many attention partials
+
+
+class Model(nn.Module):
+    def __init__(self, cfg: Config):
+        super().__init__()
+        self.cfg = cfg
+        # the megakernel is specialised to the Kimi-Linear-48B-A3B unit dimensions
+        assert (cfg.hidden, cfg.kda_heads, cfg.kda_head_dim, cfg.short_conv) == (2304, 32, 128, 4)
+        assert (cfg.mla_heads, cfg.kv_lora, cfg.qk_nope, cfg.qk_rope, cfg.v_head) == (32, 512, 128, 64, 128)
+        assert (cfg.n_experts, cfg.n_active, cfg.n_shared, cfg.moe_inter, cfg.group) == (64, 8, 1, 1024, 128)
+        assert cfg.pattern == ("K", "K", "K", "M") and cfg.routed_scaling == 2.446
+        self.blocks = nn.ModuleList(Block(cfg, k) for k in cfg.pattern)
+        self._ready = False
+        self._cache = None
+        self._parity = 0
+        self.prof = None   # optional int64[>=128] device tensor: per-phase globaltimer stamps
+        self.register_load_state_dict_post_hook(Model._invalidate)
+
+    @staticmethod
+    def _invalidate(module, incompatible_keys):
+        # (re)pack the freshly loaded weights once, at load time, when they live on the GPU
+        module._ready = False
+        if module.blocks[0].attn_norm.is_cuda:
+            module._prepare()
+
+    def _apply(self, fn, *args, **kwargs):
+        self._ready = False
+        return super()._apply(fn, *args, **kwargs)
+
+    @torch.no_grad()
+    def _prepare(self):
+        dev = self.blocks[0].attn_norm.device
+        ext = _ext()
+        self._packed = []
+        ptrs = []
+        for blk in self.blocks:
+            a = blk.attn
+            if blk.kind == "K":
+                mats = [a.q_proj, a.k_proj, a.v_proj, a.g_proj, a.o_proj]
+            else:
+                mats = [a.q_proj, a.kv_a, a.kv_b, a.o_proj]
+            pk = [_repack(m.w_q, m.scales, m.zeros) for m in mats]
+            while len(pk) < 5:
+                pk.append(pk[0])
+            m = blk.moe
+            ex = [_repack(e.w_q, e.scales, e.zeros) for e in (m.gate, m.up, m.down, m.s_gate, m.s_up, m.s_down)]
+            self._packed += pk + ex
+            beta = a.beta_proj.weight if blk.kind == "K" else blk.attn_norm
+            conv = a.conv_w if blk.kind == "K" else blk.attn_norm
+            ptrs += [t.data_ptr() for t in pk]
+            ptrs += [beta.data_ptr(), conv.data_ptr(), blk.attn_norm.data_ptr(), blk.moe_norm.data_ptr(),
+                     m.router.weight.data_ptr()]
+            ptrs += [t.data_ptr() for t in ex]
+        cfg = self.cfg
+        self._rope_inv = (1.0 / (cfg.rope_theta ** (torch.arange(0, cfg.qk_rope, 2, device=dev, dtype=torch.float32)
+                                                   / cfg.qk_rope))).contiguous()
+        self._xbuf = torch.zeros(4 * cfg.hidden, device=dev, dtype=torch.float32)
+        self._arena = [torch.zeros(4 * LAYER_FLOATS, device=dev, dtype=torch.float32) for _ in range(2)]
+        self._bar = torch.zeros(2, device=dev, dtype=torch.int32)    # grid-barrier counter + epoch base
+        self._nb = int(ext.init_device())
+        self._part = torch.empty(self._nb * PART_STRIDE, device=dev, dtype=torch.float32)
+        self._handle = int(ext.setup(ptrs, self._rope_inv.data_ptr(), self._xbuf.data_ptr(), self._part.data_ptr(),
+                                     self._bar.data_ptr()))
+        self._ext = ext
+        self._ready = True
+        torch.cuda.synchronize()
+
+    def _cache_buffers(self, ckv: torch.Tensor, kr: torch.Tensor):
+        """Return (dst_ckv, dst_kr, copy). Appends in place when the incoming cache is the
+        live prefix of our capacity buffer; otherwise a fresh buffer that the kernel fills."""
+        L = ckv.shape[0]
+        c = self._cache
+        if (c is not None and c["len"] == L and L + 1 <= c["cap"]
+                and ckv.data_ptr() == c["ckv"].data_ptr() and kr.data_ptr() == c["kr"].data_ptr()):
+            return c["ckv"], c["kr"], 0
+        cap = L + 1 + max(256, L // 4)
+        ckv_buf = torch.empty(cap, ckv.shape[1], device=ckv.device, dtype=ckv.dtype)
+        kr_buf = torch.empty(cap, kr.shape[1], device=kr.device, dtype=kr.dtype)
+        self._cache = {"ckv": ckv_buf, "kr": kr_buf, "cap": cap, "len": -1}
+        return ckv_buf, kr_buf, 1
+
+    @torch.no_grad()
+    def step(self, hidden, state):
+        if not self._ready:
+            self._prepare()
+        mst = state[3]
+        ckv, kr = mst["c_kv"], mst["k_rope"]
+        assert hidden.dtype == torch.bfloat16 and hidden.numel() == self.cfg.hidden
+        assert ckv.is_contiguous() and kr.is_contiguous() and ckv.dtype == kr.dtype == torch.bfloat16
+        for i in range(3):
+            assert state[i]["S"].dtype == torch.float32 and state[i]["S"].is_contiguous()
+            assert all(state[i][k].dtype == torch.bfloat16 and state[i][k].is_contiguous() for k in ("cq", "ck", "cv"))
+        L = ckv.shape[0]
+        dst_ckv, dst_kr, copy = self._cache_buffers(ckv, kr)
+        nb = min(self._nb, MAX_ATTN_SPLITS)
+        chunk = max(32, -(-(L + 1) // nb))
+        nb_attn = -(-(L + 1) // chunk)
+        x_in = hidden.contiguous()
+        out = torch.empty_like(x_in)
+        d = []
+        for i in range(3):
+            d.append(state[i]["S"].data_ptr())
+        for i in range(3):
+            for key in ("cq", "ck", "cv"):
+                d.append(state[i][key].data_ptr())
+        d += [ckv.data_ptr(), kr.data_ptr(), dst_ckv.data_ptr(), dst_kr.data_ptr(),
+              x_in.data_ptr(), out.data_ptr(),
+              self._arena[self._parity].data_ptr(), self._arena[1 - self._parity].data_ptr()]
+        prof = self.prof.data_ptr() if self.prof is not None else 0
+        self._ext.step(self._handle, d, L, copy, nb_attn, chunk, prof, torch.cuda.current_stream(x_in.device).cuda_stream)
+        self._parity ^= 1
+        self._cache["len"] = L + 1
+        mst["c_kv"] = dst_ckv[: L + 1]
+        mst["k_rope"] = dst_kr[: L + 1]
+        return out, state
