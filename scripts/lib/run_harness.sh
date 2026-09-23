@@ -2910,6 +2910,11 @@ if [ -f "$PROBLEM_DIR/solution.py" ]; then
     HAS_SOLUTION=true
 fi
 
+# torch's load_inline leaves <ext>/lock behind when the agent session is killed
+# mid-build (sandbox teardown), and the next load then waits on it forever: two
+# cells hung check.py for 30 min on 2026-09-22. Nothing else holds these caches
+# at grading time, so any lock left is stale.
+find "$RUN_DIR/cache/torch_extensions" -name lock -type f -delete 2>/dev/null || true
 if [ "$TEMPLATE_MUTATED" = "false" ] && [ "$HAS_SOLUTION" = "true" ]; then
     CHECK_LOG="$RUN_DIR/check.log"
     BENCH_LOG="$RUN_DIR/benchmark.log"
