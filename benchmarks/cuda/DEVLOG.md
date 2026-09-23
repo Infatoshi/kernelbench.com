@@ -55,6 +55,10 @@ images are in `media/posts/audited/opus55-cuda/` (`00_post.txt`, `01.png` to
 `03.png`). It is unsent and still has `FILL-IN` for Elliot's paragraph. The
 post names the overlapping resumes; it does not present 02-04 as one-agent
 hill climbs.
+At 2026-09-22 22:07 MDT, the same three-post thread was saved in Chrome as an
+unsent draft for `@elliotarledge`. The X Drafts list showed the opener with
+"2 more posts" and three uploaded images (results, latency, design diagram).
+`FILL-IN` remains in post 1 for Elliot's paragraph. No CUDA post was sent.
 
 ## 2026-09-22 — 02_deepseek_nsa: large_qkv dropped from the RTX PRO 6000 check
 
