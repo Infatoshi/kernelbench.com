@@ -2914,8 +2914,12 @@ fi
 # mid-build (sandbox teardown), and the next load then waits on it forever: two
 # cells hung check.py for 30 min on 2026-09-22. Nothing else holds these caches
 # at grading time, so any lock left is stale, and so is its build dir (a killed
-# build can leave no .so while torch still considers it built): drop the dir, rebuild.
-find "$RUN_DIR/cache/torch_extensions" -mindepth 2 -maxdepth 2 -name lock -type f -printf "%h\0" 2>/dev/null | xargs -0 -r rm -rf --
+# build can leave no .so while torch still considers it built): drop any dir with a
+# lock or without a .so, and it rebuilds from the same source.
+for _ext in "$RUN_DIR"/cache/torch_extensions/*/; do
+    [ -d "$_ext" ] || continue
+    if [ -e "$_ext/lock" ] || ! compgen -G "$_ext*.so" >/dev/null; then rm -rf -- "$_ext"; fi
+done
 if [ "$TEMPLATE_MUTATED" = "false" ] && [ "$HAS_SOLUTION" = "true" ]; then
     CHECK_LOG="$RUN_DIR/check.log"
     BENCH_LOG="$RUN_DIR/benchmark.log"
