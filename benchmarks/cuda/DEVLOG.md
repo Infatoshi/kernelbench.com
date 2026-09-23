@@ -47,6 +47,15 @@ then downloaded and SHA256-matched. `kb publish cuda` and its site gates passed
 locally; the site now presents Native Sparse Attention in measured milliseconds
 because its dense-equivalent roofline is not a useful headline.
 
+Live release: `654b3cc` on `origin/master`; GitHub's Vercel status reported
+success. The live `/cuda` board shows all four audited Opus cells, all four
+served kernel files SHA256-match `public/runs/`, and all four HF trace blob
+pages return 200. The three-part CUDA post draft and inspected dark-mode
+images are in `media/posts/audited/opus55-cuda/` (`00_post.txt`, `01.png` to
+`03.png`). It is unsent and still has `FILL-IN` for Elliot's paragraph. The
+post names the overlapping resumes; it does not present 02-04 as one-agent
+hill climbs.
+
 ## 2026-09-22 — 02_deepseek_nsa: large_qkv dropped from the RTX PRO 6000 check
 
 The widened check (#11) withdrew four independent kernels on 02 (Grok 4.5, Grok 4.6,
