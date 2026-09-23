@@ -154,6 +154,12 @@ for RUN_DIR in "$@"; do
     purge_untrusted_bytecode "$PROBLEM_DIR" || exit 3
 
     require_idle_gpu || { SKIP=$((SKIP+1)); continue; }
+    # A GPU that fell off the bus leaves the driver unable to init CUDA; grading
+    # then "fails" every cell and voids real numbers. Refuse instead (2026-09-22).
+    if ! CUDA_VISIBLE_DEVICES="$GPU" timeout 120 "$REPO_ROOT/.venv/bin/python" -c "import torch,sys; sys.exit(0 if torch.cuda.is_available() else 1)" >/dev/null 2>&1; then
+        echo "FATAL: CUDA does not initialise on GPU $GPU (driver fault?); refusing to grade" >&2
+        exit 5
+    fi
 
     # Same isolated caches the original run used, so a compiled extension
     # resolves the way it did in-session.
