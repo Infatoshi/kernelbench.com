@@ -167,8 +167,9 @@ for RUN_DIR in "$@"; do
     # torch's load_inline leaves <ext>/lock behind when the agent session is killed
     # mid-build (sandbox teardown), and the next load then waits on it forever: two
     # cells hung check.py for 30 min on 2026-09-22. Nothing else holds these caches
-    # at grading time, so any lock left is stale.
-    find "$RUN_DIR/cache/torch_extensions" -name lock -type f -delete 2>/dev/null || true
+    # at grading time, so any lock left is stale, and so is its build dir (a killed
+# build can leave no .so while torch still considers it built): drop the dir, rebuild.
+    find "$RUN_DIR/cache/torch_extensions" -mindepth 2 -maxdepth 2 -name lock -type f -printf "%h\0" 2>/dev/null | xargs -0 -r rm -rf --
     # Check-only is a deck-correction backfill and may run on a different box
     # than the one that graded the cell. A prebuilt extension .so in the
     # archived cache is then an ABI gamble (2026-09-20: a GLM 5.3 topk cell
