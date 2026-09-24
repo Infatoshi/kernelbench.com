@@ -64,6 +64,17 @@ graded sizes, seeds 42/123/456, against `reference.run`.
   env-steps have gaps under 2.7e-3. A gap cutoff near 1e-5 excuses the 1e-7
   flips and still flags Gemini, DeepSeek V4 Flash, bf16 and skip-a-layer.
 
+Follow-up, branch `bench/04-margin-rule` (not on master): the RTX 04 `check.py` now runs
+every graded shape as well as (128, 8), and excuses a final-position mismatch only when
+the env's first divergence is an action the reference took by a top-2 logit gap under
+`position_tie_margin: 1.0e-5` (problem.yaml); excused envs drop out of the reward and
+last-logit comparisons. RTX 3090 proxy: 11 live kernels PASS (Opus 5, Qwen 3.8 Max and
+Grok 4.7 included), DeepSeek V4 Flash 0731 FAILS (gap 1.4e-4), Gemini 3.8 Flash FAILS the
+pre-existing env_step check on the 3090 (judge on the board GPU), Fable 5.1 does not
+build for sm_86. Mutants: TF32 passes, bf16 policy and skip-a-layer fail. H100 decks
+unchanged. Merging changes the graded surface: every RTX 04 cell needs a check-only
+restamp on RTX PRO 6000 before gate E lets the cuda board publish.
+
 NSA: two kernels that skip block selection (dense causal; first 8 blocks) both
 fail the current 02 check at shape 0 nominal and small_qkv. The 09-17 fix holds
 for that class.
