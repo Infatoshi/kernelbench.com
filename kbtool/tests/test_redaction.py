@@ -147,3 +147,21 @@ def test_home_path_after_a_flag_is_redacted(text):
 ])
 def test_relative_segments_are_not_treated_as_home_paths(text):
     assert not r.HOME_RE.search(text), f'{text!r} should not match'
+
+
+@pytest.mark.parametrize('text', [
+    'lo = w_q[0::2].to(torch.uint8) & 0xF',        # slice steps parse as IPv6
+    'hi = w_q[1::2]; rev = x[::-1]; odd = xf[..., ::2]',
+    'asm volatile("cp.async.wait_group %0;\\n" :: "n"(N));',   # asm operand separator
+    'using T = C::D; auto v = ::4099;',
+    'return x[::1]  # loopback-shaped slice',
+])
+def test_code_that_parses_as_ipv6_is_left_intact(text):
+    """201 published kernels once shipped with `w_q[[REDACTED: IP]]` in place of `w_q[0::2]`."""
+    assert r.redact_text(text) == text
+    assert 'ip_address' not in r.scan_text(text)
+
+
+@pytest.mark.parametrize('text', ['fe80::1', '2001:db8::1', 'fe80::1ff:fe23:4567:890a', 'peer ::ffff:c0a8:101 up'])
+def test_real_ipv6_addresses_are_redacted(text):
+    assert '[REDACTED: IP]' in r.redact_text(text)

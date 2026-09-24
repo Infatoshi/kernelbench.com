@@ -141,11 +141,18 @@ def _already_redacted(value: str) -> bool:
 
 
 def _valid_ip(match: re.Match) -> bool:
+    text = match.group()
     try:
-        ipaddress.ip_address(match.group())
-        return True
+        addr = ipaddress.ip_address(text)
     except ValueError:
         return False
+    if addr.version == 6:
+        # Python slices (0::2, ::2), C++ scopes (C::D) and inline-asm operand
+        # separators (::) all parse as IPv6. A real address has 3+ groups or a
+        # 3+ character group (fe80::1, 2001:db8::1); loopback ::1 is not sensitive.
+        groups = [g for g in text.split(':') if g]
+        return len(groups) >= 3 or (len(groups) == 2 and max(map(len, groups)) >= 3)
+    return True
 
 
 def scan_text(text: str) -> dict[str, int]:

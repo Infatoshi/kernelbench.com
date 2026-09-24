@@ -1,5 +1,42 @@
 # KernelBench-CUDA — DEVLOG
 
+## 2026-09-24 — 04 positions at graded sizes: 5 live kernels diverge (RTX 3090 proxy)
+
+Probe, not a regrade: tetra's four GPUs were held by a GLM-5.3 vLLM server, so
+this ran on anvil's RTX 3090 with each kernel's `sm_120` flags patched to
+`sm_86` in a throwaway copy. Scripts and logs:
+`anvil:~/dev/sites/kernelbench.com/benchmarks/cuda/outputs/probes/`.
+`check.py` only runs `run(128, 8)`; this ran every live 04 kernel at the four
+graded sizes, seeds 42/123/456, against `reference.run`.
+
+- fp64 reference equals the fp32 reference on every final position at all 12
+  (size, seed) pairs, so exact positions are well defined.
+- Exact everywhere: Grok 4.5, Kimi K3 256k and 1M, Opus 4.8, Fable 5,
+  GPT-6 Astra Pro, DeepSeek V4.1 Flash, Opus 5.5.
+- Diverge, seed 42 only: Opus 5 (1/2/7 envs at 4096/16384/65536, step 1,
+  reference top-2 logit gap 1.4e-7), Qwen 3.8 Max (same envs, gap 2.3e-7),
+  Grok 4.7 (3 envs at 65536, gap 7e-7), Gemini 3.8 Flash (2/7/30, gaps up
+  to 3.7e-4), DeepSeek V4 Flash 0731 (3/11/1, gaps up to 2.7e-3, 5 envs whose
+  first divergence moves between horizons).
+- Fable 5.1 uses thread-block clusters and does not build for sm_86; Grok
+  4.7's `kernels.cu` exists only in the archive's `scratch/`, not next to
+  `solution.py`.
+- A TF32 mutant of the reference passes the numeric part of `check.py` on all
+  three seeds and flips the same seed-42 envs as Opus 5 at graded sizes.
+- Positions carry signal only on seed 42: a mutant that skips GRU layer 3
+  moves 49% of final positions on seed 42 and none on 123/456 at any size.
+  79-94% of reference agents end on the board edge (26-27 distinct final
+  positions of 128), pinned by `env_step`'s clamp. `last_logits` is what
+  catches that mutant on 123/456.
+- A margin rule scaled to the 1e-3 logit tolerance would be toothless: the
+  skip-a-layer mutant diverges only at gaps up to 1.7e-3, and ~79% of
+  env-steps have gaps under 2.7e-3. A gap cutoff near 1e-5 excuses the 1e-7
+  flips and still flags Gemini, DeepSeek V4 Flash, bf16 and skip-a-layer.
+
+NSA: two kernels that skip block selection (dense causal; first 8 blocks) both
+fail the current 02 check at shape 0 nominal and small_qkv. The 09-17 fix holds
+for that class.
+
 ## 2026-09-22 — Opus 5.5 CUDA sweep, audit, and resume failures
 
 Four Opus 5.5 `[xhigh]` cells on tetra were correct in sequential isolated

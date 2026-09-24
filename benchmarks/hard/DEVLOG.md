@@ -4,6 +4,39 @@ A running record of decisions, dead ends, and lessons. Newest entries on top. Th
 
 ---
 
+## 2026-09-24 — grader teeth: mutant kernels and fractional zero-points (RTX 3090 proxy)
+
+Probe on anvil's RTX 3090 (tetra busy), scripts and logs in
+`anvil:~/dev/sites/kernelbench.com/benchmarks/hard/outputs/probes/`. Each mutant
+is a deliberately wrong `solution.py`; `teeth.py` replays check.py's cases at
+seed 42 without stopping at the first failure.
+
+- 02 KDA: all-zeros and a one-chunk-history kernel pass `nominal` and
+  `small_qkv` on all four shapes (nominal output max 0.012-0.014 vs atol 0.05).
+  Only `large_qkv` and the property case catch them.
+- 03 paged attention: all-zeros passes `nominal` and `small_q_kv` on all five
+  shapes. A kernel that ignores q.k and averages V passes nominal, small and
+  the property case everywhere, and `large_q_kv` on shapes 2 and 4; the check
+  fails it only through `large_q_kv` on shapes 0, 1, 3.
+- 06 (shapes 1-2; shape 0 does not fit 24 GB): silu(g) replaced by g/2 passes
+  nominal and small, caught by `large_hidden` and property. Assuming balanced
+  routing is caught only by the property case.
+- 01: dropping the K tail is caught only on the K=4127 shape, as designed.
+- 07: a kernel that rounds zero-points passes all 15 cases and the check.
+  With zeros + U(-0.5, 0.5), the four top live 07 kernels fail at exactly the
+  error of rounding the zero-points: Kimi K3 256k and Opus 5 on M=16/32/256,
+  GLM-5.3 on M=1, Fable 5 on all five shapes. All pass with integer zeros.
+- `02_kda_cutlass/reference.py` reseeds `torch.manual_seed(0)` inside
+  `get_inputs`, so check.py's three seeds are one input set for 02.
+
+Side finding: `scripts/redaction.py`'s IPv6 regex matches Python slices
+(`0::2`, `1::2`) and inline-asm `:: "n"`, replacing them with
+`[REDACTED: IP]`. 201 of 594 `public/runs/*_solution.py.txt` files carry the
+marker, 53 of them live board cells, so those published kernels do not run as
+published.
+
+---
+
 ## 2026-09-20 — graded-surface backfill: 97 cells re-checked against today's deck, 17 withdrawn
 
 Publish gate E (PR #12) refuses any board cell whose `result.json` lacks the
