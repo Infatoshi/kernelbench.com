@@ -28,6 +28,19 @@ const nextConfig = {
       { source: "/kernelbench-v3", destination: "/", permanent: true },
       { source: "/kernelbench-v3/:path*", destination: "/", permanent: true },
       { source: "/data/v3/:path*", destination: "/", permanent: true },
+      // Mega transcript viewers used to ship as public/runs/<run_id>.html; the
+      // traces live only on HF now (2026-09-24), so old links go there.
+      {
+        source: "/runs/20260721_143203_codex_gpt-5.6-sol_02_kimi_linear_decode.html",
+        destination:
+          "https://huggingface.co/datasets/Infatoshi/kernelbench-mega-traces/blob/main/b200/20260721_143203_codex_gpt-5.6-sol_02_kimi_linear_decode.jsonl",
+        permanent: true,
+      },
+      {
+        source: "/runs/:rid(\\d{8}_\\d{6}_.+_kimi_linear_decode)\\.html",
+        destination: "https://huggingface.co/datasets/Infatoshi/kernelbench-mega-traces/blob/main/:rid.jsonl",
+        permanent: true,
+      },
     ]
   },
   // data.ts reads leaderboards/annotations with dynamic fs paths, so the file

@@ -6,6 +6,19 @@ benchmark. Per-benchmark journals live in `benchmarks/<bench>/DEVLOG.md`;
 
 ---
 
+## 2026-09-24 - Traces live on HuggingFace only
+
+Elliot: traces stay on HF, not GitHub. The 56 mega transcript viewers in
+`public/runs/*.html` (24.5 MB of the 39 MB `public/runs`) are removed from the repo;
+13 of them had no HF copy and were converted from local archives and uploaded to
+`Infatoshi/kernelbench-mega-traces` first, so all 56 runs have an HF trace.
+`next.config.mjs` 308-redirects `/runs/<run_id>.html` to the HF file. Nothing in the
+app read the viewers (`loadRunAudits` in `app/_lib/data.ts` has no callers).
+Same day: `scripts/redaction.py` stopped treating `0::2` slices and asm `::` as IPv6
+(commit 83a0ed9); 22 HF traces were re-exported or added with the fix.
+
+---
+
 ## 2026-09-14 - Storage cleanup and missing public traces
 
 User authorized removing reproducible archive bulk and publishing missing eligible
