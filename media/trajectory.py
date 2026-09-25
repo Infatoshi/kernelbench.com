@@ -174,7 +174,9 @@ def extract(session, result: dict) -> tuple[list[Point], float, int, list[tuple[
             seen_check = True
             raw.append((last_t, float("nan"), "check", chars, "check.py passes"))
             continue
-        if not seen_baseline:
+        # Mega's benchmark prints a baseline latency beside every scored shape.
+        # A streamed partial result is not an independent baseline checkpoint.
+        if not seen_baseline and "shape ctx=" not in body:
             m = BASELINE_RE.search(body)
             if m:
                 seen_baseline = True
@@ -449,7 +451,7 @@ def main(argv=None) -> int:
     for p in pts:
         print(f"{p.t_min:7.1f} {p.score:8.3f} {p.tokens:>9,}  {p.kind:<9} {p.label.replace(chr(10), ' / ')}")
     render(pts, out=out, title=title, subtitle=subtitle, unit=unit, session_min=session_min,
-           total_tokens=total_tokens, ref_label="reference decode = 1x" if bench == "mega" else None)
+           total_tokens=total_tokens, ref_label="optimized PyTorch = 1x" if bench == "mega" else None)
     print(out)
     return 0
 

@@ -15,7 +15,6 @@ import matplotlib
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-from matplotlib.patches import FancyBboxPatch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from kbh_theme import C, apply  # noqa: E402
@@ -118,34 +117,29 @@ fig.subplots_adjust(left=0.28, right=0.96, top=0.83, bottom=0.17)
 fig.savefig(OUT / "02.png", dpi=180, facecolor=C["bg"])
 plt.close(fig)
 
-# 03: the four submitted designs, simplified from their audited source files.
-fig, ax = plt.subplots(figsize=(14, 6.8), dpi=180)
+# 03: the three audited leaders on Grid + MinGRU.
+problem = "04_grid_mingru_sps"
+field = [(m, cell(m, problem)) for m in models]
+field = sorted(((m, c) for m, c in field if c), key=lambda item: strength(item[1], problem), reverse=True)[:3]
+assert len(field) == 3
+fig, ax = plt.subplots(figsize=(8.8, 5.4), dpi=180)
 fig.patch.set_facecolor(C["bg"])
 ax.set_facecolor(C["bg"])
-ax.axis("off")
-ax.set_xlim(0, 14)
-ax.set_ylim(0, 6.8)
-ax.text(0.25, 6.35, "Four CUDA designs in the final submissions", color=C["fg_bright"], fontsize=18, weight="bold")
-ax.text(0.25, 5.99, "Simplified from the audited solution.py files; arrows are data flow, not separate launches", color=C["fg_muted"], fontsize=9.5)
-pipelines = [
-    ("Fused MoE", ["count + scatter", "bf16 gate/up GEMM", "SiLU × up", "bf16 down GEMM", "fp32 combine"]),
-    ("Sparse attention", ["block means + top-8", "key-major sparse MMA", "local window", "softmax merge"]),
-    ("MegaQwen", ["stream step input", "QKV + RoPE", "full-prefix GQA", "O projection", "SwiGLU MLP"]),
-    ("Grid + MinGRU", ["fold encoder once", "3× MinGRU", "greedy action", "grid + exact RNG"]),
-]
-for i, (name, steps) in enumerate(pipelines):
-    y = 5.14 - i * 1.2
-    ax.text(0.25, y + 0.23, name, va="center", color=C["accent"], fontsize=12, weight="bold")
-    x0, span, gap = 2.45, 11.15, 0.12
-    w = (span - gap * (len(steps) - 1)) / len(steps)
-    for j, step in enumerate(steps):
-        x = x0 + j * (w + gap)
-        ax.add_patch(FancyBboxPatch((x, y - 0.23), w, 0.62, boxstyle="round,pad=0.02", fc=C["surface_muted"], ec=C["border"]))
-        ax.text(x + w / 2, y + 0.08, step, ha="center", va="center", color=C["fg"], fontsize=9.1)
-        if j + 1 < len(steps):
-            ax.annotate("", xy=(x + w + gap - 0.01, y + 0.08), xytext=(x + w + 0.01, y + 0.08),
-                        arrowprops=dict(arrowstyle="->", color=C["accent"], lw=1.4))
-ax.text(2.45, 0.38, "MegaQwen loops over steps and four layers in one cooperative launch; Grid loops over the rollout horizon in one.", color=C["fg_muted"], fontsize=9.5)
-fig.savefig(OUT / "03.png", dpi=180, facecolor=C["bg"], bbox_inches="tight", pad_inches=0.18)
+colors = ["#e3b84d", "#aab4bf", "#b97a4d"]
+values = [float(c["score"]) for _, c in field]
+bars = ax.bar(range(3), values, width=0.58, color=colors, edgecolor="none", zorder=3)
+ax.set_title("Grid + MinGRU", color=C["fg_bright"], fontsize=22, weight="bold", pad=24)
+ax.set_xticks(range(3), [m["name"] for m, _ in field], color=C["fg"], fontsize=12)
+ax.set_ylim(0, max(values) * 1.18)
+ax.set_yticks([])
+ax.tick_params(axis="x", length=0, pad=14)
+for edge in ("top", "right", "left", "bottom"):
+    ax.spines[edge].set_visible(False)
+for bar, value in zip(bars, values):
+    ax.text(bar.get_x() + bar.get_width() / 2, value + max(values) * 0.035,
+            f"{value:.3f}", ha="center", va="bottom", color=C["fg_bright"],
+            fontsize=15, weight="bold")
+fig.subplots_adjust(left=0.1, right=0.9, top=0.82, bottom=0.17)
+fig.savefig(OUT / "03.png", dpi=180, facecolor=C["bg"])
 plt.close(fig)
 print("written", *(OUT / f"0{i}.png" for i in range(1, 4)))

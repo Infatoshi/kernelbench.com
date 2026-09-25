@@ -88,6 +88,8 @@ MODEL_NAMES = {
     "gpt-5.5": "GPT-5.5",
     "gpt-5.6-sol": "GPT-5.6 Sol",
     "gpt-6-astra-pro": "GPT-6 Astra Pro",
+    "gpt-6-sol": "GPT-6 Sol",
+    "gpt-6-luna": "GPT-6 Luna",
     "grok-4.5": "Grok 4.5",
     "grok-4.6": "Grok 4.6",
     "grok-4.7": "Grok 4.7",

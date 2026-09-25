@@ -17,6 +17,8 @@ const LIVE_MODEL_SLUGS = new Set([
   "glm-5.3",
   "gpt-5.6-sol",
   "gpt-6-astra-pro",
+  "gpt-6-sol",
+  "gpt-6-luna",
   "grok-4.6",
   "grok-4.7",
   "claude-opus-5-5",
