@@ -22,3 +22,13 @@ Everything else is shared with Hard and lives in `benchmarks/hard/AGENTS.md`: la
 ## Resuming an interrupted claude cell
 
 `KBH_RESUME_RUN_DIR`, `KBH_RESUME_SESSION` and `KBH_RESUME_PROMPT` (read by `scripts/lib/run_harness.sh`, claude harness, host mode only) continue a session that died for infrastructure reasons (GPU off the bus, box reboot) inside its own archive: same run dir and sandbox, the session store under `agent_home`, `claude --resume <session>` with the prompt as the first new message. The old transcript stays as `transcript.part1.jsonl`. Grading, regrade and the publish gates then run unchanged. Record the interruption in the cell's annotation.
+
+## Release sweep on tetra
+
+A new model's board cells are cuda 01-04 plus mega 02 on tetra's RTX PRO 6000s (checkout `~/kernelbench.com`, `git pull` first). One command per model, one GPU per model, up to four models at once:
+
+```bash
+nohup scripts/tetra_release.sh <gpu> <harness> <model> [effort] >/dev/null 2>&1 &
+```
+
+It takes an `overnight-compute` lease on `gpu<N>`, refuses a GPU with compute PIDs, runs the five sessions on that GPU (the per-bench locks serialize their GPU commands), logs the served model ids four minutes in (publish gate 4 early warning), then regrades exactly its own cells sequentially on the same GPU with the canonical decks. Output: `runs/release-<stamp>-<harness>-<model>/` (`pipeline.log`, per-cell logs, `DONE`). Effort follows the root rules (Claude: `max`). Pullback, audits, `published_runs.json`, roster tables and publish are `app/AGENTS.md` "After every finished run".
