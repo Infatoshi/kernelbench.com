@@ -6,6 +6,39 @@ benchmark. Per-benchmark journals live in `benchmarks/<bench>/DEVLOG.md`;
 
 ---
 
+## 2026-09-26 - Release prep: tetra launcher and provider route status
+
+`scripts/tetra_release.sh <gpu> <harness> <model> [effort]` packages the Grok 4.7 /
+Opus 5.5 / GPT-6 recipe: mega 02 plus cuda 01-04 on one tetra GPU under an
+`overnight-compute` lease, a served-model check four minutes in, then the sequential
+regrade of exactly those cells on that GPU (`benchmarks/cuda/AGENTS.md`). Tested on
+tetra GPU 3 with stub runners (lease, launch arguments, run group, regrade lists, DONE).
+
+tetra prep: checkout fast-forwarded to master. The cuda and mega venvs registered their
+own package from the deleted `kernelbench.com-hfx` worktree; re-synced with
+`uv sync --frozen` plus `patch_torch.sh` (torch 2.13.0+cu130 cuda, 2.11.0+cu130 mega,
+all 4 GPUs visible). `RmProfilingAdminOnly` is 0 since the reboot, so plain `ncu`
+works. Muse's launcher was copied from the Mac to tetra (Muse Code 1.4.0); the Meta
+key lives in `~/.env_vars` as `META_MODEL_API_KEY`, which the launcher maps to
+`META_API_KEY`.
+
+Route probe on tetra (one tiny prompt through each route's CLI and env):
+- Working: claude `claude-opus-5-5` and `claude-fable-5-1` (Claude Code 2.1.283),
+  codex `gpt-6-sol` (codex-cli 0.155.1, latest 0.157.1), agy
+  `gemini-3.8-flash-high`, deepseek-claude `deepseek-flash`, minimax-claude
+  `MiniMax-M3`, longcat-claude `LongCat-2.0`, grok `grok-4.7-build-fast`, muse
+  `muse-spark-1.3`, and or-fable (OpenRouter) for `stealth/space-bunny-alpha`,
+  `moonshotai/kimi-k3`, `z-ai/glm-5.3-prime`, `xiaomi/mimo-v2.6-pro`.
+- Broken on the account side (key bytes identical on Mac and tetra): zai-claude 401;
+  kimi-claude 401, and the Kimi Code endpoint says the subscription lapsed; qwen-claude
+  token plan `AccessDenied.Unpurchased`; grok `grok-4.7` 404 because the Grok Build
+  plan no longer serves `grok-4.7-build` (the CLI default is now `grok-4.7-build-fast`).
+  Until those plans are renewed, GLM, Kimi and Qwen releases route through or-fable.
+- `benchmarks/hard/scripts/preflight_harnesses.sh` still probes GPT-5.5, Opus 4.8 and
+  GLM-5.1; its rows are stale.
+
+---
+
 ## 2026-09-24 - Traces live on HuggingFace only
 
 Elliot: traces stay on HF, not GitHub. The 56 mega transcript viewers in

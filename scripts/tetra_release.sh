@@ -32,6 +32,7 @@ fi
 
 export KBH_GPU=$GPU KBH_CUDA_HOME=/usr/local/cuda-13
 [ -f ~/.env_vars ] && set -a && . ~/.env_vars && set +a
+export META_API_KEY=${META_API_KEY:-${META_MODEL_API_KEY:-}}   # muse route; ~/.env_vars keeps the Meta key under this name
 SLUG=$(printf '%s-%s' "$HARNESS" "$MODEL" | tr -c 'A-Za-z0-9.-' '_')
 OUT=$R/runs/release-$(date +%Y%m%d_%H%M%S)-$SLUG
 mkdir -p "$OUT"
