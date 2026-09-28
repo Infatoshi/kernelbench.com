@@ -33,6 +33,10 @@ fi
 export KBH_GPU=$GPU KBH_CUDA_HOME=/usr/local/cuda-13
 [ -f ~/.env_vars ] && set -a && . ~/.env_vars && set +a
 export META_API_KEY=${META_API_KEY:-${META_MODEL_API_KEY:-}}   # muse route; ~/.env_vars keeps the Meta key under this name
+# Claude sweep account: a `claude setup-token` token kept under its own name, because tetra's
+# shells source ~/.env_vars and must keep their own login. Only these runs bill it.
+CLAUDE_AUTH=login
+if [ -n "${SWEEP_CLAUDE_OAUTH_TOKEN:-}" ]; then export CLAUDE_CODE_OAUTH_TOKEN=$SWEEP_CLAUDE_OAUTH_TOKEN; CLAUDE_AUTH=sweep-token; fi
 SLUG=$(printf '%s-%s' "$HARNESS" "$MODEL" | tr -c 'A-Za-z0-9.-' '_')
 OUT=$R/runs/release-$(date +%Y%m%d_%H%M%S)-$SLUG
 mkdir -p "$OUT"
@@ -40,7 +44,7 @@ export KBH_RUN_GROUP=$(basename "$OUT")
 exec >> "$OUT/pipeline.log" 2>&1
 log() { echo "=== $(date '+%F %T %Z') $*"; }
 log "start host=$(hostname) gpu$GPU=$(nvidia-smi -i "$GPU" --query-gpu=name --format=csv,noheader)"
-log "harness=$HARNESS model=$MODEL effort=${EFFORT:-<harness default>} claude=$(claude --version 2>/dev/null) codex=$(codex --version 2>/dev/null) grok=$(grok --version 2>/dev/null | cut -d' ' -f2)"
+log "harness=$HARNESS model=$MODEL effort=${EFFORT:-<harness default>} claude_auth=$CLAUDE_AUTH claude=$(claude --version 2>/dev/null) codex=$(codex --version 2>/dev/null) grok=$(grok --version 2>/dev/null | cut -d' ' -f2)"
 
 CELLS=(mega:problems/02_kimi_linear_decode
        cuda:problems-rtxpro6000/01_glm52_fused_moe cuda:problems-rtxpro6000/02_deepseek_nsa
