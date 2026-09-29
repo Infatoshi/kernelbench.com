@@ -22,6 +22,7 @@ const LIVE_MODEL_SLUGS = new Set([
   "grok-4.6",
   "grok-4.7",
   "claude-opus-5-5",
+  "claude-sonnet-5-5",
   "kinetic-0715",
   "muse-spark-1.3",
   "ox-alpha",

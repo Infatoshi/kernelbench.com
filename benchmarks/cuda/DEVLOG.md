@@ -1,5 +1,36 @@
 # KernelBench-CUDA — DEVLOG
 
+## 2026-09-29 — Claude Sonnet 5.5 [max] on tetra: 4/4 correct, three #1 cells
+
+Cells ran 2026-09-28 12:22 MDT onward, all five (cuda 01-04 plus mega 02) on tetra GPU 0 via
+`scripts/tetra_release.sh`, billed to a separate subscription account through
+`SWEEP_CLAUDE_OAUTH_TOKEN`. Every turn was served as `claude-sonnet-5-5` (no subagents, refusals or
+fallback). Sequential isolated regrade on GPU 0, then audit probes on the quiet GPU:
+
+- 01 Fused MoE 0.1130, clean. Overwrite of x and of expert_ids at T=1/512/4127 follows the new data.
+- 02 NSA 1.3619 (0.072 ms geomean), interesting. Exact per-token top-8; the key-stationary path stores
+  per-block partials as int8 with a per-row scale. Unseen seeds 123/456 pass at all six shapes; mean
+  error 4-5x the bf16 rounding floor on that path, at the floor on the fused path. 11.3 h session, the
+  longest of the sweep, still setting new bests at 10.1 h.
+- 03 MegaQwen 0.0800, clean. Full-context split-KV attention in one cooperative kernel. Its packed-weight
+  cache keys on (data_ptr, _version), so a weight change through `.data` goes unseen (the benchmark never
+  does that).
+- 04 Grid + MinGRU 0.9442, interesting. fp16 tensor-core policy with a 3-term hi/lo split on an fp32
+  problem, yet final positions match the reference exactly at every graded size and seed (0 of 94,208
+  envs, including seed 42's 7e-9 logit gaps). `solution.py` warms the GPU at import for 0.3-3 s; an
+  interleaved A/B measured it as no gain (0.985-0.998 with it, 0.999-1.004 without).
+
+Host skills: Claude agents on tetra see the operator's 52 personal skills; four of five cells invoked
+build or kernel skills, none of which carry prior results. The unused `traces` and `kb-article` skills
+point at the published HF traces, a live leak path for every Claude cell here. The kbgrade agent
+container (`benchmarks/grader/SPEC.md`) removes it; until then, audits check Skill calls.
+
+Memory: tetra has 62 GB. The operator's concurrent training jobs plus five agents' compiles exhausted it
+twice (14:40-15:26, 16:33); the OOM killer took operator JVMs and a trainer, never an agent session.
+
+Traces: HF `kernelbench-cuda-traces` commit 597485517bcc (4 files), converted on tetra with 11-16
+private tool calls removed each, zero redaction findings, SHA256 round-trip verified.
+
 ## 2026-09-24 — 04 positions at graded sizes: 5 live kernels diverge (RTX 3090 proxy)
 
 Probe, not a regrade: tetra's four GPUs were held by a GLM-5.3 vLLM server, so

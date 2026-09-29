@@ -6,6 +6,18 @@ Numbering note: entries before 2026-07-21 say "Problem 03" for the Kimi-Linear d
 
 ---
 
+## 2026-09-29 — Claude Sonnet 5.5 [max] on 02: 32.13x, clean, second on RTX PRO 6000
+
+Isolated regrade on tetra GPU 0: 32.13x over the optimized-PyTorch baseline (in-run 32.25x), behind
+Opus 5.5's 35.46x. One launch per token, 188 persistent CTAs over 26 phases: int4 weights dequantized in
+registers into mma GEMVs, KDA delta-rule state updates, absorbed MLA attention over every cached token
+with an in-place append into a capacity buffer, and router plus nine-expert MoE per layer. Probes on the
+quiet GPU: same-buffer token overwrite and an in-place x30 cache scale on the live append path both
+follow the new data (cos(ref,sol) 0.99998 and 0.9997). Trace on HF `kernelbench-mega-traces` commit
+8614b76ec8ac. Sweep context and the host-skills note: `benchmarks/cuda/DEVLOG.md` 2026-09-29.
+
+---
+
 ## 2026-09-11 — the 39 published mega cells have no run archive (migrated from Claude auto-memory)
 
 Found 2026-07-28 while relocating `anvil:~/kb-remote-archives`. The 39 run_ids in
