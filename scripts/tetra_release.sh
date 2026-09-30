@@ -52,6 +52,13 @@ CELLS=(mega:problems/02_kimi_linear_decode
 pids=()
 for cell in "${CELLS[@]}"; do
     B=${cell%%:*}; P=${cell#*:}; L=$OUT/${B}_$(basename "$P").log
+    # TETRA_RELEASE_RESUME=<earlier runs/release-* dir>: keep its cells that reached result.json
+    # (their logs join this regrade), rerun only the rest (e.g. after tetra lost power mid-run).
+    prev=${TETRA_RELEASE_RESUME:+$TETRA_RELEASE_RESUME/$(basename "$L")}
+    prd=$([ -f "${prev:-/nonexistent}" ] && grep -m1 -oE 'Archive: +\S+' "$prev" | awk '{print $2}')
+    if [ -n "$prd" ] && [ -f "$prd/result.json" ]; then
+        cp "$prev" "$L"; log "kept $B $(basename "$P") from $(basename "$prd")"; continue
+    fi
     ( cd "$R/benchmarks/$B" && ./scripts/run_hard.sh "$HARNESS" "$MODEL" "$P" ${EFFORT:+"$EFFORT"} ) > "$L" 2>&1 &
     pids+=($!); log "launched $B $(basename "$P") pid $!"
     sleep 30
