@@ -2,11 +2,11 @@
 
 Entrypoint for every harness (`CLAUDE.md` and `.cursorrules` symlink here): universal rules, gates, and pointers only, under 10 KB (Grok truncates there; a test enforces it). Each directory you touch has its own `AGENTS.md` with the specialized instructions (no other `CLAUDE.md` anywhere; sub-files stay under 32 KB, the Codex cap). Open the one for your task before starting.
 
-Monorepo for the KernelBench website and the evals. Canonical checkout is the Mac at `~/dev/sites/kernelbench.com` (edit, publish, deploy, orchestrate). GPU sessions run on rented workers (Lambda, Brev, Verda); anvil may hold a disposable checkout but is never source of truth.
+Monorepo for the KernelBench website and the evals. Canonical checkout is the Mac at `~/dev/sites/kernelbench.com` (edit, publish, deploy, orchestrate). Every run goes to tetra (RTX PRO 6000) or Lambda H100 PCIe with non-root `ncu` proven first: `kbtool/AGENTS.md` "GPU targets". Other checkouts are never source of truth.
 
 ## Where to read next
 
-- `kbtool/AGENTS.md` — the `kb` CLI, every harness branch (transport, key, benches, quirks), runner behaviour, workspace/GPU-lock isolation, broad sweeps, rented GPU workers (Lambda/Brev bootstrap, ncu, pulling archives back, teardown), the `KB_` variables and the danger list. Enforced by `kbtool/tests`.
+- `kbtool/AGENTS.md` — the `kb` CLI, every harness branch (transport, key, benches, quirks), runner behaviour, workspace/GPU-lock isolation, broad sweeps, GPU targets (tetra, Lambda bootstrap, ncu, pullback, teardown), the `KB_` variables and the danger list. Enforced by `kbtool/tests`.
 - `benchmarks/hard/AGENTS.md` — developer guide shared by every single-GPU bench: layout, adding a problem, correctness, results and thin archives, tests, sweep failures, torch pins and `patch_torch.sh`, the audit YAML schema, the `KBH_` variables.
 - `benchmarks/{cuda,mega,mini,multi}/AGENTS.md` — that deck, its commands, and its deltas from hard (mini adds `KBMINI_`, multi adds `KBM_` and the 4xH100 node).
 - `benchmarks/<bench>/SPEC.md` methodology, `DEVLOG.md` history and war stories (newest first).

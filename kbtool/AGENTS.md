@@ -1,4 +1,4 @@
-# kbtool — driving runs: the `kb` CLI, harness routes, rented GPU workers
+# kbtool — driving runs: the `kb` CLI, harness routes, GPU targets (tetra, Lambda)
 
 `kb` is this uv package: `uv tool install -e ./kbtool` once (editable), or `uv run --project kbtool python -m kb ...` on a fresh box. Repo root: walk up from cwd, or `KB_REPO_ROOT`. Harness routes, runner behaviour, rented nodes, and every `KB_` variable live here. Bench internals and `KBH_`: `benchmarks/hard/AGENTS.md`. Publish gates: root `AGENTS.md`.
 
@@ -86,9 +86,23 @@ The default lock is per bench (`benchmarks/{hard,cuda,mega}/outputs/gpu_lock/gpu
 
 Never start a cell you cannot afford to finish. `scripts/launch_parallel_sweep.sh` defaults to `KBH_HARNESS_CONCURRENCY=2` per harness; raise only after preflight proves quota. Workers are per harness: a problem-major loop head-of-line blocks (Codex holding its two slots keeps freed Cursor/Gemini/OpenCode slots idle). `./scripts/preflight_harnesses.sh` sends tiny prompts through the matrix and fails fast on auth/quota/route problems. After a sweep, `./scripts/launch_infra_retries.sh <run_group>` reruns only `retryable_infra_failure=true` rows; retry rows must keep empty effort fields and pass full `problems/<name>` paths or the problem slides into the effort column. `KBH_SKIP_OPENROUTER=1 KBH_USE_DIRECT_GEMINI=1` runs the non-OpenRouter rows plus Gemini direct when OpenRouter is depleted. Aborting: kill the launcher process group, then verify by cwd; some CLIs spawn orphaned timeout groups.
 
-## Rented GPU workers (Lambda, Brev, Verda)
+## GPU targets (tetra, Lambda H100 PCIe)
 
-GPU eval sessions run on rented workers, not on anvil. Bring a node up, make it able to run torch and ncu, run cells, pull archives back, tear it down. Multi's 4xH100 node specifics are in `benchmarks/multi/AGENTS.md`.
+Elliot's rule (2026-09-28): every run, sweep, and regrade goes to one of two targets, with non-root `ncu` proven on that box first. No Brev, Verda, anvil, B200, or H100 SXM unless Elliot names one.
+
+| key | target | publishable decks |
+| --- | --- | --- |
+| `RTX_PRO_6000` | tetra (4x, sm_120), one leased GPU | hard and cuda `problems-rtxpro6000`, mega |
+| `H100` (PCIe) | Lambda `gpu_1x_h100_pcie` | hard and cuda `problems-h100` |
+
+Mega claims only `RTX_PRO_6000`: no H100 deck. Mini (`H100_SXM`) and multi (4xH100 SXM, NVSwitch) cannot run on PCIe; they wait for Elliot to name SXM.
+
+1. tetra: `nvidia-smi`, `overnight-compute` lease on a free GPU, never touch another job's; `scripts/tetra_release.sh` does lease, launch, model check, regrade. Lambda: `kb lambda list` must show PCIe capacity (SXM is a different key, never a fallback), then `kb lambda up <name> gpu_1x_h100_pcie` (default is SXM5), `sync`, `bootstrap --agents`.
+2. Lambda ncu (bootstrap skips it; `kb lambda run` is host mode): add NVIDIA's repo (Bootstrap item 1), `apt-get install nsight-compute-2025.1.1` (driver 570; skip if item 1's toolkit put `ncu` on PATH), write `options nvidia NVreg_RestrictProfilingToAdminUsers=0` to `/etc/modprobe.d/nvidia-ncu.conf`, then reboot, or stop `nvidia-persistenced` and `modprobe -r nvidia_uvm nvidia_drm nvidia_modeset nvidia_peermem nvidia && modprobe nvidia nvidia_uvm`. tetra already has `ncu` 2026.2.1 and the flag.
+3. Proof as the agent's user: `RmProfilingAdminOnly: 0` in `/proc/driver/nvidia/params`, and `ncu --metrics gpu__time_duration.sum` on a tiny kernel prints a number. `ERR_NVGPUCTRPERM` or only a banner: no session on that box.
+4. Run via the harness, regrade on the same SKU, pull back, tear down.
+
+`ERR_NVGPUCTRPERM` is an admin gate, not missing bare metal (Lambda's 2025 "no Nsight on Cloud VMs" is stale). Never give the agent blanket sudo. Container mode (`KBH_AGENT_CONTAINER=1`) runs `ncu` as uid 1000 with `--cap-add CAP_PERFMON`, `--user $(id -u):$(id -g)`, `--security-opt no-new-privileges`; CAP_PERFMON alone does not clear the error, the flag does. Host mode may wrap only `ncu`/`nsys` in `sudo -n` via a NOPASSWD sudoers line for those binaries, never `/bin/bash`.
 
 ### Lambda Cloud
 
@@ -96,14 +110,13 @@ Zach / Lambda sponsored $10k of Cloud credits (2026-07) for Hard / Mega / CUDA /
 
 - Auth: `LAMBDA_API_KEY` in `~/.env_vars` (keep the legacy typo `LAMDBA_API_KEY` in sync; kimi-sweep reads it). Mint at https://cloud.lambda.ai/api-keys/cloud-api. Keep Mac and anvil `~/.env_vars` in sync.
 - SSH keys on the account: `macbook` and `anvil` (each host's `~/.ssh/id_ed25519.pub`). `lambda_worker.sh up` attaches ONE key, the current host's, because the launch API rejects more than one (observed 2026-07-21). Override with `KB_LAMBDA_SSH_KEYS`.
-- The worker scripts use the Cloud API via curl; nothing needs brew. Optional Mac-only community CLI: `brew install strand-ai/tap/lambda-cli`.
 
 ```
 kb lambda list                         # capacity by type
 kb lambda ls                           # running instances
 kb lambda up <name> [type] [region]    # default type gpu_1x_h100_sxm5
 kb lambda sync <name>                  # thin bench + allowlisted keys (preserves the node's torch-index patch)
-kb lambda bootstrap <name> [--agents]  # uv + torch; --agents = agent CLIs; ncu on PATH + NVreg_RestrictProfilingToAdminUsers=0
+kb lambda bootstrap <name> [--agents]  # uv + torch; --agents = agent CLIs; no ncu (GPU targets step 2)
 kb lambda run <name> <harness> <model> <problem> [effort]
 kb lambda pull <name>                  # -> benchmarks/hard/outputs/runs-lambda-<name>/ (excludes the node's venv)
 kb lambda regrade <name> <run_id> [runs_dir]   # sequential isolated re-grade on the node
@@ -113,20 +126,11 @@ kb lambda ssh <name> [cmd...]
 
 Or `./scripts/lambda_worker.sh ...` from the repo root. Env overrides: `KB_LAMBDA_TYPE`, `KB_LAMBDA_REGION`, `KB_LAMBDA_SSH_KEYS`, `KB_LAMBDA_PROBLEMS_ROOT` (default `problems-h100`; `problems-h100x4` when `KB_LAMBDA_BENCH=multi`), `KB_LAMBDA_BENCH` (default `hard`; `multi`, `cuda`, `mega` point the worker at another bench).
 
-Multi-GPU / NVLink work can use Lambda `gpu_8x_h100_sxm5` / `gpu_8x_b200_sxm6` when `kb lambda list` shows capacity, or Brev.
-
 ### Bootstrap order on a fresh node
 
 1. A node can pass `nvcc` checks and still not run torch. Lambda's stock image ships driver 570 and no NVIDIA CUDA apt repo, so `apt-get install cuda-toolkit-13-0` returns rc=100 while the driver install succeeds from Lambda's own archive. The node then has a driver but no `/usr/local/cuda-13.0`, or a toolkit with a driver too old for the cu130 wheel. Both failures are silent. Add the repo first (`cuda-keyring_1.1-1_all.deb` from `developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/`), install `cuda-toolkit-13-0` and `nvidia-driver-595`, reboot.
 2. Gate every launch on `torch.cuda.is_available()` after every `uv` command. `nvcc --version` is not a CUDA probe. `nvcc` must compile `#include <cuda_runtime.h>` with `cudafe++` next to it.
-3. Hyperstack / Shadeform 8xH100 nodes ship driver CUDA 12.8; the default `uv pip install torch` pulls a cu130 wheel that cannot see the GPUs ("driver too old"). Install the matched build: `uv pip install --index-url https://download.pytorch.org/whl/cu128 torch==2.8.0`. Bake uv, the repo, and this wheel into a prebaked image so node time is not spent on reinstalls. `kb lambda sync` preserves the node's patched pyproject/uv.lock (a re-sync once shipped the Mac's cu130 lock over the node's cu128 one and every later graded env died at check time, 2026-08-01).
-4. Stock Lambda SXM5 image has `nvcc` and no `ncu` until `apt-get install nsight-compute`.
-
-### ncu on rented VMs (closed 2026-08-24)
-
-`ERR_NVGPUCTRPERM` is an admin gate, not missing bare metal. Lambda `gpu_1x_h100_pcie`, Lambda `gpu_1x_h100_sxm5`, and Verda `4RTXPRO6000.120V` are all KVM VMs with `RmProfilingAdminOnly: 1`. Root `ncu` wrote a real `smsp__cycles_elapsed.avg` on all three; the Lambda `ubuntu` user has passwordless `sudo -n`. Lambda DeepTalk (Hayden, 2025-10-01) saying Nsight is unsupported on Cloud VMs is stale for these SKUs; bare metal is not required. Brev -> Lambda should match; Brev -> AWS/GCP can block counters even as root, so probe before trusting.
-
-Do not give the agent blanket sudo. Default remote sessions use `KBH_AGENT_CONTAINER=1`: `ncu` runs inside Docker as uid 1000 with `--cap-add CAP_PERFMON`, `--user $(id -u):$(id -g)`, and `--security-opt no-new-privileges`. `--cap-add CAP_PERFMON` alone does not clear the error. On every rented box, before the first agent session: (1) `ncu` on PATH, (2) `echo 'options nvidia NVreg_RestrictProfilingToAdminUsers=0' | sudo tee /etc/modprobe.d/nvidia-ncu.conf`, then reboot or reload `nvidia` with zero GPU users. `kb lambda bootstrap` does both. Host mode (`KBH_AGENT_CONTAINER=0`, some hy3, mega bwrap) may wrap only `ncu`/`nsys` with `sudo -n` via a NOPASSWD sudoers line limited to those binaries, never `/bin/bash`. Anvil and gamer are local compute; do not change their driver policy for this.
+3. Driver-570 (CUDA 12.8) nodes cannot see the GPUs with a cu130 torch wheel ("driver too old"); bootstrap pins the cu128 index. `kb lambda sync` preserves the node's patched pyproject/uv.lock (a re-sync once shipped the Mac's cu130 lock over the node's cu128 one and every later graded env died at check time, 2026-08-01).
 
 ### Running and pulling back
 
@@ -141,7 +145,7 @@ Do not give the agent blanket sudo. Default remote sessions use `KBH_AGENT_CONTA
 - **Re-grade before teardown.** The isolated re-grade runs on a live box of the matching SKU: keep one node per SKU, rsync that SKU's archives into its `outputs/runs/`, re-grade with `KBH_REGRADE_DECK`, pull back, then tear down.
 - Always `kb lambda down <name>` when done; idle nodes bill the credits. Confirm `kb lambda ls` no longer lists it.
 - Kill by pidfile, never `pkill -f` (it matches its own ssh argv and kills the session with exit 255).
-- Brev: `brev delete` hangs on a hidden confirmation with no TTY and `brev stop` / `yes | brev delete` no-op. Tear down through `scripts/brev_teardown.sh <name>` (pseudo-TTY; `expect` on macOS).
+- Brev (only when Elliot names it): tear down only via `scripts/brev_teardown.sh <name>`; `brev delete`/`stop` hang or no-op without a TTY.
 
 ## Environment variables
 

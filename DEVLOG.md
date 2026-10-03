@@ -6,6 +6,27 @@ benchmark. Per-benchmark journals live in `benchmarks/<bench>/DEVLOG.md`;
 
 ---
 
+## 2026-09-28 - GPU targets: tetra and Lambda H100 PCIe only, ncu required
+
+Elliot's rule: every run uses tetra's RTX PRO 6000 or Lambda H100 PCIe, with
+non-root `ncu` working before the first agent session. Brev, Verda, anvil, B200
+and H100 SXM are out unless he names one. He first said SXM, then switched to
+PCIe the same day because hard and cuda `problems-h100` claim the PCIe `H100` key. Workflow: `kbtool/AGENTS.md` "GPU targets".
+
+Evidence. tetra: `ncu` 2026.2.1, `RmProfilingAdminOnly: 0`, driver 615.71.09.
+Lambda `gpu_1x_h100_pcie` (us-west-3, stock Lambda Stack 22.04, driver 570.148.08,
+CUDA 12.8; SXM5 had no capacity): no `ncu`, `RmProfilingAdminOnly: 1`. After
+`nsight-compute-2025.1.1` from NVIDIA's ubuntu2204 repo, `ubuntu` got
+`ERR_NVGPUCTRPERM` and `sudo ncu` worked. After the modprobe flag and a driver
+reload (no reboot), `ubuntu` got `--set full` with all 13 sections.
+
+Found while writing it up: `kb lambda bootstrap` installs neither `ncu` nor the
+flag, although the docs said it did, and `kb lambda run` launches in host mode.
+Mega claims only `RTX_PRO_6000`, so it has no H100 deck. Mini (`H100_SXM`) and
+multi (4xH100 SXM behind NVSwitch) cannot run on PCIe and wait for SXM.
+
+---
+
 ## 2026-09-26 - Release prep: tetra launcher and provider route status
 
 `scripts/tetra_release.sh <gpu> <harness> <model> [effort]` packages the Grok 4.7 /
