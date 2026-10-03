@@ -10,7 +10,7 @@ Monorepo for the KernelBench website and the evals. Canonical checkout is the Ma
 - `benchmarks/hard/AGENTS.md` — developer guide shared by every single-GPU bench: layout, adding a problem, correctness, results and thin archives, tests, sweep failures, torch pins and `patch_torch.sh`, the audit YAML schema, the `KBH_` variables.
 - `benchmarks/{cuda,mega,mini,multi}/AGENTS.md` — that deck, its commands, and its deltas from hard (mini adds `KBMINI_`, multi adds `KBM_` and the 4xH100 node).
 - `benchmarks/<bench>/SPEC.md` methodology, `DEVLOG.md` history and war stories (newest first).
-- `media/AGENTS.md` — charts, covers, redaction scan, short X posts and X Articles: skeleton, names, ship path.
+- `media/AGENTS.md` — charts, covers, redaction scan, short X posts and X Articles: skeleton, names, ship path, paid runs.
 - `app/AGENTS.md` — the website: data flow, adding a model or lab, deploy.
 
 ## Benches

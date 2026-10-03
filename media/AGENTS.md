@@ -113,6 +113,16 @@ Tweet 1 is that skeleton plus the image. Keep the board URL there. Tweet 2 is th
 
 `kb publish` then commit + push (`kb deploy` only when the tree is clean enough to ship). Prove these three live 200s before any X post: `https://kernelbench.com/{bench}`, the kernel file, this-run HF trace. A local `public/data` write is not synced.
 
+## Paid runs
+
+Elliot accepts paid benchmark runs (2026-10-03). Scope per deal: public CUDA (4 problems) and Mega cells, a local deployment of open weights, a private eval, and/or posts on X. A paid public cell follows every rule an unpaid one does:
+- Same harness, hardware, prompts, budget, roster rules and publish gates as every other model. Nothing is tuned for the payer, and a paid cell is never rerun to chase a better number.
+- Every result is audited and published wherever it lands. The payer gets no preview, approval or edit of results, annotations or posts.
+- Posts say plainly where the model falls short. Enthusiasm for where the lab takes its next releases is fine; the numbers are never softened.
+- Kernels and full traces publish with the cell, as for every model.
+- Paid posts carry X's paid-partnership label, and the run's audit YAML records `sponsored_by:` (the paying party and the lab, if different). Before quoting, confirm which model and which lab is paying when an agency writes.
+- A private eval stays private: it is never posted or placed on the board.
+
 ## Scheduling instead of live posting
 
 `media/posts/scheduled/<post>/` holds a post that is queued in X but not yet public: `00_post.txt` (tweet 1), `01.png`, `02_links.txt` (tweet 2), and `GOAL.md`, the receipt (account, scheduled time in MDT and UTC, what went in tweet 1 and the reply, queue URL `https://x.com/compose/post/unsent/scheduled`, "verified in the saved Scheduled queue"). Scheduling is done through the X compose UI with desktop computer use; `x-cli` has no schedule command. Same gates as posting: FILL-IN present, site and links live 200, explicit go from Elliot for the schedule. After it publishes, ask for the live URL, then move the folder to `posted/` with the tweet id.
