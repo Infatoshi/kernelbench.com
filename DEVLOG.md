@@ -15,6 +15,44 @@ where the deck is SXM (`KB_LAMBDA_BENCH=mini` `gpu_1x_h100_sxm5`, `multi`
 have graded a PCIe deck on the wrong key. Mini and multi still wait for Elliot to
 name SXM (money gate); nothing was launched.
 
+07 zero-point contract: integer zero-points (the 09-24 recommendation), on branch
+`bench/recheck-04-07` with the cuda 04 1e-5 margin rule (renamed from
+`bench/04-margin-rule` and rebased on master). Detail: `benchmarks/hard/DEVLOG.md`.
+Both change an RTX graded surface, so the branch merges only after
+`scripts/recheck_04_07.sh` (prep, then `launch <gpu>` on a tetra GPU with no compute
+PIDs, then `pull`) replays every published cuda 04 and hard 07 cell check-only, plus
+the GPT-6.1 Sol 04 cell. `prep` verifies that tetra's `src/` plus the shipped branch
+decks hash to the branch's graded-surface digest and that every archive exists there.
+
+GPT-6.1 Sol xhigh (cuda 01-04, mega 02, tetra GPU 0, 09-30): thin archives pulled
+(39 MB of 2.75 GB; transcripts, logs, result.json, solution.py) into the gitignored
+`outputs/runs`, and all five audited (`results/annotations/20260930_*gpt-6.1-sol*`).
+Verdicts: 01 clean (authored grouped mma.sync MoE, 0.0941), 02 clean (exact NSA
+selection on tensor cores, 0.3521), 03 clean (one cooperative decode launch,
+0.0386), 04 interesting (hi/lo split-fp16 rollout, version-keyed weight pack,
+0.3052), mega interesting (17-minute session, single-launch Triton, 4.9899x).
+Contamination clean on all five: every foreign run id `kb contamination` reports is
+in ps, rg or nvidia-smi output, never in a command or message. 03, 04 and mega need
+the same-buffer overwrite probe (pointer tables or a version-keyed cache), which
+`scripts/probe_same_buffer.py` runs inside the same recheck job; their YAMLs say
+`audit_status: ... pending`. Do not publish GPT-6.1 Sol until those probes are in
+the YAMLs and the recheck has merged.
+
+The leak, and how audits treat it: tetra cells run in host mode, so Codex loads
+`~/.codex/AGENTS.md` (Elliot's global CLAUDE.md) and his skills, and Claude Code
+loads `~/.claude/CLAUDE.md` the same way (the 09-28 Sonnet 5.5 transcripts quote
+it). The published 09-22 GPT-6 Sol/Luna cells had it too. It carries no solution,
+grader detail or score, so it is disclosed in `harness_note`, not scored as
+contamination. It did change behaviour: 03, 04 and mega ended their sessions asking
+permission to kill GPU processes under the global "ask before killing a GPU job"
+rule, and agents leased and timed on GPUs 1-3 outside the launcher's GPU 0 lease.
+Those numbers likely understate the model. Also found: the sandbox hides
+`~/kernelbench.com` but not the stale tetra checkout `~/dev/sites/kernelbench.com`,
+whose archives and annotations an agent can list (03 listed file names, opened
+none). Masking global agent config and that checkout in `scripts/lib/sandbox.sh` is
+the fix; not done, because it changes the environment against which every published
+host-mode cell was run.
+
 ---
 
 ## 2026-09-28 - GPU targets: tetra and Lambda H100 PCIe only, ncu required
