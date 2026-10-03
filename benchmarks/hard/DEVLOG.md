@@ -4,6 +4,26 @@ A running record of decisions, dead ends, and lessons. Newest entries on top. Th
 
 ---
 
+## 2026-10-03 — 07 zero-point contract: integers (deck wording change, RTX cells need a check-only restamp)
+
+Elliot's call on the 09-24 question. 07's PROMPT.txt said only "zeros ... bf16" and
+the reference docstring said "stored already as float zero-point", while the
+reference only ever generates whole numbers 0..15 (`round().clamp(0, 15)`), which
+is also what AWQ and GPTQ checkpoints ship. The four fastest live 07 kernels (Kimi
+K3 0.3733, Opus 5 0.3708, GLM-5.3 0.3653, Fable 5 0.2608) fold z into a bf16/fp16
+magic-number add where the spacing is 1.0, so they are exact only for integer z
+(3090 proxy above). Contract chosen: integer zero-points. PROMPT.txt and the
+reference docstring now say so on all three decks; check.py, the reference math
+and the inputs are unchanged, so no kernel's correctness moves. Relying on integer
+z is within contract and is not an audit finding.
+
+Because PROMPT.txt and reference.py are in the graded-surface digest, every
+published RTX PRO 6000 07 cell is stale under gate E until re-stamped with
+`KBH_REGRADE_CHECK_ONLY=1 KBH_REGRADE_DECK=problems-rtxpro6000` on tetra. That
+rides on branch `bench/recheck-04-07` with the cuda 04 margin rule:
+`scripts/recheck_04_07.sh`. The H100 and B200 07 cells are outside gate E and are
+not re-stamped; the wording change does not alter what they were graded on.
+
 ## 2026-09-24 — grader teeth: mutant kernels and fractional zero-points (RTX 3090 proxy)
 
 Probe on anvil's RTX 3090 (tetra busy), scripts and logs in

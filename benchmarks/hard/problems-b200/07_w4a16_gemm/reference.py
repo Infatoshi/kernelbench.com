@@ -4,7 +4,8 @@ AWQ/GPTQ-style scheme:
   x:      (M, K)               bf16
   w_q:    (K // 2, N)          uint8   -- two int4 weights packed per byte (low nibble = even-K, high = odd-K)
   scales: (K // group, N)      bf16
-  zeros:  (K // group, N)      bf16    -- asymmetric (stored already as float zero-point)
+  zeros:  (K // group, N)      bf16    -- asymmetric; integer zero-points 0..15 stored as bf16
+                                          (the contract: kernels may rely on integrality)
   out:    (M, N)                bf16
 
 Dequant (per group along K):
