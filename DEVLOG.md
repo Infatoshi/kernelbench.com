@@ -6,6 +6,17 @@ benchmark. Per-benchmark journals live in `benchmarks/<bench>/DEVLOG.md`;
 
 ---
 
+## 2026-10-03 - Leftover decisions from the Sonnet 5.5 / GPT-6.1 Sol week
+
+`kb lambda up` default type now follows the deck's hardware key: `gpu_1x_h100_pcie`
+for hard and cuda (their `problems-h100` claims the PCIe `H100` key), and SXM only
+where the deck is SXM (`KB_LAMBDA_BENCH=mini` `gpu_1x_h100_sxm5`, `multi`
+`gpu_8x_h100_sxm5`). The old SXM5 default contradicted the 09-28 PCIe rule and would
+have graded a PCIe deck on the wrong key. Mini and multi still wait for Elliot to
+name SXM (money gate); nothing was launched.
+
+---
+
 ## 2026-09-28 - GPU targets: tetra and Lambda H100 PCIe only, ncu required
 
 Elliot's rule: every run uses tetra's RTX PRO 6000 or Lambda H100 PCIe, with

@@ -365,3 +365,10 @@ def test_regrade_check_only_mode_in_every_copy():
         assert "benchmark.py skipped" in text, b
     gate = (REPO / "scripts/check_publish_gates.py").read_text()
     assert "--list-stale" in gate and "KBH_REGRADE_CHECK_ONLY" in gate
+
+
+def test_lambda_default_type_matches_deck_key():
+    # hard/cuda problems-h100 claim the PCIe `H100` key; SXM is only for mini and multi.
+    lam = (REPO / "scripts/lambda_worker.sh").read_text()
+    assert 'TYPE="${2:-${KB_LAMBDA_TYPE:-$DEFAULT_TYPE}}"' in lam
+    assert '*)     DEFAULT_TYPE="gpu_1x_h100_pcie" ;;' in lam

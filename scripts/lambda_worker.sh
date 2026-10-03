@@ -4,7 +4,7 @@
 #
 #   lambda_worker.sh list                         instance types + capacity
 #   lambda_worker.sh ls                           running instances
-#   lambda_worker.sh up <name> [type] [region]    launch (default gpu_1x_h100_sxm5)
+#   lambda_worker.sh up <name> [type] [region]    launch (default per bench, see DEFAULT_TYPE)
 #   lambda_worker.sh sync <name>                  rsync thin bench -> name:kb-<bench>/
 #      (bench selected by KB_LAMBDA_BENCH, default hard; `multi` also ships ~/.kbm_env)
 #   lambda_worker.sh bootstrap <name> [--agents]  uv + torch; --agents adds CLIs + auth
@@ -18,7 +18,8 @@
 # SSH keys registered on the Lambda account (names): macbook, anvil
 #   (launch attaches BOTH so either machine can log in).
 #
-# Env: KB_LAMBDA_TYPE (default gpu_1x_h100_sxm5), KB_LAMBDA_REGION (auto if empty),
+# Env: KB_LAMBDA_TYPE (default gpu_1x_h100_pcie; mini gpu_1x_h100_sxm5, multi gpu_8x_h100_sxm5),
+#      KB_LAMBDA_REGION (auto if empty),
 #      KB_LAMBDA_SSH_KEYS (default: this host's key; API allows exactly one), KB_LAMBDA_PROBLEMS_ROOT
 #      (default problems-h100), KBH_HARDWARE (default H100) for regrade.
 set -euo pipefail
@@ -54,6 +55,15 @@ ENV_ALLOWLIST='KIMI_API_KEY|MOONSHOT_API_KEY|ZAI_API_KEY|MINIMAX_API_KEY|DEEPSEE
 case "$BENCH" in
   multi) PROBLEMS_ROOT="${KB_LAMBDA_PROBLEMS_ROOT:-problems-h100x4}" ;;
   *)     PROBLEMS_ROOT="${KB_LAMBDA_PROBLEMS_ROOT:-problems-h100}" ;;
+esac
+# Default instance type follows the deck's hardware key (2026-10-03). hard and
+# cuda `problems-h100` claim the PCIe `H100` key, so an SXM default graded them
+# on the wrong SKU. Only mini (`H100_SXM`) and multi (4xH100 SXM, NVSwitch) are
+# SXM decks; SXM is never a fallback for a PCIe deck.
+case "$BENCH" in
+  mini)  DEFAULT_TYPE="gpu_1x_h100_sxm5" ;;
+  multi) DEFAULT_TYPE="gpu_8x_h100_sxm5" ;;
+  *)     DEFAULT_TYPE="gpu_1x_h100_pcie" ;;
 esac
 # Lambda's launch API rejects requests with more than one ssh key
 # ("Invalid number of SSH keys", observed 2026-07-21), so the default is the
@@ -212,7 +222,7 @@ case "$CMD" in
 
   up)
     NAME="${1:?name required}"
-    TYPE="${2:-${KB_LAMBDA_TYPE:-gpu_1x_h100_sxm5}}"
+    TYPE="${2:-${KB_LAMBDA_TYPE:-$DEFAULT_TYPE}}"
     REGION_ARG="${3:-${KB_LAMBDA_REGION:-}}"
     REGION="$(pick_region "$TYPE" "$REGION_ARG")"
     if [ -z "$REGION" ]; then

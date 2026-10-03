@@ -97,7 +97,7 @@ Elliot's rule (2026-09-28): every run, sweep, and regrade goes to one of two tar
 
 Mega claims only `RTX_PRO_6000`: no H100 deck. Mini (`H100_SXM`) and multi (4xH100 SXM, NVSwitch) cannot run on PCIe; they wait for Elliot to name SXM.
 
-1. tetra: `nvidia-smi`, `overnight-compute` lease on a free GPU, never touch another job's; `scripts/tetra_release.sh` does lease, launch, model check, regrade. Lambda: `kb lambda list` must show PCIe capacity (SXM is a different key, never a fallback), then `kb lambda up <name> gpu_1x_h100_pcie` (default is SXM5), `sync`, `bootstrap --agents`.
+1. tetra: `nvidia-smi`, `overnight-compute` lease on a free GPU, never touch another job's; `scripts/tetra_release.sh` does lease, launch, model check, regrade. Lambda: `kb lambda list` must show PCIe capacity (SXM is a different key, never a fallback), then `kb lambda up <name>` (default `gpu_1x_h100_pcie`), `sync`, `bootstrap --agents`.
 2. Lambda ncu (bootstrap skips it; `kb lambda run` is host mode): add NVIDIA's repo (Bootstrap item 1), `apt-get install nsight-compute-2025.1.1` (driver 570; skip if item 1's toolkit put `ncu` on PATH), write `options nvidia NVreg_RestrictProfilingToAdminUsers=0` to `/etc/modprobe.d/nvidia-ncu.conf`, then reboot, or stop `nvidia-persistenced` and `modprobe -r nvidia_uvm nvidia_drm nvidia_modeset nvidia_peermem nvidia && modprobe nvidia nvidia_uvm`. tetra already has `ncu` 2026.2.1 and the flag.
 3. Proof as the agent's user: `RmProfilingAdminOnly: 0` in `/proc/driver/nvidia/params`, and `ncu --metrics gpu__time_duration.sum` on a tiny kernel prints a number. `ERR_NVGPUCTRPERM` or only a banner: no session on that box.
 4. Run via the harness, regrade on the same SKU, pull back, tear down.
@@ -114,7 +114,7 @@ Zach / Lambda sponsored $10k of Cloud credits (2026-07) for Hard / Mega / CUDA /
 ```
 kb lambda list                         # capacity by type
 kb lambda ls                           # running instances
-kb lambda up <name> [type] [region]    # default type gpu_1x_h100_sxm5
+kb lambda up <name> [type] [region]    # default gpu_1x_h100_pcie; mini sxm5, multi 8x sxm5
 kb lambda sync <name>                  # thin bench + allowlisted keys (preserves the node's torch-index patch)
 kb lambda bootstrap <name> [--agents]  # uv + torch; --agents = agent CLIs; no ncu (GPU targets step 2)
 kb lambda run <name> <harness> <model> <problem> [effort]
@@ -185,7 +185,7 @@ The following variables can change the meaning, comparability, publishability, o
 | `KB_LAMBDA_SSH_KEYS` | `scripts/lambda_worker.sh` | current host key name (`macbook` or `anvil`) | Selects the Lambda account SSH key attached at launch. | Lambda's launch API accepts exactly one key here. |
 | `KB_LAMBDA_SSH_USER` | `scripts/lambda_worker.sh` | `ubuntu` | Selects the remote SSH/rsync user. | Operational only. |
 | `KB_LAMBDA_TORCH_INDEX` | `scripts/lambda_worker.sh` | `https://download.pytorch.org/whl/cu128` | Selects the PyTorch wheel index used during worker bootstrap. | Can change the CUDA/PyTorch runtime. |
-| `KB_LAMBDA_TYPE` | `scripts/lambda_worker.sh` | `gpu_1x_h100_sxm5` | Selects the Lambda instance type when no positional type is supplied. | Direct cost and hardware control. |
+| `KB_LAMBDA_TYPE` | `scripts/lambda_worker.sh` | `gpu_1x_h100_pcie` (mini `gpu_1x_h100_sxm5`, multi `gpu_8x_h100_sxm5`) | Selects the Lambda instance type when no positional type is supplied. | Direct cost and hardware control. |
 | `KB_REPO_ROOT` | `kbtool/kb/cli.py` | walk up from cwd | Overrides where `kb` finds the monorepo. | Honoured only if it contains `benchmarks/`. |
 
 Scan exclusions (tokens the `kbtool/tests` scan finds that are not caller-facing variables): `KB_BREV_GPU` appears only in a stale comment; `scripts/brev_worker.sh` does not read it. `KB_LAMBDA_DEFAULT_KEY` is a substring of the shell-local `_KB_LAMBDA_DEFAULT_KEY`, which is computed from `hostname`.
