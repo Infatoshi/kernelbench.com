@@ -130,6 +130,19 @@ def annotation_verdict(run_id: str, annotations_dir: Path) -> str | None:
     return d.get("verdict")
 
 
+def annotation_contamination(run_id: str, annotations_dir: Path) -> str | None:
+    """The audit's separate `contamination:` field (clean when the transcript read found no foreign archive use)."""
+    f = annotations_dir / f"{run_id}.yaml"
+    if not f.exists():
+        return None
+    try:
+        import yaml
+        d = yaml.safe_load(f.read_text()) or {}
+    except Exception:
+        return None
+    return d.get("contamination")
+
+
 def _constraints(problem: str) -> dict:
     y = _HERE / "problems" / problem / "problem.yaml"
     if not y.exists():
@@ -271,8 +284,10 @@ def main() -> None:
             continue
         nc = contamination(run_dir)
         if nc >= 1:
-            if annotation_verdict(rid, annotations_dir) == "clean":
-                print(f"  KEPT (tripwire: {nc} archive ref(s); manual audit verdict=clean): {run_dir.name}")
+            # A manual contamination read (`verdict: clean`, or `contamination: clean`
+            # under another verdict such as `interesting`) overrides it, as in hard's builder.
+            if annotation_verdict(rid, annotations_dir) == "clean" or annotation_contamination(rid, annotations_dir) == "clean":
+                print(f"  KEPT (tripwire: {nc} archive ref(s); manual contamination read=clean): {run_dir.name}")
             else:
                 print(f"  EXCLUDED (contaminated, read {nc} other archive(s)): {run_dir.name}")
                 continue
