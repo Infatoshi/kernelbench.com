@@ -36,7 +36,9 @@ export META_API_KEY=${META_API_KEY:-${META_MODEL_API_KEY:-}}   # muse route; ~/.
 # Claude sweep account: a `claude setup-token` token kept under its own name, because tetra's
 # shells source ~/.env_vars and must keep their own login. Only these runs bill it.
 CLAUDE_AUTH=login
-if [ -n "${SWEEP_CLAUDE_OAUTH_TOKEN:-}" ]; then export CLAUDE_CODE_OAUTH_TOKEN=$SWEEP_CLAUDE_OAUTH_TOKEN; CLAUDE_AUTH=sweep-token; fi
+# TETRA_RELEASE_CLAUDE_AUTH=login bills tetra's own login even when the sweep token is set
+# (e.g. the sweep account is rate-limited).
+if [ "${TETRA_RELEASE_CLAUDE_AUTH:-}" != login ] && [ -n "${SWEEP_CLAUDE_OAUTH_TOKEN:-}" ]; then export CLAUDE_CODE_OAUTH_TOKEN=$SWEEP_CLAUDE_OAUTH_TOKEN; CLAUDE_AUTH=sweep-token; fi
 SLUG=$(printf '%s-%s' "$HARNESS" "$MODEL" | tr -c 'A-Za-z0-9.-' '_')
 OUT=$R/runs/release-$(date +%Y%m%d_%H%M%S)-$SLUG
 mkdir -p "$OUT"
