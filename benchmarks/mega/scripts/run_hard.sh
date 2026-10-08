@@ -68,7 +68,24 @@ MODEL_SLUG="$(echo "$MODEL" | tr '/:[] ' '_')"
 RUN_DIR_BASE="${REPO_ROOT}/outputs/runs/${TIMESTAMP}_${HARNESS}_${MODEL_SLUG}_${PROBLEM_NAME}"
 mkdir -p "$REPO_ROOT/outputs/runs"
 RUN_DIR=""
+# Resume (claude only): KBH_RESUME_RUN_DIR / KBH_RESUME_SESSION / KBH_RESUME_PROMPT continue a
+# session that an infrastructure stop ended (reboot, provider rate limit, Claude Code's
+# autocompact-thrash guard) inside its own archive, as scripts/lib/run_harness.sh does for
+# hard/cuda: same run dir and workspace, `claude --resume`, earlier legs kept as partN files.
+if [ -n "${KBH_RESUME_RUN_DIR:-}" ]; then
+    if [ "$HARNESS" != "claude" ] || [ -z "${KBH_RESUME_SESSION:-}" ] || [ ! -d "$KBH_RESUME_RUN_DIR/repo" ]; then
+        echo "STOP: resume needs HARNESS=claude, KBH_RESUME_SESSION and an existing run dir" >&2; exit 2
+    fi
+    RUN_DIR="$(cd "$KBH_RESUME_RUN_DIR" && pwd)"
+    for _f in transcript stderr; do
+        _ext=jsonl; [ "$_f" = stderr ] && _ext=log
+        _n=1; while [ -f "$RUN_DIR/$_f.part$_n.$_ext" ]; do _n=$((_n + 1)); done
+        [ -f "$RUN_DIR/$_f.$_ext" ] && mv "$RUN_DIR/$_f.$_ext" "$RUN_DIR/$_f.part$_n.$_ext"
+    done
+    echo "RESUME: $RUN_DIR session $KBH_RESUME_SESSION"
+fi
 for attempt in $(seq 0 999); do
+    [ -n "$RUN_DIR" ] && break
     if [ "$attempt" -eq 0 ]; then
         candidate="$RUN_DIR_BASE"
     else
@@ -161,12 +178,16 @@ strip_python_bytecode() {
 
 # Copy src/ (a symlink would dangle once the sandbox tmpfs hides the repo,
 # and a writable symlink lets candidates modify the trusted checker helpers).
-cp -a "$REPO_ROOT/src" "$WORKSPACE_ROOT/src"
-strip_python_bytecode "$WORKSPACE_ROOT/src"
-cp -p "$REPO_ROOT/pyproject.toml" "$WORKSPACE_ROOT/pyproject.toml"
-cp -p "$REPO_ROOT/uv.lock" "$WORKSPACE_ROOT/uv.lock"
-if [ -e "$REPO_ROOT/.python-version" ]; then
-    cp -p "$REPO_ROOT/.python-version" "$WORKSPACE_ROOT/.python-version"
+# A resumed session keeps the workspace it built (src/, deps); only the canonical problem
+# files below are recopied.
+if [ -z "${KBH_RESUME_RUN_DIR:-}" ]; then
+    cp -a "$REPO_ROOT/src" "$WORKSPACE_ROOT/src"
+    strip_python_bytecode "$WORKSPACE_ROOT/src"
+    cp -p "$REPO_ROOT/pyproject.toml" "$WORKSPACE_ROOT/pyproject.toml"
+    cp -p "$REPO_ROOT/uv.lock" "$WORKSPACE_ROOT/uv.lock"
+    if [ -e "$REPO_ROOT/.python-version" ]; then
+        cp -p "$REPO_ROOT/.python-version" "$WORKSPACE_ROOT/.python-version"
+    fi
 fi
 
 for t in "${TEMPLATE_FILES[@]}"; do
@@ -467,7 +488,8 @@ case "$HARNESS" in
             --model "$MODEL" \
             "${EFFORT_ARG[@]}" \
             --add-dir "$PROBLEM_DIR" \
-            -p "$PROMPT" ) \
+            ${KBH_RESUME_SESSION:+--resume "$KBH_RESUME_SESSION"} \
+            -p "${KBH_RESUME_PROMPT:-$PROMPT}" ) \
             > "$LOG_FILE" 2> "$STDERR_FILE" || HARNESS_EXIT=$?
         ;;
 
