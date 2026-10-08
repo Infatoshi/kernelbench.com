@@ -117,7 +117,7 @@ RUN_DIR=""
 # its own archive instead of starting a new cell. KBH_RESUME_RUN_DIR names the run
 # dir, KBH_RESUME_SESSION the claude session id stored under its agent_home, and
 # KBH_RESUME_PROMPT the first message of the continuation. The prior transcript is
-# kept as transcript.part1.jsonl. Workspace files the agent wrote are untouched;
+# kept as transcript.partN.jsonl (N counts the legs). Workspace files the agent wrote are untouched;
 # the canonical problem files are recopied. The existing src/ and trusted
 # snapshot stay in place so mutations from before the interruption remain
 # detectable after the resumed agent exits.
@@ -128,7 +128,9 @@ if [ -n "${KBH_RESUME_RUN_DIR:-}" ]; then
     RUN_DIR="$(cd "$KBH_RESUME_RUN_DIR" && pwd)"
     for _f in transcript stderr; do
         _ext=jsonl; [ "$_f" = stderr ] && _ext=log
-        [ -f "$RUN_DIR/$_f.$_ext" ] && [ ! -f "$RUN_DIR/$_f.part1.$_ext" ] && mv "$RUN_DIR/$_f.$_ext" "$RUN_DIR/$_f.part1.$_ext"
+        # Each resume keeps the previous leg as the next free partN (a session can be cut off repeatedly).
+        _n=1; while [ -f "$RUN_DIR/$_f.part$_n.$_ext" ]; do _n=$((_n + 1)); done
+        [ -f "$RUN_DIR/$_f.$_ext" ] && mv "$RUN_DIR/$_f.$_ext" "$RUN_DIR/$_f.part$_n.$_ext"
     done
     echo "RESUME: $RUN_DIR session $KBH_RESUME_SESSION"
 fi

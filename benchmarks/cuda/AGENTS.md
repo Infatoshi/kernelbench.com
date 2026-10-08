@@ -21,7 +21,7 @@ Everything else is shared with Hard and lives in `benchmarks/hard/AGENTS.md`: la
 
 ## Resuming an interrupted claude cell
 
-`KBH_RESUME_RUN_DIR`, `KBH_RESUME_SESSION` and `KBH_RESUME_PROMPT` (read by `scripts/lib/run_harness.sh`, claude harness, host mode only) continue a session that died for infrastructure reasons (GPU off the bus, box reboot) inside its own archive: same run dir and sandbox, the session store under `agent_home`, `claude --resume <session>` with the prompt as the first new message. The old transcript stays as `transcript.part1.jsonl`. Grading, regrade and the publish gates then run unchanged. Record the interruption in the cell's annotation.
+`KBH_RESUME_RUN_DIR`, `KBH_RESUME_SESSION` and `KBH_RESUME_PROMPT` (read by `scripts/lib/run_harness.sh`, claude harness, host mode only) continue a session that died for infrastructure reasons (GPU off the bus, box reboot) inside its own archive: same run dir and sandbox, the session store under `agent_home`, `claude --resume <session>` with the prompt as the first new message. Each earlier leg stays as `transcript.partN.jsonl` (N = 1, 2, ... in order), so a session cut off by a provider rate limit can be resumed again after each reset. `scripts/tetra_resume_cells.sh <gpu> <model> <effort> <bench:run_dir>... -- <bench:run_dir>...` does that on tetra: one continuation per cell at a time, waits out each rate-limit reset, then regrades the resumed cells plus the finished ones listed after `--`. Grading, regrade and the publish gates then run unchanged. Record the interruption in the cell's annotation.
 
 ## Release sweep on tetra
 
