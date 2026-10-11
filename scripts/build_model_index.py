@@ -96,6 +96,7 @@ MODEL_NAMES = {
     "grok-4.7": "Grok 4.7",
     "claude-opus-5-5": "Claude Opus 5.5",
     "claude-sonnet-5-5": "Claude Sonnet 5.5",
+    "claude-haiku-5-5": "Claude Haiku 5.5",
     "grok-build": "Grok Build",
     "minimax-m3": "MiniMax-M3",
     "kimi-k2.7-code": "Kimi K2.7-Code",
