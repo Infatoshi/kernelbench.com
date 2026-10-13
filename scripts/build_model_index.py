@@ -205,12 +205,25 @@ def lab_for(slug: str) -> str:
     return ""
 
 
+# Runs with no session to publish: archive lost (anvil's 2026-09-01 Fable 5.1
+# mega rig failures, audited `bug`) or a stub transcript with no conversation.
+# Their cells stay on the site without a trace link instead of a dead one.
+NO_TRACE_RUNS = {
+    "20260901_120240_claude_claude-fable-5-1_02_kimi_linear_decode",
+    "20260901_124502_claude_claude-fable-5-1_02_kimi_linear_decode",
+    "20260901_142726_claude_claude-fable-5-1_02_kimi_linear_decode",
+    "20260719_063102_grok_grok-build_01_fp8_gemm",
+}
+
+
 def trace_url(bench: str, run_id: str, gpu_key: str | None = None) -> str | None:
     """Canonical boards use flat <rid>.jsonl on HF; non-canonical boards use
     <gpu>/<rid>.jsonl — the same run_id can name two different sessions (one
     per GPU board), so a bare-rid key would misattribute one to the other."""
     ds = TRACE_DATASETS.get(bench)
     if not ds or not run_id:
+        return None
+    if run_id in NO_TRACE_RUNS:
         return None
     if gpu_key:
         # A few pre-split board runs were lost before their traces could be
@@ -542,13 +555,23 @@ def model_from_run_id(run_id: str) -> str | None:
     return parts[1] if len(parts) == 2 and parts[1] else None
 
 
-def annotation_gpu_key(gpu: object) -> str | None:
-    """Map annotation hardware labels onto the site's board namespaces."""
+def annotation_gpu_key(gpu: object, bench: str | None = None, run_id: str = "") -> str | None:
+    """Map annotation hardware labels onto the site's board namespaces. An
+    annotation without a gpu label falls back to where its archive lives: a
+    run kept only under outputs/runs-<h100|b200>/ belongs to that board, never
+    to the canonical RTX PRO 6000 board (two B200 cells shipped on the RTX hard
+    tab that way until 2026-10-13)."""
     label = str(gpu or "").upper()
     if "H100" in label:
         return "h100"
     if "B200" in label:
         return "b200"
+    if not label and bench and run_id:
+        out = REPO / "benchmarks" / bench / "outputs"
+        if not (out / "runs" / run_id).is_dir():
+            for key in ("h100", "b200"):
+                if (out / f"runs-{key}" / run_id).is_dir():
+                    return key
     return None
 
 ANNOTATION_FAILURE_OUTCOMES = {
@@ -694,15 +717,15 @@ def join_annotations(models: Models, bench: str, ann_dir: Path) -> tuple[list[st
                 "solution_url": (
                     mega_solution_url(run_id)
                     if bench == "mega"
-                    else solution_url(run_id, annotation_gpu_key(a.get("gpu")))
+                    else solution_url(run_id, annotation_gpu_key(a.get("gpu"), bench, run_id))
                 ),
                 "trace_url": trace_url(
-                    bench, run_id, annotation_gpu_key(a.get("gpu"))
+                    bench, run_id, annotation_gpu_key(a.get("gpu"), bench, run_id)
                 ),
             }
         )
         if bench != "mega":
-            gpu_key = annotation_gpu_key(a.get("gpu"))
+            gpu_key = annotation_gpu_key(a.get("gpu"), bench, run_id)
             target = bench_block
             if gpu_key:
                 target = bench_block.setdefault("gpus", {}).setdefault(
@@ -767,7 +790,7 @@ def join_annotations(models: Models, bench: str, ann_dir: Path) -> tuple[list[st
             # rejected/failed attempts as invalid cells so the public homepage
             # still shows that the model ran on each GPU instead of silently
             # dropping its lab logo and outcome from the board.
-            gpu_key = annotation_gpu_key(a.get("gpu"))
+            gpu_key = annotation_gpu_key(a.get("gpu"), bench, run_id)
             target = bench_block
             if gpu_key:
                 target = bench_block.setdefault("gpus", {}).setdefault(

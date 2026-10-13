@@ -92,22 +92,7 @@ export default async function HomePage() {
           <b>pass</b> bar = share of best · click a cell for solution / trace
         </span>
         <span>
-          <b className="hd-leg-blank">blank</b> no run yet
-        </span>
-        <span>
-          <b className="hd-leg-wrong">wrong</b> answers don&apos;t match
-        </span>
-        <span>
-          <b className="hd-leg-build">build</b> can&apos;t compile/import
-        </span>
-        <span>
-          <b className="hd-leg-slow">slow</b> timed out
-        </span>
-        <span>
-          <b className="hd-leg-cut">cut</b> stopped early
-        </span>
-        <span>
-          <b className="hd-leg-flag">flag</b> audit reject
+          <b className="hd-leg-blank">blank</b> no audited pass (failed, unaudited or not run; the model page lists every outcome)
         </span>
       </p>
     </div>

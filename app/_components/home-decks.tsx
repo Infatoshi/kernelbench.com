@@ -10,7 +10,8 @@ import { problemLabel } from "../_lib/models"
 // Desktop: model × problem matrix.
 // Mobile multi-problem: per-problem leaderboards (best → worst).
 // Mobile single-problem: model cards.
-// No-run cells are blank (not red). Judged fails keep a short color label.
+// Only audited passes are drawn; every other cell is blank. Rows with no pass
+// in a deck are left off that deck (their record stays on /models/<slug>).
 // Every cell with a run is a link to its dedicated /runs/<gpu>/<rid> page.
 
 
@@ -57,29 +58,14 @@ function LabMark({ row }: { row: ReportRow }) {
   )
 }
 
-/** Visual tone for non-pass chips.
- *  blank = no run / no kernel (say nothing)
- *  miss  = red — wrong answer (we graded it and it failed)
- *  warn  = amber — ran but process failed (build / slow / cut / infra / OOM)
- *  hack  = amber+ — audit reject
- */
-function failTone(chip: ProblemChip): "blank" | "miss" | "warn" | "hack" {
-  if (chip.kind === "no_kernel" || chip.label === "empty") return "blank"
-  if (chip.label === "unaudited") return "blank"
-  if (chip.kind === "hack" || chip.label === "flag") return "hack"
-  // wrong answers are the hard fail; everything else that actually ran is warn
-  if (chip.label === "wrong") return "miss"
-  return "warn"
-}
+// Non-pass cells (wrong, build/infra fail, audit reject, unaudited, no
+// kernel) render blank: only audited passes carry a mark. The cell still
+// links to its run page and /models/<slug> lists every outcome, so nothing
+// leaves the site, only the grid.
 
 /** Rank bucket for per-problem mobile boards (lower = higher on the list). */
 function rankBucket(chip: ProblemChip): number {
-  if (chip.kind === "pass" && chip.score != null) return 0
-  const tone = failTone(chip)
-  if (tone === "hack") return 1
-  if (tone === "miss") return 2
-  if (tone === "warn") return 3
-  return 4 // blank / empty
+  return chip.kind === "pass" && chip.score != null ? 0 : 1
 }
 
 const BAR_GROW_MS = 1000
@@ -117,7 +103,7 @@ function Chip({
   const pct = pass ? Math.min(100, (chip.score! / best) * 100) : 0
   const fillW = pass ? Math.max(pct, 4) : 0
   const win = pass && chip.score! >= best! - 1e-12
-  const blank = !pass && failTone(chip) === "blank"
+  const blank = !pass
 
   // pre → grow (line + count-up) → static
   const [phase, setPhase] = useState<"pre" | "grow" | "static">("pre")
@@ -177,7 +163,7 @@ function Chip({
     ? win
       ? "hd-bar-win"
       : "hd-bar-pass"
-    : `hd-bar-${failTone(chip)}`
+    : "hd-bar-blank"
 
   const fillStyle = {
     ["--hd-w" as string]: `${fillW.toFixed(1)}%`,
@@ -201,11 +187,7 @@ function Chip({
         </span>
       )}
     </>
-  ) : blank ? null : (
-    <span className="hd-bar-fail-label" aria-label={chip.title || chip.label || "fail"}>
-      {chip.label || "fail"}
-    </span>
-  )
+  ) : null
 
   const barClass = `hd-bar ${tone}${chip.page_url ? " hd-bar-hot" : ""}`
   return (
@@ -260,7 +242,7 @@ function rankEntriesForProblem(
   const entries: RankEntry[] = []
   for (const row of view.rows) {
     const chip = row.chips.find((c) => c.problem === problemId)
-    if (!chip) continue
+    if (!chip || chip.kind !== "pass" || chip.score == null) continue
     entries.push({ row, chip })
   }
   entries.sort((a, b) => {
@@ -298,6 +280,7 @@ function DeckPanel({ deck }: { deck: HomeDeck }) {
       return sum / Math.max(view.problems.length, 1)
     }
     return [...view.rows]
+      .filter((row) => row.chips.some((c) => c.kind === "pass" && c.score != null))
       .map((row) => ({ row, perf: perf(row) }))
       .sort((a, b) => b.perf - a.perf || a.row.name.localeCompare(b.row.name))
       .map((x) => x.row)
