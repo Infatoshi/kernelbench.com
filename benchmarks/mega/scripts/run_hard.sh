@@ -288,10 +288,24 @@ esac
 if [ -n "${RUN_DIR:-}" ] && [[ "$real_abs" == "${RUN_DIR}/bin/"* ]] && [ -n "$fallback" ]; then
     real="$fallback"
 fi
-if [ "${KBH_GPU_LOCK_HELD:-0}" = "1" ]; then
-    exec "$real" "$@"
-fi
 owner_file="${KBH_GPU_LOCK}.owner"
+# KBH_GPU_LOCK_HELD=1 is reentrancy for children of the lock owner (nvcc under
+# benchmark.py), not a pass: agents can set it themselves (Gemini 4 Argon's
+# cuda 01/03/04 cells did on 2026-10-13 and ran while NSA held the lock). Honor
+# it only when no one holds the lock or the live owner is one of our ancestors.
+if [ "${KBH_GPU_LOCK_HELD:-0}" = "1" ]; then
+    held_pid=""
+    [ -f "$owner_file" ] && IFS=$'\t' read -r held_pid _ < "$owner_file" || true
+    if [ -z "$held_pid" ] || ! kill -0 "$held_pid" 2>/dev/null; then
+        exec "$real" "$@"
+    fi
+    p=$$
+    while [ -n "$p" ] && [ "$p" -gt 1 ]; do
+        [ "$p" = "$held_pid" ] && exec "$real" "$@"
+        p="$(awk '{print $4}' "/proc/$p/stat" 2>/dev/null)"
+    done
+    printf '%s held_env_ignored pid=%s cmd=%s owner=%s\n' "$(date -Is)" "$$" "$name" "$held_pid" >>"$KBH_GPU_LOCK_LOG"
+fi
 if [ -f "$owner_file" ]; then
     IFS=$'\t' read -r owner_pid owner_run_dir < "$owner_file" || true
     if [ "${owner_run_dir:-}" = "${RUN_DIR:-}" ] && kill -0 "${owner_pid:-}" 2>/dev/null; then

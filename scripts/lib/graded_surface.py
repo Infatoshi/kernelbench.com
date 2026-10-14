@@ -55,6 +55,10 @@ def _update_tree(digest: "hashlib._Hash", root: Path, label: str) -> None:
         relative = path.relative_to(root).as_posix()
         if "__pycache__" in path.parts or path.suffix in (".pyc", ".pyo"):
             continue
+        # macOS AppleDouble sidecars ride along when a tree is tarred on the Mac
+        # (the 2026-10-13 Verda box restamped all four Argon cuda cells for it).
+        if path.name.startswith("._"):
+            continue
         metadata = path.lstat()
         if stat.S_ISDIR(metadata.st_mode):
             kind, contents = b"d", b""
