@@ -3,6 +3,9 @@
 # parallel sessions on ONE GPU (the per-bench GPU locks serialize their GPU commands), then the
 # sequential isolated regrade of exactly those cells on the same GPU with the canonical decks.
 # Different models run at once on different GPUs. This is the Grok 4.7 / Opus 5.5 / GPT-6 recipe.
+# KB_RELEASE_CELLS="<bench>:<deck>/<problem> ..." replaces the cell list (e.g. hard cells);
+# KB_RELEASE_GPUS="0 1 2 3" spreads cells round-robin over those GPUs, each GPU with its own
+# lock dir (rented multi-GPU boxes); the regrade still runs alone on <gpu> after every cell ends.
 #
 #   scripts/tetra_release.sh <gpu> <harness> <model> [effort]
 #   nohup scripts/tetra_release.sh 2 claude claude-opus-5-5 max >/dev/null 2>&1 &
@@ -51,7 +54,9 @@ log "harness=$HARNESS model=$MODEL effort=${EFFORT:-<harness default>} claude_au
 CELLS=(mega:problems/02_kimi_linear_decode
        cuda:problems-rtxpro6000/01_glm52_fused_moe cuda:problems-rtxpro6000/02_deepseek_nsa
        cuda:problems-rtxpro6000/03_megaqwen_decode cuda:problems-rtxpro6000/04_grid_mingru_sps)
-pids=()
+[ -n "${KB_RELEASE_CELLS:-}" ] && read -r -a CELLS <<< "$KB_RELEASE_CELLS"
+read -r -a GPUS <<< "${KB_RELEASE_GPUS:-$GPU}"
+pids=(); ci=0
 for cell in "${CELLS[@]}"; do
     B=${cell%%:*}; P=${cell#*:}; L=$OUT/${B}_$(basename "$P").log
     # TETRA_RELEASE_RESUME=<earlier runs/release-* dir>: keep its cells that reached result.json
@@ -61,8 +66,10 @@ for cell in "${CELLS[@]}"; do
     if [ -n "$prd" ] && [ -f "$prd/result.json" ]; then
         cp "$prev" "$L"; log "kept $B $(basename "$P") from $(basename "$prd")"; continue
     fi
-    ( cd "$R/benchmarks/$B" && ./scripts/run_hard.sh "$HARNESS" "$MODEL" "$P" ${EFFORT:+"$EFFORT"} ) > "$L" 2>&1 &
-    pids+=($!); log "launched $B $(basename "$P") pid $!"
+    G=${GPUS[$((ci % ${#GPUS[@]}))]}; ci=$((ci + 1))
+    LOCKDIR=; [ ${#GPUS[@]} -gt 1 ] && LOCKDIR=$R/benchmarks/$B/outputs/gpu_lock/gpu$G
+    ( cd "$R/benchmarks/$B" && env KBH_GPU=$G ${LOCKDIR:+KBH_GPU_LOCK_DIR=$LOCKDIR} ./scripts/run_hard.sh "$HARNESS" "$MODEL" "$P" ${EFFORT:+"$EFFORT"} ) > "$L" 2>&1 &
+    pids+=($!); log "launched $B $(basename "$P") gpu $G pid $!"
     sleep 30
 done
 
@@ -78,14 +85,14 @@ done
 for pid in "${pids[@]}"; do wait "$pid"; log "pid $pid exit $?"; done
 log "all cells finished"
 
-for B in mega cuda; do
+for B in mega cuda hard; do
     runs=()
     for L in "$OUT"/${B}_*.log; do
         rd=$(grep -m1 -oE 'Archive: +\S+' "$L" | awk '{print $2}')
         [ -f "$rd/result.json" ] && runs+=("$rd")
     done
     [ ${#runs[@]} -eq 0 ] && { log "no $B result.json to regrade"; continue; }
-    DECK=problems; [ "$B" = cuda ] && DECK=problems-rtxpro6000
+    DECK=problems; [ "$B" != mega ] && DECK=problems-rtxpro6000
     log "regrade $B ${#runs[@]} runs deck=$DECK gpu=$GPU"
     ( cd "$R/benchmarks/$B" && KBH_REGRADE_GPU=$GPU KBH_REGRADE_DECK=$DECK ./scripts/regrade_sequential.sh "${runs[@]}" ) > "$OUT/regrade_$B.log" 2>&1
     log "regrade $B exit $?"
