@@ -1,0 +1,632 @@
+"""DeepSeek NSA-style sparse attention, hand-written CUDA (SM120).
+
+Pipeline (all custom CUDA, compiled at import with nvcc):
+  1. means_kernel  : per-key-block mean of K  -> M[bh][block][d]   (fp32)
+  2. select_kernel : per-query block importance = q . M  (block-mean linearity:
+                     mean_{j in block}(q.k_j * scale) = (q . mean_k) * scale),
+                     exact for the partial (current) block via a per-query
+                     prefix-sum of K, then insertion-sort top-8 -> bitmap.
+  3. attn_kernel   : FlashAttention-2 style online softmax over K/V tiles whose
+                     keys are selected by the bitmap, the causal current block,
+                     or the sliding window; mma.sync m16n8k16 bf16 tensor cores.
+
+The block-importance linearity trick is what makes the scoring pass cheap:
+O(S^2 D / block_size) instead of O(S^2 D).
+"""
+
+from __future__ import annotations
+
+import ctypes
+import hashlib
+import os
+import subprocess
+import tempfile
+
+import torch
+import torch.nn as nn
+
+_CUDA_SRC = r"""
+// NSA-inspired sparse attention: block scoring -> top-n select -> masked online attention.
+#include <cuda_runtime.h>
+#include <cuda_bf16.h>
+#include <cstdint>
+
+using bf16 = __nv_bfloat16;
+#define DI __device__ __forceinline__
+#define FULLMASK 0xffffffffu
+
+DI uint32_t pack2(float lo, float hi) {
+  __nv_bfloat162 v = __floats2bfloat162_rn(lo, hi);
+  return *reinterpret_cast<uint32_t*>(&v);
+}
+DI void mma16816(float* d, const uint32_t* a, const uint32_t* b) {
+  asm volatile(
+    "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
+    "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+    : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
+    : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
+}
+DI void ldm_x4(uint32_t* d, uint32_t saddr) {
+  asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+               : "=r"(d[0]), "=r"(d[1]), "=r"(d[2]), "=r"(d[3]) : "r"(saddr));
+}
+DI void ldm_x4_t(uint32_t* d, uint32_t saddr) {
+  asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+               : "=r"(d[0]), "=r"(d[1]), "=r"(d[2]), "=r"(d[3]) : "r"(saddr));
+}
+DI uint32_t smem_u32(const void* p) { return (uint32_t)__cvta_generic_to_shared(p); }
+DI void cp_async16(uint32_t saddr, const void* g) {
+  asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" :: "r"(saddr), "l"(g));
+}
+DI void cp_commit() { asm volatile("cp.async.commit_group;\n"); }
+DI void cp_wait1() { asm volatile("cp.async.wait_group 1;\n"); }
+DI void cp_wait0() { asm volatile("cp.async.wait_group 0;\n"); }
+
+#define BS 64        // queries per CTA tile / keys per tile (= block_size)
+#define MAXW 8       // max bitmap words (=> up to 256 key blocks)
+
+// ---------------------------------------------------------------- kernel A
+// M[bh][bj][d] = mean over the keys of block bj of K
+__global__ __launch_bounds__(128)
+void means_kernel(const bf16* __restrict__ K, float* __restrict__ M,
+                  int S, int D, int nb) {
+  const int bj = blockIdx.x, bh = blockIdx.y;
+  const int j0 = bj * BS;
+  const int n = min(BS, S - j0);
+  const int tid = threadIdx.x;
+  const int d = tid % D;
+  const int part = tid / D;
+  const int nparts = 128 / D;
+  __shared__ float sm[128];
+  float acc = 0.f;
+  const int64_t base = (int64_t)bh * S * D;
+  for (int r = part; r < n; r += nparts)
+    acc += __bfloat162float(K[base + (int64_t)(j0 + r) * D + d]);
+  if (nparts == 1) {
+    if (tid < D) M[((int64_t)bh * nb + bj) * D + tid] = acc / n;
+  } else {
+    sm[tid] = acc;
+    __syncthreads();
+    if (tid < D) {
+      float s = 0.f;
+      for (int p = 0; p < nparts; ++p) s += sm[p * D + tid];
+      M[((int64_t)bh * nb + bj) * D + tid] = s / n;
+    }
+  }
+}
+
+// ---------------------------------------------------------------- kernel S
+// per-query top-n block selection -> bitmap.
+// 256 threads = 64 queries x 4 lanes: q quarter-rows live in registers, the dot
+// products are split 4 ways and combined by shfl, and the running top-8 lives in
+// the j==0 lane of each row group so no score matrix is ever materialised.
+// smem = the staged 64-key block (for the causal prefix sums) + the prefix sums.
+template <int D>
+__global__ __launch_bounds__(256)
+void select_kernel(const bf16* __restrict__ Q, const bf16* __restrict__ K,
+                   const float* __restrict__ M, uint32_t* __restrict__ selm,
+                   int S, int nb, int nwords, float scale) {
+  constexpr int QW = D / 4;      // floats of q held per lane
+  constexpr int KD = D + 8;      // staged-K row stride (bf16, 16B aligned)
+  constexpr int CPS = D + 1;     // causal-prefix row stride (floats)
+  const int tw = blockIdx.x, bh = blockIdx.y;
+  const int t0 = tw * BS;
+  const int tid = threadIdx.x;
+  const int j = tid & 3, r0 = tid >> 2;
+
+  extern __shared__ char smraw[];
+  bf16* Kb = (bf16*)smraw;                  // BS * KD
+  float* cum = (float*)(Kb + BS * KD);      // BS * CPS
+
+  const int64_t base = (int64_t)bh * S * D;
+  const int64_t mbase = (int64_t)bh * nb * D;
+
+  // ---- q quarter-row into registers ----
+  float fq[QW];
+  const int t = t0 + r0;
+  if (t < S) {
+    const bf16* qp = Q + base + (int64_t)t * D + j * QW;
+    #pragma unroll
+    for (int c = 0; c < QW / 8; ++c) {
+      uint4 u = *(const uint4*)(qp + c * 8);
+      uint32_t w[4] = {u.x, u.y, u.z, u.w};
+      #pragma unroll
+      for (int e = 0; e < 4; ++e) {
+        float2 f = __bfloat1622float2(*(__nv_bfloat162*)&w[e]);
+        fq[c * 8 + e * 2 + 0] = f.x;
+        fq[c * 8 + e * 2 + 1] = f.y;
+      }
+    }
+  } else {
+    #pragma unroll
+    for (int c = 0; c < QW; ++c) fq[c] = 0.f;
+  }
+
+  // ---- stage the current K block, then causal prefix sums per dim ----
+  for (int i = tid * 8; i < BS * D; i += 256 * 8) {
+    int r = i / D, d = i - r * D;
+    int tt = t0 + r;
+    *(uint4*)(Kb + r * KD + d) = (tt < S) ? *(const uint4*)(K + base + (int64_t)tt * D + d)
+                                          : make_uint4(0, 0, 0, 0);
+  }
+  __syncthreads();
+  if (tid < D) {
+    float acc = 0.f;
+    #pragma unroll
+    for (int r = 0; r < BS; ++r) {
+      acc += __bfloat162float(Kb[r * KD + tid]);
+      cum[r * CPS + tid] = acc;
+    }
+  }
+  __syncthreads();
+
+  // ---- running top-8 (larger block id wins a tie, as in the reference) ----
+  float tv[8]; int tb[8];
+  #pragma unroll
+  for (int i = 0; i < 8; ++i) { tv[i] = -INFINITY; tb[i] = -1; }
+  const int i0 = j * QW;
+  const float* mrow = M + mbase + i0;
+
+  // one block's importance: q . mean(k) over the 4 lanes, already scaled
+  auto imp_of = [&](int bj) -> float {
+    const float* m = mrow + (int64_t)bj * D;
+    float s0 = 0.f, s1 = 0.f, s2 = 0.f, s3 = 0.f;
+    #pragma unroll
+    for (int c = 0; c < QW; c += 4) {
+      float4 mv = *(const float4*)(m + c);
+      s0 += fq[c + 0] * mv.x; s1 += fq[c + 1] * mv.y;
+      s2 += fq[c + 2] * mv.z; s3 += fq[c + 3] * mv.w;
+    }
+    float s = (s0 + s1) + (s2 + s3);
+    s += __shfl_xor_sync(FULLMASK, s, 1);
+    s += __shfl_xor_sync(FULLMASK, s, 2);
+    return s;
+  };
+  auto insert = [&](float s, int id) {          // register-only insertion
+    if (s >= tv[7]) {
+      #pragma unroll
+      for (int i = 0; i < 8; ++i) {
+        const bool gt = (s >= tv[i]);
+        const float ov = tv[i]; const int oi = tb[i];
+        tv[i] = gt ? s : ov;  tb[i] = gt ? id : oi;
+        s = gt ? ov : s;      id = gt ? oi : id;
+      }
+    }
+  };
+
+  constexpr int BATCH = (D == 128) ? 1 : 4;   // D=128 is smem/occupancy bound: keep it simple
+  int bj = 0;
+  for (; bj + BATCH <= tw; bj += BATCH) {     // BATCH scores in flight, then BATCH inserts
+    float a[BATCH];
+    #pragma unroll
+    for (int u = 0; u < BATCH; ++u) a[u] = imp_of(bj + u);
+    if (j == 0) {
+      #pragma unroll
+      for (int u = 0; u < BATCH; ++u) insert(a[u] * scale, bj + u);
+    }
+  }
+  for (; bj < tw; ++bj) {
+    const float a = imp_of(bj);
+    if (j == 0) insert(a * scale, bj);
+  }
+  // ---- current (partial) block: (q . causal-prefix-k) / (r+1) ----
+  {
+    const float* c = cum + r0 * CPS + i0;
+    float s = 0.f;
+    #pragma unroll
+    for (int q = 0; q < QW; ++q) s += fq[q] * c[q];
+    s += __shfl_xor_sync(FULLMASK, s, 1);
+    s += __shfl_xor_sync(FULLMASK, s, 2);
+    if (j == 0) insert(s * (scale / (float)(r0 + 1)), tw);
+  }
+  // ---- bitmap out ----
+  if (j == 0 && t < S) {
+    uint32_t words[MAXW];
+    #pragma unroll
+    for (int w = 0; w < MAXW; ++w) words[w] = 0u;
+    #pragma unroll
+    for (int k = 0; k < 8; ++k)
+      if (tb[k] >= 0) words[tb[k] >> 5] |= 1u << (tb[k] & 31);
+    uint32_t* dst = selm + ((int64_t)bh * S + t) * nwords;
+    for (int w = 0; w < nwords; ++w) dst[w] = words[w];
+  }
+}
+
+// ---------------------------------------------------------------- kernel B
+// FlashAttention-2 style online softmax over the selected key tiles.
+//   * QT queries per CTA (QT/16 warps, one m16 row tile per warp)
+//   * 2-stage cp.async pipeline over the 64-key tiles
+//   * mma.sync m16n8k16 bf16, FA2 fragment reuse (C of QK -> A of PV)
+template <int D, int QT>
+__global__ __launch_bounds__(QT * 2)
+void attn_kernel(const bf16* __restrict__ Q, const bf16* __restrict__ K,
+                 const bf16* __restrict__ V, bf16* __restrict__ O,
+                 const uint32_t* __restrict__ selm,
+                 int S, int nwords, float alpha) {
+  constexpr int DP = D + 8;
+  constexpr int NKD = D / 8;    // n8 chunks over D
+  constexpr int NKK = D / 16;   // k16 steps over D
+  constexpr int NT = QT * 2;    // threads
+  const int tw = blockIdx.x, bh = blockIdx.y;
+  const int t0 = tw * QT;
+  const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
+
+  extern __shared__ char smem_raw[];
+  // QT==64 keeps Q in smem (one extra 16B-coalesced load, measured ~2% faster);
+  // QT==128 loads the fragments straight from global, which is what lets the
+  // 128-query tile fit in smem at all (it doubles the warps/SM for D=128).
+  constexpr int QSM = (QT == 128) ? 0 : QT;
+  bf16 (*Qs)[DP] = (bf16(*)[DP])smem_raw;
+  bf16 (*Ks)[BS][DP] = (bf16(*)[BS][DP])(Qs + QSM);
+  bf16 (*Vs)[BS][DP] = (bf16(*)[BS][DP])(Ks + 2);
+  uint32_t (*Sel)[MAXW] = (uint32_t(*)[MAXW])(Vs + 2);
+
+  const int64_t base = (int64_t)bh * S * D;
+  const int NCH = BS * (D / 8);   // 16B chunks per tile
+
+  // ---- selection bitmaps for this query tile ----
+  for (int i = tid; i < QT * nwords; i += NT) {
+    int r = i / nwords, w = i - r * nwords;
+    int t = t0 + r;
+    Sel[r][w] = (t < S) ? selm[((int64_t)bh * S + t) * nwords + w] : 0u;
+  }
+  if constexpr (QT != 128) {
+    // ---- Q tile (staged through smem, 16B per thread) ----
+    for (int i = tid; i < QT * (D / 8); i += NT) {
+      int r = i / (D / 8), c = i - r * (D / 8);
+      int t = t0 + r;
+      if (t < S) cp_async16(smem_u32(&Qs[r][c * 8]), Q + base + (int64_t)t * D + c * 8);
+      else *(uint4*)&Qs[r][c * 8] = make_uint4(0, 0, 0, 0);
+    }
+  }
+
+  auto prefetch = [&](int bj, int stage) {
+    const int j0 = bj * BS;
+    #pragma unroll
+    for (int i = tid; i < NCH; i += NT) {
+      int r = i / (D / 8), c = i - r * (D / 8);
+      int j = j0 + r;
+      if (j < S) {
+        int64_t off = base + (int64_t)j * D + c * 8;
+        cp_async16(smem_u32(&Ks[stage][r][c * 8]), K + off);
+        cp_async16(smem_u32(&Vs[stage][r][c * 8]), V + off);
+      } else {
+        *(uint4*)&Ks[stage][r][c * 8] = make_uint4(0, 0, 0, 0);
+        *(uint4*)&Vs[stage][r][c * 8] = make_uint4(0, 0, 0, 0);
+      }
+    }
+  };
+
+  const int kmax = (min(t0 + QT - 1, S - 1)) >> 6;   // last key tile this CTA touches
+  prefetch(kmax, 0);
+  cp_commit();
+
+  // ---- Q fragments ----
+  uint32_t qf[NKK][4];
+  if constexpr (QT == 128) {
+    // straight from global in A-fragment layout, overlapping the first cp.async
+    const int qrow = warp * 16 + (lane >> 2);   // == rr0 below
+    const int qcol = 2 * (lane & 3);
+    const int ta = t0 + qrow, tb = ta + 8;
+    const bool ok_a = (ta < S), ok_b = (tb < S);
+    const bf16* qa = Q + base + (int64_t)ta * D + qcol;
+    const bf16* qb = Q + base + (int64_t)tb * D + qcol;
+    #pragma unroll
+    for (int kk = 0; kk < NKK; ++kk) {
+      qf[kk][0] = ok_a ? *(const uint32_t*)(qa + kk * 16) : 0u;
+      qf[kk][1] = ok_b ? *(const uint32_t*)(qb + kk * 16) : 0u;
+      qf[kk][2] = ok_a ? *(const uint32_t*)(qa + kk * 16 + 8) : 0u;
+      qf[kk][3] = ok_b ? *(const uint32_t*)(qb + kk * 16 + 8) : 0u;
+    }
+  }
+
+  cp_wait0();
+  __syncthreads();
+
+  if constexpr (QT != 128) {
+    const int g = lane >> 3, ri = lane & 7;
+    const int row = warp * 16 + (g & 1) * 8 + ri;
+    #pragma unroll
+    for (int kk = 0; kk < NKK; ++kk)
+      ldm_x4(qf[kk], smem_u32(&Qs[row][kk * 16 + (g >> 1) * 8]));
+  }
+
+  float o_acc[NKD][4];
+  #pragma unroll
+  for (int i = 0; i < NKD; ++i) { o_acc[i][0] = o_acc[i][1] = o_acc[i][2] = o_acc[i][3] = 0.f; }
+  float m0 = -INFINITY, m1 = -INFINITY, l0 = 0.f, l1 = 0.f;
+
+  const int rr0 = warp * 16 + (lane >> 2);   // row within the query tile
+  const int rr1 = rr0 + 8;
+  const int kt = (t0 + warp * 16) >> 6;      // key block this warp's rows live in
+  const int rl0 = ((t0 + warp * 16) & 63) + (lane >> 2);   // row within that block
+  const int rl1 = rl0 + 8;
+  const int c0 = 2 * (lane & 3);
+  const int g8 = lane >> 3, ri8 = lane & 7;
+
+  int stage = 0;
+  for (int bj = kmax; bj >= 0; --bj) {
+    cp_wait0();          // this tile's cp.async group has landed ...
+    __syncthreads();     // ... and every warp is done reading the other buffer
+    if (bj > 0) { prefetch(bj - 1, stage ^ 1); cp_commit(); }
+
+    const int mode = (bj == kt) ? 2 : ((bj == kt - 1) ? 1 : 0);
+    const uint32_t sw0 = Sel[rr0][bj >> 5], sw1 = Sel[rr1][bj >> 5];
+    const bool s0 = (sw0 >> (bj & 31)) & 1u, s1 = (sw1 >> (bj & 31)) & 1u;
+    const bool any = __any_sync(FULLMASK, s0 | s1);
+    if (mode != 0 || any) {
+      float acc[8][4];
+      #pragma unroll
+      for (int nc = 0; nc < 8; ++nc) { acc[nc][0]=0.f; acc[nc][1]=0.f; acc[nc][2]=0.f; acc[nc][3]=0.f; }
+      const bf16 (*Kt)[DP] = Ks[stage];
+      #pragma unroll
+      for (int nc = 0; nc < 8; ++nc) {
+        uint32_t kf[NKK][2];
+        #pragma unroll
+        for (int hf = 0; hf < NKK / 2; ++hf) {
+          uint32_t r4[4];
+          ldm_x4(r4, smem_u32(&Kt[nc * 8 + ri8][hf * 32 + g8 * 8]));
+          kf[2*hf][0] = r4[0]; kf[2*hf][1] = r4[1];
+          kf[2*hf+1][0] = r4[2]; kf[2*hf+1][1] = r4[3];
+        }
+        #pragma unroll
+        for (int kk = 0; kk < NKK; ++kk) mma16816(acc[nc], qf[kk], kf[kk]);
+      }
+      // mask + scale
+      #pragma unroll
+      for (int nc = 0; nc < 8; ++nc) {
+        int c = nc * 8 + c0;
+        #pragma unroll
+        for (int j = 0; j < 2; ++j) {
+          int cc = c + j;
+          bool k0, k1;
+          if (mode == 2) { k0 = (cc <= rl0); k1 = (cc <= rl1); }
+          else if (mode == 1) { k0 = s0 | (cc > rl0); k1 = s1 | (cc > rl1); }
+          else { k0 = s0; k1 = s1; }
+          acc[nc][j]     = k0 ? acc[nc][j] * alpha : -INFINITY;
+          acc[nc][2 + j] = k1 ? acc[nc][2 + j] * alpha : -INFINITY;
+        }
+      }
+      // row max
+      float mx0 = -INFINITY, mx1 = -INFINITY;
+      #pragma unroll
+      for (int nc = 0; nc < 8; ++nc) {
+        mx0 = fmaxf(mx0, fmaxf(acc[nc][0], acc[nc][1]));
+        mx1 = fmaxf(mx1, fmaxf(acc[nc][2], acc[nc][3]));
+      }
+      mx0 = fmaxf(mx0, __shfl_xor_sync(FULLMASK, mx0, 1));
+      mx0 = fmaxf(mx0, __shfl_xor_sync(FULLMASK, mx0, 2));
+      mx1 = fmaxf(mx1, __shfl_xor_sync(FULLMASK, mx1, 1));
+      mx1 = fmaxf(mx1, __shfl_xor_sync(FULLMASK, mx1, 2));
+      const float mn0 = fmaxf(m0, mx0), mn1 = fmaxf(m1, mx1);
+      const bool chg0 = (mn0 > m0), chg1 = (mn1 > m1);
+      const float cor0 = chg0 ? exp2f(m0 - mn0) : 1.f;
+      const float cor1 = chg1 ? exp2f(m1 - mn1) : 1.f;
+      if (chg0 || chg1) {
+        #pragma unroll
+        for (int nd = 0; nd < NKD; ++nd) {
+          if (chg0) { o_acc[nd][0] *= cor0; o_acc[nd][1] *= cor0; }
+          if (chg1) { o_acc[nd][2] *= cor1; o_acc[nd][3] *= cor1; }
+        }
+      }
+      m0 = mn0; m1 = mn1;
+      l0 *= cor0; l1 *= cor1;
+      float sum0 = 0.f, sum1 = 0.f;
+      uint32_t P[4][4];
+      #pragma unroll
+      for (int nc = 0; nc < 8; ++nc) {
+        float p00 = exp2f(acc[nc][0] - m0), p01 = exp2f(acc[nc][1] - m0);
+        float p10 = exp2f(acc[nc][2] - m1), p11 = exp2f(acc[nc][3] - m1);
+        sum0 += p00 + p01; sum1 += p10 + p11;
+        P[nc >> 1][(nc & 1) * 2 + 0] = pack2(p00, p01);
+        P[nc >> 1][(nc & 1) * 2 + 1] = pack2(p10, p11);
+      }
+      sum0 += __shfl_xor_sync(FULLMASK, sum0, 1);
+      sum0 += __shfl_xor_sync(FULLMASK, sum0, 2);
+      sum1 += __shfl_xor_sync(FULLMASK, sum1, 1);
+      sum1 += __shfl_xor_sync(FULLMASK, sum1, 2);
+      l0 += sum0; l1 += sum1;
+      // PV
+      const bf16 (*Vt)[DP] = Vs[stage];
+      #pragma unroll
+      for (int nd = 0; nd < NKD; ++nd) {
+        uint32_t vf[4][2];
+        #pragma unroll
+        for (int hf = 0; hf < 2; ++hf) {
+          uint32_t r4[4];
+          ldm_x4_t(r4, smem_u32(&Vt[hf * 32 + g8 * 8 + ri8][nd * 8]));
+          vf[2*hf][0] = r4[0]; vf[2*hf][1] = r4[1];
+          vf[2*hf+1][0] = r4[2]; vf[2*hf+1][1] = r4[3];
+        }
+        #pragma unroll
+        for (int ks = 0; ks < 4; ++ks) mma16816(o_acc[nd], P[ks], vf[ks]);
+      }
+    }
+    stage ^= 1;
+  }
+
+  // ---- epilogue ----
+  {
+    const float inv0 = 1.f / l0, inv1 = 1.f / l1;
+    int t_a = t0 + rr0, t_b = t0 + rr1;
+    #pragma unroll
+    for (int nd = 0; nd < NKD; ++nd) {
+      int c = nd * 8 + c0;
+      if (t_a < S) {
+        __nv_bfloat162 v = __floats2bfloat162_rn(o_acc[nd][0] * inv0, o_acc[nd][1] * inv0);
+        *(uint32_t*)&O[base + (int64_t)t_a * D + c] = *reinterpret_cast<uint32_t*>(&v);
+      }
+      if (t_b < S) {
+        __nv_bfloat162 v = __floats2bfloat162_rn(o_acc[nd][2] * inv1, o_acc[nd][3] * inv1);
+        *(uint32_t*)&O[base + (int64_t)t_b * D + c] = *reinterpret_cast<uint32_t*>(&v);
+      }
+    }
+  }
+}
+
+// ---------------------------------------------------------------- launcher
+static bool g_smem_inited = false;
+static int g_qt = 0;          // dev override: 0 = auto
+
+extern "C" void nsa_set_qt(int v) { g_qt = v; }
+
+template <int D, int QT>
+static inline void set_attn_smem(int maxs) {
+  cudaFuncSetAttribute(attn_kernel<D, QT>, cudaFuncAttributeMaxDynamicSharedMemorySize, maxs);
+  cudaFuncSetAttribute(select_kernel<D>, cudaFuncAttributeMaxDynamicSharedMemorySize, maxs);
+}
+
+template <int D, int QT>
+static inline size_t attn_smem() {
+  constexpr int DP = D + 8;
+  constexpr int QSM = (QT == 128) ? 0 : QT;
+  return (size_t)QSM * DP * 2 + (size_t)4 * BS * DP * 2 + (size_t)QT * MAXW * 4 + MAXW * 4;
+}
+
+static void init_smem() {
+  if (g_smem_inited) return;
+  int maxs = 0;
+  cudaDeviceGetAttribute(&maxs, cudaDevAttrMaxSharedMemoryPerBlockOptin, 0);
+  set_attn_smem<64, 64>(maxs);
+  set_attn_smem<64, 128>(maxs);
+  set_attn_smem<128, 64>(maxs);
+  set_attn_smem<128, 128>(maxs);
+  g_smem_inited = true;
+}
+
+static void launch_attn(const void* q, const void* k, const void* v, void* o,
+                        const uint32_t* selm, int S, int BH, int nwords,
+                        float alpha, int qt, cudaStream_t stream) {
+  if (qt == 128)
+    attn_kernel<64, 128><<<dim3((S + 127) / 128, BH), 256, attn_smem<64, 128>(), stream>>>(
+        (const bf16*)q, (const bf16*)k, (const bf16*)v, (bf16*)o, selm, S, nwords, alpha);
+  else
+    attn_kernel<64, 64><<<dim3((S + 63) / 64, BH), 128, attn_smem<64, 64>(), stream>>>(
+        (const bf16*)q, (const bf16*)k, (const bf16*)v, (bf16*)o, selm, S, nwords, alpha);
+}
+
+static void launch_attn128(const void* q, const void* k, const void* v, void* o,
+                           const uint32_t* selm, int S, int BH, int nwords,
+                           float alpha, int qt, cudaStream_t stream) {
+  if (qt == 128)
+    attn_kernel<128, 128><<<dim3((S + 127) / 128, BH), 256, attn_smem<128, 128>(), stream>>>(
+        (const bf16*)q, (const bf16*)k, (const bf16*)v, (bf16*)o, selm, S, nwords, alpha);
+  else
+    attn_kernel<128, 64><<<dim3((S + 63) / 64, BH), 128, attn_smem<128, 64>(), stream>>>(
+        (const bf16*)q, (const bf16*)k, (const bf16*)v, (bf16*)o, selm, S, nwords, alpha);
+}
+
+static void launch_select(const void* q, const void* k, const float* means, uint32_t* selm,
+                          int ntiles, int BH, int S, int D, int nb, int nwords,
+                          float scale, cudaStream_t stream) {
+  const size_t sm64 = (size_t)BS * 65 * sizeof(float) + (size_t)BS * 72 * sizeof(bf16);
+  const size_t sm128 = (size_t)BS * 129 * sizeof(float) + (size_t)BS * 136 * sizeof(bf16);
+  if (D == 64)
+    select_kernel<64><<<dim3(ntiles, BH), 256, sm64, stream>>>(
+        (const bf16*)q, (const bf16*)k, means, selm, S, nb, nwords, scale);
+  else
+    select_kernel<128><<<dim3(ntiles, BH), 256, sm128, stream>>>(
+        (const bf16*)q, (const bf16*)k, means, selm, S, nb, nwords, scale);
+}
+
+extern "C" void nsa_launch(const void* q, const void* k, const void* v, void* o,
+                           void* means, void* selm, int B, int H, int S, int D,
+                           int nb, int nwords, void* stream_) {
+  cudaStream_t stream = (cudaStream_t)stream_;
+  const int BH = B * H;
+  const float scale = (float)(1.0 / sqrt((double)D));
+  const float alpha = (float)(1.4426950408889634 / sqrt((double)D));
+  init_smem();
+  int qt = g_qt;
+  if (!qt) {
+    // D=64: 128-thread CTAs give 2 CTAs/SM and beat the wider tile;
+    // D=128: the smem-Q tile cannot fit alongside 4 KB of K/V stages, so the
+    // register-resident-Q variant at QT=128 is what buys the 2nd warp group.
+    qt = (D == 128) ? 128 : 64;
+  }
+  means_kernel<<<dim3(nb, BH), 128, 0, stream>>>((const bf16*)k, (float*)means, S, D, nb);
+  launch_select(q, k, (const float*)means, (uint32_t*)selm, (S + BS - 1) / BS, BH, S, D,
+                nb, nwords, scale, stream);
+  if (D == 64)
+    launch_attn(q, k, v, o, (const uint32_t*)selm, S, BH, nwords, alpha, qt, stream);
+  else
+    launch_attn128(q, k, v, o, (const uint32_t*)selm, S, BH, nwords, alpha, qt, stream);
+}
+
+"""
+
+
+def _arch() -> str:
+    major, minor = torch.cuda.get_device_capability(0)
+    return f"sm_{major}{minor}a"
+
+
+def _build() -> ctypes.CDLL:
+    arch = _arch()
+    flags = ("-O3", "-std=c++17", f"-arch={arch}")
+    key = hashlib.sha1((_CUDA_SRC + " ".join(flags)).encode()).hexdigest()[:16]
+    d = os.path.join(tempfile.gettempdir(), "nsa_kernel_cache")
+    os.makedirs(d, exist_ok=True)
+    so = os.path.join(d, f"nsa_{key}.so")
+    if not os.path.exists(so):
+        cu = os.path.join(d, f"nsa_{key}.cu")
+        tmp = cu + f".{os.getpid()}.tmp"
+        with open(tmp, "w") as f:
+            f.write(_CUDA_SRC)
+        os.replace(tmp, cu)
+        out = so + f".{os.getpid()}.tmp"
+        r = subprocess.run(
+            ["nvcc", "-shared", "-Xcompiler", "-fPIC", *flags, "-o", out, cu],
+            capture_output=True,
+            text=True,
+        )
+        if r.returncode != 0:
+            raise RuntimeError("nvcc failed:\n" + r.stderr[-8000:])
+        os.replace(out, so)
+    lib = ctypes.CDLL(so)
+    lib.nsa_launch.restype = None
+    lib.nsa_launch.argtypes = [ctypes.c_void_p] * 6 + [ctypes.c_int] * 6 + [ctypes.c_void_p]
+    return lib
+
+
+_LIB = None
+
+
+def _lib() -> ctypes.CDLL:
+    global _LIB
+    if _LIB is None:
+        _LIB = _build()
+    return _LIB
+
+
+class Model(nn.Module):
+    """Drop-in for reference.Model: block-select sparse causal attention."""
+
+    def __init__(self, B, H, S, D):
+        super().__init__()
+        self.register_buffer("_dummy", torch.zeros(1, dtype=torch.bfloat16))
+        self.B, self.H, self.S, self.D = int(B), int(H), int(S), int(D)
+        self._means = None
+        self._selm = None
+        self._stream = None
+
+    def _workspace(self, bh, nb, nwords, device):
+        if self._means is None or self._means.numel() < bh * nb * self.D:
+            self._means = torch.empty(bh * nb * self.D, dtype=torch.float32, device=device)
+        if self._selm is None or self._selm.numel() < bh * self.S * nwords:
+            self._selm = torch.zeros(bh * self.S * nwords, dtype=torch.int32, device=device)
+        return self._means, self._selm
+
+    def forward(self, q, k, v):
+        B, H, S, D = q.shape
+        nb = (S + 63) // 64
+        nwords = (nb + 31) // 32
+        out = torch.empty_like(q)
+        means, selm = self._workspace(B * H, nb, nwords, q.device)
+        stream = torch.cuda.current_stream().cuda_stream
+        _lib().nsa_launch(
+            q.data_ptr(), k.data_ptr(), v.data_ptr(), out.data_ptr(),
+            means.data_ptr(), selm.data_ptr(),
+            B, H, S, D, nb, nwords, stream,
+        )
+        return out
