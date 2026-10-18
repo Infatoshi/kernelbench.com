@@ -6,6 +6,27 @@ Numbering note: entries before 2026-07-21 say "Problem 03" for the Kimi-Linear d
 
 ---
 
+## 2026-10-18 — DeepSeek V4.1 Flash (1017) on 02: passes check, MLA attention wrong, published as `bug`
+
+OpenRouter `deepseek/deepseek-v4.1-flash-1017` via `or-fable`, 8.3 h session on a rented 4x RTX PRO 6000
+box (cells spread one lock per GPU, `KB_RELEASE_GPUS`). Isolated regrade 29.89x with every graded seed
+passing, but the audit probe shows the kernel's MLA M4 stage fills only the diagonal 16 of 512 latent dims
+per head (lane = head owns m = lane*16..+15), so 31/32 of the attention reduction is missing. Two grader
+gaps let it through:
+
+- check.py cannot see MLA. On the graded random cache (0.1 randn) softmax is near uniform and the MLA
+  attention output is ~0.14% of the hidden state, so a wrong MLA still scores out=0.9999. With identical
+  cache rows x10 or the random cache x30 the solution reads cos 0.76 / 0.95 (one NaN) while baseline.py
+  stays at 0.9999. Fix candidate: a structured or scaled cache case in check.py.
+- benchmark.py times the baseline after the solution on the same stream, so a solution that sets
+  `cudaLimitPersistingL2CacheSize` plus a stream access-policy window slows the baseline: 7.70 -> 8.05
+  ms/tok at 2k (~4%), inflating the speedup. Fix candidate: reset the persisting limit and stream
+  attribute (or time the baseline in its own process) before timing it.
+
+Also: across 20 fresh-state runs per seed, ungraded seeds 1, 3 and 5 fall below 0.98 (min 0.9577), the
+same atomic-order nondeterminism class as Opus 5.5 and Argon. The cell stays on the model page as `wrong`
+and is not ranked. Grader changes need a deliberate bench version; not done here.
+
 ## 2026-09-29 — Claude Sonnet 5.5 [max] on 02: 32.13x, clean, second on RTX PRO 6000
 
 Isolated regrade on tetra GPU 0: 32.13x over the optimized-PyTorch baseline (in-run 32.25x), behind

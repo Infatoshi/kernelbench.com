@@ -13,6 +13,7 @@ const LIVE_MODEL_SLUGS = new Set([
   "claude-opus-5",
   "deepseek-flash",
   "deepseek-v4-flash-0731",
+  "deepseek-v4.1-flash-1017",
   "gemini-3.8-flash-high",
   "gemini-4-argon-high",
   "glm-5.3",

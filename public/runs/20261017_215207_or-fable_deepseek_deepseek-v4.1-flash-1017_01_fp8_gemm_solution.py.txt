@@ -1,0 +1,599 @@
+"""FP8 e4m3 GEMM: y = (x @ w.T) * weight_scale  ->  bf16.
+
+Primary path: a hand-written CUDA kernel (compiled at first use with nvcc and
+loaded through ctypes) that issues real fp8 x fp8 tensor-core MMAs
+(mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32, fp32 accumulate) fed by a
+multi-stage cp.async pipeline over xor-swizzled shared memory.
+
+Fallback path: an equivalent Triton kernel (tl.dot on e4m3 operands), used only
+if the CUDA toolchain is unavailable.
+
+Fully custom, no vendor library calls.
+"""
+import ctypes
+import hashlib
+import os
+import shutil
+import subprocess
+import tempfile
+
+import torch
+import torch.nn as nn
+
+E4M3_MAX = 448.0
+
+# --------------------------------------------------------------------------
+# CUDA source (kernel + pad + launcher)
+# --------------------------------------------------------------------------
+_CUDA_SRC = r"""
+#include <cstdint>
+#include <cuda_bf16.h>
+
+#define DEVI __device__ __forceinline__
+
+DEVI uint32_t smem_addr(const void* p) { return (uint32_t)__cvta_generic_to_shared(p); }
+
+// 16B async copy; src-size 0 zero-fills the smem destination (used for the
+// out-of-range rows of an edge tile).
+DEVI void cp_async16(uint32_t dst, const void* src, bool pred) {
+  int sz = pred ? 16 : 0;
+  asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" ::"r"(dst), "l"(src), "r"(sz));
+}
+DEVI void cp_commit() { asm volatile("cp.async.commit_group;\n"); }
+template <int N>
+DEVI void cp_wait() { asm volatile("cp.async.wait_group %0;\n" ::"n"(N)); }
+
+DEVI void ldm_x4(uint32_t& r0, uint32_t& r1, uint32_t& r2, uint32_t& r3, uint32_t addr) {
+  asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+               : "=r"(r0), "=r"(r1), "=r"(r2), "=r"(r3)
+               : "r"(addr));
+}
+
+DEVI void mma_fp8(float* d, const uint32_t* a, const uint32_t* b) {
+  asm volatile(
+      "mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 "
+      "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+      : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
+      : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
+}
+
+// The xor key must vary over a group of 8 consecutive rows so that one
+// ldmatrix (8 rows x one 16B chunk) hits 8 distinct 16B bank groups.  A row is
+// BK bytes = NC chunks wide, i.e. NC bank groups, so rows advance by NC groups:
+// with NC = 8 one row spans every group and the key is row&7; with NC = 4 a row
+// only spans half of them and rows 0 and 2 collide, so the key follows row/2.
+template <int BK>
+DEVI int swz_row(int row) {
+  constexpr int NC = BK / 16;
+  return NC == 8 ? (row & 7) : (NC == 4 ? ((row >> 1) & 3) : (row & (NC - 1)));
+}
+template <int BK>
+DEVI int swz_pre(int row) {
+  return row * BK + (swz_row<BK>(row) << 4);
+}
+
+// ---------------------------------------------------------------------------
+// C[m,n] = sum_k A[m,k] * B[n,k] * scale[n]      A,B fp8 e4m3, k-major
+// ---------------------------------------------------------------------------
+template <int BM, int BN, int BK, int WM, int WN, int STAGES, int GROUP_M, int MINB>
+__global__ __launch_bounds__(WM* WN * 32, MINB) void fp8_gemm_kernel(
+    const uint8_t* __restrict__ A, const uint8_t* __restrict__ B,
+    __nv_bfloat16* __restrict__ C, const float* __restrict__ scale,
+    int M, int N, int K) {
+  constexpr int NWARP = WM * WN;
+  constexpr int NTHREADS = NWARP * 32;
+  constexpr int WTM = BM / WM;
+  constexpr int WTN = BN / WN;
+  constexpr int MT = WTM / 16;
+  constexpr int NT = WTN / 8;
+  constexpr int NC = BK / 16;
+  constexpr int CPT_A = BM * BK / 16 / NTHREADS;
+  constexpr int CPT_B = BN * BK / 16 / NTHREADS;
+  constexpr int NKA = BK / 32;
+  static_assert(BM * BK / 16 % NTHREADS == 0 && BN * BK / 16 % NTHREADS == 0, "chunk split");
+  static_assert(NT % 2 == 0, "NT even");
+
+  extern __shared__ uint8_t smem[];
+  uint8_t* sA = smem;
+  uint8_t* sB = smem + STAGES * BM * BK;
+
+  const int tid = threadIdx.x;
+  const int warp = tid / 32;
+  const int lane = tid % 32;
+  const int warp_m = warp / WN;
+  const int warp_n = warp % WN;
+
+  const int num_pid_m = (M + BM - 1) / BM;
+  const int num_pid_n = (N + BN - 1) / BN;
+  int pid = blockIdx.x;
+  int group_sz = GROUP_M * num_pid_n;
+  int gid = pid / group_sz;
+  int first_m = gid * GROUP_M;
+  int gsz = min(num_pid_m - first_m, GROUP_M);
+  int pid_m = first_m + ((pid % group_sz) % gsz);
+  int pid_n = (pid % group_sz) / gsz;
+
+  const int m0 = pid_m * BM;
+  const int n0 = pid_n * BN;
+  const int nk = K / BK;
+
+  // ---- global -> smem chunk mapping (constant per thread) ----
+  int awoff[CPT_A], boff[CPT_B];
+  size_t asrc[CPT_A], bsrc[CPT_B];
+  bool apred[CPT_A], bpred[CPT_B];
+#pragma unroll
+  for (int i = 0; i < CPT_A; i++) {
+    int chunk = tid + i * NTHREADS;
+    int r = chunk / NC, c = chunk % NC;
+    awoff[i] = swz_pre<BK>(r) ^ (c << 4);
+    asrc[i] = (size_t)(m0 + r) * K + c * 16;
+    apred[i] = (m0 + r) < M;
+  }
+#pragma unroll
+  for (int i = 0; i < CPT_B; i++) {
+    int chunk = tid + i * NTHREADS;
+    int r = chunk / NC, c = chunk % NC;
+    boff[i] = swz_pre<BK>(r) ^ (c << 4);
+    bsrc[i] = (size_t)(n0 + r) * K + c * 16;
+    bpred[i] = (n0 + r) < N;
+  }
+
+  // ---- ldmatrix offsets ----
+  // An mma A operand is (rows 0-7, k lo), (rows 8-15, k lo), (rows 0-7, k hi),
+  // (rows 8-15, k hi) -- already the order ldmatrix.x4 returns, so matrix t/8
+  // selects row += 8 when (t/8)&1 and k-half (t/8)/2.
+  // A B operand is (n 0-7, k lo), (n 0-7, k hi) for one mma and the same pair
+  // for n 8-15 for the next, so the mapping is swapped (row += 8 when (t/8)/2,
+  // k-half (t/8)&1).  Matching these keeps the ldmatrix results in the operand
+  // quads mma wants; otherwise ptxas inserts four MOVs per fragment.
+  const int lane_row = lane & 7;
+  const int lane_mat = lane >> 3;
+  const int kx_a = ((lane >> 4) & 1) << 4;
+  const int kx_b = (lane_mat & 1) << 4;
+  int aoff[MT], boffl[NT / 2];
+#pragma unroll
+  for (int mt = 0; mt < MT; mt++) {
+    int row = warp_m * WTM + mt * 16 + lane_row + (lane_mat & 1) * 8;
+    aoff[mt] = swz_pre<BK>(row);
+  }
+#pragma unroll
+  for (int nt2 = 0; nt2 < NT / 2; nt2++) {
+    int row = warp_n * WTN + nt2 * 16 + lane_row + ((lane_mat >> 1) & 1) * 8;
+    boffl[nt2] = swz_pre<BK>(row);
+  }
+
+  float acc[MT][NT][4];
+#pragma unroll
+  for (int i = 0; i < MT; i++)
+#pragma unroll
+    for (int j = 0; j < NT; j++)
+#pragma unroll
+      for (int q = 0; q < 4; q++) acc[i][j][q] = 0.f;
+
+  auto load_tile = [&](int stage, int kb, bool valid) {
+    uint32_t dA = smem_addr(sA + stage * BM * BK);
+    uint32_t dB = smem_addr(sB + stage * BN * BK);
+    const uint8_t* pa = A + (size_t)kb * BK;
+    const uint8_t* pb = B + (size_t)kb * BK;
+#pragma unroll
+    for (int i = 0; i < CPT_A; i++) cp_async16(dA + awoff[i], pa + asrc[i], valid && apred[i]);
+#pragma unroll
+    for (int i = 0; i < CPT_B; i++) cp_async16(dB + boff[i], pb + bsrc[i], valid && bpred[i]);
+  };
+
+#pragma unroll
+  for (int s = 0; s < STAGES - 1; s++) {
+    load_tile(s, s, true);
+    cp_commit();
+  }
+
+  // Fragment registers, double buffered: the ldmatrix for k-step ks+1 is
+  // issued ahead of the mmas that consume k-step ks.
+  uint32_t fa[2][MT][4], fb[2][NT][2];
+  auto load_frags = [&](uint32_t baseA, uint32_t baseB, int ks, int buf) {
+    const uint32_t kxa = kx_a + (ks << 5);
+    const uint32_t kxb = kx_b + (ks << 5);
+#pragma unroll
+    for (int mt = 0; mt < MT; mt++)
+      ldm_x4(fa[buf][mt][0], fa[buf][mt][1], fa[buf][mt][2], fa[buf][mt][3],
+             baseA + (aoff[mt] ^ kxa));
+#pragma unroll
+    for (int nt2 = 0; nt2 < NT / 2; nt2++) {
+      ldm_x4(fb[buf][nt2 * 2][0], fb[buf][nt2 * 2][1],
+             fb[buf][nt2 * 2 + 1][0], fb[buf][nt2 * 2 + 1][1],
+             baseB + (boffl[nt2] ^ kxb));
+    }
+  };
+
+  // Prefetching across a k-block boundary reads the next smem stage, which is
+  // only resident if we hold one more group in flight (WAITN = STAGES-3).
+  constexpr bool XPREF = (STAGES >= 3);
+  constexpr int WAITN = XPREF ? (STAGES - 3) : (STAGES - 2);
+
+  int wr = 0;
+  int cur = 0;
+  if (XPREF) {
+    cp_wait<WAITN>();
+    __syncthreads();
+    load_frags(smem_addr(sA), smem_addr(sB), 0, 0);
+  }
+  for (int kb = 0; kb < nk; kb++) {
+    cp_wait<WAITN>();
+    __syncthreads();
+    int ws = (kb + STAGES - 1) % STAGES;
+    int wkb = kb + STAGES - 1;
+    load_tile(ws, wkb < nk ? wkb : 0, wkb < nk);
+    cp_commit();
+
+    const uint32_t baseA = smem_addr(sA + wr * BM * BK);
+    const uint32_t baseB = smem_addr(sB + wr * BN * BK);
+    const uint32_t nxtA = smem_addr(sA + ((wr + 1) % STAGES) * BM * BK);
+    const uint32_t nxtB = smem_addr(sB + ((wr + 1) % STAGES) * BN * BK);
+
+    if (!XPREF) load_frags(baseA, baseB, 0, cur);
+
+#pragma unroll
+    for (int ks = 0; ks < NKA; ks++) {
+      int nbuf = cur ^ 1;
+      if (ks + 1 < NKA) {
+        load_frags(baseA, baseB, ks + 1, nbuf);
+      } else if (XPREF) {
+        load_frags(nxtA, nxtB, 0, nbuf);
+      }
+#pragma unroll
+      for (int mt = 0; mt < MT; mt++)
+#pragma unroll
+        for (int nt = 0; nt < NT; nt++) mma_fp8(acc[mt][nt], fa[cur][mt], fb[cur][nt]);
+      cur = nbuf;
+    }
+    wr = (wr + 1) % STAGES;
+  }
+
+  // ---- epilogue: per-output-channel dequant scale, bf16 store ----
+  int row0 = m0 + warp_m * WTM + (lane >> 2);
+  int col0 = n0 + warp_n * WTN + (lane & 3) * 2;
+  const bool nfull = (n0 + BN <= N);   // false only for a partial last n-tile
+#pragma unroll
+  for (int i = 0; i < MT; i++) {
+    int r0 = row0 + i * 16;
+    int r1 = r0 + 8;
+    bool p0 = r0 < M, p1 = r1 < M;
+#pragma unroll
+    for (int j = 0; j < NT; j++) {
+      int col = col0 + j * 8;
+      if (nfull || (col + 1 < N)) {   // guard both the scale read and the store
+        float s0 = scale[col];
+        float s1 = scale[col + 1];
+        __nv_bfloat162 o0 = __floats2bfloat162_rn(acc[i][j][0] * s0, acc[i][j][1] * s1);
+        __nv_bfloat162 o1 = __floats2bfloat162_rn(acc[i][j][2] * s0, acc[i][j][3] * s1);
+        if (p0) *(uint32_t*)(C + (size_t)r0 * N + col) = *(uint32_t*)&o0;
+        if (p1) *(uint32_t*)(C + (size_t)r1 * N + col) = *(uint32_t*)&o1;
+      }
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// (M, K) fp8 -> (M, KP) fp8, zero padded.  One block per row.
+// Destination rows are 16B aligned (KP % 16 == 0) while a source row can begin
+// at any byte offset, so each 16B destination block is assembled from the two
+// aligned 16B source blocks that straddle it with word funnel shifts: fully
+// coalesced 16B loads and 16B stores, no byte-granular traffic.
+// ---------------------------------------------------------------------------
+#define PAD_FS(a, b) __funnelshift_r((a), (b), bsh)
+
+__global__ void fp8_pad_kernel(const uint8_t* __restrict__ src, uint8_t* __restrict__ dst,
+                               int K, int KP, int nbytes) {
+  const int r = blockIdx.x;
+  const uint8_t* s0 = src + (size_t)r * K;
+  uint8_t* d0 = dst + (size_t)r * KP;
+  const uintptr_t base = (uintptr_t)s0 & ~(uintptr_t)15;
+  const int sh = (int)((uintptr_t)s0 - base);   // row phase, 0..15
+  const int q = sh >> 2, bsh = (sh & 3) * 8;
+  const size_t base_off = (size_t)(base - (uintptr_t)src);
+  const int nb = KP >> 4;
+  for (int j = threadIdx.x; j < nb; j += blockDim.x) {
+    const int col = j << 4;
+    if (col >= K) {   // padding region
+      *(uint4*)(d0 + col) = make_uint4(0, 0, 0, 0);
+      continue;
+    }
+    const int valid = K - col;
+    const size_t off = base_off + (size_t)col;
+    if (off + 32 > (size_t)nbytes) {
+      // Final block of the final row: the 32B window would read past the buffer,
+      // and re-basing the window would break the shift phase.  Copy bytes.
+      uint8_t* dv = d0 + col;
+      for (int i = 0; i < 16; i++) dv[i] = (i < valid) ? s0[col + i] : (uint8_t)0;
+      continue;
+    }
+    const uint4 lo = *(const uint4*)(src + off);
+    const uint4 hi = *(const uint4*)(src + off + 16);
+    const uint32_t w0 = lo.x, w1 = lo.y, w2 = lo.z, w3 = lo.w;
+    const uint32_t w4 = hi.x, w5 = hi.y, w6 = hi.z, w7 = hi.w;
+    uint32_t a, b, c, d;
+    switch (q) {
+      case 0: a = PAD_FS(w0, w1); b = PAD_FS(w1, w2); c = PAD_FS(w2, w3); d = PAD_FS(w3, w4); break;
+      case 1: a = PAD_FS(w1, w2); b = PAD_FS(w2, w3); c = PAD_FS(w3, w4); d = PAD_FS(w4, w5); break;
+      case 2: a = PAD_FS(w2, w3); b = PAD_FS(w3, w4); c = PAD_FS(w4, w5); d = PAD_FS(w5, w6); break;
+      default: a = PAD_FS(w3, w4); b = PAD_FS(w4, w5); c = PAD_FS(w5, w6); d = PAD_FS(w6, w7); break;
+    }
+    if (valid < 16) {   // last block of the row: keep 'valid' bytes, zero the rest
+      uint4 o = make_uint4(a, b, c, d);
+      uint8_t* dv = d0 + col;
+      const uint8_t* ov = (const uint8_t*)&o;
+      for (int i = 0; i < 16; i++) dv[i] = (i < valid) ? ov[i] : (uint8_t)0;
+      continue;
+    }
+    *(uint4*)(d0 + col) = make_uint4(a, b, c, d);
+  }
+}
+
+// ---------------------------------------------------------------------------
+#define LAUNCH(BM, BN, BK, WM, WN, ST, GM, MB)                                     \
+  {                                                                                \
+    constexpr int SM = (ST) * ((BM) + (BN)) * (BK);                                \
+    auto kfn = fp8_gemm_kernel<BM, BN, BK, WM, WN, ST, GM, MB>;                    \
+    static bool init_##BM##_##BN##_##BK##_##WM##_##WN##_##ST##_##GM##_##MB = false; \
+    if (!init_##BM##_##BN##_##BK##_##WM##_##WN##_##ST##_##GM##_##MB) {              \
+      cudaFuncSetAttribute(kfn, cudaFuncAttributeMaxDynamicSharedMemorySize, SM);   \
+      init_##BM##_##BN##_##BK##_##WM##_##WN##_##ST##_##GM##_##MB = true;            \
+    }                                                                              \
+    dim3 grid(((M + (BM) - 1) / (BM)) * ((N + (BN) - 1) / (BN)));                  \
+    kfn<<<grid, (WM) * (WN) * 32, SM, stream>>>(                                   \
+        (const uint8_t*)Ause, (const uint8_t*)B, (__nv_bfloat16*)C, (const float*)S, \
+        M, N, K);                                                                  \
+  }
+
+extern "C" void fp8_gemm_forward(const void* A, const void* B, void* C, const void* S,
+                                 int M, int N, int K, int KP, void* As,
+                                 int cfg, cudaStream_t stream) {
+  const void* Ause = A;
+  if (KP != K) {
+    fp8_pad_kernel<<<M, 256, 0, stream>>>((const uint8_t*)A, (uint8_t*)As, K, KP, M * K);
+    K = KP;
+    Ause = As;
+  }
+  switch (cfg) {
+    case 0: LAUNCH(128, 256, 64, 2, 4, 4, 8, 1); break;  // 8 warps, 64x64 tile
+    case 1: LAUNCH(32, 64, 128, 1, 2, 8, 1, 4); break;   // skinny M
+    default: break;
+  }
+}
+
+extern "C" int fp8_gemm_smem(int cfg) {
+  switch (cfg) {
+    case 0: return 4 * (128 + 256) * 64;
+    case 1: return 8 * (32 + 64) * 128;
+    default: return -1;
+  }
+}
+"""
+
+
+# --------------------------------------------------------------------------
+# Build / load
+# --------------------------------------------------------------------------
+def _cc_arch():
+    cap = torch.cuda.get_device_capability()
+    arch = "sm_%d%d" % (cap[0], cap[1])
+    if cap[0] >= 9:
+        arch += "a"
+    return arch
+
+
+def _build_lib():
+    nvcc = shutil.which("nvcc")
+    if nvcc is None:
+        cand = os.path.join(os.environ.get("CUDA_HOME", "/usr/local/cuda"), "bin", "nvcc")
+        nvcc = cand if os.path.exists(cand) else None
+    if nvcc is None:
+        return None
+    arch = _cc_arch()
+    tag = hashlib.sha256((_CUDA_SRC + arch).encode()).hexdigest()[:16]
+    so = os.path.join(tempfile.gettempdir(), "fp8gemm_%s.so" % tag)
+    if not os.path.exists(so):
+        with tempfile.TemporaryDirectory() as td:
+            cu = os.path.join(td, "k.cu")
+            with open(cu, "w") as f:
+                f.write(_CUDA_SRC)
+            tmp_so = so + ".%d.tmp" % os.getpid()
+            cmd = [nvcc, "-O3", "-arch", arch, "-std=c++17", "--shared",
+                   "-Xcompiler", "-fPIC", "-o", tmp_so, cu]
+            r = subprocess.run(cmd, capture_output=True, timeout=600)
+            if r.returncode != 0:
+                return None
+            os.replace(tmp_so, so)
+    lib = ctypes.CDLL(so)
+    lib.fp8_gemm_forward.restype = None
+    lib.fp8_gemm_forward.argtypes = ([ctypes.c_void_p] * 4 + [ctypes.c_int] * 4 +
+                                     [ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p])
+    return lib
+
+
+_LIB = None
+_LIB_DONE = False
+# Fast, allocation-free stream lookup: the raw variant avoids building a Stream
+# object (~2.3us) and still tracks the current stream, so a cached call is safe.
+_RAW_STREAM = getattr(torch._C, "_cuda_getCurrentRawStream", None)
+
+
+def _get_lib():
+    global _LIB, _LIB_DONE
+    if not _LIB_DONE:
+        _LIB_DONE = True
+        try:
+            _LIB = _build_lib()
+        except Exception:
+            _LIB = None
+    return _LIB
+
+
+# --------------------------------------------------------------------------
+# Triton fallback
+# --------------------------------------------------------------------------
+def _triton_fallback():
+    import triton
+    import triton.language as tl
+
+    @triton.jit
+    def gemm_kernel(a_ptr, b_ptr, c_ptr, s_ptr, M, N, K, stride_am, stride_bn,
+                    stride_cm, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
+                    BLOCK_K: tl.constexpr, GROUP_M: tl.constexpr):
+        pid = tl.program_id(0)
+        num_pid_m = tl.cdiv(M, BLOCK_M)
+        num_pid_n = tl.cdiv(N, BLOCK_N)
+        num_pid_in_group = GROUP_M * num_pid_n
+        group_id = pid // num_pid_in_group
+        first_pid_m = group_id * GROUP_M
+        group_size_m = min(num_pid_m - first_pid_m, GROUP_M)
+        pid_m = first_pid_m + ((pid % num_pid_in_group) % group_size_m)
+        pid_n = (pid % num_pid_in_group) // group_size_m
+
+        rm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+        rn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+        rk = tl.arange(0, BLOCK_K)
+        a_ptrs = a_ptr + rm[:, None] * stride_am + rk[None, :]
+        b_ptrs = b_ptr + rn[None, :] * stride_bn + rk[:, None]
+
+        acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+        for _ in range(0, K // BLOCK_K):
+            a = tl.load(a_ptrs)
+            b = tl.load(b_ptrs)
+            acc = tl.dot(a, b, acc)
+            a_ptrs += BLOCK_K
+            b_ptrs += BLOCK_K
+
+        s = tl.load(s_ptr + rn)
+        acc = acc * s[None, :]
+        c_ptrs = c_ptr + rm[:, None] * stride_cm + rn[None, :]
+        tl.store(c_ptrs, acc.to(tl.bfloat16))
+
+    @triton.jit
+    def pad_kernel(src, dst, M, K, KP, BLOCK: tl.constexpr):
+        pid = tl.program_id(0)
+        npg = tl.num_programs(0)
+        rows_per = tl.cdiv(M, npg)
+        r0 = pid * rows_per
+        r1 = min(r0 + rows_per, M)
+        for r in range(r0, r1):
+            for c in range(0, KP, BLOCK):
+                offs = c + tl.arange(0, BLOCK)
+                v = tl.load(src + r * K + offs, mask=offs < K, other=0.0)
+                tl.store(dst + r * KP + offs, v, mask=offs < KP)
+
+    return gemm_kernel, pad_kernel
+
+
+_TRITON = None
+
+
+# --------------------------------------------------------------------------
+# Model
+# --------------------------------------------------------------------------
+class Model(nn.Module):
+    def __init__(self, M: int, N: int, K: int):
+        super().__init__()
+        self.M, self.N, self.K = M, N, K
+        w = torch.empty(N, K, dtype=torch.bfloat16)
+        nn.init.normal_(w, std=0.02)
+        s = (w.float().abs().amax(dim=1, keepdim=True) / E4M3_MAX).clamp(min=1e-12)
+        w_fp8 = (w.float() / s).to(torch.float8_e4m3fn)
+        self.register_buffer("weight", w_fp8)
+        self.register_buffer("weight_scale", s.squeeze(1).to(torch.float32))
+        self._wpad = None
+        self._wkey = None
+        self._xpad = None
+        self._fast = None
+
+    # ---- padded weight (cached across calls; the weight never changes) ----
+    def _padded_weight(self, KP):
+        w = self.weight
+        key = (w.data_ptr(), w._version, KP)
+        if self._wkey != key:
+            if self._wpad is None or self._wpad.shape != (self.N, KP) or \
+                    self._wpad.device != w.device:
+                self._wpad = torch.zeros((self.N, KP), device=w.device,
+                                         dtype=torch.float8_e4m3fn)
+            self._wpad.zero_()
+            # copy through uint8 views: plain strided memcpy, no fp8 kernels
+            self._wpad.view(torch.uint8)[:, :w.shape[1]].copy_(w.view(torch.uint8))
+            self._wkey = key
+        return self._wpad
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Steady-state path: everything that depends only on the shapes (launcher,
+        # pointers, output buffer, tile config) is cached, so a call is one stream
+        # query plus one ctypes invocation.  Invalidated when the weight or the
+        # weight_scale buffer is rewritten in place (numeric-stress rescales it).
+        f = self._fast
+        if (f is not None and f[0] == x.shape and f[1] == self.weight._version
+                and f[2] == self.weight_scale._version
+                and f[3] == self.weight.data_ptr() and x.is_contiguous()):
+            cfn, wsptr, out, outptr, bptr, KP, M, N, K, cfg, dev = f[4:]
+            xp = self._xpad if KP != K else x
+            cfn(x.data_ptr(), bptr, outptr, wsptr, M, N, K, KP, xp.data_ptr(), cfg,
+                _RAW_STREAM(dev) if _RAW_STREAM is not None
+                else torch.cuda.current_stream(dev).cuda_stream)
+            return out
+        return self._forward_build(x)
+
+    def _forward_build(self, x: torch.Tensor) -> torch.Tensor:
+        x = x.contiguous()
+        M, K = x.shape
+        N = self.N
+        dev = x.device
+        ws = self.weight_scale
+        cfg = 1 if M <= 64 else 0
+        bk = 128 if cfg == 1 else 64    # every kernel's BK must divide KP
+
+        lib = _get_lib()
+        if lib is not None:
+            if K % bk != 0:
+                KP = (K + bk - 1) // bk * bk
+                w = self._padded_weight(KP)
+                if self._xpad is None or self._xpad.shape != (M, KP) or \
+                        self._xpad.device != dev:
+                    self._xpad = torch.empty((M, KP), device=dev,
+                                             dtype=torch.float8_e4m3fn)
+                xp = self._xpad
+            else:
+                KP = K
+                w = self.weight
+                xp = x
+            out = torch.empty((M, N), device=dev, dtype=torch.bfloat16)
+            stream = torch.cuda.current_stream().cuda_stream
+            lib.fp8_gemm_forward(x.data_ptr(), w.data_ptr(), out.data_ptr(),
+                                 ws.data_ptr(), M, N, K, KP, xp.data_ptr(),
+                                 cfg, stream)
+            self._fast = (x.shape, self.weight._version, self.weight_scale._version,
+                          self.weight.data_ptr(), lib.fp8_gemm_forward,
+                          ws.data_ptr(), out, out.data_ptr(), w.data_ptr(),
+                          KP, M, N, K, cfg, dev.index if dev.index is not None else 0)
+            return out
+
+        # ---- Triton fallback ----
+        global _TRITON
+        if _TRITON is None:
+            _TRITON = _triton_fallback()
+        gemm_kernel = _TRITON[0]
+        import triton
+        w = self.weight
+        if K % 128 != 0:
+            KP = (K + 127) // 128 * 128
+            w = self._padded_weight(KP)
+            if self._xpad is None or self._xpad.shape != (M, KP) or \
+                    self._xpad.device != dev:
+                self._xpad = torch.zeros((M, KP), device=dev, dtype=torch.float8_e4m3fn)
+            _TRITON[1][(min(512, M),)](x, self._xpad, M, K, KP, BLOCK=1024)
+            x = self._xpad
+            K = KP
+        bm, bn, bkk = (32, 64, 128) if M <= 64 else (128, 256, 128)
+        out = torch.empty((M, N), device=dev, dtype=torch.bfloat16)
+        grid = (triton.cdiv(M, bm) * triton.cdiv(N, bn),)
+        gemm_kernel[grid](x, w, out, ws, M, N, K, x.stride(0), w.stride(0),
+                          out.stride(0), BLOCK_M=bm, BLOCK_N=bn, BLOCK_K=bkk,
+                          GROUP_M=1 if M <= 64 else 8,
+                          num_warps=4 if M <= 64 else 8,
+                          num_stages=4 if M <= 64 else 3)
+        return out

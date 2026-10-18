@@ -1,0 +1,278 @@
+"""Kimi Delta Attention forward (chunk form), custom Triton kernels for SM120.
+
+Three phases:
+  1. prepare : per-chunk WY representation (w, u), intra-chunk q-k matrix and
+               decay factors.  Fully parallel over (batch, head, chunk).
+  2. scan    : sequential inter-chunk state recurrence, parallel over
+               (batch, head, value-slice).
+  3. output  : o = (q * exp(g)) @ S + A_qk @ v_i, parallel over
+               (batch, head, chunk, value-slice).
+
+Math (chunk size BT, in-chunk inclusive cumsum G of the log decay):
+  ek = exp(G - G_last), kB = k * exp(G_last - G), kA = k * ek,
+  N  = beta * strict_tril(kA kB^T)
+  X  = (I + N)^-1                      (16x16 block scheme, see kernel)
+  w  = X (beta kA d),  u = X (beta v),  d = exp(G_last)
+  Aqk = tril(q scale ek kB^T),  qe = q scale ek d
+  per chunk: v_i = u - w S ;  o = qe S + Aqk v_i ;
+             S <- S d + kB^T v_i
+"""
+from __future__ import annotations
+
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+# ---------------------------------------------------------------- phase 1
+@triton.jit
+def _prepare_kernel(
+    q_ptr, k_ptr, v_ptr, g_ptr, beta_ptr,
+    qe_ptr, w_ptr, u_ptr, aqk_ptr, kb_ptr, d_ptr,
+    scale,
+    T, H, NT,
+    K: tl.constexpr, V: tl.constexpr, BT: tl.constexpr, BH, NLEV: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    bh = pid % BH
+    n = pid // BH
+    b = bh // H
+    h = bh % H
+
+    offs_t = tl.arange(0, BT)
+    offs_k = tl.arange(0, K)
+    row = b * T * H * K + (n * BT + offs_t) * (H * K) + h * K
+    ptrs = row[:, None] + offs_k[None, :]
+
+    # All five input tiles are issued up front.  At 8 warps this kernel keeps
+    # one CTA per SM, so the memory system has to stay busy underneath the
+    # (long, dependent) inverse chain -- hoisting the loads this way is worth
+    # ~20% over loading q/v lazily.
+    k = tl.load(k_ptr + ptrs, eviction_policy="evict_first")
+    g = tl.load(g_ptr + ptrs, eviction_policy="evict_first")
+    q = tl.load(q_ptr + ptrs, eviction_policy="evict_first")
+    v = tl.load(v_ptr + ptrs, eviction_policy="evict_first")
+    beta = tl.load(beta_ptr + b * T * H + (n * BT + offs_t) * H + h).to(tl.float32)
+
+    # in-chunk inclusive cumsum of the per-channel log decay
+    G = tl.cumsum(g, 0)
+    glast = tl.sum(tl.where(offs_t[:, None] == BT - 1, G, 0.0), 0)   # [K]
+    d = tl.exp(glast)                                                # [K]
+    ek = tl.exp(G - glast[None, :])                                  # [BT,K]
+
+    kf = k.to(tl.float32)
+    kA = (kf * ek).to(tl.bfloat16)                           # k * exp(G - G_last)
+    kB = (kf / ek).to(tl.bfloat16)                           # k * exp(G_last - G)
+
+    # q side first: aqk / qe only need q, ek, kB.  Emitting them here keeps the
+    # 64x128 q tiles out of the live set across the (register heavy) inverse.
+    qA = ((q.to(tl.float32) * scale) * ek).to(tl.bfloat16)
+    aqk = tl.dot(qA, tl.trans(kB))
+    aqk = tl.where(offs_t[:, None] >= offs_t[None, :], aqk, 0.0)
+    qe = (qA.to(tl.float32) * d[None, :]).to(tl.bfloat16)
+    obase = (bh * NT + n) * BT * K
+    tl.store(qe_ptr + obase + offs_t[:, None] * K + offs_k[None, :], qe)
+    tl.store(aqk_ptr + (bh * NT + n) * BT * BT + offs_t[:, None] * BT + offs_t[None, :],
+             aqk.to(tl.bfloat16))
+    tl.store(kb_ptr + obase + offs_t[:, None] * K + offs_k[None, :], kB,
+             eviction_policy="evict_last")
+    kg = (kA.to(tl.float32) * d[None, :]).to(tl.bfloat16)
+    rhs_w = (kg.to(tl.float32) * beta[:, None]).to(tl.bfloat16)
+
+    # strictly-lower interaction matrix N[c,i] = beta_c * kA_c . kB_i
+    N = tl.dot(kA, tl.trans(kB)) * beta[:, None]
+    N = tl.where(offs_t[:, None] > offs_t[None, :], N, 0.0)
+
+    # X = (I + N)^{-1}.  A plain 5-level doubling on the full 64x64 block is
+    # numerically unusable in bf16 (the intermediate N^k reach ~1e2 while the
+    # exact inverse is O(1), so rounding is amplified into a ~50% error).
+    # Split N = Nb + Nl with Nb block-diagonal (16x16 blocks) and Nl block
+    # strictly lower; then with Db = (I+Nb)^{-1}, L = Db Nl (L^4 = 0):
+    #     X = (I + L)^{-1} Db = (I - L + L^2 - L^3) Db.
+    # The doubling for Db stays well scaled (intermediates <= 0.4).
+    eye = tl.where(offs_t[:, None] == offs_t[None, :], 1.0, 0.0)
+    blk = (offs_t[:, None] // 16) == (offs_t[None, :] // 16)
+    Nb = tl.where(blk, N, 0.0)
+    Nl = N - Nb
+    Nbb = Nb.to(tl.bfloat16)
+    D = -Nb + eye
+    for _ in tl.static_range(0, NLEV):
+        Nbb = tl.dot(Nbb, Nbb).to(tl.bfloat16)
+        D = D + tl.dot(D.to(tl.bfloat16), Nbb)
+    L = tl.dot(D.to(tl.bfloat16), Nl.to(tl.bfloat16))
+    L2 = tl.dot(L.to(tl.bfloat16), L.to(tl.bfloat16))
+    L3 = tl.dot(L2.to(tl.bfloat16), L.to(tl.bfloat16))
+    Y = eye - L + L2 - L3
+    X = tl.dot(Y.to(tl.bfloat16), D.to(tl.bfloat16))
+    Xb = X.to(tl.bfloat16)
+
+    w = tl.dot(Xb, rhs_w)
+    tl.store(w_ptr + obase + offs_t[:, None] * K + offs_k[None, :], w.to(tl.bfloat16),
+             eviction_policy="evict_last")
+
+    rhs_u = (v.to(tl.float32) * beta[:, None]).to(tl.bfloat16)
+    u = tl.dot(Xb, rhs_u)
+    obase_v = (bh * NT + n) * BT * V
+    tl.store(u_ptr + obase_v + offs_t[:, None] * V + offs_k[None, :], u.to(tl.bfloat16))
+    tl.store(d_ptr + (bh * NT + n) * K + offs_k, d)
+
+
+# ---------------------------------------------------------------- phase 2
+@triton.jit
+def _scan_kernel(
+    w_ptr, u_ptr, kb_ptr, d_ptr, h_ptr, v_ptr,
+    NT,
+    K: tl.constexpr, V: tl.constexpr, BT: tl.constexpr, BV: tl.constexpr,
+    PF: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    S: tl.constexpr = V // BV
+    bh = pid // S
+    s = pid % S
+
+    offs_t = tl.arange(0, BT)
+    offs_k = tl.arange(0, K)
+    offs_v = s * BV + tl.arange(0, BV)
+
+    st = tl.zeros((K, BV), dtype=tl.float32)
+    if PF == 0:
+        # Many chunk-parallel CTAs per SM (BH >= 16): the hardware already
+        # overlaps the loads of neighbouring CTAs, so a manual prefetch only
+        # costs registers and measures slower.
+        for n in range(NT):
+            wo = (bh * NT + n) * BT * K + offs_t[:, None] * K + offs_k[None, :]
+            w = tl.load(w_ptr + wo, eviction_policy="evict_last")
+            kb = tl.load(kb_ptr + wo, eviction_policy="evict_last")
+            uo = (bh * NT + n) * BT * V + offs_t[:, None] * V + offs_v[None, :]
+            u = tl.load(u_ptr + uo)
+            d = tl.load(d_ptr + (bh * NT + n) * K + offs_k)
+
+            tl.store(h_ptr + (bh * NT + n) * K * V + offs_k[:, None] * V + offs_v[None, :],
+                     st.to(tl.bfloat16))
+            v = u.to(tl.float32) - tl.dot(w, st.to(tl.bfloat16))
+            tl.store(v_ptr + uo, v.to(tl.bfloat16))
+            st = st * d[:, None] + tl.dot(tl.trans(kb), v.to(tl.bfloat16))
+    else:
+        # Few CTAs (BH <= 8), far below one per SM: issue the two [BT,K]
+        # operands of step n+1 before step n's dependent dots, otherwise every
+        # step stalls on a cold DRAM read.
+        wo = (bh * NT) * BT * K + offs_t[:, None] * K + offs_k[None, :]
+        uo = (bh * NT) * BT * V + offs_t[:, None] * V + offs_v[None, :]
+        w = tl.load(w_ptr + wo, eviction_policy="evict_last")
+        kb = tl.load(kb_ptr + wo, eviction_policy="evict_last")
+        for n in range(NT):
+            nx = tl.minimum(n + 1, NT - 1)
+            wo2 = (bh * NT + nx) * BT * K + offs_t[:, None] * K + offs_k[None, :]
+            uo2 = (bh * NT + nx) * BT * V + offs_t[:, None] * V + offs_v[None, :]
+            w2 = tl.load(w_ptr + wo2, eviction_policy="evict_last")
+            kb2 = tl.load(kb_ptr + wo2, eviction_policy="evict_last")
+            u = tl.load(u_ptr + uo)
+            d = tl.load(d_ptr + (bh * NT + n) * K + offs_k)
+
+            tl.store(h_ptr + (bh * NT + n) * K * V + offs_k[:, None] * V + offs_v[None, :],
+                     st.to(tl.bfloat16))
+            v = u.to(tl.float32) - tl.dot(w, st.to(tl.bfloat16))
+            tl.store(v_ptr + uo, v.to(tl.bfloat16))
+            st = st * d[:, None] + tl.dot(tl.trans(kb), v.to(tl.bfloat16))
+            w = w2
+            kb = kb2
+            wo = wo2
+            uo = uo2
+
+
+# ---------------------------------------------------------------- phase 3
+@triton.jit
+def _output_kernel(
+    qe_ptr, aqk_ptr, v_ptr, h_ptr, o_ptr,
+    T, H, NT,
+    K: tl.constexpr, V: tl.constexpr, BT: tl.constexpr, BV: tl.constexpr, BH,
+):
+    pid = tl.program_id(0)
+    S: tl.constexpr = V // BV
+    chunk = pid // S
+    s = pid % S
+    bh = chunk % BH
+    n = chunk // BH
+    b = bh // H
+    hh = bh % H
+
+    offs_t = tl.arange(0, BT)
+    offs_k = tl.arange(0, K)
+    offs_b = tl.arange(0, BT)
+    offs_v = s * BV + tl.arange(0, BV)
+
+    qe = tl.load(qe_ptr + (bh * NT + n) * BT * K + offs_t[:, None] * K + offs_k[None, :])
+    aqk = tl.load(aqk_ptr + (bh * NT + n) * BT * BT + offs_t[:, None] * BT + offs_b[None, :])
+    vv = tl.load(v_ptr + (bh * NT + n) * BT * V + offs_t[:, None] * V + offs_v[None, :])
+    hs = tl.load(h_ptr + (bh * NT + n) * K * V + offs_k[:, None] * V + offs_v[None, :])
+
+    o = tl.dot(qe, hs) + tl.dot(aqk, vv)
+    optr = (b * T * H * V) + (n * BT + offs_t)[:, None] * (H * V) + hh * V + offs_v[None, :]
+    tl.store(o_ptr + optr, o.to(tl.bfloat16), eviction_policy="evict_first")
+
+
+# ---------------------------------------------------------------- driver
+_CACHE: dict = {}
+
+
+def _buffers(B, T, H, K, V, dev):
+    key = (B, T, H, K, V, dev.index)
+    buf = _CACHE.get(key)
+    if buf is None:
+        BH = B * H
+        NT = T // 64
+        n1 = BH * NT * 64 * K
+        buf = (
+            torch.empty(n1, dtype=torch.bfloat16, device=dev),                 # qe
+            torch.empty(n1, dtype=torch.bfloat16, device=dev),                 # w
+            torch.empty(BH * NT * 64 * V, dtype=torch.bfloat16, device=dev),   # u
+            torch.empty(n1, dtype=torch.bfloat16, device=dev),                 # kb
+            torch.empty(BH * NT * 64 * 64, dtype=torch.bfloat16, device=dev),  # aqk
+            torch.empty(BH * NT * K, dtype=torch.float32, device=dev),         # d
+            torch.empty(BH * NT * K * V, dtype=torch.bfloat16, device=dev),    # hs
+            torch.empty(BH * NT * 64 * V, dtype=torch.bfloat16, device=dev),   # vv
+        )
+        _CACHE[key] = buf
+    return buf
+
+
+def _forward(q, k, v, g, beta, scale, BV=None, obv=None):
+    B, T, H, K = q.shape
+    V = v.shape[-1]
+    BT = 64
+    NT = T // BT
+    BH = B * H
+    dev = q.device
+    qe, w, u, kb, aqk, d, hs, vv = _buffers(B, T, H, K, V, dev)
+
+    _prepare_kernel[(NT * BH,)](
+        q, k, v, g, beta, qe, w, u, aqk, kb, d, scale,
+        T, H, NT, K, V, BT, BH, 3, num_warps=8,
+    )
+    if BV is None:
+        BV = 16
+    _scan_kernel[(BH * (V // BV),)](
+        w, u, kb, d, hs, vv, NT, K, V, BT, BV, 0 if BH >= 16 else 2,
+        num_warps=8, num_stages=3,
+    )
+    if obv is None:
+        obv = 64
+    o = torch.empty((B, T, H, V), dtype=torch.bfloat16, device=dev)
+    _output_kernel[(BH * NT * (V // obv),)](
+        qe, aqk, vv, hs, o, T, H, NT, K, V, BT, obv, BH, num_warps=8,
+    )
+    return o
+
+
+class Model(nn.Module):
+    def __init__(self, B: int, T: int, H: int, K: int, V: int, chunk_size: int = 64):
+        super().__init__()
+        self.B, self.T, self.H, self.K, self.V = B, T, H, K, V
+        self.chunk_size = chunk_size
+        self.scale = float(K) ** -0.5
+        self.register_buffer("_dummy", torch.zeros(1), persistent=False)
+
+    def forward(self, q, k, v, g, beta):
+        return _forward(q.contiguous(), k.contiguous(), v.contiguous(),
+                        g.contiguous(), beta.contiguous(), self.scale)

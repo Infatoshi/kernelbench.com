@@ -114,6 +114,7 @@ MODEL_NAMES = {
     "deepseek-v4-flash": "DeepSeek V4 Flash",
     "deepseek-v4-flash-0731": "DeepSeek V4 Flash (0731)",
     "deepseek-flash": "DeepSeek V4.1 Flash",
+    "deepseek-v4.1-flash-1017": "DeepSeek V4.1 Flash (1017)",
     "longcat-2.0": "LongCat 2.0",
     "hy3": "Tencent Hy3",
     "qwen3.6-max-preview": "Qwen 3.6 Max Preview",
