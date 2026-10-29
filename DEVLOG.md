@@ -6,6 +6,49 @@ benchmark. Per-benchmark journals live in `benchmarks/<bench>/DEVLOG.md`;
 
 ---
 
+## 2026-10-29 - Mac run archives thinned; mini outputs deleted
+
+Mini is discontinued (Elliot, 10-29). Deleted `benchmarks/mini/outputs` (15.6 GB): the
+306 LFM2.5-2.6B-Agent sessions from 07-28 to 07-30 (0 correct), never published, no HF
+dataset. The mini code is still in the tree.
+
+hard/cuda/mega archives on the Mac went from about 29 GB to 20.4 GB on disk. Removed:
+regenerable caches in 1,262 dirs (run `cache/`, `agent_home/.cache`, `agent_home/.triton`,
+and `tcache`, `triton_cache`, `.triton`, `__pycache__`, `.venv`, `torch_extensions` dirs
+in the workspace; 7.98 GB) and 56 vendored upstream trees (CUTLASS 4.5.2 to 4.6.1, FLA,
+vLLM, Triton, faiss sources; 2.06 GB) that had 200 or more files, no `solution.py`
+inside, and no mention in a published solution. Their paths and CUTLASS versions are in
+`benchmarks/hard/outputs/third_party_removed_20261029.tsv` (gitignored).
+
+Kept: every top-level run file (`result.json`, `solution.py`, transcripts, logs, `gpu`,
+`roofline.png`, `index.html`), agent session logs under `agent_home`, the problem
+workspace and agent-written sources (read by `kb contamination`, the mega framework
+detector and the grok viewer), binaries outside caches, and 48 vendored trees in 39
+published runs whose solution builds against them (4.34 GB, e.g.
+`extra_include_paths=[_HERE / "cutlass" / "include"]`), so those kernels still compile on
+regrade. `scripts/check_publish_gates.py` passed afterward.
+
+Raw transcripts: 786 files (`transcript.jsonl`, `transcript.part1.jsonl`,
+`codex_session.jsonl`) from 720 runs, 8.59 GB, moved off the Mac to tetra's cold
+archive as `kernelbench/kernelbench-raw-transcripts-20261029.tar.zst` (1.28 GB, sha256
+`fef1c026...`, file count checked on tetra). The 6 `transcript.part1.jsonl` files (20 MB)
+were restored to the Mac: `build_run_detail.py` sets `resumed_segment` from their presence,
+and a publish without them dropped that flag from 5 runs. Only runs whose HF trace exists
+went, and only where removal cannot change a board: the builders' archive-reference
+tripwire is silent, or a clean audit overrides it, and mega's copied-solution check does
+not fire. Still on the Mac: 615 runs with no HF trace (1.51 GB, the only copy) and 51
+runs whose raw transcript is what keeps them off a board (0.73 GB). HF traces are
+redacted, normalized and use synthetic timestamps, so `media/trajectory.py` on an old run
+needs the tetra archive.
+
+Trace links: `scripts/build_catalog.py` had its own `trace_url` that always emitted the
+flat `<rid>.jsonl`, so 43 B200/H100 board cells in `catalog.json` linked to 404s (HF stores
+them under `b200/` and `h100/`). It now delegates to `build_model_index.trace_url`.
+`20260719_024723_grok_grok-build_01_fp8_gemm` (launch failed, "unknown model id", no
+session) joins `NO_TRACE_RUNS`. All 695 site trace links resolve against the HF trees.
+
+---
+
 ## 2026-10-03 - Leftover decisions from the Sonnet 5.5 / GPT-6.1 Sol week
 
 `kb lambda up` default type now follows the deck's hardware key: `gpu_1x_h100_pcie`

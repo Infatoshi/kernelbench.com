@@ -105,13 +105,13 @@ def solution_url(run_id: str) -> str | None:
     return f"/runs/{run_id}_solution.py.txt" if p.exists() else f"/runs/{run_id}_solution.py.txt"
 
 
-def trace_url(bench: str, run_id: str) -> str | None:
-    if not run_id:
-        return None
-    return (
-        f"https://huggingface.co/datasets/Infatoshi/kernelbench-{bench}-traces"
-        f"/blob/main/{run_id}.jsonl"
-    )
+def trace_url(bench: str, run_id: str, gpu: str | None = None) -> str | None:
+    # Delegate to the model index so the catalog and models.json agree: per-GPU
+    # boards live under <gpu>/ on HF, and NO_TRACE_RUNS get no link. A local
+    # copy that always emitted the flat path left 45 dead links (2026-10-29).
+    from build_model_index import trace_url as model_trace_url
+
+    return model_trace_url(bench, run_id, None if gpu in (None, "rtxpro6000") else gpu)
 
 
 def find_result(run_id: str, dirs: list[Path]) -> Path | None:
@@ -260,7 +260,7 @@ def cells_from_hard_leaderboard(path: Path, gpu_key: str, ann: dict[str, str]) -
                     "has_solution": has_sol,
                     "verdict": verdict,
                     "solution_url": solution_url(rid) if rid else None,
-                    "trace_url": trace_url("hard", rid) if rid else None,
+                    "trace_url": trace_url("hard", rid, gpu_key) if rid else None,
                     "elapsed_seconds": c.get("elapsed_seconds")
                     or result.get("elapsed_seconds")
                     or result.get("total_elapsed_seconds"),
@@ -388,7 +388,7 @@ def cells_from_mega(ann: dict[str, str]) -> list[dict]:
                 "has_solution": has_sol,
                 "verdict": verdict,
                 "solution_url": solution_url(rid) if rid else None,
-                "trace_url": trace_url("mega", rid) if rid else None,
+                "trace_url": trace_url("mega", rid, gpu) if rid else None,
                 "elapsed_seconds": int(r["elapsed_s"]) if r.get("elapsed_s") else None,
                 "tok_s": float(r["tok_s"]) if r.get("tok_s") else None,
             }

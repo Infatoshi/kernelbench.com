@@ -215,6 +215,7 @@ NO_TRACE_RUNS = {
     "20260901_124502_claude_claude-fable-5-1_02_kimi_linear_decode",
     "20260901_142726_claude_claude-fable-5-1_02_kimi_linear_decode",
     "20260719_063102_grok_grok-build_01_fp8_gemm",
+    "20260719_024723_grok_grok-build_01_fp8_gemm",
 }
 
 
