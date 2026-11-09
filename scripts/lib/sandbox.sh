@@ -147,10 +147,24 @@ kbh_sandbox_init() {
         esac
     fi
 
-    # --- session-history overlays (NOT the whole dotdirs: auth must survive) -
+    # --- Claude Code: its own config dir under agent_home, the host ~/.claude gone ---
+    # Directory-level, because host tools (fleet sync) atomically rename new copies of
+    # ~/.claude/settings.json and CLAUDE.md into place, which detaches a file bind inside a
+    # live sandbox: on 2026-11-09 at 14:23 that re-exposed the host settings mid-run, every
+    # session switched to the host's local plan router and died on 401/503. Claude auth is
+    # the env token (CLAUDE_CODE_OAUTH_TOKEN / ANTHROPIC_*); a host /login session is not
+    # carried in (copying one revokes the host's). Session history lands in the archive.
     local agent_home="$run_dir/agent_home"
+    mkdir -p "$agent_home/.claude"
+    if [ -d "$HOME/.claude" ]; then
+        KBH_SBX+=(--tmpfs "$HOME/.claude")
+        must_hidden+=("$HOME/.claude")
+    fi
+    KBH_SBX+=(--setenv CLAUDE_CONFIG_DIR "$agent_home/.claude")
+
+    # --- session-history overlays (NOT the whole dotdirs: auth must survive) -
     local host_dir sub
-    for sub in ".claude/projects" ".grok/sessions" ".codex/sessions" \
+    for sub in ".grok/sessions" ".codex/sessions" \
                ".gemini/tmp" ".local/share/opencode/storage"; do
         host_dir="$HOME/$sub"
         [ -d "$(dirname "$host_dir")" ] || continue
@@ -163,13 +177,14 @@ kbh_sandbox_init() {
     # without this they load ~/.claude/CLAUDE.md and settings.json hooks (a
     # SessionStart `belt brief`) and read tuned sm_120 playbooks and the audit
     # procedure (2026-11-09 Fable 5.2 release: all 5 cells ran `belt show`).
-    # Auth stays: credential files (.credentials.json, auth.json) are not here.
-    local op_files=(.claude/CLAUDE.md .claude/settings.json .claude/settings.local.json
-                    .codex/AGENTS.md .codex/hooks.json .gemini/GEMINI.md .grok/AGENTS.md
-                    AGENTS.md CLAUDE.md .env_vars .kbm_env)
+    # ~/.claude is handled above. Other harnesses keep their auth files (auth.json etc.).
+    # File binds can be detached by an atomic rename on the host (see above); these are
+    # instruction/secret files that change rarely, and the OPERATOR-CONTEXT tripwire in
+    # `kb contamination` catches a leak that slips through.
+    local op_files=(.claude.json .codex/AGENTS.md .codex/hooks.json .gemini/GEMINI.md
+                    .grok/AGENTS.md AGENTS.md CLAUDE.md .env_vars .kbm_env)
     # dev/belt also takes the `belt` CLI with it (~/.local/bin/belt is a symlink into it).
-    local op_dirs=(.claude/hooks .claude/skills .claude/agents .claude/commands .claude/rules
-                   .claude/plugins .agents .codex/skills .omp .pi dev/belt)
+    local op_dirs=(.agents .codex/skills .omp .pi dev/belt)
     local op
     mkdir -p "$run_dir/.sandbox"
     : > "$run_dir/.sandbox/empty"
@@ -179,6 +194,7 @@ kbh_sandbox_init() {
     for op in "${op_files[@]}"; do
         [ -e "$HOME/$op" ] || continue
         target="$(readlink -f "$HOME/$op")"
+        case "$target" in "$HOME/.claude"/*) continue ;; esac   # already an empty tmpfs
         case "$seen" in *" $target "*) continue ;; esac
         seen+="$target "
         KBH_SBX+=(--ro-bind "$run_dir/.sandbox/empty" "$target")

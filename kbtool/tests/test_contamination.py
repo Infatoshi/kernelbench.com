@@ -304,9 +304,11 @@ def test_operator_context_tripwire(tmp_path):
 
 
 def test_sandbox_blanks_operator_context():
-    """The shared sandbox must keep blanking the host user's agent instructions, hooks and belt."""
+    """The shared sandbox must keep the host user's agent instructions, hooks and belt out:
+    ~/.claude hidden at the directory level (file binds detach on an atomic rename) and
+    Claude pointed at its own config dir."""
     text = (Path(__file__).resolve().parents[2] / "scripts/lib/sandbox.sh").read_text()
-    for needle in (".claude/CLAUDE.md", ".claude/settings.json", ".claude/hooks", "dev/belt", ".env_vars"):
+    for needle in ('--tmpfs "$HOME/.claude"', "--setenv CLAUDE_CONFIG_DIR", "dev/belt", ".env_vars"):
         assert needle in text
 
 

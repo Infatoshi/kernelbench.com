@@ -21,8 +21,20 @@ and tmpfs hooks/skills/agents/commands/plugins, `.agents`, `.omp`, `.pi`, `~/dev
 `belt` CLI). Auth survives (credentials files untouched; release runs bill `SWEEP_CLAUDE_OAUTH_TOKEN`).
 Verified on tetra inside the sandbox: those files 0 bytes, `belt: command not found`, a real
 `claude -p` answers with 0 `hook_started` events. `kb contamination` gains an OPERATOR-CONTEXT
-tripwire (hook_started or a `belt` call in the transcript). Still visible by design (hygiene, not
+tripwire (a `belt` call, belt text, or a hook that injected output; the Opus/Sonnet/Haiku 5.5 tetra
+runs fired hooks that returned `{}` and are clean). Still visible by design (hygiene, not
 containment): the rest of `$HOME`, including other kernel repos.
+
+Same day, second hole: the clean relaunch (`release-20261109_142120`) died at 14:29, all five cells
+`no_solution`. At 14:23 a host tool atomically renamed new copies of `~/.claude/settings.json` and
+`CLAUDE.md` into place; a rename over a file bind in another mount namespace detaches the bind, so
+the live sessions saw the real settings again, switched to the host's local plan router
+(127.0.0.1:41871), and got 401 then 503 "Central account configuration or recovery needs attention"
+until Claude Code gave up. Fix: `~/.claude` is now an empty tmpfs (directory-level, rename-proof:
+verified with a host-side `mv` into `~/.claude` mid-session) and bwrap sets `CLAUDE_CONFIG_DIR` to
+`$RUN_DIR/agent_home/.claude`, so settings, state and session history are per-run. Claude auth in
+host mode is the env token only; `KBH_CLAUDE_AUTH=keychain` (the host `/login`) no longer works under
+the host sandbox. Both voided release dirs stay on tetra and are never pulled.
 
 ---
 
