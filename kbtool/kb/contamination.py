@@ -197,6 +197,21 @@ def honeytoken_hit(run_dir: Path) -> bool:
     return False
 
 
+_OPERATOR_CONTEXT = re.compile(r'"subtype": ?"hook_started"|"command": ?"belt[ "]|belt: procedures, tools, gates')
+
+
+def operator_context_hit(run_dir: Path) -> bool:
+    """True if the transcript shows the host user's agent context reaching the agent: a
+    host hook firing (e.g. a SessionStart `belt brief`) or a `belt` call. The sandbox blanks
+    these since 2026-11-09; before that, all five Fable 5.2 release cells read belt playbooks."""
+    t = run_dir / "transcript.jsonl"
+    try:
+        with t.open(errors="ignore") as f:
+            return any(_OPERATOR_CONTEXT.search(line) for line in f)
+    except OSError:
+        return False
+
+
 def own_artifact_urls(run_dir: Path) -> set[str]:
     """Own-artifact URLs (site / raw kernelbench paths / HF trace datasets)
     referenced in this run's agent transcript."""
@@ -280,6 +295,7 @@ def run(argv: list[str] | None = None, repo_root: Path | None = None) -> int:
     corpus: dict[str, list[tuple[str, int, str]]] = {}
     beacon_hits: list[str] = []
     url_hits: dict[str, list[str]] = {}
+    operator_hits: list[str] = []
     total = 0
     for d in sorted(runs.iterdir()):
         if not d.is_dir():
@@ -298,6 +314,9 @@ def run(argv: list[str] | None = None, repo_root: Path | None = None) -> int:
         if u:
             url_hits[d.name] = sorted(u)
             dirty.setdefault(d.name, 0)
+        if operator_context_hit(d):
+            operator_hits.append(d.name)
+            dirty.setdefault(d.name, 0)
 
     print(f"=== contamination audit: {len(dirty)} / {total} runs contaminated ===")
     for name, cnt in sorted(dirty.items(), key=lambda x: -x[1]):
@@ -306,6 +325,8 @@ def run(argv: list[str] | None = None, repo_root: Path | None = None) -> int:
         print(f"  HONEYTOKEN  {name}  (sandbox decoy beacon bytes in submitted kernel — verdict: contamination, no judgment call)")
     for name, urls in sorted(url_hits.items()):
         print(f"  URL-TRIPWIRE  {name}  (own published artifacts fetched: {', '.join(urls[:3])}{' ...' if len(urls) > 3 else ''})")
+    for name in operator_hits:
+        print(f"  OPERATOR-CONTEXT  {name}  (host hook fired or belt read inside the agent session)")
 
     print(
         f"=== audit-corpus read: {len(corpus)} / {total} runs referenced "

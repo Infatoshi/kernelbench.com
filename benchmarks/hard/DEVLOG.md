@@ -4,6 +4,28 @@ A running record of decisions, dead ends, and lessons. Newest entries on top. Th
 
 ---
 
+## 2026-11-09 — host-mode agents loaded the operator's own agent context; sandbox now blanks it
+
+Fable 5.2 high release on tetra gpu2 (`runs/release-20261109_140206-claude-claude-fable-5-2`) was
+stopped 14 minutes in. Host mode (`tetra_release.sh` never sets `KBH_AGENT_CONTAINER=1`, and mega
+has no container path) runs the agent as the host user under `bwrap --dev-bind / /`, so Claude
+Code read `~/.claude/CLAUDE.md` and `settings.json`, whose SessionStart hook runs `belt brief`.
+All five cells then ran `belt show perf.kernel` / `perf.cuda-build-blackwell`; three also read
+`perf.benchmark-integrity` (how audits catch hacks). That is tuned sm_120 knowledge and the audit
+playbook no other row had: not publishable. Earlier tetra Claude runs (Opus 5.5 09-22, Haiku 5.5
+10-07) made zero belt calls; the hook arrived later. `~/.env_vars` was also readable.
+
+Fix in `scripts/lib/sandbox.sh` (shared by hard/cuda/mini and mega): blank the user-level agent
+files (CLAUDE.md, settings*.json, AGENTS.md/GEMINI.md, `.env_vars`, `.kbm_env`; symlinks resolved)
+and tmpfs hooks/skills/agents/commands/plugins, `.agents`, `.omp`, `.pi`, `~/dev/belt` (takes the
+`belt` CLI). Auth survives (credentials files untouched; release runs bill `SWEEP_CLAUDE_OAUTH_TOKEN`).
+Verified on tetra inside the sandbox: those files 0 bytes, `belt: command not found`, a real
+`claude -p` answers with 0 `hook_started` events. `kb contamination` gains an OPERATOR-CONTEXT
+tripwire (hook_started or a `belt` call in the transcript). Still visible by design (hygiene, not
+containment): the rest of `$HOME`, including other kernel repos.
+
+---
+
 ## 2026-10-03 — 07 zero-point contract: integers (deck wording change, RTX cells need a check-only restamp)
 
 Elliot's call on the 09-24 question. 07's PROMPT.txt said only "zeros ... bf16" and

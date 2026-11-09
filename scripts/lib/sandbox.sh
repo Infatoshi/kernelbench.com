@@ -158,6 +158,38 @@ kbh_sandbox_init() {
         KBH_SBX+=(--bind "$agent_home/$sub" "$host_dir")
     done
 
+    # --- operator context: the host user's agent instructions, hooks, skills,
+    # fleet knowledge base and secrets. Host-mode agents run as this user, so
+    # without this they load ~/.claude/CLAUDE.md and settings.json hooks (a
+    # SessionStart `belt brief`) and read tuned sm_120 playbooks and the audit
+    # procedure (2026-11-09 Fable 5.2 release: all 5 cells ran `belt show`).
+    # Auth stays: credential files (.credentials.json, auth.json) are not here.
+    local op_files=(.claude/CLAUDE.md .claude/settings.json .claude/settings.local.json
+                    .codex/AGENTS.md .codex/hooks.json .gemini/GEMINI.md .grok/AGENTS.md
+                    AGENTS.md CLAUDE.md .env_vars .kbm_env)
+    # dev/belt also takes the `belt` CLI with it (~/.local/bin/belt is a symlink into it).
+    local op_dirs=(.claude/hooks .claude/skills .claude/agents .claude/commands .claude/rules
+                   .claude/plugins .agents .codex/skills .omp .pi dev/belt)
+    local op
+    mkdir -p "$run_dir/.sandbox"
+    : > "$run_dir/.sandbox/empty"
+    # bwrap cannot mount over a symlink (~/.codex/AGENTS.md -> ~/.claude/CLAUDE.md), so
+    # blank the resolved target once.
+    local target seen=" "
+    for op in "${op_files[@]}"; do
+        [ -e "$HOME/$op" ] || continue
+        target="$(readlink -f "$HOME/$op")"
+        case "$seen" in *" $target "*) continue ;; esac
+        seen+="$target "
+        KBH_SBX+=(--ro-bind "$run_dir/.sandbox/empty" "$target")
+    done
+    for op in "${op_dirs[@]}"; do
+        if [ -d "$HOME/$op" ]; then
+            KBH_SBX+=(--tmpfs "$HOME/$op")
+            must_hidden+=("$HOME/$op")
+        fi
+    done
+
     # --- honeytoken decoy run (deliberately visible, read-only) --------------
     local hp_score="0.9137"
     case "$repo_root" in *mega) hp_score="24.1337" ;; esac

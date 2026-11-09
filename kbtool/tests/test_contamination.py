@@ -12,6 +12,7 @@ from kb.contamination import (
     audit_corpus_hits,
     copied_foreign_solution,
     honeytoken_hit,
+    operator_context_hit,
     other_archives,
     own_artifact_urls,
     run,
@@ -263,6 +264,40 @@ def test_honeytoken_beacon_matches_sandbox_helper():
     sandbox_sh = Path(__file__).resolve().parents[2] / "scripts/lib/sandbox.sh"
     text = sandbox_sh.read_text()
     assert f'KBH_SANDBOX_BEACON="{HONEYTOKEN_BEACON}"' in text
+
+
+def test_operator_context_tripwire(tmp_path):
+    """2026-11-09: a host SessionStart hook (`belt brief`) fired inside all five Fable 5.2
+    release sessions and each agent ran `belt show perf.kernel`."""
+    hooked = _mk_run(tmp_path, "20261109_140306_claude_claude-fable-5-2_02_deepseek_nsa",
+                     "02_deepseek_nsa", None)
+    (hooked / "transcript.jsonl").write_text(
+        json.dumps({"type": "system", "subtype": "hook_started", "hook_event": "SessionStart"},
+                   separators=(",", ":")) + "\n")
+    assert operator_context_hit(hooked) is True
+
+    belt_call = _mk_run(tmp_path, "20261109_140336_claude_claude-fable-5-2_03_megaqwen_decode",
+                        "03_megaqwen_decode", None)
+    (belt_call / "transcript.jsonl").write_text(json.dumps(
+        {"type": "assistant", "message": {"content": [{"type": "tool_use", "name": "Bash",
+         "input": {"command": "belt show perf.kernel 2>&1 | head -150"}}]}},
+        separators=(",", ":")) + "\n")
+    assert operator_context_hit(belt_call) is True
+
+    clean = _mk_run(tmp_path, "20260922_121858_claude_claude-opus-5-5_02_deepseek_nsa",
+                    "02_deepseek_nsa", 0.3)
+    (clean / "transcript.jsonl").write_text(json.dumps(
+        {"type": "assistant", "message": {"content": [{"type": "tool_use", "name": "Bash",
+         "input": {"command": "nvcc -O3 kernel.cu # seatbelt check"}}]}},
+        separators=(",", ":")) + "\n")
+    assert operator_context_hit(clean) is False
+
+
+def test_sandbox_blanks_operator_context():
+    """The shared sandbox must keep blanking the host user's agent instructions, hooks and belt."""
+    text = (Path(__file__).resolve().parents[2] / "scripts/lib/sandbox.sh").read_text()
+    for needle in (".claude/CLAUDE.md", ".claude/settings.json", ".claude/hooks", "dev/belt", ".env_vars"):
+        assert needle in text
 
 
 def test_own_artifact_url_tripwire(tmp_path):
