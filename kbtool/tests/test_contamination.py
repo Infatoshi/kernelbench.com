@@ -272,9 +272,19 @@ def test_operator_context_tripwire(tmp_path):
     hooked = _mk_run(tmp_path, "20261109_140306_claude_claude-fable-5-2_02_deepseek_nsa",
                      "02_deepseek_nsa", None)
     (hooked / "transcript.jsonl").write_text(
-        json.dumps({"type": "system", "subtype": "hook_started", "hook_event": "SessionStart"},
+        json.dumps({"type": "system", "subtype": "hook_response", "hook_event": "SessionStart",
+                    "output": "kernel playbook: sm_120 peaks 548 TFLOPS bf16"},
                    separators=(",", ":")) + "\n")
     assert operator_context_hit(hooked) is True
+
+    empty_hook = _mk_run(tmp_path, "20261007_121157_claude_claude-haiku-5-5_01_glm52_fused_moe",
+                         "01_glm52_fused_moe", 0.1)
+    (empty_hook / "transcript.jsonl").write_text("\n".join(
+        json.dumps(o, separators=(",", ":")) for o in (
+            {"type": "system", "subtype": "hook_started", "hook_event": "SessionStart"},
+            {"type": "system", "subtype": "hook_response", "hook_event": "SessionStart",
+             "output": "{}", "stdout": "{}"})) + "\n")
+    assert operator_context_hit(empty_hook) is False
 
     belt_call = _mk_run(tmp_path, "20261109_140336_claude_claude-fable-5-2_03_megaqwen_decode",
                         "03_megaqwen_decode", None)

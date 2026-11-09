@@ -197,19 +197,32 @@ def honeytoken_hit(run_dir: Path) -> bool:
     return False
 
 
-_OPERATOR_CONTEXT = re.compile(r'"subtype": ?"hook_started"|"command": ?"belt[ "]|belt: procedures, tools, gates')
+_OPERATOR_CONTEXT = re.compile(r'"command": ?"belt[ "]|belt: procedures, tools, gates')
 
 
 def operator_context_hit(run_dir: Path) -> bool:
-    """True if the transcript shows the host user's agent context reaching the agent: a
-    host hook firing (e.g. a SessionStart `belt brief`) or a `belt` call. The sandbox blanks
-    these since 2026-11-09; before that, all five Fable 5.2 release cells read belt playbooks."""
+    """True if the transcript shows the host user's agent context reaching the agent: a `belt`
+    call, belt text, or a host hook that injected output (e.g. a SessionStart `belt brief`).
+    Hooks that fired but returned nothing (`{}`; Opus/Sonnet/Haiku 5.5 tetra runs) do not count.
+    The sandbox blanks all of it since 2026-11-09; before that, all five Fable 5.2 release
+    cells read belt playbooks."""
     t = run_dir / "transcript.jsonl"
     try:
         with t.open(errors="ignore") as f:
-            return any(_OPERATOR_CONTEXT.search(line) for line in f)
+            for line in f:
+                if _OPERATOR_CONTEXT.search(line):
+                    return True
+                if '"hook_response"' in line:
+                    try:
+                        o = json.loads(line)
+                    except ValueError:
+                        continue
+                    out = f"{o.get('output') or ''}{o.get('stdout') or ''}".strip()
+                    if out.strip("{} \n"):
+                        return True
     except OSError:
         return False
+    return False
 
 
 def own_artifact_urls(run_dir: Path) -> set[str]:
