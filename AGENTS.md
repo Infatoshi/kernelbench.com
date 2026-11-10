@@ -1,6 +1,6 @@
 # kernelbench.com — operator guide
 
-Entrypoint for every harness (`CLAUDE.md` and `.cursorrules` symlink here): universal rules, gates, and pointers only, under 10 KB (Grok truncates there; a test enforces it). Each directory you touch has its own `AGENTS.md` with the specialized instructions (no other `CLAUDE.md` anywhere; sub-files stay under 32 KB, the Codex cap). Open the one for your task before starting.
+Entrypoint for every harness (`CLAUDE.md` and `.cursorrules` symlink here): universal rules, gates, and pointers only, under 10 KB (Grok truncates there; a test enforces it). Each directory you touch has its own `AGENTS.md` with the specialized instructions (no other `CLAUDE.md` anywhere; sub-files stay under 32 KB, the Codex cap). Open the one for your task first.
 
 Monorepo for the KernelBench website and the evals. Canonical checkout is the Mac at `~/dev/sites/kernelbench.com` (edit, publish, deploy, orchestrate). Every run goes to tetra (RTX PRO 6000) or Lambda H100 PCIe with non-root `ncu` proven first: `kbtool/AGENTS.md` "GPU targets". Other checkouts are never source of truth.
 
@@ -19,11 +19,11 @@ Monorepo for the KernelBench website and the evals. Canonical checkout is the Ma
 | --- | --- | --- | --- | --- |
 | hard | `benchmarks/hard/` | 6 per-op kernels, CUDA or Triton; per-GPU decks `problems-rtxpro6000` (default), `-h100`, `-b200` | `kb sweep` / `uv run kbh run` | `/hard` |
 | mega | `benchmarks/mega/` | 1 fused megakernel, `02_kimi_linear_decode` | `cd benchmarks/mega && ./scripts/run_hard.sh` | `/mega` |
-| cuda | `benchmarks/cuda/` | 4 CUDA-only problems; `src/eval/cuda_language.py` fails Triton, DSLs, pure torch | `kb -b cuda ...` | `/cuda` |
+| cuda | `benchmarks/cuda/` | 3 CUDA-only problems; `src/eval/cuda_language.py` fails Triton, DSLs, pure torch | `kb -b cuda ...` | `/cuda` |
 | mini | `benchmarks/mini/` | 4 problems, sub-200B open weights, 30-min cap, 5 repeats, Lambda H100 SXM | `cd benchmarks/mini && ./scripts/sweep_mini.sh` | homepage category; unpublished, keep out of posts |
 | multi | `benchmarks/multi/` | 4xH100 NVLink, frontier roster only | `benchmarks/multi/scripts/sweep_wave.sh` | unpublished |
 
-Hard, mega, and cuda share the runner and run unlimited. Removed stay removed (`04_kahan_softmax`, mega `01_rl_grid_ppo`, v3, `environments/`). Eligibility is `benchmarks/<bench>/roster.yaml` (open benches: the leaderboard is the list; multi refuses off-roster before GPU time).
+Hard, mega, and cuda share the runner and run unlimited. Removed stay removed (`04_kahan_softmax`, mega `01_rl_grid_ppo`, cuda `04_grid_mingru_sps`, v3, `environments/`). Eligibility is `benchmarks/<bench>/roster.yaml` (open benches: the leaderboard is the list; multi refuses off-roster before GPU time).
 
 ## "Do a sweep of <model>" is an order, not a question
 

@@ -1,5 +1,5 @@
 #!/bin/bash
-# Release sweep on tetra (4x RTX PRO 6000 Blackwell): one model's mega 02 plus cuda 01-04 as
+# Release sweep on tetra (4x RTX PRO 6000 Blackwell): one model's mega 02 plus cuda 01-03 as
 # parallel sessions on ONE GPU (the per-bench GPU locks serialize their GPU commands), then the
 # sequential isolated regrade of exactly those cells on the same GPU with the canonical decks.
 # Different models run at once on different GPUs. This is the Grok 4.7 / Opus 5.5 / GPT-6 recipe.
@@ -53,7 +53,7 @@ log "harness=$HARNESS model=$MODEL effort=${EFFORT:-<harness default>} claude_au
 
 CELLS=(mega:problems/02_kimi_linear_decode
        cuda:problems-rtxpro6000/01_glm52_fused_moe cuda:problems-rtxpro6000/02_deepseek_nsa
-       cuda:problems-rtxpro6000/03_megaqwen_decode cuda:problems-rtxpro6000/04_grid_mingru_sps)
+       cuda:problems-rtxpro6000/03_megaqwen_decode)
 [ -n "${KB_RELEASE_CELLS:-}" ] && read -r -a CELLS <<< "$KB_RELEASE_CELLS"
 read -r -a GPUS <<< "${KB_RELEASE_GPUS:-$GPU}"
 pids=(); ci=0

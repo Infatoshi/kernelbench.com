@@ -1,5 +1,22 @@
 # KernelBench-CUDA — DEVLOG
 
+## 2026-11-09 — `04_grid_mingru_sps` retired; the deck is 01-03
+
+The problem confused readers. Its prompt says final positions and rewards must be exact, but the grader
+excuses position flips at near-ties under 1e-5 logit gap, so a plain-fp16 policy passes. The RTX board
+then ranked the plain-fp16 Opus 5 kernel first at 1.961 while the careful exact designs (Opus 5.5 0.7938,
+Sonnet 5.5 0.9442, Fable 5.2 1.0334) sat at 0.79-1.03: the score rewarded the loophole, not the CUDA.
+
+Removed: the deck dirs `problems-{rtxpro6000,h100,h100sxm}/04_grid_mingru_sps`, 04 from
+`scripts/build_v2_leaderboard.py` PROBLEMS, and 04 from `scripts/tetra_release.sh` (release sweeps are
+now mega 02 plus cuda 01-03). The 25 published 04 run ids moved from `results/published_runs.json`
+`run_ids` to `excluded` ("problem 04 retired 2026-11-09"). `scripts/build_model_index.py` skips 04
+annotations (and the one v0-numbered `03_grid_mingru_sps` grok-4.5 audit from 2026-07-15) so model
+pages and audit counts drop it too. Kept: every archive under `outputs/runs*/` and
+every 04 annotation YAML (history). The 04 entry in `src/eval/numeric_stress.py` stays as a dead key,
+because `src/` is in every problem's graded-surface digest and editing it would stale every published
+01-03 cell (publish gate E) and force a full GPU regrade. Removed stays removed.
+
 ## 2026-09-29 — Claude Sonnet 5.5 [max] on tetra: 4/4 correct, three #1 cells
 
 Cells ran 2026-09-28 12:22 MDT onward, all five (cuda 01-04 plus mega 02) on tetra GPU 0 via

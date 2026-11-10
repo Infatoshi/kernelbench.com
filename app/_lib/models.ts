@@ -126,7 +126,6 @@ export const PROBLEM_LABELS: Record<string, string> = {
   "01_glm52_fused_moe": "GLM-5.2 Fused MoE",
   "02_deepseek_nsa": "DeepSeek NSA",
   "03_megaqwen_decode": "MegaQwen Decode",
-  "04_grid_mingru_sps": "Grid + MinGRU SPS",
   "01_rmsnorm_residual": "RMSNorm + Residual",
   "02_online_softmax": "Online Softmax",
 }
@@ -376,7 +375,6 @@ const PROBLEM_SHORT: Record<string, string> = {
   "01_glm52_fused_moe": "moe",
   "02_deepseek_nsa": "nsa",
   "03_megaqwen_decode": "qwen",
-  "04_grid_mingru_sps": "sps",
 }
 
 export type ChipKind = "pass" | "numerics" | "no_kernel" | "hack" | "fail"
@@ -882,8 +880,8 @@ export function barsForBench(
 //      pct_m = 100 * passed / total, summed over the CANONICAL boards of
 //              every bench the model has any published cells on (a bench the
 //              model never attempted does not enter the denominator).
-//    Worked example (real data): grok-4.5 is 6/6 hard + 1/2 mega + 4/4 cuda
-//    = 11/12 = 91.67% -> bar label rounds to "92%". A model that attempted a
+//    Worked example: a model at 6/6 hard + 1/2 mega + 3/3 cuda
+//    = 10/11 = 90.91% -> bar label rounds to "91%". A model that attempted a
 //    bench and solved nothing renders a real 0% label; a model with no cells
 //    anywhere renders no bar.
 //

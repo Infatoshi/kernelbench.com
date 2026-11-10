@@ -1,13 +1,12 @@
 # KernelBench-CUDA
 
-CUDA-only writing bench (4 problems). Hard and Mega are frozen live boards, so this is a separate deck with the same harness DNA: `src/eval/cuda_language.py` is the hard fail, and a numeric PASS with Triton, a kernel DSL, or pure torch still fails the problem (`cuda_language.json` records `framework` / `triton_cheat`). Live board: `/cuda`. Default deck `problems-rtxpro6000/`; `problems-h100/` and `problems-h100sxm/` exist.
+CUDA-only writing bench (3 problems). Hard and Mega are frozen live boards, so this is a separate deck with the same harness DNA: `src/eval/cuda_language.py` is the hard fail, and a numeric PASS with Triton, a kernel DSL, or pure torch still fails the problem (`cuda_language.json` records `framework` / `triton_cheat`). Live board: `/cuda`. Default deck `problems-rtxpro6000/`; `problems-h100/` and `problems-h100sxm/` exist.
 
 | NN | problem | note |
 | -- | ------- | ---- |
 | 01 | `01_glm52_fused_moe` | GLM-5.2 MoE (E=256, top_k=8, 1 shared); fused; ban Triton |
 | 02 | `02_deepseek_nsa` | NSA-inspired block-select sparse attention; ms-anchored (dense-eq roofline is unreadable) |
 | 03 | `03_megaqwen_decode` | Qwen3-0.6B geometry; improve [MegaQwen](https://github.com/Infatoshi/MegaQwen); decode-only timed at ctx 2k to 128k; `BASELINE.md` in the problem dir |
-| 04 | `04_grid_mingru_sps` | grid + 3xMinGRU(h=256) steps/sec; `peak_sps` 150M is an aspirational ceiling, do not fit it to the best kernel |
 
 ```bash
 kb -b cuda run|sweep|audit|lint|traces-to-hf ...        # from the Mac, remote worker
@@ -15,7 +14,7 @@ cd benchmarks/cuda && uv sync && ./scripts/patch_torch.sh   # on the GPU box
 uv run kbh run grok grok-4.5 problems-rtxpro6000/01_glm52_fused_moe
 ```
 
-Deck is frozen at four; spec-decode tree attention was pitched as a fifth and rejected (2026-07-15), do not re-pitch it. The retired v0 problems (`01_rmsnorm_residual`, `02_online_softmax`) stay retired.
+Deck is frozen at three; spec-decode tree attention was pitched as a fifth problem and rejected (2026-07-15), do not re-pitch it. The retired v0 problems (`01_rmsnorm_residual`, `02_online_softmax`) stay retired, and so does `04_grid_mingru_sps` (retired 2026-11-09, DEVLOG; its archives and annotations stay, `published_runs.json` lists its run ids under `excluded`).
 
 Everything else is shared with Hard and lives in `benchmarks/hard/AGENTS.md`: layout, adding a problem, correctness and numeric stress, results and thin archives, tests, torch policy, the audit YAML schema (`results/annotations/`), and the `KBH_` variables. Harness routes, the shared runner, rented workers: `kbtool/AGENTS.md`. Methodology, including the latency-anchored scoring for `02_deepseek_nsa`: `SPEC.md`. History: `DEVLOG.md`. Publish gates: root `AGENTS.md`.
 
@@ -25,10 +24,10 @@ Everything else is shared with Hard and lives in `benchmarks/hard/AGENTS.md`: la
 
 ## Release sweep on tetra
 
-A new model's board cells are cuda 01-04 plus mega 02 on tetra's RTX PRO 6000s (checkout `~/kernelbench.com`, `git pull` first). One command per model, one GPU per model, up to four models at once:
+A new model's board cells are cuda 01-03 plus mega 02 on tetra's RTX PRO 6000s (checkout `~/kernelbench.com`, `git pull` first). One command per model, one GPU per model, up to four models at once:
 
 ```bash
 nohup scripts/tetra_release.sh <gpu> <harness> <model> [effort] >/dev/null 2>&1 &
 ```
 
-It takes an `overnight-compute` lease on `gpu<N>`, refuses a GPU with compute PIDs, runs the five sessions on that GPU (the per-bench locks serialize their GPU commands), logs the served model ids four minutes in (publish gate 4 early warning), then regrades exactly its own cells sequentially on the same GPU with the canonical decks. Output: `runs/release-<stamp>-<harness>-<model>/` (`pipeline.log`, per-cell logs, `DONE`). Effort follows the root rules (Claude: `max`). Claude cells bill `SWEEP_CLAUDE_OAUTH_TOKEN` from `~/.env_vars` when set (a `claude setup-token` token for the sweep account, mapped to `CLAUDE_CODE_OAUTH_TOKEN` for these runs only), otherwise tetra's own login; `TETRA_RELEASE_CLAUDE_AUTH=login` forces the login even when the token is set. If tetra dies mid-run, `TETRA_RELEASE_RESUME=runs/release-<stamp>-<slug>` on the same command keeps that directory's cells that reached `result.json` and reruns only the rest, then regrades all five. `KB_RELEASE_CELLS` (e.g. `"hard:problems-rtxpro6000/01_fp8_gemm ..."`) replaces the cell list (hard cells regrade too) and `KB_RELEASE_GPUS` (e.g. `"0 1 2 3"`) spreads cells round-robin over those GPUs with one lock dir per GPU (rented multi-GPU boxes, where there is no `overnight-compute`); the regrade still runs alone on `<gpu>` after every cell ends. Pullback, audits, `published_runs.json`, roster tables and publish are `app/AGENTS.md` "After every finished run".
+It takes an `overnight-compute` lease on `gpu<N>`, refuses a GPU with compute PIDs, runs the four sessions on that GPU (the per-bench locks serialize their GPU commands), logs the served model ids four minutes in (publish gate 4 early warning), then regrades exactly its own cells sequentially on the same GPU with the canonical decks. Output: `runs/release-<stamp>-<harness>-<model>/` (`pipeline.log`, per-cell logs, `DONE`). Effort follows the root rules (Claude: `max`). Claude cells bill `SWEEP_CLAUDE_OAUTH_TOKEN` from `~/.env_vars` when set (a `claude setup-token` token for the sweep account, mapped to `CLAUDE_CODE_OAUTH_TOKEN` for these runs only), otherwise tetra's own login; `TETRA_RELEASE_CLAUDE_AUTH=login` forces the login even when the token is set. If tetra dies mid-run, `TETRA_RELEASE_RESUME=runs/release-<stamp>-<slug>` on the same command keeps that directory's cells that reached `result.json` and reruns only the rest, then regrades all four. `KB_RELEASE_CELLS` (e.g. `"hard:problems-rtxpro6000/01_fp8_gemm ..."`) replaces the cell list (hard cells regrade too) and `KB_RELEASE_GPUS` (e.g. `"0 1 2 3"`) spreads cells round-robin over those GPUs with one lock dir per GPU (rented multi-GPU boxes, where there is no `overnight-compute`); the regrade still runs alone on `<gpu>` after every cell ends. Pullback, audits, `published_runs.json`, roster tables and publish are `app/AGENTS.md` "After every finished run".

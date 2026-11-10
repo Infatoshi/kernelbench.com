@@ -1,7 +1,7 @@
 """Build results/leaderboard_v2.json from run archives (KernelBench-CUDA).
 
 v2 environment: KBH_AGENT_CONTAINER=1, parallel sessions, per-command GPU lock,
-4-problem CUDA-only deck. Applies audit verdicts from results/annotations/:
+3-problem CUDA-only deck. Applies audit verdicts from results/annotations/:
 reward_hack cells are kept visible but marked invalid and excluded from
 ceiling ranking; rubric_leak/interesting are valid but flagged.
 """
@@ -29,7 +29,9 @@ except Exception:
     _TORCH_VERSION = "unknown"
 
 _hw = get_hw(os.environ.get("KBH_HARDWARE", "RTX_PRO_6000"))
-PROBLEMS = ["01_glm52_fused_moe","02_deepseek_nsa","03_megaqwen_decode","04_grid_mingru_sps"]
+# 04_grid_mingru_sps retired 2026-11-09 (see DEVLOG); its archives and annotations
+# stay on disk, the board just never collects them again.
+PROBLEMS = ["01_glm52_fused_moe","02_deepseek_nsa","03_megaqwen_decode"]
 
 # run_id -> (verdict, summary)
 ann = {}
@@ -214,7 +216,7 @@ for p in PROBLEMS:
 out = {
     "schema_version": 2,
     "environment": "v2_containerized",
-    "environment_notes": f"KBH_AGENT_CONTAINER=1, parallel sessions, per-command GPU lock, torch {_TORCH_VERSION}; 4-problem CUDA-only deck (language gate: Triton/DSL fail)",
+    "environment_notes": f"KBH_AGENT_CONTAINER=1, parallel sessions, per-command GPU lock, torch {_TORCH_VERSION}; 3-problem CUDA-only deck (language gate: Triton/DSL fail)",
     "hardware": {"name":_hw.name,"sm":_hw.sm,"vram_gb":_hw.vram_gb,"peak_bandwidth_gb_s":_hw.peak_bandwidth_gb_s},
     "problems": PROBLEMS,
     "models": sorted(models, key=lambda m: -m["valid_pass_count"]),

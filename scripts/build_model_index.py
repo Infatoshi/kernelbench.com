@@ -153,6 +153,13 @@ _TAG_TAIL = re.compile(r"\s*\[[^\]]*\]\s*$")
 _TS_PREFIX = re.compile(r"^\d{8}_\d{6}_")
 KNOWN_PROBLEMS: set[str] = set()
 ACTIVE_PROBLEMS: dict[str, set[str]] = {}
+# Problems removed from a deck whose annotations stay on disk as history. Their
+# audits are skipped entirely (no cells, no outcomes, no audited counts), so a
+# retired problem never reappears on a model page. Removed stay removed.
+RETIRED_PROBLEMS: dict[str, set[str]] = {
+    # retired 2026-11-09, benchmarks/cuda/DEVLOG.md; 03_ is the same problem in the v0 deck numbering
+    "cuda": {"04_grid_mingru_sps", "03_grid_mingru_sps"},
+}
 
 
 def slugify(model_field: str) -> str:
@@ -664,9 +671,11 @@ def should_replace_annotation_cell(
 
 
 def join_annotations(models: Models, bench: str, ann_dir: Path) -> tuple[list[str], int]:
-    """Attach audit counts + flag lists. Returns (annotation-only slugs, n_files)."""
+    """Attach audit counts + flag lists. Returns (annotation-only slugs, n_files),
+    n_files excluding annotations of RETIRED_PROBLEMS (skipped on purpose)."""
     files = [f for f in annotation_files(ann_dir) if f.exists()]
     annotation_only: set[str] = set()
+    n_retired = 0
     for f in files:
         try:
             a = yaml.safe_load(f.read_text()) or {}
@@ -674,6 +683,10 @@ def join_annotations(models: Models, bench: str, ann_dir: Path) -> tuple[list[st
             print(f"  WARN: yaml parse fallback {f.name}")
             a = regex_annotation(f.read_text())
         run_id = a.get("run_id") or f.stem
+        retired = RETIRED_PROBLEMS.get(bench, set())
+        if a.get("problem") in retired or any(run_id.endswith("_" + p) for p in retired):
+            n_retired += 1
+            continue
         model_field = (a.get("model") or "").strip() if isinstance(a.get("model"), str) else ""
         if not model_field:
             model_field = model_from_run_id(run_id) or ""
@@ -877,7 +890,9 @@ def join_annotations(models: Models, bench: str, ann_dir: Path) -> tuple[list[st
                 )
                 if flagged or cell.get("verdict") in (None, "unaudited"):
                     cell["verdict"] = eff
-    return sorted(annotation_only), len(files)
+    if n_retired:
+        print(f"  {bench}: skipped {n_retired} annotations of retired problems {sorted(RETIRED_PROBLEMS[bench])}")
+    return sorted(annotation_only), len(files) - n_retired
 
 
 # Problems excluded from the perf aggregate while their cells remain in

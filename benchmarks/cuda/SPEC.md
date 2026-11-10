@@ -1,10 +1,10 @@
 # KernelBench-CUDA: Design Specification
 
-Last updated: 2026-07-16.
+Last updated: 2026-11-09.
 
 ## Purpose
 
-Four hard **CUDA-only** problems. Hard/Mega stay frozen. Language gate fails
+Three hard **CUDA-only** problems. Hard/Mega stay frozen. Language gate fails
 Triton/DSL and pure PyTorch without a kernel.
 
 ## Perfect stack (v1)
@@ -14,7 +14,10 @@ Triton/DSL and pure PyTorch without a kernel.
 | 01 | `glm52_fused_moe` | GLM-5.2 MoE (256+shared, top-8) fused; ban Triton/vllm |
 | 02 | `deepseek_nsa` | Chinese weird arch: block top-n + sparse attn |
 | 03 | `megaqwen_decode` | Improve known MegaQwen CUDA megakernel geometry |
-| 04 | `grid_mingru_sps` | Non-LLM RL sim SPS; fusion optional |
+
+Problem 04 (grid + MinGRU RL sim SPS) was retired 2026-11-09: its prompt
+promised exact positions and rewards while the grader excused sub-1e-5 near-tie
+flips, so the board rewarded plain fp16 over exact designs. See DEVLOG.md.
 
 ## Language gate
 
@@ -28,7 +31,6 @@ off-alignment / serving tails (e.g. T=4127, S not multiple of NSA block_size).
 - 01, 02: roofline peak_fraction (dense-eq FLOPs where relevant)
 - 03: **decode-only** tok/s at ctx ∈ {2k,8k,32k,128k}; prefill untimed; pure
   numeric last_hidden (no tokenizer)
-- 04: SPS vs `peak_sps` (150M)
 
 **Latency-anchored relative scoring (standing rule, 2026-07-15).** Where a
 roofline ceiling is structurally unreadable (dense-equivalent FLOPs that a
@@ -55,4 +57,4 @@ uv run kbh run grok grok-4.5 problems-rtxpro6000/01_vllm_fused_moe
 - Paged-attn rematch of Hard
 - MLA isolate (use mega decode instead)
 - Lightning / Mamba
-- Spec-decode tree attention (rejected 2026-07-15; deck stays at four)
+- Spec-decode tree attention (rejected 2026-07-15; deck stays at three since 2026-11-09)
