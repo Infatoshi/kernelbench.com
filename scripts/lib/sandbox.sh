@@ -164,8 +164,13 @@ kbh_sandbox_init() {
 
     # --- session-history overlays (NOT the whole dotdirs: auth must survive) -
     local host_dir sub
+    # agy (Antigravity CLI) keeps prior conversations, summaries and annotations under
+    # ~/.gemini/antigravity-cli; its OAuth token sits beside them and stays visible.
     for sub in ".grok/sessions" ".codex/sessions" \
-               ".gemini/tmp" ".local/share/opencode/storage"; do
+               ".gemini/tmp" ".local/share/opencode/storage" \
+               ".gemini/antigravity-cli/brain" ".gemini/antigravity-cli/conversations" \
+               ".gemini/antigravity-cli/annotations" ".gemini/antigravity-cli/implicit" \
+               ".gemini/antigravity-cli/knowledge"; do
         host_dir="$HOME/$sub"
         [ -d "$(dirname "$host_dir")" ] || continue
         mkdir -p "$agent_home/$sub"
@@ -184,7 +189,10 @@ kbh_sandbox_init() {
     local op_files=(.claude.json .codex/AGENTS.md .codex/hooks.json .gemini/GEMINI.md
                     .grok/AGENTS.md AGENTS.md CLAUDE.md .env_vars .kbm_env)
     # dev/belt also takes the `belt` CLI with it (~/.local/bin/belt is a symlink into it).
-    local op_dirs=(.agents .codex/skills .omp .pi dev/belt)
+    # .gemini/config is agy's hooks.json, mcp_config, skills and instruction links (fleet sync
+    # added a belt-command-timer PreToolUse hook on 2026-11-09; with dev/belt hidden it failed
+    # every tool call and all four Gemini 4 Carbon cells on 2026-11-10 quit in 5 minutes).
+    local op_dirs=(.agents .codex/skills .omp .pi dev/belt .gemini/config .gemini/skills)
     local op
     mkdir -p "$run_dir/.sandbox"
     : > "$run_dir/.sandbox/empty"

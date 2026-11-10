@@ -4,6 +4,25 @@ A running record of decisions, dead ends, and lessons. Newest entries on top. Th
 
 ---
 
+## 2026-11-10 — agy read its own hook and history dirs; sandbox now hides those too
+
+Gemini 4 Carbon high release on tetra gpu2 (`runs/release-20261110_112532-agy-gemini-4-carbon-high`)
+ended in 5 minutes, all four cells `no_solution`. Fleet sync had added `~/.gemini/config/` on
+11-09 21:19 (agy's `hooks.json`, `mcp_config.json`, skills, AGENTS.md/GEMINI.md links). Its
+`belt-command-timer` PreToolUse hook ran `python3 ~/dev/belt/...`, which the sandbox hides, so
+agy rejected every tool call and each agent stopped asking for the hook to be fixed. The instruction
+links resolve into `~/.claude` (already an empty tmpfs), so no operator text reached the model.
+Second hole found in the same look: agy's prior conversations (`~/.gemini/antigravity-cli/brain`,
+`conversations`, `annotations`, `implicit`, `knowledge`) were visible, including earlier agy runs on
+these problems. Fix: tmpfs `.gemini/config` and `.gemini/skills`, overlay the five agy stores with
+per-run dirs under `agent_home` (OAuth token beside them stays visible; the run's own brain/scratch
+now lands in its archive, no manual `agy_brain` copy). The published Argon mega 02 and cuda NSA
+archives each reference exactly one brain id (their own scratch), so no sign they read another
+conversation. OPERATOR-CONTEXT tripwire
+also matches agy's `jsonhook__belt-` text. The four dead archives were deleted; relaunched same day.
+
+---
+
 ## 2026-11-09 — host-mode agents loaded the operator's own agent context; sandbox now blanks it
 
 Fable 5.2 high release on tetra gpu2 (`runs/release-20261109_140206-claude-claude-fable-5-2`) was

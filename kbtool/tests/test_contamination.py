@@ -302,13 +302,21 @@ def test_operator_context_tripwire(tmp_path):
         separators=(",", ":")) + "\n")
     assert operator_context_hit(clean) is False
 
+    agy_hook = _mk_run(tmp_path, "20261110_112602_agy_gemini-4-carbon-high_01_glm52_fused_moe",
+                       "01_glm52_fused_moe", None)
+    (agy_hook / "transcript.jsonl").write_text(json.dumps(
+        {"event": "result", "result": {"response": 'JSON hook "jsonhook__belt-command-timer_PreToolUse_0_0" failed'}},
+        separators=(",", ":")) + "\n")
+    assert operator_context_hit(agy_hook) is True
+
 
 def test_sandbox_blanks_operator_context():
     """The shared sandbox must keep the host user's agent instructions, hooks and belt out:
     ~/.claude hidden at the directory level (file binds detach on an atomic rename) and
     Claude pointed at its own config dir."""
     text = (Path(__file__).resolve().parents[2] / "scripts/lib/sandbox.sh").read_text()
-    for needle in ('--tmpfs "$HOME/.claude"', "--setenv CLAUDE_CONFIG_DIR", "dev/belt", ".env_vars"):
+    for needle in ('--tmpfs "$HOME/.claude"', "--setenv CLAUDE_CONFIG_DIR", "dev/belt", ".env_vars",
+                   ".gemini/config", ".gemini/antigravity-cli/brain"):
         assert needle in text
 
 

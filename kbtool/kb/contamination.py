@@ -197,7 +197,8 @@ def honeytoken_hit(run_dir: Path) -> bool:
     return False
 
 
-_OPERATOR_CONTEXT = re.compile(r'"command": ?"belt[ "]|belt: procedures, tools, gates')
+# agy reports a host hook as `jsonhook__<name>_<Event>` (2026-11-10 Gemini 4 Carbon cells).
+_OPERATOR_CONTEXT = re.compile(r'"command": ?"belt[ "]|belt: procedures, tools, gates|jsonhook__belt-')
 
 
 def operator_context_hit(run_dir: Path) -> bool:
