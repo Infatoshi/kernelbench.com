@@ -10,6 +10,7 @@ import type { ModelIndex } from "./models"
 const LIVE_MODEL_SLUGS = new Set([
   "claude-fable-5",
   "claude-fable-5-1",
+  "claude-fable-5-2",
   "claude-opus-5",
   "deepseek-flash",
   "deepseek-v4-flash-0731",

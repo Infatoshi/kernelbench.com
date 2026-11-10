@@ -1,0 +1,1511 @@
+"""Kimi-Linear W4A16 hybrid decode unit -- single-launch CUDA megakernel.
+
+The whole per-token forward (3x KDA + 1x MLA, each followed by the 64-expert MoE)
+runs as ONE persistent CUDA kernel launch per `step()` (188 blocks, one per SM):
+
+  * Every int4 projection is a fused dequant-GEMV.  A warp loads a 512-byte tile of
+    packed 4-bit weights (16 output columns x 64 inputs), splits it into its two
+    nibble planes in registers and multiplies them on the integer tensor cores
+    (mma m16n8k32, u8 x s8 -> s32) against the activation vector, which is held as
+    16-bit fixed point = two signed base-256 digit planes per 64-element slab.  The
+    per-group scale / zero-point (inlined in the weight stream) is applied to the s32
+    partial sums:  y += s * (xs * sum(q*w) - z * xs * sum(q)).  The bf16 weight matrix
+    is never materialised and every int4 byte is read exactly once per token.
+  * The phases of the forward (RMSNorm + projections + short conv, KDA state update,
+    o_proj, router, top-8 + expert gate/up, expert down, and for MLA the absorb /
+    two-pass latent-cache attention) are separated by grid-wide barriers *inside* the
+    kernel (one atomic counter), so there is exactly one kernel launch per token.
+  * MLA uses the "absorb" formulation: W_kvb is folded into the query (q_abs) and
+    into the output (u @ W_v), so the latent cache is only ever touched as the
+    compressed L x 512 bf16 matrix (two bf16 tensor-core passes over it).
+  * Memory system: the token-invariant attention weights are kept L2-resident (128 MB
+    L2); expert weights are streamed with evict-first loads (ld.global.cs) so they do
+    not displace them.  At short contexts a few blocks of the same launch warm the
+    experts the router is predicted to choose (speculative prefetch; never affects
+    the result).  Data handed from one phase to the next lives in write-once per-layer
+    scratch arrays because the per-SM L1 is not coherent across SMs within a launch.
+  * Activations follow the model's bf16 rounding points exactly (residual stream,
+    RMSNorm outputs, projection outputs, router logits), so routing decisions agree
+    with the reference; accumulation is fp32 / exact integer.
+
+The int4 weights are re-laid-out once at load time (same 4-bit values, permuted so a
+warp reads its tensor-core operand tile as one contiguous 512-byte chunk, with the
+per-group scale/zero inlined in the stream).  Nothing here imports a prebuilt
+quantised kernel or model stack, and there is no CUDA graph / torch.compile.
+"""
+from __future__ import annotations
+
+import os
+import struct
+from dataclasses import dataclass, field
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+OP_TYPE = "kimi_linear_w4a16_decode"
+EPS = 1.0e-6
+GROUP_SIZE = 128
+
+
+@dataclass(frozen=True)
+class Config:
+    hidden: int = 2304
+    kda_heads: int = 32
+    kda_head_dim: int = 128
+    short_conv: int = 4
+    mla_heads: int = 32
+    kv_lora: int = 512
+    qk_nope: int = 128
+    qk_rope: int = 64
+    v_head: int = 128
+    rope_theta: float = 10000.0
+    n_experts: int = 64
+    n_active: int = 8
+    n_shared: int = 1
+    moe_inter: int = 1024
+    routed_scaling: float = 2.446
+    group: int = 128
+    pattern: tuple = ("K", "K", "K", "M")
+    dtype: torch.dtype = field(default=torch.bfloat16)
+
+
+def build_config(shape: dict) -> Config:
+    return Config(n_experts=int(shape.get("n_experts", 64)))
+
+
+# --------------------------------------------------------------------------- #
+# CUDA megakernel source
+# --------------------------------------------------------------------------- #
+_CUDA_SRC = r"""
+#include <cuda_runtime.h>
+#include <stdint.h>
+#include <string.h>
+#include <math.h>
+
+typedef unsigned int u32;
+typedef unsigned short u16;
+typedef unsigned char u8;
+typedef unsigned long long u64;
+
+#define NTHR 1024        /* threads per block (32 warps), one block per SM */
+#define HID 2304
+#define CH 4096
+#define DK 128
+#define GB 1088          /* bytes per packed int4 group: 2 x 512B tiles + 64B scale/zero */
+#define RSLABS 2448      /* 512B slabs per expert matrix (gate, up and down are all 1,253,376 B) */
+#define QSC 32512.0f     /* activations -> 16-bit fixed point = 2 signed base-256 digits */
+#define XS 34            /* smem words per activation slab: 32 operand words + xs + xs*sum */
+#define MAXL 8
+
+/* Scratch layout (4-byte words).  Word 0 = grid-barrier counter.  Everything else is
+   per layer and WRITE-ONCE per launch: each array is written in exactly one phase and
+   only read in later phases, and every array starts on a 256-byte boundary.  That is
+   what makes plain (L1-cached) loads safe: the per-SM L1 is not coherent across SMs
+   within a launch, so a line must never be modified after some SM has read it. */
+#define SO_HA     0          /* [2304]  residual after attention            */
+#define SO_HM     2304       /* [2304]  residual after MoE                  */
+#define SO_ACCP   4608       /* [16384] projection outputs                  */
+#define SO_BETA   20992      /* [64]                                        */
+#define SO_LOGITS 21056      /* [1024]                                      */
+#define SO_OREC   22080      /* [4096] o_proj input vector                  */
+#define SO_HH     26176      /* [9][16 slabs][64] expert hidden operand records */
+#define SO_MGLOB  35392      /* [64]                                        */
+#define SO_ZPART  35456      /* [256 blocks][32]   softmax denominator partials        */
+#define SO_UPART  43648      /* [256 blocks][2048] attention-weighted latent partials  */
+#define SO_SEL    567936     /* [64] routed expert ids of the most recent token (prefetch prediction) */
+#define LSZ       568000
+#define SCR_WORDS (64 + MAXL * LSZ)
+
+struct LayerP {
+    int kind, L, adopt, pad;
+    const u16* norm_a; const u16* norm_m;
+    const u8* w_a; const u8* w_b; const u8* w_o;
+    const u16* beta_w; const u16* conv_w; const u16* router;
+    const u8* w_gate; const u8* w_up; const u8* w_down;
+    float* S; u16* cq; u16* ck; u16* cv;
+    const u8* kvbT; const u8* kvbV; const u16* kvb_s; const u16* kvb_z;
+    const u16* src_c; const u16* src_k; u16* dst_c; u16* dst_k;
+    u32* PB; float* MT; float* ZT; u16* QABS; u16* QROPE;
+};
+struct KArgs {
+    LayerP Ly[MAXL];
+    float invf[32];
+    const u16* hid_in; u16* hid_out; float* scr;
+    int nl, E; u32 base; u32 flags;
+    float rscale, mla_scale;
+    int npf;                 /* number of prefetch-only blocks (the last npf blocks of the grid) */
+    u32 stamp;               /* unique per launch */
+};
+
+/* ------------------------------------------------------------------ helpers */
+__device__ __forceinline__ float bf2f(u32 b16) { return __uint_as_float(b16 << 16); }
+__device__ __forceinline__ u32 f2bf(float f) {            /* round-to-nearest-even to bf16 bits */
+    u32 u = __float_as_uint(f);
+    return (u + 0x7FFFu + ((u >> 16) & 1u)) >> 16;
+}
+__device__ __forceinline__ float rbf(float f) { return bf2f(f2bf(f)); }
+__device__ __forceinline__ float sigm(float x) { return 1.f / (1.f + __expf(-x)); }
+__device__ __forceinline__ int fkey(float f) { int i = __float_as_int(f); return i >= 0 ? i : (i ^ 0x7FFFFFFF); }
+__device__ __forceinline__ float fkeyinv(int i) { return __int_as_float(i >= 0 ? i : (i ^ 0x7FFFFFFF)); }
+
+/* weight-stream loads; CS = evict-first (routed-expert weights are streamed once per
+   token, keep them from displacing the token-invariant weights in L2) */
+template<bool CS> __device__ __forceinline__ uint4 ldw4(const uint4* p) {
+    uint4 r;
+    if (CS) asm volatile("ld.global.cs.v4.u32 {%0,%1,%2,%3}, [%4];" : "=r"(r.x), "=r"(r.y), "=r"(r.z), "=r"(r.w) : "l"(p));
+    else r = *p;
+    return r;
+}
+template<bool CS> __device__ __forceinline__ uint2 ldw2(const uint2* p) {
+    uint2 r;
+    if (CS) asm volatile("ld.global.cs.v2.u32 {%0,%1}, [%2];" : "=r"(r.x), "=r"(r.y) : "l"(p));
+    else r = *p;
+    return r;
+}
+/* integer tensor-core op: D[16x8] += A[16x32](u8) * B[32x8](s8).  (The native 4-bit
+   variant of this instruction is ~7x slower on this GPU, so the int4 weights are split
+   into even/odd-k nibble planes in registers and fed to the 8-bit one instead.) */
+#define MMA_U8(c, a0, a1, a2, a3, b0, b1) \
+    asm volatile("mma.sync.aligned.m16n8k32.row.col.s32.u8.s8.s32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};" \
+        : "+r"(c[0]), "+r"(c[1]), "+r"(c[2]), "+r"(c[3]) : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1))
+#define NIB 0x0F0F0F0Fu
+/* one packed 64-k tile (4 regs x 8 nibbles) against the slab operand x (4 words per lane) */
+#define TILE_U8(c, AA, XO, l7) { \
+    MMA_U8(c, (AA).x & NIB, (AA).y & NIB, (AA).z & NIB, (AA).w & NIB, (XO)[(l7)], (XO)[(l7) + 1]); \
+    MMA_U8(c, ((AA).x >> 4) & NIB, ((AA).y >> 4) & NIB, ((AA).z >> 4) & NIB, ((AA).w >> 4) & NIB, (XO)[(l7) + 2], (XO)[(l7) + 3]); }
+
+#define MMA_BF(d0, d1, d2, d3, a0, a1, a2, a3, b0, b1) \
+    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};" \
+        : "+f"(d0), "+f"(d1), "+f"(d2), "+f"(d3) : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1))
+
+/* grid-wide barrier between phases of the single launch */
+__device__ __forceinline__ void grid_barrier(u32* ctr, u32 target) {
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        __threadfence();
+        atomicAdd(ctr, 1u);
+        while ((int)(*(volatile u32*)ctr - target) < 0) { }
+    }
+    __syncthreads();
+}
+
+__device__ __forceinline__ float warp_sum(float v) {
+    v += __shfl_xor_sync(0xffffffffu, v, 16); v += __shfl_xor_sync(0xffffffffu, v, 8);
+    v += __shfl_xor_sync(0xffffffffu, v, 4);  v += __shfl_xor_sync(0xffffffffu, v, 2);
+    v += __shfl_xor_sync(0xffffffffu, v, 1);
+    return v;
+}
+
+/* Activation -> tensor-core operand.  8 consecutive lanes own one 64-element slab
+   (8 values per lane).  Values are scaled by the slab max to 16-bit fixed point q and
+   split into 2 signed base-256 digits ((q + 0x8080) ^ 0x8080 yields both s8 digits);
+   w[] = {lo digits of the even k, lo/odd, hi/even, hi/odd} (4 x s8 each).
+   xs = fixed-point step, xsq = xs * sum_i zw[i]*q[i] (for the zero-point correction).
+   Must be executed by all 32 lanes of the warp (shuffles). */
+__device__ __forceinline__ void digitize8(const float* v, const float* zw, u32* w, float& xs, float& xsq) {
+    float m = fmaxf(fmaxf(fmaxf(fabsf(v[0]), fabsf(v[1])), fmaxf(fabsf(v[2]), fabsf(v[3]))),
+                    fmaxf(fmaxf(fabsf(v[4]), fabsf(v[5])), fmaxf(fabsf(v[6]), fabsf(v[7]))));
+    m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, 1));
+    m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, 2));
+    m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, 4));
+    const float sc = (m > 0.f) ? (QSC / m) : 0.f;
+    u32 u[8]; float qf[8];
+#pragma unroll
+    for (int i = 0; i < 8; i++) {
+        const int q = __float2int_rn(v[i] * sc);
+        qf[i] = (zw ? zw[i] : 1.f) * (float)q;
+        u[i] = (((u32)(q + 0x8080)) ^ 0x8080u) & 0xFFFFu;
+    }
+    float zq = ((qf[0] + qf[1]) + (qf[2] + qf[3])) + ((qf[4] + qf[5]) + (qf[6] + qf[7]));
+    w[0] = (u[0] & 0xFFu) | ((u[2] & 0xFFu) << 8) | ((u[4] & 0xFFu) << 16) | (u[6] << 24);
+    w[1] = (u[1] & 0xFFu) | ((u[3] & 0xFFu) << 8) | ((u[5] & 0xFFu) << 16) | (u[7] << 24);
+    w[2] = (u[0] >> 8) | ((u[2] >> 8) << 8) | ((u[4] >> 8) << 16) | ((u[6] >> 8) << 24);
+    w[3] = (u[1] >> 8) | ((u[3] >> 8) << 8) | ((u[5] >> 8) << 16) | ((u[7] >> 8) << 24);
+    zq += __shfl_xor_sync(0xffffffffu, zq, 1);
+    zq += __shfl_xor_sync(0xffffffffu, zq, 2);
+    zq += __shfl_xor_sync(0xffffffffu, zq, 4);
+    xs = m * (1.f / QSC);
+    xsq = xs * zq;
+}
+/* store one lane's part of a slab operand record: j8 = lane index within the slab (0..7).
+   record word [(digit*4 + tid)*4 + parity*2 + half]; words 32/33 = xs, xsq. */
+__device__ __forceinline__ void put_slab(u32* rec, int j8, const u32* w, float xs, float xsq) {
+    const int td = (j8 & 3) * 4, half = j8 >> 2;
+    rec[td + half] = w[0]; rec[td + 2 + half] = w[1];
+    rec[16 + td + half] = w[2]; rec[16 + td + 2 + half] = w[3];
+    if (j8 == 0) { rec[32] = __float_as_uint(xs); rec[33] = __float_as_uint(xsq); }
+}
+
+/* Block-level RMSNorm + operand prep (all threads of the block call it):
+   x = bf16(src * rsqrt(mean(src^2)+eps) * wn), HID elements -> slab operands in xw
+   (XS words per 64-element slab) and float copy in xf.
+   SRC 0: fp32 scratch (write-once array), SRC 1: bf16 input vector. */
+template<int SRC>
+__device__ __forceinline__ void prep_norm(const void* src, const u16* wn, u32* xw, float* xf, float* red) {
+    const int t = threadIdx.x, lane = t & 31, warp = t >> 5;
+    const bool mine = warp < (HID >> 8);
+    float v[8];
+    uint4 r;
+    if (mine) {
+        if (SRC == 0) {
+            const float4 p = *(const float4*)((const float*)src + 8 * t), q = *(const float4*)((const float*)src + 8 * t + 4);
+            v[0] = p.x; v[1] = p.y; v[2] = p.z; v[3] = p.w; v[4] = q.x; v[5] = q.y; v[6] = q.z; v[7] = q.w;
+        } else {
+            const uint4 h = *((const uint4*)src + t);
+            v[0] = bf2f(h.x & 0xFFFFu); v[1] = bf2f(h.x >> 16); v[2] = bf2f(h.y & 0xFFFFu); v[3] = bf2f(h.y >> 16);
+            v[4] = bf2f(h.z & 0xFFFFu); v[5] = bf2f(h.z >> 16); v[6] = bf2f(h.w & 0xFFFFu); v[7] = bf2f(h.w >> 16);
+        }
+        r = *((const uint4*)wn + t);
+        float ss = ((v[0] * v[0] + v[1] * v[1]) + (v[2] * v[2] + v[3] * v[3])) + ((v[4] * v[4] + v[5] * v[5]) + (v[6] * v[6] + v[7] * v[7]));
+        ss = warp_sum(ss);
+        if (lane == 0) red[warp] = ss;
+    }
+    __syncthreads();
+    if (mine) {
+        const float tot = ((red[0] + red[1]) + (red[2] + red[3])) + ((red[4] + red[5]) + (red[6] + red[7])) + red[8];
+        const float rs = rsqrtf(tot * (1.f / HID) + 1.0e-6f);
+        v[0] = rbf(v[0] * rs * bf2f(r.x & 0xFFFFu)); v[1] = rbf(v[1] * rs * bf2f(r.x >> 16));
+        v[2] = rbf(v[2] * rs * bf2f(r.y & 0xFFFFu)); v[3] = rbf(v[3] * rs * bf2f(r.y >> 16));
+        v[4] = rbf(v[4] * rs * bf2f(r.z & 0xFFFFu)); v[5] = rbf(v[5] * rs * bf2f(r.z >> 16));
+        v[6] = rbf(v[6] * rs * bf2f(r.w & 0xFFFFu)); v[7] = rbf(v[7] * rs * bf2f(r.w >> 16));
+#pragma unroll
+        for (int i = 0; i < 8; i++) xf[8 * t + i] = v[i];
+        u32 w[4]; float s_, sq_;
+        digitize8(v, nullptr, w, s_, sq_);
+        put_slab(xw + (t >> 3) * XS, t & 7, w, s_, sq_);
+    }
+    __syncthreads();
+}
+
+/* Fused int4 dequant-GEMV over packed groups [g0,g1) of one 16-output column tile.
+   Per group: two 512B int4 tiles are loaded once, split into nibble planes in registers
+   and multiplied on the integer tensor cores against the s8 digit planes of x (operand
+   records, STR words per slab); then the per-group scale / zero-point (inlined 64B) are
+   applied to the s32 sums:  y += s * (xs * sum(q*w) - z * xs * sum(q)).
+   Lane tid==0 of quad `grp` ends up with outputs grp and grp+8 of the tile. */
+template<bool CS, int STR>
+__device__ __forceinline__ void gemv_groups(const u8* base, int g0, int g1, const u32* xw, int lane, float& acc0, float& acc1) {
+    const int l7 = (lane & 7) * 4;
+    for (int g = g0; g < g1; g++) {
+        const u8* p = base + (size_t)g * GB;
+        const uint4 A0 = ldw4<CS>((const uint4*)p + lane);
+        const uint4 A1 = ldw4<CS>((const uint4*)(p + 512) + lane);
+        const uint2 mt = ldw2<CS>((const uint2*)(p + 1024) + (lane >> 2));
+        const u32* x0 = xw + (2 * g) * STR;
+        const u32* x1 = x0 + STR;
+        int c[4] = {0, 0, 0, 0}, d[4] = {0, 0, 0, 0};
+        TILE_U8(c, A0, x0, l7);
+        TILE_U8(d, A1, x1, l7);
+        const float xs0 = __uint_as_float(x0[32]), xs1 = __uint_as_float(x1[32]);
+        const float xq = __uint_as_float(x0[33]) + __uint_as_float(x1[33]);
+        const float sA = __uint_as_float(mt.x << 16), sB = __uint_as_float(mt.x & 0xFFFF0000u);
+        const float zA = __uint_as_float(mt.y << 16), zB = __uint_as_float(mt.y & 0xFFFF0000u);
+        const float fa = xs0 * (float)(c[0] + 256 * c[1]) + xs1 * (float)(d[0] + 256 * d[1]) - zA * xq;
+        const float fb = xs0 * (float)(c[2] + 256 * c[3]) + xs1 * (float)(d[2] + 256 * d[3]) - zB * xq;
+        acc0 = fmaf(sA, fa, acc0);
+        acc1 = fmaf(sB, fb, acc1);
+    }
+}
+
+/* dot of smem floats with a bf16 row, pairs p = lane + 32 i < npairs */
+__device__ __forceinline__ float dot_bf(const float* xfp, const u16* w, int npairs, int lane) {
+    float s = 0.f;
+    for (int p = lane; p < npairs; p += 32) {
+        const u32 ww = *(const u32*)(w + 2 * p);
+        s += xfp[2 * p] * bf2f(ww & 0xFFFFu) + xfp[2 * p + 1] * bf2f(ww >> 16);
+    }
+    return s;
+}
+
+/* Speculative weight prefetcher, run by the last `npf` blocks of the grid inside the same
+   launch (only used when the L2 has room for it).  The expert weights are the only part
+   of the token's weight stream that is not L2-resident; while the worker blocks run the
+   L2-bound attention phases the DRAM would sit idle.  These blocks pull the experts the
+   router is predicted to pick (the previous token's choice for that layer, replaced by
+   the actual choice as soon as the workers publish it) into L2 just ahead of the phase
+   that consumes them.  It is purely a cache warm-up: the workers still read and use
+   every weight themselves, so a wrong guess only wastes bandwidth. */
+__device__ __noinline__ void prefetcher(const KArgs& a, int NBW, volatile int* pf_state, int* pf_sel) {
+    const int t = threadIdx.x, lane = t & 31, warp = t >> 5;
+    const int b = blockIdx.x;
+    const u32* const ctr = (const u32*)a.scr;
+    const int nl = a.nl;
+    const int nrl = 27;                               /* expert matrices per layer: (8 routed + shared) x (gate, up, down) */
+    const int n5 = 18;                                /* gate/up matrices (consumed by the gate/up phase) */
+    if (t == 0) { pf_state[0] = 0; pf_state[1] = 0; }
+    if (t < nl * 8) pf_sel[t] = ((const int*)(a.scr + 64 + (size_t)(t >> 3) * LSZ + SO_SEL))[t & 7];   /* last token's experts */
+    __syncthreads();
+    if (warp == 0) {
+        /* poller warp: follows the workers' phase counter and the published expert choices */
+        for (;;) {
+            int done = 0;
+            if (lane == 0) {
+                const u32 c = *(const volatile u32*)ctr;
+                done = (*(const volatile u32*)(ctr + 16) == a.stamp) ? 1 : 0;
+                pf_state[0] = (int)(c - a.base) / NBW;           /* barriers completed by all workers */
+                if (done) pf_state[1] = 1;
+            }
+            if (lane < nl * 8) pf_sel[lane] = *(const volatile int*)((const int*)(a.scr + 64 + (size_t)(lane >> 3) * LSZ + SO_SEL) + (lane & 7));
+            done = __shfl_sync(0xffffffffu, done, 0);
+            if (done) break;
+        }
+    } else {
+        const int npw = a.npf * 31, pw = (b - NBW) * 31 + (warp - 1);
+        const int s0 = (int)(((long long)pw * RSLABS) / npw), s1 = (int)(((long long)(pw + 1) * RSLABS) / npw);
+        u32 acc = 0;
+        int ph = 0, prev5 = -8;
+        for (int l = 0; l < nl; l++) {
+            const LayerP& P = a.Ly[l];
+            const int p5 = ph + (P.kind ? 8 : 5);    /* barriers completed once layer l's gate/up phase is done */
+            ph = p5 + 1;
+            /* stage 0: gate/up matrices of layer l -- from the moment the workers enter layer l
+               until its gate/up phase starts (then the workers stream them themselves);
+               stage 1: its down matrices, until the down phase starts. */
+            const int startA = prev5 + 1;
+            prev5 = p5;
+            while (pf_state[0] < startA) { if (pf_state[1]) goto out; }
+#pragma unroll 1
+            for (int stage = 0; stage < 2; stage++) {
+                const int nk = stage ? (nrl - n5) : n5;
+                const int stop_at = stage ? p5 : (p5 - 1);
+#pragma unroll 1
+                for (int i = 0; i < nk; i++) {
+                    if (pf_state[1]) goto out;
+                    if (pf_state[0] >= stop_at) break;
+                    /* every warp walks the matrices in a different rotation, so at any moment all
+                       of them are covered to the same fraction (the workers read them all at once) */
+                    const int k = (stage ? n5 : 0) + (i + pw * 5) % nk;
+                    const u8* base; int j;
+                    if (k < 9) { base = P.w_gate; j = k; } else if (k < 18) { base = P.w_up; j = k - 9; } else { base = P.w_down; j = k - 18; }
+                    const int e = (j < 8) ? min(max(pf_sel[l * 8 + j], 0), a.E - 1) : a.E;
+                    const uint4* p = (const uint4*)(base + (size_t)e * ((size_t)RSLABS * 512)) + lane;
+                    int sidx = s0;
+                    for (; sidx + 1 < s1; sidx += 2) {
+                        const uint4 v = p[(size_t)sidx * 32], v2 = p[(size_t)(sidx + 1) * 32];
+                        acc ^= v.x ^ v.y ^ v.z ^ v.w ^ v2.x ^ v2.y ^ v2.z ^ v2.w;
+                    }
+                    if (sidx < s1) { const uint4 v = p[(size_t)sidx * 32]; acc ^= v.x ^ v.y ^ v.z ^ v.w; }
+                }
+            }
+        }
+out:
+        if (acc == 0x9E3779B9u) ((volatile u32*)a.scr)[32 + (t & 15)] = acc;     /* keep the loads live */
+    }
+}
+
+/* =========================================================== the megakernel */
+__global__ void __launch_bounds__(NTHR, 1) kimi_mega(const KArgs a)
+{
+    __shared__ u32 xw[64 * XS];
+    __shared__ float xf[HID];
+    __shared__ float red[1024];
+    __shared__ float wk[4096];
+    __shared__ int ssel[8];
+    __shared__ float sselw[8];
+
+    const int t = threadIdx.x, lane = t & 31, warp = t >> 5, grp = lane >> 2, tid = lane & 3;
+    const int b = blockIdx.x;
+    const int NB = (int)gridDim.x - a.npf;             /* worker blocks; the rest only prefetch */
+    u32* const ctr = (u32*)a.scr;
+    if (b >= NB) { prefetcher(a, NB, (volatile int*)ssel, (int*)wk); return; }
+    const int E = a.E;
+    const bool cs_oproj = (a.flags & 1u) != 0;        /* large contexts: o_proj is streamed too (L2 budget) */
+    u32 target = a.base;
+#define FINISH() { if (b == 0 && t == 0) ctr[16] = a.stamp; return; }      /* tells the prefetch blocks to exit */
+#define BARRIER() { target += (u32)NB; grid_barrier(ctr, target); }
+
+    for (int li = 0; li < a.nl; li++) {
+        const LayerP& P = a.Ly[li];
+        float* const LS = a.scr + 64 + (size_t)li * LSZ;       /* this layer's scratch */
+        float* const HA = LS + SO_HA;
+        float* const HM = LS + SO_HM;
+        const float* const HPREV = LS - LSZ + SO_HM;           /* previous layer's output (li > 0) */
+        float* const ACCP = LS + SO_ACCP;
+        float* const BETA = LS + SO_BETA;
+        float* const LOGITS = LS + SO_LOGITS;
+        float* const OVEC = LS + SO_OREC;                      /* [4096] attention output vector (o_proj input) */
+        u32* const HH = (u32*)(LS + SO_HH);
+        int* const MGLOB = (int*)(LS + SO_MGLOB);
+        float* const ZPART = LS + SO_ZPART;
+        float* const UPART = LS + SO_UPART;
+        int* const SEL = (int*)(LS + SO_SEL);
+
+        /* ---------------- phase 1: RMSNorm + input projections ---------------- */
+        if (li == 0) prep_norm<1>(a.hid_in, P.norm_a, xw, xf, red);
+        else         prep_norm<0>(HPREV, P.norm_a, xw, xf, red);
+
+        if (P.kind == 0) {
+            /* KDA: q,k,v,g int4 GEMVs (+beta), then short conv + SiLU / decay gate.
+               Warps 0..27: 7 column tiles x 4 K-chunks; warps 28..31 finalize the 7x16 outputs
+               (their conv window / weights are fetched while the others stream). */
+            for (int r0 = 0; r0 < 1024; r0 += NB * 7) {
+                const int team = warp >> 2, chunk = warp & 3;
+                const int ct = r0 + b + NB * team;
+                const bool act = (warp < 28) && (ct < 1024);
+                const int f = t - 896, fteam = f >> 4, frow = f & 15;
+                const int fct = r0 + b + NB * fteam;
+                const bool fact = (warp >= 28) && (f < 112) && (fct < 1024);
+                const int fm = fct >> 8, fchn = (fct & 255) * 16 + frow;
+                u32 p0 = 0, p1 = 0, p2 = 0; uint2 cw = make_uint2(0, 0);
+                u16* win = (fm == 0) ? P.cq : ((fm == 1) ? P.ck : P.cv);
+                if (fact && fm < 3) {
+                    p0 = win[fchn]; p1 = win[CH + fchn]; p2 = win[2 * CH + fchn];
+                    cw = *(const uint2*)(P.conv_w + ((size_t)fm * CH + fchn) * 4);
+                }
+                if (act) {
+                    float acc0 = 0.f, acc1 = 0.f;
+                    gemv_groups<false, XS>(P.w_a + (size_t)ct * 18 * GB, (18 * chunk) >> 2, (18 * (chunk + 1)) >> 2, xw, lane, acc0, acc1);
+                    if (tid == 0) { red[warp * 16 + grp] = acc0; red[warp * 16 + grp + 8] = acc1; }
+                } else if (warp >= 30 && r0 == 0 && b < 32) {
+                    const int k0 = (warp - 30) * 1152;
+                    float s = dot_bf(xf + k0, P.beta_w + (size_t)b * HID + k0, 576, lane);
+                    s = warp_sum(s);
+                    if (lane == 0) red[warp * 16] = s;
+                }
+                __syncthreads();
+                if (fact) {
+                    const int rb0 = fteam * 64 + frow;
+                    const float raw = (red[rb0] + red[rb0 + 16]) + (red[rb0 + 32] + red[rb0 + 48]);
+                    float outv;
+                    if (fm < 3) {
+                        const u32 rb = f2bf(raw);
+                        const float cv = (bf2f(p0) * bf2f(cw.x & 0xFFFFu) + bf2f(p1) * bf2f(cw.x >> 16))
+                                       + (bf2f(p2) * bf2f(cw.y & 0xFFFFu) + bf2f(rb) * bf2f(cw.y >> 16));
+                        win[fchn] = (u16)p1; win[CH + fchn] = (u16)p2; win[2 * CH + fchn] = (u16)rb;
+                        outv = rbf(cv * sigm(cv));
+                        if (fm == 0) outv *= 0.08838834764831845f;     /* Dk^-0.5 */
+                    } else {
+                        outv = 1.f / (1.f + __expf(rbf(raw)));          /* exp(-softplus(g)) */
+                    }
+                    ACCP[fm * CH + fchn] = outv;
+                }
+                if (r0 == 0 && b < 32 && t == 0) BETA[b] = sigm(rbf(red[30 * 16] + red[31 * 16]));
+                __syncthreads();
+            }
+            BARRIER();
+
+            /* ---------------- phase 2: gated-delta state update (a quarter head = 32 value columns per block).
+               warp = key rows {w, w+32, w+64, w+96}, lane = value column (coalesced 128B rows of S);
+               the column reductions (pred, o) are done warp-parallel through shared memory. ---------------- */
+            for (int r0 = 0; r0 < 128; r0 += NB) {
+                const int task = r0 + b;
+                if (task < 128) {
+                    const int h = task >> 2, j0 = (task & 3) * 32;
+                    float* pr = wk;             /* [32] reduced columns */
+                    float* pa = wk + 1024;      /* [32 warps][32] partials */
+                    float* SA = P.S + ((size_t)(h * DK + warp)) * DK + j0 + lane;
+                    float s0 = SA[0], s1 = SA[32 * DK], s2 = SA[64 * DK], s3 = SA[96 * DK];
+                    const float* kp = ACCP + CH + h * DK + warp;
+                    const float* qp = ACCP + h * DK + warp;
+                    const float* dp = ACCP + 3 * CH + h * DK + warp;
+                    const float k0 = kp[0], k1 = kp[32], k2 = kp[64], k3 = kp[96];
+                    const float e0 = dp[0], e1 = dp[32], e2 = dp[64], e3 = dp[96];
+                    const float q0 = qp[0], q1 = qp[32], q2 = qp[64], q3 = qp[96];
+                    float vb = 0.f;                              /* warp w also owns column w for the reductions */
+                    if (lane == 0) vb = ACCP[2 * CH + h * DK + j0 + warp];
+                    const float beta = BETA[h];
+                    s0 *= e0; s1 *= e1; s2 *= e2; s3 *= e3;
+                    pa[warp * 32 + lane] = (s0 * k0 + s1 * k1) + (s2 * k2 + s3 * k3);
+                    __syncthreads();
+                    {
+                        const float pred = warp_sum(pa[lane * 32 + warp]);
+                        if (lane == 0) pr[warp] = beta * (vb - pred);
+                    }
+                    __syncthreads();
+                    const float da = pr[lane];
+                    s0 += k0 * da; s1 += k1 * da; s2 += k2 * da; s3 += k3 * da;
+                    SA[0] = s0; SA[32 * DK] = s1; SA[64 * DK] = s2; SA[96 * DK] = s3;
+                    pa[warp * 32 + lane] = (s0 * q0 + s1 * q1) + (s2 * q2 + s3 * q3);
+                    __syncthreads();
+                    {
+                        const float o = warp_sum(pa[lane * 32 + warp]);
+                        if (lane == 0) OVEC[h * DK + j0 + warp] = rbf(o);
+                    }
+                }
+                __syncthreads();
+            }
+            BARRIER();
+        } else {
+            /* MLA: q_proj + kv_a int4 GEMVs */
+            for (int r0 = 0; r0 < 420; r0 += NB * 3) {
+                const int team = warp / 10, chunk = warp - team * 10;
+                const int ct = r0 + b + NB * team;
+                const bool act = (warp < 30) && (ct < 420);
+                if (act) {
+                    const u8* base = (ct < 384) ? (P.w_a + (size_t)ct * 18 * GB) : (P.w_b + (size_t)(ct - 384) * 18 * GB);
+                    float acc0 = 0.f, acc1 = 0.f;
+                    gemv_groups<false, XS>(base, (18 * chunk) / 10, (18 * (chunk + 1)) / 10, xw, lane, acc0, acc1);
+                    if (tid == 0) { red[warp * 16 + grp] = acc0; red[warp * 16 + grp + 8] = acc1; }
+                }
+                __syncthreads();
+                if (act && chunk == 0 && lane < 16) {
+                    float s = 0.f;
+#pragma unroll
+                    for (int i = 0; i < 10; i++) s += red[(warp + i) * 16 + lane];
+                    ACCP[ct * 16 + lane] = rbf(s);
+                }
+                __syncthreads();
+            }
+            BARRIER();
+
+            const int L = P.L;
+            const int ntiles = (L + 16) >> 4;          /* 16-row tiles covering rows 0..L */
+
+            /* -------- M2: append new latent row, RoPE, absorb W_kvb^k into the query -------- */
+            if (b == 32) {
+                if (t < 512) P.dst_c[(size_t)L * 512 + t] = (u16)f2bf(ACCP[6144 + t]);
+                else if (t < 544) {
+                    const int i = t - 512;
+                    const float e = ACCP[6144 + 512 + 2 * i], o = ACCP[6144 + 512 + 2 * i + 1];
+                    float sn, cs; sincosf((float)L * a.invf[i], &sn, &cs);
+                    P.dst_k[(size_t)L * 64 + 2 * i] = (u16)f2bf(e * cs - o * sn);
+                    P.dst_k[(size_t)L * 64 + 2 * i + 1] = (u16)f2bf(o * cs + e * sn);
+                }
+                const int tend = ntiles * 16;
+                for (int r = L + 1; r < tend; r++) {
+                    if (t < 512) P.dst_c[(size_t)r * 512 + t] = 0;
+                    else if (t < 576) P.dst_k[(size_t)r * 64 + (t - 512)] = 0;
+                }
+            } else if (b < 32) {
+                const int h = b;
+                float* sq = wk;
+                if (t < 192) sq[t] = ACCP[h * 192 + t];
+                __syncthreads();
+                if (t < 32) {
+                    const float e = sq[128 + 2 * t], o = sq[128 + 2 * t + 1];
+                    float sn, cs; sincosf((float)L * a.invf[t], &sn, &cs);
+                    P.QROPE[h * 64 + 2 * t] = (u16)f2bf(e * cs - o * sn);
+                    P.QROPE[h * 64 + 2 * t + 1] = (u16)f2bf(o * cs + e * sn);
+                }
+                if (warp < 2) {
+                    const int g = t >> 4, jj = t & 15;
+                    const u16* sp = P.kvb_s + (size_t)g * 8192 + h * 256 + 8 * jj;
+                    const u16* zp = P.kvb_z + (size_t)g * 8192 + h * 256 + 8 * jj;
+                    float v[8], z[8];
+#pragma unroll
+                    for (int i = 0; i < 8; i++) { v[i] = sq[8 * jj + i] * bf2f(sp[i]); z[i] = bf2f(zp[i]); }
+                    u32 w[4]; float s_, sq_;
+                    digitize8(v, z, w, s_, sq_);
+                    put_slab(xw + (g * 2 + (jj >> 3)) * XS, jj & 7, w, s_, sq_);
+                }
+                __syncthreads();
+                {
+                    const int g = warp >> 3;
+                    const uint4* ap = (const uint4*)(P.kvbT + ((size_t)(h * 32 + warp)) * 1024);
+                    const uint4 A0 = ap[lane], A1 = ap[32 + lane];
+                    const u32* x0 = xw + (g * 2) * XS; const u32* x1 = x0 + XS;
+                    const int l7 = (lane & 7) * 4;
+                    int c[4] = {0, 0, 0, 0}, d[4] = {0, 0, 0, 0};
+                    TILE_U8(c, A0, x0, l7);
+                    TILE_U8(d, A1, x1, l7);
+                    const float xs0 = __uint_as_float(x0[32]), xs1 = __uint_as_float(x1[32]);
+                    const float xq = __uint_as_float(x0[33]) + __uint_as_float(x1[33]);
+                    const float fa = xs0 * (float)(c[0] + 256 * c[1]) + xs1 * (float)(d[0] + 256 * d[1]) - xq;
+                    const float fb = xs0 * (float)(c[2] + 256 * c[3]) + xs1 * (float)(d[2] + 256 * d[3]) - xq;
+                    if (tid == 0) {
+                        P.QABS[h * 512 + warp * 16 + grp] = (u16)f2bf(fa);
+                        P.QABS[h * 512 + warp * 16 + grp + 8] = (u16)f2bf(fb);
+                    }
+                }
+            }
+            BARRIER();
+
+            /* -------- M3: attention pass 1 -- scores over the latent cache (bf16 tensor cores).
+               16 warps share a 16-row tile: (8-head group hg) x (quarter rq of the 512 latent columns);
+               their partial scores are summed through shared memory.  2 tiles per block per round. -------- */
+            {
+                const int slot = warp >> 4, hg = (warp >> 2) & 3, rq = warp & 3;
+                const float sc = a.mla_scale;
+                const bool adopt = P.adopt != 0;
+                float mr0 = -INFINITY, mr1 = -INFINITY;
+                for (int tb0 = b; tb0 < ntiles; tb0 += NB * 2) {
+                    const int tl = tb0 + NB * slot;
+                    const bool tact = tl < ntiles;
+                    const int rA = tl * 16 + grp, rB = rA + 8;
+                    float c0 = 0.f, c1 = 0.f, c2 = 0.f, c3 = 0.f;
+                    if (tact) {
+                        const u16* pA = ((rA < L) ? P.src_c : (const u16*)P.dst_c) + (size_t)rA * 512 + 8 * tid;
+                        const u16* pB = ((rB < L) ? P.src_c : (const u16*)P.dst_c) + (size_t)rB * 512 + 8 * tid;
+                        const u16* qp = P.QABS + (size_t)(8 * hg + grp) * 512 + 8 * tid;
+#pragma unroll
+                        for (int jj = 0; jj < 4; jj++) {
+                            const int j = 4 * rq + jj;
+                            const uint4 RA = *(const uint4*)(pA + 32 * j);
+                            const uint4 RB = *(const uint4*)(pB + 32 * j);
+                            const uint4 Q = *(const uint4*)(qp + 32 * j);
+                            MMA_BF(c0, c1, c2, c3, RA.x, RB.x, RA.y, RB.y, Q.x, Q.y);
+                            MMA_BF(c0, c1, c2, c3, RA.z, RB.z, RA.w, RB.w, Q.z, Q.w);
+                            if (adopt && hg == 0) {
+                                if (rA < L) *(uint4*)(P.dst_c + (size_t)rA * 512 + 8 * tid + 32 * j) = RA;
+                                if (rB < L) *(uint4*)(P.dst_c + (size_t)rB * 512 + 8 * tid + 32 * j) = RB;
+                            }
+                        }
+                        if (rq < 2) {                                /* the two 32-wide chunks of the RoPE key */
+                            const u16* kA = ((rA < L) ? P.src_k : (const u16*)P.dst_k) + (size_t)rA * 64 + 8 * tid + 32 * rq;
+                            const u16* kB = ((rB < L) ? P.src_k : (const u16*)P.dst_k) + (size_t)rB * 64 + 8 * tid + 32 * rq;
+                            const uint4 RA = *(const uint4*)kA, RB = *(const uint4*)kB;
+                            const uint4 Q = *(const uint4*)(P.QROPE + (size_t)(8 * hg + grp) * 64 + 8 * tid + 32 * rq);
+                            MMA_BF(c0, c1, c2, c3, RA.x, RB.x, RA.y, RB.y, Q.x, Q.y);
+                            MMA_BF(c0, c1, c2, c3, RA.z, RB.z, RA.w, RB.w, Q.z, Q.w);
+                            if (adopt && hg == 0) {
+                                if (rA < L) *(uint4*)(P.dst_k + (size_t)rA * 64 + 8 * tid + 32 * rq) = RA;
+                                if (rB < L) *(uint4*)(P.dst_k + (size_t)rB * 64 + 8 * tid + 32 * rq) = RB;
+                            }
+                        }
+                        if (rq != 0) { float* w4 = wk + (warp * 32 + lane) * 4; w4[0] = c0; w4[1] = c1; w4[2] = c2; w4[3] = c3; }
+                    }
+                    __syncthreads();
+                    if (tact && rq == 0) {
+#pragma unroll
+                        for (int q = 1; q < 4; q++) {
+                            const float* w4 = wk + ((warp + q) * 32 + lane) * 4;
+                            c0 += w4[0]; c1 += w4[1]; c2 += w4[2]; c3 += w4[3];
+                        }
+                        const float s0 = (rA <= L) ? c0 * sc : -INFINITY, s1 = (rA <= L) ? c1 * sc : -INFINITY;
+                        const float s2 = (rB <= L) ? c2 * sc : -INFINITY, s3 = (rB <= L) ? c3 * sc : -INFINITY;
+                        float m0 = fmaxf(s0, s2), m1 = fmaxf(s1, s3);
+                        m0 = fmaxf(m0, __shfl_xor_sync(0xffffffffu, m0, 4)); m0 = fmaxf(m0, __shfl_xor_sync(0xffffffffu, m0, 8)); m0 = fmaxf(m0, __shfl_xor_sync(0xffffffffu, m0, 16));
+                        m1 = fmaxf(m1, __shfl_xor_sync(0xffffffffu, m1, 4)); m1 = fmaxf(m1, __shfl_xor_sync(0xffffffffu, m1, 8)); m1 = fmaxf(m1, __shfl_xor_sync(0xffffffffu, m1, 16));
+                        const u32 b0 = f2bf(expf(s0 - m0)), b1 = f2bf(expf(s1 - m1)), b2 = f2bf(expf(s2 - m0)), b3 = f2bf(expf(s3 - m1));
+                        float z0 = bf2f(b0) + bf2f(b2), z1 = bf2f(b1) + bf2f(b3);
+                        z0 += __shfl_xor_sync(0xffffffffu, z0, 4); z0 += __shfl_xor_sync(0xffffffffu, z0, 8); z0 += __shfl_xor_sync(0xffffffffu, z0, 16);
+                        z1 += __shfl_xor_sync(0xffffffffu, z1, 4); z1 += __shfl_xor_sync(0xffffffffu, z1, 8); z1 += __shfl_xor_sync(0xffffffffu, z1, 16);
+                        u32* pb = P.PB + ((size_t)(tl * 4 + hg)) * 64 + 2 * lane;
+                        pb[0] = b0 | (b2 << 16); pb[1] = b1 | (b3 << 16);
+                        if (grp == 0) {
+                            float* mt = P.MT + (size_t)tl * 32 + 8 * hg + 2 * tid;
+                            float* zt = P.ZT + (size_t)tl * 32 + 8 * hg + 2 * tid;
+                            mt[0] = m0; mt[1] = m1; zt[0] = z0; zt[1] = z1;
+                            mr0 = fmaxf(mr0, m0); mr1 = fmaxf(mr1, m1);
+                        }
+                    }
+                    __syncthreads();
+                }
+                if (rq == 0 && grp == 0 && mr0 > -INFINITY) {
+                    atomicMax(MGLOB + 8 * hg + 2 * tid, fkey(mr0));
+                    atomicMax(MGLOB + 8 * hg + 2 * tid + 1, fkey(mr1));
+                }
+            }
+            BARRIER();
+
+            /* -------- M4: attention pass 2 -- u[h] = sum_l p[l,h] c[l]  (bf16 tensor cores).
+               Block = one 64-column strip of the cache x a range of tiles; warp = (16 columns, 8 heads,
+               half of the tiles).  Partial sums are added atomically into the per-layer accumulator. -------- */
+            {
+                /* global per-head max: updated by atomics above -> one volatile read per block */
+                if (t < 32) red[64 + t] = fkeyinv(*(const volatile int*)(MGLOB + t));
+                __syncthreads();
+                const int strip = b & 7, bi = b >> 3, nblk = (NB - strip + 7) >> 3;
+                const int T0 = (int)(((long long)bi * ntiles) / nblk), T1 = (int)(((long long)(bi + 1) * ntiles) / nblk);
+                const int rt = warp & 3, hg = (warp >> 2) & 3, half = warp >> 4;
+                const int Tm = (T0 + T1) >> 1;
+                const int ta = half ? Tm : T0, tb = half ? T1 : Tm;
+                const int h0 = 8 * hg + 2 * tid;
+                const float mg0 = red[64 + h0], mg1 = red[64 + h0 + 1];
+                float a0 = 0.f, a1 = 0.f, a2 = 0.f, a3 = 0.f, z0 = 0.f, z1 = 0.f;
+                const bool zown = (strip == 0) && (rt == 0) && (grp == 0);
+                const u16* cb = P.dst_c + 64 * strip + 16 * rt + 2 * grp;
+                int tl = ta;
+                for (; tl + 4 <= tb; tl += 4) {               /* 4 tiles per round trip to the cache */
+                    u32 Wa[4], Wb[4], Wc[4], Wd[4], b0[4], b1[4]; float2 mt[4];
+#pragma unroll
+                    for (int q = 0; q < 4; q++) {
+                        const u16* base = cb + (size_t)(tl + q) * 16 * 512;
+                        Wa[q] = *(const u32*)(base + tid * 512); Wb[q] = *(const u32*)(base + (tid + 8) * 512);
+                        Wc[q] = *(const u32*)(base + (tid + 4) * 512); Wd[q] = *(const u32*)(base + (tid + 12) * 512);
+                        const u32* pb = P.PB + (size_t)((tl + q) * 4 + hg) * 64 + 8 * tid + grp;
+                        b0[q] = pb[0]; b1[q] = pb[32];
+                        mt[q] = *(const float2*)(P.MT + (size_t)(tl + q) * 32 + h0);
+                    }
+#pragma unroll
+                    for (int q = 0; q < 4; q++) {
+                        float d0 = 0.f, d1 = 0.f, d2 = 0.f, d3 = 0.f;
+                        MMA_BF(d0, d1, d2, d3, (Wa[q] & 0xFFFFu) | (Wb[q] << 16), (Wa[q] >> 16) | (Wb[q] & 0xFFFF0000u),
+                                               (Wc[q] & 0xFFFFu) | (Wd[q] << 16), (Wc[q] >> 16) | (Wd[q] & 0xFFFF0000u), b0[q], b1[q]);
+                        const float f0 = __expf(mt[q].x - mg0), f1 = __expf(mt[q].y - mg1);
+                        a0 += f0 * d0; a1 += f1 * d1; a2 += f0 * d2; a3 += f1 * d3;
+                        if (zown) { const float* zt = P.ZT + (size_t)(tl + q) * 32 + h0; z0 += f0 * zt[0]; z1 += f1 * zt[1]; }
+                    }
+                }
+                for (; tl < tb; tl++) {
+                    const u16* base = cb + (size_t)tl * 16 * 512;
+                    const u32 Wa = *(const u32*)(base + tid * 512), Wb = *(const u32*)(base + (tid + 8) * 512);
+                    const u32 Wc = *(const u32*)(base + (tid + 4) * 512), Wd = *(const u32*)(base + (tid + 12) * 512);
+                    const u32* pb = P.PB + (size_t)(tl * 4 + hg) * 64 + 8 * tid + grp;
+                    const u32 b0 = pb[0], b1 = pb[32];
+                    float d0 = 0.f, d1 = 0.f, d2 = 0.f, d3 = 0.f;
+                    MMA_BF(d0, d1, d2, d3, (Wa & 0xFFFFu) | (Wb << 16), (Wa >> 16) | (Wb & 0xFFFF0000u),
+                                           (Wc & 0xFFFFu) | (Wd << 16), (Wc >> 16) | (Wd & 0xFFFF0000u), b0, b1);
+                    const float* mt = P.MT + (size_t)tl * 32 + h0;
+                    const float f0 = __expf(mt[0] - mg0), f1 = __expf(mt[1] - mg1);
+                    a0 += f0 * d0; a1 += f1 * d1; a2 += f0 * d2; a3 += f1 * d3;
+                    if (zown) { const float* zt = P.ZT + (size_t)tl * 32 + h0; z0 += f0 * zt[0]; z1 += f1 * zt[1]; }
+                }
+                float* w4 = wk + warp * 128 + lane * 4;
+                w4[0] = a0; w4[1] = a1; w4[2] = a2; w4[3] = a3;
+                if (zown) { red[half * 32 + h0] = z0; red[half * 32 + h0 + 1] = z1; }
+                __syncthreads();
+                if (half == 0) {                                 /* combine the two tile halves, publish the block partial */
+                    const float* o4 = wk + (warp + 16) * 128 + lane * 4;
+                    float4 pv = make_float4(a0 + o4[0], a1 + o4[1], a2 + o4[2], a3 + o4[3]);
+                    *(float4*)(UPART + (size_t)b * 2048 + (rt * 4 + hg) * 128 + lane * 4) = pv;
+                }
+                if (strip == 0 && t < 32) ZPART[b * 32 + t] = red[t] + red[32 + t];
+            }
+            BARRIER();
+
+            /* -------- M5: normalise, then o[h] = u[h] @ W_kvb^v[h] (int4 GEMV per head) -------- */
+            if (b == 32) {
+                if (t < 32) MGLOB[t] = (int)0x80000000;                 /* re-arm the max for the next token */
+            } else if (b < 32) {
+                const int h = b, hg = h >> 3, tid2 = (h & 7) >> 1, el = h & 1;
+                float* su = wk;
+                if (t < 512) {
+                    const int r = t, strip = r >> 6, rt = (r >> 4) & 3, g2 = (r >> 1) & 7, eh = r & 1;
+                    const int idx = (rt * 4 + hg) * 128 + (g2 * 4 + tid2) * 4 + eh * 2 + el;
+                    const int nblk = (NB - strip + 7) >> 3;       /* blocks that worked on this strip (<= 32) */
+                    float sacc = 0.f;
+                    for (int b0 = 0; b0 < nblk; b0 += 8) {        /* 8 partial loads in flight at a time */
+                        float pv[8];
+#pragma unroll
+                        for (int q = 0; q < 8; q++) pv[q] = UPART[(size_t)(min(b0 + q, nblk - 1) * 8 + strip) * 2048 + idx];
+#pragma unroll
+                        for (int q = 0; q < 8; q++) sacc += (b0 + q < nblk) ? pv[q] : 0.f;
+                    }
+                    su[r] = sacc;
+                } else if (t < 544) {
+                    const int bi = t - 512, nblk0 = (NB + 7) >> 3;
+                    red[bi] = (bi < nblk0) ? ZPART[(bi * 8) * 32 + h] : 0.f;
+                }
+                __syncthreads();
+                if (warp < 2) {
+                    const float iz = 1.f / warp_sum(red[lane]);
+                    float v[8];
+#pragma unroll
+                    for (int i = 0; i < 8; i++) v[i] = su[8 * t + i] * iz;
+                    u32 w[4]; float s_, sq_;
+                    digitize8(v, nullptr, w, s_, sq_);
+                    put_slab(xw + (t >> 3) * XS, t & 7, w, s_, sq_);
+                }
+                __syncthreads();
+                {
+                    const int c = warp & 7, g = warp >> 3;
+                    float acc0 = 0.f, acc1 = 0.f;
+                    gemv_groups<false, XS>(P.kvbV + (size_t)(h * 8 + c) * 4 * GB, g, g + 1, xw, lane, acc0, acc1);
+                    if (tid == 0) { red[warp * 16 + grp] = acc0; red[warp * 16 + grp + 8] = acc1; }
+                }
+                __syncthreads();
+                if (warp < 8 && lane < 16)
+                    OVEC[h * 128 + warp * 16 + lane] = rbf((red[warp * 16 + lane] + red[(8 + warp) * 16 + lane]) + (red[(16 + warp) * 16 + lane] + red[(24 + warp) * 16 + lane]));
+            }
+            BARRIER();
+        }
+
+        /* ---------------- o_proj (int4 GEMV) + residual.
+           Block = one 16-column output tile, warp w = K-group w (128 inputs = slabs 2w, 2w+1):
+           the warp turns its 128 inputs into operands in its own shared-memory slots. ---------------- */
+        for (int r0 = 0; r0 < 144; r0 += NB) {
+            const int ct = r0 + b;
+            const bool fin = (ct < 144) && (warp < 16);
+            const int n = ct * 16 + warp;
+            float xp = 0.f;
+            if (fin && lane == 0) xp = (li == 0) ? bf2f(a.hid_in[n]) : HPREV[n];
+            if (ct < 144) {
+                float v[8];
+                const float4 o0 = *(const float4*)(OVEC + warp * 128 + (lane & 15) * 8), o1 = *(const float4*)(OVEC + warp * 128 + (lane & 15) * 8 + 4);
+                v[0] = o0.x; v[1] = o0.y; v[2] = o0.z; v[3] = o0.w; v[4] = o1.x; v[5] = o1.y; v[6] = o1.z; v[7] = o1.w;
+                u32 w[4]; float s_, sq_;
+                digitize8(v, nullptr, w, s_, sq_);
+                if (lane < 16) put_slab(xw + (2 * warp + (lane >> 3)) * XS, lane & 7, w, s_, sq_);
+                __syncwarp();
+                float acc0 = 0.f, acc1 = 0.f;
+                if (cs_oproj) gemv_groups<true, XS>(P.w_o + (size_t)ct * 32 * GB, warp, warp + 1, xw, lane, acc0, acc1);
+                else gemv_groups<false, XS>(P.w_o + (size_t)ct * 32 * GB, warp, warp + 1, xw, lane, acc0, acc1);
+                if (tid == 0) { red[warp * 16 + grp] = acc0; red[warp * 16 + grp + 8] = acc1; }
+            }
+            __syncthreads();
+            if (fin) {                                   /* warp w reduces output w over the 32 K-chunks */
+                const float s = warp_sum(red[lane * 16 + warp]);
+                if (lane == 0) HA[n] = rbf(xp + rbf(s));
+            }
+            __syncthreads();
+        }
+        BARRIER();
+
+        /* ---------------- MoE: RMSNorm + router ---------------- */
+        prep_norm<0>(HA, P.norm_m, xw, xf, red);
+        for (int e = b; e < E; e += NB) {
+            const float* xp_ = xf + warp * 72;
+            const u16* wr = P.router + (size_t)e * HID + warp * 72;
+            const u32 w0 = *(const u32*)(wr + 2 * lane);
+            float s = xp_[2 * lane] * bf2f(w0 & 0xFFFFu) + xp_[2 * lane + 1] * bf2f(w0 >> 16);
+            if (lane < 4) {
+                const u32 w1 = *(const u32*)(wr + 64 + 2 * lane);
+                s += xp_[64 + 2 * lane] * bf2f(w1 & 0xFFFFu) + xp_[65 + 2 * lane] * bf2f(w1 >> 16);
+            }
+            s = warp_sum(s);
+            if (lane == 0) red[warp] = s;
+            __syncthreads();
+            if (warp == 0) {
+                const float tot = warp_sum(red[lane]);
+                if (lane == 0) LOGITS[e] = rbf(tot);
+            }
+            __syncthreads();
+        }
+        BARRIER();
+
+        /* ---------------- MoE: top-8 select, expert gate/up int4 GEMVs, SiLU gate ---------------- */
+        {
+            /* top-8 of E logits: every thread compares one expert against a few others,
+               the partial ranks are summed -- no long serial loops */
+            const int sh = 32 - __clz(((E + 31) & ~31) - 1);       /* log2 of padded E */
+            const int epad = 1 << sh, epw = epad >> 5, nparts = 1024 >> sh, cpp = (E + nparts - 1) / nparts;
+            int* rk = (int*)wk; float* slog = wk + 1024; float* lmx = wk + 2048; float* exs = wk + 2080; float* sselv = wk + 2112;
+            float lg = -INFINITY;
+            if (t < epad) {
+                if (t < E) { lg = LOGITS[t]; slog[t] = lg; }
+                float m = lg;
+                m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, 16)); m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, 8));
+                m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, 4));  m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, 2));
+                m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, 1));
+                if (lane == 0) lmx[warp] = m;
+            }
+            __syncthreads();
+            float ex = 0.f;
+            {
+                const int e = t & (epad - 1), part = t >> sh;
+                if (part < nparts) {
+                    const float me = (e < E) ? slog[e] : 0.f;
+                    int rank = 0;
+#pragma unroll 4
+                    for (int i = 0; i < cpp; i++) {
+                        const int e2 = part * cpp + i;
+                        if (e2 < E) { const float o = slog[e2]; rank += ((o > me) || (o == me && e2 < e)) ? 1 : 0; }
+                    }
+                    rk[part * epad + e] = rank;
+                }
+                if (t < epad) {
+                    float lmax = lmx[0];
+                    for (int w = 1; w < epw; w++) lmax = fmaxf(lmax, lmx[w]);
+                    ex = (t < E) ? __expf(lg - lmax) : 0.f;
+                    const float es = warp_sum(ex);
+                    if (lane == 0) exs[warp] = es;
+                }
+            }
+            __syncthreads();
+            if (t < E) {
+                int rank = 0;
+#pragma unroll 16
+                for (int pp = 0; pp < nparts; pp++) rank += rk[pp * epad + t];
+                if (rank < 8) { ssel[rank] = t; sselv[rank] = ex; }
+            }
+            __syncthreads();
+            if (warp == 0) {
+                const float pj = (lane < 8) ? sselv[lane] : 0.f;
+                const float ps = warp_sum(pj);
+                float den = exs[0];
+                for (int w = 1; w < epw; w++) den += exs[w];
+                if (lane < 8) {
+                    sselw[lane] = (pj / den) / (ps / den + 1.0e-9f) * a.rscale;
+                    if (b == 0) SEL[lane] = ssel[lane];                 /* publish for the prefetch blocks / next token */
+                }
+            }
+            __syncthreads();
+            for (int r0 = 0; r0 < 144; r0 += NB) {
+                const int bt = r0 + b;
+                if (bt < 144) {
+                    const int j = bt >> 4, sl = bt & 15;
+                    const int e = (j < 8) ? ssel[j] : E;
+                    const int cc = warp & 3, mat = (warp >> 2) & 1, chunk = warp >> 3;
+                    const u8* base = (mat ? P.w_up : P.w_gate) + ((size_t)(e * 64 + sl * 4 + cc) * 18) * GB;
+                    const int g0 = (18 * chunk) >> 2, g1 = (18 * (chunk + 1)) >> 2;
+                    float acc0 = 0.f, acc1 = 0.f;
+                    gemv_groups<true, XS>(base, g0, g1, xw, lane, acc0, acc1);
+                    if (tid == 0) { red[warp * 16 + grp] = acc0; red[warp * 16 + grp + 8] = acc1; }
+                }
+                __syncthreads();
+                if (bt < 144) {
+                    const int j = bt >> 4, sl = bt & 15;
+                    if (warp < 4 && lane < 16) {
+                        float g = 0.f, u = 0.f;
+#pragma unroll
+                        for (int c4 = 0; c4 < 4; c4++) { g += red[((c4 << 3) | warp) * 16 + lane]; u += red[((c4 << 3) | 4 | warp) * 16 + lane]; }
+                        float hh = g * sigm(g) * u;
+                        if (j < 8) hh *= sselw[j];
+                        wk[1100 + warp * 16 + lane] = hh;
+                    }
+                    __syncthreads();
+                    if (warp == 0) {                                    /* expert hidden slab -> down-proj operand record */
+                        float v[8];
+#pragma unroll
+                        for (int i = 0; i < 8; i++) v[i] = (lane < 8) ? wk[1100 + lane * 8 + i] : 0.f;
+                        u32 w[4]; float s_, sq_;
+                        digitize8(v, nullptr, w, s_, sq_);
+                        if (lane < 8) put_slab(HH + ((size_t)(j * 16 + sl)) * 64, lane, w, s_, sq_);
+                    }
+                }
+                __syncthreads();
+            }
+        }
+        BARRIER();
+
+        /* ---------------- MoE: expert down int4 GEMVs + residual ---------------- */
+        {
+            const bool last = (li == a.nl - 1);
+            for (int r0 = 0; r0 < 144; r0 += NB) {
+                const int ct = r0 + b;
+                const bool fin = (ct < 144) && (warp < 16);
+                const int n = ct * 16 + warp;
+                float hav = 0.f;
+                if (fin && lane == 0) hav = HA[n];
+                if (ct < 144 && warp < 27) {
+                    const int j = warp / 3, chunk = warp - 3 * j;
+                    const int e = (j < 8) ? ssel[j] : E;
+                    const u8* base = P.w_down + ((size_t)(e * 144 + ct) * 8) * GB;
+                    const u32* rec = HH + (size_t)(j * 16) * 64;
+                    const int g0 = (8 * chunk) / 3, g1 = (8 * (chunk + 1)) / 3;
+                    float acc0 = 0.f, acc1 = 0.f;
+                    gemv_groups<true, 64>(base, g0, g1, rec, lane, acc0, acc1);
+                    if (tid == 0) { red[warp * 16 + grp] = acc0; red[warp * 16 + grp + 8] = acc1; }
+                }
+                __syncthreads();
+                if (fin) {                               /* warp w reduces output w over the 27 (expert, K-chunk) partials */
+                    const float s = warp_sum((lane < 27) ? red[lane * 16 + warp] : 0.f);
+                    if (lane == 0) {
+                        const float hn = rbf(hav + rbf(s));
+                        HM[n] = hn;
+                        if (last) a.hid_out[n] = (u16)f2bf(hn);
+                    }
+                }
+                __syncthreads();
+            }
+            if (!last) BARRIER();
+        }
+    }
+    FINISH();
+}
+
+/* ------------------------------------------------------------------ host side */
+#include <vector>
+struct KHandle { KArgs a; int nb; int nph; };   /* nb = blocks in the grid (one per SM) */
+static std::vector<KHandle> g_handles;
+
+/* static layout: [nl, E, nb, flags, rscale_bits, mla_scale_bits, scr, invf_bits x32, then per layer 16 values] */
+extern "C" int kimi_setup_c(const long long* v, int n) {
+    KHandle h; memset(&h, 0, sizeof(h));
+    int p = 0;
+    h.a.nl = (int)v[p++]; h.a.E = (int)v[p++]; h.nb = (int)v[p++]; h.a.flags = (u32)v[p++];
+    { int bits = (int)v[p++]; memcpy(&h.a.rscale, &bits, 4); }
+    { int bits = (int)v[p++]; memcpy(&h.a.mla_scale, &bits, 4); }
+    h.a.scr = (float*)v[p++];
+    for (int i = 0; i < 32; i++) { int bits = (int)v[p++]; memcpy(&h.a.invf[i], &bits, 4); }
+    h.nph = 0;
+    for (int l = 0; l < h.a.nl; l++) {
+        LayerP& L = h.a.Ly[l];
+        L.kind = (int)v[p++];
+        L.norm_a = (const u16*)v[p++]; L.norm_m = (const u16*)v[p++];
+        L.w_a = (const u8*)v[p++]; L.w_b = (const u8*)v[p++]; L.w_o = (const u8*)v[p++];
+        L.beta_w = (const u16*)v[p++]; L.conv_w = (const u16*)v[p++]; L.router = (const u16*)v[p++];
+        L.w_gate = (const u8*)v[p++]; L.w_up = (const u8*)v[p++]; L.w_down = (const u8*)v[p++];
+        L.kvbT = (const u8*)v[p++]; L.kvbV = (const u8*)v[p++]; L.kvb_s = (const u16*)v[p++]; L.kvb_z = (const u16*)v[p++];
+        h.nph += (L.kind == 0) ? 6 : 9;
+    }
+    h.nph -= 1;
+    if (p != n) return -1;
+    g_handles.push_back(h);
+    return (int)g_handles.size() - 1;
+}
+
+/* dynamic layout: [hid_in, hid_out, flags, npf, then per layer: K: S,cq,ck,cv | M: src_c,src_k,dst_c,dst_k,PB,MT,ZT,QABS,QROPE,L,adopt] */
+extern "C" int kimi_step_c(int handle, const long long* v, int n) {
+    KHandle& h = g_handles[handle];
+    int p = 0;
+    h.a.hid_in = (const u16*)v[p++]; h.a.hid_out = (u16*)v[p++]; h.a.flags = (u32)v[p++];
+    h.a.npf = (int)v[p++];
+    h.a.stamp += 1u;
+    for (int l = 0; l < h.a.nl; l++) {
+        LayerP& L = h.a.Ly[l];
+        if (L.kind == 0) {
+            L.S = (float*)v[p++]; L.cq = (u16*)v[p++]; L.ck = (u16*)v[p++]; L.cv = (u16*)v[p++];
+        } else {
+            L.src_c = (const u16*)v[p++]; L.src_k = (const u16*)v[p++]; L.dst_c = (u16*)v[p++]; L.dst_k = (u16*)v[p++];
+            L.PB = (u32*)v[p++]; L.MT = (float*)v[p++]; L.ZT = (float*)v[p++]; L.QABS = (u16*)v[p++]; L.QROPE = (u16*)v[p++];
+            L.L = (int)v[p++]; L.adopt = (int)v[p++];
+        }
+    }
+    if (p != n) return -1;
+    kimi_mega<<<h.nb, NTHR>>>(h.a);            /* the ONE kernel launch of the decode step */
+    h.a.base += (u32)(h.nph * (h.nb - h.a.npf)); /* every worker block passes every barrier once */
+    return (int)cudaGetLastError();
+}
+extern "C" long long kimi_scratch_words_c() { return SCR_WORDS; }
+/* word offsets of the per-layer MGLOB arrays (host initialises them to INT_MIN once) */
+extern "C" long long kimi_mglob_off_c(int layer) { return 64 + (long long)layer * LSZ + SO_MGLOB; }
+"""
+
+_CPP_SRC = r"""
+#include <vector>
+#include <stdexcept>
+#include <string>
+extern "C" int kimi_setup_c(const long long* v, int n);
+extern "C" int kimi_step_c(int handle, const long long* v, int n);
+extern "C" long long kimi_scratch_words_c();
+extern "C" long long kimi_mglob_off_c(int layer);
+
+int kimi_setup(std::vector<long long> v) {
+    int h = kimi_setup_c(v.data(), (int)v.size());
+    if (h < 0) throw std::runtime_error("kimi_setup: bad argument list");
+    return h;
+}
+void kimi_step(int handle, std::vector<long long> v) {
+    int e = kimi_step_c(handle, v.data(), (int)v.size());
+    if (e != 0) throw std::runtime_error("kimi_step: CUDA launch error " + std::to_string(e));
+}
+long long kimi_scratch_words() { return kimi_scratch_words_c(); }
+long long kimi_mglob_off(int layer) { return kimi_mglob_off_c(layer); }
+"""
+
+_EXT = None
+
+
+def _get_ext():
+    global _EXT
+    if _EXT is None:
+        from torch.utils import cpp_extension as cpe
+        major, minor = torch.cuda.get_device_capability(0)
+        name = "kimi_mega_ext"
+        bdir = os.path.join(cpe.get_default_build_root(), name)
+        # load_inline force-prepends `#include <torch/types.h>` to every CUDA source, and
+        # nvcc's front-end cannot digest that header with this host GCC (15).  The kernel
+        # translation unit is plain CUDA and needs no torch headers, so give nvcc (only
+        # nvcc -- the pybind C++ unit still uses the real headers) an empty shim for it.
+        shim = os.path.join(bdir, "nvcc_shim")
+        os.makedirs(os.path.join(shim, "torch"), exist_ok=True)
+        shim_h = os.path.join(shim, "torch", "types.h")
+        if not os.path.exists(shim_h):
+            with open(shim_h, "w") as f:
+                f.write("// intentionally empty: the CUDA unit does not use torch headers\n")
+        _EXT = cpe.load_inline(
+            name=name,
+            cpp_sources=[_CPP_SRC],
+            cuda_sources=[_CUDA_SRC],
+            functions=["kimi_setup", "kimi_step", "kimi_scratch_words", "kimi_mglob_off"],
+            with_cuda=True,
+            extra_cuda_cflags=["-O3", f"-arch=sm_{major}{minor}", f"-I{shim}"],
+            build_directory=bdir,
+            verbose=False,
+        )
+    return _EXT
+
+
+def _fbits(x: float) -> int:
+    return struct.unpack("<i", struct.pack("<f", float(x)))[0]
+
+
+# --------------------------------------------------------------------------- #
+# int4 re-layout (same 4-bit values; permuted into tensor-core operand tiles)
+# --------------------------------------------------------------------------- #
+def _pack_stream(w_q: torch.Tensor, scales: torch.Tensor, zeros: torch.Tensor) -> torch.Tensor:
+    """w_q [B, K/2, N] u8 (two nibbles along K per byte), scales/zeros [B, G, N] bf16
+    -> [B, N/16, G, 1088] u8: per (16-column tile, group): two 512B u4 mma A-tiles
+    (lane-major: lane = 4*row%8 + k-quad, 4 regs of 8 nibbles) + 64B (scale, zero)."""
+    B, K2, N = w_q.shape
+    G, C = K2 // 64, N // 16
+    w = w_q.view(B, G, 2, 2, 4, 4, C, 2, 8)                 # [g, slab, half, tid, j, c, rh, grp]
+    w = w.permute(0, 6, 1, 2, 8, 4, 3, 7, 5).reshape(B, C, G, 1024)
+    s = scales.contiguous().view(torch.int16).view(B, G, C, 2, 8).permute(0, 2, 1, 4, 3)   # [c, g, grp, rh]
+    z = zeros.contiguous().view(torch.int16).view(B, G, C, 2, 8).permute(0, 2, 1, 4, 3)
+    meta = torch.stack([s, z], dim=4).contiguous().view(torch.uint8).reshape(B, C, G, 64)
+    return torch.cat([w, meta], dim=-1).contiguous()
+
+
+def _pack_kvb_t(w_q: torch.Tensor, H: int, per_head: int, nope: int) -> torch.Tensor:
+    """Transposed tiles of the k-half of kv_b for the absorb GEMV:
+    q_abs[h][r] = sum_d w[r, h*per_head + d] * q[h][d].  -> [H, R/16, 1024] u8."""
+    R2, N = w_q.shape
+    R = R2 * 2
+    nib = torch.empty((R, N), dtype=torch.uint8, device=w_q.device)
+    nib[0::2] = w_q & 0xF
+    nib[1::2] = (w_q >> 4) & 0xF
+    nib = nib.view(R, H, per_head)[:, :, :nope]             # [r, h, d]
+    by = nib[:, :, 0::2] | (nib[:, :, 1::2] << 4)           # bytes along d
+    by = by.reshape(R // 16, 2, 8, H, 2, 2, 4, 4)            # [rb, rh, grp, h, slab, half, tid, j]
+    by = by.permute(3, 0, 4, 2, 6, 5, 1, 7)                  # [h, rb, slab, grp, tid, half, rh, j]
+    return by.reshape(H, R // 16, 1024).contiguous()
+
+
+# --------------------------------------------------------------------------- #
+# modules (parameter / buffer names identical to the reference)
+# --------------------------------------------------------------------------- #
+class QuantLinear(nn.Module):
+    def __init__(self, in_f: int, out_f: int, group: int = GROUP_SIZE):
+        super().__init__()
+        self.in_f, self.out_f, self.group = in_f, out_f, group
+        ng = in_f // group
+        self.register_buffer("w_q", torch.zeros(in_f // 2, out_f, dtype=torch.uint8))
+        self.register_buffer("scales", torch.zeros(ng, out_f, dtype=torch.bfloat16))
+        self.register_buffer("zeros", torch.zeros(ng, out_f, dtype=torch.bfloat16))
+
+
+class QuantExperts(nn.Module):
+    def __init__(self, n: int, in_f: int, out_f: int, group: int = GROUP_SIZE):
+        super().__init__()
+        self.n, self.in_f, self.out_f, self.group = n, in_f, out_f, group
+        ng = in_f // group
+        self.register_buffer("w_q", torch.zeros(n, in_f // 2, out_f, dtype=torch.uint8))
+        self.register_buffer("scales", torch.zeros(n, ng, out_f, dtype=torch.bfloat16))
+        self.register_buffer("zeros", torch.zeros(n, ng, out_f, dtype=torch.bfloat16))
+
+
+class KDA(nn.Module):
+    def __init__(self, cfg: Config):
+        super().__init__()
+        H, Dk, d = cfg.kda_heads, cfg.kda_head_dim, cfg.hidden
+        self.q_proj = QuantLinear(d, H * Dk, cfg.group)
+        self.k_proj = QuantLinear(d, H * Dk, cfg.group)
+        self.v_proj = QuantLinear(d, H * Dk, cfg.group)
+        self.g_proj = QuantLinear(d, H * Dk, cfg.group)
+        self.beta_proj = nn.Linear(d, H, bias=False, dtype=cfg.dtype)
+        self.conv_w = nn.Parameter(torch.zeros(3, H * Dk, cfg.short_conv, dtype=cfg.dtype))
+        self.o_proj = QuantLinear(H * Dk, d, cfg.group)
+
+
+class MLA(nn.Module):
+    def __init__(self, cfg: Config):
+        super().__init__()
+        H, d = cfg.mla_heads, cfg.hidden
+        self.q_proj = QuantLinear(d, H * (cfg.qk_nope + cfg.qk_rope), cfg.group)
+        self.kv_a = QuantLinear(d, cfg.kv_lora + cfg.qk_rope, cfg.group)
+        self.kv_b = QuantLinear(cfg.kv_lora, H * (cfg.qk_nope + cfg.v_head), cfg.group)
+        self.o_proj = QuantLinear(H * cfg.v_head, d, cfg.group)
+
+
+class MoE(nn.Module):
+    def __init__(self, cfg: Config):
+        super().__init__()
+        d, m, E = cfg.hidden, cfg.moe_inter, cfg.n_experts
+        self.router = nn.Linear(d, E, bias=False, dtype=cfg.dtype)
+        self.gate = QuantExperts(E, d, m, cfg.group)
+        self.up = QuantExperts(E, d, m, cfg.group)
+        self.down = QuantExperts(E, m, d, cfg.group)
+        self.s_gate = QuantExperts(cfg.n_shared, d, m, cfg.group)
+        self.s_up = QuantExperts(cfg.n_shared, d, m, cfg.group)
+        self.s_down = QuantExperts(cfg.n_shared, m, d, cfg.group)
+
+
+class Block(nn.Module):
+    def __init__(self, cfg: Config, kind: str):
+        super().__init__()
+        self.kind = kind
+        self.attn_norm = nn.Parameter(torch.ones(cfg.hidden, dtype=cfg.dtype))
+        self.moe_norm = nn.Parameter(torch.ones(cfg.hidden, dtype=cfg.dtype))
+        self.attn = KDA(cfg) if kind == "K" else MLA(cfg)
+        self.moe = MoE(cfg)
+
+
+class _CacheBuf:
+    """Capacity-backed MLA latent cache + per-layer attention side buffers."""
+    __slots__ = ("ck", "kr", "pb", "mt", "zt", "qabs", "qrope", "cap", "len", "ptrs")
+
+    def __init__(self, cap: int, dev):
+        self.cap = cap
+        self.len = 0
+        self.ck = torch.empty((cap, 512), dtype=torch.bfloat16, device=dev)
+        self.kr = torch.empty((cap, 64), dtype=torch.bfloat16, device=dev)
+        nt = cap // 16
+        self.pb = torch.empty((nt, 256), dtype=torch.int32, device=dev)
+        self.mt = torch.empty((nt, 32), dtype=torch.float32, device=dev)
+        self.zt = torch.empty((nt, 32), dtype=torch.float32, device=dev)
+        self.qabs = torch.empty((32, 512), dtype=torch.bfloat16, device=dev)
+        self.qrope = torch.empty((32, 64), dtype=torch.bfloat16, device=dev)
+        self.ptrs = [self.ck.data_ptr(), self.kr.data_ptr(), self.pb.data_ptr(), self.mt.data_ptr(),
+                     self.zt.data_ptr(), self.qabs.data_ptr(), self.qrope.data_ptr()]
+
+
+class Model(nn.Module):
+    GROW = 4096          # spare latent-cache rows allocated on adoption
+
+    def __init__(self, cfg: Config):
+        super().__init__()
+        self.cfg = cfg
+        self.blocks = nn.ModuleList(Block(cfg, k) for k in cfg.pattern)
+        self._rt = None
+
+    # -- invalidate the packed runtime whenever weights may have changed ------
+    def load_state_dict(self, *args, **kwargs):
+        self._rt = None
+        return super().load_state_dict(*args, **kwargs)
+
+    def _apply(self, fn, *args, **kwargs):
+        self._rt = None
+        return super()._apply(fn, *args, **kwargs)
+
+    # -- capability check ------------------------------------------------------
+    def _fused_supported(self) -> bool:
+        c = self.cfg
+        if os.environ.get("KIMI_EAGER", "0") == "1":
+            return False
+        ok = (c.hidden == 2304 and c.kda_heads == 32 and c.kda_head_dim == 128 and c.short_conv == 4
+              and c.mla_heads == 32 and c.kv_lora == 512 and c.qk_nope == 128 and c.qk_rope == 64
+              and c.v_head == 128 and c.n_active == 8 and c.n_shared == 1 and c.moe_inter == 1024
+              and c.group == 128 and 8 <= c.n_experts <= 1024 and len(c.pattern) <= 8
+              and c.dtype == torch.bfloat16)
+        if not ok or not torch.cuda.is_available():
+            return False
+        p = next(self.parameters())
+        if not p.is_cuda:
+            return False
+        if torch.cuda.get_device_capability(p.device)[0] < 8:
+            return False
+        return torch.cuda.get_device_properties(p.device).multi_processor_count >= 64
+
+    # -- one-time re-layout of the int4 weights + kernel argument block -------
+    @torch.no_grad()
+    def _build_runtime(self):
+        cfg = self.cfg
+        ext = _get_ext()
+        dev = next(self.parameters()).device
+        keep = []
+
+        hot_w = []
+
+        def ql(m):
+            t = _pack_stream(m.w_q[None], m.scales[None], m.zeros[None])[0].contiguous()
+            keep.append(t)
+            hot_w.append(t)
+            return t.data_ptr()
+
+        def qe(routed, shared):
+            t = torch.cat([_pack_stream(routed.w_q, routed.scales, routed.zeros),
+                           _pack_stream(shared.w_q, shared.scales, shared.zeros)], dim=0).contiguous()
+            keep.append(t)
+            return t.data_ptr()
+
+        def par(p):
+            t = p.detach().contiguous()
+            keep.append(t)
+            assert t.data_ptr() % 16 == 0
+            return t.data_ptr()
+
+        props = torch.cuda.get_device_properties(dev)
+        nb = min(props.multi_processor_count, 256)         # one 1024-thread block per SM
+        scratch = torch.zeros(int(ext.kimi_scratch_words()), dtype=torch.float32, device=dev)
+        keep.append(scratch)
+        for li in range(len(cfg.pattern)):          # per-head running max starts at -inf (int key)
+            off = int(ext.kimi_mglob_off(li))
+            scratch[off:off + 64].view(torch.int32).fill_(-2 ** 31)
+        inv = 1.0 / (cfg.rope_theta ** (torch.arange(0, cfg.qk_rope, 2, dtype=torch.float32) / cfg.qk_rope))
+        static = [len(cfg.pattern), cfg.n_experts, nb, 0, _fbits(cfg.routed_scaling),
+                  _fbits((cfg.qk_nope + cfg.qk_rope) ** -0.5), scratch.data_ptr()]
+        static += [_fbits(float(x)) for x in inv.tolist()]
+        for blk in self.blocks:
+            at, moe = blk.attn, blk.moe
+            gate = qe(moe.gate, moe.s_gate)
+            up = qe(moe.up, moe.s_up)
+            down = qe(moe.down, moe.s_down)
+            if blk.kind == "K":
+                wa = torch.cat([_pack_stream(m.w_q[None], m.scales[None], m.zeros[None])
+                                for m in (at.q_proj, at.k_proj, at.v_proj, at.g_proj)], dim=0).contiguous()
+                keep.append(wa)
+                hot_w.append(wa)
+                static += [0, par(blk.attn_norm), par(blk.moe_norm), wa.data_ptr(), 0, ql(at.o_proj),
+                           par(at.beta_proj.weight), par(at.conv_w), par(moe.router.weight),
+                           gate, up, down, 0, 0, 0, 0]
+            else:
+                H, ph = cfg.mla_heads, cfg.qk_nope + cfg.v_head
+                kb = at.kv_b
+                kvbT = _pack_kvb_t(kb.w_q, H, ph, cfg.qk_nope)
+                wv = kb.w_q.view(-1, H, ph)[:, :, cfg.qk_nope:].permute(1, 0, 2).contiguous()
+                sv = kb.scales.view(-1, H, ph)[:, :, cfg.qk_nope:].permute(1, 0, 2).contiguous()
+                zv = kb.zeros.view(-1, H, ph)[:, :, cfg.qk_nope:].permute(1, 0, 2).contiguous()
+                kvbV = _pack_stream(wv, sv, zv).contiguous()
+                keep += [kvbT, kvbV]
+                hot_w += [kvbT, kvbV]
+                static += [1, par(blk.attn_norm), par(blk.moe_norm), ql(at.q_proj), ql(at.kv_a), ql(at.o_proj),
+                           0, 0, par(moe.router.weight), gate, up, down,
+                           kvbT.data_ptr(), kvbV.data_ptr(), par(kb.scales), par(kb.zeros)]
+        handle = ext.kimi_setup(static)
+        # L2 budget (MB): the token-invariant attention weights + recurrent state should stay
+        # L2-resident; expert weights are always streamed evict-first.  What is left over decides
+        # whether there is room for the speculative expert prefetch (short contexts) or whether
+        # o_proj has to be streamed as well (the latent cache of a long context needs the room).
+        hot = sum(t.numel() * t.element_size() for t in hot_w) / 2 ** 20
+        hot += sum(1 for k in cfg.pattern if k == "K") * (cfg.kda_heads * cfg.kda_head_dim ** 2 * 4) / 2 ** 20 + 6.0
+        self._rt = {"ext": ext, "handle": handle, "keep": keep, "step": ext.kimi_step, "dev": dev,
+                    "kinds": [b.kind for b in self.blocks], "nb": nb,
+                    "l2_mb": float(props.L2_cache_size) / 2 ** 20, "hot_mb": hot}
+
+    def _policy(self, rt, cache_rows: int):
+        """(flags, n_prefetch_blocks) for this step from the L2 budget."""
+        spare = rt["l2_mb"] - rt["hot_mb"] - cache_rows * 1152 / 2 ** 20
+        nb = rt["nb"]
+        if spare >= 24.0 and nb >= 172:
+            return 0, 24                      # room for the prefetch window: 24 SMs warm the predicted experts
+        if spare >= 14.0:
+            return 0, 0
+        return 1, 0                           # long context: stream o_proj too
+
+    # -- the decode step: exactly one kernel launch ---------------------------
+    def step(self, hidden, state):
+        rt = self._rt
+        if rt is None:
+            if not self._fused_supported():
+                return self._step_eager(hidden, state)
+            self._build_runtime()
+            rt = self._rt
+        if hidden.dtype != torch.bfloat16 or not hidden.is_contiguous() or hidden.data_ptr() % 16 != 0:
+            hidden = hidden.to(torch.bfloat16).contiguous().clone()
+        out = torch.empty_like(hidden)
+        dyn = [hidden.data_ptr(), out.data_ptr(), 0, 0]
+        grown = []
+        rows = 0
+        for i, kind in enumerate(rt["kinds"]):
+            st = state[i]
+            if kind == "K":
+                S, cq, ck, cv = st["S"], st["cq"], st["ck"], st["cv"]
+                if S.dtype != torch.float32 or not S.is_contiguous():
+                    S = st["S"] = S.float().contiguous()
+                if cq.dtype != torch.bfloat16 or not cq.is_contiguous():
+                    cq = st["cq"] = cq.to(torch.bfloat16).contiguous()
+                if ck.dtype != torch.bfloat16 or not ck.is_contiguous():
+                    ck = st["ck"] = ck.to(torch.bfloat16).contiguous()
+                if cv.dtype != torch.bfloat16 or not cv.is_contiguous():
+                    cv = st["cv"] = cv.to(torch.bfloat16).contiguous()
+                dyn += [S.data_ptr(), cq.data_ptr(), ck.data_ptr(), cv.data_ptr()]
+            else:
+                c, kr = st["c_kv"], st["k_rope"]
+                L = c.shape[0]
+                rows += L
+                buf = st.get("_kimi_buf")
+                if (buf is not None and buf.len == L and L + 1 <= buf.cap
+                        and c.data_ptr() == buf.ptrs[0] and kr.data_ptr() == buf.ptrs[1]):
+                    dyn += [buf.ptrs[0], buf.ptrs[1], buf.ptrs[0], buf.ptrs[1]] + buf.ptrs[2:] + [L, 0]
+                else:
+                    # first step on this cache: adopt it into a capacity buffer so later tokens
+                    # append in place (the copy itself happens inside the kernel, as a side
+                    # effect of the first attention pass)
+                    if (c.dtype != torch.bfloat16 or not c.is_contiguous() or c.data_ptr() % 16 != 0
+                            or kr.dtype != torch.bfloat16 or not kr.is_contiguous() or kr.data_ptr() % 16 != 0):
+                        c = c.to(torch.bfloat16).contiguous().clone()
+                        kr = kr.to(torch.bfloat16).contiguous().clone()
+                    buf = _CacheBuf(((L + 16) // 16) * 16 + self.GROW, rt["dev"])
+                    dyn += [c.data_ptr(), kr.data_ptr(), buf.ptrs[0], buf.ptrs[1]] + buf.ptrs[2:] + [L, 1]
+                    st["_kimi_src"] = (c, kr)        # keep the source alive while the kernel reads it
+                grown.append((st, buf, L))
+        dyn[2], dyn[3] = self._policy(rt, rows)
+        rt["step"](rt["handle"], dyn)             # <- the single kernel launch
+        for st, buf, L in grown:
+            buf.len = L + 1
+            st["c_kv"] = buf.ck[: L + 1]
+            st["k_rope"] = buf.kr[: L + 1]
+            st["_kimi_buf"] = buf
+        return out, state
+
+    # -- slow eager path (debugging / unsupported configs); not the timed path --
+    @torch.no_grad()
+    def _step_eager(self, hidden, state):
+        cfg = self.cfg
+
+        def deq(wq, s, z):
+            K = wq.shape[0] * 2
+            wu = torch.empty((K, wq.shape[1]), dtype=torch.uint8, device=wq.device)
+            wu[0::2] = wq & 0xF
+            wu[1::2] = (wq >> 4) & 0xF
+            return (wu.float() - z.float().repeat_interleave(cfg.group, 0)) * s.float().repeat_interleave(cfg.group, 0)
+
+        def lin(m, x):
+            return (x.float() @ deq(m.w_q, m.scales, m.zeros)).to(torch.bfloat16)
+
+        def rms(x, w):
+            xf = x.float()
+            return (xf * torch.rsqrt(xf.pow(2).mean(-1, keepdim=True) + EPS) * w.float()).to(x.dtype)
+
+        def rope(x, cos, sin):
+            xf = x.float()
+            o = torch.empty_like(xf)
+            o[..., 0::2] = xf[..., 0::2] * cos - xf[..., 1::2] * sin
+            o[..., 1::2] = xf[..., 1::2] * cos + xf[..., 0::2] * sin
+            return o.to(x.dtype)
+
+        x = hidden
+        for i, blk in enumerate(self.blocks):
+            st, at = state[i], blk.attn
+            xn = rms(x, blk.attn_norm)
+            if blk.kind == "K":
+                H, Dk = cfg.kda_heads, cfg.kda_head_dim
+                vals = []
+                for idx, (proj, key) in enumerate(((at.q_proj, "cq"), (at.k_proj, "ck"), (at.v_proj, "cv"))):
+                    val = lin(proj, xn)
+                    win = torch.cat([st[key], val[None]], 0)
+                    o = (win.float() * at.conv_w[idx].float().t()).sum(0)
+                    vals.append(F.silu(o).to(torch.bfloat16).view(H, Dk).float())
+                    st[key] = win[1:]
+                q, k, v = vals[0] * Dk ** -0.5, vals[1], vals[2]
+                g = (-F.softplus(lin(at.g_proj, xn).float())).view(H, Dk)
+                beta = torch.sigmoid(at.beta_proj(xn).float())
+                S = st["S"] * g.exp()[:, :, None]
+                pred = (S * k[:, :, None]).sum(1)
+                S = S + beta[:, None, None] * k[:, :, None] * (v - pred)[:, None, :]
+                st["S"] = S
+                o = (S * q[:, :, None]).sum(1).reshape(-1).to(torch.bfloat16)
+            else:
+                H, nope, rp = cfg.mla_heads, cfg.qk_nope, cfg.qk_rope
+                pos = st["c_kv"].shape[0]
+                q = lin(at.q_proj, xn).view(H, nope + rp)
+                kv = lin(at.kv_a, xn)
+                inv = 1.0 / (cfg.rope_theta ** (torch.arange(0, rp, 2, device=x.device, dtype=torch.float32) / rp))
+                cos, sin = torch.cos(pos * inv), torch.sin(pos * inv)
+                st["c_kv"] = torch.cat([st["c_kv"], kv[None, : cfg.kv_lora]], 0)
+                st["k_rope"] = torch.cat([st["k_rope"], rope(kv[cfg.kv_lora:], cos, sin)[None]], 0)
+                W = deq(at.kv_b.w_q, at.kv_b.scales, at.kv_b.zeros).view(cfg.kv_lora, H, nope + cfg.v_head)
+                qabs = torch.einsum("rhd,hd->hr", W[:, :, :nope], q[:, :nope].float())
+                sc = (st["c_kv"].float() @ qabs.t() + st["k_rope"].float() @ rope(q[:, nope:], cos, sin).float().t())
+                p = torch.softmax(sc * (nope + rp) ** -0.5, dim=0)
+                u = p.t() @ st["c_kv"].float()
+                o = torch.einsum("hr,rhd->hd", u, W[:, :, nope:]).reshape(-1).to(torch.bfloat16)
+            x = x + lin(at.o_proj, o)
+            hn = rms(x, blk.moe_norm)
+            moe = blk.moe
+            probs = torch.softmax(moe.router(hn).float(), -1)
+            w, idx = torch.topk(probs, cfg.n_active)
+            w = w / (w.sum() + 1e-9) * cfg.routed_scaling
+            out = torch.zeros(cfg.hidden, device=x.device)
+            sel = [(moe.gate, moe.up, moe.down, int(e), float(wt)) for e, wt in zip(idx.tolist(), w.tolist())]
+            sel += [(moe.s_gate, moe.s_up, moe.s_down, s, 1.0) for s in range(cfg.n_shared)]
+            for G_, U_, D_, e, wt in sel:
+                hh = F.silu(hn.float() @ deq(G_.w_q[e], G_.scales[e], G_.zeros[e])) * (hn.float() @ deq(U_.w_q[e], U_.scales[e], U_.zeros[e]))
+                out = out + wt * (hh @ deq(D_.w_q[e], D_.scales[e], D_.zeros[e]))
+            x = x + out.to(torch.bfloat16)
+        return x, state
+
+
+# --------------------------------------------------------------------------- #
+# state / inputs (same contract as the reference)
+# --------------------------------------------------------------------------- #
+def init_state(cfg: Config, context_len: int, seed: int) -> list:
+    dev = torch.device("cuda:0")
+    g = torch.Generator(device=dev).manual_seed(seed)
+    H, Dk = cfg.kda_heads, cfg.kda_head_dim
+    C = H * Dk
+    state = []
+    for kind in cfg.pattern:
+        if kind == "K":
+            state.append({
+                "S": torch.randn(H, Dk, Dk, device=dev, generator=g) * 0.05,
+                "cq": torch.randn(cfg.short_conv - 1, C, device=dev, generator=g, dtype=cfg.dtype) * 0.1,
+                "ck": torch.randn(cfg.short_conv - 1, C, device=dev, generator=g, dtype=cfg.dtype) * 0.1,
+                "cv": torch.randn(cfg.short_conv - 1, C, device=dev, generator=g, dtype=cfg.dtype) * 0.1,
+            })
+        else:
+            state.append({
+                "c_kv": torch.randn(context_len, cfg.kv_lora, device=dev, generator=g, dtype=cfg.dtype) * 0.1,
+                "k_rope": torch.randn(context_len, cfg.qk_rope, device=dev, generator=g, dtype=cfg.dtype) * 0.1,
+            })
+    return state
+
+
+def init_token(cfg: Config, seed: int) -> torch.Tensor:
+    dev = torch.device("cuda:0")
+    g = torch.Generator(device=dev).manual_seed(seed + 1)
+    return torch.randn(cfg.hidden, device=dev, generator=g, dtype=cfg.dtype) * 0.25

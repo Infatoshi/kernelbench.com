@@ -1,0 +1,1559 @@
+"""Grid foraging + 3-layer MinGRU(h=256) rollout as a fused CUDA megakernel.
+
+Design (details are in the CUDA source below):
+
+* One persistent thread block owns up to 64 envs and runs the whole horizon
+  for them (policy + env step). Envs are split into "rounds" of at most one
+  block per SM; each round is a single launch.
+* MinGRU layer 0 is folded: gates0 = W_gru[0] @ (W_enc @ obs + b_enc) is an
+  affine map of the 4-float observation (products precomputed in fp64 on the
+  GPU), evaluated with one tensor-core MMA per tile.
+* Layers 1/2 (the two 256->768 GEMMs that dominate the cost) run on tensor
+  cores. fp16 operands alone are not accurate enough for exact greedy actions,
+  so W*2^s = Wh + Wr and h*2^t = hh + hr are split into an fp16 high part and
+  its exact residual, and W.h = Wh.hh + (Wh.hr + Wr.hh) + O(2^-22):
+    - fast kernel: the two correction terms use 8-bit quantisations in ONE
+      int8 MMA per 16 k (2 MMAs per k-step in total). Logit error is ~1e-5 of
+      the computed signal (2e-8 absolute with reference-initialised weights).
+    - fp32-grade kernel: corrections in fp16 as well (3 MMAs per k-step),
+      error at the level of fp32 rounding noise.
+  The fast kernel certifies every greedy decision (top-2 gap >= 5e-4 x signal,
+  signal <= 0.5); if any decision is not certified the host reruns the rollout
+  with the fp32-grade kernel, so actions never depend on the cheaper GEMM.
+* Weights stream from L2 pre-packed in MMA fragment order (re-packed by small
+  prep kernels on every call, since weights may change); activations live in
+  shared memory and are read with ldmatrix; the cell runs in registers on the
+  accumulator fragments; the action head is accumulated in fp32.
+* The reference advances *every* env's LCG whenever *any* env in the batch
+  hits food. Blocks therefore run under an assumed "any hit at step t"
+  schedule, record the actual one, and the host verifies it (and reruns with
+  the corrected schedule in the rare case the assumption mattered).
+
+policy_forward / env_step are separate straightforward fp32 CUDA kernels.
+"""
+from __future__ import annotations
+
+import os
+
+import torch
+import torch.nn as nn
+import torch.utils.cpp_extension
+
+BOARD = 11
+OBS_DIM = 4
+HIDDEN = 256
+GRU_LAYERS = 3
+NUM_ACTIONS = 4
+GRU_OUT = 3 * HIDDEN
+
+
+class Model(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.w_enc = nn.Parameter(torch.empty(HIDDEN, OBS_DIM))
+        self.b_enc = nn.Parameter(torch.zeros(HIDDEN))
+        self.w_gru = nn.Parameter(torch.empty(GRU_LAYERS, GRU_OUT, HIDDEN))
+        self.w_a = nn.Parameter(torch.empty(NUM_ACTIONS, HIDDEN))
+        self.b_a = nn.Parameter(torch.zeros(NUM_ACTIONS))
+        self.w_v = nn.Parameter(torch.empty(1, HIDDEN))
+        self.b_v = nn.Parameter(torch.zeros(1))
+        self.reset_parameters(0)
+
+    def reset_parameters(self, seed: int = 0) -> None:
+        g = torch.Generator(device="cpu")
+        g.manual_seed(seed)
+        for p in self.parameters():
+            tmp = torch.empty(p.shape, dtype=p.dtype, device="cpu")
+            tmp.normal_(0.0, 0.02, generator=g)
+            p.data.copy_(tmp)
+
+    def forward(self, obs: torch.Tensor, state: torch.Tensor):
+        return policy_forward(self, obs, state)
+
+
+# --------------------------------------------------------------------------
+# Shared declarations (compiled into both the nvcc and the g++ translation unit)
+# --------------------------------------------------------------------------
+_COMMON_SRC = r"""
+#include <stdint.h>
+struct MegaParams {
+    const void* Wp;          // packed GRU weights, layers 1 and 2 (int8 correction pass + fp16 pass)
+    const void* A0;          // packed split-fp16 folded layer-0 map (zh, zg, zp, h0 rows)
+    const void* WA;          // action head weights, transposed per cell-owning thread (float4)
+    const float* b_a;        // [4]
+    const float* scal;       // [16] scales written by the prep kernels
+    float* state;            // per-block GRU state scratch (reused by every launch)
+    const uint8_t* init;     // [N][4] agent x,y food x,y
+    const uint64_t* lcg;     // [H][2] composed LCG (mul, add) per step
+    int* anyhit;             // [H]
+    int* unsafe;             // [1] set when a greedy decision was not safely separated
+    float* rewards;          // [N]
+    long long* positions;    // [N][2]
+    float* last_logits;      // [N][4]
+    uint64_t seed_base;
+    int N, H;
+    int env_base;            // first env of this launch
+};
+extern "C" {
+void mg_launch_prep(const float* w_enc, const float* b_enc, const float* w_gru, const float* w_a,
+                    void* Wp, void* A0, void* WA, float* g0tab, float* scal, int exact);
+int mg_launch_mega(int en, int exact, const MegaParams* P, int nblocks);
+int mg_has_en(int en);
+void mg_launch_pf(const float* obs, const float* state, const float* w_enc, const float* b_enc,
+                  const float* w_gru, const float* w_a, const float* b_a, const float* w_v,
+                  const float* b_v, float* logits, float* new_state, float* value, int n);
+void mg_launch_env(const int* agent, const int* food, const long long* actions, const long long* rng,
+                   int* agent_out, int* food_out, float* reward, long long* rng_out, int* flag, int n);
+}
+"""
+
+# --------------------------------------------------------------------------
+# CUDA kernels
+# --------------------------------------------------------------------------
+_CUDA_SRC = _COMMON_SRC + r"""
+#include <cuda_runtime.h>
+#include <cuda_fp16.h>
+#include <math.h>
+
+#define HID 256
+#define NWARP 8
+#define WARP_ROWS 192                         // packed uint4 rows per (layer, warp): 96 int8-pass + 96 fp16-pass
+#define LAYER_U4 (NWARP * WARP_ROWS * 32)     // uint4 entries per packed layer
+#define LCG_A 6364136223846793005ULL
+#define LCG_MASK 0x7FFFFFFFFFFFFFFFULL
+#define LOG2E_F 1.44269504088896340736f
+
+// D(16x8) += A(16x16, fp16) * B(16x8, fp16), fp32 accumulate
+#define MMA16(c, a, b) asm volatile( \
+    "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n" \
+    : "+f"((c)[0]), "+f"((c)[1]), "+f"((c)[2]), "+f"((c)[3]) \
+    : "r"((a)[0]), "r"((a)[1]), "r"((a)[2]), "r"((a)[3]), "r"((b)[0]), "r"((b)[1]))
+// D(16x8) += A(16x32, s8) * B(32x8, s8), s32 accumulate
+#define MMA8(c, a, b) asm volatile( \
+    "mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n" \
+    : "+r"((c)[0]), "+r"((c)[1]), "+r"((c)[2]), "+r"((c)[3]) \
+    : "r"((a)[0]), "r"((a)[1]), "r"((a)[2]), "r"((a)[3]), "r"((b)[0]), "r"((b)[1]))
+
+static __device__ __forceinline__ void ldm4t(uint32_t* r, uint32_t addr) {
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+        : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "r"(addr));
+}
+static __device__ __forceinline__ float ex2_fast(float x) {
+    float y; asm("ex2.approx.ftz.f32 %0, %1;" : "=f"(y) : "f"(x)); return y;
+}
+static __device__ __forceinline__ float rcp_fast(float x) {
+    float y; asm("rcp.approx.ftz.f32 %0, %1;" : "=f"(y) : "f"(x)); return y;
+}
+// round-to-nearest, saturating float -> int8 (returned in the low byte)
+static __device__ __forceinline__ uint32_t f2s8(float x) {
+    int y; asm("cvt.rni.sat.s8.f32 %0, %1;" : "=r"(y) : "f"(x)); return (uint32_t)y & 0xffu;
+}
+// Optimisation barrier: the result cannot be hoisted or merged with an earlier copy, so values
+// derived from it live only inside the phase that computes them (keeps registers free in the GEMMs).
+static __device__ __forceinline__ int opaque_i(int x) {
+    int y; asm volatile("mov.u32 %0, %1;" : "=r"(y) : "r"(x)); return y;
+}
+static __device__ __forceinline__ float h2f(uint32_t bits) {
+    return __half2float(__ushort_as_half((unsigned short)bits));
+}
+
+// MinGRU cell (highway), reference.policy_forward math:
+//   out = st + sigmoid(zg) * (tanh(zh) - st);  h' = p*out + (1-p)*h,  p = sigmoid(zp)
+// Fast path (all |z| < 0.125): odd Taylor polynomials, truncation error < 2e-10.
+static __device__ __forceinline__ void cell_fast(float zh, float zg, float zp, float x2h, float x2g, float x2p,
+                                                 float st, float hprev, float& out, float& hn) {
+    const float g = fmaf(zg, fmaf(x2g, fmaf(x2g, 1.0f / 480.0f, -1.0f / 48.0f), 0.25f), 0.5f);
+    const float p = fmaf(zp, fmaf(x2p, fmaf(x2p, 1.0f / 480.0f, -1.0f / 48.0f), 0.25f), 0.5f);
+    const float th = fmaf(zh * x2h, fmaf(x2h, fmaf(x2h, -17.0f / 315.0f, 2.0f / 15.0f), -1.0f / 3.0f), zh);
+    out = fmaf(g, th - st, st);
+    hn = fmaf(p, out, (1.0f - p) * hprev);
+}
+// General path: sigmoid(x) = 1/(1+2^(-x log2e)); tanh: degree-9 odd polynomial for |x| < 0.25
+// (error < 3e-9), (E-1)/(E+1) with E = 2^(2x log2e) otherwise.
+static __device__ __forceinline__ void cell_slow(float zh, float zg, float zp,
+                                                 float st, float hprev, float& out, float& hn) {
+    const float g = rcp_fast(1.0f + ex2_fast(-(zg * LOG2E_F)));
+    const float p = rcp_fast(1.0f + ex2_fast(-(zp * LOG2E_F)));
+    const float x2 = zh * zh;
+    float pl = fmaf(x2, 0.021869488536155203f, -0.053968253968253971f);
+    pl = fmaf(x2, pl, 0.13333333333333333f);
+    pl = fmaf(x2, pl, -0.33333333333333333f);
+    const float tpoly = fmaf(zh * x2, pl, zh);
+    const float E = ex2_fast(zh * (2.0f * LOG2E_F));
+    const float texp = fmaf(-2.0f, rcp_fast(E + 1.0f), 1.0f);
+    const float th = (fabsf(zh) < 0.25f) ? tpoly : texp;
+    out = fmaf(g, th - st, st);
+    hn = fmaf(p, out, (1.0f - p) * hprev);
+}
+
+// --------------------------------------------------------------------------
+// Megakernel: one block = EN*8 envs for the full horizon (one launch per
+// "round" of up to #SM blocks).
+//
+// Thread <-> element mapping (fixed for all layers, it is the MMA C-fragment
+// layout): warp w owns hidden units j in [32w, 32w+32) as two 16-row tiles
+// ("halves" hf); for each half the warp accumulates three 16x8 tiles per env
+// tile (zh, zg, zp rows of the same j), so every thread ends a GEMM holding
+// the complete gate triple for its (j, env) pairs and runs the cell in
+// registers. A thread's elements: j = 32w + 16hf + g + 8r, env = 8et + 2tid + c.
+//
+// 256->768 GEMM (layers 1, 2), W.h with fp32-level accuracy on tensor cores:
+//   W*2^s = Wh + Wr (Wh fp16, Wr exact residual), h*2^t = hh + hr (same)
+//   W.h ~= Wh.hh  (fp16 MMA, exact products, fp32 accumulate)
+//        + Wh8.hl8 + Wl8.hh8  (one int8 MMA covers both correction terms for
+//          16 k; Wh8/Wl8 are 8-bit quantisations of W/Wr, hh8/hl8 of h/hr with
+//          a per-block scale; int32 accumulate is exact)
+// The int8 pass runs first, its int32 sums are converted in place and the
+// fp16 pass accumulates on top, so one accumulator set stays in registers.
+//
+// Activations live in shared memory transposed ([k][env]) so a thread's two
+// envs are adjacent (paired stores) and ldmatrix.trans yields B fragments.
+// --------------------------------------------------------------------------
+//
+// EX = true selects the fp32-grade GEMM instead: W.h ~= Wh.hh + Wh.hl + Wl.hh with all four
+// operands fp16 (three MMAs per k-step, dropped term ~2^-22 relative). The host uses it when the
+// fast kernel reports that some greedy decision was not safely separated (see the head).
+template <int EN, bool EX>
+__global__ void __launch_bounds__(256, 1) mega_kernel(MegaParams Pin) {
+    constexpr int ENVS = EN * 8;
+    constexpr int NCH = 2 * EN;              // float4 chunks ("quads") of state per thread and layer
+    // Operand rows hold one 16-byte tile (8 envs x u16) per env tile. The 8 rows a warp touches at
+    // once (ldmatrix, the cell's paired stores) must fall into distinct shared-memory banks: use an
+    // odd row stride (in tiles), or for EN == 8 (no room to pad) rotate the tiles by the row index.
+    constexpr bool SKEW = (EN == 8);
+    constexpr int ROWT = (EN & 1) ? EN : (SKEW ? EN : EN + 1);
+    constexpr int ROWB = ROWT * 16;          // bytes per operand row
+#ifndef MG_LA
+#define MG_LA 2
+#endif
+    constexpr int LA = MG_LA;                // state-load lookahead (quads)
+    extern __shared__ __align__(16) unsigned char smem[];
+    unsigned char* const hhT = smem;                     // [256][ENVS] fp16 high parts of h*2^t
+    unsigned char* const hlT = smem + 256 * ROWB;        // [256][ENVS] fp16 low parts
+    unsigned char* const l8T = smem + 512 * ROWB;        // [16 win][8][ENVS] s8 pairs: low parts
+    unsigned char* const h8T = smem + 640 * ROWB;        // [16 win][8][ENVS] s8 pairs: h itself
+    unsigned char* const obT = smem + 768 * ROWB;        // [16][ENVS] fp16 layer-0 operand slots
+    int* const envd = (int*)(smem + 784 * ROWB);         // [ENVS][2] packed pos, reward count
+    float* const mxs = (float*)(envd + 2 * ENVS);        // [8] per-warp max |h|
+    // Launch parameters and scales are parked in shared memory and re-read where needed
+    // (volatile) so they do not pin registers across the GEMM loops.
+    const volatile float* const SC = mxs + 8;            // [16] copy of the prep scales, [4] action bias
+    const volatile MegaParams& P = *(const volatile MegaParams*)(mxs + 28);
+
+    const int tix = threadIdx.x;
+    int warp = tix >> 5, lane = tix & 31, g = lane >> 2, tid = lane & 3;
+
+    // Per-env observation operand for the folded layer 0 (split fp16, scaled by 2^14):
+    // slots 0-3: hi(o), 4-7: lo(o), 8-11: hi(o), 12-13: one, 14-15: zero
+    auto write_obs = [&](int el, int ax, int ay, int fx, int fy) {
+        float o[4];
+        o[0] = (float)(fx - ax) / 11.0f; o[1] = (float)(fy - ay) / 11.0f;
+        o[2] = (float)ax / 10.0f; o[3] = (float)ay / 10.0f;
+        auto slot = [&](int i) -> __half* {
+            const int tile = SKEW ? (((el >> 3) + i) & 7) : (el >> 3);
+            return (__half*)(obT + i * ROWB + tile * 16 + (el & 7) * 2);
+        };
+        #pragma unroll
+        for (int i = 0; i < 4; i++) {
+            const float v = o[i] * 16384.0f;
+            const __half a = __float2half_rn(v);
+            const __half b = __float2half_rn(v - __half2float(a));
+            *slot(i) = a; *slot(4 + i) = b; *slot(8 + i) = a;
+        }
+        const __half one = __float2half_rn(16384.0f), zero = __float2half_rn(0.0f);
+        *slot(12) = one; *slot(13) = one;
+        *slot(14) = zero; *slot(15) = zero;
+    };
+
+    if (tix == 0) *(MegaParams*)(mxs + 28) = Pin;
+    if (tix < 16) *(float*)(mxs + 8 + tix) = Pin.scal[tix];
+    if (tix < 4) *(float*)(mxs + 24 + tix) = Pin.b_a[tix];
+    if (tix < ENVS) {
+        const int e = Pin.env_base + blockIdx.x * ENVS + tix;
+        uint32_t pos = 0x05050000u;
+        if (e < Pin.N) pos = *(const uint32_t*)(Pin.init + 4 * (size_t)e);
+        envd[2 * tix] = (int)pos;
+        envd[2 * tix + 1] = 0;
+        write_obs(tix, pos & 255, (pos >> 8) & 255, (pos >> 16) & 255, pos >> 24);
+    }
+    // global state scratch: [block][layer][warp][NCH][lane] float4 (a warp-wide access = 4 full lines)
+    auto state_ptr = [&](int L) -> float4* {
+        return (float4*)P.state + ((size_t)(blockIdx.x * 3 + L) * 8 + warp) * (NCH * 32) + lane;
+    };
+    const uint32_t s_hh = (uint32_t)__cvta_generic_to_shared(hhT);
+    const uint32_t s_c8 = (uint32_t)__cvta_generic_to_shared(l8T);
+    const uint32_t s_ob = (uint32_t)__cvta_generic_to_shared(obT);
+    // ldmatrix.trans row addresses for this lane; matrix index = lane>>3
+    //   fp16 pass : bit0 -> k+8,               bit1 -> next env tile
+    //   int8 pass : bit0 -> h8T instead of l8T, bit1 -> next env tile
+    uint32_t loff = 0, loffc = 0;
+    // this thread's operand rows / columns as a cell element
+    int o_hh = 0;   // + (16hf + 8r)*ROWB + gtile(et)
+    int o_c8 = 0;   // + hf*8*ROWB + gtile(et)
+    // Thread-identity values are re-derived behind an optimisation barrier at the start of every
+    // phase so they are not kept in registers across the GEMM loops.
+    auto refresh = [&]() {
+        const int tx = opaque_i((int)threadIdx.x);
+        warp = tx >> 5; lane = tx & 31; g = lane >> 2; tid = lane & 3;
+        loff = ((lane & 7) + 8 * ((lane >> 3) & 1)) * ROWB;
+        loffc = (lane & 7) * ROWB + ((lane >> 3) & 1) * (128 * ROWB);
+        o_hh = (32 * warp + g) * ROWB + (2 * tid) * 2;
+        o_c8 = (16 * warp + g) * ROWB + (2 * tid) * 2;
+    };
+    // byte offset of env tile `tile` in the row this lane addresses in an ldmatrix (row & 7 == lane & 7)
+    auto ltile = [&](int tile) -> uint32_t {
+        return SKEW ? (uint32_t)(((tile + lane) & 7) * 16) : (uint32_t)(tile * 16);
+    };
+    // ... and in the rows this thread owns as a cell element (row & 7 == g)
+    auto gtile = [&](int et) -> int { return SKEW ? (((et + g) & 7) * 16) : (et * 16); };
+    float qh = 1.0f;                         // per-block int8 quantum of h*2^t for the next GEMM
+    __syncthreads();
+
+    // ---- cell for one quad (2 hidden units x 2 envs); `wr`: write h' as next-layer operands
+    auto quad = [&](const float* azh, const float* azg, const float* azp, float zs, const float* hprev,
+                    const float4 sv, float4& outq, float* hn, int hf, int et, bool wr, float& mx) {
+        const float svv[4] = {sv.x, sv.y, sv.z, sv.w};
+        float zh[4], zg[4], zp[4], x2h[4], x2g[4], x2p[4], outv[4];
+        float m2 = 0.0f;
+        #pragma unroll
+        for (int q = 0; q < 4; q++) {
+            zh[q] = azh[q] * zs; zg[q] = azg[q] * zs; zp[q] = azp[q] * zs;
+            x2h[q] = zh[q] * zh[q]; x2g[q] = zg[q] * zg[q]; x2p[q] = zp[q] * zp[q];
+            m2 = fmaxf(m2, fmaxf(x2h[q], fmaxf(x2g[q], x2p[q])));
+        }
+        if (m2 < 0.015625f) {
+            #pragma unroll
+            for (int q = 0; q < 4; q++)
+                cell_fast(zh[q], zg[q], zp[q], x2h[q], x2g[q], x2p[q], svv[q], hprev[q], outv[q], hn[q]);
+        } else {
+            #pragma unroll
+            for (int q = 0; q < 4; q++)
+                cell_slow(zh[q], zg[q], zp[q], svv[q], hprev[q], outv[q], hn[q]);
+        }
+        outq = make_float4(outv[0], outv[1], outv[2], outv[3]);
+        if (wr) {
+            const float hs = SC[2];
+            #pragma unroll
+            for (int r = 0; r < 2; r++) {
+                const float h0 = hn[2 * r] * hs, h1 = hn[2 * r + 1] * hs;
+                mx = fmaxf(mx, fmaxf(fabsf(h0), fabsf(h1)));
+                const __half2 a = __floats2half2_rn(h0, h1);
+                const float2 af = __half22float2(a);
+                const __half2 b = __floats2half2_rn(h0 - af.x, h1 - af.y);
+                unsigned char* const p = hhT + o_hh + (16 * hf + 8 * r) * ROWB + gtile(et);
+                *(__half2*)p = a;
+                *(__half2*)(p + 256 * ROWB) = b;
+            }
+        }
+    };
+    // ---- block max of |h*2^t| -> int8 operands (hh8, hl8) for the next GEMM
+    auto quantize8 = [&](float mx, float irho) {
+        mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, 16));
+        mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, 8));
+        mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, 4));
+        mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, 2));
+        mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, 1));
+        if (lane == 0) mxs[warp] = mx;
+        __syncthreads();
+        refresh();
+        float mh = 1e-30f;
+        #pragma unroll
+        for (int i = 0; i < 8; i++) mh = fmaxf(mh, mxs[i]);
+        qh = mh * (1.0f / 127.0f);
+        const float ih = 127.0f / mh;        // h8 = hsv / qh
+        const float il = ih * irho;          // l8 = hres / (qh * rho)
+        #pragma unroll 1
+        for (int hf = 0; hf < 2; hf++) {
+            #pragma unroll 1
+            for (int et = 0; et < EN; et++) {
+                const unsigned char* const p = hhT + o_hh + (16 * hf) * ROWB + gtile(et);
+                const float2 h0 = __half22float2(*(const __half2*)p);
+                const float2 h1 = __half22float2(*(const __half2*)(p + 8 * ROWB));
+                const float2 l0 = __half22float2(*(const __half2*)(p + 256 * ROWB));
+                const float2 l1 = __half22float2(*(const __half2*)(p + 264 * ROWB));
+                // byte order: (j, e0), (j+8, e0), (j, e1), (j+8, e1)
+                const uint32_t wh = f2s8(h0.x * ih) | (f2s8(h1.x * ih) << 8)
+                                  | (f2s8(h0.y * ih) << 16) | (f2s8(h1.y * ih) << 24);
+                const uint32_t wl = f2s8(l0.x * il) | (f2s8(l1.x * il) << 8)
+                                  | (f2s8(l0.y * il) << 16) | (f2s8(l1.y * il) << 24);
+                unsigned char* const c = l8T + o_c8 + hf * (8 * ROWB) + gtile(et);
+                *(uint32_t*)c = wl;
+                *(uint32_t*)(c + 128 * ROWB) = wh;
+            }
+        }
+    };
+
+    #pragma unroll 1
+    for (int t = 0; t < P.H; t++) {
+        // ==================================================================
+        // Layer 0: folded encoder + gates (affine in the observation), one MMA
+        // per (row tile, env tile); processed one half at a time.
+        // ==================================================================
+        {
+            refresh();
+            const uint4* ap = (const uint4*)P.A0 + (size_t)warp * (2 * 4 * 32) + lane;
+            float4* const stg = state_ptr(0);
+            const float zs0 = SC[5];
+            float mx = 0.0f;
+            #pragma unroll 1
+            for (int hf = 0; hf < 2; hf++) {
+                float4 st0[EN];
+                #pragma unroll
+                for (int i = 0; i < EN; i++) st0[i] = make_float4(0.f, 0.f, 0.f, 0.f);
+                if (t > 0) {
+                    #pragma unroll
+                    for (int i = 0; i < EN; i++) st0[i] = stg[(hf * EN + i) * 32];
+                }
+                uint4 wq[4];
+                #pragma unroll
+                for (int i = 0; i < 4; i++) wq[i] = ap[(hf * 4 + i) * 32];
+                float a0[4][EN][4];
+                #pragma unroll
+                for (int a = 0; a < 4; a++)
+                    #pragma unroll
+                    for (int e = 0; e < EN; e++)
+                        #pragma unroll
+                        for (int q = 0; q < 4; q++) a0[a][e][q] = 0.0f;
+                uint32_t wa[4][4];
+                #pragma unroll
+                for (int m = 0; m < 4; m++) {
+                    const uint4 w = wq[m];
+                    wa[m][0] = w.x; wa[m][1] = w.y; wa[m][2] = w.z; wa[m][3] = w.w;
+                }
+                #pragma unroll
+                for (int ep = 0; ep < (EN + 1) / 2; ep++) {
+                    uint32_t bo[4];
+                    ldm4t(bo, s_ob + loff + ltile(2 * ep + (lane >> 4)));
+                    #pragma unroll
+                    for (int et = 0; et < 2; et++) {
+                        if (2 * ep + et < EN) {
+                            #pragma unroll
+                            for (int m = 0; m < 4; m++) MMA16(a0[m][2 * ep + et], wa[m], bo + 2 * et);
+                        }
+                    }
+                }
+                #pragma unroll
+                for (int et = 0; et < EN; et++) {
+                    float hprev[4];
+                    #pragma unroll
+                    for (int q = 0; q < 4; q++) hprev[q] = a0[3][et][q] * zs0;
+                    float4 outq;
+                    float hn[4];
+                    quad(a0[0][et], a0[1][et], a0[2][et], zs0, hprev, st0[et], outq, hn, hf, et, true, mx);
+                    stg[(hf * EN + et) * 32] = outq;
+                }
+            }
+            if (!EX) quantize8(mx, SC[10]);
+            __syncthreads();
+        }
+
+        // ==================================================================
+        // Layers 1, 2
+        // ==================================================================
+        #pragma unroll 1          // one copy of the layer body: code size matters (instruction cache)
+        for (int L = 1; L <= 2; L++) {
+            float acc[6][EN][4];
+            refresh();
+            // packed stream of this warp: rows [0, 96) = correction operand, rows [96, 192) = fp16 high
+            // parts, both ordered (k-step, half, gate)
+            const uint4* wp = (const uint4*)P.Wp + (size_t)(L - 1) * LAYER_U4 + (size_t)warp * (WARP_ROWS * 32) + lane;
+            if (EX) {
+                // ---- fp32-grade GEMM: acc += Wh.hh + Wh.hl + Wl.hh, everything fp16
+                #pragma unroll
+                for (int a = 0; a < 6; a++)
+                    #pragma unroll
+                    for (int e = 0; e < EN; e++)
+                        #pragma unroll
+                        for (int q = 0; q < 4; q++) acc[a][e][q] = 0.0f;
+                #pragma unroll 1
+                for (int ks = 0; ks < 16; ks++) {
+                    #pragma unroll
+                    for (int hf = 0; hf < 2; hf++) {
+                        uint32_t wh[3][4], wl[3][4];
+                        #pragma unroll
+                        for (int m = 0; m < 3; m++) {
+                            const uint4 u = wp[m * 32];
+                            wl[m][0] = u.x; wl[m][1] = u.y; wl[m][2] = u.z; wl[m][3] = u.w;
+                            const uint4 v = wp[(96 + m) * 32];
+                            wh[m][0] = v.x; wh[m][1] = v.y; wh[m][2] = v.z; wh[m][3] = v.w;
+                        }
+                        wp += 3 * 32;
+                        #pragma unroll
+                        for (int ep = 0; ep < (EN + 1) / 2; ep++) {
+                            uint32_t bh[4], bl[4];
+                            const uint32_t a0 = s_hh + loff + ks * (16 * ROWB) + ltile(2 * ep + (lane >> 4));
+                            ldm4t(bh, a0);
+                            ldm4t(bl, a0 + 256 * ROWB);
+                            #pragma unroll
+                            for (int et = 0; et < 2; et++) {
+                                if (2 * ep + et < EN) {
+                                    #pragma unroll
+                                    for (int m = 0; m < 3; m++) {
+                                        MMA16(acc[hf * 3 + m][2 * ep + et], wh[m], bh + 2 * et);
+                                        MMA16(acc[hf * 3 + m][2 * ep + et], wh[m], bl + 2 * et);
+                                        MMA16(acc[hf * 3 + m][2 * ep + et], wl[m], bh + 2 * et);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            } else {
+                int acci[6][EN][4];
+                #pragma unroll
+                for (int a = 0; a < 6; a++)
+                    #pragma unroll
+                    for (int e = 0; e < EN; e++)
+                        #pragma unroll
+                        for (int q = 0; q < 4; q++) acci[a][e][q] = 0;
+                // ---- int8 correction pass: acci += Wh8.hl8 + Wl8.hh8
+                #pragma unroll 1
+                for (int w = 0; w < 16; w++) {
+                    #pragma unroll
+                    for (int hf = 0; hf < 2; hf++) {
+                        uint32_t wc[3][4];
+                        #pragma unroll
+                        for (int m = 0; m < 3; m++) {
+                            const uint4 v = wp[m * 32];
+                            wc[m][0] = v.x; wc[m][1] = v.y; wc[m][2] = v.z; wc[m][3] = v.w;
+                        }
+                        wp += 3 * 32;
+                        #pragma unroll
+                        for (int ep = 0; ep < (EN + 1) / 2; ep++) {
+                            uint32_t bc[4];
+                            ldm4t(bc, s_c8 + loffc + w * (8 * ROWB) + ltile(2 * ep + (lane >> 4)));
+                            #pragma unroll
+                            for (int et = 0; et < 2; et++) {
+                                if (2 * ep + et < EN) {
+                                    #pragma unroll
+                                    for (int m = 0; m < 3; m++) MMA8(acci[hf * 3 + m][2 * ep + et], wc[m], bc + 2 * et);
+                                }
+                            }
+                        }
+                    }
+                }
+                const float cs = SC[6 + 3 * L] * qh;
+                #pragma unroll
+                for (int a = 0; a < 6; a++)
+                    #pragma unroll
+                    for (int e = 0; e < EN; e++)
+                        #pragma unroll
+                        for (int q = 0; q < 4; q++) acc[a][e][q] = (float)acci[a][e][q] * cs;
+                // ---- fp16 main pass: acc += Wh.hh
+                #pragma unroll 1
+                for (int ks = 0; ks < 16; ks++) {
+                    #pragma unroll
+                    for (int hf = 0; hf < 2; hf++) {
+                        uint32_t wh[3][4];
+                        #pragma unroll
+                        for (int m = 0; m < 3; m++) {
+                            const uint4 v = wp[m * 32];
+                            wh[m][0] = v.x; wh[m][1] = v.y; wh[m][2] = v.z; wh[m][3] = v.w;
+                        }
+                        wp += 3 * 32;
+                        #pragma unroll
+                        for (int ep = 0; ep < (EN + 1) / 2; ep++) {
+                            uint32_t bh[4];
+                            ldm4t(bh, s_hh + loff + ks * (16 * ROWB) + ltile(2 * ep + (lane >> 4)));
+                            #pragma unroll
+                            for (int et = 0; et < 2; et++) {
+                                if (2 * ep + et < EN) {
+                                    #pragma unroll
+                                    for (int m = 0; m < 3; m++) MMA16(acc[hf * 3 + m][2 * ep + et], wh[m], bh + 2 * et);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            // first state loads go out before the barrier; the rest stay LA quads ahead
+            float4* const stL = state_ptr(L);
+            float4 stq[NCH];
+            #pragma unroll
+            for (int i = 0; i < NCH; i++) stq[i] = make_float4(0.f, 0.f, 0.f, 0.f);
+            if (t > 0) {
+                #pragma unroll
+                for (int i = 0; i < LA && i < NCH; i++) stq[i] = stL[i * 32];
+            }
+            // layer 2 also accumulates this thread's share of the action logits (fp32):
+            // wj[2hf + r] = W_a[:, j] for its four hidden units
+            float4 wj[4];
+            if (L == 2) {
+                const float4* wat = (const float4*)P.WA + (size_t)warp * (4 * 32) + lane;
+                #pragma unroll
+                for (int i = 0; i < 4; i++) wj[i] = wat[i * 32];
+            }
+            __syncthreads();   // every warp is done reading the operands before they are overwritten
+            refresh();
+
+            const float zs = SC[(L == 1) ? 3 : 4];
+            const float ihs = 1.0f / SC[2];      // power of two, exact
+            float mx = 0.0f;
+            float lg[EN][2][4];                  // [env tile][env in pair][action]
+            #pragma unroll
+            for (int e = 0; e < EN; e++)
+                #pragma unroll
+                for (int c = 0; c < 2; c++)
+                    #pragma unroll
+                    for (int a = 0; a < 4; a++) lg[e][c][a] = 0.0f;
+            #pragma unroll
+            for (int hf = 0; hf < 2; hf++) {
+                #pragma unroll
+                for (int et = 0; et < EN; et++) {
+                    const int i = hf * EN + et;
+                    if (t > 0 && i + LA < NCH) stq[i + LA] = stL[(i + LA) * 32];
+                    float hprev[4];
+                    #pragma unroll
+                    for (int r = 0; r < 2; r++) {
+                        const unsigned char* const p = hhT + o_hh + (16 * hf + 8 * r) * ROWB + gtile(et);
+                        const float2 a = __half22float2(*(const __half2*)p);
+                        const float2 b = __half22float2(*(const __half2*)(p + 256 * ROWB));
+                        hprev[2 * r] = (a.x + b.x) * ihs;
+                        hprev[2 * r + 1] = (a.y + b.y) * ihs;
+                    }
+                    float4 outq;
+                    float hn[4];
+                    quad(acc[hf * 3 + 0][et], acc[hf * 3 + 1][et], acc[hf * 3 + 2][et], zs, hprev, stq[i], outq, hn,
+                         hf, et, L == 1, mx);
+                    stL[i * 32] = outq;
+                    if (L == 2) {
+                        #pragma unroll
+                        for (int r = 0; r < 2; r++) {
+                            const float4 w = wj[2 * hf + r];
+                            #pragma unroll
+                            for (int c = 0; c < 2; c++) {
+                                const float h = hn[2 * r + c];
+                                lg[et][c][0] = fmaf(w.x, h, lg[et][c][0]);
+                                lg[et][c][1] = fmaf(w.y, h, lg[et][c][1]);
+                                lg[et][c][2] = fmaf(w.z, h, lg[et][c][2]);
+                                lg[et][c][3] = fmaf(w.w, h, lg[et][c][3]);
+                            }
+                        }
+                    }
+                }
+            }
+            if (L == 1) {
+                if (!EX) quantize8(mx, SC[13]);
+            } else {
+                // warp-level partial logits (sum over the 8 lanes sharing tid) -> scratch in the
+                // (now dead) int8 operand area: LS[warp][env][action]
+                float* const LS = (float*)l8T + (size_t)warp * (ENVS * 4);
+                #pragma unroll
+                for (int e = 0; e < EN; e++) {
+                    #pragma unroll
+                    for (int c = 0; c < 2; c++) {
+                        float v[4];
+                        #pragma unroll
+                        for (int a = 0; a < 4; a++) {
+                            float x = lg[e][c][a];
+                            x += __shfl_xor_sync(0xffffffffu, x, 4);
+                            x += __shfl_xor_sync(0xffffffffu, x, 8);
+                            x += __shfl_xor_sync(0xffffffffu, x, 16);
+                            v[a] = x;
+                        }
+                        if (g == 0) *(float4*)(LS + (8 * e + 2 * tid + c) * 4) = make_float4(v[0], v[1], v[2], v[3]);
+                    }
+                }
+            }
+            __syncthreads();
+        }
+
+        // ==================================================================
+        // Finish the action head, greedy action, env step. Warp w < EN handles
+        // env tile w; lane = 4 * (env in tile) + action.
+        // ==================================================================
+        refresh();
+        if (warp < EN) {
+            const int a = lane & 3, el = 8 * warp + (lane >> 2);
+            const float* const ls = (const float*)l8T + el * 4 + a;
+            float vr = 0.0f;                    // W_a . h  (logit without bias: the computed "signal")
+            #pragma unroll
+            for (int w = 0; w < 8; w++) vr += ls[w * (ENVS * 4)];
+            const float v = vr + SC[16 + a];
+            const int base = lane & ~3;
+            const float r0 = __shfl_sync(0xffffffffu, vr, base);
+            const float r1 = __shfl_sync(0xffffffffu, vr, base + 1);
+            const float r2 = __shfl_sync(0xffffffffu, vr, base + 2);
+            const float r3 = __shfl_sync(0xffffffffu, vr, base + 3);
+            const float l0 = r0 + SC[16], l1 = r1 + SC[17], l2 = r2 + SC[18], l3 = r3 + SC[19];
+            const int eg = P.env_base + blockIdx.x * ENVS + el;
+            const int N = P.N;
+            if (t == P.H - 1 && eg < N) P.last_logits[4 * (size_t)eg + a] = v;
+            if (a == 0) {
+                int act = 0; float best = l0;
+                if (l1 > best) { best = l1; act = 1; }
+                if (l2 > best) { best = l2; act = 2; }
+                if (l3 > best) { best = l3; act = 3; }
+                // Certificate for the fast (int8-corrected) GEMM, whose logit error is a small
+                // fraction of the signal: the greedy decision is accepted only if the top-2 gap
+                // clears a 5e-4 relative margin and the signal is small enough that the absolute
+                // error stays far below the 1e-5 tie margin. Otherwise the host reruns with EX.
+                {
+                    const float m01 = fmaxf(l0, l1), n01 = fminf(l0, l1), m23 = fmaxf(l2, l3), n23 = fminf(l2, l3);
+                    const float second = fmaxf(fminf(m01, m23), fmaxf(n01, n23));
+                    const float sig = fmaxf(fmaxf(fabsf(r0), fabsf(r1)), fmaxf(fabsf(r2), fabsf(r3)));
+                    const bool safe = (fmaxf(m01, m23) - second >= 5e-4f * sig) && (sig <= 0.5f);
+                    if (!safe && eg < N) P.unsafe[0] = 1;
+                }
+                const uint32_t pos = (uint32_t)envd[2 * el];
+                int ax = pos & 255, ay = (pos >> 8) & 255, fx = (pos >> 16) & 255, fy = pos >> 24;
+                if (act == 0) ay = max(ay - 1, 0);
+                else if (act == 1) ay = min(ay + 1, 10);
+                else if (act == 2) ax = max(ax - 1, 0);
+                else ax = min(ax + 1, 10);
+                if (ax == fx && ay == fy) {
+                    envd[2 * el + 1] += 1;
+                    if (eg < N) P.anyhit[t] = 1;
+                    const uint64_t sd = P.seed_base + (uint64_t)eg;
+                    const uint64_t x1 = (P.lcg[2 * t] * sd + P.lcg[2 * t + 1]) & LCG_MASK;
+                    const uint64_t x2 = (x1 * LCG_A + 1ULL) & LCG_MASK;
+                    fx = (int)(x1 % 11ULL);
+                    fy = (int)(x2 % 11ULL);
+                }
+                envd[2 * el] = (int)((uint32_t)ax | ((uint32_t)ay << 8) | ((uint32_t)fx << 16) | ((uint32_t)fy << 24));
+                write_obs(el, ax, ay, fx, fy);
+            }
+        }
+        __syncthreads();
+    }
+
+    if (tix < ENVS) {
+        const int e = P.env_base + blockIdx.x * ENVS + tix;
+        if (e < P.N) {
+            const uint32_t pos = (uint32_t)envd[2 * tix];
+            P.positions[2 * (size_t)e] = (long long)(pos & 255);
+            P.positions[2 * (size_t)e + 1] = (long long)((pos >> 8) & 255);
+            P.rewards[e] = (float)envd[2 * tix + 1];
+        }
+    }
+}
+
+// --------------------------------------------------------------------------
+// Prep kernels (run every rollout: weights may have changed)
+// --------------------------------------------------------------------------
+#define PREP_NB 32
+// Stage 1 (PREP_NB blocks): partial maxima. part[b] = {layer-0 input bound, max|W_gru[1]|, max|W_gru[2]|, -}
+__global__ void prep_max(const float* w_enc, const float* b_enc, const float* w_gru, float* part) {
+    __shared__ float red[3][1024];
+    const int tix = threadIdx.x, b = blockIdx.x;
+    const int CH = 768 * 256 / PREP_NB;      // 6144 weights per block and layer
+    float m1 = 0.f, m2 = 0.f, m0 = 0.f;
+    #pragma unroll
+    for (int i = 0; i < CH / 1024; i++) {
+        const int idx = b * CH + i * 1024 + tix;
+        m1 = fmaxf(m1, fabsf(w_gru[768 * 256 + idx]));
+        m2 = fmaxf(m2, fabsf(w_gru[2 * 768 * 256 + idx]));
+    }
+    if (b == 0 && tix < 256) {
+        // |h0[j]| <= sum_i |w_enc[j][i]| * max|obs_i| + |b_enc[j]|
+        m0 = fabsf(w_enc[4 * tix]) * (10.0f / 11.0f) + fabsf(w_enc[4 * tix + 1]) * (10.0f / 11.0f)
+           + fabsf(w_enc[4 * tix + 2]) + fabsf(w_enc[4 * tix + 3]) + fabsf(b_enc[tix]);
+    }
+    red[0][tix] = m0; red[1][tix] = m1; red[2][tix] = m2;
+    __syncthreads();
+    for (int s = 512; s > 0; s >>= 1) {
+        if (tix < s) {
+            #pragma unroll
+            for (int k = 0; k < 3; k++) red[k][tix] = fmaxf(red[k][tix], red[k][tix + s]);
+        }
+        __syncthreads();
+    }
+    if (tix < 3) part[4 * b + tix] = red[tix][0];
+}
+
+// Scales for one GRU layer from max|W|: ws = 2^s with max|W|*2^s in [2^14, 2^15) (fp16 hi part),
+// q8 = int8 quantum of W*2^s, ql = int8 quantum of its fp16 residual (<= half an ulp of the top
+// binade = max * 2^-11, so the ratio of the two quanta is exactly 2^-11).
+struct LayerScale { float ws, q8, ql; int s; };
+static __device__ __forceinline__ LayerScale layer_scale(const float* part, int layer) {
+    float mw = 0.f;
+    #pragma unroll
+    for (int b = 0; b < PREP_NB; b++) mw = fmaxf(mw, part[4 * b + 1 + layer]);
+    LayerScale r;
+    r.s = 0;
+    if (mw > 0.f && mw < 1e30f) r.s = 14 - ilogbf(mw);
+    if (r.s > 60) r.s = 60;
+    r.ws = ldexpf(1.0f, r.s);
+    float mW = mw * r.ws;
+    if (!(mW > 0.f) || !(mW < 1e30f)) mW = 1.0f;
+    r.q8 = mW * (1.0f / 127.0f);
+    r.ql = mW * (1.0f / (127.0f * 2048.0f));
+    return r;
+}
+
+// Stage 2: pack the GRU weights (blocks < NPACK), fold layer 0 in fp64 (remaining blocks) and
+// publish the scales.
+// scal: [0],[1] 2^s (layers 1,2)  [2] 2^t  [3],[4] 2^-(s+t)  [5] layer-0 out scale  [6] head out scale
+//       [8],[11] int8 quantum of W*2^s   [9],[12] int8 quantum of the fp16 residual   [10],[13] their ratio
+__global__ void prep_pack(const float* w_enc, const float* b_enc, const float* w_gru,
+                          uint4* Wp, float* g0tab, float* scal, const float* part, int exact) {
+    const int NPACK = 2 * LAYER_U4 / 256;
+    if (blockIdx.x == 0 && threadIdx.x == 0) {
+        float bound = fmaxf(1.0f, part[0] * 1.0001f);
+        if (!(bound < 1e30f)) bound = 1.0f;
+        const int te = 14 - ilogbf(bound);
+        scal[2] = ldexpf(1.0f, te);
+        #pragma unroll
+        for (int l = 0; l < 2; l++) {
+            const LayerScale ls = layer_scale(part, l);
+            scal[l] = ls.ws;
+            scal[3 + l] = ldexpf(1.0f, -(ls.s + te));
+            scal[8 + 3 * l] = ls.q8;
+            scal[9 + 3 * l] = ls.ql;
+            scal[10 + 3 * l] = 2048.0f;
+        }
+    }
+    if (blockIdx.x < NPACK) {
+        const int idx = blockIdx.x * 256 + threadIdx.x;
+        const int lane = idx & 31;
+        const int row = (idx >> 5) % WARP_ROWS;
+        const int rest = (idx >> 5) / WARP_ROWS;
+        const int warp = rest & 7, layer = rest >> 3;
+        const int g = lane >> 2, tid = lane & 3;
+        const LayerScale ls = layer_scale(part, layer);
+        const float ws = ls.ws;
+        const float* W = w_gru + (size_t)(layer + 1) * 768 * 256;
+        uint32_t reg[4];
+        if (row < 96 && exact) {
+            // fp32-grade mode: fp16 low parts (residual of the fp16 rounding), same layout as the high parts
+            const int m = row % 3, hf = (row / 3) & 1, ks = row / 6;
+            #pragma unroll
+            for (int r = 0; r < 4; r++) {
+                const int j = 32 * warp + 16 * hf + g + ((r & 1) ? 8 : 0);
+                const int k0 = 16 * ks + 2 * tid + ((r & 2) ? 8 : 0);
+                uint32_t v = 0;
+                #pragma unroll
+                for (int b = 0; b < 2; b++) {
+                    const float x = W[(size_t)(m * 256 + j) * 256 + k0 + b] * ws;
+                    const float lo = x - __half2float(__float2half_rn(x));
+                    v |= (uint32_t)__half_as_ushort(__float2half_rn(lo)) << (16 * b);
+                }
+                reg[r] = v;
+            }
+        } else if (row < 96) {
+            // int8 pass, window w = 16 k; slot s<16: Wh8 (pairs with hl8), s>=16: Wl8 (pairs with hh8);
+            // slot (s&15) = 2r + b  <->  k = 16w + r + 8b
+            const int m = row % 3, hf = (row / 3) & 1, w = row / 6;
+            const float iq8 = 1.0f / ls.q8, iql = 1.0f / ls.ql;
+            #pragma unroll
+            for (int r = 0; r < 4; r++) {
+                const int j = 32 * warp + 16 * hf + g + ((r & 1) ? 8 : 0);
+                uint32_t v = 0;
+                #pragma unroll
+                for (int b = 0; b < 4; b++) {
+                    const int s = 4 * tid + b;
+                    const int k = 16 * w + (s >> 1) + 8 * (s & 1);
+                    const float x = W[(size_t)(m * 256 + j) * 256 + k] * ws;
+                    float q;
+                    if (r & 2) q = (x - __half2float(__float2half_rn(x))) * iql;
+                    else q = x * iq8;
+                    q = fminf(fmaxf(rintf(q), -127.0f), 127.0f);
+                    v |= ((uint32_t)(int)q & 0xffu) << (8 * b);
+                }
+                reg[r] = v;
+            }
+        } else {
+            const int rr = row - 96;
+            const int m = rr % 3, hf = (rr / 3) & 1, ks = rr / 6;
+            #pragma unroll
+            for (int r = 0; r < 4; r++) {
+                const int j = 32 * warp + 16 * hf + g + ((r & 1) ? 8 : 0);
+                const int k0 = 16 * ks + 2 * tid + ((r & 2) ? 8 : 0);
+                uint32_t v = 0;
+                #pragma unroll
+                for (int b = 0; b < 2; b++) {
+                    const float x = W[(size_t)(m * 256 + j) * 256 + k0 + b] * ws;
+                    v |= (uint32_t)__half_as_ushort(__float2half_rn(x)) << (16 * b);
+                }
+                reg[r] = v;
+            }
+        }
+        Wp[idx] = make_uint4(reg[0], reg[1], reg[2], reg[3]);
+    } else {
+        const int idx = (blockIdx.x - NPACK) * 256 + threadIdx.x;
+        if (idx < 768 * 5) {
+            const int r = idx / 5, i = idx % 5;
+            const int gate = r / 256, j = r % 256;
+            const float* wr = w_gru + (size_t)r * 256;
+            double acc = 0.0;
+            for (int k = 0; k < 256; k++) acc += (double)wr[k] * (double)((i < 4) ? w_enc[4 * k + i] : b_enc[k]);
+            g0tab[15 * j + 5 * gate + i] = (float)acc;
+        }
+    }
+}
+
+// Folded layer 0 as an MMA A operand. Rows: zh, zg, zp (W_gru[0] @ [W_enc | b_enc], fp64 products
+// from prep_pack) and h0 ([W_enc | b_enc]); 16 k-slots: 0-3 hi(M), 4-7 hi(M), 8-11 lo(M), 12 hi(c), 13 lo(c).
+__global__ void prep_l0(const float* w_enc, const float* b_enc, const float* w_a, const float* g0tab,
+                        uint4* A0, uint4* WA, float* scal) {
+    __shared__ float red[1024];
+    const int tix = threadIdx.x;
+    // ---- action head weights per cell-owning thread: WA[warp][2hf + r][lane] = W_a[:, j],
+    //      j = 32 warp + 16 hf + (lane >> 2) + 8 r
+    {
+        const int lane = tix & 31, hr = (tix >> 5) & 3, warp = tix >> 7;
+        const int j = 32 * warp + 16 * (hr >> 1) + (lane >> 2) + 8 * (hr & 1);
+        *(float4*)(WA + tix) = make_float4(w_a[j], w_a[256 + j], w_a[512 + j], w_a[768 + j]);
+    }
+    float m = 0.f;
+    for (int i = tix; i < 256 * 15; i += 1024) m = fmaxf(m, fabsf(g0tab[i]));
+    m = fmaxf(m, fabsf(w_enc[tix]));
+    if (tix < 256) m = fmaxf(m, fabsf(b_enc[tix]));
+    red[tix] = m;
+    __syncthreads();
+    for (int s = 512; s > 0; s >>= 1) {
+        if (tix < s) red[tix] = fmaxf(red[tix], red[tix + s]);
+        __syncthreads();
+    }
+    int s0 = 0;
+    if (red[0] > 0.f && red[0] < 1e30f) s0 = 14 - ilogbf(red[0]);
+    if (s0 > 60) s0 = 60;
+    const float ws = ldexpf(1.0f, s0);
+    if (tix == 0) scal[5] = ldexpf(1.0f, -(s0 + 14));
+    for (int idx = tix; idx < NWARP * 2 * 4 * 32; idx += 1024) {
+        const int lane = idx & 31, m4 = (idx >> 5) & 3, hf = (idx >> 7) & 1, warp = idx >> 8;
+        const int g = lane >> 2, tid = lane & 3;
+        uint32_t reg[4];
+        #pragma unroll
+        for (int r = 0; r < 4; r++) {
+            const int j = 32 * warp + 16 * hf + g + ((r & 1) ? 8 : 0);
+            uint32_t v = 0;
+            #pragma unroll
+            for (int b = 0; b < 2; b++) {
+                const int slot = 2 * tid + ((r & 2) ? 8 : 0) + b;
+                float x = 0.f; bool lo = false; bool used = true;
+                int i = 0;
+                if (slot < 4) { i = slot; }
+                else if (slot < 8) { i = slot - 4; }
+                else if (slot < 12) { i = slot - 8; lo = true; }
+                else if (slot == 12) { i = 4; }
+                else if (slot == 13) { i = 4; lo = true; }
+                else used = false;
+                if (used) {
+                    if (m4 < 3) x = g0tab[15 * j + 5 * m4 + i];
+                    else x = (i < 4) ? w_enc[4 * j + i] : b_enc[j];
+                    x *= ws;
+                    const __half hi = __float2half_rn(x);
+                    const __half val = lo ? __float2half_rn(x - __half2float(hi)) : hi;
+                    v |= (uint32_t)__half_as_ushort(val) << (16 * b);
+                }
+            }
+            reg[r] = v;
+        }
+        A0[idx] = make_uint4(reg[0], reg[1], reg[2], reg[3]);
+    }
+}
+
+// --------------------------------------------------------------------------
+// Stand-alone exact-fp32 policy forward (one block per env) and env step.
+// --------------------------------------------------------------------------
+__global__ void pf_kernel(const float* obs, const float* state, const float* w_enc, const float* b_enc,
+                          const float* w_gru, const float* w_a, const float* b_a, const float* w_v,
+                          const float* b_v, float* logits, float* new_state, float* value) {
+    __shared__ float h[256];
+    const int n = blockIdx.x, j = threadIdx.x;
+    {
+        double acc = 0.0;
+        #pragma unroll
+        for (int i = 0; i < 4; i++) acc += (double)w_enc[4 * j + i] * (double)obs[4 * (size_t)n + i];
+        float hv = (float)(acc + (double)b_enc[j]);
+        __syncthreads();
+        h[j] = hv;
+        __syncthreads();
+    }
+    for (int l = 0; l < 3; l++) {
+        const float* W = w_gru + (size_t)l * 768 * 256;
+        double zh = 0.0, zg = 0.0, zp = 0.0;
+        for (int k = 0; k < 256; k++) {
+            const double hk = (double)h[k];
+            zh += (double)W[(size_t)j * 256 + k] * hk;
+            zg += (double)W[(size_t)(256 + j) * 256 + k] * hk;
+            zp += (double)W[(size_t)(512 + j) * 256 + k] * hk;
+        }
+        const float st = state[((size_t)n * 3 + l) * 256 + j];
+        const float gg = 1.0f / (1.0f + expf(-(float)zg));
+        const float pp = 1.0f / (1.0f + expf(-(float)zp));
+        const float out = st + gg * (tanhf((float)zh) - st);
+        const float hn = pp * out + (1.0f - pp) * h[j];
+        new_state[((size_t)n * 3 + l) * 256 + j] = out;
+        __syncthreads();
+        h[j] = hn;
+        __syncthreads();
+    }
+    if (j < 5) {
+        const float* wr = (j < 4) ? (w_a + j * 256) : w_v;
+        double acc = 0.0;
+        for (int k = 0; k < 256; k++) acc += (double)wr[k] * (double)h[k];
+        if (j < 4) logits[4 * (size_t)n + j] = (float)(acc + (double)b_a[j]);
+        else value[n] = (float)(acc + (double)b_v[0]);
+    }
+}
+
+__global__ void env_move_kernel(const int* agent, const int* food, const long long* actions,
+                                int* agent_out, float* reward, int* flag, int n) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    int ax = agent[2 * i], ay = agent[2 * i + 1];
+    const long long a = actions[i];
+    if (a == 0) ay -= 1; else if (a == 1) ay += 1; else if (a == 2) ax -= 1; else if (a == 3) ax += 1;
+    ax = min(max(ax, 0), 10); ay = min(max(ay, 0), 10);
+    agent_out[2 * i] = ax; agent_out[2 * i + 1] = ay;
+    const bool hit = (ax == food[2 * i]) && (ay == food[2 * i + 1]);
+    reward[i] = hit ? 1.0f : 0.0f;
+    if (hit) flag[0] = 1;
+}
+__global__ void env_respawn_kernel(const int* food, const long long* rng, const float* reward,
+                                   int* food_out, long long* rng_out, const int* flag, int n) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    int fx = food[2 * i], fy = food[2 * i + 1];
+    uint64_t r = (uint64_t)rng[i];
+    if (flag[0]) {
+        const uint64_t x1 = (r * LCG_A + 1ULL) & LCG_MASK;
+        const uint64_t x2 = (x1 * LCG_A + 1ULL) & LCG_MASK;
+        r = x2;
+        if (reward[i] != 0.0f) { fx = (int)(x1 % 11ULL); fy = (int)(x2 % 11ULL); }
+    }
+    food_out[2 * i] = fx; food_out[2 * i + 1] = fy;
+    rng_out[i] = (long long)r;
+}
+
+// --------------------------------------------------------------------------
+// Launchers (C linkage, called from the g++-compiled glue)
+// --------------------------------------------------------------------------
+#ifndef MG_EN_LIST
+#define MG_EN_LIST X(1) X(2) X(3) X(4) X(5) X(6) X(7) X(8)
+#endif
+template <int EN, bool EX> static int launch_mega_t(const MegaParams* P, int nblocks) {
+    static bool configured = false;
+    const int rowt = (EN & 1) ? EN : (EN == 8 ? EN : EN + 1);   // must match mega_kernel
+    const int smem = 784 * 16 * rowt + 64 * EN + 112 + (int)((sizeof(MegaParams) + 15) & ~(size_t)15);
+    if (!configured) {
+        cudaFuncSetAttribute(mega_kernel<EN, EX>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+        configured = true;
+    }
+    mega_kernel<EN, EX><<<nblocks, 256, smem>>>(*P);
+    return (int)cudaGetLastError();
+}
+extern "C" int mg_has_en(int en) {
+    switch (en) {
+#define X(n) case n: return 1;
+        MG_EN_LIST
+#undef X
+    }
+    return 0;
+}
+extern "C" int mg_launch_mega(int en, int exact, const MegaParams* P, int nblocks) {
+    if (exact) {
+        switch (en) {
+#define X(n) case n: return launch_mega_t<n, true>(P, nblocks);
+            MG_EN_LIST
+#undef X
+        }
+    } else {
+        switch (en) {
+#define X(n) case n: return launch_mega_t<n, false>(P, nblocks);
+            MG_EN_LIST
+#undef X
+        }
+    }
+    return -1;
+}
+extern "C" void mg_launch_prep(const float* w_enc, const float* b_enc, const float* w_gru, const float* w_a,
+                               void* Wp, void* A0, void* WA, float* g0tab, float* scal, int exact) {
+    float* part = scal + 16;     // scratch for the partial maxima
+    prep_max<<<PREP_NB, 1024>>>(w_enc, b_enc, w_gru, part);
+    prep_pack<<<2 * LAYER_U4 / 256 + 15, 256>>>(w_enc, b_enc, w_gru, (uint4*)Wp, g0tab, scal, part, exact);
+    prep_l0<<<1, 1024>>>(w_enc, b_enc, w_a, g0tab, (uint4*)A0, (uint4*)WA, scal);
+}
+extern "C" void mg_launch_pf(const float* obs, const float* state, const float* w_enc, const float* b_enc,
+                             const float* w_gru, const float* w_a, const float* b_a, const float* w_v,
+                             const float* b_v, float* logits, float* new_state, float* value, int n) {
+    if (n > 0) pf_kernel<<<n, 256>>>(obs, state, w_enc, b_enc, w_gru, w_a, b_a, w_v, b_v, logits, new_state, value);
+}
+extern "C" void mg_launch_env(const int* agent, const int* food, const long long* actions, const long long* rng,
+                              int* agent_out, int* food_out, float* reward, long long* rng_out, int* flag, int n) {
+    if (n <= 0) return;
+    const int nb = (n + 255) / 256;
+    env_move_kernel<<<nb, 256>>>(agent, food, actions, agent_out, reward, flag, n);
+    env_respawn_kernel<<<nb, 256>>>(food, rng, reward, food_out, rng_out, flag, n);
+}
+"""
+
+# --------------------------------------------------------------------------
+# Host glue (g++): RNG init identical to torch's CPU mt19937 randint,
+# buffer management, launch, hit-schedule verification.
+# --------------------------------------------------------------------------
+_CPP_SRC = _COMMON_SRC + r"""
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <vector>
+#include <stdexcept>
+#include <string>
+
+#include <chrono>
+#define LCG_A 6364136223846793005ULL
+#define PACK_BYTES (2 * 8 * 192 * 32 * 16)
+
+namespace {
+
+// ---- MT19937 (same stream as torch.Generator(device="cpu")) ---------------
+__attribute__((target_clones("avx512f", "avx2", "default")))
+void mt_twist(uint32_t* s) {
+    const uint32_t U = 0x80000000u, Lm = 0x7fffffffu, MAG = 0x9908b0dfu;
+    for (int i = 0; i < 227; i++) {
+        uint32_t y = (s[i] & U) | (s[i + 1] & Lm);
+        s[i] = s[i + 397] ^ (y >> 1) ^ ((0u - (y & 1u)) & MAG);
+    }
+    for (int i = 227; i < 623; i++) {
+        uint32_t y = (s[i] & U) | (s[i + 1] & Lm);
+        s[i] = s[i - 227] ^ (y >> 1) ^ ((0u - (y & 1u)) & MAG);
+    }
+    uint32_t y = (s[623] & U) | (s[0] & Lm);
+    s[623] = s[396] ^ (y >> 1) ^ ((0u - (y & 1u)) & MAG);
+}
+__attribute__((target_clones("avx512f", "avx2", "default")))
+void mt_temper_mod11(const uint32_t* s, uint8_t* out, int n) {
+    for (int i = 0; i < n; i++) {
+        uint32_t y = s[i];
+        y ^= y >> 11;
+        y ^= (y << 7) & 0x9d2c5680u;
+        y ^= (y << 15) & 0xefc60000u;
+        y ^= y >> 18;
+        out[i] = (uint8_t)(y % 11u);
+    }
+}
+// out[i] = (i-th output of mt19937(seed)) % 11
+void mt_fill_mod11(uint32_t seed, uint8_t* out, size_t n) {
+    alignas(64) uint32_t s[624 + 16];
+    s[0] = seed;
+    for (int i = 1; i < 624; i++) s[i] = 1812433253u * (s[i - 1] ^ (s[i - 1] >> 30)) + (uint32_t)i;
+    size_t done = 0;
+    while (done < n) {
+        mt_twist(s);
+        int m = (int)std::min<size_t>(624, n - done);
+        mt_temper_mod11(s, out + done, m);
+        done += m;
+    }
+}
+
+void ck(cudaError_t e, const char* what) {
+    if (e != cudaSuccess) throw std::runtime_error(std::string("CUDA error in ") + what + ": " + cudaGetErrorString(e));
+}
+
+struct Buffers {
+    void* Wp = nullptr;
+    void* A0 = nullptr;
+    void* WA = nullptr;
+    float* g0tab = nullptr;
+    float* scal = nullptr;
+    float* state = nullptr; size_t state_bytes = 0;
+    uint8_t* init_dev = nullptr; size_t init_cap = 0;
+    uint8_t* init_host = nullptr;           // pinned: [init bytes][lcg table]
+    uint64_t* lcg_dev = nullptr; int* anyhit_dev = nullptr; size_t h_cap = 0;
+    uint64_t* lcg_host = nullptr; int* anyhit_host = nullptr;
+} B;
+
+void ensure(size_t n_envs, size_t horizon, size_t state_bytes) {
+    if (!B.Wp) {
+        ck(cudaMalloc(&B.Wp, PACK_BYTES + 4096), "malloc Wp");   // + slack: prefetch reads one group past the end
+        ck(cudaMemset(B.Wp, 0, PACK_BYTES + 4096), "clear Wp");
+        ck(cudaMalloc(&B.A0, 8 * 2 * 4 * 32 * 16), "malloc A0");
+        ck(cudaMalloc(&B.WA, 1024 * 16), "malloc WA");
+        ck(cudaMalloc(&B.g0tab, 256 * 15 * sizeof(float)), "malloc g0tab");
+        ck(cudaMalloc(&B.scal, (16 + 4 * 32) * sizeof(float)), "malloc scal");   // scales + prep scratch
+    }
+    if (state_bytes > B.state_bytes) {
+        if (B.state) cudaFree(B.state);
+        ck(cudaMalloc(&B.state, state_bytes), "malloc state");
+        B.state_bytes = state_bytes;
+    }
+    if (n_envs > B.init_cap) {
+        if (B.init_dev) cudaFree(B.init_dev);
+        if (B.init_host) cudaFreeHost(B.init_host);
+        size_t cap = n_envs + n_envs / 4 + 1024;
+        ck(cudaMalloc(&B.init_dev, cap * 4), "malloc init");
+        ck(cudaHostAlloc(&B.init_host, cap * 4, cudaHostAllocDefault), "hostalloc init");
+        B.init_cap = cap;
+    }
+    if (horizon > B.h_cap) {
+        if (B.lcg_dev) cudaFree(B.lcg_dev);
+        if (B.anyhit_dev) cudaFree(B.anyhit_dev);
+        if (B.lcg_host) cudaFreeHost(B.lcg_host);
+        if (B.anyhit_host) cudaFreeHost(B.anyhit_host);
+        size_t cap = horizon * 2 + 64;
+        ck(cudaMalloc(&B.lcg_dev, cap * 16), "malloc lcg");
+        ck(cudaMalloc(&B.anyhit_dev, cap * 4), "malloc anyhit");
+        ck(cudaHostAlloc(&B.lcg_host, cap * 16, cudaHostAllocDefault), "hostalloc lcg");
+        ck(cudaHostAlloc(&B.anyhit_host, cap * 4, cudaHostAllocDefault), "hostalloc anyhit");
+        B.h_cap = cap;
+    }
+}
+
+const float* fptr(const torch::Tensor& t) { return (const float*)t.data_ptr(); }
+
+double g_tm[8];
+// 0: int8-corrected fast GEMM (results certified by the kernel), 1: fp32-grade GEMM.
+// Sticky across calls: a model that needed the exact path starts there next time, and goes back
+// to the fast path once an exact run reports that every decision would have been certified.
+int g_exact = 0;
+inline double now_s() {
+    return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+}  // namespace
+
+// Fill (n,4) uint8 [ax, ay, fx, fy] exactly like the reference's two torch.randint calls.
+void mg_init_bytes(torch::Tensor out, int64_t seed) {
+    int64_t n = out.size(0);
+    std::vector<uint8_t> tmp((size_t)n * 4);
+    mt_fill_mod11((uint32_t)(uint64_t)seed, tmp.data(), (size_t)n * 4);
+    uint8_t* o = (uint8_t*)out.data_ptr();
+    for (int64_t e = 0; e < n; e++) {
+        o[4 * e + 0] = tmp[2 * e]; o[4 * e + 1] = tmp[2 * e + 1];
+        o[4 * e + 2] = tmp[2 * n + 2 * e]; o[4 * e + 3] = tmp[2 * n + 2 * e + 1];
+    }
+}
+
+// Full rollout. A plan = [en0, nblocks0, en1, nblocks1, ...]: one launch ("round") per pair,
+// covering consecutive env ranges. Returns the number of passes that were needed.
+int mg_run(torch::Tensor w_enc, torch::Tensor b_enc, torch::Tensor w_gru, torch::Tensor w_a,
+           torch::Tensor b_a, torch::Tensor rewards, torch::Tensor positions, torch::Tensor last_logits,
+           int64_t num_envs, int64_t horizon, int64_t seed, int64_t seed_base,
+           std::vector<int64_t> plan_fast, std::vector<int64_t> plan_exact,
+           torch::Tensor init_override) {
+    g_tm[0] = now_s();
+    const size_t N = (size_t)num_envs;
+    const int H = (int)horizon;
+    size_t max_state = 0, covered = 0;
+    for (const std::vector<int64_t>* pl : {&plan_fast, &plan_exact}) {
+        covered = 0;
+        for (size_t i = 0; i + 1 < pl->size(); i += 2) {
+            if (!mg_has_en((int)(*pl)[i])) throw std::runtime_error("unsupported block size in plan");
+            const size_t envs = (size_t)(*pl)[i] * 8 * (size_t)(*pl)[i + 1];
+            max_state = std::max(max_state, envs * 3 * 256 * sizeof(float));
+            covered += envs;
+        }
+        if (covered < N) throw std::runtime_error("plan does not cover all envs");
+    }
+    ensure(N, (size_t)H, max_state);
+
+    // GPU: pack weights while the CPU generates the initial positions.
+    int exact = g_exact;
+    mg_launch_prep(fptr(w_enc), fptr(b_enc), fptr(w_gru), fptr(w_a), B.Wp, B.A0, B.WA, B.g0tab, B.scal, exact);
+    g_tm[1] = now_s();
+
+    if (init_override.defined() && init_override.numel() == (int64_t)N * 4) {
+        memcpy(B.init_host, init_override.data_ptr(), N * 4);
+    } else {
+        // stream order: agent (N,2) row-major, then food (N,2) row-major
+        static std::vector<uint8_t> tmp;
+        if (tmp.size() < N * 4) tmp.resize(N * 4);
+        mt_fill_mod11((uint32_t)(uint64_t)seed, tmp.data(), N * 4);
+        const uint8_t* a = tmp.data();
+        const uint8_t* f = tmp.data() + 2 * N;
+        uint8_t* o = B.init_host;
+        for (size_t e = 0; e < N; e++) {
+            o[4 * e + 0] = a[2 * e]; o[4 * e + 1] = a[2 * e + 1];
+            o[4 * e + 2] = f[2 * e]; o[4 * e + 3] = f[2 * e + 1];
+        }
+    }
+    g_tm[2] = now_s();
+    ck(cudaMemcpyAsync(B.init_dev, B.init_host, N * 4, cudaMemcpyHostToDevice, 0), "init upload");
+
+    MegaParams P;
+    P.Wp = B.Wp; P.A0 = B.A0; P.WA = B.WA;
+    P.b_a = fptr(b_a); P.scal = B.scal; P.state = B.state;
+    P.init = B.init_dev; P.lcg = B.lcg_dev; P.anyhit = B.anyhit_dev; P.unsafe = B.anyhit_dev + H;
+    P.rewards = (float*)rewards.data_ptr(); P.positions = (long long*)positions.data_ptr();
+    P.last_logits = (float*)last_logits.data_ptr();
+    P.seed_base = (uint64_t)seed_base; P.N = (int)N; P.H = H; P.env_base = 0;
+
+    // Assumed schedule: a[t] = "some env hits food at step t" (the reference
+    // advances every env's LCG twice on such steps). Start optimistic.
+    std::vector<int> sched(H, 1);
+    int passes = 0;
+    for (;;) {
+        uint64_t mul = 1, add = 0;   // composition of the LCG so far: x -> mul*x + add
+        for (int t = 0; t < H; t++) {
+            // respawn at step t uses LCG^(2A(t)+1) for x and one more step for y
+            B.lcg_host[2 * t] = mul * LCG_A;
+            B.lcg_host[2 * t + 1] = add * LCG_A + 1ULL;
+            if (sched[t]) {
+                for (int r = 0; r < 2; r++) { mul = mul * LCG_A; add = add * LCG_A + 1ULL; }
+            }
+        }
+        ck(cudaMemcpyAsync(B.lcg_dev, B.lcg_host, (size_t)H * 16, cudaMemcpyHostToDevice, 0), "lcg upload");
+        ck(cudaMemsetAsync(B.anyhit_dev, 0, (size_t)(H + 1) * 4, 0), "anyhit clear");
+        size_t base = 0;
+        const std::vector<int64_t>& plan = exact ? plan_exact : plan_fast;
+        for (size_t i = 0; i + 1 < plan.size() && base < N; i += 2) {
+            const int en = (int)plan[i];
+            const size_t left = (N - base + (size_t)en * 8 - 1) / ((size_t)en * 8);
+            const int nb = (int)std::min<size_t>((size_t)plan[i + 1], left);
+            P.env_base = (int)base;
+            int err = mg_launch_mega(en, exact, &P, nb);
+            if (err != 0) throw std::runtime_error(std::string("megakernel launch failed: ") + cudaGetErrorString((cudaError_t)err));
+            base += (size_t)nb * en * 8;
+        }
+        passes++;
+        g_tm[3] = now_s();
+        ck(cudaMemcpy(B.anyhit_host, B.anyhit_dev, (size_t)(H + 1) * 4, cudaMemcpyDeviceToHost), "anyhit readback");
+        const bool unsafe = B.anyhit_host[H] != 0;
+        if (unsafe && !exact) {
+            // some decision was too close for the fast GEMM's accuracy: redo with the fp32-grade kernel
+            exact = 1; g_exact = 1;
+            mg_launch_prep(fptr(w_enc), fptr(b_enc), fptr(w_gru), fptr(w_a), B.Wp, B.A0, B.WA, B.g0tab, B.scal, exact);
+            if (passes > 2 * H + 8) throw std::runtime_error("rollout did not converge");
+            continue;
+        }
+        // Valid iff at every step with a hit, the assumed number of earlier
+        // hit-steps equals the actual one (steps without hits never use it).
+        bool ok = true;
+        int a_assumed = 0, a_true = 0;
+        for (int t = 0; t < H; t++) {
+            if (B.anyhit_host[t] && a_assumed != a_true) { ok = false; break; }
+            a_assumed += sched[t];
+            a_true += B.anyhit_host[t] ? 1 : 0;
+        }
+        g_tm[4] = now_s();
+        if (ok) {
+            if (exact && !unsafe) g_exact = 0;
+            g_tm[5] = (double)exact;
+            break;
+        }
+        for (int t = 0; t < H; t++) sched[t] = B.anyhit_host[t] ? 1 : 0;
+        if (passes > H + 2) throw std::runtime_error("hit schedule did not converge");
+    }
+    return passes;
+}
+
+int mg_supported(int64_t en) { return mg_has_en((int)en); }
+
+// Host-side stage timestamps of the last mg_run (seconds): entry, prep launched, init generated,
+// kernels launched, results verified.
+std::vector<double> mg_timing() { return std::vector<double>(g_tm, g_tm + 6); }
+
+void mg_policy_forward(torch::Tensor obs, torch::Tensor state, torch::Tensor w_enc, torch::Tensor b_enc,
+                       torch::Tensor w_gru, torch::Tensor w_a, torch::Tensor b_a, torch::Tensor w_v,
+                       torch::Tensor b_v, torch::Tensor logits, torch::Tensor new_state, torch::Tensor value) {
+    mg_launch_pf(fptr(obs), fptr(state), fptr(w_enc), fptr(b_enc), fptr(w_gru), fptr(w_a), fptr(b_a),
+                 fptr(w_v), fptr(b_v), (float*)logits.data_ptr(), (float*)new_state.data_ptr(),
+                 (float*)value.data_ptr(), (int)obs.size(0));
+    ck(cudaGetLastError(), "policy_forward");
+}
+
+void mg_env_step(torch::Tensor agent, torch::Tensor food, torch::Tensor actions, torch::Tensor rng,
+                 torch::Tensor agent_out, torch::Tensor food_out, torch::Tensor reward, torch::Tensor rng_out,
+                 torch::Tensor flag) {
+    mg_launch_env((const int*)agent.data_ptr(), (const int*)food.data_ptr(), (const long long*)actions.data_ptr(),
+                  (const long long*)rng.data_ptr(), (int*)agent_out.data_ptr(), (int*)food_out.data_ptr(),
+                  (float*)reward.data_ptr(), (long long*)rng_out.data_ptr(), (int*)flag.data_ptr(),
+                  (int)agent.size(0));
+    ck(cudaGetLastError(), "env_step");
+}
+"""
+
+_ext = None
+_mt_ok = None
+_SM_COUNT = 188
+
+
+def _load_ext():
+    global _ext, _mt_ok, _SM_COUNT
+    if _ext is not None:
+        return _ext
+    torch.cuda.init()
+    _SM_COUNT = int(torch.cuda.get_device_properties(0).multi_processor_count)
+    _ext = torch.utils.cpp_extension.load_inline(
+        name="grid_mingru_mega_v11",
+        cpp_sources=[_CPP_SRC],
+        cuda_sources=[_CUDA_SRC],
+        functions=["mg_run", "mg_policy_forward", "mg_env_step", "mg_init_bytes", "mg_supported", "mg_timing"],
+        extra_cflags=["-O3"],
+        extra_cuda_cflags=["-O3"],
+        with_cuda=True,
+        verbose=bool(os.environ.get("MG_VERBOSE")),
+    )
+    # Self-check the host MT19937 against torch's CPU generator.
+    try:
+        n = 777
+        out = torch.empty((n, 4), dtype=torch.uint8)
+        _ext.mg_init_bytes(out, 20261109)
+        g = torch.Generator(device="cpu")
+        g.manual_seed(20261109)
+        a = torch.randint(0, BOARD, (n, 2), generator=g)
+        f = torch.randint(0, BOARD, (n, 2), generator=g)
+        _mt_ok = bool(torch.equal(out.long(), torch.cat([a, f], dim=1)))
+    except Exception:
+        _mt_ok = False
+    return _ext
+
+
+def _dev():
+    return torch.device("cuda:0")
+
+
+def _params(model):
+    ps = (model.w_enc, model.b_enc, model.w_gru, model.w_a, model.b_a, model.w_v, model.b_v)
+    out = []
+    for p in ps:
+        t = p.detach()
+        if t.device.type != "cuda" or t.dtype != torch.float32 or not t.is_contiguous():
+            t = t.to(device=_dev(), dtype=torch.float32).contiguous()
+        out.append(t)
+    return out
+
+
+# Measured per-step time (us) of one round on the RTX PRO 6000 (188 SMs) by env tiles per block
+# (8 envs each), at 50% / 75% / 100% of the SMs occupied. Small blocks are bound by the L2 weight
+# stream (so fewer blocks -> faster), large ones by tensor-core time.
+_STEP_US = {
+    1: (23.3, 28.4, 35.8),
+    2: (24.3, 29.3, 36.9),
+    3: (26.9, 31.6, 39.1),
+    4: (29.4, 33.8, 41.1),
+    5: (34.4, 38.0, 44.6),
+    6: (38.9, 41.8, 47.6),
+    7: (45.8, 47.9, 52.3),
+    8: (54.5, 55.9, 60.7),
+}
+# Same at 100% occupancy for the fp32-grade fallback kernel (3 MMAs per k-step instead of 2).
+_STEP_US_EXACT_FULL = {1: 36.5, 2: 38.0, 3: 40.5, 4: 43.1, 5: 49.5, 6: 57.1, 7: 65.2, 8: 87.0}
+_plan_cache = {}
+
+
+def _round_cost(en: int, nb: int, sm: int, exact: bool = False) -> float:
+    t50, t75, t100 = _STEP_US[en]
+    if exact:
+        f = _STEP_US_EXACT_FULL[en] / t100
+        t50, t75, t100 = t50 * f, t75 * f, t100 * f
+    x = nb / sm
+    if x >= 0.75:
+        return t75 + (t100 - t75) * (x - 0.75) / 0.25
+    if x >= 0.5:
+        return t50 + (t75 - t50) * (x - 0.5) / 0.25
+    return t50 * (0.8 + 0.4 * x)
+
+
+def _plan(num_envs: int, exact: bool = False):
+    """Partition envs into rounds (one launch each, <= #SM blocks, EN*8 envs per block).
+
+    Every block streams all GRU weights from L2 once per layer and step, so a
+    round's time grows slowly with the envs per block: fill rounds with the
+    most efficient block size, then search the tail rounds for minimum total
+    time. Returns [en0, nblocks0, en1, nblocks1, ...].
+    """
+    key = (num_envs, _SM_COUNT, exact)
+    hit = _plan_cache.get(key)
+    if hit is not None:
+        return hit
+    sm = _SM_COUNT
+    ens = [e for e in range(8, 0, -1) if _ext.mg_supported(e)]
+    tiles = -(-num_envs // 8)                      # env tiles needed in total
+    bulk = min(ens, key=lambda e: _round_cost(e, sm, sm, exact) / e)
+    full = max(0, (tiles - 3 * sm * bulk) // (sm * bulk))
+    best = None
+
+    def search(left, rounds, cost, max_en):
+        nonlocal best
+        if left <= 0:
+            if best is None or cost < best[0] - 1e-9:
+                best = (cost, list(rounds))
+            return
+        if best is not None and cost >= best[0]:
+            return
+        for en in ens:
+            if en > max_en:
+                continue
+            nb = min(sm, -(-left // en))
+            rounds.append((en, nb))
+            search(left - nb * en, rounds, cost + _round_cost(en, nb, sm, exact), en)
+            rounds.pop()
+
+    search(tiles - full * sm * bulk, [], 0.0, ens[0])
+    rounds = sorted([(bulk, sm)] * full + best[1], reverse=True)
+    flat = []
+    for en, nb in rounds:
+        flat += [en, nb]
+    _plan_cache[key] = flat
+    return flat
+
+
+def run(num_envs: int, horizon: int, seed: int, model=None) -> dict:
+    ext = _load_ext()
+    dev = _dev()
+    if model is None:
+        model = Model()
+    w_enc, b_enc, w_gru, w_a, b_a, _w_v, _b_v = _params(model)
+    num_envs = int(num_envs)
+    horizon = int(horizon)
+    seed = int(seed)
+
+    rewards = torch.empty(num_envs, dtype=torch.float32, device=dev)
+    positions = torch.empty((num_envs, 2), dtype=torch.int64, device=dev)
+    last_logits = torch.empty((num_envs, NUM_ACTIONS), dtype=torch.float32, device=dev)
+    if num_envs == 0:
+        return {"rewards": rewards, "positions": positions, "last_logits": last_logits}
+
+    init = None
+    if (not _mt_ok) or horizon <= 0:
+        g = torch.Generator(device="cpu")
+        g.manual_seed(seed)
+        a = torch.randint(0, BOARD, (num_envs, 2), generator=g)
+        f = torch.randint(0, BOARD, (num_envs, 2), generator=g)
+        init = torch.cat([a, f], dim=1).to(torch.uint8).contiguous()
+    if horizon <= 0:
+        rewards.zero_()
+        last_logits.zero_()
+        positions.copy_(init[:, :2].to(dev).long())
+        return {"rewards": rewards, "positions": positions, "last_logits": last_logits}
+
+    seed_base = (seed * 10007) & 0xFFFFFFFFFFFFFFFF
+    if seed_base >= 1 << 63:
+        seed_base -= 1 << 64
+    ext.mg_run(w_enc, b_enc, w_gru, w_a, b_a, rewards, positions, last_logits,
+               num_envs, horizon, seed & 0xFFFFFFFF, seed_base, _plan(num_envs), _plan(num_envs, True),
+               init if init is not None else torch.empty(0, dtype=torch.uint8))
+    return {"rewards": rewards, "positions": positions, "last_logits": last_logits}
+
+
+def policy_forward(model, obs: torch.Tensor, state: torch.Tensor):
+    """obs (N,4), state (N,L,H) -> logits (N,4), new_state (N,L,H), value (N,)."""
+    ext = _load_ext()
+    dev = _dev()
+    w_enc, b_enc, w_gru, w_a, b_a, w_v, b_v = _params(model)
+    obs_c = obs.detach().to(device=dev, dtype=torch.float32).contiguous()
+    state_c = state.detach().to(device=dev, dtype=torch.float32).contiguous()
+    n = obs_c.shape[0]
+    logits = torch.empty((n, NUM_ACTIONS), dtype=torch.float32, device=dev)
+    new_state = torch.empty((n, GRU_LAYERS, HIDDEN), dtype=torch.float32, device=dev)
+    value = torch.empty((n,), dtype=torch.float32, device=dev)
+    ext.mg_policy_forward(obs_c, state_c, w_enc, b_enc, w_gru, w_a, b_a, w_v, b_v, logits, new_state, value)
+    return logits, new_state, value
+
+
+def env_step(agent: torch.Tensor, food: torch.Tensor, actions: torch.Tensor, rng_state: torch.Tensor):
+    """Deterministic env step (same semantics as the reference, incl. the global LCG advance)."""
+    ext = _load_ext()
+    dev = _dev()
+    n = agent.shape[0]
+    a_i = agent.detach().to(dev).round().to(torch.int32).contiguous()
+    f_i = food.detach().to(dev).round().to(torch.int32).contiguous()
+    act = actions.detach().to(device=dev, dtype=torch.int64).contiguous()
+    rng = rng_state.detach().to(device=dev, dtype=torch.int64).contiguous()
+    a_o = torch.empty_like(a_i)
+    f_o = torch.empty_like(f_i)
+    reward = torch.empty((n,), dtype=torch.float32, device=dev)
+    rng_o = torch.empty_like(rng)
+    flag = torch.zeros((1,), dtype=torch.int32, device=dev)
+    ext.mg_env_step(a_i, f_i, act, rng, a_o, f_o, reward, rng_o, flag)
+    return (a_o.to(agent.dtype).to(agent.device), f_o.to(food.dtype).to(food.device),
+            reward.to(agent.device), rng_o.to(rng_state.device))
+
+
+try:
+    if torch.cuda.is_available():
+        _load_ext()
+except Exception:  # surfaced on first use
+    _ext = None
