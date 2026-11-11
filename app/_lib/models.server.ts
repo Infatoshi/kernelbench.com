@@ -17,6 +17,7 @@ const LIVE_MODEL_SLUGS = new Set([
   "deepseek-v4.1-flash-1017",
   "gemini-3.8-flash-high",
   "gemini-4-argon-high",
+  "gemini-4-carbon-high",
   "glm-5.3",
   "gpt-5.6-sol",
   "gpt-6-astra-pro",

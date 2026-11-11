@@ -109,6 +109,7 @@ MODEL_NAMES = {
     "gemini-3.5-flash": "Gemini 3.5 Flash",
     "gemini-3.8-flash-high": "Gemini 3.8 Flash (High)",
     "gemini-4-argon-high": "Gemini 4 Argon (High)",
+    "gemini-4-carbon-high": "Gemini 4 Carbon (High)",
     "muse-spark-1.3": "Muse Spark 1.3",
     "gemini-3.1-pro-preview": "Gemini 3.1 Pro",
     "deepseek-v4-pro": "DeepSeek V4 Pro",
