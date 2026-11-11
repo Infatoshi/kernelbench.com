@@ -67,6 +67,8 @@ HOME_RE = re.compile(
             r"(?<=-[\w][\w])",
             r"(?<=-[\w][\w][\w])",
             r"(?<=-[\w][\w][\w][\w])",
+            # agy links files as markdown `[x](file:///home/user/...)` (2026-11-10 Carbon traces)
+            r"(?<=file://)",
         ]
     )
     + r")"

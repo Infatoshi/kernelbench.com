@@ -128,6 +128,7 @@ def test_embedded_json_triton_decorator_is_not_email():
     'export LD_LIBRARY_PATH=/home/bob/lib',
     '"cat /home/bob/.env"',
     '-L/root/x',
+    '[solution.py](file:///home/bob/kb/solution.py)',   # agy markdown file link
 ])
 def test_home_path_after_a_flag_is_redacted(text):
     """A home path preceded by a short flag letter must still be redacted.
