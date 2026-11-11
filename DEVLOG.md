@@ -6,6 +6,24 @@ benchmark. Per-benchmark journals live in `benchmarks/<bench>/DEVLOG.md`;
 
 ---
 
+## 2026-11-11 - Gemini 4 Carbon (high) published & posted; Fable 5.2 staged; X post & chart rules
+
+Published **Gemini 4 Carbon (`gemini-4-carbon-high`, `agy` harness)** on `RTX PRO 6000` across CUDA (`01` Fused MoE `0.1022` / 10.2%, `02` DeepSeek Native Sparse Attention `0.0879 ms` geomean, `03` MegaQwen Decode `0.0609` / 6.1%; `04_grid_mingru_sps` retired in `2ebda3b`) and Mega (`02_kimi_linear_decode` `23.79x`, `0.25 ms/tok` at 2k), following `Claude Fable 5.2 (high)` (`1d02d7c`).
+
+- **Harness, sandbox & redaction (`6fc6f5a`, `941e409`, `aefc4d4`, `07dd3d7`):** `scripts/lib/sandbox.sh` now hides `~/.gemini/config` (blocking host hooks inside `agy` runs) and overlays `agy` conversation stores per run; `scripts/redaction.py` now matches home paths inside `file://` markdown links (`file:///home/<user>/...`); GPU lock check timeout capped at 1800 s (`KBH_CHECK_TIMEOUT_SECONDS`). Direct audit of all four Carbon transcripts confirmed zero `belt` or operator-context reads (only MegaQwen's prompt-linked public baseline repo).
+- **Live X receipts (posted 2026-11-11 ~3:37 pm CST via `xctl`, folders moved to `media/posts/posted/carbon-{cuda,mega}/`):**
+  - **KernelBench-CUDA:** root `https://x.com/elliotarledge/status/2120631806596981165` (`2120631806596981165`), links reply `https://x.com/elliotarledge/status/2120631962650218529` (`2120631962650218529`), chart generator `media/make_carbon_cuda.py`.
+  - **KernelBench-Mega:** root `https://x.com/elliotarledge/status/2120631976181035177` (`2120631976181035177`), links reply `https://x.com/elliotarledge/status/2120632472350416912` (`2120632472350416912`), chart generator `media/make_carbon_mega_traj_compare.py`.
+- **Post & chart learnings locked in (`media/AGENTS.md` updated):**
+  1. **Trajectories over bar charts, minimal chart text:** Multi-panel or head-to-head **trajectory hill-climb charts** (`make_carbon_cuda.py`, `make_carbon_mega_traj_compare.py`) carry far more signal than side-by-side percentage bar graphs. Strip GPU name and "isolated regrade" subtitles off the PNGs (readers already know both, or it lives in one word of prose).
+  2. **Qualitative trace narrative over score recitation:** Do not recite leaderboard standings ("Model A leads at X%, Model B at Y%"), which reads AI-generated. Focus on unconventional engineering moves, debugging recoveries, and concrete thinking-trace quotes (e.g., Carbon deriving a Cauchy-Schwarz BF16 rounding bound on NSA, streaming CPU RNG draws across a host-pinned flag inside a persistent MegaQwen decode kernel, spotting odd-length half-warp shuffle divergence after a 30-min timeout, reading raw PTX when `compute-sanitizer` timed out on GPU lock, and catching odd-count 29-vs-28 software barrier bit-flip parity on Kimi-Linear).
+  3. **Plain English on X (zero backticks):** Never put backticks, hex masks, or raw C++/PTX identifier soup in X posts; explain every hardware/kernel mechanism in plain prose with zero em dashes.
+- **Open items carried forward (from collapsed `side duties` session):**
+  - `media/posts/audited/fable52-cuda/` and `media/posts/audited/fable52-mega/` remain staged (rewrite to match the plain-English trajectory format above before posting if Elliot decides to post them).
+  - **Mega board SKU baseline note (unfixed):** `02_kimi_linear_decode` currently pools runs regraded on `RTX PRO 6000 Blackwell Server Edition` (`kb-*` cloud boxes, PyTorch baseline ~7.6 ms/tok at 2k) with runs regraded on `RTX PRO 6000 Blackwell Workstation Edition` (local workstation, baseline ~5.9-6.1 ms/tok), inflating relative `Nx` multipliers on Server Edition regrades vs Workstation Edition regrades even at similar absolute `ms/tok`.
+
+---
+
 ## 2026-10-29 - Mac run archives thinned; mini outputs deleted
 
 Mini is discontinued (Elliot, 10-29). Deleted `benchmarks/mini/outputs` (15.6 GB): the

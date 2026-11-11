@@ -61,12 +61,15 @@ Hugging Face "unresolved" is a missing file (404), not a private dataset. `Infat
 
 Style bar (read, do not copy adjectives): https://x.com/elliotarledge/status/2090458795172360257 (2026-08-20 DeepSeek V4 Pro Hard. Live short-post.) Fable Mega (older, same skeleton): https://x.com/elliotarledge/status/2072814573753975266. Hard vs Hard update (two-model, field is the other model): https://x.com/elliotarledge/status/2075415715306410147.
 
-Live edits from 2090458795172360257:
+Live edits from 2090458795172360257 and 2026-11-11 Gemini 4 Carbon threads (`2120631806596981165`, `2120631976181035177`):
+- **Trajectories over bar charts, minimal text on PNGs (2026-11-11):** Prefer multi-panel or head-to-head **trajectory charts** (`make_carbon_cuda.py`, `make_carbon_mega_traj_compare.py`) over side-by-side percentage bar charts. Keep text on the image minimal: no GPU SKU banners, no "final isolated regrade" subtitles, and zero overlapping endpoint labels (inspect rendered PNGs in dark mode).
+- **Qualitative trace stories, never leaderboard score-reading (2026-11-11):** Do not list which models sit at what percentages ("Sonnet leads at X%, then Opus at Y%"); that reads AI-generated. Write the unconventional engineering moves, debugging recoveries, and direct thinking-trace quotes that distinguish how the model actually solved or broke the problem.
+- **Zero backticks or code-identifier soup on X (2026-11-11):** X renders backticks literally and inline C++/PTX variable names, flags, and hex masks (`0xffffffff`, `__shfl_xor_sync`, `ld.global.cv`) read poorly on timeline. Explain every kernel/PTX trick in clean plain English, with zero backticks and zero em dashes.
 - "June checkpoint" not "June Pro" in the header.
 - No harness ids in "It was tested on".
 - Rest of deck is one cell per line.
 - Two images are fine when the extra chart is the rest-of-deck.
-- Never write `x.data` or `foo.data_ptr`. X autolinks `x.data`. Say "the input pointer" or wrap as `` `data_ptr()` `` without a dotted prefix.
+- Never write `x.data` or `foo.data_ptr`. X autolinks `x.data`. Say "the input pointer" without a dotted prefix.
 - FILL-IN is Elliot. "no comment" is valid if they have not used the model.
 
 The rank chart is the field. Do not reprint it as a `>` list. Do not write "sits between" / "ahead of". Do not say "dense-eq board". Pick the standout cell for this model, not the cell that was interesting in an earlier chat. Do not repeat the problem name and the score in a header line and then again in "It was tested on". One sentence: model, bench, problem, GPU, score. Peers that are not in the chart may stay. The GPU belongs in that sentence.
