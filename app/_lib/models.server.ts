@@ -30,9 +30,11 @@ const LIVE_MODEL_SLUGS = new Set([
   "claude-sonnet-5-5",
   "claude-haiku-5-5",
   "kinetic-0715",
+  "k3.1-pro",
   "muse-spark-1.3",
   "ox-alpha",
   "qwen3.8-max",
+  "qwen4-max",
 ])
 
 /** Models with published cells that are deliberately off the homepage and

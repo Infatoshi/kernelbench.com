@@ -96,6 +96,8 @@ export const MODEL_NAMES: Record<string, string> = {
   "kimi-k2.7-code": "Kimi K2.7-Code",
   "kinetic-0715": "Kimi K3 (256k)",
   "kinetic-0715[1m]": "Kimi K3 (1M)",
+  "k3.1-pro": "Kimi K3.1 Pro",
+  "kimi-code/k3.1-pro": "Kimi K3.1 Pro",
   "composer-2.5-fast": "Composer 2.5 Fast",
   "gemini-3.5-flash": "Gemini 3.5 Flash",
   "gemini-3.8-flash-high": "Gemini 3.8 Flash (High)",
@@ -112,6 +114,8 @@ export const MODEL_NAMES: Record<string, string> = {
   "qwen3.8-max-preview": "Qwen 3.8 Max (preview)",
   "qwen3.8-max": "Qwen 3.8 Max",
   "qwen/qwen3.8-max": "Qwen 3.8 Max",
+  "qwen4-max": "Qwen 4 Max",
+  "qwen/qwen4-max": "Qwen 4 Max",
 }
 
 function displayName(modelId: string): string {
@@ -145,10 +149,14 @@ const LIVE_MODEL_IDS = new Set([
   "claude-sonnet-5-5",
   "claude-haiku-5-5",
   "kinetic-0715",
+  "k3.1-pro",
+  "kimi-code/k3.1-pro",
   "muse-spark-1.3",
   "ox-alpha",
   "qwen3.8-max",
   "qwen/qwen3.8-max",
+  "qwen4-max",
+  "qwen/qwen4-max",
   "stealth/ox-alpha",
 ])
 
@@ -306,6 +314,8 @@ const SHORT_NAMES: Record<string, string> = {
   "kimi-k2.7-code": "Kimi",
   "kinetic-0715": "K3 (256k)",
   "kinetic-0715[1m]": "K3 (1M)",
+  "k3.1-pro": "K3.1 Pro",
+  "kimi-code/k3.1-pro": "K3.1 Pro",
   "composer-2.5-fast": "Composer",
   "gemini-3.5-flash": "Gemini",
   "gemini-3.8-flash-high": "Gemini 3.8",
@@ -322,6 +332,8 @@ const SHORT_NAMES: Record<string, string> = {
   "qwen3.8-max-preview": "Qwen 3.8",
   "qwen3.8-max": "Qwen 3.8",
   "qwen/qwen3.8-max": "Qwen 3.8",
+  "qwen4-max": "Qwen 4",
+  "qwen/qwen4-max": "Qwen 4",
 }
 
 function shortName(modelId: string): string {
