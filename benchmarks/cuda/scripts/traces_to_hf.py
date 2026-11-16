@@ -25,24 +25,20 @@ sys.path.insert(0, str(REPO_ROOT))
 sys.path.insert(0, str(MONOREPO_ROOT))
 
 from scripts.redaction import redact_text  # noqa: E402
+from scripts.trace_privacy import private_call_ids  # noqa: E402
 
-from src.viewer.parsers import parse  # noqa: E402
+from scripts.kimi_wire_parser import parse_transcript  # noqa: E402
+from src.viewer.parsers import parse as _src_parse  # noqa: E402
+
+
+def parse(path: Path):
+    """Kimi Code 2.x goes to scripts/kimi_wire_parser.py (kept out of the
+    graded src tree); every other format to the bench's src parser."""
+    return parse_transcript(path, _src_parse)
 
 
 def _redact(s):
     return redact_text(s) if isinstance(s, str) else s
-
-
-_PRIVATE_PATH = re.compile(r"(?:^|[/~])\.(?:claude|codex|ssh)(?:/|$)|\.env_vars\b|/proc/\S+/environ\b")
-_PRIVATE_SHELL = re.compile(r"(?:^|[;&|])\s*(?:env\s*\||printenv\b|(?:cat|ls|find)\s+~(?:/|\s|$))")
-
-
-def _private_tool_call(call) -> bool:
-    """Keep private config/environment calls and their results out of HF."""
-    args = call.args or {}
-    target = str(args.get("file_path") or "")
-    command = str(args.get("command") or "")
-    return bool(_PRIVATE_PATH.search(target) or _PRIVATE_PATH.search(command) or _PRIVATE_SHELL.search(command))
 
 
 def _new_uuid() -> str:
@@ -183,16 +179,8 @@ def convert(run_dir: Path, out_dir: Path) -> Path | None:
             return False
         return True
 
-    private_ids: set[str] = set()
-    for event in session.events:
-        for call in event.tool_calls:
-            if _private_tool_call(call):
-                if not call.call_id:
-                    raise ValueError(f"private tool call without pairable ID in {rid}")
-                private_ids.add(call.call_id)
-    paired_ids = {e.tool_result.call_id for e in session.events if e.tool_result is not None}
-    if private_ids - paired_ids:
-        raise ValueError(f"private tool call missing its paired result in {rid}")
+    # Private config reads and host process listings, dropped with their results.
+    private_ids = private_call_ids(session.events, rid)
 
     for e in session.events:
         if e.role == "assistant":

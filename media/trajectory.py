@@ -93,12 +93,14 @@ def pick_transcript(run_dir: Path) -> Path | None:
 
 def load_session(run_dir: Path, bench_dir: Path):
     sys.path.insert(0, str(bench_dir))
+    sys.path.insert(0, str(ROOT))
+    from scripts.kimi_wire_parser import parse_transcript  # Kimi Code 2.x, outside graded src
     from src.viewer.parsers import parse  # bench-local viewer
 
     tp = pick_transcript(run_dir)
     if tp is None:
         sys.exit(f"no transcript in {run_dir}")
-    return parse(tp), tp
+    return parse_transcript(tp, parse), tp
 
 
 def pretty_model(model_id: str) -> str:

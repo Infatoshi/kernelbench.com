@@ -6,6 +6,21 @@ Numbering note: entries before 2026-07-21 say "Problem 03" for the Kimi-Linear d
 
 ---
 
+## 2026-11-16 — Kimi K3.1 Pro [max] on 02: passes check at 8.6x, MLA attention wrong, published as `bug`
+
+`kimi` harness (Kimi Code CLI 2.5.3, `kimi-code/k3.1-pro`, effort max) on tetra GPU 3. The kernel is a real
+one-launch megakernel (six decode steps are six cooperative launches) and the harness grades it 8.62x on
+the isolated regrade (0.606 / 0.714 / 0.866 ms per token against 5.571 / 6.178 / 6.965 for the baseline),
+but the absorbed MLA query reads the output projection with the wrong per-head stride (128 where the
+layout is 192, solution.py:577). On the graded cache that error is invisible; with the random cache scaled
+x30 the solution reads cos 0.922 / 0.934 and x60 reads 0.264 / 0.386 while `baseline.py` stays at 0.996 to
+0.9999. Verdict `bug`, no score, same treatment as the DeepSeek V4.1 Flash (1017) row below. This is the
+second model in a row to pass `check.py` with a wrong MLA path, so the scaled or structured cache case
+proposed in that entry is now overdue; it still needs a deliberate bench version.
+
+`kb contamination` trips on this cell (six foreign run ids) because one `ps` tool result lists sibling
+sessions; the annotation carries a manual `contamination: clean`.
+
 ## 2026-10-18 — DeepSeek V4.1 Flash (1017) on 02: passes check, MLA attention wrong, published as `bug`
 
 OpenRouter `deepseek/deepseek-v4.1-flash-1017` via `or-fable`, 8.3 h session on a rented 4x RTX PRO 6000

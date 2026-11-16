@@ -19,7 +19,8 @@
 # dirs under $RUN_DIR/agent_home/ — the agent cannot read PRIOR session
 # history (a leak path: old transcripts quote old runs), auth files stay
 # visible via the host bind, and this run's own session history lands in the
-# archive where the audit needs it.
+# archive where the audit needs it. Claude Code and Kimi Code get a whole per-run
+# home instead (CLAUDE_CONFIG_DIR, KIMI_CODE_HOME), their host dotdirs hidden.
 #
 # Canary: before the model starts, scripts/lib/sandbox_canary.py sweeps the
 # visible tree INSIDE the same bwrap for anything result.json-shaped,
@@ -162,6 +163,25 @@ kbh_sandbox_init() {
     fi
     KBH_SBX+=(--setenv CLAUDE_CONFIG_DIR "$agent_home/.claude")
 
+    # --- Kimi Code: host ~/.kimi-code gone except its binary and login ---
+    # It holds AGENTS.md (a link to the operator's CLAUDE.md), config.toml [[hooks]], skills
+    # and every prior session. The `kimi` branch points KIMI_CODE_HOME at a per-run home under
+    # agent_home (scripts/lib/kimi_home.py) whose credentials/ and oauth/ link back here. Both
+    # are directory binds, read-write: a token refresh renames a new credentials file into
+    # place under the oauth/<slot>.lock refresh lock, and that must reach the host for the
+    # host CLI and the next run. bin/ holds the CLI itself (~/.local/bin/kimi links into it).
+    if [ -d "$HOME/.kimi-code" ]; then
+        KBH_SBX+=(--tmpfs "$HOME/.kimi-code")
+        if [ -d "$HOME/.kimi-code/bin" ]; then
+            KBH_SBX+=(--ro-bind "$HOME/.kimi-code/bin" "$HOME/.kimi-code/bin")
+        fi
+        if [ -d "$HOME/.kimi-code/credentials" ]; then
+            mkdir -p "$HOME/.kimi-code/oauth"
+            KBH_SBX+=(--bind "$HOME/.kimi-code/credentials" "$HOME/.kimi-code/credentials")
+            KBH_SBX+=(--bind "$HOME/.kimi-code/oauth" "$HOME/.kimi-code/oauth")
+        fi
+    fi
+
     # --- session-history overlays (NOT the whole dotdirs: auth must survive) -
     local host_dir sub
     # agy (Antigravity CLI) keeps prior conversations, summaries and annotations under
@@ -192,7 +212,8 @@ kbh_sandbox_init() {
     # .gemini/config is agy's hooks.json, mcp_config, skills and instruction links (fleet sync
     # added a belt-command-timer PreToolUse hook on 2026-11-09; with dev/belt hidden it failed
     # every tool call and all four Gemini 4 Carbon cells on 2026-11-10 quit in 5 minutes).
-    local op_dirs=(.agents .codex/skills .omp .pi dev/belt .gemini/config .gemini/skills)
+    # .kimi is the legacy kimi-cli home (its sessions include old benchmark runs).
+    local op_dirs=(.agents .codex/skills .omp .pi dev/belt .gemini/config .gemini/skills .kimi)
     local op
     mkdir -p "$run_dir/.sandbox"
     : > "$run_dir/.sandbox/empty"

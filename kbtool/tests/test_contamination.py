@@ -310,13 +310,53 @@ def test_operator_context_tripwire(tmp_path):
     assert operator_context_hit(agy_hook) is True
 
 
+def test_operator_context_tripwire_kimi(tmp_path):
+    """Kimi Code 2.x: stream-json tool arguments are an escaped JSON string, and the session
+    wire (archived as kimi_wire.jsonl) lists every AGENTS.md loaded into the system prompt.
+    Unsandboxed on 2026-11-16 it loaded ~/.agents/AGENTS.md and the model planned `belt brief`."""
+    rid = "20261116_065802_kimi_kimi-code_k3.1-pro_02_deepseek_nsa"
+    belt = _mk_run(tmp_path, rid, "02_deepseek_nsa", None)
+    (belt / "transcript.jsonl").write_text(json.dumps(
+        {"role": "assistant", "tool_calls": [{"type": "function", "id": "t1", "function": {
+            "name": "Bash", "arguments": json.dumps({"command": "belt brief"})}}]},
+        separators=(",", ":")) + "\n")
+    assert operator_context_hit(belt) is True
+
+    leaked = _mk_run(tmp_path, rid.replace("065802", "065803"), "02_deepseek_nsa", None)
+    (leaked / "transcript.jsonl").write_text('{"role":"meta","type":"system.version","version":"2.5.3"}\n')
+    (leaked / "kimi_wire.jsonl").write_text(json.dumps(
+        {"type": "changeNotifier.snapshot", "agentId": "main",
+         "agentsMdFiles": {"/home/u/.agents/AGENTS.md": "b7"}}, separators=(",", ":")) + "\n")
+    assert operator_context_hit(leaked) is True
+
+    clean = _mk_run(tmp_path, rid.replace("065802", "065804"), "02_deepseek_nsa", None)
+    (clean / "transcript.jsonl").write_text('{"role":"meta","type":"system.version","version":"2.5.3"}\n')
+    (clean / "kimi_wire.jsonl").write_text(json.dumps(
+        {"type": "changeNotifier.snapshot", "agentId": "main", "agentsMdFiles": {}},
+        separators=(",", ":")) + "\n")
+    assert operator_context_hit(clean) is False
+
+
+def test_kimi_subagent_wire_is_scanned(tmp_path):
+    """Kimi subagent tool calls live only in their own wire (kimi_wire.<agent>.jsonl)."""
+    run = _mk_run(tmp_path, "20261116_070000_kimi_kimi-code_k3.1-pro_01_glm52_fused_moe",
+                  "01_glm52_fused_moe", None)
+    (run / "transcript.jsonl").write_text('{"role":"meta","type":"system.version","version":"2.5.3"}\n')
+    (run / "kimi_wire.explore-1.jsonl").write_text(json.dumps(
+        {"type": "context.append_loop_event", "event": {"type": "tool.call", "name": "Bash",
+         "args": {"command": "ls outputs/runs/20260101_000000_x/solution.py"}}}) + "\n")
+    assert other_archives(run) == {"20260101_000000"}
+
+
 def test_sandbox_blanks_operator_context():
     """The shared sandbox must keep the host user's agent instructions, hooks and belt out:
     ~/.claude hidden at the directory level (file binds detach on an atomic rename) and
     Claude pointed at its own config dir."""
     text = (Path(__file__).resolve().parents[2] / "scripts/lib/sandbox.sh").read_text()
     for needle in ('--tmpfs "$HOME/.claude"', "--setenv CLAUDE_CONFIG_DIR", "dev/belt", ".env_vars",
-                   ".gemini/config", ".gemini/antigravity-cli/brain"):
+                   ".gemini/config", ".gemini/antigravity-cli/brain",
+                   '--tmpfs "$HOME/.kimi-code"', '--bind "$HOME/.kimi-code/credentials"',
+                   '--bind "$HOME/.kimi-code/oauth"'):
         assert needle in text
 
 

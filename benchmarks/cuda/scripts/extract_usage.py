@@ -76,6 +76,32 @@ def _claude_or_kimi(events: list[dict]) -> dict:
     }
 
 
+def _kimi_wire(run_dir: Path) -> dict:
+    """Kimi Code 2.x: stream-json has no usage. The runner archives the session wires
+    (kimi_wire.jsonl = main agent, kimi_wire.<agent>.jsonl = subagents); each LLM call
+    is one {"type":"usage.record","usage":{inputOther,output,inputCacheRead,
+    inputCacheCreation}}. Count a file's records for its own agent only."""
+    inp = out = cr = cc = 0
+    for w in sorted(run_dir.glob("kimi_wire*.jsonl")):
+        agent = w.name[len("kimi_wire."):-len(".jsonl")] if w.name != "kimi_wire.jsonl" else "main"
+        for e in _read_jsonl(w):
+            if e.get("type") != "usage.record" or e.get("agentId", agent) != agent:
+                continue
+            u = e.get("usage") or {}
+            inp += u.get("inputOther", 0) or 0
+            out += u.get("output", 0) or 0
+            cr += u.get("inputCacheRead", 0) or 0
+            cc += u.get("inputCacheCreation", 0) or 0
+    return {
+        "input_tokens": inp,
+        "output_tokens": out,
+        "cache_read_tokens": cr,
+        "cache_creation_tokens": cc,
+        "reasoning_tokens": None,
+        "total_cost_usd": None,
+    }
+
+
 def _codex(events: list[dict]) -> dict:
     """Codex session.jsonl: token_count events carry running totals."""
     inp = out = cr = reason = 0
@@ -212,6 +238,8 @@ def extract(run_dir: Path, harness: str) -> dict:
         if not events:
             events = _read_jsonl(run_dir / "transcript.jsonl")
         return _codex(events)
+    if harness == "kimi" and any(run_dir.glob("kimi_wire*.jsonl")):
+        return _kimi_wire(run_dir)
     transcript = _read_jsonl(run_dir / "transcript.jsonl")
     # Every Claude-Code-routed provider (zai/minimax/kimi/deepseek/qwen-claude,
     # ccr-claude, native claude) and bare kimi emit the Anthropic-shape terminal

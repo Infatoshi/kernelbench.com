@@ -6,6 +6,56 @@ benchmark. Per-benchmark journals live in `benchmarks/<bench>/DEVLOG.md`;
 
 ---
 
+## 2026-11-16 - Kimi K3.1 Pro and Qwen 4 Max night on tetra: harness, isolation and trace-privacy lessons
+
+Kimi K3.1 Pro (`kimi` harness, Kimi Code CLI 2.5.3, `kimi-code/k3.1-pro`, effort max) ran on tetra GPU 3 and
+is published; Qwen 4 Max (`or-fable`, `qwen/qwen4-max`) ran on GPU 2 the same night. Results are in the cuda
+and mega DEVLOGs. What changed in the tooling, and what is still open:
+
+- **`kimi` harness rewritten for Kimi Code 2.x.** Per-run CLI home and effort via `scripts/lib/kimi_home.py`;
+  usage and the served model id come from the session wire log the runner archives as `kimi_wire.jsonl`
+  (the stream transcript has no reasoning, usage or model id). The CLI login must use the global region
+  (kimi.ai); the default device-code page (kimi.com) only offers WeChat or a mainland phone number.
+- **New transcript parsers go in `scripts/`, never under `benchmarks/*/src/`.** The first version of the Kimi
+  2.x parser replaced `src/viewer/parsers/kimi.py` in four benches. Every byte under `src/` is in the
+  graded-surface digest, so the four Kimi cells were stamped with a digest no published cell has and gate E
+  reported 181 published hard and cuda cells as stale. Fix: parser moved to `scripts/kimi_wire_parser.py`
+  (exporters and `media/trajectory.py` route Kimi 2.x through it), the eight src files restored, and the
+  Kimi cells restamped with a check-only replay (`KBH_REGRADE_CHECK_ONLY=1`, timing kept, `recheck` in
+  `result.json`). The rule did not fit under the 32 KB cap of `benchmarks/hard/AGENTS.md`; it lives in the
+  parser's docstring and here.
+- **OpenRouter Qwen route and prompt caching.** Claude Code puts its cache marker on the last tool result and
+  the Alibaba endpoint ignores a marker there, so only the system prefix was cached and each call re-billed
+  the whole conversation ($0.22 to $0.31 per call at 165k to 231k context). The first Qwen 4 Max attempt was
+  stopped after 75 minutes and $48.35 and restarted fresh with `DISABLE_PROMPT_CACHING=1` (provider-side
+  automatic caching then covers 71% to 98% of the context, about a cent per call early on). The `or-fable`
+  branch of `scripts/lib/run_harness.sh` and `benchmarks/mega/scripts/run_hard.sh` now set this for
+  `qwen/qwen4-max`. The container-mode pass-through is untested. Any other non-Anthropic model on this route
+  needs the same check before a long run. The aborted archives (`20261116_0044*` to `0046*`) have no
+  `result.json` and are never graded or published.
+- **GPU pinning is advisory.** A session is pinned to its card only through `CUDA_VISIBLE_DEVICES`, which the
+  model can override. Qwen 4 Max sessions ran jobs on GPU 3 (3:30 to 3:35 am and a 3 s job at 4:11 am, both
+  on top of Kimi regrades) and on GPU 1 (3:35 to 3:40 am, 4:32 am); a Kimi session ran one 29 s job on
+  GPU 2. An "isolated" regrade is therefore only isolated if something checks it: a logger that records
+  every compute process on every GPU every 3 s ran from 3:50 am, the Kimi regrades were repeated until the
+  log showed the card to itself (MegaQwen took three tries), and each crossing is in the affected audit
+  YAML. Open: enforce the pin (device cgroup or per-run `nvidia-container`-style visibility) and make the
+  regrade script refuse or repeat on a foreign process itself.
+- **The sandbox shares the host process table.** `ps`, `top`, `pgrep -a`, `/proc/*/cmdline` and nvidia-smi's
+  process table show sibling sessions' command lines (run ids, the sandbox hide list, inline patch source)
+  and unrelated host jobs. No session used it to read another kernel, but it is a leak channel between
+  cells and it trips `kb contamination` (the Kimi mega and NSA cells carry a manual `contamination: clean`).
+  Open: a PID namespace for the sandbox.
+- **Public traces drop process listings.** `scripts/trace_privacy.py` is now the one filter for every
+  `traces_to_hf.py` (hard and mini had none): private config reads, operator skill files, the host's GPU
+  lease listing and every process-listing command are removed with their paired results. Open: older
+  staged exports under `runs/{mega,cuda,hard}/traces` (12 files found) still carry operator skill text,
+  lease job names and one `ps` result, and three June mega traces carry redacted env dumps. Most have no
+  transcript on the Mac, so cleaning them means pulling the archives back and re-exporting.
+- **Deck gaps seen in the audits.** Mega `check.py` cannot see a wrong MLA attention path (second model in a
+  row to pass it with wrong attention; it needs a cache case where attention matters). `BASELINE.md` for
+  cuda 03 is not copied into any agent's workspace.
+
 ## 2026-11-11 - Gemini 4 Carbon (high) published & posted; Fable 5.2 staged; X post & chart rules
 
 Published **Gemini 4 Carbon (`gemini-4-carbon-high`, `agy` harness)** on `RTX PRO 6000` across CUDA (`01` Fused MoE `0.1022` / 10.2%, `02` DeepSeek Native Sparse Attention `0.0879 ms` geomean, `03` MegaQwen Decode `0.0609` / 6.1%; `04_grid_mingru_sps` retired in `2ebda3b`) and Mega (`02_kimi_linear_decode` `23.79x`, `0.25 ms/tok` at 2k), following `Claude Fable 5.2 (high)` (`1d02d7c`).

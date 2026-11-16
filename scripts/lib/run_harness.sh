@@ -2054,6 +2054,18 @@ case "$HARNESS" in
                 ;;
         esac
         OR_FABLE_BASE_URL="${OR_FABLE_BASE_URL:-https://openrouter.ai/api}"
+        # qwen/qwen4-max (Alibaba) ignores Claude Code's cache_control breakpoint
+        # on the last tool_result: only the ~19k system prefix caches and every
+        # turn re-bills the whole conversation ($48 in 75 min, 2026-11-16). With
+        # no cache_control at all, Alibaba's implicit cache covers the
+        # conversation (71-98% of input cached, 1.5-4 cents per call measured).
+        OR_FABLE_NO_CACHE_CONTROL=0
+        case "$OR_FABLE_MODEL" in
+            qwen/qwen4-max)
+                export DISABLE_PROMPT_CACHING="${DISABLE_PROMPT_CACHING:-1}"
+                OR_FABLE_NO_CACHE_CONTROL=1
+                ;;
+        esac
         # KBH_OR_PROVIDER pins an OpenRouter provider (e.g. novita) for this
         # run. Claude Code cannot send OpenRouter's `provider` routing field,
         # but /api/v1/messages honors it (verified 2026-08-01: order +
@@ -2115,6 +2127,7 @@ case "$HARNESS" in
                 ANTHROPIC_DEFAULT_OPUS_MODEL
                 ENABLE_PROMPT_CACHING_1H
             )
+            [ "$OR_FABLE_NO_CACHE_CONTROL" = "1" ] && CLAUDE_CONTAINER_ENV_NAMES+=(DISABLE_PROMPT_CACHING)
             CLAUDE_CONTAINER_EXTRA_CLAUDE_ARGS=(--disallowedTools ExitPlanMode EnterPlanMode AskUserQuestion)
             ( export ANTHROPIC_AUTH_TOKEN="$OPENROUTER_API_KEY" && \
                 unset ANTHROPIC_API_KEY CLAUDE_CODE_OAUTH_TOKEN && \
@@ -2588,11 +2601,31 @@ case "$HARNESS" in
         ;;
 
     kimi)
-        echo "$PROMPT" | "${KBH_SBX[@]}" timeout "$BUDGET_SECONDS" kimi \
-            -w "$PROBLEM_DIR" \
-            --print \
+        # Kimi Code CLI (kimi-code 2.x). -p is prompt mode, which forces the never-ask
+        # `auto` permission mode itself (it rejects --auto). No cwd flag, so cd into
+        # PROBLEM_DIR. KIMI_CODE_HOME is a per-run home in the archive (kimi_home.py:
+        # host config minus hooks, thinking pinned at the effort arg, default max;
+        # credentials/ and oauth/ linked to the host so token refreshes persist).
+        # No self-update mid-run; failed LLM requests retry forever (default: 3 per step).
+        # The stream carries no usage or model id; the session wire does, so it is
+        # copied to kimi_wire.jsonl (subagents: kimi_wire.<agent>.jsonl).
+        KIMI_HOME="$RUN_DIR/agent_home/.kimi-code"
+        "$REAL_PYTHON" "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/kimi_home.py" \
+            "$KIMI_HOME" "$MODEL" "$REASONING_EFFORT" || exit 1
+        ( cd "$PROBLEM_DIR" && export KIMI_CODE_HOME="$KIMI_HOME" KIMI_CODE_NO_AUTO_UPDATE=1 KIMI_CODE_INFINITE_RETRY=1 && \
+            unset KIMI_MODEL_THINKING_EFFORT KIMI_SECONDARY_MODEL KIMI_SECONDARY_EFFORT && \
+            "${KBH_SBX[@]}" timeout "$BUDGET_SECONDS" kimi \
+            -m "$MODEL" \
             --output-format stream-json \
-            > "$LOG_FILE" 2> "$STDERR_FILE" || HARNESS_EXIT=$?
+            -p "$PROMPT" ) \
+            </dev/null > "$LOG_FILE" 2> "$STDERR_FILE" || HARNESS_EXIT=$?
+        rm -f "$KIMI_HOME/credentials" "$KIMI_HOME/oauth"
+        KIMI_SID="$({ grep -m1 -o '"session_id":"session_[^"]*"' "$LOG_FILE" 2>/dev/null || true; } | sed 's/.*:"//; s/"$//')"
+        for _w in "$KIMI_HOME"/sessions/*/"${KIMI_SID:-session_*}"/agents/*/wire.jsonl; do
+            [ -f "$_w" ] || continue
+            _a="$(basename "$(dirname "$_w")")"
+            if [ "$_a" = main ]; then cp "$_w" "$RUN_DIR/kimi_wire.jsonl"; else cp "$_w" "$RUN_DIR/kimi_wire.$_a.jsonl"; fi
+        done
         ;;
 
     droid)
@@ -2858,7 +2891,7 @@ ELAPSED=$((HARNESS_END_TIME - START_TIME))
 #   cursor:               {"type":"result"} (final usage block)
 #   grok:                 {"type":"end"}
 #   droid:                exit code only; stream has init/message/error events
-#   kimi:                 no canonical terminal event — treat exit code as truth
+#   kimi:                 {"type":"session.resume_hint"} (printed only after a completed turn)
 #
 # We surface this as session_complete=true|false in result.json so the viewer
 # can render an INCOMPLETE banner and downstream aggregation can exclude
@@ -2896,7 +2929,12 @@ case "$HARNESS" in
             SESSION_COMPLETE=false
         fi
         ;;
-    droid|kimi|opencode|opencode-nemotron|nvcf-nemotron|hy3|hy3-claude|tinker|inkling|lfm-opencode|hermes|pi)
+    kimi)
+        if ! grep -q '"type":"session.resume_hint"' "$CHECK_FILE" 2>/dev/null; then
+            SESSION_COMPLETE=false
+        fi
+        ;;
+    droid|opencode|opencode-nemotron|nvcf-nemotron|hy3|hy3-claude|tinker|inkling|lfm-opencode|hermes|pi)
         # No reliable terminal marker; trust the exit code.
         if [ "$HARNESS_EXIT" -ne 0 ]; then
             SESSION_COMPLETE=false

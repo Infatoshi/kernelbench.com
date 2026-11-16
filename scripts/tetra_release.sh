@@ -78,7 +78,9 @@ sleep 240
 for L in "$OUT"/*.log; do
     [ "$L" = "$OUT/pipeline.log" ] && continue
     rd=$(grep -m1 -oE 'Archive: +\S+' "$L" | awk '{print $2}')
-    served=$(grep -ohE '"model":"[^"]+"|^model: \S+' "$rd/transcript.jsonl" "$rd/stderr.log" 2>/dev/null | sort | uniq -c | sort -rn | head -3 | tr -s ' \n' ' ')
+    # kimi: the stream has no model id; its live session wire (llm.request "model") does.
+    served=$(grep -ohE '"model":"[^"]+"|^model: \S+' "$rd/transcript.jsonl" "$rd/stderr.log" \
+        "$rd"/agent_home/.kimi-code/sessions/*/*/agents/main/wire.jsonl 2>/dev/null | sort | uniq -c | sort -rn | head -3 | tr -s ' \n' ' ')
     log "served $(basename "$L" .log): ${served:-none yet}"
 done
 

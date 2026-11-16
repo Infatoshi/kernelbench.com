@@ -1,5 +1,25 @@
 # KernelBench-CUDA — DEVLOG
 
+## 2026-11-16 — Kimi K3.1 Pro [max] on tetra: 3/3 correct, one flagged
+
+`kimi` harness (Kimi Code CLI 2.5.3, `kimi-code/k3.1-pro`, effort max), three sessions on tetra GPU 3 that
+each stopped on their own in 60 to 90 minutes. Sequential isolated regrade on GPU 3, repeated until a
+GPU-use log showed the card to itself (Qwen 4 Max sessions on GPU 2 overrode their GPU pin during the
+first passes; root DEVLOG 2026-11-16), then audit probes on the quiet GPU:
+
+- 01 Fused MoE 0.1007, `rubric_leak`, the first on the RTX board. The routing sort is cached on the
+  identity of the expert-id tensor and `benchmark.py` reuses its inputs, so the sort never lands in the
+  timed window; the session's first design note says so. Probe: the cache is worth 1.068x on the geomean
+  (30% at T=1), and an in-place rewrite of the ids returns stale output (cos 0.81 to 0.88). About 0.094
+  on equal terms. GEMMs are cuBLAS.
+- 02 NSA 0.1037 (0.950 ms geomean), clean. Exact per-query top-8 with a WMMA scoring kernel and a
+  per-query gather; no cache. Overwrite and tie-direction probes pass. More than 10x behind the designs that
+  share K/V blocks across queries.
+- 03 MegaQwen 0.0610, interesting. One cooperative launch for the whole timed decode. Decode inputs are
+  drawn in the untimed prefill (3.3% at 2k context, measured), and the softmax skips the max subtraction
+  (exact at the graded unit gains, non-finite once q/k norm gains reach 6). Packed weights go stale under
+  in-place edits, as for Carbon and Fable 5.2.
+
 ## 2026-11-09 — `04_grid_mingru_sps` retired; the deck is 01-03
 
 The problem confused readers. Its prompt says final positions and rewards must be exact, but the grader

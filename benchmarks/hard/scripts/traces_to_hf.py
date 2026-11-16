@@ -25,8 +25,16 @@ sys.path.insert(0, str(REPO_ROOT))
 sys.path.insert(0, str(MONOREPO_ROOT))
 
 from scripts.redaction import redact_text  # noqa: E402
+from scripts.trace_privacy import private_call_ids  # noqa: E402
 
-from src.viewer.parsers import parse  # noqa: E402
+from scripts.kimi_wire_parser import parse_transcript  # noqa: E402
+from src.viewer.parsers import parse as _src_parse  # noqa: E402
+
+
+def parse(path: Path):
+    """Kimi Code 2.x goes to scripts/kimi_wire_parser.py (kept out of the
+    graded src tree); every other format to the bench's src parser."""
+    return parse_transcript(path, _src_parse)
 
 
 def _redact(s):
@@ -169,6 +177,9 @@ def convert(run_dir: Path, out_dir: Path) -> Path | None:
             return False
         return True
 
+    # Private config reads and host process listings, dropped with their results.
+    private_ids = private_call_ids(session.events, rid)
+
     for e in session.events:
         if e.role == "assistant":
             blocks: list[dict] = []
@@ -177,6 +188,8 @@ def convert(run_dir: Path, out_dir: Path) -> Path | None:
             if e.text:
                 blocks.append({"type": "text", "text": _redact(e.text)})
             for tc in e.tool_calls:
+                if tc.call_id in private_ids:
+                    continue
                 args = json.loads(_redact(json.dumps(tc.args, default=str))) if tc.args else {}
                 blocks.append({
                     "type": "tool_use",
@@ -197,6 +210,8 @@ def convert(run_dir: Path, out_dir: Path) -> Path | None:
             emit("assistant", msg)
         elif e.role in ("user", "tool"):
             if e.tool_result is not None:
+                if e.tool_result.call_id in private_ids:
+                    continue
                 # Cap huge tool dumps so the HF viewer stays responsive
                 body = e.tool_result.content or ""
                 if len(body) > 80000:
@@ -225,6 +240,8 @@ def convert(run_dir: Path, out_dir: Path) -> Path | None:
     out_dir.mkdir(parents=True, exist_ok=True)
     out = out_dir / f"{rid}.jsonl"
     out.write_text("\n".join(json.dumps(ln) for ln in lines) + "\n")
+    if private_ids:
+        print(f"  {rid}: removed {len(private_ids)} paired private tool calls/results")
     return out
 
 
