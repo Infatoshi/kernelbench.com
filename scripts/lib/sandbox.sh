@@ -4,15 +4,31 @@
 # benchmarks/mega/scripts/run_hard.sh. Do not fork the hide logic again.
 #
 # Model: hide-the-tree, not a denylist. bwrap keeps `--dev-bind / /` so the
-# GPU, driver, ncu/nsys/CUPTI, toolchains, and CLI auth all keep working, then
-# tmpfs's the WHOLE monorepo (or thin bench root) away and binds back only:
+# driver libraries, ncu/nsys/CUPTI, toolchains, and CLI auth all keep working,
+# then tmpfs's the WHOLE monorepo (or thin bench root) away and binds back only:
 #   - this run's $RUN_DIR (rw)
 #   - the dedicated gpu-lock dir (rw; flock is on the inode, so sandboxed and
 #     host commands still serialize against each other)
 #   - one deliberately visible honeytoken decoy run (ro)
-# Because the full host root stays bound, this is HYGIENE (a live agent cannot
-# see a foreign archive), NOT containment (docker.sock, ssh keys, the network
-# all remain reachable). The refuse-closed audit still owns the verdict.
+#
+# Session isolation, on by construction (no knob):
+#   - PID: `--unshare-pid --proc /proc`. ps and /proc show only this session's
+#     processes, a kill of any host or sibling-session PID fails (ESRCH), and
+#     when the session's top process exits everything it left running dies with
+#     the namespace. PIDs recorded inside mean nothing outside, so the gpu-lock
+#     owner file carries a PID-namespace + start-time tag (see gpu-lock-exec).
+#   - GPU: a fresh `--dev /dev` with only /dev/nvidiactl, /dev/nvidia-uvm(-tools)
+#     and the assigned card's /dev/nvidia<minor>. KBH_GPU is the nvidia-smi
+#     index; NVML maps it to the UUID and device minor. NVML and CUDA then
+#     enumerate exactly that card as index 0 whatever CUDA_VISIBLE_DEVICES says
+#     (unset, other indices, other UUIDs), and the sandbox sets
+#     CUDA_VISIBLE_DEVICES=0. Nodes cannot be recreated (no mknod in the userns).
+#     No mapping (no NVML, no node) refuses the launch (exit 4).
+# ~/.ssh and the docker socket are blanked too (either one is a one-command way
+# back to the host process table and the other cards). Because the host root
+# stays bound, this is HYGIENE plus process/GPU separation between sessions, NOT
+# containment (the network, the user's systemd/D-Bus session and other host
+# sockets remain reachable). The refuse-closed audit still owns the verdict.
 #
 # Session stores: ~/.claude/projects, ~/.grok/sessions, ~/.codex/sessions,
 # ~/.gemini/tmp, and ~/.local/share/opencode/storage are overlaid with per-run
@@ -25,7 +41,11 @@
 # Canary: before the model starts, scripts/lib/sandbox_canary.py sweeps the
 # visible tree INSIDE the same bwrap for anything result.json-shaped,
 # solution.py-shaped, run-dir-shaped, or runs-remote-*/runs-lambda-* shaped
-# that is not this run or the honeytoken. Any hit refuses the launch (exit 4).
+# that is not this run or the honeytoken; proves a host sentinel `sleep` started
+# for the check is invisible and unkillable (and still alive after); and proves
+# only the assigned GPU's UUID is reachable via NVML and via CUDA with
+# CUDA_VISIBLE_DEVICES unset, all indices, or another card's UUID. Any hit
+# refuses the launch (exit 4). sandbox.json records pid_namespace and the GPU.
 #
 # Honeytoken: a fake juicy run dir IS visible on purpose. Its solution.py
 # embeds the beacon token below; beacon bytes in a submitted kernel make the
@@ -34,11 +54,11 @@
 #
 # Interface:
 #   requires (env): REPO_ROOT RUN_DIR RUN_ID PROBLEM_DIR PROBLEM_NAME
-#                   KBH_GPU_LOCK; optional REAL_PYTHON, KBH_SANDBOX (default 1)
+#                   KBH_GPU_LOCK KBH_GPU; optional REAL_PYTHON, KBH_SANDBOX (default 1)
 #   call: kbh_sandbox_init
 #   sets: KBH_SBX (bwrap argv array, empty when inactive)
 #         KBH_SANDBOX_ACTIVE (0|1)
-#   may exit 4: canary hit or unsafe lock-dir layout (refuse-closed).
+#   may exit 4: canary hit, unmappable GPU, or unsafe lock-dir layout (refuse-closed).
 
 # Keep in sync with kbtool/kb/contamination.py HONEYTOKEN_BEACON
 # (kbtool/tests/test_contamination.py enforces the match).
@@ -97,7 +117,48 @@ kbh_sandbox_init() {
     esac
     mkdir -p "$lock_dir"
 
-    KBH_SBX=(bwrap --die-with-parent --dev-bind / / --tmpfs "$hide_root")
+    local canary_src canary_py
+    canary_src="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/sandbox_canary.py"
+    if [ ! -f "$canary_src" ]; then
+        echo "STOP: sandbox_canary.py not found next to sandbox.sh ($canary_src)" >&2
+        exit 4
+    fi
+    canary_py="${REAL_PYTHON:-$(command -v python3)}"
+
+    # --- GPU: map KBH_GPU (nvidia-smi index) to its device node via NVML -----
+    # The minor number comes from NVML (nvidia-smi -q "Minor Number"), never from
+    # the index, and the node must be char 195:<minor>. No mapping, no launch.
+    local gpu_index="${KBH_GPU:-}" gpu_uuid="" gpu_minor="" gpu_count="" gpu_others=""
+    case "$gpu_index" in
+        ''|*[!0-9]*)
+            echo "STOP: KBH_GPU ('$gpu_index') must be the nvidia-smi index of the assigned GPU; refusing to launch" >&2
+            exit 4
+            ;;
+    esac
+    if ! read -r gpu_uuid gpu_minor gpu_count gpu_others \
+            < <("$canary_py" "$canary_src" --gpu-info "$gpu_index" 2>&1 || true) \
+            || [[ "$gpu_uuid" != GPU-* ]]; then
+        echo "STOP: cannot map KBH_GPU=$gpu_index to a GPU via NVML ($gpu_uuid $gpu_minor); refusing to launch without GPU isolation" >&2
+        exit 4
+    fi
+    local gpu_node="/dev/nvidia$gpu_minor"
+    if [ ! -c "$gpu_node" ] || [ "$(stat -c '%t:%T' "$gpu_node")" != "c3:$(printf '%x' "$gpu_minor")" ] \
+            || [ ! -c /dev/nvidiactl ]; then
+        echo "STOP: GPU $gpu_index ($gpu_uuid) has no device node $gpu_node (char 195:$gpu_minor) or /dev/nvidiactl is missing; refusing to launch without GPU isolation" >&2
+        exit 4
+    fi
+
+    # Own PID namespace + fresh /proc: no sibling session or host process is
+    # visible or signallable, and everything the session leaves running dies with
+    # it. Fresh /dev with only the assigned GPU's node (plus the shared control and
+    # UVM nodes): NVML and CUDA enumerate one card whatever CUDA_VISIBLE_DEVICES
+    # says, and it is index 0 inside, so the sandbox pins CUDA_VISIBLE_DEVICES=0.
+    KBH_SBX=(bwrap --die-with-parent --unshare-pid --dev-bind / / --proc /proc --dev /dev)
+    local node
+    for node in /dev/nvidiactl /dev/nvidia-uvm /dev/nvidia-uvm-tools "$gpu_node"; do
+        [ -e "$node" ] && KBH_SBX+=(--dev-bind "$node" "$node")
+    done
+    KBH_SBX+=(--setenv CUDA_VISIBLE_DEVICES 0 --tmpfs "$hide_root")
 
     # --- stray archive trees outside the hide root --------------------------
     # Sibling bench checkouts on a thin worker ($HOME/hard, $HOME/kb-mega, ...)
@@ -213,7 +274,9 @@ kbh_sandbox_init() {
     # added a belt-command-timer PreToolUse hook on 2026-11-09; with dev/belt hidden it failed
     # every tool call and all four Gemini 4 Carbon cells on 2026-11-10 quit in 5 minutes).
     # .kimi is the legacy kimi-cli home (its sessions include old benchmark runs).
-    local op_dirs=(.agents .codex/skills .omp .pi dev/belt .gemini/config .gemini/skills .kimi)
+    # .ssh holds the operator's private keys: `ssh localhost` would walk straight out of the
+    # PID and GPU isolation, and no agent CLI needs it.
+    local op_dirs=(.agents .codex/skills .omp .pi dev/belt .gemini/config .gemini/skills .kimi .ssh)
     local op
     mkdir -p "$run_dir/.sandbox"
     : > "$run_dir/.sandbox/empty"
@@ -234,6 +297,13 @@ kbh_sandbox_init() {
             must_hidden+=("$HOME/$op")
         fi
     done
+    # The docker socket is root on the host for a docker-group user, so it reaches every
+    # sibling session's processes and GPUs. Host-mode sessions never use docker.
+    local dsock
+    dsock="$(readlink -f /var/run/docker.sock 2>/dev/null || true)"
+    if [ -n "$dsock" ] && [ -S "$dsock" ]; then
+        KBH_SBX+=(--ro-bind "$run_dir/.sandbox/empty" "$dsock")
+    fi
 
     # --- honeytoken decoy run (deliberately visible, read-only) --------------
     local hp_score="0.9137"
@@ -272,15 +342,8 @@ HPEOF
     KBH_SBX+=(--chdir "$problem_dir")
 
     # --- canary: refuse-closed sweep INSIDE the sandbox, before the model ----
-    local canary_src canary_py
-    canary_src="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/sandbox_canary.py"
-    if [ ! -f "$canary_src" ]; then
-        echo "STOP: sandbox_canary.py not found next to sandbox.sh ($canary_src)" >&2
-        exit 4
-    fi
     mkdir -p "$run_dir/.sandbox"
     cp -p "$canary_src" "$run_dir/.sandbox/canary.py"
-    canary_py="${REAL_PYTHON:-$(command -v python3)}"
     local canary_args=(
         --run-id "$run_id" --allow "$hp_id" --walk "$hide_root"
     )
@@ -288,15 +351,39 @@ HPEOF
     for mh in ${must_hidden[@]+"${must_hidden[@]}"}; do
         canary_args+=(--must-be-hidden "$mh")
     done
-    if ! "${KBH_SBX[@]}" "$canary_py" "$run_dir/.sandbox/canary.py" \
-            "${canary_args[@]}" > "$run_dir/sandbox_canary.log" 2>&1; then
+    # Host sentinel: started here for this check only; the canary must neither
+    # see nor signal it, and it must still be alive afterwards.
+    local host_pidns sentinel_token sentinel_pid ou _kbh_others=()
+    host_pidns="$(readlink /proc/self/ns/pid)"
+    sentinel_token="kbh-sandbox-sentinel-$$-$RANDOM$RANDOM"
+    (exec -a "$sentinel_token" sleep 300) </dev/null >/dev/null 2>&1 &
+    sentinel_pid=$!
+    canary_args+=(--sentinel-pid "$sentinel_pid" --sentinel-token "$sentinel_token"
+                  --host-pidns "$host_pidns" --gpu-uuid "$gpu_uuid" --host-gpu-count "$gpu_count")
+    if [ "$gpu_others" != "-" ]; then
+        IFS=, read -r -a _kbh_others <<< "$gpu_others"
+        for ou in "${_kbh_others[@]}"; do
+            canary_args+=(--other-gpu-uuid "$ou")
+        done
+    fi
+    local canary_ok=1
+    "${KBH_SBX[@]}" "$canary_py" "$run_dir/.sandbox/canary.py" \
+        "${canary_args[@]}" > "$run_dir/sandbox_canary.log" 2>&1 || canary_ok=0
+    if ! kill -0 "$sentinel_pid" 2>/dev/null \
+            || ! tr '\0' ' ' < "/proc/$sentinel_pid/cmdline" 2>/dev/null | grep -q "$sentinel_token"; then
+        echo "sandbox canary: host sentinel $sentinel_pid did not survive the canary" >> "$run_dir/sandbox_canary.log"
+        canary_ok=0
+    fi
+    kill "$sentinel_pid" 2>/dev/null || true
+    wait "$sentinel_pid" 2>/dev/null || true
+    if [ "$canary_ok" != "1" ]; then
         cat "$run_dir/sandbox_canary.log" >&2
-        echo "STOP: sandbox canary found foreign archive material inside the sandbox; refusing to launch (see $run_dir/sandbox_canary.log)" >&2
+        echo "STOP: sandbox canary failed (foreign archive material, host processes or another GPU reachable inside the sandbox); refusing to launch (see $run_dir/sandbox_canary.log)" >&2
         exit 4
     fi
 
     KBH_SANDBOX_ACTIVE=1
-    printf '{"active": true, "hide_root": "%s", "honeytoken_run_id": "%s", "beacon": "%s", "canary": "pass"}\n' \
-        "$hide_root" "$hp_id" "$KBH_SANDBOX_BEACON" > "$run_dir/sandbox.json"
-    echo "agent sandbox: bwrap hide-the-tree (root: $hide_root; honeytoken: $hp_id; canary: PASS)"
+    printf '{"active": true, "hide_root": "%s", "honeytoken_run_id": "%s", "beacon": "%s", "pid_namespace": true, "gpu_index": %s, "gpu_uuid": "%s", "gpu_device": "%s", "cuda_visible_devices": "0", "canary": "pass"}\n' \
+        "$hide_root" "$hp_id" "$KBH_SANDBOX_BEACON" "$gpu_index" "$gpu_uuid" "$gpu_node" > "$run_dir/sandbox.json"
+    echo "agent sandbox: bwrap hide-the-tree + own PID namespace + GPU $gpu_index only ($gpu_uuid as $gpu_node; root: $hide_root; honeytoken: $hp_id; canary: PASS)"
 }

@@ -155,7 +155,7 @@ Reference for the `KB_` orchestration variables. `KBH_` (single-GPU harness) is 
 
 The following variables can change the meaning, comparability, publishability, or cost of a run. Record non-default values with the run and do not publish an experimental result as a canonical cell.
 
-- Deck and hardware identity: `KBH_PROBLEMS_ROOT`, `KBH_HARDWARE`, `KBH_HARDWARE_LABEL`, and `KBH_GPU` select problem material or the physical GPU / roofline label. A mismatch can produce a plausible but meaningless score. `KBH_GPU` also exports `CUDA_VISIBLE_DEVICES`; empty hide is illegal.
+- Deck and hardware identity: `KBH_PROBLEMS_ROOT`, `KBH_HARDWARE`, `KBH_HARDWARE_LABEL`, and `KBH_GPU` select problem material or the physical GPU / roofline label. A mismatch can produce a plausible but meaningless score. A sandboxed session can open only the `KBH_GPU` card; empty hide is illegal.
 - Time budget: `KBH_BUDGET_SECONDS_OVERRIDE` changes the direct hard/cuda/mini agent budget. Mega's direct runner instead reads unprefixed `BUDGET_SECONDS`; its sweep launchers read `KBH_BUDGET_SECONDS` and export `BUDGET_SECONDS` to each run.
 - Regrading: the `KBH_REGRADE_ALLOW_BUSY`, `KBH_REGRADE_DECK`, `KBH_REGRADE_DRY_RUN`, and `KBH_REGRADE_GPU` family controls which GPU and deck are used and whether contention checks or writes occur. `KBH_REGRADE_ALLOW_BUSY=1` can make timings unpublishable.
 - Correctness: `KBH_NUMERIC_STRESS=0` removes the single-GPU numeric-stress cases. `KBH_PROPERTY_SEED` pins Hard's generated structural cases instead of drawing a fresh plan. `KBM_NUMERIC_STRESS=0`, `KBM_SKIP_FORBIDDEN=1`, and `KBM_SKIP_GRADE=1` similarly weaken or omit Multi validation. These are debugging/replay controls, never default official-run settings.

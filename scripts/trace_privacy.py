@@ -5,10 +5,12 @@ hard's). A private call is dropped together with its paired tool result.
 
 Two families:
   * private config/environment reads (`~/.claude`, `~/.env_vars`, `env |`, ...);
-  * host process listings. The sandbox shares the host's process table, so
-    `ps`, `top`, `pstree`, `pgrep -a`, `/proc/<pid>/cmdline` and nvidia-smi's
-    process table print sibling benchmark sessions' argv (run ids, the bwrap
-    hide list) and unrelated projects' command lines and data paths.
+  * host process listings. Until 2026-11-16 the sandbox shared the host's
+    process table (sessions since then have their own PID namespace), so in
+    older traces and unsandboxed runs `ps`, `top`, `pstree`, `pgrep -a`,
+    `/proc/<pid>/cmdline` and nvidia-smi's process table print sibling
+    benchmark sessions' argv (run ids, the bwrap hide list) and unrelated
+    projects' command lines and data paths.
 """
 from __future__ import annotations
 

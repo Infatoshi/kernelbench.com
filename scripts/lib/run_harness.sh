@@ -420,26 +420,47 @@ if [ -n "${RUN_DIR:-}" ] && [[ "$real_abs" == "${RUN_DIR}/bin/"* ]] && [ -n "$fa
     real="$fallback"
 fi
 owner_file="${KBH_GPU_LOCK}.owner"
+# Owner file: "<pid>\t<run_dir>\t<pidns>:<starttime>". Each agent sandbox has its
+# own PID namespace and the harness grades on the host under the same RUN_DIR, so
+# a bare PID from another namespace is a different process or none. Trust a PID
+# only when its tag (our PID namespace + that PID's start time) matches;
+# otherwise fall through to flock, which is the truth.
+my_pidns="$(readlink /proc/self/ns/pid 2>/dev/null || true)"
+pid_tag() {
+    local st
+    st="$(awk '{sub(/.*\) /, ""); print $20}' "/proc/$1/stat" 2>/dev/null || true)"
+    [ -n "$my_pidns" ] && [ -n "$st" ] && printf '%s:%s' "$my_pidns" "$st"
+    return 0
+}
+owner_live_here() {
+    [ -n "$1" ] && [ -n "$2" ] && [ "$(pid_tag "$1")" = "$2" ]
+}
 # KBH_GPU_LOCK_HELD=1 is reentrancy for children of the lock owner (nvcc under
 # benchmark.py), not a pass: agents can set it themselves (Gemini 4 Argon's
 # cuda 01/03/04 cells did on 2026-10-13 and ran while NSA held the lock). Honor
-# it only when no one holds the lock or the live owner is one of our ancestors.
+# it only when no one holds the lock or the live owner, in our PID namespace, is
+# one of our ancestors. An owner in another namespace (a sibling sandbox) is
+# never treated as dead.
 if [ "${KBH_GPU_LOCK_HELD:-0}" = "1" ]; then
     held_pid=""
-    [ -f "$owner_file" ] && IFS=$'\t' read -r held_pid _ < "$owner_file" || true
-    if [ -z "$held_pid" ] || ! kill -0 "$held_pid" 2>/dev/null; then
+    held_tag=""
+    [ -f "$owner_file" ] && IFS=$'\t' read -r held_pid _ held_tag < "$owner_file" || true
+    if [ -z "$held_pid" ]; then
         exec "$real" "$@"
     fi
-    p=$$
-    while [ -n "$p" ] && [ "$p" -gt 1 ]; do
-        [ "$p" = "$held_pid" ] && exec "$real" "$@"
-        p="$(awk '{print $4}' "/proc/$p/stat" 2>/dev/null)"
-    done
-    printf '%s held_env_ignored pid=%s cmd=%s owner=%s\n' "$(date -Is)" "$$" "$name" "$held_pid" >>"$KBH_GPU_LOCK_LOG"
+    if [ -n "$my_pidns" ] && [ "${held_tag%:*}" = "$my_pidns" ]; then
+        owner_live_here "$held_pid" "$held_tag" || exec "$real" "$@"
+        p=$$
+        while [ -n "$p" ] && [ "$p" -gt 1 ]; do
+            [ "$p" = "$held_pid" ] && exec "$real" "$@"
+            p="$(awk '{print $4}' "/proc/$p/stat" 2>/dev/null)"
+        done
+    fi
+    printf '%s held_env_ignored pid=%s cmd=%s owner=%s owner_tag=%s\n' "$(date -Is)" "$$" "$name" "$held_pid" "$held_tag" >>"$KBH_GPU_LOCK_LOG"
 fi
 if [ -f "$owner_file" ]; then
-    IFS=$'\t' read -r owner_pid owner_run_dir < "$owner_file" || true
-    if [ "${owner_run_dir:-}" = "${RUN_DIR:-}" ] && kill -0 "${owner_pid:-}" 2>/dev/null; then
+    IFS=$'\t' read -r owner_pid owner_run_dir owner_tag < "$owner_file" || true
+    if [ "${owner_run_dir:-}" = "${RUN_DIR:-}" ] && owner_live_here "${owner_pid:-}" "${owner_tag:-}"; then
         exec "$real" "$@"
     fi
 fi
@@ -463,8 +484,8 @@ fi
         # (Cost 71 min of a 6-cell Opus 5 sweep on 2026-07-24.)
         until flock -x -w 5 9; do
             if [ -f "$owner_file" ]; then
-                IFS=$'\t' read -r owner_pid owner_run_dir < "$owner_file" || true
-                if [ "${owner_run_dir:-}" = "${RUN_DIR:-}" ] && kill -0 "${owner_pid:-}" 2>/dev/null; then
+                IFS=$'\t' read -r owner_pid owner_run_dir owner_tag < "$owner_file" || true
+                if [ "${owner_run_dir:-}" = "${RUN_DIR:-}" ] && owner_live_here "${owner_pid:-}" "${owner_tag:-}"; then
                     printf '%s reentrant_after_wait pid=%s cmd=%s owner=%s\n' \
                         "$(date -Is)" "$$" "$name" "${owner_pid:-}" >&3
                     exec "$real" "$@"
@@ -473,7 +494,7 @@ fi
         done
     fi
     start="$(date +%s)"
-    printf '%s\t%s\n' "$$" "${RUN_DIR:-}" > "$owner_file"
+    printf '%s\t%s\t%s\n' "$$" "${RUN_DIR:-}" "$(pid_tag $$)" > "$owner_file"
     printf '%s start pid=%s cmd=%s\n' "$(date -Is)" "$$" "$name" >&3
     set +e
     export KBH_GPU_LOCK_HELD=1

@@ -1,9 +1,11 @@
 #!/bin/bash
 # End-to-end smoke of the contamination sandbox (scripts/lib/sandbox.sh) on a
-# Linux box with bwrap. Touches NO GPU and NO real archives: it builds a
+# Linux box with bwrap and an NVIDIA driver. Runs NO GPU compute (NVML and
+# cuInit only, on KBH_GPU, default 0) and touches NO real archives: it builds a
 # throwaway fake monorepo under <repo>/out/ (gitignored) and verifies:
 #   1. kbh_sandbox_init builds the bwrap argv, plants the honeytoken, and the
-#      launch canary PASSES on the correctly hidden tree;
+#      launch canary PASSES on the correctly hidden tree (including the PID
+#      namespace sentinel and the one-GPU checks);
 #   2. inside the sandbox, planted foreign archives / runs-remote-* /
 #      public/data/*/code are invisible while the own run dir, gpu lock dir,
 #      and honeytoken decoy (with beacon) are visible;
@@ -24,6 +26,10 @@ if ! command -v bwrap >/dev/null 2>&1; then
 fi
 if ! bwrap --dev-bind / / true 2>/dev/null; then
     echo "SKIP: bwrap present but user namespaces denied on this box" >&2
+    exit 2
+fi
+if ! command -v nvidia-smi >/dev/null 2>&1; then
+    echo "SKIP: no NVIDIA driver; the sandbox refuses to launch without GPU isolation" >&2
     exit 2
 fi
 
@@ -54,7 +60,8 @@ PROBLEM_NAME="01_smoke"
 PROBLEM_DIR="$RUN_DIR/repo/problems/$PROBLEM_NAME"
 mkdir -p "$PROBLEM_DIR"
 export KBH_GPU_LOCK="$REPO_ROOT/outputs/gpu_lock/gpu.lock"
-export REPO_ROOT RUN_DIR RUN_ID PROBLEM_DIR PROBLEM_NAME
+KBH_GPU="${KBH_GPU:-0}"
+export REPO_ROOT RUN_DIR RUN_ID PROBLEM_DIR PROBLEM_NAME KBH_GPU
 
 # --- 1. init: argv + honeytoken + canary must pass ---------------------------
 # shellcheck source=lib/sandbox.sh
@@ -62,7 +69,16 @@ export REPO_ROOT RUN_DIR RUN_ID PROBLEM_DIR PROBLEM_NAME
 kbh_sandbox_init    # exits 4 (killing this smoke) if the canary fires
 [ "$KBH_SANDBOX_ACTIVE" = "1" ] || fail "sandbox did not activate"
 grep -q '"canary": "pass"' "$RUN_DIR/sandbox.json" || fail "sandbox.json missing canary pass"
+grep -q '"pid_namespace": true' "$RUN_DIR/sandbox.json" || fail "sandbox.json missing pid_namespace"
+grep -q '"gpu_uuid": "GPU-' "$RUN_DIR/sandbox.json" || fail "sandbox.json missing gpu_uuid"
 echo "PASS: kbh_sandbox_init + launch canary clean"
+
+# --- 1b. isolation: only own processes, only the assigned GPU node -----------
+NPROC="$("${KBH_SBX[@]}" sh -c 'ls -d /proc/[0-9]* | wc -l')"
+[ "$NPROC" -le 4 ] || fail "sandbox /proc lists $NPROC processes (host PID table visible?)"
+NNODES="$("${KBH_SBX[@]}" sh -c 'ls /dev | grep -cE "^nvidia[0-9]+$"')"
+[ "$NNODES" = "1" ] || fail "sandbox exposes $NNODES GPU device nodes, expected 1"
+echo "PASS: own PID namespace ($NPROC procs visible) and one GPU node inside"
 
 # --- 2. inside the sandbox: foreign hidden, own + honeytoken visible ---------
 sbx() { "${KBH_SBX[@]}" "$@"; }
