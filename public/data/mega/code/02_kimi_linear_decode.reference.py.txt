@@ -25,6 +25,7 @@ the bf16 weight. Pack format is identical to KernelBench-Hard problem 07.
 Contract (reference.py / baseline.py / solution.py all expose it):
     Model(cfg); Model.step(hidden, state) -> (hidden, state)
     build_config(shape); init_state(cfg, ctx, seed); init_token(cfg, seed)
+    (init_state_attn(cfg, ctx, seed) is a grader-side variant of init_state.)
 """
 from __future__ import annotations
 
@@ -348,6 +349,31 @@ def init_state(cfg: Config, context_len: int, seed: int) -> list:
                 "c_kv": torch.randn(context_len, cfg.kv_lora, device=dev, generator=g, dtype=cfg.dtype) * 0.1,
                 "k_rope": torch.randn(context_len, cfg.qk_rope, device=dev, generator=g, dtype=cfg.dtype) * 0.1,
             })
+    return state
+
+
+ATTN_HOT_ROWS = 64
+ATTN_HOT_GAIN = 60.0
+
+
+def init_state_attn(cfg: Config, context_len: int, seed: int) -> list:
+    """init_state, but with an MLA cache where attention carries the output.
+
+    On the init_state cache the softmax is near uniform and MLA attention moves
+    the next-token hidden by ~0.1%, so it cannot tell a right attention path
+    from a wrong one. Here ATTN_HOT_ROWS cache positions (drawn from `seed`)
+    have their latent and rope key scaled by ATTN_HOT_GAIN: their scores
+    dominate, each head concentrates on its own few of them, and attention
+    becomes ~90% of the next-token hidden. Used by check.py and benchmark.py.
+    """
+    state = init_state(cfg, context_len, seed)
+    m = state[cfg.pattern.index("M")]
+    g = torch.Generator(device="cpu").manual_seed(10_000 + seed)
+    rows = torch.randperm(context_len, generator=g)[:ATTN_HOT_ROWS].to(m["c_kv"].device)
+    for key in ("c_kv", "k_rope"):
+        t = m[key].clone()
+        t[rows] = t[rows] * ATTN_HOT_GAIN
+        m[key] = t
     return state
 
 
