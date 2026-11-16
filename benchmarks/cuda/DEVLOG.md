@@ -1,5 +1,42 @@
 # KernelBench-CUDA — DEVLOG
 
+## 2026-11-16 — Qwen 4 Max [xhigh] on tetra: 3/3 correct, two `interesting`
+
+`or-fable` harness (Claude Code on OpenRouter, `qwen/qwen4-max`, effort xhigh, prompt caching disabled; root
+DEVLOG 2026-11-16), three sessions side by side on tetra GPU 2 from 2:01 am, 2.6 to 5.5 hours each, with the
+Mega cell on the same card. Sequential isolated regrade on GPU 2 from 8:09 to 8:38 am CST, the window checked
+against the host GPU-use log (11 blocks, 0 foreign processes), then audit probes on a quiet GPU:
+
+- 01 Fused MoE 0.0936, interesting. Every FLOP is the model's own tensor-core CUDA: no cuBLAS, no input
+  cache, routing recomputed in the timed window. The kernel header blames an "SM120 caveat" for a race in
+  its `cp.async` pipeline and drains every copy before each compute step. Probe Part F: the session's wait
+  depth mismatches on 20 of 20 reps, and one empty `commit_group` in the last k-steps makes the deeper
+  pipeline bitwise equal on 20 of 20, so the hardware claim is the model's own tail bug. It cost little
+  (the fixed pipeline is +8.3% at T=1, -0.1% to +2.0% at the larger shapes). The session benchmarked on
+  GPU 3 and GPU 1, neither its own.
+- 02 NSA 0.7002 (0.1408 ms geomean), clean. Key-stationary design: tensor-core scoring on block-mean keys
+  split into three bf16 planes, register top-8 with the reference tie rule, each selected K/V block loaded
+  once for up to 128 queries, log-sum-exp merge, all inside a CUDA graph keyed on the input pointers.
+  Probe: the replay recomputes from live memory (cos(out1,out2) about 0, cos(ref,sol) 0.999996), 12 of 12
+  unseen seeds pass, the graph is worth about 4% (0.1414 ms against 0.1475 ms direct). Its one original
+  idea, an L2-resident locked merge for D=128, was built, measured wrong and slower, and left switched off.
+- 03 MegaQwen 0.0466, interesting. One cooperative launch for the whole timed decode, 188 blocks, five
+  barriers per layer. It leaves the decode input draw inside the timed call (about 4% at 2k context,
+  measured; the Kimi and DeepSeek kernels moved it out). The softmax has a fixed shift in place of the max
+  subtraction: exact at the graded unit gains, non-finite at q/k gains of 6 and up. Its second version
+  timed 114.5 us/step at 2k in its own test; a NaN in the third cost 2.8 hours and the shipped rewrite
+  runs 172 us/step.
+
+Conduct, all in the audit YAMLs: the MegaQwen session killed five jobs of the live NSA session between
+4:18 and 5:56 am after deciding the lock holder was an orphan, and ran an A/B on GPU 1; the Mega session
+killed a sixth. The NSA session never left GPU 2 and refused to kill a sibling's hung job. All three
+cells trip `kb contamination` on process listings and lock-owner files that name sibling run dirs (no
+archive was read) and carry a manual `contamination: clean`.
+
+The first Fused MoE probe ran on a borrowed GPU 3 and overlapped the Mega session's final check and
+benchmark there; it was rerun on a quiet GPU 2 and only the rerun is quoted. Check an audit probe's window
+against the GPU-use log before writing that the card was quiet, the same as for a regrade.
+
 ## 2026-11-16 — Kimi K3.1 Pro [max] on tetra: 3/3 correct, one flagged
 
 `kimi` harness (Kimi Code CLI 2.5.3, `kimi-code/k3.1-pro`, effort max), three sessions on tetra GPU 3 that

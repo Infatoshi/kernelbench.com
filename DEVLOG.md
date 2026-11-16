@@ -39,8 +39,33 @@ and mega DEVLOGs. What changed in the tooling, and what is still open:
   GPU 2. An "isolated" regrade is therefore only isolated if something checks it: a logger that records
   every compute process on every GPU every 3 s ran from 3:50 am, the Kimi regrades were repeated until the
   log showed the card to itself (MegaQwen took three tries), and each crossing is in the affected audit
-  YAML. Open: enforce the pin (device cgroup or per-run `nvidia-container`-style visibility) and make the
-  regrade script refuse or repeat on a foreign process itself.
+  YAML. Later the same night the Qwen 4 Max Mega session ran on GPU 3 (6:09 am to 8:07 am, including its
+  final check and benchmark) and on GPU 0 (6:48 to 8:03 am), and the MegaQwen session ran an A/B on GPU 1
+  (7:29 am). Open: enforce the pin (device cgroup or per-run `nvidia-container`-style visibility) and make
+  the regrade script refuse or repeat on a foreign process itself.
+- **Sessions can kill each other's jobs.** The shared process table also takes signals. The Qwen 4 Max
+  MegaQwen session killed five GPU jobs of the live Qwen 4 Max NSA session (4:18 to 5:56 am, seven kill
+  commands) after deciding the lock holder was an orphan, and the Mega session killed a sixth
+  (`kill -9` on a pid it took for its own zombie, 5:59 am). Two more NSA jobs have no end line in its lock
+  log and no established killer. The NSA cell still finished and graded clean. The PID namespace above
+  closes this too.
+- **`gpu-lock-exec` re-entrancy.** A process from the same run skips the lock with no log line, so a
+  session that holds the lock in one job can run more GPU jobs unlocked and unlogged (the MegaQwen
+  session's first `benchmark.py` held the cuda lock from 6:16:56 to 6:54:16 am while its own check, a
+  second benchmark and a dev bench ran on the card). Open: log re-entrant runs, or serialize them.
+- **Audit probes need the same window check as regrades.** The first Fused MoE probe ran on a borrowed
+  GPU 3 while the Mega session's final check and benchmark were on it. Rerun on a quiet GPU 2. Run
+  `gpu_window_clean.py` over the probe window before writing that the card was quiet.
+- **Token counts for multi-turn Claude Code sessions.** A session woken by background tasks emits one
+  `result` event per turn and each `usage` covers that turn only; `extract_usage.py` took the last one, so
+  the four Qwen cells first stored 205 to 3,767 output tokens for sessions that wrote 264,654 to 759,370.
+  All four copies now read the final event's cumulative `modelUsage` (test:
+  `kbtool/tests/test_extract_usage.py`) and record no cost when Claude Code marks the price basis unknown
+  (its figure for these cells, $29.59 to $250.50, is a fallback-rate estimate; OpenRouter's own
+  daily usage for the key read $122.26 after all four sessions ended, the aborted $48.35 first attempt
+  included). The four archives were re-extracted. Open:
+  the retired, unpublished `20261109_143848` Fable 5.2 cell has the same undercount, and older
+  OpenRouter-routed cells still show Claude Code's estimate as the run cost.
 - **The sandbox shares the host process table.** `ps`, `top`, `pgrep -a`, `/proc/*/cmdline` and nvidia-smi's
   process table show sibling sessions' command lines (run ids, the sandbox hide list, inline patch source)
   and unrelated host jobs. No session used it to read another kernel, but it is a leak channel between

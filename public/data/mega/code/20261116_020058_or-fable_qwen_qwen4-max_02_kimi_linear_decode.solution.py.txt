@@ -1,0 +1,902 @@
+"""Kimi-Linear W4A16 hybrid decode -- single-launch Triton megakernel.
+
+The entire per-token forward (3x KDA + 1x MLA, each with a 64-expert top-8 MoE)
+runs in ONE persistent Triton kernel launch per step(). A fixed grid of
+co-resident CTAs (occupancy-probed at first call: up to 4 CTAs/SM on SM120)
+executes the whole token as a sequence of parallel phases separated by a
+software grid-wide barrier (two-slot monotonic atomic counters, epoch-tracked
+across steps so no reset is needed). The MoE gate/up -> SiLU -> down chain is
+fused into one phase with per-tile/per-expert completion counters, so down
+tasks start as soon as their expert's hidden state is ready.
+
+Every int4 dequant-GEMV streams the packed weights once and unpacks nibbles in
+registers (bf16 magic-number trick: q|0x4300 bitcast = 128+q); no bf16 weight
+is ever materialized. MLA uses the absorb formulation: kv_b's key half is
+folded into q (q_abs = W_k^T q_nope), attention runs flash-style directly over
+the 512-d latent cache (bf16 partials), and the value half is applied to the
+512-d attention output -- O(L*512) cache traffic instead of materializing
+L*8192 keys/values.
+
+Precision policy: bf16 rounding at exactly the reference's cast points
+(projection outputs, conv outputs, residuals, norms, router logits, cache
+rows), fp32 accumulation everywhere else -- so the discrete top-8 routing
+decisions track the reference.
+"""
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+OP_TYPE = "kimi_linear_w4a16_decode"
+EPS = 1.0e-6
+GROUP_SIZE = 128
+
+
+@dataclass(frozen=True)
+class Config:
+    hidden: int = 2304
+    kda_heads: int = 32
+    kda_head_dim: int = 128
+    short_conv: int = 4
+    mla_heads: int = 32
+    kv_lora: int = 512
+    qk_nope: int = 128
+    qk_rope: int = 64
+    v_head: int = 128
+    rope_theta: float = 10000.0
+    n_experts: int = 64
+    n_active: int = 8
+    n_shared: int = 1
+    moe_inter: int = 1024
+    routed_scaling: float = 2.446
+    group: int = 128
+    pattern: tuple = ("K", "K", "K", "M")
+    dtype: torch.dtype = field(default=torch.bfloat16)
+
+
+def build_config(shape: dict) -> Config:
+    return Config(n_experts=int(shape.get("n_experts", 64)))
+
+
+# --------------------------------------------------------------------------- #
+# modules: identical buffer/parameter names & shapes to the reference so
+# load_state_dict(ref.state_dict(), strict=True) works.
+# --------------------------------------------------------------------------- #
+class QuantLinear(nn.Module):
+    def __init__(self, in_f, out_f, group=GROUP_SIZE):
+        super().__init__()
+        self.in_f, self.out_f, self.group = in_f, out_f, group
+        ng = in_f // group
+        self.register_buffer("w_q", torch.zeros(in_f // 2, out_f, dtype=torch.uint8))
+        self.register_buffer("scales", torch.zeros(ng, out_f, dtype=torch.bfloat16))
+        self.register_buffer("zeros", torch.zeros(ng, out_f, dtype=torch.bfloat16))
+
+
+class QuantExperts(nn.Module):
+    def __init__(self, n, in_f, out_f, group=GROUP_SIZE):
+        super().__init__()
+        self.n, self.in_f, self.out_f, self.group = n, in_f, out_f, group
+        ng = in_f // group
+        self.register_buffer("w_q", torch.zeros(n, in_f // 2, out_f, dtype=torch.uint8))
+        self.register_buffer("scales", torch.zeros(n, ng, out_f, dtype=torch.bfloat16))
+        self.register_buffer("zeros", torch.zeros(n, ng, out_f, dtype=torch.bfloat16))
+
+
+class KDA(nn.Module):
+    def __init__(self, cfg):
+        super().__init__()
+        H, Dk, d = cfg.kda_heads, cfg.kda_head_dim, cfg.hidden
+        self.q_proj = QuantLinear(d, H * Dk)
+        self.k_proj = QuantLinear(d, H * Dk)
+        self.v_proj = QuantLinear(d, H * Dk)
+        self.g_proj = QuantLinear(d, H * Dk)
+        self.beta_proj = nn.Linear(d, H, bias=False, dtype=cfg.dtype)
+        self.conv_w = nn.Parameter(torch.empty(3, H * Dk, cfg.short_conv, dtype=cfg.dtype))
+        self.o_proj = QuantLinear(H * Dk, d)
+
+
+class MLA(nn.Module):
+    def __init__(self, cfg):
+        super().__init__()
+        H, d = cfg.mla_heads, cfg.hidden
+        self.q_proj = QuantLinear(d, H * (cfg.qk_nope + cfg.qk_rope))
+        self.kv_a = QuantLinear(d, cfg.kv_lora + cfg.qk_rope)
+        self.kv_b = QuantLinear(cfg.kv_lora, H * (cfg.qk_nope + cfg.v_head))
+        self.o_proj = QuantLinear(H * cfg.v_head, d)
+
+
+class MoE(nn.Module):
+    def __init__(self, cfg):
+        super().__init__()
+        d, m, E = cfg.hidden, cfg.moe_inter, cfg.n_experts
+        self.router = nn.Linear(d, E, bias=False, dtype=cfg.dtype)
+        self.gate = QuantExperts(E, d, m)
+        self.up = QuantExperts(E, d, m)
+        self.down = QuantExperts(E, m, d)
+        self.s_gate = QuantExperts(cfg.n_shared, d, m)
+        self.s_up = QuantExperts(cfg.n_shared, d, m)
+        self.s_down = QuantExperts(cfg.n_shared, m, d)
+
+
+class Block(nn.Module):
+    def __init__(self, cfg, kind):
+        super().__init__()
+        self.kind = kind
+        self.attn_norm = nn.Parameter(torch.ones(cfg.hidden, dtype=cfg.dtype))
+        self.moe_norm = nn.Parameter(torch.ones(cfg.hidden, dtype=cfg.dtype))
+        self.attn = KDA(cfg) if kind == "K" else MLA(cfg)
+        self.moe = MoE(cfg)
+
+
+# --------------------------------------------------------------------------- #
+# megakernel
+# --------------------------------------------------------------------------- #
+# weight-table slots (per block, stride 64)
+T_ANORM, T_MNORM, T_ROUTER = 0, 1, 2
+T_QW, T_QS, T_QZ = 3, 4, 5
+# KDA: 6..17 k/v/g/o, 18 beta, 19 conv ; MLA: 6..8 kv_a, 9..11 kv_b, 12..14 o
+T_GW, T_GS, T_GZ = 24, 25, 26
+T_UW, T_US, T_UZ = 27, 28, 29
+T_DW, T_DS, T_DZ = 30, 31, 32
+T_SGW, T_SGS, T_SGZ = 33, 34, 35
+T_SUW, T_SUS, T_SUZ = 36, 37, 38
+T_SDW, T_SDS, T_SDZ = 39, 40, 41
+
+
+@triton.jit
+def _bar(cnt, ph: tl.constexpr, NCTA: tl.constexpr, BASE):
+    p = ph + BASE
+    slot = p % 2
+    target = (p // 2 + 1) * NCTA
+    tl.atomic_add(cnt + slot, 1, sem="acq_rel", scope="gpu")
+    v = tl.atomic_add(cnt + slot, 0, sem="acquire", scope="gpu")
+    while v < target:
+        v = tl.atomic_add(cnt + slot, 0, sem="acquire", scope="gpu")
+
+
+@triton.jit
+def _wp(tab, idx):
+    return tl.load(tab + idx).to(tl.pointer_type(tl.uint8))
+
+
+@triton.jit
+def _bp(tab, idx):
+    return tl.load(tab + idx).to(tl.pointer_type(tl.bfloat16))
+
+
+@triton.jit
+def _gemv(x_ptr, wq_ptr, s_ptr, z_ptr, k1, N, n0, k0, BN_: tl.constexpr, FMA: tl.constexpr = False):
+    """y[n0:n0+BN] = sum_{k in [k0,k1)} x[k] * dequant(w)[k, n]. fp32 out.
+    FMA=True: fp32 activation x fp32(bf16 weight), reference-faithful down proj."""
+    offs_n = n0 + tl.arange(0, BN_)
+    if FMA:
+        acc = tl.zeros((BN_,), dtype=tl.float32)
+        for g in range(k0 // 128, k1 // 128):
+            r = g * 64 + tl.arange(0, 64)
+            wp = tl.load(wq_ptr + r[None, :] * N + offs_n[:, None])
+            lo = ((wp & 0xF).to(tl.uint16) | 0x4300).to(tl.bfloat16, bitcast=True)
+            hi = ((wp >> 4).to(tl.uint16) | 0x4300).to(tl.bfloat16, bitcast=True)
+            s = tl.load(s_ptr + g * N + offs_n)
+            z = tl.load(z_ptr + g * N + offs_n)
+            z128 = (z.to(tl.float32) + 128.0).to(tl.bfloat16)
+            wl = ((lo - z128[:, None]) * s[:, None]).to(tl.float32)
+            wh = ((hi - z128[:, None]) * s[:, None]).to(tl.float32)
+            xe = tl.load(x_ptr + g * 128 + 2 * tl.arange(0, 64)).to(tl.float32)
+            xo = tl.load(x_ptr + g * 128 + 2 * tl.arange(0, 64) + 1).to(tl.float32)
+            acc += tl.sum(xe[None, :] * wl, axis=1) + tl.sum(xo[None, :] * wh, axis=1)
+        return acc
+    acc = tl.zeros((BN_, 16), dtype=tl.float32)
+    for g in range(k0 // 128, k1 // 128):
+        r = g * 64 + tl.arange(0, 64)
+        wp = tl.load(wq_ptr + r[None, :] * N + offs_n[:, None])
+        lo = ((wp & 0xF).to(tl.uint16) | 0x4300).to(tl.bfloat16, bitcast=True)
+        hi = ((wp >> 4).to(tl.uint16) | 0x4300).to(tl.bfloat16, bitcast=True)
+        s = tl.load(s_ptr + g * N + offs_n)
+        z = tl.load(z_ptr + g * N + offs_n)
+        z128 = (z.to(tl.float32) + 128.0).to(tl.bfloat16)
+        lo = (lo - z128[:, None]) * s[:, None]
+        hi = (hi - z128[:, None]) * s[:, None]
+        xe = tl.load(x_ptr + g * 128 + 2 * tl.arange(0, 64)).to(tl.bfloat16)
+        xo = tl.load(x_ptr + g * 128 + 2 * tl.arange(0, 64) + 1).to(tl.bfloat16)
+        acc = tl.dot(lo, tl.broadcast_to(xe[:, None], (64, 16)), acc)
+        acc = tl.dot(hi, tl.broadcast_to(xo[:, None], (64, 16)), acc)
+    return tl.max(acc, axis=1)
+
+
+@triton.jit
+def _rmsnorm(h_ptr, w_ptr, out_ptr, D: tl.constexpr, add_ptr, DO_ADD: tl.constexpr):
+    """out = bf16(rmsnorm(h [+ bf16(add)])); also writes rounded residual to h."""
+    o1 = tl.arange(0, 2048)
+    o2 = 2048 + tl.arange(0, 256)
+    x1 = tl.load(h_ptr + o1).to(tl.float32)
+    x2 = tl.load(h_ptr + o2).to(tl.float32)
+    if DO_ADD:
+        a1 = tl.load(add_ptr + o1).to(tl.bfloat16).to(tl.float32)
+        a2 = tl.load(add_ptr + o2).to(tl.bfloat16).to(tl.float32)
+        x1 = (x1 + a1).to(tl.bfloat16).to(tl.float32)
+        x2 = (x2 + a2).to(tl.bfloat16).to(tl.float32)
+        tl.store(h_ptr + o1, x1.to(tl.bfloat16))
+        tl.store(h_ptr + o2, x2.to(tl.bfloat16))
+    ss = (tl.sum(x1 * x1) + tl.sum(x2 * x2)) / D
+    r = tl.rsqrt(ss + 1.0e-6)
+    w1 = tl.load(w_ptr + o1).to(tl.float32)
+    w2 = tl.load(w_ptr + o2).to(tl.float32)
+    tl.store(out_ptr + o1, (x1 * r * w1).to(tl.bfloat16))
+    tl.store(out_ptr + o2, (x2 * r * w2).to(tl.bfloat16))
+
+
+@triton.jit
+def _silu(x):
+    return x / (1.0 + tl.exp(-x))
+
+
+
+@triton.jit
+def _sincos_pos(pos, i):
+    """cos/sin(pos * 10000^(-2i/64)) with fp64 range reduction + approx sincos.
+    Avoids libdevice large-argument paths (register-heavy, spill-prone)."""
+    freq = tl.exp2(-13.287712379549449 * (2.0 * i.to(tl.float32) / 64.0))
+    ang = pos.to(tl.float64) * freq.to(tl.float64)
+    two_pi = 6.283185307179586476925286766559
+    k = tl.floor(ang / two_pi + 0.5)
+    r = (ang - k * two_pi).to(tl.float32)
+    co = tl.inline_asm_elementwise("cos.approx.f32 $0, $1;", "=f,f", [r],
+                                   dtype=tl.float32, is_pure=True, pack=1)
+    si = tl.inline_asm_elementwise("sin.approx.f32 $0, $1;", "=f,f", [r],
+                                   dtype=tl.float32, is_pure=True, pack=1)
+    return co, si
+
+@triton.jit(do_not_specialize=["L", "REPACK", "NCHUNK", "BASE"])
+def _megakernel(tab, input_ptr, output_ptr,
+                h_ptr, xn_ptr, attn_ptr, moe_ptr,
+                qraw_ptr, kraw_ptr, vraw_ptr, graw_ptr, beta_ptr, o_ptr,
+                kvraw_ptr, qabs_ptr, lat_ptr, pacc_ptr, pml_ptr,
+                hh_ptr, gu_ptr, mcnt_ptr, ids_ptr, ws_ptr, logits_ptr,
+                cbuf_ptr, rbuf_ptr, cold_ptr, rold_ptr, cnt,
+                S0, S1, S2, cq0, ck0, cv0, cq1, ck1, cv1, cq2, ck2, cv2,
+                L, REPACK, NCHUNK, BASE,
+                PAT: tl.constexpr, NCTA: tl.constexpr):
+    pid = tl.program_id(0)
+    BN: tl.constexpr = 64
+    CHUNK: tl.constexpr = 256
+    SUB: tl.constexpr = 128
+    T_ANORM: tl.constexpr = 0
+    T_MNORM: tl.constexpr = 1
+    T_ROUTER: tl.constexpr = 2
+    T_QW: tl.constexpr = 3
+    T_QS: tl.constexpr = 4
+    T_QZ: tl.constexpr = 5
+    T_GW: tl.constexpr = 24
+    T_GS: tl.constexpr = 25
+    T_GZ: tl.constexpr = 26
+    T_UW: tl.constexpr = 27
+    T_US: tl.constexpr = 28
+    T_UZ: tl.constexpr = 29
+    T_DW: tl.constexpr = 30
+    T_DS: tl.constexpr = 31
+    T_DZ: tl.constexpr = 32
+    T_SGW: tl.constexpr = 33
+    T_SGS: tl.constexpr = 34
+    T_SGZ: tl.constexpr = 35
+    T_SUW: tl.constexpr = 36
+    T_SUS: tl.constexpr = 37
+    T_SUZ: tl.constexpr = 38
+    T_SDW: tl.constexpr = 39
+    T_SDS: tl.constexpr = 40
+    T_SDZ: tl.constexpr = 41
+    D: tl.constexpr = 2304
+    C: tl.constexpr = 4096
+    H: tl.constexpr = 32
+    DK: tl.constexpr = 128
+    M: tl.constexpr = 1024
+    ph = 0
+
+    # ---- P0: copy input -> h; optional cache repack ------------------------ #
+    if pid == 0:
+        offs = tl.arange(0, 4096)
+        m = offs < D
+        v = tl.load(input_ptr + offs, mask=m, other=0.0)
+        tl.store(h_ptr + offs, v, mask=m)
+    if REPACK:
+        nrt = (L + 127) // 128
+        for t in range(pid, nrt, NCTA):
+            rows = t * 128 + tl.arange(0, 128)
+            rm = rows < L
+            for j in tl.static_range(8):
+                cc = j * 64 + tl.arange(0, 64)
+                v = tl.load(cold_ptr + rows[:, None] * 512 + cc[None, :], mask=rm[:, None], other=0.0)
+                tl.store(cbuf_ptr + rows[:, None] * 512 + cc[None, :], v, mask=rm[:, None])
+            rr = tl.arange(0, 64)
+            v = tl.load(rold_ptr + rows[:, None] * 64 + rr[None, :], mask=rm[:, None], other=0.0)
+            tl.store(rbuf_ptr + rows[:, None] * 64 + rr[None, :], v, mask=rm[:, None])
+    _bar(cnt, ph, NCTA, BASE); ph += 1
+
+    for b in tl.static_range(4):
+        base = b * 64
+        is_k = PAT[b] == 0
+        # ---- norm1 (+ residual from previous block's MoE) ------------------ #
+        if pid == 0:
+            _rmsnorm(h_ptr, _bp(tab, base + T_ANORM), xn_ptr, D, moe_ptr, b > 0)
+        elif pid <= 4:
+            offs = tl.arange(0, 4096)
+            z = tl.zeros((4096,), dtype=tl.float32)
+            if is_k:
+                if pid == 1:
+                    tl.store(qraw_ptr + offs, z)
+                elif pid == 2:
+                    tl.store(kraw_ptr + offs, z)
+                elif pid == 3:
+                    tl.store(vraw_ptr + offs, z)
+                else:
+                    tl.store(graw_ptr + offs, z)
+            else:
+                if pid == 1:
+                    tl.store(qraw_ptr + offs, z, mask=offs < 6144)
+                    tl.store(qraw_ptr + 4096 + offs, z, mask=offs < 2048)
+                elif pid == 2:
+                    tl.store(kvraw_ptr + offs, z, mask=offs < 576)
+        _bar(cnt, ph, NCTA, BASE); ph += 1
+
+        # ---- attention input projections ----------------------------------- #
+        if is_k:
+            for t in range(pid, 544, NCTA):
+                if t < 512:
+                    proj = t // 128
+                    tile = (t % 128) // 2
+                    ks = t % 2
+                    k0 = ks * 1152
+                    k1 = (ks + 1) * 1152
+                    n0 = tile * 64
+                    if proj == 0:
+                        y = _gemv(xn_ptr, _wp(tab, base + T_QW), _bp(tab, base + T_QS), _bp(tab, base + T_QZ), k1, C, n0, k0, 64)
+                        tl.atomic_add(qraw_ptr + n0 + tl.arange(0, 64), y)
+                    elif proj == 1:
+                        y = _gemv(xn_ptr, _wp(tab, base + 6), _bp(tab, base + 7), _bp(tab, base + 8), k1, C, n0, k0, 64)
+                        tl.atomic_add(kraw_ptr + n0 + tl.arange(0, 64), y)
+                    elif proj == 2:
+                        y = _gemv(xn_ptr, _wp(tab, base + 9), _bp(tab, base + 10), _bp(tab, base + 11), k1, C, n0, k0, 64)
+                        tl.atomic_add(vraw_ptr + n0 + tl.arange(0, 64), y)
+                    else:
+                        y = _gemv(xn_ptr, _wp(tab, base + 12), _bp(tab, base + 13), _bp(tab, base + 14), k1, C, n0, k0, 64)
+                        tl.atomic_add(graw_ptr + n0 + tl.arange(0, 64), y)
+                else:
+                    # beta[e] = sigmoid(bf16(xn @ Wbeta[e])) -- whole-row dot
+                    e = t - 512
+                    bw = _bp(tab, base + 18)
+                    offs = tl.arange(0, 4096)
+                    dm = offs < D
+                    w = tl.load(bw + e * D + offs, mask=dm, other=0.0)
+                    xg = tl.load(xn_ptr + offs, mask=dm, other=0.0)
+                    acc = tl.sum(w.to(tl.float32) * xg.to(tl.float32))
+                    acc = acc.to(tl.bfloat16).to(tl.float32)
+                    tl.store(beta_ptr + e + tl.arange(0, 1), tl.sigmoid(acc))
+        else:
+            for t in range(pid, 630, NCTA):
+                if t < 576:
+                    n0 = (t // 6) * 64
+                    ks = t % 6
+                    y = _gemv(xn_ptr, _wp(tab, base + T_QW), _bp(tab, base + T_QS), _bp(tab, base + T_QZ), (ks + 1) * 384, 6144, n0, ks * 384, 64)
+                    tl.atomic_add(qraw_ptr + n0 + tl.arange(0, 64), y)
+                else:
+                    u = t - 576
+                    n0 = (u // 6) * 64
+                    ks = u % 6
+                    y = _gemv(xn_ptr, _wp(tab, base + 6), _bp(tab, base + 7), _bp(tab, base + 8), (ks + 1) * 384, 576, n0, ks * 384, 64)
+                    tl.atomic_add(kvraw_ptr + n0 + tl.arange(0, 64), y)
+        _bar(cnt, ph, NCTA, BASE); ph += 1
+
+        if is_k:
+            # select this block's state pointers (b is a trace-time constant)
+            if b == 0:
+                Sp, cqp, ckp, cvp = S0, cq0, ck0, cv0
+            elif b == 1:
+                Sp, cqp, ckp, cvp = S1, cq1, ck1, cv1
+            else:
+                Sp, cqp, ckp, cvp = S2, cq2, ck2, cv2
+            # ---- KDA: conv + silu + gate + recurrence (64 dv-half tasks) ---- #
+            for t in range(pid, 129, NCTA):
+                if t < 128:
+                    hd = t // 4
+                    half = t % 4
+                    dk = tl.arange(0, DK)
+                    dv = half * 32 + tl.arange(0, 32)
+                    ch = hd * DK + dk
+                    chv = hd * DK + dv
+                    cw = _bp(tab, base + 19)
+                    # conv q (full 128 channels; redundant across halves, read-only)
+                    rawq = tl.load(qraw_ptr + ch).to(tl.bfloat16).to(tl.float32)
+                    a0 = tl.load(cqp + 0 * C + ch).to(tl.float32)
+                    a1 = tl.load(cqp + 1 * C + ch).to(tl.float32)
+                    a2 = tl.load(cqp + 2 * C + ch).to(tl.float32)
+                    w0 = tl.load(cw + 0 * C * 4 + ch * 4 + 0).to(tl.float32)
+                    w1 = tl.load(cw + 0 * C * 4 + ch * 4 + 1).to(tl.float32)
+                    w2 = tl.load(cw + 0 * C * 4 + ch * 4 + 2).to(tl.float32)
+                    w3 = tl.load(cw + 0 * C * 4 + ch * 4 + 3).to(tl.float32)
+                    qv = _silu(a0 * w0 + a1 * w1 + a2 * w2 + rawq * w3)
+                    qv = qv.to(tl.bfloat16).to(tl.float32) * 0.08838834764831845
+                    # conv k
+                    rawk = tl.load(kraw_ptr + ch).to(tl.bfloat16).to(tl.float32)
+                    a0 = tl.load(ckp + 0 * C + ch).to(tl.float32)
+                    a1 = tl.load(ckp + 1 * C + ch).to(tl.float32)
+                    a2 = tl.load(ckp + 2 * C + ch).to(tl.float32)
+                    w0 = tl.load(cw + 1 * C * 4 + ch * 4 + 0).to(tl.float32)
+                    w1 = tl.load(cw + 1 * C * 4 + ch * 4 + 1).to(tl.float32)
+                    w2 = tl.load(cw + 1 * C * 4 + ch * 4 + 2).to(tl.float32)
+                    w3 = tl.load(cw + 1 * C * 4 + ch * 4 + 3).to(tl.float32)
+                    kv = _silu(a0 * w0 + a1 * w1 + a2 * w2 + rawk * w3)
+                    kv = kv.to(tl.bfloat16).to(tl.float32)
+                    # conv v (own 64 channels)
+                    rawv = tl.load(vraw_ptr + chv).to(tl.bfloat16).to(tl.float32)
+                    a0 = tl.load(cvp + 0 * C + chv).to(tl.float32)
+                    a1 = tl.load(cvp + 1 * C + chv).to(tl.float32)
+                    a2 = tl.load(cvp + 2 * C + chv).to(tl.float32)
+                    w0 = tl.load(cw + 2 * C * 4 + chv * 4 + 0).to(tl.float32)
+                    w1 = tl.load(cw + 2 * C * 4 + chv * 4 + 1).to(tl.float32)
+                    w2 = tl.load(cw + 2 * C * 4 + chv * 4 + 2).to(tl.float32)
+                    w3 = tl.load(cw + 2 * C * 4 + chv * 4 + 3).to(tl.float32)
+                    vv = _silu(a0 * w0 + a1 * w1 + a2 * w2 + rawv * w3)
+                    vv = vv.to(tl.bfloat16).to(tl.float32)
+                    # decay gate: exp(-softplus(g)) == sigmoid(-g)
+                    g = tl.load(graw_ptr + ch).to(tl.bfloat16).to(tl.float32)
+                    decay = tl.sigmoid(-g)
+                    bet = tl.load(beta_ptr + hd)
+                    # recurrent state update (fp32, reference op order)
+                    soff = Sp + hd * (DK * DK) + dk[:, None] * DK + dv[None, :]
+                    S = tl.load(soff)
+                    S = S * decay[:, None]
+                    pred = tl.sum(S * kv[:, None], axis=0)
+                    err = vv - pred
+                    S = S + bet * kv[:, None] * err[None, :]
+                    oh = tl.sum(S * qv[:, None], axis=0)
+                    tl.store(soff, S)
+                    tl.store(o_ptr + hd * DK + dv, oh.to(tl.bfloat16))
+                else:
+                    offs = tl.arange(0, 4096)
+                    tl.store(attn_ptr + offs, tl.zeros((4096,), dtype=tl.float32), mask=offs < D)
+            _bar(cnt, ph, NCTA, BASE); ph += 1
+            # ---- o_proj split-K atomics + conv-window shift ------------------ #
+            for t in range(pid, 588, NCTA):
+                if t < 576:
+                    tile = t // 16
+                    ks = t % 16
+                    k0 = ks * 256
+                    k1 = (ks + 1) * 256
+                    n0 = tile * 64
+                    y = _gemv(o_ptr, _wp(tab, base + 15), _bp(tab, base + 16), _bp(tab, base + 17), k1, D, n0, k0, 64)
+                    tl.atomic_add(attn_ptr + n0 + tl.arange(0, 64), y)
+                else:
+                    # window shift: [w1, w2, raw] for q/k/v, 1024 channels each
+                    u = t - 576
+                    proj = u // 4
+                    c0 = (u % 4) * 1024 + tl.arange(0, 1024)
+                    if proj == 0:
+                        wp_, rawp = cqp, qraw_ptr
+                    elif proj == 1:
+                        wp_, rawp = ckp, kraw_ptr
+                    else:
+                        wp_, rawp = cvp, vraw_ptr
+                    x1 = tl.load(wp_ + 1 * C + c0)
+                    x2 = tl.load(wp_ + 2 * C + c0)
+                    xr = tl.load(rawp + c0).to(tl.bfloat16)
+                    tl.store(wp_ + 0 * C + c0, x1)
+                    tl.store(wp_ + 1 * C + c0, x2)
+                    tl.store(wp_ + 2 * C + c0, xr)
+            _bar(cnt, ph, NCTA, BASE); ph += 1
+        else:
+            # ---- MLA: rope + cache append + absorb -------------------------- #
+            # absorb is a TRANSPOSED gemv: q_abs[c] = sum_j q_nope[j]*W[c,j],
+            # reduction along kv_b's column dim (128 j's), one 128-c group/tile.
+            for t in range(pid, 130, NCTA):
+                if t < 128:
+                    hd = t // 4
+                    ct = t % 4
+                    c0 = ct * 128
+                    kvbw = _wp(tab, base + 9)
+                    kvbs = _bp(tab, base + 10)
+                    kvbz = _bp(tab, base + 11)
+                    r = c0 // 2 + tl.arange(0, 64)
+                    qn = qraw_ptr + hd * 192
+                    ye = tl.zeros((64,), dtype=tl.float32)
+                    yo = tl.zeros((64,), dtype=tl.float32)
+                    for jj in tl.static_range(2):
+                        j = hd * 256 + jj * 64 + tl.arange(0, 64)
+                        wp = tl.load(kvbw + r[:, None] * 8192 + j[None, :])
+                        lo = ((wp & 0xF).to(tl.uint16) | 0x4300).to(tl.bfloat16, bitcast=True)
+                        hi = ((wp >> 4).to(tl.uint16) | 0x4300).to(tl.bfloat16, bitcast=True)
+                        s = tl.load(kvbs + ct * 8192 + j)
+                        z = tl.load(kvbz + ct * 8192 + j)
+                        z128 = (z.to(tl.float32) + 128.0).to(tl.bfloat16)
+                        lo = (lo - z128[None, :]) * s[None, :]
+                        hi = (hi - z128[None, :]) * s[None, :]
+                        x = tl.load(qn + jj * 64 + tl.arange(0, 64)).to(tl.bfloat16)
+                        xm = tl.broadcast_to(x[:, None], (64, 16))
+                        ye += tl.max(tl.dot(lo, xm), axis=1)
+                        yo += tl.max(tl.dot(hi, xm), axis=1)
+                    y = tl.interleave(ye, yo)
+                    tl.store(qabs_ptr + (c0 + tl.arange(0, 128)) * 32 + hd, y)
+                    if ct == 0:
+                        # rope q_rope in place (pos = L)
+                        i = tl.arange(0, 32)
+                        co, si = _sincos_pos(L, i)
+                        xe = tl.load(qn + 128 + 2 * i).to(tl.bfloat16).to(tl.float32)
+                        xo = tl.load(qn + 128 + 2 * i + 1).to(tl.bfloat16).to(tl.float32)
+                        tl.store(qn + 128 + 2 * i, (xe * co - xo * si).to(tl.bfloat16).to(tl.float32))
+                        tl.store(qn + 128 + 2 * i + 1, (xo * co + xe * si).to(tl.bfloat16).to(tl.float32))
+                elif t == 128:
+                    # append cache row L
+                    cc = tl.arange(0, 512)
+                    v = tl.load(kvraw_ptr + cc).to(tl.bfloat16)
+                    tl.store(cbuf_ptr + L * 512 + cc, v)
+                    i = tl.arange(0, 32)
+                    co, si = _sincos_pos(L, i)
+                    xe = tl.load(kvraw_ptr + 512 + 2 * i).to(tl.bfloat16).to(tl.float32)
+                    xo = tl.load(kvraw_ptr + 512 + 2 * i + 1).to(tl.bfloat16).to(tl.float32)
+                    tl.store(rbuf_ptr + L * 64 + 2 * i, (xe * co - xo * si).to(tl.bfloat16))
+                    tl.store(rbuf_ptr + L * 64 + 2 * i + 1, (xo * co + xe * si).to(tl.bfloat16))
+                else:
+                    offs = tl.arange(0, 4096)
+                    tl.store(attn_ptr + offs, tl.zeros((4096,), dtype=tl.float32), mask=offs < D)
+            _bar(cnt, ph, NCTA, BASE); ph += 1
+            # ---- MLA flash attention over latent cache ---------------------- #
+            # task = (chunk of 128 rows, head-group of 8 padded to 16).
+            # Single subchunk: no online rescale inside the task; p stays in
+            # registers; each latent-quarter accumulator is stored immediately
+            # so only one is live -> low register/smem footprint (4 CTAs/SM).
+            for t in range(pid, NCHUNK * 4, NCTA):
+                chunk = t // 4
+                hg = t % 4
+                rows = chunk * 128 + tl.arange(0, 128)
+                rm = rows < L + 1
+                h16 = hg * 8 + tl.arange(0, 16)
+                hm = tl.arange(0, 16) < 8
+                scores = tl.zeros((128, 16), dtype=tl.float32)
+                for j in range(16):
+                    cc = j * 32 + tl.arange(0, 32)
+                    cj = tl.load(cbuf_ptr + rows[:, None] * 512 + cc[None, :], mask=rm[:, None], other=0.0)
+                    qt = tl.load(qabs_ptr + cc[:, None] * 32 + h16[None, :], mask=hm[None, :], other=0.0).to(tl.bfloat16)
+                    scores = tl.dot(cj, qt, scores)
+                for j in range(2):
+                    rr = j * 32 + tl.arange(0, 32)
+                    kr = tl.load(rbuf_ptr + rows[:, None] * 64 + rr[None, :], mask=rm[:, None], other=0.0)
+                    qrt = tl.load(qraw_ptr + h16[None, :] * 192 + 128 + rr[:, None], mask=hm[None, :], other=0.0).to(tl.bfloat16)
+                    scores = tl.dot(kr, qrt, scores)
+                scores = scores * 0.07216878364870322
+                scores = tl.where(rm[:, None], scores, float("-inf"))
+                m_i = tl.max(scores, axis=0)
+                p = tl.exp(scores - m_i[None, :])
+                l_i = tl.sum(p, axis=0)
+                pt = tl.trans(p.to(tl.bfloat16))
+                pbase = pacc_ptr + chunk * (32 * 512) + h16[:, None] * 512
+                for j in range(16):
+                    cc = j * 32 + tl.arange(0, 32)
+                    cj = tl.load(cbuf_ptr + rows[:, None] * 512 + cc[None, :], mask=rm[:, None], other=0.0)
+                    accj = tl.dot(pt, cj)
+                    tl.store(pbase + cc[None, :], accj.to(tl.bfloat16), mask=hm[:, None])
+                tl.store(pml_ptr + chunk * 64 + h16, m_i, mask=hm)
+                tl.store(pml_ptr + chunk * 64 + 32 + h16, l_i, mask=hm)
+            _bar(cnt, ph, NCTA, BASE); ph += 1
+            # ---- combine partials + un-absorb value half (32 head tasks) ---- #
+            for t in range(pid, 128, NCTA):
+                hd = t // 4
+                jh = t % 4
+                coffs = tl.arange(0, 256)
+                cm = coffs < NCHUNK
+                mc_v = tl.load(pml_ptr + coffs * 64 + hd, mask=cm, other=float("-inf"))
+                m_g = tl.max(mc_v)
+                lc_v = tl.load(pml_ptr + coffs * 64 + 32 + hd, mask=cm, other=0.0)
+                a_v = tl.exp(mc_v - m_g)
+                l_g = tl.sum(lc_v * a_v)
+                lat = tl.zeros((512,), dtype=tl.float32)
+                c8 = tl.arange(0, 8)
+                for c0 in range(0, NCHUNK, 8):
+                    cc = c0 + c8
+                    cmk = cc < NCHUNK
+                    mc8 = tl.load(pml_ptr + cc * 64 + hd, mask=cmk, other=float("-inf"))
+                    a8 = tl.exp(mc8 - m_g)
+                    pa8 = tl.load(pacc_ptr + cc[:, None] * (32 * 512) + hd * 512 + tl.arange(0, 512)[None, :], mask=cmk[:, None], other=0.0).to(tl.float32)
+                    lat += tl.sum(pa8 * a8[:, None], axis=0)
+                lat = lat / l_g
+                tl.store(lat_ptr + t * 512 + tl.arange(0, 512), lat.to(tl.bfloat16))
+                # o[hd, jh*64:] = W_v[hd, jh*64:]^T @ lat  (K=512)
+                y = _gemv(lat_ptr + t * 512, _wp(tab, base + 9), _bp(tab, base + 10), _bp(tab, base + 11), 512, 8192, hd * 256 + 128 + jh * 32, 0, 32)
+                tl.store(o_ptr + hd * 128 + jh * 32 + tl.arange(0, 32), y.to(tl.bfloat16))
+            _bar(cnt, ph, NCTA, BASE); ph += 1
+            # ---- o_proj split-K atomics ------------------------------------- #
+            for t in range(pid, 752, NCTA):
+                if t < 400:
+                    tile = t // 8
+                    ks = t % 8
+                    k0 = ks * 512
+                    k1 = (ks + 1) * 512
+                else:
+                    u = t - 400
+                    tile = 50 + u // 16
+                    ks = u % 16
+                    k0 = ks * 256
+                    k1 = (ks + 1) * 256
+                n0 = tile * 32
+                y = _gemv(o_ptr, _wp(tab, base + 12), _bp(tab, base + 13), _bp(tab, base + 14), k1, D, n0, k0, 32)
+                tl.atomic_add(attn_ptr + n0 + tl.arange(0, 32), y)
+            _bar(cnt, ph, NCTA, BASE); ph += 1
+
+        # ---- norm2 (+ residual) + zero moe_out ------------------------------ #
+        if pid == 0:
+            _rmsnorm(h_ptr, _bp(tab, base + T_MNORM), xn_ptr, D, attn_ptr, True)
+            offs = tl.arange(0, 4096)
+            tl.store(moe_ptr + offs, tl.zeros((4096,), dtype=tl.float32), mask=offs < D)
+        _bar(cnt, ph, NCTA, BASE); ph += 1
+        # ---- router logits: 64 parallel tasks -------------------------------- #
+        for t in range(pid, 64, NCTA):
+            rw = _bp(tab, base + T_ROUTER)
+            offs = tl.arange(0, 4096)
+            dm = offs < D
+            w = tl.load(rw + t * D + offs, mask=dm, other=0.0)
+            xg = tl.load(xn_ptr + offs, mask=dm, other=0.0)
+            acc = tl.sum(w.to(tl.float32) * xg.to(tl.float32))
+            tl.store(logits_ptr + t + tl.arange(0, 1), acc.to(tl.bfloat16).to(tl.float32))
+        _bar(cnt, ph, NCTA, BASE); ph += 1
+        # ---- softmax + top-8 + weights (single task) ------------------------- #
+        if pid == 0:
+            logits = tl.load(logits_ptr + tl.arange(0, 64))
+            mx = tl.max(logits)
+            pr = tl.exp(logits - mx)
+            pr = pr / tl.sum(pr)
+            e64 = tl.arange(0, 64)
+            bits = pr.to(tl.int32, bitcast=True).to(tl.int64)
+            keys = (bits << 32) | (63 - e64).to(tl.int64)
+            skeys = tl.sort(keys, descending=True)
+            top8 = tl.sum(tl.where((tl.arange(0, 8) == 0)[:, None], tl.reshape(skeys, (8, 8)), 0), axis=0)
+            ws_v = (top8 >> 32).to(tl.int32).to(tl.float32, bitcast=True)
+            ids_v = (63 - (top8 & 0xFFFFFFFF)).to(tl.int32)
+            wsum = tl.sum(ws_v)
+            ws_v = ws_v / (wsum + 1e-9) * 2.446
+            tl.store(ids_ptr + tl.arange(0, 8), ids_v)
+            tl.store(ws_ptr + tl.arange(0, 8), ws_v)
+        elif pid <= 2:
+            offs = tl.arange(0, 4096)
+            z = tl.zeros((4096,), dtype=tl.float32)
+            baseoff = (pid - 1) * (9 * 1024)
+            tl.store(gu_ptr + baseoff + offs, z)
+            tl.store(gu_ptr + baseoff + 4096 + offs, z)
+            tl.store(gu_ptr + baseoff + 8192 + offs, z, mask=offs < 1024)
+        elif pid == 3:
+            offs = tl.arange(0, 128)
+            tl.store(mcnt_ptr + offs, tl.zeros((128,), dtype=tl.int32), mask=offs < 81)
+        _bar(cnt, ph, NCTA, BASE); ph += 1
+
+        # ---- MoE: gate/up + hh + down merged (per-tile/expert counters) ----- #
+        for t in range(pid, 1296, NCTA):
+          if t < 648:
+            tile = t // 9
+            ks = t % 9
+            k0 = ks * 256
+            k1 = (ks + 1) * 256
+            e = tile // 8
+            n0 = (tile % 8) * 128
+            if e < 8:
+                eid = tl.load(ids_ptr + e)
+                gw = _wp(tab, base + T_GW) + eid * (1152 * 1024)
+                gs = _bp(tab, base + T_GS) + eid * (18 * 1024)
+                gz = _bp(tab, base + T_GZ) + eid * (18 * 1024)
+                uw = _wp(tab, base + T_UW) + eid * (1152 * 1024)
+                us = _bp(tab, base + T_US) + eid * (18 * 1024)
+                uz = _bp(tab, base + T_UZ) + eid * (18 * 1024)
+            else:
+                gw = _wp(tab, base + T_SGW)
+                gs = _bp(tab, base + T_SGS)
+                gz = _bp(tab, base + T_SGZ)
+                uw = _wp(tab, base + T_SUW)
+                us = _bp(tab, base + T_SUS)
+                uz = _bp(tab, base + T_SUZ)
+            gv = _gemv(xn_ptr, gw, gs, gz, k1, M, n0, k0, 128)
+            uv = _gemv(xn_ptr, uw, us, uz, k1, M, n0, k0, 128)
+            tl.atomic_add(gu_ptr + e * M + n0 + tl.arange(0, 128), gv)
+            tl.atomic_add(gu_ptr + 9 * M + e * M + n0 + tl.arange(0, 128), uv)
+            old = tl.atomic_add(mcnt_ptr + tile, 1, sem="acq_rel", scope="gpu")
+            if old == 8:
+                g = tl.load(gu_ptr + e * M + n0 + tl.arange(0, 128))
+                u = tl.load(gu_ptr + 9 * M + e * M + n0 + tl.arange(0, 128))
+                tl.store(hh_ptr + e * M + n0 + tl.arange(0, 128), _silu(g) * u)
+                tl.atomic_add(mcnt_ptr + 72 + e, 1, sem="release", scope="gpu")
+          else:
+            dt = t - 648
+            tile = dt // 4
+            ks = dt % 4
+            k0 = ks * 256
+            k1 = (ks + 1) * 256
+            e = tile // 18
+            n0 = (tile % 18) * 128
+            v = tl.atomic_add(mcnt_ptr + 72 + e, 0, sem="acquire", scope="gpu")
+            while v < 8:
+                v = tl.atomic_add(mcnt_ptr + 72 + e, 0, sem="acquire", scope="gpu")
+            if e < 8:
+                eid = tl.load(ids_ptr + e)
+                dw = _wp(tab, base + T_DW) + eid * (512 * 2304)
+                ds = _bp(tab, base + T_DS) + eid * (8 * 2304)
+                dz = _bp(tab, base + T_DZ) + eid * (8 * 2304)
+                wj = tl.load(ws_ptr + e)
+            else:
+                dw = _wp(tab, base + T_SDW)
+                ds = _bp(tab, base + T_SDS)
+                dz = _bp(tab, base + T_SDZ)
+                wj = 1.0
+            y = _gemv(hh_ptr + e * M, dw, ds, dz, k1, D, n0, k0, 128, FMA=True)
+            tl.atomic_add(moe_ptr + n0 + tl.arange(0, 128), y * wj)
+        _bar(cnt, ph, NCTA, BASE); ph += 1
+
+
+    # ---- final residual ----------------------------------------------------- #
+    if pid == 0:
+        offs = tl.arange(0, 4096)
+        m = offs < D
+        hv = tl.load(h_ptr + offs, mask=m, other=0.0).to(tl.float32)
+        mv = tl.load(moe_ptr + offs, mask=m, other=0.0).to(tl.bfloat16).to(tl.float32)
+        tl.store(output_ptr + offs, (hv + mv).to(tl.bfloat16), mask=m)
+
+
+# --------------------------------------------------------------------------- #
+# host side
+# --------------------------------------------------------------------------- #
+def _ptr(t):
+    return t.data_ptr()
+
+
+class Model(nn.Module):
+    def __init__(self, cfg: Config):
+        super().__init__()
+        self.cfg = cfg
+        self.blocks = nn.ModuleList(Block(cfg, k) for k in cfg.pattern)
+        self._prepped = False
+
+    # -- lazy device-side prep (plain attributes, NOT registered buffers, so
+    #    state_dict stays identical to the reference) ------------------------- #
+    def _prep(self, dev):
+        cfg = self.cfg
+        tab = torch.zeros(4 * 64, dtype=torch.int64)
+        for b, blk in enumerate(self.blocks):
+            o = b * 64
+            a = blk.attn
+            tab[o + T_ANORM] = _ptr(blk.attn_norm)
+            tab[o + T_MNORM] = _ptr(blk.moe_norm)
+            tab[o + T_ROUTER] = _ptr(blk.moe.router.weight)
+            for slot, ql in ((T_QW, a.q_proj),):
+                tab[o + slot] = _ptr(ql.w_q)
+                tab[o + slot + 1] = _ptr(ql.scales)
+                tab[o + slot + 2] = _ptr(ql.zeros)
+            if blk.kind == "K":
+                for slot, ql in ((6, a.k_proj), (9, a.v_proj), (12, a.g_proj), (15, a.o_proj)):
+                    tab[o + slot] = _ptr(ql.w_q)
+                    tab[o + slot + 1] = _ptr(ql.scales)
+                    tab[o + slot + 2] = _ptr(ql.zeros)
+                tab[o + 18] = _ptr(a.beta_proj.weight)
+                tab[o + 19] = _ptr(a.conv_w)
+            else:
+                for slot, ql in ((6, a.kv_a), (9, a.kv_b), (12, a.o_proj)):
+                    tab[o + slot] = _ptr(ql.w_q)
+                    tab[o + slot + 1] = _ptr(ql.scales)
+                    tab[o + slot + 2] = _ptr(ql.zeros)
+            mo = blk.moe
+            for slot, qe in ((T_GW, mo.gate), (T_UW, mo.up), (T_DW, mo.down),
+                             (T_SGW, mo.s_gate), (T_SUW, mo.s_up), (T_SDW, mo.s_down)):
+                tab[o + slot] = _ptr(qe.w_q)
+                tab[o + slot + 1] = _ptr(qe.scales)
+                tab[o + slot + 2] = _ptr(qe.zeros)
+        self._tab = tab.to(dev)
+        bf = dict(device=dev, dtype=torch.bfloat16)
+        f32 = dict(device=dev, dtype=torch.float32)
+        self._h = torch.empty(2304, **bf)
+        self._xn = torch.empty(2304, **bf)
+        self._attn = torch.empty(2304, **f32)
+        self._moe = torch.empty(2304, **f32)
+        self._qraw = torch.empty(6144, **f32)
+        self._kraw = torch.empty(4096, **f32)
+        self._vraw = torch.empty(4096, **f32)
+        self._graw = torch.empty(4096, **f32)
+        self._beta = torch.empty(32, **f32)
+        self._o = torch.empty(4096, **bf)
+        self._kvraw = torch.empty(576, **f32)
+        self._qabs = torch.empty(512 * 32, **f32)
+        self._lat = torch.empty(128 * 512, **bf)
+        self._hh = torch.empty(9 * 1024, **f32)
+        self._gu = torch.empty(2 * 9 * 1024, **f32)
+        self._mcnt = torch.empty(81, device=dev, dtype=torch.int32)
+        self._ids = torch.empty(8, device=dev, dtype=torch.int32)
+        self._logits = torch.empty(64, **f32)
+        self._ws = torch.empty(8, **f32)
+        self._out = torch.empty(2304, **bf)
+        self._cnt = torch.zeros(2, dtype=torch.int64).to(dev)
+        self._base = 0
+        self._ncta = None
+        self._cbuf = None
+        self._rbuf = None
+        self._pacc = None
+        self._pml = None
+        self._prepped = True
+
+    def step(self, hidden, state):
+        dev = hidden.device
+        if not self._prepped:
+            self._prep(dev)
+        cfg = self.cfg
+        mi = cfg.pattern.index("M")
+        L = state[mi]["c_kv"].shape[0]
+        # cache capacity management: append in place; repack (fused in-kernel)
+        # only when the incoming cache is foreign or capacity is exhausted.
+        repack = 0
+        cap = 0 if self._cbuf is None else self._cbuf.shape[0]
+        if (self._cbuf is None or state[mi]["c_kv"].data_ptr() != self._cbuf.data_ptr()
+                or L + 1 > cap):
+            cap = L + 512
+            self._cbuf = torch.empty(cap, cfg.kv_lora, device=dev, dtype=torch.bfloat16)
+            self._rbuf = torch.empty(cap, cfg.qk_rope, device=dev, dtype=torch.bfloat16)
+            self._pacc = torch.empty(((cap + 127) // 128) * 32 * 512, device=dev, dtype=torch.bfloat16)
+            self._pml = torch.empty(((cap + 127) // 128) * 64, device=dev, dtype=torch.float32)
+            repack = 1
+        nchunk = (L + 1 + 127) // 128
+        ks = [state[i] for i, k in enumerate(cfg.pattern) if k == "K"]
+        args = (
+            self._tab, hidden, self._out,
+            self._h, self._xn, self._attn, self._moe,
+            self._qraw, self._kraw, self._vraw, self._graw, self._beta, self._o,
+            self._kvraw, self._qabs, self._lat, self._pacc, self._pml,
+            self._hh, self._gu, self._mcnt, self._ids, self._ws, self._logits,
+            self._cbuf, self._rbuf, state[mi]["c_kv"], state[mi]["k_rope"], self._cnt,
+            ks[0]["S"], ks[1]["S"], ks[2]["S"],
+            ks[0]["cq"], ks[0]["ck"], ks[0]["cv"],
+            ks[1]["cq"], ks[1]["ck"], ks[1]["cv"],
+            ks[2]["cq"], ks[2]["ck"], ks[2]["cv"],
+            L, repack, nchunk, self._base,
+        )
+        kw = dict(PAT=tuple(0 if k == "K" else 1 for k in cfg.pattern),
+                  num_warps=4, num_stages=3, maxnreg=128)
+        if self._ncta is None:
+            # pick the largest co-resident grid (barriers deadlock otherwise):
+            # compile-only probe, check regs/smem against per-SM limits.
+            for cand, rlim, slim in ((752, 128, 25600), (376, 255, 51200), (188, 255, 101376)):
+                comp = _megakernel.warmup(*args, NCTA=cand, grid=(1,), **kw)
+                comp._init_handles()
+                if comp.n_regs <= rlim and comp.metadata.shared <= slim:
+                    self._ncta = cand
+                    break
+            if self._ncta is None:
+                raise RuntimeError("megakernel does not fit even 1 CTA/SM")
+        _megakernel[(self._ncta,)](*args, NCTA=self._ncta, **kw)
+        self._base += 1 + sum(8 if cfg.pattern[b] == "K" else 10 for b in range(4))
+        state[mi]["c_kv"] = self._cbuf[: L + 1]
+        state[mi]["k_rope"] = self._rbuf[: L + 1]
+        return self._out, state
+
+
+# --------------------------------------------------------------------------- #
+# state / inputs (mirrors reference contract)
+# --------------------------------------------------------------------------- #
+def init_state(cfg: Config, context_len: int, seed: int) -> list:
+    dev = torch.device("cuda:0")
+    g = torch.Generator(device=dev).manual_seed(seed)
+    H, Dk = cfg.kda_heads, cfg.kda_head_dim
+    C = H * Dk
+    state = []
+    for kind in cfg.pattern:
+        if kind == "K":
+            state.append({
+                "S": torch.randn(H, Dk, Dk, device=dev, generator=g) * 0.05,
+                "cq": torch.randn(cfg.short_conv - 1, C, device=dev, generator=g, dtype=cfg.dtype) * 0.1,
+                "ck": torch.randn(cfg.short_conv - 1, C, device=dev, generator=g, dtype=cfg.dtype) * 0.1,
+                "cv": torch.randn(cfg.short_conv - 1, C, device=dev, generator=g, dtype=cfg.dtype) * 0.1,
+            })
+        else:
+            state.append({
+                "c_kv": torch.randn(context_len, cfg.kv_lora, device=dev, generator=g, dtype=cfg.dtype) * 0.1,
+                "k_rope": torch.randn(context_len, cfg.qk_rope, device=dev, generator=g, dtype=cfg.dtype) * 0.1,
+            })
+    return state
+
+
+def init_token(cfg: Config, seed: int) -> torch.Tensor:
+    dev = torch.device("cuda:0")
+    g = torch.Generator(device=dev).manual_seed(seed + 1)
+    return torch.randn(cfg.hidden, device=dev, generator=g, dtype=cfg.dtype) * 0.25

@@ -1,0 +1,656 @@
+"""GLM-5.2 fused MoE layer — hand-written CUDA (SM120 Blackwell).
+
+Pipeline (all device-side, no host sync):
+  1. moe_align_kernel: histogram 256 routed experts + 1 shared expert (treated
+     as expert E, weight 1, fires on every token), pad per-expert counts to
+     BLOCK_M, scatter pair ids into sorted order, build inverse map.
+  2. fused gate/up GEMM: per (expert, m-block, n-tile): two mma accumulators
+     (gate cols n, up cols n+I), epilogue h = silu(g)*u -> bf16 cache2.
+  3. down GEMM: cache2 x w2[e]^T -> fp16 y_sorted (fp16 storage keeps the
+     large-magnitude stress-case precision margin at bf16 byte cost).
+  4. reduce: out[t] = sum_j w_j * y_sorted[inv[t*9+j]] in fp32 -> bf16.
+
+Tensor cores: mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 with
+cp.async multistage shared-memory pipeline and XOR-swizzled ldmatrix tiles.
+Weight layout (E, 2I, H) / (E, H, I) row-major is already the K-major B
+operand layout the mma wants, so weights are streamed without repacking.
+
+SM120 caveat (empirical): cp.async.wait_group N with N>0 intermittently lets
+ldmatrix read stale shared-memory tiles on this part (RTX PRO 6000), even with
+fence.proxy.async / membar. Only wait_group 0 is reliable, so the pipeline
+drains all in-flight copies before each tile's mma phase. Aggregate DRAM
+bandwidth still saturates because all 188 SMs keep independent loads in flight.
+"""
+from __future__ import annotations
+
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+_CUDA_SRC = r"""
+#include <torch/extension.h>
+#include <ATen/cuda/CUDAContext.h>
+#include <cuda_runtime.h>
+#include <cuda_bf16.h>
+#include <cuda_fp16.h>
+#include <cstdint>
+
+
+using bf16 = __nv_bfloat16;
+using bf162 = __nv_bfloat162;
+using half2 = __half2;
+
+#define DEVINL __device__ __forceinline__
+
+DEVINL uint32_t smem_addr(const void* p) {
+  return static_cast<uint32_t>(__cvta_generic_to_shared(p));
+}
+DEVINL void cp_async16(uint32_t s, const void* g) {
+  asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"(s), "l"(g));
+}
+DEVINL void cp_commit() { asm volatile("cp.async.commit_group;\n"); }
+template <int N>
+DEVINL void cp_wait() { asm volatile("cp.async.wait_group %0;\n" ::"n"(N)); }
+
+DEVINL void ldsm_x4(uint32_t& r0, uint32_t& r1, uint32_t& r2, uint32_t& r3,
+                    uint32_t a) {
+  asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+               : "=r"(r0), "=r"(r1), "=r"(r2), "=r"(r3)
+               : "r"(a));
+}
+DEVINL void ldsm_x2(uint32_t& r0, uint32_t& r1, uint32_t a) {
+  asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0,%1}, [%2];\n"
+               : "=r"(r0), "=r"(r1)
+               : "r"(a));
+}
+DEVINL void mma_bf16(float& d0, float& d1, float& d2, float& d3, uint32_t a0,
+                     uint32_t a1, uint32_t a2, uint32_t a3, uint32_t b0,
+                     uint32_t b1) {
+  asm volatile(
+      "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
+      "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+      : "+f"(d0), "+f"(d1), "+f"(d2), "+f"(d3)
+      : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+}
+
+// ---------------------------------------------------------------------------
+// Align: one block. P = T*(topk+1) pairs; pair p -> t=p/(topk+1), j=p%(topk+1);
+// j<topk routed (expert ids[t*topk+j]), j==topk shared (expert E, weight 1).
+// Outputs: sorted[EM] pair ids (-1 pad), inv[P] positions, expert_mb[MB] (-1
+// unused).
+// ---------------------------------------------------------------------------
+__global__ void __launch_bounds__(1024, 1) moe_align_kernel(
+    const int64_t* __restrict__ ids, int T, int topk, int E, int pad,
+    int P, int EM_max, int MB_max,
+    int* __restrict__ sorted, int* __restrict__ inv,
+    int* __restrict__ expert_mb) {
+  __shared__ int sh_cnt[257];
+  __shared__ int sh_off[258];
+  __shared__ int sh_cur[257];
+  __shared__ int sh_tmp[512];
+  const int tid = threadIdx.x;
+  const int RT = topk + 1;
+  const int routedP = T * topk;
+
+  if (tid < E + 1) sh_cnt[tid] = 0;
+  __syncthreads();
+  for (int p = tid; p < P; p += 1024) {
+    int t = p / RT, j = p - t * RT;
+    int e = (j < topk) ? (int)ids[t * topk + j] : E;
+    atomicAdd(&sh_cnt[e], 1);
+  }
+  __syncthreads();
+  // padded counts
+  int pc = 0;
+  if (tid < E + 1) pc = ((sh_cnt[tid] + pad - 1) / pad) * pad;
+  if (tid < 512) sh_tmp[tid] = (tid < E + 1) ? pc : 0;
+  __syncthreads();
+  // inclusive scan over 512 slots (Hillis-Steele)
+  for (int d = 1; d < 512; d <<= 1) {
+    int v = (tid >= d && tid < 512) ? sh_tmp[tid - d] : 0;
+    __syncthreads();
+    if (tid < 512) sh_tmp[tid] += v;
+    __syncthreads();
+  }
+  if (tid < E + 1) {
+    sh_off[tid] = sh_tmp[tid] - pc;  // exclusive
+    sh_cur[tid] = 0;
+  }
+  if (tid == E + 1) sh_off[E + 1] = sh_tmp[E];  // total EM
+  __syncthreads();
+  const int EM = sh_off[E + 1];
+  // expert per m-block + sentinel fill
+  for (int e = tid; e < E + 1; e += 1024) {
+    int b0 = sh_off[e] / pad, b1 = sh_off[e + 1] / pad;
+    for (int b = b0; b < b1; ++b) expert_mb[b] = e;
+  }
+  for (int b = EM / pad + tid; b < MB_max; b += 1024) expert_mb[b] = -1;
+  for (int i = tid; i < EM_max; i += 1024) sorted[i] = -1;
+  __syncthreads();
+  for (int p = tid; p < P; p += 1024) {
+    int t = p / RT, j = p - t * RT;
+    int e = (j < topk) ? (int)ids[t * topk + j] : E;
+    int pos = sh_off[e] + atomicAdd(&sh_cur[e], 1);
+    sorted[pos] = p;
+    inv[p] = pos;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Swizzled tile helpers. Tiles are [rows][BK] bf16, BK=64 (128B rows, 8x16B
+// chunks); chunk c of row r lives at physical chunk (c ^ (r&7)).
+// ---------------------------------------------------------------------------
+template <int BK>
+DEVINL uint32_t tile_off(int row, int k) {
+  // byte offset of 16B chunk containing element (row,k), k multiple of 8
+  int c = k >> 3;
+  return (row * (BK / 8) + (c ^ (row & 7))) * 16;
+}
+
+// ldmatrix lane addressing for an m16k16 A tile at (r0,k0).
+// x4 matrix order: (rows r0..r0+7, k0..k0+7), (r0+8..+15, k0..+7),
+// (r0..+7, k0+8..+15), (r0+8..+15, k0+8..+15).
+DEVINL uint32_t ldsm_a_addr(uint32_t base, int r0, int k0, int lane) {
+  int row = r0 + (lane & 7) + (((lane >> 3) & 1) << 3);
+  int c = (k0 >> 3) + (lane >> 4);
+  return base + (row * 8 + (c ^ (row & 7))) * 16;
+}
+// ldmatrix x2 for an n8k16 B tile at (r0,k0) (B stored [n][k])
+DEVINL uint32_t ldsm_b_addr(uint32_t base, int r0, int k0, int lane) {
+  int row = r0 + (lane & 7);
+  int c = (k0 >> 3) + ((lane >> 3) & 1);
+  return base + (row * 8 + (c ^ (row & 7))) * 16;
+}
+
+// ---------------------------------------------------------------------------
+// Kernel A: fused gate+up GEMM + silu*mul.
+// grid (I/BN, MB_max). Each block: BM pairs of one expert, BN gate cols and
+// BN up cols. cache2[pos, n] = silu(g)*u (bf16), pos = padded sorted row.
+// ---------------------------------------------------------------------------
+template <int BM, int BN, int BK, int WM, int WN, int STAGES>
+__global__ void __launch_bounds__(WM* WN * 32, 1) moe_gate_up_kernel(
+    const bf16* __restrict__ x, const bf16* __restrict__ w1r,
+    const bf16* __restrict__ w1s, const int* __restrict__ sorted,
+    const int* __restrict__ expert_mb, bf16* __restrict__ cache2,
+    int T, int topk, int E, int H, int I, int RT) {
+  constexpr int NTHR = WM * WN * 32;
+  constexpr int WTM = BM / WM;
+  constexpr int WTN = BN / WN;
+  constexpr int MT = WTM / 16;
+  constexpr int NT = WTN / 8;
+  constexpr int A_STAGE = BM * BK;        // elements
+  constexpr int B_STAGE = 2 * BN * BK;    // gate rows then up rows
+  constexpr int STAGE_ELEMS = A_STAGE + B_STAGE;
+  constexpr int KSTEPS = 0;  // unused; H passed at runtime
+
+  extern __shared__ bf16 smem[];
+  const int tid = threadIdx.x;
+  const int lane = tid & 31;
+  const int warp = tid >> 5;
+  const int warp_row = warp % WM;
+  const int warp_col = warp / WM;
+
+  const int mb = blockIdx.y;
+  const int e = expert_mb[mb];
+  if (e < 0) return;
+  const int n0 = blockIdx.x * BN;
+  const bf16* w1 = (e < E) ? (w1r + (int64_t)e * 2 * I * H) : w1s;
+
+  // token id per row (padding rows -> token 0, results discarded downstream)
+  __shared__ int sh_tok[BM];
+  const int pos0 = mb * BM;
+  for (int r = tid; r < BM; r += NTHR) {
+    int p = sorted[pos0 + r];
+    sh_tok[r] = (p < 0) ? 0 : (p / RT);
+  }
+  __syncthreads();
+
+  const int ksteps = H / BK;
+  const int64_t xstride = H;
+
+  auto load_stage = [&](int stage, int kb) {
+    bf16* sa = smem + stage * STAGE_ELEMS;
+    bf16* sb = sa + A_STAGE;
+    const int k0 = kb * BK;
+    // A: BM rows x BK/8 chunks
+    for (int i = tid; i < BM * (BK / 8); i += NTHR) {
+      int r = i / (BK / 8), c = i % (BK / 8);
+      const bf16* g = x + (int64_t)sh_tok[r] * xstride + k0 + c * 8;
+      cp_async16(smem_addr(sa + r * BK + ((c ^ (r & 7)) * 8)), g);
+    }
+    // B: 2*BN rows x BK/8 chunks (gate rows n0.., up rows I+n0..)
+    for (int i = tid; i < 2 * BN * (BK / 8); i += NTHR) {
+      int r = i / (BK / 8), c = i % (BK / 8);
+      int grow = (r < BN) ? (n0 + r) : (I + n0 + r - BN);
+      const bf16* g = w1 + (int64_t)grow * H + k0 + c * 8;
+      cp_async16(smem_addr(sb + r * BK + ((c ^ (r & 7)) * 8)), g);
+    }
+    cp_commit();
+  };
+
+  float acc[2][MT][NT][4];
+#pragma unroll
+  for (int a = 0; a < 2; ++a)
+#pragma unroll
+    for (int m = 0; m < MT; ++m)
+#pragma unroll
+      for (int n = 0; n < NT; ++n)
+#pragma unroll
+        for (int i = 0; i < 4; ++i) acc[a][m][n][i] = 0.f;
+
+#pragma unroll
+  for (int s = 0; s < STAGES - 1; ++s) load_stage(s, s);
+
+  const int wr0 = warp_row * WTM;
+  const int wc0 = warp_col * WTN;
+
+  for (int kb = 0; kb < ksteps; ++kb) {
+    cp_wait<0>();
+    __syncthreads();
+    int stage = kb % STAGES;
+    if (kb + STAGES - 1 < ksteps)
+      load_stage((kb + STAGES - 1) % STAGES, kb + STAGES - 1);
+    uint32_t sa = smem_addr(smem + stage * STAGE_ELEMS);
+    uint32_t sb = sa + A_STAGE * 2;
+#pragma unroll
+    for (int kk = 0; kk < BK / 16; ++kk) {
+      uint32_t a[MT][4];
+#pragma unroll
+      for (int m = 0; m < MT; ++m)
+        ldsm_x4(a[m][0], a[m][1], a[m][2], a[m][3],
+                ldsm_a_addr(sa, wr0 + m * 16, kk * 16, lane));
+      uint32_t b[2][NT][2];
+#pragma unroll
+      for (int g = 0; g < 2; ++g)
+#pragma unroll
+        for (int n = 0; n < NT; ++n)
+          ldsm_x2(b[g][n][0], b[g][n][1],
+                  ldsm_b_addr(sb, g * BN + wc0 + n * 8, kk * 16, lane));
+#pragma unroll
+      for (int m = 0; m < MT; ++m)
+#pragma unroll
+        for (int n = 0; n < NT; ++n) {
+          mma_bf16(acc[0][m][n][0], acc[0][m][n][1], acc[0][m][n][2],
+                   acc[0][m][n][3], a[m][0], a[m][1], a[m][2], a[m][3],
+                   b[0][n][0], b[0][n][1]);
+          mma_bf16(acc[1][m][n][0], acc[1][m][n][1], acc[1][m][n][2],
+                   acc[1][m][n][3], a[m][0], a[m][1], a[m][2], a[m][3],
+                   b[1][n][0], b[1][n][1]);
+        }
+    }
+  }
+  cp_wait<0>();
+  __syncthreads();
+
+  // epilogue: h = silu(g)*u -> smem (BM x BN, padded stride) -> 16B stores
+  constexpr int EP_STRIDE = BN + 8;
+  bf16* ep = smem;  // reuse pipeline smem
+#pragma unroll
+  for (int m = 0; m < MT; ++m)
+#pragma unroll
+    for (int n = 0; n < NT; ++n) {
+      int r = wr0 + m * 16 + (lane >> 2);
+      int c = wc0 + n * 8 + ((lane & 3) << 1);
+#pragma unroll
+      for (int i = 0; i < 2; ++i) {
+        float g = acc[0][m][n][i * 2];
+        float u = acc[1][m][n][i * 2];
+        float g2 = acc[0][m][n][i * 2 + 1];
+        float u2 = acc[1][m][n][i * 2 + 1];
+        float h = g / (1.f + __expf(-g)) * u;
+        float h2 = g2 / (1.f + __expf(-g2)) * u2;
+        *reinterpret_cast<bf162*>(ep + (r + i * 8) * EP_STRIDE + c) =
+            __floats2bfloat162_rn(h, h2);
+      }
+    }
+  __syncthreads();
+  bf16* outbase = cache2 + (int64_t)pos0 * I + n0;
+  for (int i = tid; i < BM * (BN / 8); i += NTHR) {
+    int r = i / (BN / 8), c = (i % (BN / 8)) * 8;
+    *reinterpret_cast<uint4*>(outbase + (int64_t)r * I + c) =
+        *reinterpret_cast<const uint4*>(ep + r * EP_STRIDE + c);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Kernel B: down projection. grid (H/BN, MB_max).
+// y_sorted[pos, n] = (cache2[pos,:] @ w2[e][n,:]) stored fp16 (unweighted).
+// ---------------------------------------------------------------------------
+template <int BM, int BN, int BK, int WM, int WN, int STAGES>
+__global__ void __launch_bounds__(WM* WN * 32, 1) moe_down_kernel(
+    const bf16* __restrict__ cache2, const bf16* __restrict__ w2r,
+    const bf16* __restrict__ w2s, const int* __restrict__ expert_mb,
+    __half* __restrict__ ysorted, int E, int H, int I) {
+  constexpr int NTHR = WM * WN * 32;
+  constexpr int WTM = BM / WM;
+  constexpr int WTN = BN / WN;
+  constexpr int MT = WTM / 16;
+  constexpr int NT = WTN / 8;
+  constexpr int A_STAGE = BM * BK;
+  constexpr int B_STAGE = BN * BK;
+  constexpr int STAGE_ELEMS = A_STAGE + B_STAGE;
+
+  extern __shared__ bf16 smem[];
+  const int tid = threadIdx.x;
+  const int lane = tid & 31;
+  const int warp = tid >> 5;
+  const int warp_row = warp % WM;
+  const int warp_col = warp / WM;
+
+  const int mb = blockIdx.y;
+  const int e = expert_mb[mb];
+  if (e < 0) return;
+  const int n0 = blockIdx.x * BN;
+  const bf16* w2 = (e < E) ? (w2r + (int64_t)e * H * I) : w2s;
+  const bf16* a_base = cache2 + (int64_t)mb * BM * I;
+
+  const int ksteps = I / BK;
+
+  auto load_stage = [&](int stage, int kb) {
+    bf16* sa = smem + stage * STAGE_ELEMS;
+    bf16* sb = sa + A_STAGE;
+    const int k0 = kb * BK;
+    for (int i = tid; i < BM * (BK / 8); i += NTHR) {
+      int r = i / (BK / 8), c = i % (BK / 8);
+      const bf16* g = a_base + (int64_t)r * I + k0 + c * 8;
+      cp_async16(smem_addr(sa + r * BK + ((c ^ (r & 7)) * 8)), g);
+    }
+    for (int i = tid; i < BN * (BK / 8); i += NTHR) {
+      int r = i / (BK / 8), c = i % (BK / 8);
+      const bf16* g = w2 + (int64_t)(n0 + r) * I + k0 + c * 8;
+      cp_async16(smem_addr(sb + r * BK + ((c ^ (r & 7)) * 8)), g);
+    }
+    cp_commit();
+  };
+
+  float acc[MT][NT][4];
+#pragma unroll
+  for (int m = 0; m < MT; ++m)
+#pragma unroll
+    for (int n = 0; n < NT; ++n)
+#pragma unroll
+      for (int i = 0; i < 4; ++i) acc[m][n][i] = 0.f;
+
+#pragma unroll
+  for (int s = 0; s < STAGES - 1; ++s) load_stage(s, s);
+
+  const int wr0 = warp_row * WTM;
+  const int wc0 = warp_col * WTN;
+
+  for (int kb = 0; kb < ksteps; ++kb) {
+    cp_wait<0>();
+    __syncthreads();
+    int stage = kb % STAGES;
+    if (kb + STAGES - 1 < ksteps)
+      load_stage((kb + STAGES - 1) % STAGES, kb + STAGES - 1);
+    uint32_t sa = smem_addr(smem + stage * STAGE_ELEMS);
+    uint32_t sb = sa + A_STAGE * 2;
+#pragma unroll
+    for (int kk = 0; kk < BK / 16; ++kk) {
+      uint32_t a[MT][4];
+#pragma unroll
+      for (int m = 0; m < MT; ++m)
+        ldsm_x4(a[m][0], a[m][1], a[m][2], a[m][3],
+                ldsm_a_addr(sa, wr0 + m * 16, kk * 16, lane));
+      uint32_t b[NT][2];
+#pragma unroll
+      for (int n = 0; n < NT; ++n)
+        ldsm_x2(b[n][0], b[n][1],
+                ldsm_b_addr(sb, wc0 + n * 8, kk * 16, lane));
+#pragma unroll
+      for (int m = 0; m < MT; ++m)
+#pragma unroll
+        for (int n = 0; n < NT; ++n)
+          mma_bf16(acc[m][n][0], acc[m][n][1], acc[m][n][2], acc[m][n][3],
+                   a[m][0], a[m][1], a[m][2], a[m][3], b[n][0], b[n][1]);
+    }
+  }
+  cp_wait<0>();
+  __syncthreads();
+
+  constexpr int EP_STRIDE = BN + 8;
+  __half* ep = reinterpret_cast<__half*>(smem);
+#pragma unroll
+  for (int m = 0; m < MT; ++m)
+#pragma unroll
+    for (int n = 0; n < NT; ++n) {
+      int r = wr0 + m * 16 + (lane >> 2);
+      int c = wc0 + n * 8 + ((lane & 3) << 1);
+#pragma unroll
+      for (int i = 0; i < 2; ++i) {
+        *reinterpret_cast<half2*>(ep + (r + i * 8) * EP_STRIDE + c) =
+            __floats2half2_rn(acc[m][n][i * 2], acc[m][n][i * 2 + 1]);
+      }
+    }
+  __syncthreads();
+  __half* outbase = ysorted + (int64_t)mb * BM * H + n0;
+  for (int i = tid; i < BM * (BN / 8); i += NTHR) {
+    int r = i / (BN / 8), c = (i % (BN / 8)) * 8;
+    *reinterpret_cast<uint4*>(outbase + (int64_t)r * H + c) =
+        *reinterpret_cast<const uint4*>(ep + r * EP_STRIDE + c);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Reduce: out[t] = sum_j w_j * ysorted[inv[t*RT+j]], fp32 accum -> bf16.
+// grid (T, H/2048), block 256; each thread handles 8 columns.
+// ---------------------------------------------------------------------------
+__global__ void __launch_bounds__(256, 1) moe_reduce_kernel(
+    const __half* __restrict__ ysorted, const int* __restrict__ inv,
+    const bf16* __restrict__ ew, bf16* __restrict__ out, int T, int topk,
+    int H, int RT) {
+  __shared__ int sh_pos[16];
+  __shared__ float sh_w[16];
+  const int t = blockIdx.x;
+  const int tid = threadIdx.x;
+  if (tid < RT) {
+    int p = t * RT + tid;
+    sh_pos[tid] = inv[p];
+    sh_w[tid] = (tid < topk) ? __bfloat162float(ew[t * topk + tid]) : 1.f;
+  }
+  __syncthreads();
+  const int col = (blockIdx.y * 256 + tid) * 8;
+  float acc[8] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+  for (int j = 0; j < RT; ++j) {
+    const uint4 v = *reinterpret_cast<const uint4*>(
+        ysorted + (int64_t)sh_pos[j] * H + col);
+    const __half* h = reinterpret_cast<const __half*>(&v);
+    float w = sh_w[j];
+#pragma unroll
+    for (int i = 0; i < 8; ++i) acc[i] += w * __half2float(h[i]);
+  }
+  bf162 o[4];
+#pragma unroll
+  for (int i = 0; i < 4; ++i)
+    o[i] = __floats2bfloat162_rn(acc[i * 2], acc[i * 2 + 1]);
+  *reinterpret_cast<uint4*>(out + (int64_t)t * H + col) =
+      *reinterpret_cast<const uint4*>(o);
+}
+
+// ---------------------------------------------------------------------------
+// Host launcher
+// ---------------------------------------------------------------------------
+template <int BM, int BN, int BK, int WM, int WN, int STAGES>
+void launch_a(const bf16* x, const bf16* w1r, const bf16* w1s,
+              const int* sorted, const int* expert_mb, bf16* cache2, int T,
+              int topk, int E, int H, int I, int RT, int MB_max,
+              cudaStream_t stream) {
+  constexpr int SMEM = STAGES * (BM + 2 * BN) * BK * 2;
+  auto k = moe_gate_up_kernel<BM, BN, BK, WM, WN, STAGES>;
+  cudaFuncSetAttribute(k, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM);
+  dim3 grid(I / BN, MB_max);
+  k<<<grid, WM * WN * 32, SMEM, stream>>>(x, w1r, w1s, sorted, expert_mb,
+                                          cache2, T, topk, E, H, I, RT);
+}
+template <int BM, int BN, int BK, int WM, int WN, int STAGES>
+void launch_b(const bf16* cache2, const bf16* w2r, const bf16* w2s,
+              const int* expert_mb, __half* ysorted, int E, int H, int I,
+              int MB_max, cudaStream_t stream) {
+  constexpr int SMEM = STAGES * (BM + BN) * BK * 2;
+  auto k = moe_down_kernel<BM, BN, BK, WM, WN, STAGES>;
+  cudaFuncSetAttribute(k, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM);
+  dim3 grid(H / BN, MB_max);
+  k<<<grid, WM * WN * 32, SMEM, stream>>>(cache2, w2r, w2s, expert_mb, ysorted,
+                                          E, H, I);
+}
+
+
+
+torch::Tensor moe_forward(
+    torch::Tensor x, torch::Tensor w1r, torch::Tensor w2r, torch::Tensor w1s,
+    torch::Tensor w2s, torch::Tensor ids, torch::Tensor ew,
+    torch::Tensor sorted, torch::Tensor inv, torch::Tensor expert_mb,
+    torch::Tensor cache2, torch::Tensor ysorted, torch::Tensor out,
+    int64_t pad, int64_t cfgA, int64_t cfgB) {
+  const int T = x.size(0);
+  const int H = x.size(1);
+  const int E = w1r.size(0);
+  const int I = w1r.size(1) / 2;
+  const int topk = ids.size(1);
+  const int RT = topk + 1;
+  const int P = T * RT;
+  const int EM_max = sorted.size(0);
+  const int MB_max = expert_mb.size(0);
+
+  cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  const bf16* xp = reinterpret_cast<const bf16*>(x.data_ptr());
+  const bf16* w1rp = reinterpret_cast<const bf16*>(w1r.data_ptr());
+  const bf16* w2rp = reinterpret_cast<const bf16*>(w2r.data_ptr());
+  const bf16* w1sp = reinterpret_cast<const bf16*>(w1s.data_ptr());
+  const bf16* w2sp = reinterpret_cast<const bf16*>(w2s.data_ptr());
+  const int64_t* idsp = ids.data_ptr<int64_t>();
+  const bf16* ewp = reinterpret_cast<const bf16*>(ew.data_ptr());
+  int* sortedp = sorted.data_ptr<int>();
+  int* invp = inv.data_ptr<int>();
+  int* embp = expert_mb.data_ptr<int>();
+  bf16* c2p = reinterpret_cast<bf16*>(cache2.data_ptr());
+  __half* ysp = reinterpret_cast<__half*>(ysorted.data_ptr());
+  bf16* outp = reinterpret_cast<bf16*>(out.data_ptr());
+
+  moe_align_kernel<<<1, 1024, 0, stream>>>(idsp, T, topk, E, (int)pad, P,
+                                           EM_max, MB_max, sortedp, invp,
+                                           embp);
+
+  // Kernel A configs: (BM,BN,BK,WM,WN,STAGES)
+  switch (cfgA) {
+    case 0:
+      launch_a<64, 64, 64, 2, 4, 4>(xp, w1rp, w1sp, sortedp, embp, c2p, T,
+                                    topk, E, H, I, RT, MB_max, stream);
+      break;
+    case 1:
+      launch_a<128, 64, 64, 4, 2, 3>(xp, w1rp, w1sp, sortedp, embp, c2p, T,
+                                     topk, E, H, I, RT, MB_max, stream);
+      break;
+    default:
+      TORCH_CHECK(false, "bad cfgA");
+  }
+  // Kernel B configs
+  switch (cfgB) {
+    case 0:
+      launch_b<64, 128, 64, 2, 4, 4>(c2p, w2rp, w2sp, embp, ysp, E, H, I,
+                                     MB_max, stream);
+      break;
+    case 1:
+      launch_b<128, 128, 64, 4, 2, 3>(c2p, w2rp, w2sp, embp, ysp, E, H, I,
+                                      MB_max, stream);
+      break;
+    default:
+      TORCH_CHECK(false, "bad cfgB");
+  }
+  dim3 rgrid(T, H / 2048);
+  moe_reduce_kernel<<<rgrid, 256, 0, stream>>>(ysp, invp, ewp, outp, T, topk,
+                                               H, RT);
+  return out;
+}
+
+"""
+
+_CPP_SRC = r"""
+torch::Tensor moe_forward(
+    torch::Tensor x, torch::Tensor w1r, torch::Tensor w2r, torch::Tensor w1s,
+    torch::Tensor w2s, torch::Tensor ids, torch::Tensor ew,
+    torch::Tensor sorted, torch::Tensor inv, torch::Tensor expert_mb,
+    torch::Tensor cache2, torch::Tensor ysorted, torch::Tensor out,
+    int64_t pad, int64_t cfgA, int64_t cfgB);
+"""
+
+_ext = load_inline(
+    name="glm52_fused_moe_final",
+    cpp_sources=_CPP_SRC,
+    cuda_sources=_CUDA_SRC,
+    functions=["moe_forward"],
+    extra_cuda_cflags=[
+        "-O3",
+        "--use_fast_math",
+        "-std=c++17",
+        "--expt-relaxed-constexpr",
+        "-gencode=arch=compute_120,code=sm_120",
+    ],
+    verbose=False,
+)
+
+
+def _pick_cfg(T: int):
+    # (pad, cfgA, cfgB) — tuned per size regime (see dev sweep):
+    # small/decode batches use BM=64 tiles; large prefills use BM=128 tiles.
+    if T <= 1024:
+        return 64, 0, 0
+    return 128, 1, 1
+
+
+class Model(nn.Module):
+    def __init__(self, T: int, E: int, top_k: int, n_shared: int, H: int, I: int):
+        super().__init__()
+        self.T, self.E, self.top_k = T, E, top_k
+        self.n_shared, self.H, self.I = n_shared, H, I
+        self.w1_routed = nn.Parameter(torch.empty(E, 2 * I, H, dtype=torch.bfloat16))
+        self.w2_routed = nn.Parameter(torch.empty(E, H, I, dtype=torch.bfloat16))
+        self.w1_shared = nn.Parameter(torch.empty(n_shared, 2 * I, H, dtype=torch.bfloat16))
+        self.w2_shared = nn.Parameter(torch.empty(n_shared, H, I, dtype=torch.bfloat16))
+        for p in self.parameters():
+            nn.init.normal_(p, std=0.02)
+        self._ws: dict = {}
+
+    def _workspace(self, T: int, pad: int, device):
+        key = (T, pad)
+        ws = self._ws.get(key)
+        if ws is None:
+            RT = self.top_k + 1
+            P = T * RT
+            EM_max = P + (self.E + self.n_shared) * (pad - 1)
+            MB_max = EM_max // pad + 1
+            ws = (
+                torch.empty(EM_max, dtype=torch.int32, device=device),
+                torch.empty(P, dtype=torch.int32, device=device),
+                torch.empty(MB_max, dtype=torch.int32, device=device),
+                torch.empty(EM_max * self.I, dtype=torch.bfloat16, device=device),
+                torch.empty(EM_max * self.H, dtype=torch.float16, device=device),
+                torch.empty(T, self.H, dtype=torch.bfloat16, device=device),
+            )
+            self._ws[key] = ws
+        return ws
+
+    def forward(self, x, expert_ids, expert_weights):
+        T = x.shape[0]
+        pad, cfgA, cfgB = _pick_cfg(T)
+        sorted_ids, inv, expert_mb, cache2, ysorted, out = self._workspace(
+            T, pad, x.device
+        )
+        return _ext.moe_forward(
+            x.contiguous(),
+            self.w1_routed,
+            self.w2_routed,
+            self.w1_shared,
+            self.w2_shared,
+            expert_ids.contiguous(),
+            expert_weights.contiguous(),
+            sorted_ids,
+            inv,
+            expert_mb,
+            cache2,
+            ysorted,
+            out,
+            pad,
+            cfgA,
+            cfgB,
+        )

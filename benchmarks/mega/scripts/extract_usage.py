@@ -39,18 +39,48 @@ def _read_jsonl(p: Path) -> list[dict]:
 
 
 def _claude_or_kimi(events: list[dict]) -> dict:
-    """Anthropic-shape stream-json: terminal `{"type":"result"}` has cumulative usage."""
-    for e in reversed(events):
-        if e.get("type") == "result":
-            u = e.get("usage", {})
+    """Anthropic-shape stream-json. A session emits one `{"type":"result"}` per turn
+    (several when woken by background tasks or monitors), and each one's `usage`
+    covers only that turn. The terminal result's `modelUsage` is cumulative for the
+    whole session (all models, including compaction calls), so prefer it; else sum
+    `usage` over every result event."""
+    results = [e for e in events if e.get("type") == "result"]
+    if results:
+        last = results[-1]
+        mu = last.get("modelUsage")
+        if isinstance(mu, dict) and mu:
+            models = [m for m in mu.values() if isinstance(m, dict)]
+            # Claude Code prices a model it has no rate card for at a fallback rate
+            # and marks it costBasis "unknown" (OpenRouter-routed open models). That
+            # figure is not a bill, so do not record it as the run's cost.
+            priced = any(m.get("costBasis") != "unknown" for m in models)
+            return {
+                "input_tokens": sum(m.get("inputTokens", 0) or 0 for m in models),
+                "output_tokens": sum(m.get("outputTokens", 0) or 0 for m in models),
+                "cache_read_tokens": sum(m.get("cacheReadInputTokens", 0) or 0 for m in models),
+                "cache_creation_tokens": sum(m.get("cacheCreationInputTokens", 0) or 0 for m in models),
+                "reasoning_tokens": None,
+                "total_cost_usd": last.get("total_cost_usd") if priced else None,
+            }
+        if len(results) == 1:
+            u = last.get("usage", {}) or {}
             return {
                 "input_tokens": u.get("input_tokens"),
                 "output_tokens": u.get("output_tokens"),
                 "cache_read_tokens": u.get("cache_read_input_tokens"),
                 "cache_creation_tokens": u.get("cache_creation_input_tokens"),
                 "reasoning_tokens": None,
-                "total_cost_usd": e.get("total_cost_usd"),
+                "total_cost_usd": last.get("total_cost_usd"),
             }
+        usages = [r.get("usage", {}) or {} for r in results]
+        return {
+            "input_tokens": sum(u.get("input_tokens", 0) or 0 for u in usages),
+            "output_tokens": sum(u.get("output_tokens", 0) or 0 for u in usages),
+            "cache_read_tokens": sum(u.get("cache_read_input_tokens", 0) or 0 for u in usages),
+            "cache_creation_tokens": sum(u.get("cache_creation_input_tokens", 0) or 0 for u in usages),
+            "reasoning_tokens": None,
+            "total_cost_usd": last.get("total_cost_usd"),
+        }
     # Fallback: sum per-message usage from assistant events.
     inp = out = cr = cc = 0
     saw = False
