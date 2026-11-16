@@ -6,6 +6,107 @@ Numbering note: entries before 2026-07-21 say "Problem 03" for the Kimi-Linear d
 
 ---
 
+## 2026-11-16 — Grader v3 replay of the RTX PRO 6000 board: 11 kernels fail the attention case, 27 re-timed
+
+Grader v3 (commit `4c2c347`, graded surface `c522e2010e34`, was `829522700bbe`) adds attention-sensitive
+check cases and times the baseline in its own process (`SPEC.md` Metric and Correctness). Every scored
+RTX PRO 6000 row was replayed under it with `scripts/regrade_sequential.sh` (`KBH_REGRADE_DECK=problems`)
+on tetra GPU 2, one cell at a time, alone on the card: 38 board cells twice (2:04 to 2:49 pm and 2:49 to
+3:17 pm CST), plus two older sibling runs twice (3:17 to 3:32 pm). All 89 graded windows are clean in
+the host GPU-use log. The published number is each cell's second run. The two passes differ by a median
+0.28%; the largest gaps are slow kernels (inkling 7.6%, Kimi K2.7 5.4%, Sonnet 5 2.0%). Baseline at
+context 2048 read 5.476 to 5.495 ms per token on every passing cell.
+
+Eleven kernels fail the new attention case, all on the first case (seed 27, context 2048) except hy3:
+
+| model | old score | cosine (two runs) | cause |
+| --- | --- | --- | --- |
+| DeepSeek V4.1 Flash 1017 | 29.89 (already `bug`) | 0.3457, 0.3448 | wrong MLA attention, known since October |
+| Gemini 4 Argon | 27.03 | 0.9399, 0.8874 | race: every thread reads `smem_red[0]` (solution.py:1434) while warp 0 overwrites it (:1438), no barrier |
+| kinetic-0715 | 18.09 | 0.6444, 0.6665 | shared-memory overflow: `load_sx_bf16(..., sx, 4096)` into a 2304-float `sx` (kimi_mega.py:620, :985); also a race |
+| ox-alpha | 13.64 | 0.2936, 0.2936 | absorbed query reads 512 values from head h's query and contracts the wrong `kv_b` dimension (solution.py:659) |
+| GLM-5.2 | 11.14 | 0.2381, 0.2373 | strided `q_rope` view handed to a RoPE kernel that indexes it as contiguous (:509, :347) |
+| kinetic-0715 1m | 9.78 | 0.5828, 0.5845 | `sp = it % 6` where the split has 3 slots, so half of q is never written (:819); a second smaller race not located |
+| Kimi K3.1 Pro | 8.62 (already `bug`) | 0.4628, 0.4628 | absorbed query steps 128 where the head stride is 192 |
+| DeepSeek V4 Pro | 4.64 | 0.2067, 0.2067 | queries stored as `r*32 + h`, loaded as `r + h*32` (:700, :714, :735, :749) |
+| GPT-5.5 | 4.34 | 0.5856, 0.5856 | same stride mistake as Kimi: strided `q_nope` view read at `pid_h * 128` (:676, :384) |
+| MiniMax-M3 | 2.62 | 0.4363, 0.4363 | `view(...).t()` where a permute is needed scrambles W_k (:490) |
+| hy3-preview | 0.31 | 0.9617, 0.9617 (seed 27, ctx 8192) | softmax scale 1/sqrt(128) where the reference is 1/sqrt(192) (:558) |
+
+The eight that were not already known were root-caused before any verdict moved (a probe per kernel on
+tetra: gain sweep of the hot cache rows from 1 to 120, three repeats, torch profiler to confirm the
+graded path, then a one-line scratch fix). Every failure reproduces from a fresh build with empty caches
+to four digits, every fixed kernel returns to 0.996 or better (kinetic-0715 1m only to 0.964 to 0.98,
+its second race), and `baseline.py` holds 0.9963 to 0.9999 at every gain, so the case is not harsh on a
+correct kernel. hy3 fails only at gains 30 to 60 and recovers above 90 because the softmax goes one-hot
+whatever the temperature; a gain-40 case would catch temperature errors with more margin (not added).
+Eight annotations move to `verdict: bug` with a `withdrawn:` block; Kimi K3.1 Pro and DeepSeek 1017 get a
+`regrade_v3:` note; hy3 has no annotation and shows as a failed row. The 28 passing cells that have an
+annotation get the new `peak_fraction` and a `regrade_v3:` block with both runs.
+
+Voiding a headline lets an older run of the same model become the row (the builder keeps the best scored
+run per model), so the two that would surface were replayed too: kinetic-0715 `20260715_204551` reads
+12.06 (was 14.11) and DeepSeek V4 Pro `20260618_150605` reads 2.08 (was 2.11). Both pass.
+
+Re-timed cells, old then new (second run):
+
+| model | old | new | note |
+| --- | --- | --- | --- |
+| Opus 5.5 | 35.46 | 35.34 | |
+| Sonnet 5.5 | 32.13 | 31.65 | |
+| Fable 5.2 | 31.41 | 31.01 | |
+| Gemini 4 Carbon | 23.76 | 24.68 | kernel 0.249 to 0.232 ms per token at 2048; both grades on tetra, cause not established, both passes agree |
+| GPT-6 Astra Pro | 24.80 | 20.87 | first graded on a rented box |
+| Fable 5 (or-fable) | 24.61 | 20.85 | first graded on a rented box |
+| Fable 5.1 (or-fable) | 22.95 | 19.34 | first graded on a rented box |
+| GLM-5.3 | 19.43 | 19.22 | |
+| Fable 5 (claude) | 18.71 | 19.10 | |
+| Qwen 4 Max | 16.29 | 16.10 | |
+| Fable 5.1 (claude) | 15.84 | 15.63 | |
+| DeepSeek V4.1 Flash (deepseek-flash) | 17.10 | 15.05 | first graded on a rented box |
+| Opus 4.8 | 14.40 | 14.28 | |
+| Grok 4.7 | 6.38 | 6.34 | |
+| GPT-6.1 Sol | 4.99 | 4.96 | |
+| DeepSeek V4 Flash 0731 | 5.24 | 4.32 | first graded on a rented box; `reward_hack`, not on the chart |
+| Sonnet 5 | 4.03 | 3.92 | |
+| GPT-5.6 Sol | 2.64 | 2.64 | |
+| Composer 2.5 Fast | 2.48 | 2.46 | |
+| GPT-6 Luna | 2.48 | 2.46 | |
+| Gemini 3.8 Flash High | 2.74 | 2.36 | first graded on a rented box |
+| Gemini 3.5 Flash | 2.28 | 2.27 | |
+| Kimi K2.7 | 2.59 | 2.25 | old baseline at 2048 was 11.93 ms per token (contended); 5.49 now |
+| Muse Spark 1.3 | 2.18 | 2.04 | first graded on a rented box |
+| GPT-6 Sol | 0.96 | 0.95 | |
+| Grok 4.5 | 0.82 | 0.82 | |
+| inkling | 0.17 | 0.54 | old grade was contended on both sides (kernel 71.7, baseline 11.35 ms per token at 2048) |
+
+Lessons and loose ends:
+
+- Host effect. The baseline is CPU-bound eager PyTorch: 7.6 to 8.0 ms per token at 2048 on the rented
+  boxes that first graded seven of these cells, 5.48 on tetra. The kernels are faster on tetra too, by
+  less, so those cells read 7 to 18% lower here. One board is comparable only when timed on one host.
+- The H100 (16 rows) and B200 (10 rows) boards are still on the pre-v3 grader. Replaying them needs
+  rented cards. Publish gate E (`stale_mega_cells` in `scripts/check_publish_gates.py`) covers the
+  RTX PRO 6000 rows only for that reason.
+- Old kernels need `NVCC_APPEND_FLAGS=-std=c++20` on tetra: torch 2.11's `ATen/core/List_inl.h` does
+  not compile under nvcc 13 with gcc 15 as C++17. Nine cells were graded with it. A kernel with a
+  PyTorch fallback passes the check on the fallback when its build fails: deepseek-flash read 0.41x in
+  pass 1 that way and 14.99 and 15.05 once built, so grep both logs for the build error.
+- `regrade_sequential.sh` now restores `baseline.py` from the deck. The pre-replay `result.json` of every
+  replayed cell is kept as `result.grader_v1.json`. The pre-replay logs are in `check.prior.log` and
+  `benchmark.prior.log` for the 20 cells that had been regraded before, and in `*.contended.log` for the
+  20 that had not (the script parks a first regrade's predecessor there; their `*.prior.log` is the
+  first replay run). Match on the printed `peak_fraction`, not the file name.
+- The first replay attempt (12:53 pm, GPU 3) lost the card to another project's queued jobs after three
+  cells; its window check flagged five cells and nothing from it was kept. The driver now holds that
+  project's per-GPU lock file for the whole replay and stops if a foreign process appears.
+- One window verdict (deepseek-flash, 3:31 pm) was rerun by hand against the GPU-use log because the
+  log was renamed while that cell was running; it is clean (5 log blocks, 0 foreign).
+- The 2026-09-11 entry below ("the 39 published mega cells have no run archive") is out of date: all 66
+  board rows have a `solution.py` archive on the Mac, which is what made this replay possible.
+- Evidence: tetra `runs/mega-grader-v3-replay/` (`cells.pass1.tsv`, `cells.pass2.tsv`, `cells.sib1.tsv`,
+  `cells.sib2.tsv`, the GPU-use logs and the driver).
+
 ## 2026-11-16 — Qwen 4 Max [xhigh] on 02: 16.29x with correct MLA, `interesting` for conduct
 
 `or-fable` harness (Claude Code on OpenRouter, `qwen/qwen4-max`, effort xhigh) on tetra GPU 2, one 6.1 hour

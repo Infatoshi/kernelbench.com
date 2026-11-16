@@ -180,7 +180,7 @@ def gate_tracked(fail: list[str]) -> None:
 
 
 def stale_cells() -> list[tuple[str, str, str, Path]]:
-    """Every published hard/cuda cell whose stamp is missing or not the current deck.
+    """Every published hard/cuda/mega cell whose stamp is missing or not the current deck.
 
     Shared by gate E and `--list-stale`, so the backfill regrades exactly the set
     the gate would refuse, nothing enumerated a second way.
@@ -188,8 +188,8 @@ def stale_cells() -> list[tuple[str, str, str, Path]]:
     sys.path.insert(0, str(REPO / "scripts" / "lib"))
     import graded_surface  # noqa: E402
 
-    # (bench, leaderboard, deck root, runs dir) -- only benches whose cells this
-    # repo grades locally; mega's board is built by its own script.
+    # (bench, leaderboard, deck root, runs dir) for the JSON boards; mega's board
+    # is a CSV built by its own script and is handled by stale_mega_cells().
     boards = [
         ("hard", REPO / "benchmarks/hard/results/leaderboard.json",
          REPO / "benchmarks/hard/problems-rtxpro6000", REPO / "benchmarks/hard/outputs/runs"),
@@ -226,6 +226,48 @@ def stale_cells() -> list[tuple[str, str, str, Path]]:
                     continue
                 if got != expect[prob]:
                     out.append((bench, rid, prob, runs_root / rid))
+    out += stale_mega_cells(graded_surface)
+    return out
+
+
+def stale_mega_cells(graded_surface) -> list[tuple[str, str, str, Path]]:
+    """Scored RTX PRO 6000 rows of the mega board whose stamp is not the current deck.
+
+    The mega board is a CSV, one row per (gpu, model, problem). Only rows that
+    print a score are checked (a failed row shows no number), and only the GPU
+    this repo can re-grade: the H100 and B200 rows were graded on rented boxes
+    and stay on the deck that scored them until someone replays them there
+    (benchmarks/mega/DEVLOG.md 2026-11-16).
+    """
+    import csv
+
+    board = REPO / "public/data/mega/results.csv"
+    deck_root = REPO / "benchmarks/mega/problems"
+    src = REPO / "benchmarks/mega/src"
+    runs_root = REPO / "benchmarks/mega/outputs/runs"
+    if not board.exists() or not deck_root.is_dir() or not src.is_dir():
+        return []
+    expect: dict[str, str] = {}
+    out: list[tuple[str, str, str, Path]] = []
+    with board.open(newline="") as f:
+        for row in csv.DictReader(f):
+            rid, prob = row.get("run_id") or "", row.get("problem") or ""
+            if not rid or not row.get("score") or not (row.get("gpu") or "").startswith("RTX PRO 6000"):
+                continue
+            if prob not in expect:
+                try:
+                    expect[prob] = graded_surface.graded_surface_digest(deck_root / prob, src)
+                except SystemExit:
+                    expect[prob] = ""
+            rj = runs_root / rid / "result.json"
+            if not expect[prob] or not rj.exists():
+                continue
+            try:
+                got = json.loads(rj.read_text()).get("graded_surface_sha")
+            except (OSError, json.JSONDecodeError):
+                continue
+            if got != expect[prob]:
+                out.append(("mega", rid, prob, runs_root / rid))
     return out
 
 
@@ -261,7 +303,7 @@ def main() -> int:
     if len(sys.argv) >= 2 and sys.argv[1] == "--list-stale":
         # Backfill feed: one run dir per line, relative to the bench root, so
         # `scripts/regrade_sequential.sh $(...)` in that bench consumes it as is.
-        want = set(sys.argv[2:]) or {"hard", "cuda"}
+        want = set(sys.argv[2:]) or {"hard", "cuda", "mega"}
         for bench, _, _, run_dir in stale_cells():
             if bench in want:
                 print(run_dir.relative_to(REPO / "benchmarks" / bench))

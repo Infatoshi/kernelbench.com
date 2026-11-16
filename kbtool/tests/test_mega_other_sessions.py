@@ -147,3 +147,27 @@ def test_csv_column_and_model_index_parse(builder, tmp_path, monkeypatch):
         {"run_id": "20261201_000100_claude_m-1_02_kimi_linear_decode", "score": 31.2}
     ]
     assert all("other_sessions" not in c for c in cells.values() if c is not m1)
+
+
+def test_failed_cell_prints_no_timing(builder, tmp_path, monkeypatch):
+    # A replay that fails check.py never runs benchmark.py, so benchmark.log is
+    # still the previous grade's; the board must not print its tok/s or speedups.
+    runs = tmp_path / "runs"
+    log = ("shape ctx=2048: solution 0.500 ms/tok (2000 tok/s) | baseline 5.000 ms/tok | speedup 10.00x\n"
+           "peak_fraction: 10.0\n")
+    ok, bad = "20261201_000000_claude_m-1_02_kimi_linear_decode", "20261201_000100_claude_m-2_02_kimi_linear_decode"
+    _run(runs, ok, 10.0)
+    _run(runs, bad, 10.0, model="m-2")
+    for rid in (ok, bad):
+        (runs / rid / "benchmark.log").write_text(log)
+    d = json.loads((runs / bad / "result.json").read_text())
+    d.update(correct=False, peak_fraction=None)
+    (runs / bad / "result.json").write_text(json.dumps(d))
+    out = tmp_path / "results.csv"
+    monkeypatch.setattr(sys, "argv", ["b", "--runs", str(runs), "--out", str(out),
+                                      "--runs-html", str(tmp_path / "nohtml")])
+    builder.main()
+    by_model = {r["model"]: r for r in csv.DictReader(out.open())}
+    assert (by_model["m-1"]["tok_s"], by_model["m-1"]["ctx2048"]) == ("2000", "10.00")
+    assert by_model["m-2"]["correct"] == "false" and by_model["m-2"]["score"] == ""
+    assert (by_model["m-2"]["tok_s"], by_model["m-2"]["ctx2048"]) == ("", "")

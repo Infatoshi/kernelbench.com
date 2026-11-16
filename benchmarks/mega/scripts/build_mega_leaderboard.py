@@ -350,6 +350,10 @@ def main() -> None:
             continue
         gpu = (run_dir / "gpu").read_text().strip()
         tok_s, ctx = _bench(run_dir / "benchmark.log")
+        # A cell that failed its (re)grade prints no timing: when check.py fails,
+        # benchmark.py never runs and benchmark.log is still the previous grade's.
+        if not d.get("correct") or d.get("peak_fraction") is None:
+            tok_s, ctx = "", {}
         usage = d.get("usage") or {}
         mk_kernels, mk_status, mk_judged = megakernel_row(
             run_dir, rid, annotations_dir, d.get("problem", "")

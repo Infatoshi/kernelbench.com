@@ -1,6 +1,6 @@
 # KernelBench-Mega: Design Specification
 
-Last updated: 2026-09-02.
+Last updated: 2026-11-16 (grader v3).
 
 ## Purpose
 
@@ -18,16 +18,20 @@ See each problem's `problem.yaml` and `PROMPT.txt` for exact shapes, dtypes, tol
 
 ## Metric
 
-Primary score is fraction of the RTX PRO 6000 memory roofline for the active shape sweep. B=1 decode is dominated by streamed weights, KV-cache traffic, phase boundaries, and intermediate movement rather than dense tensor-core peak. `problem.yaml` still records dense-equivalent FLOPs for telemetry.
+The score is the speedup over `baseline.py` (optimized eager PyTorch that materializes the dequantized weights): baseline latency divided by solution latency per decode step at batch 1, geometric mean over the context sweep in `shapes.py` (2048, 8192, 16384). It is stored in `peak_fraction` as a multiple, not a roofline fraction.
 
-The score is the geometric mean across the declared decode sequence lengths. Each input cache has `seq_len - 1` prior tokens, so the current-token attention scan is exactly `seq_len`.
+Grader v3 (2026-11-16): `benchmark.py` times the two sides in separate processes, solution first. The parent creates no CUDA context; the baseline process never imports the solution and starts only after the solution process and everything it spawned have exited, so device state a solution leaves behind (L2 persistence, stream attributes, stray processes) cannot slow the baseline. Before v3 the baseline ran in the solution's process and read up to 10% slow after a kernel that pinned L2. `baseline.py` is part of the graded-surface digest.
+
+The baseline is CPU-bound eager PyTorch, so the same kernel scores differently on hosts with different CPUs (one kernel read 29.9x on a rented box and 26.9x on tetra under the same benchmark). Rows of one GPU board are comparable only when timed on one host; the RTX PRO 6000 board was re-timed on tetra under v3 for that reason. The H100 and B200 boards were graded on rented boxes under the pre-v3 grader and stay that way until replayed there.
 
 ## Correctness
 
-- BF16 tolerance for the first problem is `atol=rtol=0.08`.
-- Three seeds per shape: 42, 123, 456.
+- Per step, not a trajectory: reference and solution get an identical state and one new token and each runs one decode step. The next-token hidden, the KDA recurrent state and the MLA latent cache must each reach cosine 0.98 (`problem.yaml` `tolerance.cos_sim`). NaN or inf fails.
+- Graded cache: seeds 0, 1, 2 at context 2048 and 8192 on the random cache from `reference.init_state`. On that cache the MLA softmax is near uniform and attention moves the output by about 0.1%, so it cannot tell a right attention path from a wrong one.
+- Attention-sensitive cases (v3, 2026-11-16): seeds 27, 64, 76 (`shapes.ATTENTION_SEEDS`) at the same two contexts on `reference.init_state_attn`, where 64 cache rows have their latent and rope key scaled by 60 so attention carries about 90% of the output. In the 2026-11-16 replay of the RTX PRO 6000 board the 29 passing kernels read 0.9968 to 1.0000 on these cases and the 11 that fail read 0.21 to 0.96 (every one a confirmed kernel defect, `DEVLOG.md` 2026-11-16); `baseline.py` holds 0.996 or better from gain 1 to 120. Seeds were chosen so no MoE router has a near-tie at its top-8 cut (honest rounding can flip a tie, and these caches amplify the flip).
+- The check proves each attention case before using it: the reference's output with the cache history zeroed must differ (cosine at most 0.7) and every router's top-8 margin must be at least 2.5%. A failure there prints `GRADER ERROR` and exits 2; it is the grader's fault, not the solution's.
+- `benchmark.py` runs a one-step gate on both cache kinds at every shape before timing; a failure scores 0.0 and the baseline is never run.
 - `check.py` loads the reference state dict with `strict=True`.
-- NaN or inf output fails through the shared correctness helper.
 - Forbidden framework shortcuts are declared in `problem.yaml` and rejected by `check.py`.
 
 ## Prompt Design
