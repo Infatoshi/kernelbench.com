@@ -459,6 +459,12 @@ def load_mega(models: Models, csv_path: Path) -> None:
                 "tok_s": int(float(r["tok_s"])) if r.get("tok_s") else None,
                 "ctx": {k: float(r[k]) for k in ("ctx2048", "ctx8192", "ctx16384") if r.get(k)},
                 "framework": r.get("framework") or None,
+                # Audited sessions of the same cell that are not the headline
+                # ("run_id:score;..." from build_mega_leaderboard.py), best first.
+                **({"other_sessions": [
+                    {"run_id": rid, "score": float(s)}
+                    for rid, s in (p.rsplit(":", 1) for p in r["other_sessions"].split(";"))
+                ]} if r.get("other_sessions") else {}),
                 "solution_url": mega_solution_url(r.get("run_id") or ""),
                 "trace_url": trace_url("mega", r.get("run_id") or "", gpu_key),
                 # verdict/validity filled in after annotations are joined

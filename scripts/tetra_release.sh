@@ -1,9 +1,12 @@
 #!/bin/bash
-# Release sweep on tetra (4x RTX PRO 6000 Blackwell): one model's mega 02 plus cuda 01-03 as
-# parallel sessions on ONE GPU (the per-bench GPU locks serialize their GPU commands), then the
-# sequential isolated regrade of exactly those cells on the same GPU with the canonical decks.
-# Different models run at once on different GPUs. This is the Grok 4.7 / Opus 5.5 / GPT-6 recipe.
-# KB_RELEASE_CELLS="<bench>:<deck>/<problem> ..." replaces the cell list (e.g. hard cells);
+# Release sweep on tetra (4x RTX PRO 6000 Blackwell): one model's mega 02 (the headline cell,
+# TWO independent sessions so the board can print both scores; the row keeps the better one)
+# plus cuda 01-03 (one session each) as parallel sessions on ONE GPU (the per-bench GPU locks
+# serialize their GPU commands), then the sequential isolated regrade of exactly those sessions
+# on the same GPU with the canonical decks. Different models run at once on different GPUs.
+# KB_RELEASE_CELLS="<bench>:<deck>/<problem> ..." replaces the cell list (e.g. hard cells, or
+# mega 02 named once for a single session); a cell named N times runs N sessions, logged as
+# <bench>_<problem>.log, <bench>_<problem>_s2.log, ...;
 # KB_RELEASE_GPUS="0 1 2 3" spreads cells round-robin over those GPUs, each GPU with its own
 # lock dir (rented multi-GPU boxes); the regrade still runs alone on <gpu> after every cell ends.
 #
@@ -51,25 +54,28 @@ log() { echo "=== $(date '+%F %T %Z') $*"; }
 log "start host=$(hostname) gpu$GPU=$(nvidia-smi -i "$GPU" --query-gpu=name --format=csv,noheader)"
 log "harness=$HARNESS model=$MODEL effort=${EFFORT:-<harness default>} claude_auth=$CLAUDE_AUTH claude=$(claude --version 2>/dev/null) codex=$(codex --version 2>/dev/null) grok=$(grok --version 2>/dev/null | cut -d' ' -f2)"
 
-CELLS=(mega:problems/02_kimi_linear_decode
+CELLS=(mega:problems/02_kimi_linear_decode mega:problems/02_kimi_linear_decode
        cuda:problems-rtxpro6000/01_glm52_fused_moe cuda:problems-rtxpro6000/02_deepseek_nsa
        cuda:problems-rtxpro6000/03_megaqwen_decode)
 [ -n "${KB_RELEASE_CELLS:-}" ] && read -r -a CELLS <<< "$KB_RELEASE_CELLS"
 read -r -a GPUS <<< "${KB_RELEASE_GPUS:-$GPU}"
-pids=(); ci=0
+pids=(); ci=0; seen=" "
 for cell in "${CELLS[@]}"; do
-    B=${cell%%:*}; P=${cell#*:}; L=$OUT/${B}_$(basename "$P").log
+    B=${cell%%:*}; P=${cell#*:}; n=${B}_$(basename "$P")
+    # Repeat sessions of a cell get _s2, _s3, ... so logs (and resume lookups) never collide.
+    k=1; while [[ $seen == *" ${n}#$k "* ]]; do k=$((k + 1)); done; seen+="${n}#$k "
+    L=$OUT/$n$([ "$k" -gt 1 ] && echo "_s$k").log
     # TETRA_RELEASE_RESUME=<earlier runs/release-* dir>: keep its cells that reached result.json
     # (their logs join this regrade), rerun only the rest (e.g. after tetra lost power mid-run).
     prev=${TETRA_RELEASE_RESUME:+$TETRA_RELEASE_RESUME/$(basename "$L")}
     prd=$([ -f "${prev:-/nonexistent}" ] && grep -m1 -oE 'Archive: +\S+' "$prev" | awk '{print $2}')
     if [ -n "$prd" ] && [ -f "$prd/result.json" ]; then
-        cp "$prev" "$L"; log "kept $B $(basename "$P") from $(basename "$prd")"; continue
+        cp "$prev" "$L"; log "kept $(basename "$L" .log) from $(basename "$prd")"; continue
     fi
     G=${GPUS[$((ci % ${#GPUS[@]}))]}; ci=$((ci + 1))
     LOCKDIR=; [ ${#GPUS[@]} -gt 1 ] && LOCKDIR=$R/benchmarks/$B/outputs/gpu_lock/gpu$G
     ( cd "$R/benchmarks/$B" && env KBH_GPU=$G ${LOCKDIR:+KBH_GPU_LOCK_DIR=$LOCKDIR} ./scripts/run_hard.sh "$HARNESS" "$MODEL" "$P" ${EFFORT:+"$EFFORT"} ) > "$L" 2>&1 &
-    pids+=($!); log "launched $B $(basename "$P") gpu $G pid $!"
+    pids+=($!); log "launched $(basename "$L" .log) gpu $G pid $!"
     sleep 30
 done
 

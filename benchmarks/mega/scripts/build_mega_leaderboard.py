@@ -143,6 +143,54 @@ def annotation_contamination(run_id: str, annotations_dir: Path) -> str | None:
     return d.get("contamination")
 
 
+# Audit verdicts that carry a score. A non-headline session for the same
+# (gpu, model, problem) is printed as `other_sessions` only with one of these,
+# so an aborted, unaudited, bug, timeout_unverified or flagged retry never
+# shows up as "the other session".
+SCORING_VERDICTS = {"clean", "interesting"}
+
+
+def scoring_session(run_id: str, annotations_dir: Path) -> bool:
+    """True when the run's audit YAML scores it: a scoring verdict and no
+    `publish_grade: false` / `board_eligible: false` override."""
+    f = annotations_dir / f"{run_id}.yaml"
+    if not f.exists():
+        return False
+    try:
+        import yaml
+        d = yaml.safe_load(f.read_text()) or {}
+    except Exception:
+        return False
+    return (
+        d.get("verdict") in SCORING_VERDICTS
+        and d.get("publish_grade") is not False
+        and d.get("board_eligible") is not False
+    )
+
+
+def other_sessions(rows: list[dict], best: dict, annotations_dir: Path) -> dict:
+    """(gpu, model, problem) -> "run_id:score;run_id:score" of the audited,
+    scoring sessions from the headline row's own release (same `run_group`)
+    that are not the headline row, best first. The headline
+    stays the argmax row; this only lets the site print the other numbers."""
+    out: dict[tuple, list[dict]] = {}
+    for r in rows:
+        key = (r["gpu"], r["model"], r["problem"])
+        if r is best[key] or r["correct"] != "true" or not r["score"]:
+            continue
+        # Same release only: twins launched together under one budget and deck.
+        # An older run of the model (3-hour cap, earlier deck) is not a twin.
+        if not r.get("run_group") or r.get("run_group") != best[key].get("run_group"):
+            continue
+        if scoring_session(r["run_id"], annotations_dir):
+            out.setdefault(key, []).append(r)
+    return {
+        k: ";".join(f"{r['run_id']}:{r['score']}"
+                    for r in sorted(v, key=lambda x: (-float(x["score"]), x["run_id"])))
+        for k, v in out.items()
+    }
+
+
 def _constraints(problem: str) -> dict:
     y = _HERE / "problems" / problem / "problem.yaml"
     if not y.exists():
@@ -325,6 +373,7 @@ def main() -> None:
             "megakernel_judged": "true" if mk_judged else "false",
             "has_viewer": "true" if rid in html_ids else "false",
             "run_id": rid,
+            "run_group": d.get("run_group") or "",   # not a CSV column; pairs twin sessions
         })
 
     # keep best (highest score) per (gpu, model, problem)
@@ -334,15 +383,20 @@ def main() -> None:
         cur = best.get(key)
         if cur is None or (r["score"] and float(r["score"] or 0) > float(cur["score"] or 0)):
             best[key] = r
+    # Headline cell runs two sessions per model (scripts/tetra_release.sh); the
+    # row stays the best one and names the others for the site to print.
+    others = other_sessions(rows, best, annotations_dir)
+    for key, r in best.items():
+        r["other_sessions"] = others.get(key, "")
 
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
     fields = ["gpu", "harness", "model", "problem", "correct", "score", "tok_s",
               "elapsed_s", "output_tokens", "ctx2048", "ctx8192", "ctx16384",
               "framework", "kernels", "megakernel", "megakernel_judged",
-              "has_viewer", "run_id"]
+              "has_viewer", "run_id", "other_sessions"]
     with out.open("w", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=fields)
+        w = csv.DictWriter(f, fieldnames=fields, extrasaction="ignore")
         w.writeheader()
         for r in sorted(best.values(), key=lambda x: (x["gpu"], -float(x["score"] or 0))):
             w.writerow(r)
@@ -350,7 +404,8 @@ def main() -> None:
     for r in sorted(best.values(), key=lambda x: (x["gpu"], -float(x["score"] or 0))):
         _mk = f"{r['megakernel']}({r['kernels']}k{'*' if r['megakernel_judged']=='true' else '?'})"
         print(f"  {r['gpu']:24s} {r['model']:20s} score={r['score']:>7} tok/s={r['tok_s']:>5} "
-              f"fw={r['framework']:8s} mk={_mk:12s} viewer={r['has_viewer']}")
+              f"fw={r['framework']:8s} mk={_mk:12s} viewer={r['has_viewer']}"
+              + (f" others={r['other_sessions']}" if r["other_sessions"] else ""))
 
 
 if __name__ == "__main__":

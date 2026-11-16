@@ -27,6 +27,8 @@ export interface ModelCell {
   tok_s?: number | null
   ctx?: Record<string, number>
   framework?: string | null
+  /** Mega: the other audited sessions of this cell (headline is the best), best first. */
+  other_sessions?: { run_id: string; score: number }[]
   solution_url: string | null
   trace_url: string | null
   /** baked rundetail fetch path; gpu-namespaced for non-canonical boards */
@@ -393,6 +395,8 @@ export interface ProblemChip {
   detail_url?: string | null
   /** dedicated run page: /runs/<gpu>/<run_id> (null when the cell has no run) */
   page_url: string | null
+  /** Mega: the cell's other audited sessions, printed under the headline score */
+  others?: { run_id: string; label: string; page_url: string }[]
 }
 
 export interface ReportRow {
@@ -543,6 +547,15 @@ function chipFromCell(
         : `${(c.score * 100).toFixed(2)}% of roofline`,
       score: c.score,
       ...links,
+      ...(c.other_sessions?.length
+        ? {
+            others: c.other_sessions.map((o) => ({
+              run_id: o.run_id,
+              label: benchValue(bench ?? "mega", o.score),
+              page_url: `/runs/${gpuKey}/${o.run_id}`,
+            })),
+          }
+        : {}),
     }
   }
   // A correct-but-unaudited cell is not a failure and not a pass: it ran and

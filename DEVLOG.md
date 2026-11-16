@@ -6,6 +6,23 @@ benchmark. Per-benchmark journals live in `benchmarks/<bench>/DEVLOG.md`;
 
 ---
 
+## 2026-11-16 - Two sessions for the Mega cell, both printed
+
+One session per cell hides session luck (Qwen 4 Max's second MegaQwen kernel timed 114.5 us per step in
+its own test and the one it shipped timed 172). From the next release, `scripts/tetra_release.sh` runs
+Mega 02 as two independent sessions (the second logs as `mega_02_kimi_linear_decode_s2.log`; a cell named
+N times in `KB_RELEASE_CELLS` runs N sessions). Both are regraded and audited. The board row stays the
+argmax; `build_mega_leaderboard.py` writes the other session into a new last CSV column `other_sessions`
+(`run_id:score`, `;`-joined), `build_model_index.py` carries it into `models.json`, and the homepage Mega
+deck prints "other session N.NNx" under the bar. A run counts as the other session only when it is
+correct, audited `clean` or `interesting`, and shares the headline's `run_group`, so an older run of the
+same model under another budget or deck (three such audited pairs exist: kinetic-0715 on two GPUs and
+deepseek-v4-pro) is not shown as a twin. CUDA cells stay single-session: Elliot's order covered the
+headline cell, and tripling to six CUDA sessions costs more than the Mega twin. Cost: roughly double the
+API spend of the Mega cell. Not yet exercised on tetra (stub-run on the Mac only): the first real release
+should confirm both logs, both regrades and the resume path. Twins share the one Mega GPU lock, so their
+GPU commands serialize.
+
 ## 2026-11-16 - Sandbox: own PID namespace and one-GPU device view for every host-mode session
 
 Closes three items left open in the entry below (advisory GPU pin, sessions killing each other's jobs, the
