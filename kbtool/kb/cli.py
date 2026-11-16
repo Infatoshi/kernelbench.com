@@ -579,6 +579,19 @@ def cmd_push_runs(root: Path, args: list[str], bench: str = "hard") -> int:
     produced = sorted(staging.glob("*.jsonl"))
     print(f"  produced {len(produced)} jsonl traces")
 
+    # Scan the exact files that upload (media/AGENTS.md "Public trace privacy").
+    # The staging folder also holds older exports with no local transcript, and
+    # upload_folder sends everything in it, so scan all of it, not just this run.
+    sys.path.insert(0, str(root))
+    from scripts.redaction import scan_file
+
+    dirty = {p.name: f for p in produced if (f := scan_file(p))}
+    if dirty:
+        for name, found in sorted(dirty.items()):
+            print(f"  REDACTION FINDINGS {name}: {found}", file=sys.stderr)
+        sys.exit(f"kb push-runs: {len(dirty)} staged trace(s) fail the redaction scan; nothing uploaded")
+    print(f"  redaction scan clean on {len(produced)} staged traces")
+
     dest = f"{dataset}" + (f" under {board}/" if board else "")
     if dry:
         print(f"[dry-run] would upload {staging} -> {dest} (dataset)")
