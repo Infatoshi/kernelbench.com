@@ -16,5 +16,12 @@ SHAPES = [
     {"context_len": 16384, "steps": 16, "n_experts": 64},
 ]
 
-# Correctness is checked on these seeds (one decode step + a few AR steps each).
+# Correctness is checked on these seeds (one decode step each).
 GRADING_SEEDS = (0, 1, 2)
+
+# Seeds for the attention-sensitive cases (reference.init_state_attn), where MLA
+# attention carries the output and so amplifies any upstream difference. Chosen
+# so that every MoE router's top-8 cut has a relative margin of >= 3% in the
+# reference (no near-tie for honest rounding to flip); check.py re-verifies it.
+# benchmark.py's gate uses the first one.
+ATTENTION_SEEDS = (27, 64, 76)

@@ -39,6 +39,10 @@ DECK_FILES = (
     "PROMPT.txt",
 )
 
+# Graded when present: a problem scored against a baseline implementation
+# (mega 02's baseline.py) must stamp that baseline too.
+OPTIONAL_DECK_FILES = ("baseline.py",)
+
 
 def _update_tree(digest: "hashlib._Hash", root: Path, label: str) -> None:
     """Fold one directory tree into *digest*, deterministically.
@@ -87,6 +91,13 @@ def graded_surface_digest(deck_dir: Path, src_dir: Path) -> str:
             raise SystemExit(f"graded surface: missing {name} in {deck_dir}")
         digest.update(b"f" + name.encode() + b"\0")
         digest.update(hashlib.sha256(path.read_bytes()).digest())
+    # Folded in only where the deck has them, so decks without one keep their
+    # stamp. mega's baseline.py is the denominator of the score.
+    for name in OPTIONAL_DECK_FILES:
+        path = Path(deck_dir) / name
+        if path.is_file():
+            digest.update(b"f" + name.encode() + b"\0")
+            digest.update(hashlib.sha256(path.read_bytes()).digest())
     return digest.hexdigest()
 
 

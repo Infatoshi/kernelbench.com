@@ -7,6 +7,12 @@ next-token hidden plus the updated decode state (KDA recurrent state, MLA latent
 cache) by cosine similarity. Cosine sim is robust to bf16/fp8 precision but
 still rejects wrong answers. Chaining steps would just measure how fast two
 precisions diverge, which is not a kernel-correctness signal.
+
+Two families of cases, same threshold: the graded random cache (init_state),
+where the MLA softmax is near uniform and attention barely moves the output,
+and attention-sensitive caches (init_state_attn, shapes.ATTENTION_SEEDS), where
+a few large cache rows dominate the softmax and attention carries the output,
+so a wrong MLA attention path fails.
 """
 from __future__ import annotations
 
@@ -19,8 +25,33 @@ import torch.nn.functional as F
 import yaml
 
 
+# Grader self-checks for the attention-sensitive cases (see main()).
+ATTN_SENS_MAX = 0.7        # cos(ref, ref with the MLA cache history zeroed)
+ROUTER_MARGIN_MIN = 0.025  # (p8 - p9) / p8 of every MoE router in the reference
+
+
 def _cos(a, b):
     return F.cosine_similarity(a.float().flatten(), b.float().flatten(), dim=0).item()
+
+
+def _zero_history(state, mla_layer):
+    for key in ("c_kv", "k_rope"):
+        state[mla_layer][key] = torch.zeros_like(state[mla_layer][key])
+    return state
+
+
+def _router_margins(reference, model, h, state):
+    """Reference step, block by block, returning each MoE router's relative
+    top-8 margin (p8 - p9) / p8."""
+    margins = []
+    for blk, st in zip(model.blocks, state):
+        h = h + blk.attn.step(reference._rmsnorm(h, blk.attn_norm), st)
+        x = reference._rmsnorm(h, blk.moe_norm)
+        p = torch.sort(torch.softmax(blk.moe.router(x).float(), dim=-1), descending=True).values
+        k = model.cfg.n_active
+        margins.append(((p[k - 1] - p[k]) / p[k - 1]).item())
+        h = h + blk.moe.step(x)
+    return margins
 
 
 def main() -> None:
@@ -156,6 +187,47 @@ def main() -> None:
                     sys.exit(1)
             print(f"seed {seed} ctx {ctx}: out={checks['out']:.4f} "
                   f"S={checks['kda_state']:.4f} cache={checks['mla_cache']:.4f} OK", flush=True)
+
+    # Attention-sensitive cases: same comparison on a cache where MLA attention
+    # carries the output (reference.init_state_attn). Before each one the
+    # reference must prove the case can see attention (its output with the
+    # cache history zeroed has to differ clearly) and has no near-tie in any MoE
+    # router; a failure there is a grader fault, not the solution's.
+    for seed in shapes.ATTENTION_SEEDS:
+        for ctx in (2048, 8192):
+            h = reference.init_token(cfg, seed)
+            with torch.no_grad():
+                o_neutral, _ = ref_model.step(h.clone(), _zero_history(reference.init_state_attn(cfg, ctx, seed), mla_layer))
+                margin = min(_router_margins(reference, ref_model, h.clone(), reference.init_state_attn(cfg, ctx, seed)))
+                o_ref, st_ref = ref_model.step(h.clone(), reference.init_state_attn(cfg, ctx, seed))
+            sens = _cos(o_ref, o_neutral)
+            if sens > ATTN_SENS_MAX or margin < ROUTER_MARGIN_MIN:
+                print(f"GRADER ERROR: attention case seed {seed} ctx {ctx} is not discriminative "
+                      f"(cos(ref, ref without cache history) {sens:.4f}, need <= {ATTN_SENS_MAX}; "
+                      f"min router top-8 margin {margin:.3f}, need >= {ROUTER_MARGIN_MIN})")
+                sys.exit(2)
+            st_sol = reference.init_state_attn(cfg, ctx, seed)
+            try:
+                with torch.no_grad():
+                    o_sol, st_sol = sol_model.step(h.clone(), st_sol)
+            except Exception as e:
+                print(f"FAIL: attention case seed {seed} ctx {ctx}: solution.step raised {type(e).__name__}: {e}")
+                sys.exit(1)
+            if o_ref.shape != o_sol.shape or not torch.isfinite(o_sol).all():
+                print(f"FAIL: attention case seed {seed} ctx {ctx}: bad output shape/finite")
+                sys.exit(1)
+            checks = {
+                "out": _cos(o_ref, o_sol),
+                "kda_state": _cos(st_ref[kda_layer]["S"], st_sol[kda_layer]["S"]),
+                "mla_cache": _cos(st_ref[mla_layer]["c_kv"], st_sol[mla_layer]["c_kv"]),
+            }
+            for name, c in checks.items():
+                if c < thr:
+                    print(f"FAIL: attention case seed {seed} ctx {ctx}: {name} cosine {c:.4f} < {thr}")
+                    sys.exit(1)
+            print(f"attention case seed {seed} ctx {ctx}: out={checks['out']:.4f} "
+                  f"S={checks['kda_state']:.4f} cache={checks['mla_cache']:.4f} OK "
+                  f"(reference sensitivity {sens:.3f})", flush=True)
 
     _emit_framework_label(sol_src)
     print("PASS")

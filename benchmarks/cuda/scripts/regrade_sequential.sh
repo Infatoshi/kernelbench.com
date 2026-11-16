@@ -201,6 +201,12 @@ for RUN_DIR in "$@"; do
                 cp -p "$SRC_DECK/$t" "$PROBLEM_DIR/$t" || exit 3
             fi
         done
+        # baseline.py (mega) is the denominator of the score: grade against the
+        # canonical one, and give a thin archive the copy it never kept.
+        if [ -f "$SRC_DECK/baseline.py" ] && ! cmp -s "$SRC_DECK/baseline.py" "$PROBLEM_DIR/baseline.py"; then
+            echo "    restoring baseline.py from $KBH_REGRADE_DECK (workspace copy differed)"
+            cp -p "$SRC_DECK/baseline.py" "$PROBLEM_DIR/baseline.py" || exit 3
+        fi
 
         # A canonical check may import helpers or dependencies added after this
         # archive was created. Restore src and the complete locked project
@@ -281,6 +287,10 @@ for RUN_DIR in "$@"; do
     for L in $PARK_LOGS; do
         if [ -f "$RUN_DIR/$L.log" ] && [ ! -f "$RUN_DIR/$L.contended.log" ]; then
             mv "$RUN_DIR/$L.log" "$RUN_DIR/$L.contended.log"
+        elif [ -f "$RUN_DIR/$L.log" ] && [ ! -f "$RUN_DIR/$L.prior.log" ]; then
+            # Re-grade of an already re-graded cell (a deck version replay):
+            # keep the earlier isolated grade's log once.
+            cp -p "$RUN_DIR/$L.log" "$RUN_DIR/$L.prior.log"
         fi
     done
     CLOG="$RUN_DIR/check.log"
@@ -378,7 +388,16 @@ else:
     r["peak_fraction"] = num(os.environ["SCORE"])
     r["benchmark_exit_code"] = num(os.environ["BEXIT"])
     r["benchmark_elapsed_seconds"] = num(os.environ["BEL"])
+    prev = r.get("regrade") if isinstance(r.get("regrade"), dict) else None
     r["regrade"] = dict(provenance, mode="sequential_isolated", contended=contended)
+    if prev and prev.get("mode") == "sequential_isolated":
+        # Re-grade of an already re-graded cell (a deck version replay): what
+        # this pass replaced is the earlier isolated grade, not the in-session
+        # numbers. Keep both, and name the surface the earlier grade used.
+        r["regrade"]["contended"] = prev.get("contended", contended)
+        r["regrade"]["prior_regrade"] = dict(
+            {k: prev.get(k) for k in ("at", "host", "gpu_index", "gpu_name")},
+            graded_surface_sha=r.get("graded_surface_sha"), values=contended)
 
 # Stamp the surface this re-grade actually used, via the shared digest module
 # (same implementation the runner and the publish gate call), so a re-grade
