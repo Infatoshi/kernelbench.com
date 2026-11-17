@@ -1,5 +1,35 @@
 # KernelBench-CUDA — DEVLOG
 
+## 2026-11-17 — GPT-6.2 Astra [xhigh] on tetra: 3/3 correct, two `clean`, one `interesting`
+
+`codex` harness, native Codex CLI 0.169.0 on a ChatGPT Pro login (earlier CLIs reject `gpt-6.2-astra`
+with "not supported when using Codex with a ChatGPT account"), `gpt-6.2-astra` at `model_reasoning_effort
+xhigh`, reasoning summaries `auto`, service tier default (fast off). Effort matches the September GPT-6
+Astra Pro cells, which ran Codex 0.140.0 through OpenRouter, so the two are a rough comparison. Three
+sessions on tetra GPU 2 from 1:33 pm with the two mega sessions; each stopped on its own in 36 to 65 minutes
+on 30k to 45k output tokens. Sequential isolated regrade on GPU 2, 2:51 to 3:18 pm, then audit probes on
+quiet GPUs 0 and 1:
+
+- 01 Fused MoE 0.1064, clean, third of 29 and the best codex cell (GPT-6 Astra Pro 0.0945). Hand-written
+  TMA + mma.sync grouped GEMM, no cache of any kind; same-buffer overwrite cos(out1,out2) about 0, 54/54
+  unseen-seed stress cases pass. Its in-run 0.0672 was contention from the MegaQwen sibling (below).
+- 02 NSA 0.8005 (0.1231 ms geomean), clean, fifth in latency. Exact-ranking block scores, reference tie
+  rule, each selected block attended once per choosing query; overwrite probe recomputes, 24/24 unseen
+  seeds, S up to 16384 past the deck pass.
+- 03 MegaQwen 0.0578, interesting, ties 11th. 28 ordinary kernels per token, not a megakernel. Pointer-
+  and version-keyed weight pack (`.data` edits are missed, off the graded path); multi-step decode drifts
+  out of tolerance at q/k norm gains of 2 and up (graded gain is 1). It used the upstream MegaQwen repo the
+  prompt offers, via a stale `/tmp/megaqwen_ref` clone left by the 2026-11-16 Qwen 4 Max attempt; 4 of 310
+  lines match upstream, no copied code.
+
+Harness gaps found by the audits, none touching the regrades: (1) inside the sandbox plain `python`
+resolved to `~/.local/bin/python` ahead of the run's lock wrapper, so the NSA and MegaQwen sessions ran GPU
+work outside the GPU lock for long stretches and contended the siblings' in-run numbers; (2) `/tmp` and
+`~/.cache` are shared across sandboxes; (3) the stale tetra checkout `~/dev/sites/kernelbench.com` (old
+archives with solutions) is outside the sandbox hide root and the canary misses it. All three cells'
+`kb contamination` flags are a `rg --files -g pyvenv.cfg` over home that listed paths in that stale
+checkout (or, for 03, the upstream repo listing); nothing was opened.
+
 ## 2026-11-16 — Qwen 4 Max [xhigh] on tetra: 3/3 correct, two `interesting`
 
 `or-fable` harness (Claude Code on OpenRouter, `qwen/qwen4-max`, effort xhigh, prompt caching disabled; root

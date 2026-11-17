@@ -129,6 +129,8 @@ def test_embedded_json_triton_decorator_is_not_email():
     '"cat /home/bob/.env"',
     '-L/root/x',
     '[solution.py](file:///home/bob/kb/solution.py)',   # agy markdown file link
+    '<cwd>/home/bob/kb/problems/x</cwd>',               # codex environment_context
+    'error: no conversion\\n/home/bob/kb/solution.py',  # literal escaped newline in tool output
 ])
 def test_home_path_after_a_flag_is_redacted(text):
     """A home path preceded by a short flag letter must still be redacted.

@@ -6,6 +6,25 @@ benchmark. Per-benchmark journals live in `benchmarks/<bench>/DEVLOG.md`;
 
 ---
 
+## 2026-11-17 - GPT-6.2 Astra release: redaction hole closed, tetra codex 0.169.0
+
+Redaction: `HOME_RE` missed a home path after `>` (codex `<cwd>/home/...` in environment_context) and
+after a literal escaped newline (`\n/home/...` in tool output), so the scanner passed the five GPT-6.2
+Astra traces with up to 97 raw home paths each. Both lookbehinds added, with tests. The stricter scan then
+caught six older traces already public on HF (four GPT-6 Astra Pro cuda, Inkling and GLM-5.2 mega, all
+`/home/<user>/sites/kernelbench.com/...` paths); they were re-redacted and re-uploaded. HF keeps the old
+revisions in the dataset history.
+
+Codex on tetra is now 0.169.0 (was 0.159.2); `gpt-6.2-astra` needs it on the native ChatGPT route. The
+0.140.0 pin for rented boxes (OpenRouter tool payloads, `benchmarks/mega/AGENTS.md`) is unchanged. The
+sweep billed a different ChatGPT Pro login than tetra's own (that one was rate-limited); tetra's login and
+`~/.codex/config.toml` were restored afterwards. Fast service tier was off for the sessions.
+
+Open before the next release: delete or hide tetra's stale `~/dev/sites/kernelbench.com` (archives with
+solutions, visible inside the sandbox, missed by the canary), put the lock wrapper ahead of
+`~/.local/bin/python` inside the sandbox, and give each sandbox its own `/tmp` and `~/.cache`
+(`benchmarks/cuda/DEVLOG.md` 2026-11-17).
+
 ## 2026-11-16 - Two sessions for the Mega cell, both printed
 
 One session per cell hides session luck (Qwen 4 Max's second MegaQwen kernel timed 114.5 us per step in

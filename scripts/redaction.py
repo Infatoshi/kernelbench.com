@@ -69,6 +69,10 @@ HOME_RE = re.compile(
             r"(?<=-[\w][\w][\w][\w])",
             # agy links files as markdown `[x](file:///home/user/...)` (2026-11-10 Carbon traces)
             r"(?<=file://)",
+            # codex: `<cwd>/home/user/...` in environment_context, and tool output kept as
+            # literal escaped text (`\n/home/user/...`), both live in 2026-11-17 GPT-6.2 traces
+            r"(?<=>)",
+            r"(?<=\\[nrt])",
         ]
     )
     + r")"

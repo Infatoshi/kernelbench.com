@@ -6,6 +6,26 @@ Numbering note: entries before 2026-07-21 say "Problem 03" for the Kimi-Linear d
 
 ---
 
+## 2026-11-17 — GPT-6.2 Astra [xhigh] on 02: 23.48x and 22.93x, both `clean`, both stopped early
+
+`codex` harness, native Codex CLI 0.169.0, `gpt-6.2-astra` at xhigh (cuda DEVLOG 2026-11-17 has the
+route), two sessions on tetra GPU 2 next to the three cuda cells. Isolated regrade 23.4782x (s1, board
+row) and 22.9346x (s2) at 2:49 to 2:51 pm. Each wrote its own one-launch cooperative CUDA megakernel (no
+shared code): int4 dequant fused into the GEMVs, weights repacked once at load, absorbed MLA with the
+correct per-head stride of 192. Probes on a quiet GPU 2: same-buffer overwrites of token, state and
+weights read live values, six steps are six launches with no memcpy, memset or graph, 18 attention-heavy
+caches hold at cos(ref,sol) 0.9999 or better, 32/32 unseen seeds, caches to 131,072 rows pass (baseline.py
+itself drops to 0.96 there). One s1 six-step chain on an attention-heavy cache falls to 0.967; baseline.py
+fails the same chain at 0.963 because the reference's top-8 router margin there is under check.py's 0.025.
+
+Both sessions ended on their own about 75 minutes in, on 55k to 57k output tokens, against 2.8 to 6 hours
+and 0.6M to 1.2M output tokens for the 31x to 35x Claude cells. Neither trace weighs remaining headroom:
+benchmark printed a number, check printed PASS, it cleaned up and reported. The late in-run jump on s1
+(18.75x to 23.64x in its last seven minutes) is mostly s2's contention lifting; its own kernel timer puts the
+last change at 273.5 to 252.0 us per step. s1 ran its GPU work outside the GPU lock (cuda DEVLOG gap 1).
+Both `kb contamination` flags are one `rg` over home that printed pyvenv paths in the stale tetra checkout;
+no mega archive was named or read.
+
 ## 2026-11-16 — Grader v3 replay of the RTX PRO 6000 board: 11 kernels fail the attention case, 27 re-timed
 
 Grader v3 (commit `4c2c347`, graded surface `c522e2010e34`, was `829522700bbe`) adds attention-sensitive
