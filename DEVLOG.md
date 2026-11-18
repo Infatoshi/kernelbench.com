@@ -6,6 +6,14 @@ benchmark. Per-benchmark journals live in `benchmarks/<bench>/DEVLOG.md`;
 
 ---
 
+## 2026-11-17 - Two Mega sessions reverted: one session per release again
+
+Elliot reverted the 2026-11-16 "two sessions for the Mega cell" rule (commit f85f4c3, added by an agent,
+never his decision). `scripts/tetra_release.sh` launches Mega 02 once again, the `other_sessions` column,
+its site display and its test are gone, and posts state one Mega score. GPT-6.2 Astra's second session
+(`20261117_133406_codex_gpt-6.2-astra_02_kimi_linear_decode`, 22.93x, audited clean) stays in the archive
+and its annotation as audit evidence; the board row is the first session at 23.48x.
+
 ## 2026-11-17 - GPT-6.2 Astra release: redaction hole closed, tetra codex 0.169.0
 
 Redaction: `HOME_RE` missed a home path after `>` (codex `<cwd>/home/...` in environment_context) and

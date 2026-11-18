@@ -217,17 +217,6 @@ function Chip({
           {barBody}
         </span>
       )}
-      {pass &&
-        chip.others?.map((o) => (
-          <Link
-            key={o.run_id}
-            href={o.page_url}
-            className="hd-other tabular no-underline"
-            title={`Other audited session of this cell: ${o.label}. The headline is the better session. Open run page`}
-          >
-            other session {o.label}
-          </Link>
-        ))}
     </span>
   )
 }
