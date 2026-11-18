@@ -24,6 +24,25 @@
 #     (unset, other indices, other UUIDs), and the sandbox sets
 #     CUDA_VISIBLE_DEVICES=0. Nodes cannot be recreated (no mknod in the userns).
 #     No mapping (no NVML, no node) refuses the launch (exit 4).
+#   - Foreign archives outside the hide root (2026-11-17): every other
+#     KernelBench checkout, bench root, outputs/runs*-style collection and loose
+#     run dir under $HOME, /data, /mnt, /media, /srv, /opt, /scratch, /workspace
+#     and other readable homes is tmpfs'd (bounded walk, sandbox_canary.py
+#     find_archives), and the canary repeats the sweep inside.
+#   - GPU lock on the binaries: every python interpreter (system and uv-managed,
+#     so every venv), uv/uvx, nvcc, ncu and nsys is replaced inside by a shim that
+#     runs $RUN_DIR/bin/gpu-lock-exec, then the real file from a private
+#     read-only copy of its prefix. PATH order, rc files, venv activation and
+#     absolute paths no longer skip the lock. A per-run ZDOTDIR keeps $RUN_DIR/bin
+#     first after zsh login rc files.
+#   - Per-run /tmp, /var/tmp ($RUN_DIR/tmp) and ~/.cache, ~/.triton, ~/.nv,
+#     ~/.cupy, ~/.tilelang ($RUN_DIR/cache/home/); ~/.cache/uv stays shared.
+#   Residuals: archives deeper than SWEEP_DEPTH or behind a symlink into an
+#   unswept root; inner Nsight binaries (target-*/ncu) and other interpreters
+#   (node, a hand-built python) by absolute path; bash login shells keep the host
+#   PATH order (still locked via the shims); a Python-based agent CLI would hold
+#   the lock all session (none in use is); uv's own sdist/git builds in the
+#   shared ~/.cache/uv; agent CLI caches in ~/.cache start empty each session.
 # ~/.ssh and the docker socket are blanked too (either one is a one-command way
 # back to the host process table and the other cards). Because the host root
 # stays bound, this is HYGIENE plus process/GPU separation between sessions, NOT
@@ -41,7 +60,9 @@
 # Canary: before the model starts, scripts/lib/sandbox_canary.py sweeps the
 # visible tree INSIDE the same bwrap for anything result.json-shaped,
 # solution.py-shaped, run-dir-shaped, or runs-remote-*/runs-lambda-* shaped
-# that is not this run or the honeytoken; proves a host sentinel `sleep` started
+# that is not this run or the honeytoken, and any foreign archive tree anywhere
+# the home sweep reaches; proves every shimmed binary is the shim and /tmp and
+# ~/.cache are this run's; proves a host sentinel `sleep` started
 # for the check is invisible and unkillable (and still alive after); and proves
 # only the assigned GPU's UUID is reachable via NVML and via CUDA with
 # CUDA_VISIBLE_DEVICES unset, all indices, or another card's UUID. Any hit
@@ -160,10 +181,27 @@ kbh_sandbox_init() {
     done
     KBH_SBX+=(--setenv CUDA_VISIBLE_DEVICES 0 --tmpfs "$hide_root")
 
+    # --- foreign archives anywhere else the sandbox can read ----------------
+    # Any other KernelBench checkout or bench root, any outputs/runs*-style
+    # collection and any loose run dir with a result.json/solution.py under $HOME,
+    # /data, /mnt, /media, /srv, /opt, /scratch, /workspace or another readable
+    # home (2026-11-17: tetra's stale ~/dev/sites/kernelbench.com and a home backup
+    # under /mnt were readable). Bounded walk (sandbox_canary.py SWEEP_DEPTH, heavy
+    # trees pruned, no symlinks); the canary repeats it inside and refuses on a hit.
+    local must_hidden=() found_archives found
+    if ! found_archives="$("$canary_py" "$canary_src" --find-archives --home-sweep "$HOME" --skip "$hide_root")"; then
+        echo "STOP: foreign-archive discovery failed; refusing to launch" >&2
+        exit 4
+    fi
+    while IFS= read -r found; do
+        [ -n "$found" ] || continue
+        KBH_SBX+=(--tmpfs "$found")
+        must_hidden+=("$found")
+    done <<< "$found_archives"
+
     # --- stray archive trees outside the hide root --------------------------
     # Sibling bench checkouts on a thin worker ($HOME/hard, $HOME/kb-mega, ...)
     # and the known stray archive dir. Anything under hide_root is already gone.
-    local must_hidden=()
     local sib_parent extra b
     sib_parent="$(dirname "$repo_root")"
     for b in hard mega cuda mini multi v3; do
@@ -208,6 +246,33 @@ kbh_sandbox_init() {
                 ;;
         esac
     fi
+
+    # --- per-run /tmp and home caches (2026-11-17) ---------------------------
+    # TMPDIR and the TORCH/TRITON/CUDA cache variables already point into
+    # $RUN_DIR, but code that hardcodes /tmp or ~/.cache ignores them: a cuda
+    # session reused a /tmp clone an earlier run left, and a solution built into
+    # ~/.cache/torch. /tmp and /var/tmp become this run's $RUN_DIR/tmp (persisted
+    # with the archive, not RAM), and ~/.cache, ~/.triton, ~/.nv, ~/.cupy and
+    # ~/.tilelang become per-run dirs under $RUN_DIR/cache/home/. ~/.cache/uv is
+    # bound back shared: it is uv's content-addressed store of public wheels and
+    # index metadata, and a cold per-run cache would re-download torch on every
+    # `uv run` in the workspace. Residual: uv also caches wheels it builds from
+    # sdists/git sources there (no run archive, solution or clone a run made by hand).
+    mkdir -p "$run_dir/tmp" "$run_dir/cache/home/.cache"
+    KBH_SBX+=(--bind "$run_dir/tmp" /tmp)
+    [ -d /var/tmp ] && KBH_SBX+=(--bind "$run_dir/tmp" /var/tmp)
+    local cdir private_dirs=("/tmp=$run_dir/tmp")
+    KBH_SBX+=(--bind "$run_dir/cache/home/.cache" "$HOME/.cache")
+    private_dirs+=("$HOME/.cache=$run_dir/cache/home/.cache")
+    if [ -d "$HOME/.cache/uv" ]; then
+        KBH_SBX+=(--bind "$HOME/.cache/uv" "$HOME/.cache/uv")
+    fi
+    for cdir in .triton .nv .cupy .tilelang; do
+        [ -d "$HOME/$cdir" ] || continue
+        mkdir -p "$run_dir/cache/home/$cdir"
+        KBH_SBX+=(--bind "$run_dir/cache/home/$cdir" "$HOME/$cdir")
+        private_dirs+=("$HOME/$cdir=$run_dir/cache/home/$cdir")
+    done
 
     # --- Claude Code: its own config dir under agent_home, the host ~/.claude gone ---
     # Directory-level, because host tools (fleet sync) atomically rename new copies of
@@ -305,6 +370,120 @@ kbh_sandbox_init() {
         KBH_SBX+=(--ro-bind "$run_dir/.sandbox/empty" "$dsock")
     fi
 
+    # --- GPU lock on the binaries themselves (2026-11-17) ---------------------
+    # $RUN_DIR/bin first on PATH was the whole lock, and three ways round it ran a
+    # GPT-6.2 Astra session's GPU work unlocked for 52 minutes: a login shell's rc
+    # files put ~/.local/bin (python -> /usr/bin/python3) ahead of it, `source
+    # <bench>/.venv/bin/activate` puts the venv first, and an absolute interpreter
+    # path never consults PATH. So the real interpreter and toolchain files are
+    # replaced INSIDE the sandbox by a shim that runs gpu-lock-exec: every python
+    # (each /usr/bin and uv-managed CPython, which every venv's bin/python links
+    # to), uv, nvcc, ncu and nsys, by whatever path it is reached. Each binary's
+    # prefix (dirname of its bin dir) is also bound read-only at
+    # $RUN_DIR/.sandbox/lockshim/real/<n>, and the shim execs the binary from
+    # there, so nothing recurses and $ORIGIN libraries and toolkit-relative paths
+    # (nvcc.profile, ncu's ../nsight-compute-*) resolve. argv[0] is kept: a venv
+    # python still finds its pyvenv.cfg and sys.executable stays the shim, so
+    # subprocesses re-enter the lock (reentrant under KBH_GPU_LOCK_HELD). Grading
+    # runs on the host, outside the sandbox, and never sees the shims.
+    local shim_dir="$run_dir/.sandbox/lockshim"
+    rm -rf "$shim_dir"
+    mkdir -p "$shim_dir/real"
+    cat > "$shim_dir/realexec" <<'RXEOF'
+#!/bin/bash
+# kbh-gpu-lock-shim trampoline: exec the real binary under the caller's argv[0].
+real="$1"; argv0="$2"; shift 2
+exec -a "$argv0" "$real" "$@"
+RXEOF
+    chmod +x "$shim_dir/realexec"
+    local shim_targets=() shim_names=() cand cname creal
+    _kbh_shim_add() {   # <name> <path>...
+        local n="$1" p r t; shift
+        for p in "$@"; do
+            [ -n "$p" ] && [ -e "$p" ] || continue
+            r="$(readlink -f "$p")" || continue
+            [ -f "$r" ] && [ -x "$r" ] || continue
+            case "$r" in "$run_dir"/*) continue ;; esac
+            # Interpreters must be the binary itself, not a wrapper script.
+            if [ "$n" = python ] && [ "$(head -c 4 "$r" | od -An -c | tr -d ' ')" != '177ELF' ]; then
+                continue
+            fi
+            for t in ${shim_targets[@]+"${shim_targets[@]}"}; do
+                [ "$t" = "$r" ] && continue 2
+            done
+            shim_targets+=("$r")
+            shim_names+=("$n")
+        done
+    }
+    _kbh_shim_add python "${REAL_PYTHON:-}" "$_py" "$(command -v python3 || true)" "$(command -v python || true)" \
+        "$HOME"/.local/bin/python* /usr/bin/python3 /usr/bin/python3.[0-9]* /usr/local/bin/python3* \
+        "$HOME"/.local/share/uv/python/*/bin/python3.[0-9]*
+    _kbh_shim_add uv "${REAL_UV:-}" "$(command -v uv || true)" "$HOME/.local/bin/uv" "$HOME/.cargo/bin/uv" \
+        "$(command -v uvx || true)" "$HOME/.local/bin/uvx"
+    _kbh_shim_add nvcc "${REAL_NVCC:-}" "$(command -v nvcc || true)" /usr/local/cuda*/bin/nvcc
+    _kbh_shim_add ncu "${REAL_NCU:-}" "$(command -v ncu || true)" /usr/local/cuda*/bin/ncu \
+        /usr/local/cuda*/nsight-compute-*/ncu /opt/nvidia/nsight-compute/*/ncu
+    _kbh_shim_add nsys "${REAL_NSYS:-}" "$(command -v nsys || true)" /usr/local/cuda*/bin/nsys \
+        /usr/local/cuda*/nsight-systems-*/bin/nsys /opt/nvidia/nsight-systems*/*/bin/nsys
+    unset -f _kbh_shim_add
+    local i pfx rel slot prefixes=() pslots=() shim_q real_q
+    local wrapped_args=() canary_real=""
+    local canary_real_target
+    canary_real_target="$(readlink -f "$canary_py" 2>/dev/null || true)"
+    for i in "${!shim_targets[@]}"; do
+        creal="${shim_targets[$i]}"
+        cname="${shim_names[$i]}"
+        pfx="$(dirname "$(dirname "$creal")")"
+        rel="${creal#"$pfx"/}"
+        slot=""
+        for cand in "${!prefixes[@]}"; do
+            [ "${prefixes[$cand]}" = "$pfx" ] && slot="${pslots[$cand]}" && break
+        done
+        if [ -z "$slot" ]; then
+            slot="$shim_dir/real/${#prefixes[@]}"
+            mkdir -p "$slot"
+            prefixes+=("$pfx")
+            pslots+=("$slot")
+            KBH_SBX+=(--ro-bind "$pfx" "$slot")
+        fi
+        printf -v shim_q '%q' "$run_dir"
+        printf -v real_q '%q' "$slot/$rel"
+        {
+            printf '#!/bin/bash\n'
+            printf '# kbh-gpu-lock-shim for %s (scripts/lib/sandbox.sh): takes the GPU lock, then runs the real binary.\n' "$creal"
+            printf 'export RUN_DIR=%s KBH_GPU_LOCK=%q KBH_GPU_LOCK_LOG=%q\n' "$shim_q" "$gpu_lock" "$run_dir/gpu_lock.log"
+            printf 'exec %q %s %q %s "$0" "$@"\n' "$run_dir/bin/gpu-lock-exec" "$cname" "$shim_dir/realexec" "$real_q"
+        } > "$shim_dir/shim.$i"
+        chmod 755 "$shim_dir/shim.$i"
+        wrapped_args+=(--wrapped "$creal")
+        [ "$creal" = "$canary_real_target" ] && canary_real="$slot/$rel"
+    done
+    # Overlays only after every private prefix bind, so the private copies keep
+    # the real files.
+    for i in "${!shim_targets[@]}"; do
+        KBH_SBX+=(--ro-bind "$shim_dir/shim.$i" "${shim_targets[$i]}")
+    done
+    printf '%s\n' ${shim_targets[@]+"${shim_targets[@]}"} > "$shim_dir/targets.txt"
+
+    # Login shells (codex runs `zsh -lc`) re-read the host rc files, which put
+    # ~/.local/bin and the CUDA bin ahead of $RUN_DIR/bin, so plain `python` was
+    # the system one without torch and agents went hunting for venvs. A per-run
+    # ZDOTDIR sources each host zsh startup file and then puts $RUN_DIR/bin first
+    # again. The shims above are the enforcement; this keeps `python` the bench
+    # interpreter. bash login shells keep the host order (still locked).
+    local zd="$run_dir/.sandbox/zdotdir" zf
+    mkdir -p "$zd"
+    for zf in .zshenv .zprofile .zshrc .zlogin; do
+        {
+            printf '# kbh sandbox (scripts/lib/sandbox.sh): host %s, then the run lock wrappers first on PATH\n' "$zf"
+            printf '_kbh_zd="$ZDOTDIR"; ZDOTDIR="$HOME"\n'
+            printf '[[ -r "$HOME/%s" ]] && source "$HOME/%s"\n' "$zf" "$zf"
+            printf 'ZDOTDIR="$_kbh_zd"; unset _kbh_zd\n'
+            printf 'path=(%q ${path:#%q})\n' "$run_dir/bin" "$run_dir/bin"
+        } > "$zd/$zf"
+    done
+    KBH_SBX+=(--setenv ZDOTDIR "$zd")
+
     # --- honeytoken decoy run (deliberately visible, read-only) --------------
     local hp_score="0.9137"
     case "$repo_root" in *mega) hp_score="24.1337" ;; esac
@@ -346,8 +525,13 @@ HPEOF
     cp -p "$canary_src" "$run_dir/.sandbox/canary.py"
     local canary_args=(
         --run-id "$run_id" --allow "$hp_id" --walk "$hide_root"
+        --home-sweep "$HOME" --skip "$hide_root"
+        ${wrapped_args[@]+"${wrapped_args[@]}"}
     )
-    local mh
+    local mh pd
+    for pd in "${private_dirs[@]}"; do
+        canary_args+=(--private-dir "$pd")
+    done
     for mh in ${must_hidden[@]+"${must_hidden[@]}"}; do
         canary_args+=(--must-be-hidden "$mh")
     done
@@ -367,7 +551,11 @@ HPEOF
         done
     fi
     local canary_ok=1
-    "${KBH_SBX[@]}" "$canary_py" "$run_dir/.sandbox/canary.py" \
+    # The canary runs the interpreter from its private copy (realexec), not
+    # through the lock shim: a launch must not queue behind a sibling's GPU job.
+    local canary_cmd=("$canary_py")
+    [ -n "$canary_real" ] && canary_cmd=("$shim_dir/realexec" "$canary_real" "$canary_py")
+    "${KBH_SBX[@]}" "${canary_cmd[@]}" "$run_dir/.sandbox/canary.py" \
         "${canary_args[@]}" > "$run_dir/sandbox_canary.log" 2>&1 || canary_ok=0
     if ! kill -0 "$sentinel_pid" 2>/dev/null \
             || ! tr '\0' ' ' < "/proc/$sentinel_pid/cmdline" 2>/dev/null | grep -q "$sentinel_token"; then
@@ -383,7 +571,9 @@ HPEOF
     fi
 
     KBH_SANDBOX_ACTIVE=1
-    printf '{"active": true, "hide_root": "%s", "honeytoken_run_id": "%s", "beacon": "%s", "pid_namespace": true, "gpu_index": %s, "gpu_uuid": "%s", "gpu_device": "%s", "cuda_visible_devices": "0", "canary": "pass"}\n' \
-        "$hide_root" "$hp_id" "$KBH_SANDBOX_BEACON" "$gpu_index" "$gpu_uuid" "$gpu_node" > "$run_dir/sandbox.json"
-    echo "agent sandbox: bwrap hide-the-tree + own PID namespace + GPU $gpu_index only ($gpu_uuid as $gpu_node; root: $hide_root; honeytoken: $hp_id; canary: PASS)"
+    local n_foreign=0
+    [ -n "$found_archives" ] && n_foreign="$(printf '%s\n' "$found_archives" | grep -c .)"
+    printf '{"active": true, "hide_root": "%s", "honeytoken_run_id": "%s", "beacon": "%s", "pid_namespace": true, "gpu_index": %s, "gpu_uuid": "%s", "gpu_device": "%s", "cuda_visible_devices": "0", "foreign_archives_hidden": %s, "private_tmp": true, "gpu_lock_shims": %s, "canary": "pass"}\n' \
+        "$hide_root" "$hp_id" "$KBH_SANDBOX_BEACON" "$gpu_index" "$gpu_uuid" "$gpu_node" "$n_foreign" "${#shim_targets[@]}" > "$run_dir/sandbox.json"
+    echo "agent sandbox: bwrap hide-the-tree + own PID namespace + GPU $gpu_index only ($gpu_uuid as $gpu_node; root: $hide_root; $n_foreign foreign archive trees hidden; ${#shim_targets[@]} binaries lock-shimmed; per-run /tmp and caches; honeytoken: $hp_id; canary: PASS)"
 }

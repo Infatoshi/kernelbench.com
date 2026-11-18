@@ -261,3 +261,114 @@ def test_gpu_lock_wrapper_copies_identical_and_namespace_safe():
 def test_runners_still_source_shared_sandbox(script):
     text = (_ROOT / script).read_text()
     assert "kbh_sandbox_init" in text and "sandbox.sh" in text
+
+
+# --- 2026-11-17: foreign archives outside the hide root, lock shims, per-run dirs ---
+
+def _home_with_stale_checkout(tmp_path: Path) -> tuple[Path, Path, Path]:
+    """$HOME with the live checkout (hide root), a stale second checkout full of
+    archives, a loose pulled run and an unrelated project."""
+    home = tmp_path / "home"
+    live = home / "kernelbench.com"
+    (live / "benchmarks" / "cuda" / "outputs" / "runs" / RUN_ID).mkdir(parents=True)
+    (live / "kbtool").mkdir()
+    stale = home / "dev" / "sites" / "kernelbench.com"
+    old = stale / "benchmarks" / "mega" / "outputs" / "runs" / "20260801_101010_kimi_k3_02_kimi_linear_decode"
+    old.mkdir(parents=True)
+    (old / "solution.py").write_text("old kernel\n")
+    (stale / "kbtool").mkdir()
+    loose = home / "scratch" / "pulled" / "20260719_121747_codex_gpt-6_01_fp8_gemm"
+    loose.mkdir(parents=True)
+    (loose / "result.json").write_text("{}")
+    (home / "proj" / "src").mkdir(parents=True)
+    (home / "proj" / "src" / "result.json").write_text("{}")  # not run-dir shaped
+    return home, live, stale
+
+
+def test_find_archives_reports_stale_checkout_and_loose_runs(tmp_path):
+    home, live, stale = _home_with_stale_checkout(tmp_path)
+    found = dict(canary.find_archives([str(home)], [str(live)]))
+    assert found == {
+        str(stale): "KernelBench checkout",
+        str(home / "scratch" / "pulled"): "run dirs",
+    }
+
+
+def test_find_archives_descends_into_checkout_that_contains_the_hide_root(tmp_path):
+    """The smoke test's fake repo lives inside the real checkout: never hide an
+    ancestor of the hide root, but still report the archives inside it."""
+    home, live, _ = _home_with_stale_checkout(tmp_path)
+    fake = live / "out" / "smoke" / "fakerepo"
+    (fake / "benchmarks").mkdir(parents=True)
+    (fake / "kbtool").mkdir()
+    found = dict(canary.find_archives([str(home)], [str(fake)]))
+    assert str(live) not in found
+    assert found[str(live / "benchmarks" / "cuda" / "outputs" / "runs")] == "run archive collection"
+    assert str(fake) not in found
+
+
+def test_find_archives_ignores_symlinks_and_respects_depth(tmp_path):
+    home, live, stale = _home_with_stale_checkout(tmp_path)
+    (home / "link").symlink_to(stale)
+    deep = home / "a" / "b" / "c" / "d" / "e" / "f" / "g" / "h" / "i" / "kernelbench.com"
+    (deep / "benchmarks").mkdir(parents=True)
+    (deep / "kbtool").mkdir()
+    found = dict(canary.find_archives([str(home)], [str(live)]))
+    assert str(home / "link") not in found
+    assert str(deep) not in found          # deeper than SWEEP_DEPTH
+    assert dict(canary.find_archives([str(home)], [str(live)], max_depth=12))[str(deep)]
+
+
+def test_home_sweep_fails_canary_until_hidden(tmp_path, capsys):
+    home, live, stale = _home_with_stale_checkout(tmp_path)
+    args = ["--run-id", RUN_ID, "--walk", str(live), "--home-sweep", str(home), "--skip", str(live)]
+    assert canary.main(args) == 1
+    assert f"foreign KernelBench checkout outside the hide root: {stale}" in capsys.readouterr().out
+    # What the sandbox presents after the tmpfs: empty mountpoints.
+    import shutil
+    for p in (stale, home / "scratch" / "pulled"):
+        shutil.rmtree(p)
+        p.mkdir()
+    assert canary.main(args) == 0
+
+
+def test_find_archives_cli_prints_paths(tmp_path, capsys):
+    home, live, stale = _home_with_stale_checkout(tmp_path)
+    assert canary.main(["--find-archives", "--home-sweep", str(home), "--skip", str(live)]) == 0
+    assert str(stale) in capsys.readouterr().out.split()
+
+
+def test_wrapped_and_private_dir_checks(tmp_path):
+    shim = tmp_path / "python3.11"
+    shim.write_text("#!/bin/bash\n# kbh-gpu-lock-shim for /x (scripts/lib/sandbox.sh)\nexec true\n")
+    real = tmp_path / "python3.12"
+    real.write_bytes(b"\x7fELF\x02\x01\x01")
+    assert canary.check_wrapped(str(shim)) == []
+    assert canary.check_wrapped(str(real))
+    assert canary.check_wrapped(str(tmp_path / "missing"))
+    a, b = tmp_path / "a", tmp_path / "b"
+    a.mkdir()
+    b.mkdir()
+    assert canary.check_private_dir(str(a), str(a)) == []
+    assert canary.check_private_dir(str(a), str(b))
+
+
+def test_sandbox_sh_closes_the_2026_11_17_holes():
+    text = (_ROOT / "scripts/lib/sandbox.sh").read_text()
+    # Hole 1: discovery on the host, the same sweep inside the canary.
+    assert "--find-archives --home-sweep" in text
+    assert '--home-sweep "$HOME" --skip "$hide_root"' in text
+    # Hole 2: shims over the real binaries, private prefix copies, canary checks them.
+    for tool in ("_kbh_shim_add python", "_kbh_shim_add uv", "_kbh_shim_add nvcc",
+                 "_kbh_shim_add ncu", "_kbh_shim_add nsys"):
+        assert tool in text, tool
+    assert "kbh-gpu-lock-shim" in text and "--wrapped" in text and "exec -a" in text
+    assert "/bin/gpu-lock-exec" in text and "--setenv ZDOTDIR" in text
+    # Private prefix binds come before the overlays, or the shim would exec itself.
+    assert text.index('KBH_SBX+=(--ro-bind "$pfx" "$slot")') < \
+        text.index('KBH_SBX+=(--ro-bind "$shim_dir/shim.$i" "${shim_targets[$i]}")')
+    # Hole 3: per-run /tmp and home caches, uv's wheel cache shared.
+    assert 'KBH_SBX+=(--bind "$run_dir/tmp" /tmp)' in text
+    assert '--bind "$run_dir/cache/home/.cache" "$HOME/.cache"' in text
+    assert '--bind "$HOME/.cache/uv" "$HOME/.cache/uv"' in text
+    assert "--private-dir" in text

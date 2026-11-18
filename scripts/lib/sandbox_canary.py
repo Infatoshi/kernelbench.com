@@ -8,6 +8,13 @@ runs-remote-*/runs-lambda-* archive, or the published public/data/*/code tree.
 Any hit fails the launch (exit 1). The inverse of the old denylist: instead of
 enumerating paths to hide, prove nothing archive-shaped is visible.
 
+Since 2026-11-17 it also sweeps beyond the hide root (--home-sweep: $HOME, the
+data mounts, other readable homes) for other checkouts, bench roots, runs*
+collections and loose run dirs (find_archives; sandbox.sh calls the same
+function on the host with --find-archives to decide what to tmpfs), checks that
+every gpu-lock-shimmed binary is the shim (--wrapped), and that /tmp and the home
+caches are this run's (--private-dir).
+
 Allowed by name: this run's own directory and the deliberately planted
 honeytoken decoy (see sandbox.sh; beacon documented in kbtool/kb/contamination.py).
 
@@ -40,6 +47,174 @@ REMOTE_ARCHIVE_RE = re.compile(r"^runs-(remote|lambda)-")
 # Never descend into these; they are huge and cannot legally hold archives
 # (the strict rule that every KernelBench artifact stays in outputs/runs).
 PRUNE = {".git", ".venv", "node_modules", "__pycache__", ".cache", ".npm", ".bun"}
+
+
+# --- foreign archives anywhere the sandbox can reach (2026-11-17) --------------
+# The hide root is only this checkout. A stale second checkout (tetra's
+# ~/dev/sites/kernelbench.com, a home backup under /mnt) sat outside it with
+# hundreds of archives, readable inside the sandbox, and the canary said CLEAN.
+# find_archives() is run twice by sandbox.sh: on the host to list what to tmpfs,
+# and inside the sandbox (--home-sweep) to prove nothing archive-shaped is left.
+# Bounded: no symlinks followed, heavy trees pruned, at most SWEEP_DEPTH levels.
+SWEEP_DEPTH = 8
+SWEEP_WORKERS = 32      # fork-pool size cap for the sweep
+SWEEP_BUDGET = 1500     # directories per work unit before it hands its stack back
+SWEEP_PRUNE = PRUNE | {"site-packages", "dist-packages", ".rustup", ".cargo", ".nvm",
+                       ".pnpm-store", "proc", "sys", "lost+found"}
+SWEEP_EXTRA_ROOTS = ("/data", "/mnt", "/media", "/srv", "/opt", "/scratch", "/workspace")
+ARCHIVE_COLLECTION_RE = re.compile(r"^(runs|runs-.+|kb-remote-archives)$")
+
+
+def sweep_roots(home: str) -> list[str]:
+    """$HOME, the usual data mounts, and every other readable home on the box."""
+    roots = [home] + [r for r in SWEEP_EXTRA_ROOTS if os.path.isdir(r)]
+    homes_parent = os.path.dirname(home.rstrip("/")) or "/"
+    try:
+        others = sorted(os.listdir(homes_parent))
+    except OSError:
+        others = []
+    for name in others:
+        p = os.path.join(homes_parent, name)
+        if p != home and os.path.isdir(p) and not os.path.islink(p) and os.access(p, os.R_OK | os.X_OK):
+            roots.append(p)
+    return roots
+
+
+def _within(path: str, root: str) -> bool:
+    return path == root or path.startswith(root.rstrip("/") + "/")
+
+
+def _archive_kind(name: str, subdirs: set[str], entries: set[str]) -> str | None:
+    """Why a directory (its name, child dir names, all child names) is foreign
+    archive material, or None. Uses only the one scandir the walk already did."""
+    if "benchmarks" in subdirs and "kbtool" in subdirs:
+        return "KernelBench checkout"
+    if "problems" in subdirs and "outputs" in subdirs:
+        return "bench root"
+    if ARCHIVE_COLLECTION_RE.match(name) and any(RUN_DIR_RE.match(s) for s in subdirs):
+        return "run archive collection"
+    if RUN_DIR_RE.match(name) and ("result.json" in entries or "solution.py" in entries):
+        return "run dir"
+    return None
+
+
+def _walk(job: tuple) -> tuple[list[tuple[str, str]], list[tuple[str, int]]]:
+    """Depth-first sweep. job = (starts, skip, max_depth, budget): starts is a
+    list of (dir, depth). Visits at most `budget` directories (None: all) and
+    returns (hits, leftover) so a pool can rebalance the unvisited rest."""
+    starts, skip, max_depth, budget = job
+    hits: list[tuple[str, str]] = []
+    stack = list(starts)
+    visited = 0
+    while stack:
+        if budget is not None and visited >= budget:
+            break
+        visited += 1
+        path, depth = stack.pop()
+        try:
+            with os.scandir(path) as it:
+                entries = list(it)
+        except OSError:
+            continue
+        # d_type only: no stat per entry, and symlinked dirs are never followed.
+        subdirs = [e for e in entries if e.is_dir(follow_symlinks=False)]
+        if depth > 0 and not any(_within(s, path) for s in skip):
+            kind = _archive_kind(os.path.basename(path), {e.name for e in subdirs},
+                                 {e.name for e in entries})
+            if kind:
+                hits.append((path, kind))
+                continue
+        if depth >= max_depth:
+            continue
+        for e in subdirs:
+            if e.name in SWEEP_PRUNE or any(_within(e.path, s) for s in skip):
+                continue
+            stack.append((e.path, depth + 1))
+    return hits, stack
+
+
+def _sweep(starts: list[tuple[str, int]], skip: list[str], max_depth: int) -> list[tuple[str, str]]:
+    """All hits under starts. Serially, or (Linux, enough cores) as rounds of
+    budgeted work units on a fork pool: a ~400k-directory sweep of tetra's
+    $HOME, /mnt and /data took ~14 s on one core, and one wide subtree (a 40k-dir
+    cubin cache) defeated a fixed split depth."""
+    workers = min(SWEEP_WORKERS, (os.cpu_count() or 1) - 1)
+    picklable = getattr(sys.modules.get(_walk.__module__), "_walk", None) is _walk
+    if workers < 2 or not picklable or not sys.platform.startswith("linux"):
+        return _walk((starts, skip, max_depth, None))[0]
+    import multiprocessing
+    hits: list[tuple[str, str]] = []
+    pending = list(starts)
+    with multiprocessing.get_context("fork").Pool(workers) as pool:
+        while pending:
+            n = min(len(pending), workers * 4)
+            jobs = [(pending[i::n], skip, max_depth, SWEEP_BUDGET) for i in range(n)]
+            pending = []
+            for h, left in pool.imap_unordered(_walk, jobs):
+                hits += h
+                pending += left
+    return hits
+
+
+def find_archives(roots: list[str], skip: list[str], max_depth: int = SWEEP_DEPTH) -> list[tuple[str, str]]:
+    """(path, kind) of every topmost foreign archive tree under roots.
+
+    `skip` holds trees that are handled elsewhere (the hide root, this run).
+    A directory that CONTAINS a skipped tree (the live checkout above a smoke
+    repo) is never reported itself; the walk descends into it instead, so the
+    archives inside it are still reported one by one. Loose run dirs that share
+    a parent collapse to that parent when the parent is safe to hide.
+    """
+    skip = [os.path.abspath(s) for s in skip if s]
+    roots_abs = {os.path.abspath(r) for r in roots}
+    starts = [(r, 0) for r in dict.fromkeys(os.path.abspath(r) for r in roots)
+              if os.path.isdir(r) and not os.path.islink(r) and not any(_within(r, s) for s in skip)]
+    hits = sorted(set(_sweep(starts, skip, max_depth)))
+    # Collapse sibling loose run dirs to their parent (one mount, not hundreds).
+    by_parent: dict[str, list[tuple[str, str]]] = {}
+    for path, kind in hits:
+        if kind == "run dir":
+            by_parent.setdefault(os.path.dirname(path), []).append((path, kind))
+    out = [(p, k) for p, k in hits if k != "run dir"]
+    for parent, items in by_parent.items():
+        unsafe = (parent in roots_abs or parent == "/" or any(_within(s, parent) for s in skip))
+        if unsafe:
+            out.extend(items)
+        else:
+            out.append((parent, "run dirs"))
+    out.sort()
+    # Topmost only.
+    top: list[tuple[str, str]] = []
+    for p, k in out:
+        if not any(_within(p, t) for t, _ in top):
+            top.append((p, k))
+    return top
+
+
+def check_private_dir(dst: str, src: str) -> list[str]:
+    """dst inside the sandbox must be the very same directory as src (a bind)."""
+    try:
+        a, b = os.stat(dst), os.stat(src)
+    except OSError as e:
+        return [f"private dir check failed: {e}"]
+    if (a.st_dev, a.st_ino) != (b.st_dev, b.st_ino):
+        return [f"{dst} is shared with the host, not this run's {src}"]
+    return []
+
+
+LOCK_SHIM_MARKER = b"kbh-gpu-lock-shim"
+
+
+def check_wrapped(path: str) -> list[str]:
+    """path inside the sandbox must be the gpu-lock shim, not the real binary."""
+    try:
+        with open(path, "rb") as f:
+            head = f.read(256)
+    except OSError as e:
+        return [f"lock shim missing at {path}: {e}"]
+    if not head.startswith(b"#!") or LOCK_SHIM_MARKER not in head:
+        return [f"{path} is the real binary inside the sandbox (GPU lock bypassable)"]
+    return []
 
 
 def _is_published_code_dir(dirpath: str, name: str) -> bool:
@@ -206,6 +381,18 @@ def _cuda_probe_envs(others: list[str], n_host: int) -> dict[str, str | None]:
     return envs
 
 
+def _probe_python() -> str:
+    """The interpreter binary itself. Inside the sandbox sys.executable is the
+    gpu-lock shim path, and the canary must not queue on the GPU lock."""
+    try:
+        exe = os.readlink("/proc/self/exe")
+        if os.access(exe, os.X_OK):
+            return exe
+    except OSError:
+        pass
+    return sys.executable
+
+
 def probe_cuda_envs(envs: dict[str, str | None]) -> dict[str, list[str] | str]:
     """Run cuda_uuids() in a child per env (CUDA reads the variable at cuInit)."""
     procs = {}
@@ -215,7 +402,7 @@ def probe_cuda_envs(envs: dict[str, str | None]) -> dict[str, list[str] | str]:
         if cvd is not None:
             env["CUDA_VISIBLE_DEVICES"] = cvd
         procs[label] = subprocess.Popen(
-            [sys.executable, os.path.abspath(__file__), "--cuda-probe"],
+            [_probe_python(), os.path.abspath(__file__), "--cuda-probe"],
             env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
     out: dict[str, list[str] | str] = {}
     for label, p in procs.items():
@@ -275,8 +462,23 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--other-gpu-uuid", action="append", default=[],
                     help="another host GPU that must be unreachable")
     ap.add_argument("--host-gpu-count", type=int, default=0)
+    ap.add_argument("--find-archives", action="store_true",
+                    help="host mode: print foreign archive trees under the sweep roots, one per line")
+    ap.add_argument("--home-sweep", metavar="HOME",
+                    help="also sweep HOME, the data mounts and other readable homes for foreign archives")
+    ap.add_argument("--skip", action="append", default=[],
+                    help="tree the home sweep ignores (the hide root, swept by --walk)")
+    ap.add_argument("--wrapped", action="append", default=[],
+                    help="path that must be the gpu-lock shim inside the sandbox")
+    ap.add_argument("--private-dir", action="append", default=[], metavar="DST=SRC",
+                    help="DST inside the sandbox must be the same directory as this run's SRC")
     args = ap.parse_args(argv)
 
+    if args.find_archives:
+        home = args.home_sweep or os.path.expanduser("~")
+        for path, _ in find_archives(sweep_roots(home), args.skip):
+            print(path)
+        return 0
     if args.cuda_probe:
         print(json.dumps(cuda_uuids()))
         return 0
@@ -291,6 +493,24 @@ def main(argv: list[str] | None = None) -> int:
         ap.error("--run-id is required")
 
     hits = scan(args.walk, args.must_be_hidden, args.run_id, args.allow)
+    if args.home_sweep:
+        roots = sweep_roots(args.home_sweep)
+        home_hits = [f"foreign {kind} outside the hide root: {path}"
+                     for path, kind in find_archives(roots, args.skip)]
+        hits += home_hits
+        if not home_hits:
+            print(f"sandbox canary: no foreign archive under {', '.join(roots)} (depth {SWEEP_DEPTH})")
+    lock_hits = [h for p in args.wrapped for h in check_wrapped(p)]
+    hits += lock_hits
+    if args.wrapped and not lock_hits:
+        print(f"sandbox canary: {len(args.wrapped)} interpreter/toolchain paths are gpu-lock shims")
+    priv_hits = []
+    for spec in args.private_dir:
+        dst, _, src = spec.partition("=")
+        priv_hits += check_private_dir(dst, src)
+    hits += priv_hits
+    if args.private_dir and not priv_hits:
+        print(f"sandbox canary: per-run {', '.join(s.partition('=')[0] for s in args.private_dir)}")
     if args.sentinel_pid is not None:
         pid_hits = check_pidns(args.sentinel_pid, args.sentinel_token or "", args.host_pidns)
         hits += pid_hits

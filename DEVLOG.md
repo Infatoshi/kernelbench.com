@@ -28,10 +28,20 @@ Codex on tetra is now 0.169.0 (was 0.159.2); `gpt-6.2-astra` needs it on the nat
 sweep billed a different ChatGPT Pro login than tetra's own (that one was rate-limited); tetra's login and
 `~/.codex/config.toml` were restored afterwards. Fast service tier was off for the sessions.
 
-Open before the next release: delete or hide tetra's stale `~/dev/sites/kernelbench.com` (archives with
-solutions, visible inside the sandbox, missed by the canary), put the lock wrapper ahead of
-`~/.local/bin/python` inside the sandbox, and give each sandbox its own `/tmp` and `~/.cache`
-(`benchmarks/cuda/DEVLOG.md` 2026-11-17).
+Closed the same day in `scripts/lib/sandbox.sh` and `scripts/lib/sandbox_canary.py`, proven on tetra:
+(1) a bounded host sweep hides every foreign KernelBench archive under `$HOME`, `/data`, `/mnt`, `/scratch`
+and other readable roots (11 trees on tetra, incl. the stale `~/dev/sites/kernelbench.com`), and the
+canary fails when one is reachable anywhere it can see, not only under the hide root; (2) every real
+python, uv, nvcc, ncu and nsys binary is replaced in place inside the sandbox by a lock shim, so PATH
+order, venv activation and absolute interpreter paths all log a `gpu_lock.log` entry, and a per-run
+ZDOTDIR puts `$RUN_DIR/bin` first after the host zsh rc; (3) `/tmp`, `/var/tmp`, `~/.cache`, `~/.triton`,
+`~/.nv` are per run under `$RUN_DIR`, with `~/.cache/uv` (public wheels) shared. Residual: archives deeper
+than 8 levels, Nsight's inner `target-*` binaries by absolute path, uv-built wheels in the shared cache,
+and mega and cuda still taking separate locks on one physical GPU.
+
+Stranded archives: tetra's stale `~/dev/sites/kernelbench.com` (48 GB, not git) holds 44 run ids absent
+from the Mac, including the four audited-clean Opus 5 hard cells of 2026-07-24 (`155957` fp8_gemm,
+`160022`, `160047`, `160137`) that `models.json` publishes. Pull their thin sets before anyone deletes it.
 
 ## 2026-11-16 - Two sessions for the Mega cell, both printed
 
