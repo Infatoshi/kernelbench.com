@@ -1,5 +1,35 @@
 # KernelBench-CUDA — DEVLOG
 
+## 2026-11-19 - Gemini 4 Neon (XHigh) on tetra: 3/3 correct, two `clean`, one `interesting`
+
+`agy` harness, `gemini-4-neon-xhigh` (reasoning level in model id), three sessions on tetra GPU 0
+starting 3:04 to 3:05 pm CST 2026-11-18 alongside Mega 02. Isolated sequential regrades on quiet
+GPU 0 (12:37 to 12:51 am CST 2026-11-19) and quiet GPU 2 for 03 (1:06 to 1:18 am CST, replacing an
+initial GPU 0 regrade at 0.0736 overlapped by an unrelated `llama-imatrix` job on shape 3), plus
+audit probes on GPU 3 (timings strictly from the quiet GPU 0 / GPU 2 regrades):
+
+- 01 Fused MoE 0.1010, `clean`, 7th overall on an uniterated V1 first draft. Pure SM120 PTX
+  (`cp.async.cg`, `ldmatrix.x4`, bf16 `mma.sync`, 2-kernel streaming GEMV at `T <= 4`), zero cache
+  or graph; same-buffer overwrite cos(out1,out2) ~0, cos(ref,sol) 0.999997, 6/6 unseen seeds pass.
+  After its initial smoke test, sibling 02's deadlocked smoke test held the shared `cuda` lock from
+  3:18 to 6:01 pm, so this session exited cleanly at 5:29 pm without ever benchmarking or iterating.
+- 02 NSA 1.3506 (0.0730 ms geomean), `interesting`, 2nd overall (within 0.8% of #1 Sonnet 5.5 at
+  1.3619 / 0.0724 ms, well ahead of #3 Carbon at 1.1247 / 0.0879 ms). Exact 3xBF16 block scoring,
+  exact reference tie-break to larger block index (`S=1024/2048` tie probe cos 1.000000/0.999999),
+  lock-free inverted-index key-stationary attention with PTX `int8` partial outputs (`pack_i8x4`),
+  same design class as Sonnet 5.5. Overwrite recomputes on all three paths, 12/12 unseen seeds pass
+  (mean_abs 0.00028-0.00035, slightly tighter than Sonnet 5.5's 0.00037-0.00044), extended `S=16384`
+  passes (cos 0.999982). Operator sent `SIGTERM` three times: deadlocked smoke test (6:01 pm) and
+  two `lockshim` + `ncu` zombie hangs (7:24 pm, 8:36 pm; root DEVLOG 2026-11-19).
+- 03 MegaQwen 0.0755 (14,499 / 7,435 / 2,594 / 725 tok/s at 2k / 8k / 32k / 128k), `clean`, 3rd
+  overall (2nd `clean`, ahead of Opus 5.5 at 0.0739, Fable 5.2 at 0.0671, Carbon at 0.0612, and
+  GPT-6.2 Astra at 0.0578). SM120 CUDA Graph + Programmatic Dependent Launch (`griddepcontrol`),
+  exact PyTorch CPU MT19937 + Box-Muller noise computed on GPU inside the timed graph, full bf16 KV
+  cache (~1.56 TB/s at 128k). Same-buffer overwrite of hidden + KV recomputes (cos 0.999946),
+  `p.copy_` repacks cleanly (0.999952; `.data.copy_` bypasses `_version` like Sonnet 5.5), unseen
+  seeds 123/456 pass (0.999966/0.999964), 1-step `q_norm/k_norm` gain stress holds 0.999983-1.000000
+  through gain=8 (all finite), and `CUDA_LAUNCH_BLOCKING=1` completes cleanly in 0.35 s.
+
 ## 2026-11-17 — GPT-6.2 Astra [xhigh] on tetra: 3/3 correct, two `clean`, one `interesting`
 
 `codex` harness, native Codex CLI 0.169.0 on a ChatGPT Pro login (earlier CLIs reject `gpt-6.2-astra`

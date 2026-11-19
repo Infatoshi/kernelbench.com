@@ -6,6 +6,28 @@ Numbering note: entries before 2026-07-21 say "Problem 03" for the Kimi-Linear d
 
 ---
 
+## 2026-11-19 - Gemini 4 Neon (XHigh) on 02: 36.66x (`interesting`), new #1 overall
+
+`agy` harness, `gemini-4-neon-xhigh`, single session on tetra GPU 0 (3:04 pm to 11:25 pm CST
+2026-11-18, 1,000 turns, 1.98M output / 811K thinking tokens). Isolated sequential regrade on quiet
+GPU 0 at 12:36 to 12:37 am CST 2026-11-19 (graded surface `c522e2010e34`): 36.655x geomean
+(34.93x / 36.54x / 38.59x; 0.157 / 0.166 / 0.176 ms/tok; 6,350 / 6,012 / 5,686 tok/s; geomean
+6,010 tok/s), taking #1 overall ahead of Claude Opus 5.5 (35.34x), Sonnet 5.5 (31.65x), Fable 5.2
+(31.01x), and Gemini 4 Carbon (24.68x, +48.5%).
+
+Hand-written 2,529-line SM120 cooperative megakernel (`188 x 512`, `torch.profiler` confirms
+exactly 6 `kimi_decode_megakernel` launches across 6 steps, 0 other kernels): fused int4 dequant,
+online absorbed MLA, split-K tiled projections, and in-place chained decode. Marked `interesting`
+for three audit findings: (1) `dot32_bf2` accumulates 32-element GEMV chunks in `fma.rn.bf16x2`
+before reducing to FP32; (2) `*g_norm_sq = 0.0f` at `solution.py:1132`, `:1470`, and `:1764`
+executes before the preceding `grid.sync()` (0/60 graded ctx=8192 repeats and 0/50 6-step chains
+failed, though one 6-step chain under concurrent GPU load dropped at step 2 to cos 0.0174); (3)
+`_dense_arena` weight packing invalidates on `load_state_dict()` rather than bare `p.copy_()`.
+All attention-sensitive probes pass cleanly (identical rows x10 cos 0.99987, random cache x30 cos
+0.99978, unseen seeds 123/456 cos 0.99976-0.99983). Operator sent `SIGTERM` twice during the
+session: once for a deadlocked `python check.py` (6:01 pm) and once for the `lockshim` + `ncu`
+zombie hang (6:37 pm; root DEVLOG 2026-11-19).
+
 ## 2026-11-17 — GPT-6.2 Astra [xhigh] on 02: 23.48x and 22.93x, both `clean`, both stopped early
 
 `codex` harness, native Codex CLI 0.169.0, `gpt-6.2-astra` at xhigh (cuda DEVLOG 2026-11-17 has the

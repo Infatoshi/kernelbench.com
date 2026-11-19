@@ -6,6 +6,25 @@ benchmark. Per-benchmark journals live in `benchmarks/<bench>/DEVLOG.md`;
 
 ---
 
+## 2026-11-19 - Gemini 4 Neon (XHigh) release and sandbox `lockshim` + `ncu` deadlock bug
+
+First release of `agy` / `gemini-4-neon-xhigh` (default effort; reasoning level is part of the
+model id) across Mega 02 and CUDA 01-03 on tetra GPU 0 (one session per cell, 3:04 pm to 11:25 pm
+CST 2026-11-18, isolated sequential regrades 12:36 to 1:19 am CST 2026-11-19). All four cells
+passed, audited, and published: Mega 02 sets a new #1 at 36.66x (`interesting`), CUDA 02 takes #2
+at 1.3506 (0.0730 ms, `interesting`), CUDA 03 takes #3 (#2 `clean`) at 0.0755 after a clean GPU 2
+re-regrade (first GPU 0 regrade overlapped an unrelated `llama-imatrix` process on shape 3), and
+CUDA 01 lands 0.1010 (`clean`) on an uniterated V1 first draft after sibling CUDA 02's deadlock
+held the shared `cuda` GPU lock for 2h42m.
+
+Sandbox regression found from commit `014c9e2` (in-place `gpu-lock-exec` shims replacing real
+`python`/`python3` binaries inside the sandbox): when an agent profiles a Python workload under
+Nsight Compute (`ncu`), `ncu`'s `TreeLauncherSub` spawns the shimmed `python` and hangs permanently
+with a zombie `(gpu-lock-exec)` child, holding the GPU lock until killed. Hit Mega 02 once
+(6:37 pm) and CUDA 02 twice (7:24 pm, 8:36 pm); operator cleared each hung `ncu` child with
+`SIGTERM` so the sessions could recover. Follow-up: exempt `ncu` inner re-execs (or detect
+`NSIGHT_*` / `NCU_*` env in `gpu-lock-exec`) before the next release.
+
 ## 2026-11-17 - Two Mega sessions reverted: one session per release again
 
 Elliot reverted the 2026-11-16 "two sessions for the Mega cell" rule (commit f85f4c3, added by an agent,
