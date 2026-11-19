@@ -27,13 +27,16 @@ sys.path.insert(0, str(MONOREPO_ROOT))
 from scripts.redaction import redact_text  # noqa: E402
 from scripts.trace_privacy import private_call_ids  # noqa: E402
 
+from scripts.agy_full_parser import is_agy_full, parse_agy_full  # noqa: E402
 from scripts.kimi_wire_parser import parse_transcript  # noqa: E402
 from src.viewer.parsers import parse as _src_parse  # noqa: E402
 
 
 def parse(path: Path):
-    """Kimi Code 2.x goes to scripts/kimi_wire_parser.py (kept out of the
-    graded src tree); every other format to the bench's src parser."""
+    """Kimi Code 2.x and agy full transcripts go to scripts/ parsers (kept out
+    of the graded src tree); every other format to the bench's src parser."""
+    if is_agy_full(path):
+        return parse_agy_full(path)
     return parse_transcript(path, _src_parse)
 
 
@@ -59,7 +62,7 @@ def _pick_transcript(run_dir: Path) -> Path | None:
     """
     run_dir = Path(run_dir)
     # Explicit high-fidelity session files first.
-    for name in ("codex_session.jsonl",):
+    for name in ("codex_session.jsonl", "agy_transcript_full.jsonl"):
         p = run_dir / name
         if p.exists() and p.stat().st_size > 0:
             return p

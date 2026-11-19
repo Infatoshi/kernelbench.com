@@ -404,6 +404,41 @@ if [ -z "$real" ]; then
     echo "$name is unavailable" >&2
     exit 127
 fi
+owner_file="${KBH_GPU_LOCK}.owner"
+# Zero-fork pure-bash fast path for reentrant children (e.g. python spawned by
+# ncu's TreeLauncherSubreaper). Under Nsight Compute, LD_PRELOAD injects a
+# multithreaded profiler library into every child process, causing any bash
+# subshell $(...) inside this wrapper to deadlock with a defunct child. Walking
+# /proc/$p/stat with built-in `read` and matching the live ancestor's starttime
+# avoids every fork while keeping the exact same anti-spoofing guarantee.
+_stat_fields() { _sf_ppid="${2:-}"; _sf_st="${20:-}"; }
+if [ "${KBH_GPU_LOCK_HELD:-0}" = "1" ] && { [ -z "${RUN_DIR:-}" ] || [[ "$real" != "${RUN_DIR}/bin/"* ]]; }; then
+    held_pid=""
+    held_tag=""
+    [ -f "$owner_file" ] && IFS=$'\t' read -r held_pid _ held_tag < "$owner_file" || true
+    if [ -z "$held_pid" ]; then
+        exec "$real" "$@"
+    fi
+    held_st="${held_tag#*:}"
+    if [ -n "$held_st" ] && [ -r "/proc/$held_pid/stat" ]; then
+        IFS= read -r _line < "/proc/$held_pid/stat" || _line=""
+        set -f
+        _stat_fields ${_line##*) }
+        set +f
+        if [ "$_sf_st" = "$held_st" ]; then
+            _p=$$
+            while [ -n "$_p" ] && [ "$_p" -gt 1 ] 2>/dev/null; do
+                [ "$_p" = "$held_pid" ] && exec "$real" "$@"
+                [ -r "/proc/$_p/stat" ] || break
+                IFS= read -r _line < "/proc/$_p/stat" || break
+                set -f
+                _stat_fields ${_line##*) }
+                set +f
+                _p="$_sf_ppid"
+            done
+        fi
+    fi
+fi
 real_abs="$(readlink -f "$real" 2>/dev/null || printf '%s' "$real")"
 case "$name" in
     uv)
@@ -419,7 +454,6 @@ esac
 if [ -n "${RUN_DIR:-}" ] && [[ "$real_abs" == "${RUN_DIR}/bin/"* ]] && [ -n "$fallback" ]; then
     real="$fallback"
 fi
-owner_file="${KBH_GPU_LOCK}.owner"
 # Owner file: "<pid>\t<run_dir>\t<pidns>:<starttime>". Each agent sandbox has its
 # own PID namespace and the harness grades on the host under the same RUN_DIR, so
 # a bare PID from another namespace is a different process or none. Trust a PID

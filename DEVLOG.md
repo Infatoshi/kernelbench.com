@@ -6,6 +6,26 @@ benchmark. Per-benchmark journals live in `benchmarks/<bench>/DEVLOG.md`;
 
 ---
 
+## 2026-11-19 - Zero-fork `gpu-lock-exec` `ncu` fix, full `agy` thinking trace export, and Neon solo MoE rerun
+
+Closed the `lockshim` + `ncu` deadlock bug from earlier today in both `scripts/lib/run_harness.sh`
+and `benchmarks/mega/scripts/run_hard.sh` (byte-identical, enforced by `test_sandbox_canary.py`):
+when `KBH_GPU_LOCK_HELD=1`, `gpu-lock-exec` now runs a 100% zero-fork pure-bash `/proc/$p/stat`
+ancestor + `starttime` check before touching `readlink` or `awk`, eliminating every subshell fork
+inside `ncu`'s `LD_PRELOAD`-injected multithreaded children while preserving the exact anti-spoofing
+guarantee. Verified by 32/32 `test_sandbox_canary.py` tests and a live tetra GPU 2 `ncu` run
+(17 s, exit 0, `NCU_OK`).
+
+Added `scripts/agy_full_parser.py` (kept outside `benchmarks/*/src/`) and wired
+`benchmarks/{hard,cuda}/scripts/traces_to_hf.py` to prefer `agy_transcript_full.jsonl` when
+present so HuggingFace uploads preserve full `agy` thinking blocks instead of tool-only streaming
+updates; re-uploaded Mega 02 and CUDA 01-03 Neon traces with 0 redaction hits.
+
+Completed the solo Gemini 4 Neon (XHigh) CUDA 01 Fused MoE rerun (`20261119_123612`, 3 hours on
+tetra GPU 2, clean isolated re-regrade on quiet GPU 0 at 4:10 to 4:20 pm CST): 0.1105 (`clean`,
+#2 overall on Fused MoE, lifting Neon's CUDA composite from 0.9384 to 0.9665, within 2.9% of #1
+Sonnet 5.5 at 0.9951).
+
 ## 2026-11-19 - Gemini 4 Neon (XHigh) release and sandbox `lockshim` + `ncu` deadlock bug
 
 First release of `agy` / `gemini-4-neon-xhigh` (default effort; reasoning level is part of the

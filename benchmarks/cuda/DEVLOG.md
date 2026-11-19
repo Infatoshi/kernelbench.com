@@ -1,5 +1,28 @@
 # KernelBench-CUDA — DEVLOG
 
+## 2026-11-19 - Gemini 4 Neon (XHigh) solo Fused MoE rerun: 0.1105 (`clean`, #2 on MoE, CUDA composite 0.9665)
+
+Solo rerun (`20261119_123612_agy_gemini-4-neon-xhigh_01_glm52_fused_moe`) of CUDA 01 on tetra GPU 2
+(12:36 to 3:36 pm CST, 3.0 h wall, after deploying the zero-fork `gpu-lock-exec` `ncu` fix; an
+earlier GPU 0 attempt `20261119_114923` was aborted at minute 31 on the pre-fix `ncu` deadlock).
+Initial post-run grade (0.0717) and GPU 2 regrade (0.0807) overlapped an unrelated external host
+job on shapes 3 to 5; clean isolated sequential re-regrade on quiet GPU 0 (4:10 to 4:20 pm CST,
+5-second watch log confirmed zero foreign compute PIDs during the entire `benchmark.py` window):
+
+- 01 Fused MoE 0.1105, `clean`, 2nd overall (+9.4% over lock-blocked V1 0.1010, passing Fable 5.2
+  at 0.1085 and GPT-6.2 Astra at 0.1064, trailing only Sonnet 5.5 at 0.1130 by 2.2%). Self-contained
+  1,977-line SM120 CUDA/PTX/TMA suite with zero CPU-GPU sync across 4 adaptive regimes: split-warp
+  streaming GEMV for decode (`T <= 4`), single-barrier hybrid `cp.async` + 3D-TMA (`L2::evict_first`
+  when `nm==1`) with direct-store shared-expert overlap for small (`BM=64`) and medium (disjoint
+  `[BM=128, BM=192]`) batches, and sequential direct-store shared + universal 3-bucket
+  `[BM=128, BM=96, BM=192]` schedule minimizing `(padded_rows, m_tiles)` at `T=8192`. Sets board-best
+  latency at `T=1` (0.299 ms), `T=512` (7.921 ms), and `T=1000` (7.993 ms), with `T=4096/4127/8192`
+  at 8.829 / 9.069 / 14.215 ms. Live probes on GPU 0: 4/4 same-buffer overwrite regimes pass
+  (cos(out1,out2) ~0, cos(ref,sol) 0.999997), 12/12 unseen seeds (123/456 x 6 shapes) pass, and
+  `CUDA_LAUNCH_BLOCKING=1` passes on `T=512` and `T=4096`. Operator sent one `SIGTERM` at 1:52 pm
+  CST to a deadlocked scratch test (`bench_ab_v2.py`, host PID 943258 / sandbox PID 4521). Lifts
+  Neon's CUDA composite from 0.9384 to 0.9665 (#2 overall, within 2.9% of #1 Sonnet 5.5 at 0.9951).
+
 ## 2026-11-19 - Gemini 4 Neon (XHigh) on tetra: 3/3 correct, two `clean`, one `interesting`
 
 `agy` harness, `gemini-4-neon-xhigh` (reasoning level in model id), three sessions on tetra GPU 0
