@@ -11,7 +11,7 @@ Triton/DSL and pure PyTorch without a kernel.
 
 | NN | problem | skill |
 | -- | --- | --- |
-| 01 | `glm52_fused_moe` | GLM-5.2 MoE (256+shared, top-8) fused; ban Triton/vllm |
+| 01 | `glm52_fused_moe` | GLM-5.3 Fused MoE (256+shared, top-8) fused; ban Triton/vllm |
 | 02 | `deepseek_nsa` | Chinese weird arch: block top-n + sparse attn |
 | 03 | `megaqwen_decode` | Improve known MegaQwen CUDA megakernel geometry |
 

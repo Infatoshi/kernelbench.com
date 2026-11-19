@@ -4,7 +4,7 @@ CUDA-only writing bench (3 problems). Hard and Mega are frozen live boards, so t
 
 | NN | problem | note |
 | -- | ------- | ---- |
-| 01 | `01_glm52_fused_moe` | GLM-5.2 MoE (E=256, top_k=8, 1 shared); fused; ban Triton |
+| 01 | `01_glm52_fused_moe` | GLM-5.3 Fused MoE (E=256, top_k=8, 1 shared); fused; ban Triton |
 | 02 | `02_deepseek_nsa` | NSA-inspired block-select sparse attention; ms-anchored (dense-eq roofline is unreadable) |
 | 03 | `03_megaqwen_decode` | Qwen3-0.6B geometry; improve [MegaQwen](https://github.com/Infatoshi/MegaQwen); decode-only timed at ctx 2k to 128k; `BASELINE.md` in the problem dir |
 

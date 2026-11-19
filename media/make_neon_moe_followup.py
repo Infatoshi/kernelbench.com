@@ -124,7 +124,7 @@ ax.annotate("v3", xy=(105.5, 10.79), xytext=(0, -15), textcoords="offset points"
 ax.annotate("v4 self", xy=(174.5, 11.15), xytext=(-14, 9), textcoords="offset points", color=C["fg_muted"], fontsize=9, ha="center")
 
 fig.suptitle(
-    "Gemini 4 Neon on GLM-5.2 Fused MoE",
+    "Gemini 4 Neon on GLM-5.3 Fused MoE",
     color=C["fg_bright"],
     fontsize=16,
     fontweight="bold",

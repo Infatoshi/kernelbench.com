@@ -65,7 +65,7 @@ def main() -> None:
          ("Muse 1.3", 0.0879, True), ("Grok 4.5", 0.0844, False), ("K3 (1M)", 0.0810, False),
          ("Fable 5", 0.0804, False), ("Opus 4.8", 0.0653, False), ("K3 (256k)", 0.0595, False),
          ("V4 Flash", 0.0411, False)],
-        "GLM-5.2 Fused MoE · peak fraction · RTX PRO 6000", "{:.3f}",
+        "GLM-5.3 Fused MoE · peak fraction · RTX PRO 6000", "{:.3f}",
     )
 
 

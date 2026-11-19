@@ -123,7 +123,7 @@ export const PROBLEM_LABELS: Record<string, string> = {
   "06_sonic_moe_swiglu": "Sonic MoE",
   "07_w4a16_gemm": "W4A16 GEMM",
   "02_kimi_linear_decode": "Kimi-Linear Decode",
-  "01_glm52_fused_moe": "GLM-5.2 Fused MoE",
+  "01_glm52_fused_moe": "GLM-5.3 Fused MoE",
   "02_deepseek_nsa": "DeepSeek NSA",
   "03_megaqwen_decode": "MegaQwen Decode",
   "01_rmsnorm_residual": "RMSNorm + Residual",
