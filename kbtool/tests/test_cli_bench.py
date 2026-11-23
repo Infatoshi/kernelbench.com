@@ -15,14 +15,28 @@ def test_pop_bench_flag_forms():
     assert cli._pop_bench(argv) == "mini"
     assert argv == ["run", "x"]
     argv = ["publish"]
-    assert cli._pop_bench(argv) == "hard"
+    assert cli._pop_bench(argv) == "cuda"
 
 
 def test_pop_bench_env_fallback(monkeypatch):
-    monkeypatch.setenv("KB_BENCH", "cuda")
-    assert cli._pop_bench(["audit", "rid"]) == "cuda"
+    monkeypatch.setenv("KB_BENCH", "mega")
+    assert cli._pop_bench(["audit", "rid"]) == "mega"
     monkeypatch.delenv("KB_BENCH")
-    assert cli._pop_bench(["audit", "rid"]) == "hard"
+    assert cli._pop_bench(["audit", "rid"]) == "cuda"
+
+
+def test_deprecated_hard_refuses_without_override(monkeypatch):
+    root = Path(__file__).resolve().parents[2]
+    monkeypatch.delenv("KB_ALLOW_DEPRECATED", raising=False)
+    for fn, args in (
+        (cli.cmd_sweep, ["claude", "m"]),
+        (cli.cmd_run, ["claude", "m", "01_fp8_gemm"]),
+        (cli.cmd_publish, ["hard"]),
+    ):
+        with pytest.raises(SystemExit) as e:
+            fn(root, args, bench="hard")
+        assert "deprecated" in str(e.value)
+        assert "KB_ALLOW_DEPRECATED=1" in str(e.value)
 
 
 def test_default_problems_root_matches_bench_decks():

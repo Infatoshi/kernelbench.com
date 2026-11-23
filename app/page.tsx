@@ -29,16 +29,10 @@ export default async function HomePage() {
   const modelIdx = await loadModelIndex()
 
   const megaByGpu: NonNullable<HomeDeck["byGpu"]> = {}
-  const hardByGpu: NonNullable<HomeDeck["byGpu"]> = {}
   for (const g of HOME_GPU_TABS) {
     megaByGpu[g.key] = reportCardForBench(
       modelIdx,
       "mega",
-      g.key === "rtxpro6000" ? undefined : g.key,
-    )
-    hardByGpu[g.key] = reportCardForBench(
-      modelIdx,
-      "hard",
       g.key === "rtxpro6000" ? undefined : g.key,
     )
   }
@@ -61,14 +55,6 @@ export default async function HomePage() {
       byGpu: { rtxpro6000: cudaReport },
       gpus: [{ key: "rtxpro6000", label: "RTX PRO 6000" }],
       defaultGpu: "rtxpro6000",
-    },
-    {
-      key: "hard",
-      title: "Hard",
-      accent: "#a78bfa",
-      byGpu: hardByGpu,
-      gpus: HOME_GPU_TABS,
-      defaultGpu: DEFAULT_GPU,
     },
     {
       key: "multi",

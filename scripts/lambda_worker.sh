@@ -6,7 +6,7 @@
 #   lambda_worker.sh ls                           running instances
 #   lambda_worker.sh up <name> [type] [region]    launch (default per bench, see DEFAULT_TYPE)
 #   lambda_worker.sh sync <name>                  rsync thin bench -> name:kb-<bench>/
-#      (bench selected by KB_LAMBDA_BENCH, default hard; `multi` also ships ~/.kbm_env)
+#      (bench selected by KB_LAMBDA_BENCH, default cuda; `multi` also ships ~/.kbm_env)
 #   lambda_worker.sh bootstrap <name> [--agents]  uv + torch; --agents adds CLIs + auth
 #   lambda_worker.sh run <name> <harness> <model> <problem> [effort]
 #   lambda_worker.sh regrade <name> <run_id> [runs_dir]
@@ -24,10 +24,10 @@
 #      (default problems-h100), KBH_HARDWARE (default H100) for regrade.
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")/.." && pwd)"
-# Which bench this worker serves. Default `hard` keeps every existing invocation
-# byte-identical; KB_LAMBDA_BENCH=multi targets the 4xH100 deck, which has its
-# own entry script and problem root. (2026-07-28)
-BENCH="${KB_LAMBDA_BENCH:-hard}"
+# Which bench this worker serves. Default `cuda` (hard deprecated 2026-11-23);
+# KB_LAMBDA_BENCH=multi targets the 4xH100 deck, which has its own entry script
+# and problem root.
+BENCH="${KB_LAMBDA_BENCH:-cuda}"
 BENCH_DIR="$HERE/benchmarks/$BENCH"
 REMOTE_DIR="kb-$BENCH"
 [ -d "$BENCH_DIR" ] || { echo "ERROR: unknown bench '$BENCH'" >&2; exit 1; }

@@ -1,6 +1,8 @@
-# KernelBench-Hard: Design Specification
+# KernelBench-Hard: Design Specification (DEPRECATED)
 
-Last updated: 2026-04-27.
+Last updated: 2026-11-23.
+
+> **Status: Deprecated (2026-11-23).** KernelBench-Hard is frozen and no longer updated for new models; active benchmarks are KernelBench Mega (`benchmarks/mega/`) and KernelBench CUDA (`benchmarks/cuda/`). Historical results stay archived at `/hard` and in `Infatoshi/kernelbench-hard-traces`.
 
 ## Purpose
 

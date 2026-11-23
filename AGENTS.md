@@ -17,23 +17,23 @@ Monorepo for the KernelBench website and the evals. Canonical checkout is the Ma
 
 | bench | path | deck | drive it with | site |
 | --- | --- | --- | --- | --- |
-| hard | `benchmarks/hard/` | 6 per-op kernels, CUDA or Triton; per-GPU decks `problems-rtxpro6000` (default), `-h100`, `-b200` | `kb sweep` / `uv run kbh run` | `/hard` |
-| mega | `benchmarks/mega/` | 1 fused megakernel, `02_kimi_linear_decode` | `cd benchmarks/mega && ./scripts/run_hard.sh` | `/mega` |
-| cuda | `benchmarks/cuda/` | 3 CUDA-only problems; `src/eval/cuda_language.py` fails Triton, DSLs, pure torch | `kb -b cuda ...` | `/cuda` |
-| mini | `benchmarks/mini/` | 4 problems, sub-200B open weights, 30-min cap, 5 repeats, Lambda H100 SXM | `cd benchmarks/mini && ./scripts/sweep_mini.sh` | homepage category; unpublished, keep out of posts |
+| mega | `benchmarks/mega/` | 1 fused megakernel, `02_kimi_linear_decode` | `cd benchmarks/mega && ./scripts/run_hard.sh` | `/#mega` |
+| cuda | `benchmarks/cuda/` | 3 CUDA-only problems; `src/eval/cuda_language.py` fails Triton, DSLs, pure torch | `kb sweep` (default) | `/#cuda` |
+| hard | `benchmarks/hard/` | **DEPRECATED (2026-11-23)**; frozen 6-op archive (`KB_ALLOW_DEPRECATED=1` to run) | frozen | `/hard` (archive) |
+| mini | `benchmarks/mini/` | 4 problems, sub-200B open weights, 30-min cap, 5 repeats, Lambda H100 SXM | `cd benchmarks/mini && ./scripts/sweep_mini.sh` | unpublished |
 | multi | `benchmarks/multi/` | 4xH100 NVLink, frontier roster only | `benchmarks/multi/scripts/sweep_wave.sh` | unpublished |
 
-Hard, mega, and cuda share the runner and run unlimited. Removed stay removed (`04_kahan_softmax`, mega `01_rl_grid_ppo`, cuda `04_grid_mingru_sps`, v3, `environments/`). Eligibility is `benchmarks/<bench>/roster.yaml` (open benches: the leaderboard is the list; multi refuses off-roster before GPU time).
+Mega and cuda share the runner and run unlimited (hard is deprecated/frozen). Removed stay removed (`04_kahan_softmax`, mega `01_rl_grid_ppo`, cuda `04_grid_mingru_sps`, v3, `environments/`). Eligibility is `benchmarks/<bench>/roster.yaml` (open benches: the leaderboard is the list; multi refuses off-roster before GPU time).
 
 ## "Do a sweep of <model>" is an order, not a question
 
-State the assumption in one line ("Assuming: all problems, hard + mega, audited, published") and go. Scope: every problem in the deck for the current GPU plus the mega deck; an audit YAML for every passing cell; contamination check, redaction, `kb publish`, commit, push. Existing valid cells for the same (model, harness, problem, GPU) are not rerun. The human coming back to finished, audited, published results is the success condition. Interrupt only for `STOP: needs $X_API_KEY` (append the key to `~/.env_vars`, rerun), a shared GPU that never frees, or an ambiguous model identity. Post to X only after the live board, this run's kernel file, and this run's HF trace return 200.
+State the assumption in one line ("Assuming: cuda 01-03 + mega 02, audited, published") and go. Scope: every problem in the active deck for the current GPU plus mega; an audit YAML for every passing cell; contamination check, redaction, `kb publish`, commit, push. Existing valid cells for the same (model, harness, problem, GPU) are not rerun. The human coming back to finished, audited, published results is the success condition. Interrupt only for `STOP: needs $X_API_KEY` (append the key to `~/.env_vars`, rerun), a shared GPU that never frees, or an ambiguous model identity. Post to X only after the live board, this run's kernel file, and this run's HF trace return 200.
 
 ```
-kb sweep <harness> <model>      # all hard problems, parallel containers, unlimited time
-kb publish [hard|cuda|mini|mega] # rebuild leaderboard, viewers, models.json from archives
-kb deploy "<msg>"               # publish + commit + push
-kb -b <cuda|mini> run|sweep|audit|lint|traces-to-hf ...   # other benches; mega and multi keep their own drivers
+kb sweep <harness> <model>       # all cuda problems (default), parallel containers, unlimited time
+kb publish [cuda|mega|mini]      # rebuild leaderboard, viewers, models.json from archives
+kb deploy "<msg>"                # publish cuda + mega, commit, push
+kb -b <cuda|mini> run|sweep|audit|lint|traces-to-hf ...   # mega/multi have own drivers; hard deprecated
 kb lambda ... | kb brev ... | kb contamination <bench> | kb push-runs <bench> | kb help
 ```
 

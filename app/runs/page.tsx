@@ -1,97 +1,172 @@
-import { readdir } from "node:fs/promises"
-import { join } from "node:path"
-import { loadLeaderboard } from "@/app/_lib/data"
+import Link from "next/link"
+import {
+  ACTIVE_BENCHES,
+  BENCH_LABELS,
+  CANONICAL_GPU,
+  FLAG_VERDICTS,
+  SITE_HIDDEN_GPUS,
+  problemLabel,
+  visibleProblems,
+  type Bench,
+  type ModelCell,
+} from "@/app/_lib/models"
+import { loadAllModelIndex } from "@/app/_lib/models.server"
 import { PageHead } from "@/app/_components/page-head"
 
-// Full agent transcripts live on HuggingFace (per-run trace JSONL); the site
-// keeps only the raw submitted-kernel files locally. Each row links to its HF
-// trace, matching how /hard and /mega surface transcripts.
-const HARD_TRACES_HF = "https://huggingface.co/datasets/Infatoshi/kernelbench-hard-traces"
+// Active run ledger across Mega and CUDA (Hard was deprecated on 2026-11-23
+// and stays archived at /hard and Infatoshi/kernelbench-hard-traces).
 
-function traceUrl(runId: string): string {
-  return `${HARD_TRACES_HF}/blob/main/${runId}.jsonl`
+export const metadata = { title: "runs · kernelbench" }
+
+const MEGA_TRACES_HF =
+  "https://huggingface.co/datasets/Infatoshi/kernelbench-mega-traces"
+const CUDA_TRACES_HF =
+  "https://huggingface.co/datasets/Infatoshi/kernelbench-cuda-traces"
+const HARD_TRACES_HF =
+  "https://huggingface.co/datasets/Infatoshi/kernelbench-hard-traces"
+
+const GPU_LABELS: Record<string, string> = {
+  rtxpro6000: "RTX PRO 6000",
+  h100: "H100 PCIe",
+  b200: "B200",
+}
+
+const GPU_ORDER: Record<string, number> = {
+  rtxpro6000: 0,
+  h100: 1,
+  b200: 2,
 }
 
 type RunRow = {
+  key: string
   run_id: string
+  bench: Bench
+  gpu: string
   problem: string
+  modelSlug: string
+  modelName: string
   harness: string
-  model: string
-  effort: string
+  effort: string | null
+  score: number | null
+  latency_ms: number | null
+  valid: boolean
   correct: boolean
-  has_solution: boolean
+  verdict: string | null
+  outcome_label: string | null
   failure_reason: string | null
-  peak_fraction: number | null
   elapsed_seconds: number | null
+  trace_url: string | null
 }
 
 type RunsIndexProps = {
   searchParams?: Promise<{
     harness?: string | string[]
+    bench?: string | string[]
   }>
 }
 
-async function loadAllRuns(): Promise<RunRow[]> {
-  const lb = await loadLeaderboard()
-  const solutionEntries = new Set<string>()
-  try {
-    const entries = await readdir(join(process.cwd(), "public/runs"))
-    for (const n of entries) {
-      if (n.endsWith("_solution.py.txt"))
-        solutionEntries.add(n.slice(0, -"_solution.py.txt".length))
+async function loadActiveRuns(): Promise<RunRow[]> {
+  const idx = await loadAllModelIndex()
+  const out: RunRow[] = []
+  const seen = new Set<string>()
+
+  for (const m of idx.models) {
+    for (const bench of ACTIVE_BENCHES) {
+      const block = m.benches[bench]
+      if (!block) continue
+      const meta = idx.benches[bench]
+      const allowed = new Set(
+        visibleProblems(
+          bench,
+          meta?.problems?.length ? meta.problems : Object.keys(block.cells),
+        ),
+      )
+      const views: { gpu: string; cells: Record<string, ModelCell> }[] = [
+        { gpu: CANONICAL_GPU, cells: block.cells ?? {} },
+      ]
+      for (const [g, v] of Object.entries(block.gpus ?? {})) {
+        if (SITE_HIDDEN_GPUS.has(g)) continue
+        views.push({ gpu: g, cells: v.cells ?? {} })
+      }
+      for (const { gpu, cells } of views) {
+        for (const [problem, cell] of Object.entries(cells)) {
+          if (!allowed.has(problem) || !cell.run_id) continue
+          const key = `${bench}:${gpu}:${cell.run_id}:${problem}`
+          if (seen.has(key)) continue
+          seen.add(key)
+          out.push({
+            key,
+            run_id: cell.run_id,
+            bench,
+            gpu,
+            problem,
+            modelSlug: m.slug,
+            modelName: m.name,
+            harness: block.harness ?? "unknown",
+            effort: block.effort ?? null,
+            score: cell.score ?? null,
+            latency_ms: cell.latency_ms ?? null,
+            valid: Boolean(cell.valid),
+            correct: Boolean(cell.correct),
+            verdict: cell.verdict ?? null,
+            outcome_label: cell.outcome_label ?? null,
+            failure_reason: cell.failure_reason ?? null,
+            elapsed_seconds: cell.elapsed_seconds ?? null,
+            trace_url: cell.trace_url ?? null,
+          })
+        }
+      }
     }
-  } catch {
-    // no public/runs dir — page still works, just empty
   }
 
-  const out: RunRow[] = []
-  for (const m of lb.models) {
-    for (const [problem, cell] of Object.entries(m.results)) {
-      if (!solutionEntries.has(cell.run_id)) continue
-      out.push({
-        run_id: cell.run_id,
-        problem,
-        harness: m.harness,
-        model: m.model,
-        effort: m.effort,
-        correct: cell.correct,
-        has_solution: cell.has_solution,
-        failure_reason: cell.failure_reason ?? null,
-        peak_fraction: cell.peak_fraction,
-        elapsed_seconds: cell.elapsed_seconds ?? null,
-      })
-    }
-  }
-  // Sort by scored peak_fraction desc, with correctness-only no-perf rows before FAIL/ERR.
   out.sort((a, b) => {
-    const ap = a.correct ? a.peak_fraction ?? -0.5 : a.has_solution ? -1 : -2
-    const bp = b.correct ? b.peak_fraction ?? -0.5 : b.has_solution ? -1 : -2
-    return bp - ap
+    const ba = ACTIVE_BENCHES.indexOf(a.bench)
+    const bb = ACTIVE_BENCHES.indexOf(b.bench)
+    if (ba !== bb) return ba - bb
+    const ga = GPU_ORDER[a.gpu] ?? 9
+    const gb = GPU_ORDER[b.gpu] ?? 9
+    if (ga !== gb) return ga - gb
+    if (a.problem !== b.problem) return a.problem.localeCompare(b.problem)
+    const av = a.valid && a.score != null ? a.score : -1
+    const bv = b.valid && b.score != null ? b.score : -1
+    if (bv !== av) return bv - av
+    return a.modelName.localeCompare(b.modelName)
   })
+
   return out
 }
 
-function shortModel(harness: string, model: string, effort: string) {
-  let m = model.replace("openrouter-pinned/", "or/")
-  if (effort) m += ` [${effort}]`
-  return m
-}
-
-function statusCell(r: RunRow) {
-  if (r.correct) {
-    return r.peak_fraction !== null ? (
+function scoreCell(r: RunRow) {
+  if (r.valid && r.score != null) {
+    if (r.bench === "mega") {
+      return (
+        <span className="text-[var(--color-fg-bright)] tabular">
+          {r.score.toFixed(2)}×
+        </span>
+      )
+    }
+    if (r.bench === "cuda" && r.problem === "02_deepseek_nsa" && r.latency_ms != null) {
+      return (
+        <span className="text-[var(--color-fg-bright)] tabular">
+          {r.latency_ms.toFixed(3)} ms
+        </span>
+      )
+    }
+    return (
       <span className="text-[var(--color-fg-bright)] tabular">
-        {r.peak_fraction.toFixed(3)}
-      </span>
-    ) : (
-      <span className="text-[var(--color-bad)]">
-        {r.failure_reason === "benchmark_timeout" ? "BENCH" : "NO PERF"}
+        {(r.score * 100).toFixed(r.score >= 0.1 ? 1 : 2)}%
       </span>
     )
   }
-  if (r.has_solution)
-    return <span className="text-[var(--color-fg-dim)]">FAIL</span>
-  return <span className="text-[var(--color-bad)]">ERR</span>
+  const flagged = r.verdict && FLAG_VERDICTS.has(r.verdict)
+  if (flagged) {
+    return <span className="text-[var(--color-bad)]">{r.verdict}</span>
+  }
+  const label =
+    r.outcome_label ??
+    r.failure_reason?.replace(/_/g, " ") ??
+    (r.correct ? "unaudited" : "fail")
+  return <span className="text-[var(--color-fg-dim)]">{label}</span>
 }
 
 function harnessLabel(harness: string) {
@@ -103,11 +178,8 @@ function harnessLabel(harness: string) {
     kimi: "kimi",
     cursor: "Cursor",
     gemini: "Gemini CLI",
+    agy: "Antigravity",
     grok: "Grok Build",
-    "zai-claude": "Claude Code",
-    "minimax-claude": "Claude Code",
-    "deepseek-claude": "Claude Code",
-    "kimi-claude": "Claude Code",
   }
   if (harness.endsWith("-claude")) return "Claude Code"
   return labels[harness] ?? harness
@@ -120,54 +192,66 @@ function harnessClass(harness: string) {
 }
 
 export default async function RunsIndex({ searchParams }: RunsIndexProps) {
-  const allRuns = await loadAllRuns()
+  const allRuns = await loadActiveRuns()
   const params = searchParams ? await searchParams : {}
   const rawHarness = Array.isArray(params.harness)
     ? params.harness[0]
     : params.harness
+  const rawBench = Array.isArray(params.bench) ? params.bench[0] : params.bench
   const harnessFilter = rawHarness?.trim()
-  const runs = harnessFilter
-    ? allRuns.filter((r) => r.harness === harnessFilter)
-    : allRuns
+  const benchFilter =
+    rawBench === "mega" || rawBench === "cuda" ? rawBench : undefined
 
-  const scored = runs.filter((r) => r.correct && r.peak_fraction !== null).length
-  const noPerf = runs.filter((r) => r.correct && r.peak_fraction === null).length
-  const fails = runs.filter((r) => !r.correct && r.has_solution).length
-  const errs = runs.filter((r) => !r.correct && !r.has_solution).length
-  const title = harnessFilter ? `Runs · ${harnessLabel(harnessFilter)}` : "Run index"
+  const runs = allRuns.filter((r) => {
+    if (harnessFilter && r.harness !== harnessFilter) return false
+    if (benchFilter && r.bench !== benchFilter) return false
+    return true
+  })
+
+  const passed = runs.filter((r) => r.valid && r.score != null).length
+  const flagged = runs.filter(
+    (r) => r.verdict && FLAG_VERDICTS.has(r.verdict),
+  ).length
+  const other = runs.length - passed - flagged
+  const titleParts = ["Run index"]
+  if (benchFilter) titleParts.push(BENCH_LABELS[benchFilter])
+  if (harnessFilter) titleParts.push(harnessLabel(harnessFilter))
 
   return (
     <div className="space-y-6">
       <PageHead
         kicker="Index"
-        title={title}
+        title={titleParts.join(" · ")}
         sub={
           <>
-            <strong>{runs.length}</strong> runs · {scored} scored · {noPerf} no perf ·{" "}
-            {fails} fail · {errs} err
-            {harnessFilter && (
+            <strong>{runs.length}</strong> active Mega / CUDA cells · {passed}{" "}
+            audited pass · {flagged} flagged · {other} other
+            {(harnessFilter || benchFilter) && (
               <>
                 {" "}
-                · filter{" "}
-                <span className={harnessClass(harnessFilter)}>
-                  harness={harnessLabel(harnessFilter)}
-                </span>{" "}
-                (<a href="/runs">clear</a>)
+                · (<Link href="/runs">clear filters</Link>)
               </>
             )}
           </>
         }
         notes={
           <p>
-            One row per (model, problem) cell, scored rows sorted by peak
-            fraction desc. Click any row to open the full agent transcript on
-            HuggingFace — every tool call, every reasoning step, the
-            model&apos;s solution.py, and the result. Transcripts are published
-            as per-run JSONL in the{" "}
+            Active published cells across KernelBench Mega and CUDA. Click a
+            run to inspect per-shape timing, audit notes, and the redacted
+            kernel; full JSONL agent transcripts live on HuggingFace in{" "}
+            <a href={MEGA_TRACES_HF} target="_blank" rel="noreferrer">
+              kernelbench-mega-traces
+            </a>{" "}
+            and{" "}
+            <a href={CUDA_TRACES_HF} target="_blank" rel="noreferrer">
+              kernelbench-cuda-traces
+            </a>
+            . Archived runs from the deprecated{" "}
+            <Link href="/hard">Hard</Link> deck stay in{" "}
             <a href={HARD_TRACES_HF} target="_blank" rel="noreferrer">
               kernelbench-hard-traces
-            </a>{" "}
-            dataset.
+            </a>
+            .
           </p>
         }
       />
@@ -176,58 +260,73 @@ export default async function RunsIndex({ searchParams }: RunsIndexProps) {
         <table className="term tabular text-xs sm:text-sm">
           <thead>
             <tr>
-              <th>peak</th>
+              <th>score</th>
+              <th>bench</th>
+              <th>gpu</th>
               <th>problem</th>
               <th>model</th>
               <th>harness</th>
-              <th>elapsed</th>
-              <th>run id</th>
+              <th>run</th>
             </tr>
           </thead>
           <tbody>
-            {runs.map((r) => (
-              <tr key={r.run_id}>
-                <td className="text-right pr-4">{statusCell(r)}</td>
-                <td className="text-[var(--color-fg)] whitespace-nowrap">
-                  <a
-                    href={traceUrl(r.run_id)}
-                    target="_blank"
-                    rel="noreferrer"
-                    className="no-underline hover:text-[var(--color-accent)]"
-                  >
-                    {r.problem}
-                  </a>
-                </td>
-                <td className="text-[var(--color-fg-bright)] whitespace-nowrap">
-                  <a
-                    href={traceUrl(r.run_id)}
-                    target="_blank"
-                    rel="noreferrer"
-                    className="no-underline hover:text-[var(--color-accent)]"
-                  >
-                    {shortModel(r.harness, r.model, r.effort)}
-                  </a>
-                </td>
-                <td className={harnessClass(r.harness)}>
-                  {harnessLabel(r.harness)}
-                </td>
-                <td className="text-[var(--color-fg-muted)]">
-                  {r.elapsed_seconds !== null
-                    ? `${Math.round(r.elapsed_seconds / 60)}m`
-                    : "-"}
-                </td>
-                <td className="text-[var(--color-fg-muted)] text-[10px]">
-                  <a
-                    href={traceUrl(r.run_id)}
-                    target="_blank"
-                    rel="noreferrer"
-                    className="no-underline hover:text-[var(--color-accent)]"
-                  >
-                    {r.run_id}
-                  </a>
-                </td>
-              </tr>
-            ))}
+            {runs.map((r) => {
+              const runHref = `/runs/${r.gpu}/${r.run_id}`
+              return (
+                <tr key={r.key}>
+                  <td className="text-right pr-4 whitespace-nowrap">
+                    {scoreCell(r)}
+                  </td>
+                  <td className="text-[var(--color-fg-muted)] whitespace-nowrap uppercase text-[11px]">
+                    {BENCH_LABELS[r.bench]}
+                  </td>
+                  <td className="text-[var(--color-fg-muted)] whitespace-nowrap">
+                    {GPU_LABELS[r.gpu] ?? r.gpu}
+                  </td>
+                  <td className="text-[var(--color-fg)] whitespace-nowrap">
+                    <Link
+                      href={runHref}
+                      className="no-underline hover:text-[var(--color-accent)]"
+                    >
+                      {problemLabel(r.problem)}
+                    </Link>
+                  </td>
+                  <td className="text-[var(--color-fg-bright)] whitespace-nowrap">
+                    <Link
+                      href={`/models/${r.modelSlug}`}
+                      className="no-underline hover:text-[var(--color-accent)]"
+                    >
+                      {r.modelName}
+                    </Link>
+                  </td>
+                  <td className={`${harnessClass(r.harness)} whitespace-nowrap`}>
+                    {harnessLabel(r.harness)}
+                  </td>
+                  <td className="text-[var(--color-fg-muted)] text-[10px] whitespace-nowrap">
+                    <Link
+                      href={runHref}
+                      className="no-underline hover:text-[var(--color-accent)]"
+                    >
+                      {r.run_id}
+                    </Link>
+                    {r.trace_url && (
+                      <>
+                        {" "}
+                        <a
+                          href={r.trace_url}
+                          target="_blank"
+                          rel="noreferrer"
+                          className="text-[var(--color-fg-dim)] hover:text-[var(--color-accent)]"
+                          title="Open agent transcript on HuggingFace"
+                        >
+                          trace↗
+                        </a>
+                      </>
+                    )}
+                  </td>
+                </tr>
+              )
+            })}
           </tbody>
         </table>
       </section>

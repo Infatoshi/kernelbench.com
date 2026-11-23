@@ -209,8 +209,11 @@ export const HOME_GPU_TABS: { key: string; label: string }[] = [
   { key: "b200", label: "B200" },
 ]
 
-/** Homepage ranking chart order (Mega → CUDA → Hard). */
-export const HOME_BENCH_ORDER: Bench[] = ["mega", "cuda", "hard"]
+/** Active benchmark decks (Hard was deprecated on 2026-11-23). */
+export const ACTIVE_BENCHES: Bench[] = ["mega", "cuda"]
+
+/** Homepage ranking chart order (Mega → CUDA). */
+export const HOME_BENCH_ORDER: Bench[] = ["mega", "cuda"]
 
 /**
  * Lab brand presentation for charts (AA-style: bar color + logo keyed by lab).
@@ -656,11 +659,17 @@ export function reportCardForBench(
   }
 }
 
-/** Homepage index view: rank by benches fully passed, then mean normalized
- *  perf across benches attempted; per-bench pass chips on every row. */
-export function rowsForIndex(index: ModelIndex): { board: ModelRow[]; sink: ModelRow[] } {
-  const benches: Bench[] = ["mega", "hard", "cuda"]
+/** Models index view: rank by active benches (Mega, CUDA) fully passed, then
+ *  mean normalized perf across active benches attempted. Models that only ran
+ *  the deprecated Hard deck stay in `archived` rather than `sink`. */
+export function rowsForIndex(index: ModelIndex): {
+  board: ModelRow[]
+  archived: ModelRow[]
+  sink: ModelRow[]
+} {
+  const benches: Bench[] = ACTIVE_BENCHES
   const board: ModelRow[] = []
+  const archived: ModelRow[] = []
   const sink: ModelRow[] = []
   for (const m of index.models) {
     const attempted = benches.filter((b) => {
@@ -668,7 +677,10 @@ export function rowsForIndex(index: ModelIndex): { board: ModelRow[]; sink: Mode
       return blk && (blk.passed > 0 || Object.keys(blk.cells).length > 0)
     })
     if (attempted.length === 0) {
-      if (m.totals.audited > 0 || m.totals.flagged > 0) {
+      const hardBlk = m.benches.hard
+      if (hardBlk && (hardBlk.passed > 0 || Object.keys(hardBlk.cells).length > 0)) {
+        archived.push({ ...makeIndexRow(m, [], null), full: 0 })
+      } else if (m.totals.audited > 0 || m.totals.flagged > 0) {
         sink.push({ ...makeIndexRow(m, [], null), full: 0 })
       }
       continue
@@ -690,8 +702,9 @@ export function rowsForIndex(index: ModelIndex): { board: ModelRow[]; sink: Mode
     if (bp !== ap) return bp - ap
     return a.slug.localeCompare(b.slug)
   })
+  archived.sort((a, b) => a.slug.localeCompare(b.slug))
   sink.sort((a, b) => a.slug.localeCompare(b.slug))
-  return { board, sink }
+  return { board, archived, sink }
 }
 
 function makeIndexRow(
@@ -699,7 +712,7 @@ function makeIndexRow(
   attempted: Bench[],
   meanPerf: number | null,
 ): Omit<ModelRow, "full"> {
-  const order: Bench[] = ["mega", "hard", "cuda"]
+  const order: Bench[] = ACTIVE_BENCHES
   const badges = order
     .filter((b) => attempted.includes(b))
     .map((b) => {
@@ -713,6 +726,8 @@ function makeIndexRow(
     })
   const totalPassed = attempted.reduce((s, b) => s + m.benches[b]!.passed, 0)
   const totalProblems = attempted.reduce((s, b) => s + m.benches[b]!.total_problems, 0)
+  const activeAudited = ACTIVE_BENCHES.reduce((s, b) => s + (m.benches[b]?.audited ?? 0), 0)
+  const activeFlagged = ACTIVE_BENCHES.reduce((s, b) => s + (m.benches[b]?.flagged ?? 0), 0)
   return {
     slug: m.slug,
     name: m.name,
@@ -721,8 +736,8 @@ function makeIndexRow(
     passed: totalPassed,
     total: totalProblems,
     perf: meanPerf,
-    audited: m.totals.audited,
-    flagged: m.totals.flagged,
+    audited: activeAudited,
+    flagged: activeFlagged,
     badges,
   }
 }
@@ -917,13 +932,13 @@ export interface ColChart {
   maxValue: number
 }
 
-/** Per-model correctness across canonical boards: { pct, passed, total }. */
+/** Per-model correctness across active canonical boards: { pct, passed, total }. */
 function correctnessOf(index: ModelIndex, m: ModelEntry): {
   pct: number | null
   passed: number
   total: number
 } {
-  const order: Bench[] = ["mega", "hard", "cuda"]
+  const order: Bench[] = ACTIVE_BENCHES
   let passed = 0
   let total = 0
   for (const b of order) {

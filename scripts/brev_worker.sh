@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
-# Brev GPU worker lifecycle for the hard bench, driven from the control plane
-# (Mac or anvil). Wraps: provision -> sync -> bootstrap -> run/regrade -> pull
-# -> verified teardown. `kb brev ...` shells out here.
+# Brev GPU worker lifecycle for KernelBench (default cuda; hard deprecated),
+# driven from the control plane (Mac or anvil). Wraps: provision -> sync ->
+# bootstrap -> run/regrade -> pull -> verified teardown. `kb brev ...` shells
+# out here.
 #
 #   brev_worker.sh up <name> [type]             create instance (default hyperstack_H100) + wait + refresh ssh
-#   brev_worker.sh sync <name>                  rsync thin bench (KB_BREV_BENCH, default hard) -> <name>:kb-<bench>/
+#   brev_worker.sh sync <name>                  rsync thin bench (KB_BREV_BENCH, default cuda) -> <name>:kb-<bench>/
 #   brev_worker.sh bootstrap <name> [--agents]  uv + torch (cu128); --agents adds node + agent CLIs + auth
 #   brev_worker.sh run <name> <harness> <model> <problem> [effort]   detached agent session (problems root auto)
 #   brev_worker.sh regrade <name> <run_id> [runs_dir]   re-grade an archived solution.py: check.py then benchmark.py, sequentially
@@ -15,8 +16,8 @@
 #      KBH_HARDWARE (default H100) for roofline peaks on regrade.
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")/.." && pwd)"          # repo root
-# Bench selected by KB_BREV_BENCH (default hard) — mirrors KB_LAMBDA_BENCH.
-BENCH="${KB_BREV_BENCH:-hard}"
+# Bench selected by KB_BREV_BENCH (default cuda; hard deprecated) — mirrors KB_LAMBDA_BENCH.
+BENCH="${KB_BREV_BENCH:-cuda}"
 BENCH_DIR="$HERE/benchmarks/$BENCH"
 REMOTE_DIR="kb-$BENCH"
 [ -d "$BENCH_DIR" ] || { echo "ERROR: unknown bench '$BENCH'" >&2; exit 1; }

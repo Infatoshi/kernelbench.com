@@ -7,6 +7,7 @@ us one stable entrypoint to preserve while the runner internals move into Python
 from __future__ import annotations
 
 import argparse
+import os
 import shlex
 import subprocess
 import sys
@@ -59,6 +60,13 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def run_command(args: argparse.Namespace) -> int:
+    if os.environ.get("KB_ALLOW_DEPRECATED") != "1":
+        print(
+            "STOP: KernelBench-Hard is deprecated (superseded by cuda and mega). "
+            "Pass KB_ALLOW_DEPRECATED=1 to run anyway.",
+            file=sys.stderr,
+        )
+        return 2
     root = repo_root()
     runner = args.runner or root / "scripts" / "run_hard.sh"
     runner = runner if runner.is_absolute() else root / runner

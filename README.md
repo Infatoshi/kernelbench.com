@@ -13,14 +13,15 @@ history: each bench's `SPEC.md` and `DEVLOG.md`.
 
 | bench | path | what | site |
 | --- | --- | --- | --- |
-| **hard** | `benchmarks/hard/` | per-op kernels (CUDA or Triton), roofline-graded | [/hard](https://kernelbench.com/hard) |
-| **mega** | `benchmarks/mega/` | full fused megakernels | [/mega](https://kernelbench.com/mega) |
-| **cuda** | `benchmarks/cuda/` | CUDA-only writing deck (Triton/DSL fail) | [/cuda](https://kernelbench.com/cuda) |
+| **mega** | `benchmarks/mega/` | full fused megakernels | [/#mega](https://kernelbench.com/#mega) |
+| **cuda** | `benchmarks/cuda/` | CUDA-only writing deck (Triton/DSL fail) | [/#cuda](https://kernelbench.com/#cuda) |
+| **hard** | `benchmarks/hard/` | **deprecated** (2026-11-23) per-op CUDA/Triton deck, frozen archive | [/hard](https://kernelbench.com/hard) |
 | **mini** | `benchmarks/mini/` | small-model (<200B) deck, capped + 5-repeat (WIP) | homepage scroll category on `/` when debuted (not `/mini`) |
 | **multi** | `benchmarks/multi/` | 4×H100 NVLink multi-GPU (WIP, frontier roster) | unpublished |
 
-Hard / mega / cuda share harness machinery and run unlimited wall-clock
-(`BUDGET_SECONDS=0`). Mini is capped; multi is sequential on a 4-GPU node.
+Mega and cuda share harness machinery and run unlimited wall-clock
+(`BUDGET_SECONDS=0`). Hard is deprecated and frozen (archived at `/hard`). Mini
+is capped; multi is sequential on a 4-GPU node.
 
 ## Website (local)
 

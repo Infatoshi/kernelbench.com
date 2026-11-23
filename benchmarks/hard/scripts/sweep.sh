@@ -8,6 +8,11 @@
 
 set -euo pipefail
 
+if [ "${KB_ALLOW_DEPRECATED:-0}" != "1" ]; then
+    echo "STOP: KernelBench-Hard is deprecated (superseded by cuda and mega). Pass KB_ALLOW_DEPRECATED=1 to sweep anyway." >&2
+    exit 2
+fi
+
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$REPO_ROOT"
 

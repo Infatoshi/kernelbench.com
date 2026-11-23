@@ -152,7 +152,7 @@ def _write_run(run_dir: Path) -> None:
     (run_dir / "transcript.jsonl").write_text("\n".join(json.dumps(x) for x in lines) + "\n")
 
 
-# mega has no exporter of its own: kb falls back to hard's.
+# mega has no exporter of its own: kb falls back to cuda's.
 @pytest.mark.parametrize("bench", ["hard", "cuda", "mini"])
 def test_exporter_drops_paired_ps_call_keeps_neighbour(bench, tmp_path):
     run = tmp_path / "runs" / "20261116_000000_claude_m_01_x"
@@ -171,7 +171,7 @@ def test_exporter_drops_paired_ps_call_keeps_neighbour(bench, tmp_path):
 def test_mega_falls_back_to_a_filtering_exporter():
     assert not (ROOT / "benchmarks/mega/scripts/traces_to_hf.py").exists()
     cli = (ROOT / "kbtool/kb/cli.py").read_text()
-    assert '_bench_dir(root, "hard") / "scripts" / "traces_to_hf.py"' in cli
+    assert '_bench_dir(root, "cuda") / "scripts" / "traces_to_hf.py"' in cli
     for bench in ("hard", "cuda", "mini"):
         src = (ROOT / "benchmarks" / bench / "scripts" / "traces_to_hf.py").read_text()
         assert "from scripts.trace_privacy import private_call_ids" in src, bench

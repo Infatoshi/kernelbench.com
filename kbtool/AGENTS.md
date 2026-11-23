@@ -3,10 +3,10 @@
 `kb` is this uv package: `uv tool install -e ./kbtool` once (editable), or `uv run --project kbtool python -m kb ...` on a fresh box. Repo root: walk up from cwd, or `KB_REPO_ROOT`. Harness routes, runner behaviour, rented nodes, and every `KB_` variable live here. Bench internals and `KBH_`: `benchmarks/hard/AGENTS.md`. Publish gates: root `AGENTS.md`.
 
 ```
-kb sweep <harness> <model>      # all hard problems, parallel containers, unlimited time
-kb publish [hard|cuda|mini|mega] # rebuild leaderboard, viewers, models.json from archives
-kb deploy "<msg>"               # publish + commit + push
-kb -b <cuda|mini> run|sweep|audit|lint|traces-to-hf ...   # other benches; mega and multi keep their own drivers
+kb sweep <harness> <model>      # all cuda problems (default), parallel containers, unlimited time
+kb publish [cuda|mini|mega]     # rebuild leaderboard, viewers, models.json from archives (hard deprecated)
+kb deploy "<msg>"               # publish cuda + mega, commit, push
+kb -b <cuda|mini> run|sweep|audit|lint|traces-to-hf ...   # other benches; mega/multi have own drivers; hard deprecated
 kb lambda ... | kb brev ... | kb contamination <bench> | kb push-runs <bench> | kb help
 ```
 
@@ -171,23 +171,24 @@ The following variables can change the meaning, comparability, publishability, o
 
 | Var | Read by (paths) | Default | What it changes | Notes |
 | --- | --- | --- | --- | --- |
-| `KB_ALLOW_LOCAL` | `kbtool/kb/cli.py` | unset / `0` | Lets `kb run` and `kb sweep` proceed on the local host when the normal remote-worker guard would refuse. | Safety override; value must be `1`. |
-| `KB_BENCH` | `kbtool/kb/cli.py` | `hard` | Default bench for `kb` commands when no `-b/--bench` flag is passed. | Flag wins over env. Benches: hard, cuda, mini, mega, multi. |
-| `KB_BENCH_BANNER` | `scripts/lib/run_harness.sh` | `KERNELBENCH RUN` | Banner line printed at session start. | Pinned by each bench's `run_hard.sh` wrapper; not user-set. |
-| `KB_BENCH_DIR` | `scripts/lib/run_harness.sh` | required | Bench root (outputs/, problems, src/) the shared runner operates in. | Pinned by each bench's `run_hard.sh` wrapper; the lib refuses to run without it. |
-| `KB_BUDGET_SECONDS_DEFAULT` | `scripts/lib/run_harness.sh` | `0` (unlimited) | Bench-identity wall-clock cap default (mini pins `1800`). | Pinned by the wrapper. Per-run override remains `KBH_BUDGET_SECONDS_OVERRIDE` (see Danger). |
-| `KB_BREV_BENCH` | `scripts/brev_worker.sh` | `hard` | Selects the bench directory, remote directory, runner, and sync/pull payload for a Brev worker. | Bench identity changes the problem deck and publication destination. |
-| `KB_BREV_PROBLEMS_ROOT` | `scripts/brev_worker.sh` | `problems-h100` | Selects the problem tree synced to and run on a Brev worker. | Deck identity affects comparability. |
-| `KB_BREV_RUN_ENV` | `scripts/brev_worker.sh` | empty | Extra `VAR=VALUE` pairs injected into the detached remote run environment (for example, a shared GPU-lock path). | Injected values can change provider, grading, or isolation. Never put secrets here because the string lands in remote argv. |
-| `KB_BREV_TYPE` | `scripts/brev_worker.sh` | `hyperstack_H100` | Selects the Brev instance type for `up` when no positional type is supplied. | Can change cost and hardware. |
-| `KB_LAMBDA_BENCH` | `scripts/lambda_worker.sh` | `hard` | Selects the bench directory, remote directory, runner, and sync payload. | `multi` also changes the default problem root and ships `.kbm_env`. |
-| `KB_LAMBDA_PROBLEMS_ROOT` | `scripts/lambda_worker.sh` | `problems-h100`; `problems-h100x4` for Multi | Selects the problem tree used by the Lambda worker. | Deck identity affects comparability. |
-| `KB_LAMBDA_REGION` | `scripts/lambda_worker.sh` | empty, auto-pick available region | Pins the launch region instead of capacity-based selection. | May affect availability; instance cost follows Lambda pricing. |
-| `KB_LAMBDA_RUN_ENV` | `scripts/lambda_worker.sh` | empty | Extra `VAR=VALUE` pairs injected into the remote run's environment by `kb lambda run` (e.g. `KBH_OR_PROVIDER=novita KBH_BUDGET_SECONDS_OVERRIDE=900`). | Whatever it injects can change budget, provider identity, or grading — the injected vars carry their own danger flags. Never put secrets here (lands in remote argv). |
-| `KB_LAMBDA_SSH_KEYS` | `scripts/lambda_worker.sh` | current host key name (`macbook` or `anvil`) | Selects the Lambda account SSH key attached at launch. | Lambda's launch API accepts exactly one key here. |
-| `KB_LAMBDA_SSH_USER` | `scripts/lambda_worker.sh` | `ubuntu` | Selects the remote SSH/rsync user. | Operational only. |
-| `KB_LAMBDA_TORCH_INDEX` | `scripts/lambda_worker.sh` | `https://download.pytorch.org/whl/cu128` | Selects the PyTorch wheel index used during worker bootstrap. | Can change the CUDA/PyTorch runtime. |
-| `KB_LAMBDA_TYPE` | `scripts/lambda_worker.sh` | `gpu_1x_h100_pcie` (mini `gpu_1x_h100_sxm5`, multi `gpu_8x_h100_sxm5`) | Selects the Lambda instance type when no positional type is supplied. | Direct cost and hardware control. |
-| `KB_REPO_ROOT` | `kbtool/kb/cli.py` | walk up from cwd | Overrides where `kb` finds the monorepo. | Honoured only if it contains `benchmarks/`. |
+| `KB_ALLOW_DEPRECATED` | `kbtool/kb/cli.py`, `benchmarks/hard/` | `0` | Allows running, sweeping, or publishing deprecated `hard`. | Archive replay only (`1`). |
+| `KB_ALLOW_LOCAL` | `kbtool/kb/cli.py` | `0` | Lets `kb run`/`sweep` run locally without remote-worker guard. | Override (`1`). |
+| `KB_BENCH` | `kbtool/kb/cli.py` | `cuda` | Default bench when `-b/--bench` is omitted. | Active: cuda, mini, mega, multi (`hard` deprecated). |
+| `KB_BENCH_BANNER` | `scripts/lib/run_harness.sh` | `KERNELBENCH RUN` | Banner printed at session start. | Pinned by `run_hard.sh` wrapper. |
+| `KB_BENCH_DIR` | `scripts/lib/run_harness.sh` | required | Bench root (`outputs/`, `problems*`, `src/`). | Pinned by `run_hard.sh` wrapper. |
+| `KB_BUDGET_SECONDS_DEFAULT` | `scripts/lib/run_harness.sh` | `0` | Bench wall-clock default (`mini`: `1800`). | Pinned by wrapper; override via `KBH_BUDGET_SECONDS_OVERRIDE`. |
+| `KB_BREV_BENCH` | `scripts/brev_worker.sh` | `cuda` | Bench synced and run on a Brev worker. | Changes deck and publish target. |
+| `KB_BREV_PROBLEMS_ROOT` | `scripts/brev_worker.sh` | `problems-h100` | Problem tree synced to a Brev worker. | Affects comparability. |
+| `KB_BREV_RUN_ENV` | `scripts/brev_worker.sh` | empty | Extra `VAR=VALUE` pairs injected into remote run env. | Lands in remote argv; never put secrets here. |
+| `KB_BREV_TYPE` | `scripts/brev_worker.sh` | `hyperstack_H100` | Default Brev instance type for `up`. | Affects cost and hardware. |
+| `KB_LAMBDA_BENCH` | `scripts/lambda_worker.sh` | `cuda` | Bench synced and run on Lambda. | `multi` ships `.kbm_env` and uses `problems-h100x4`. |
+| `KB_LAMBDA_PROBLEMS_ROOT` | `scripts/lambda_worker.sh` | `problems-h100` | Problem tree on Lambda (`multi`: `problems-h100x4`). | Affects comparability. |
+| `KB_LAMBDA_REGION` | `scripts/lambda_worker.sh` | auto | Pins Lambda launch region. | Affects availability and pricing. |
+| `KB_LAMBDA_RUN_ENV` | `scripts/lambda_worker.sh` | empty | Extra `VAR=VALUE` pairs for `kb lambda run`. | Lands in remote argv; never put secrets here. |
+| `KB_LAMBDA_SSH_KEYS` | `scripts/lambda_worker.sh` | host key (`macbook`/`anvil`) | Single Lambda SSH key attached at launch. | API accepts one key. |
+| `KB_LAMBDA_SSH_USER` | `scripts/lambda_worker.sh` | `ubuntu` | Remote SSH/rsync user. | Operational. |
+| `KB_LAMBDA_TORCH_INDEX` | `scripts/lambda_worker.sh` | `cu128` wheel index | PyTorch wheel index during bootstrap. | Changes CUDA/PyTorch runtime. |
+| `KB_LAMBDA_TYPE` | `scripts/lambda_worker.sh` | `gpu_1x_h100_pcie` | Default Lambda instance (`mini` `sxm5`, `multi` `8x`). | Controls cost and hardware. |
+| `KB_REPO_ROOT` | `kbtool/kb/cli.py` | walk up from cwd | Overrides monorepo root for `kb`. | Must contain `benchmarks/`. |
 
 Scan exclusions (tokens the `kbtool/tests` scan finds that are not caller-facing variables): `KB_BREV_GPU` appears only in a stale comment; `scripts/brev_worker.sh` does not read it. `KB_LAMBDA_DEFAULT_KEY` is a substring of the shell-local `_KB_LAMBDA_DEFAULT_KEY`, which is computed from `hostname`.

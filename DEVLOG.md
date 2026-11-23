@@ -6,6 +6,23 @@ benchmark. Per-benchmark journals live in `benchmarks/<bench>/DEVLOG.md`;
 
 ---
 
+## 2026-11-23 - Deprecate KernelBench-Hard across benchmark CLI and website
+
+Deprecated KernelBench-Hard (frozen historical archive; active frontier boards are Mega and CUDA).
+
+- Website: dropped the Hard deck from the homepage (`/`), excluded Hard from active `/models`
+  rankings and `/models/[slug]` headline totals (Hard-only models move to an archived section
+  and model detail pages show Hard below active boards with a `deprecated` pill), updated
+  `/runs` from Hard-only to active Mega + CUDA published runs, and converted `/hard` from a
+  broken `/#hard` redirect into a frozen archive page with a deprecation banner. Historical
+  `/runs/<gpu>/<rid>` links continue working with a `deprecated` pill and `/hard` back-link.
+- Tooling: switched default bench from `hard` to `cuda` in `kbtool/kb/cli.py`,
+  `scripts/lambda_worker.sh`, and `scripts/brev_worker.sh`; added `KB_ALLOW_DEPRECATED=1`
+  refusal guards to `kb` (`sweep`/`run`/`publish`), `benchmarks/hard/src/kbh/cli.py`, and
+  `benchmarks/hard/scripts/{run_hard,sweep,sweep_deck}.sh`; updated `kb deploy` to publish
+  only `cuda` and `mega` and `scripts/check_publish_gates.py` gate E to skip frozen `hard`
+  unless `--list-stale hard` is passed.
+
 ## 2026-11-19 - Zero-fork `gpu-lock-exec` `ncu` fix, full `agy` thinking trace export, and Neon solo MoE rerun
 
 Closed the `lockshim` + `ncu` deadlock bug from earlier today in both `scripts/lib/run_harness.sh`

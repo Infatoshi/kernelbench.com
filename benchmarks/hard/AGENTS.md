@@ -1,19 +1,8 @@
-# KernelBench-Hard — and the single-GPU bench internals (hard, cuda, mini; mega deltas noted)
+# KernelBench-Hard (DEPRECATED) — single-GPU bench internals (cuda, mini; mega deltas noted)
 
-Per-op GPU kernel bench: frontier coding agents write competitive CUDA or Triton kernels, unlimited wall-clock, roofline-graded, reward-hack audited. Default deck is `problems-rtxpro6000/` (RTX PRO 6000); variants exist as `problems-h100/` and `problems-b200/`. Live board: `/hard`.
+> **DEPRECATED (2026-11-23):** Hard is frozen (superseded by `cuda` and `mega`). Removed from `/` and active `/models` rankings; archived at `/hard`. Runners refuse `hard` unless `KB_ALLOW_DEPRECATED=1`. Shared single-GPU internals reference below still applies to `cuda` and `mini`.
 
-| NN | problem | note |
-| -- | ------- | ---- |
-| 01 | `01_fp8_gemm` | FP8 e4m3 GEMM, off-alignment shapes |
-| 02 | `02_kda_cutlass` | Kimi Delta Attention via CUTLASS CuTe |
-| 03 | `03_paged_attention` | paged attention decode |
-| 05 | `05_topk_bitonic` | top-k via bitonic sort (ms-anchored) |
-| 06 | `06_sonic_moe_swiglu` | Sonic-MoE grouped GEMM + SwiGLU |
-| 07 | `07_w4a16_gemm` | W4A16 weight-only quantized GEMM |
-
-04 (`kahan_softmax`) is retired and stays retired. Drive it with `kb sweep <harness> <model>` or `uv run kbh run claude claude-opus-4-7 problems-rtxpro6000/01_fp8_gemm` on the GPU box. Harness routes, the shared runner, rented workers, and `KB_` variables: `kbtool/AGENTS.md`. Methodology: `SPEC.md`. History: `DEVLOG.md`. The rules that gate a published number: root `AGENTS.md`.
-
-The benchmark: frontier coding agents get URLs to SOTA implementations (sonic-moe, flashinfer, marlin) and are asked to write a competitive kernel on the deck's GPU in one autonomous session with unlimited time. Roofline-graded. The published artifact is the best kernel per (problem x model x harness) plus the agent trace. `problems/<X>/PROMPT.txt` is the human-voice query fed to the agent under test, not operator documentation.
+Frozen 6-op deck (`problems-rtxpro6000/`, `-h100/`, `-b200/`; `04_kahan_softmax` retired): `01_fp8_gemm`, `02_kda_cutlass`, `03_paged_attention`, `05_topk_bitonic`, `06_sonic_moe_swiglu`, `07_w4a16_gemm`. Harness routes and `KB_` vars: `kbtool/AGENTS.md`. Methodology: `SPEC.md`. History: `DEVLOG.md`. Publish gates: root `AGENTS.md`. `problems/<X>/PROMPT.txt` is the query fed to the agent under test, not operator documentation.
 
 ## Layout
 

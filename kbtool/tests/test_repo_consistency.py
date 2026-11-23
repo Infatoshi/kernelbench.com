@@ -17,7 +17,7 @@ import subprocess
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[2]
-BENCHES = ("hard", "cuda", "mini", "mega")
+BENCHES = ("cuda", "hard", "mini", "mega")
 AGENTS_FILES = (
     "AGENTS.md",
     "kbtool/AGENTS.md",
@@ -55,7 +55,7 @@ def _read(bench: str, rel: str) -> bytes:
 def test_shared_bench_files_are_identical():
     drifted = []
     for rel in SHARED_IDENTICAL:
-        ref_path = REPO / "benchmarks/hard" / rel
+        ref_path = REPO / "benchmarks/cuda" / rel
         assert ref_path.exists(), f"reference file missing: {ref_path}"
         ref = ref_path.read_bytes()
         for bench in BENCHES[1:]:
@@ -65,7 +65,7 @@ def test_shared_bench_files_are_identical():
             if p.read_bytes() != ref:
                 drifted.append(f"{bench}/{rel}")
     assert not drifted, (
-        "shared bench files drifted from hard's copy (sync them or record a "
+        "shared bench files drifted from cuda's copy (sync them or record a "
         f"deliberate fork in DEVLOG and remove from SHARED_IDENTICAL): {drifted}"
     )
 

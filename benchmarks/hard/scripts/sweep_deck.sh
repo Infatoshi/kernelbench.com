@@ -3,6 +3,10 @@
 # Usage: ./scripts/sweep_deck.sh <harness> <model> [effort]
 # Run from benchmarks/hard. Sessions overlap; GPU commands serialize via the lock.
 set -u
+if [ "${KB_ALLOW_DEPRECATED:-0}" != "1" ]; then
+  echo "STOP: KernelBench-Hard is deprecated (superseded by cuda and mega). Pass KB_ALLOW_DEPRECATED=1 to sweep anyway." >&2
+  exit 2
+fi
 HARNESS="${1:?harness required}"; MODEL="${2:?model required}"; EFFORT="${3:-}"
 HARD_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$HARD_DIR"

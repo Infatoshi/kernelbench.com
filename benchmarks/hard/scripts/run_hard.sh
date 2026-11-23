@@ -3,6 +3,10 @@
 # ALL harness logic lives in scripts/lib/run_harness.sh at the monorepo root;
 # this file only pins the bench identity. Edit the lib, not this file.
 set -euo pipefail
+if [ "${KB_ALLOW_DEPRECATED:-0}" != "1" ]; then
+    echo "STOP: KernelBench-Hard is deprecated (superseded by cuda and mega). Pass KB_ALLOW_DEPRECATED=1 to run anyway." >&2
+    exit 2
+fi
 KB_BENCH_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 export KB_BENCH_DIR
 export KB_BENCH_BANNER="KERNELBENCH-HARD RUN"

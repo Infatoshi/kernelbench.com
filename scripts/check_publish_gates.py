@@ -179,11 +179,13 @@ def gate_tracked(fail: list[str]) -> None:
         fail.append(f"[D tracked] {f} is not git-tracked; models.json ships it as unaudited. `git add` it and rerun kb publish.")
 
 
-def stale_cells() -> list[tuple[str, str, str, Path]]:
-    """Every published hard/cuda/mega cell whose stamp is missing or not the current deck.
+def stale_cells(include_deprecated: bool = False) -> list[tuple[str, str, str, Path]]:
+    """Every published active cuda/mega cell whose stamp is missing or not the current deck.
 
     Shared by gate E and `--list-stale`, so the backfill regrades exactly the set
-    the gate would refuse, nothing enumerated a second way.
+    the gate would refuse, nothing enumerated a second way. Hard was deprecated
+    on 2026-11-23 (frozen archive) and is checked only when explicitly requested
+    via `--list-stale hard`.
     """
     sys.path.insert(0, str(REPO / "scripts" / "lib"))
     import graded_surface  # noqa: E402
@@ -191,11 +193,15 @@ def stale_cells() -> list[tuple[str, str, str, Path]]:
     # (bench, leaderboard, deck root, runs dir) for the JSON boards; mega's board
     # is a CSV built by its own script and is handled by stale_mega_cells().
     boards = [
-        ("hard", REPO / "benchmarks/hard/results/leaderboard.json",
-         REPO / "benchmarks/hard/problems-rtxpro6000", REPO / "benchmarks/hard/outputs/runs"),
         ("cuda", REPO / "benchmarks/cuda/results/leaderboard.json",
          REPO / "benchmarks/cuda/problems-rtxpro6000", REPO / "benchmarks/cuda/outputs/runs"),
     ]
+    if include_deprecated:
+        boards.insert(
+            0,
+            ("hard", REPO / "benchmarks/hard/results/leaderboard.json",
+             REPO / "benchmarks/hard/problems-rtxpro6000", REPO / "benchmarks/hard/outputs/runs"),
+        )
     out: list[tuple[str, str, str, Path]] = []
     for bench, lb_path, deck_root, runs_root in boards:
         if not lb_path.exists():
@@ -303,8 +309,8 @@ def main() -> int:
     if len(sys.argv) >= 2 and sys.argv[1] == "--list-stale":
         # Backfill feed: one run dir per line, relative to the bench root, so
         # `scripts/regrade_sequential.sh $(...)` in that bench consumes it as is.
-        want = set(sys.argv[2:]) or {"hard", "cuda", "mega"}
-        for bench, _, _, run_dir in stale_cells():
+        want = set(sys.argv[2:]) or {"cuda", "mega"}
+        for bench, _, _, run_dir in stale_cells(include_deprecated="hard" in want):
             if bench in want:
                 print(run_dir.relative_to(REPO / "benchmarks" / bench))
         return 0

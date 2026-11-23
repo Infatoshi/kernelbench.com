@@ -335,10 +335,12 @@ function BenchPanel({
   bench,
   model,
   idx,
+  deprecated = false,
 }: {
   bench: Bench
   model: ModelEntry
   idx: ModelIndex
+  deprecated?: boolean
 }) {
   const block = model.benches[bench]!
   const meta = idx.benches[bench]
@@ -368,10 +370,13 @@ function BenchPanel({
   }
   const canonical = splitOffBoard(problems, block)
   return (
-    <section className="chart-panel board-panel">
+    <section className={`chart-panel board-panel${deprecated ? " opacity-85" : ""}`}>
       <div className="chart-panel-head">
         <div className="board-head-title">
           <span className="board-name">{BENCH_LABELS[bench]}</span>
+          {deprecated && (
+            <span className="status-pill status-pill-warn">deprecated</span>
+          )}
           {harness && <span className="board-harness">{harness}</span>}
         </div>
         <div className="board-head-chips">
@@ -461,14 +466,16 @@ export default async function ModelPage({
   const model = idx.models.find((m) => m.slug === slug)
   if (!model) notFound()
 
-  const benchOrder: Bench[] = ["hard", "mega", "cuda"]
-  const benches = benchOrder.filter((b) => model.benches[b])
+  const activeBenchOrder: Bench[] = ["mega", "cuda"]
+  const benches = activeBenchOrder.filter((b) => model.benches[b])
+  const hasArchivedHard = Boolean(model.benches.hard)
   const legacy = model.legacy?.hard_v1
   const brand = brandFor(model.lab, model.slug)
 
   const passed = benches.reduce((s, b) => s + (model.benches[b]?.passed ?? 0), 0)
   const total = benches.reduce((s, b) => s + (model.benches[b]?.total_problems ?? 0), 0)
-  const { audited, flagged } = model.totals
+  const audited = benches.reduce((s, b) => s + (model.benches[b]?.audited ?? 0), 0)
+  const flagged = benches.reduce((s, b) => s + (model.benches[b]?.flagged ?? 0), 0)
 
   return (
     <div id="top" className="space-y-6">
@@ -487,7 +494,7 @@ export default async function ModelPage({
           <>
             {benches.length > 0 ? (
               <>
-                {benches.length} bench {benches.length === 1 ? "deck" : "decks"} ·{" "}
+                {benches.length} active {benches.length === 1 ? "deck" : "decks"} ·{" "}
                 <strong>
                   {passed}/{total}
                 </strong>{" "}
@@ -507,9 +514,9 @@ export default async function ModelPage({
                 .
               </>
             ) : (
-              legacy
-                ? "No published cells on the current decks — the legacy board record is below."
-                : "No published cells on the current decks."
+              hasArchivedHard || legacy
+                ? "No published cells on the active Mega / CUDA decks — archived Hard record is below."
+                : "No published cells on the active Mega / CUDA decks."
             )}
           </>
         }
@@ -517,7 +524,7 @@ export default async function ModelPage({
           <>
             <p>
               <strong>How to read.</strong> Cell scores are peak fraction of the
-              board roofline (Hard / most CUDA), geomean milliseconds for CUDA
+              board roofline (most CUDA / archived Hard), geomean milliseconds for CUDA
               Native Sparse Attention, or speedup vs the torch baseline (Mega).
               Each cell has an unlimited agent budget; interrupted or overlapping
               resumes are documented in the audit. Audit chips come
@@ -586,6 +593,16 @@ export default async function ModelPage({
       {benches.map((bench) => (
         <BenchPanel key={bench} bench={bench} model={model} idx={idx} />
       ))}
+
+      {hasArchivedHard && (
+        <div className="space-y-2">
+          <p className="model-legacy">
+            archived <Link href="/hard">Hard</Link> deck — deprecated on 2026-11-23;
+            excluded from active rankings and totals above
+          </p>
+          <BenchPanel bench="hard" model={model} idx={idx} deprecated />
+        </div>
+      )}
 
       {legacy && (
         <p className="model-legacy">

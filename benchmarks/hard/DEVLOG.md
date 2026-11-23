@@ -4,6 +4,26 @@ A running record of decisions, dead ends, and lessons. Newest entries on top. Th
 
 ---
 
+## 2026-11-23 — KernelBench-Hard deprecated
+
+KernelBench-Hard (6 per-op Triton/CUDA kernels) is deprecated and frozen; active frontier
+evaluation is Mega (`02_kimi_linear_decode`) and CUDA (`01`-`03`).
+
+- Website: removed Hard from the homepage decks (`app/page.tsx`) and active `/models`
+  rankings/totals (`app/_lib/models.ts`, `app/models/page.tsx`, `app/models/[slug]/page.tsx`),
+  switched `/runs` (`app/runs/page.tsx`) from Hard-only to active Mega + CUDA cells, and
+  turned `/hard` into a clearly badged frozen archive page so old post links remain valid.
+  Archived per-run pages `/runs/<gpu>/<rid>` and dimmed Hard sections on `/models/[slug]`
+  remain readable.
+- CLI and benchmark scripts: `kb` default bench (`KB_BENCH`), `KB_LAMBDA_BENCH`, and
+  `KB_BREV_BENCH` moved from `hard` to `cuda`. `kb sweep`/`run`/`publish`, `kbh run`, and
+  `benchmarks/hard/scripts/{run_hard,sweep,sweep_deck}.sh` refuse `hard` unless
+  `KB_ALLOW_DEPRECATED=1` is set. `kb deploy` publishes only `cuda` and `mega` and leaves
+  `benchmarks/hard/results` frozen. `test_repo_consistency.py` uses `benchmarks/cuda` as the
+  shared-file reference.
+
+---
+
 ## 2026-11-10 — agy read its own hook and history dirs; sandbox now hides those too
 
 Gemini 4 Carbon high release on tetra gpu2 (`runs/release-20261110_112532-agy-gemini-4-carbon-high`)

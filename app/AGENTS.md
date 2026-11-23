@@ -18,12 +18,12 @@ Transcripts go to HF (`Infatoshi/kernelbench-<bench>-traces`) via `kb push-runs 
 
 - New model, four tables, all enforced by `scripts/check_publish_gates.py` at `kb publish` / `kb deploy`: `LIVE_MODEL_SLUGS` in `app/_lib/models.server.ts` (homepage and /models roster; `RETIRED_MODEL_SLUGS` there for models kept off it), `MODEL_NAMES` in `scripts/build_model_index.py` (display name in `models.json`), and `MODEL_NAMES`, `SHORT_NAMES`, `LIVE_MODEL_IDS` in `app/_lib/charts.ts` keyed by every board `model` id the model ships under (bare slug and provider-prefixed both occur, e.g. `qwen3.8-max` and `qwen/qwen3.8-max`). Bench and problem labels are `BENCH_LABELS` / `PROBLEM_LABELS` there; GPU tabs are `HOME_GPU_TABS` in `app/_lib/models.ts`.
 - New lab: `LAB_BRANDS` in `app/_lib/models.ts` plus `public/logos/labs/<lab>.svg`.
-- Mini is a homepage `HomeDecks` scroll category on `/` when it debuts, not a `/mini` route. Multi is unpublished.
-- Old external links land on bench sections via the redirects noted at the top of `app/{hard,cuda,multi}/page.tsx`; keep them working.
+- Mini is a homepage `HomeDecks` scroll category on `/` when it debuts, not a `/mini` route. Multi is unpublished. Hard was deprecated on 2026-11-23: removed from `/` and active `/models` rankings, kept as a frozen archive page at `/hard` and dimmed archived section on `/models/[slug]`.
+- Old external links land on active bench sections via the redirects noted at the top of `app/{cuda,mega,multi}/page.tsx`, and on the frozen archive at `app/hard/page.tsx`; keep them working.
 
 ## Before `kb deploy`
 
-Skim the homepage chart and `/hard` (dark mode, look at the actual render). Run the redaction scan (`media/AGENTS.md`) before any `public/runs` commit. Site palette tokens live in `app/globals.css`; `media/kbh_theme.py` copies them, so a palette change updates both.
+Skim the homepage chart (`/#mega`, `/#cuda`) and `/models` (dark mode, look at the actual render). Run the redaction scan (`media/AGENTS.md`) before any `public/runs` commit. Site palette tokens live in `app/globals.css`; `media/kbh_theme.py` copies them, so a palette change updates both.
 
 ## After every finished run
 

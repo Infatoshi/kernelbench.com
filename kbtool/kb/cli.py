@@ -24,20 +24,21 @@ from pathlib import Path
 USAGE = """\
 kb — KernelBench operator CLI   (repo: {root})
 
-Bench selection: every command targets ONE bench — default hard. Pick another
-with `kb -b <bench> ...` (or KB_BENCH=cuda). Benches: hard cuda mini mega multi.
+Bench selection: every command targets ONE bench — default cuda. Pick another
+with `kb -b <bench> ...` (or KB_BENCH=mega). Active benches: cuda mini mega multi
+(hard is deprecated; pass KB_ALLOW_DEPRECATED=1 to run or publish it).
 
-  kb [-b bench] sweep <harness> <model> [effort]   full deck sweep, parallel containers (hard|cuda|mini; mega/multi have their own drivers)
-  kb [-b bench] run <harness> <model> <problem> [effort]  one problem (problem = e.g. 05_topk_bitonic)
-  kb publish [bench]                            rebuild leaderboard + viewers from archives (hard|cuda|mini|mega)
-  kb deploy [message]                           publish, commit, push -> Vercel deploys
+  kb [-b bench] sweep <harness> <model> [effort]   full deck sweep, parallel containers (cuda|mini; mega/multi have their own drivers; hard deprecated)
+  kb [-b bench] run <harness> <model> <problem> [effort]  one problem (problem = e.g. 01_glm52_fused_moe)
+  kb publish [bench]                            rebuild leaderboard + viewers from archives (cuda|mini|mega; hard deprecated)
+  kb deploy [message]                           publish cuda + mega, commit, push -> Vercel deploys
   kb dev                                        preview site locally (localhost:3000)
   kb build                                      next build
   kb [-b bench] audit <run_id>                  print a run's result + annotation verdict
   kb [-b bench] lint <run_id|--all>             static reward-hack tripwire (scans solution.py)
-  kb contamination <hard|mega|cuda|mini|multi|v3|path> [--published <lb.json>]   cross-run contamination audit
+  kb contamination <cuda|mega|hard|mini|multi|v3|path> [--published <lb.json>]   cross-run contamination audit
   kb traces-to-hf <out_dir> [run_dirs...]       convert run transcripts to HF agent-trace JSONL
-  kb push-runs <hard|mega|cuda> [--board h100|b200] [--dataset R] [--dry-run]   convert published/audited runs' traces and push to HF (per-GPU uploads under <board>/)
+  kb push-runs <cuda|mega|hard> [--board h100|b200] [--dataset R] [--dry-run]   convert published/audited runs' traces and push to HF (per-GPU uploads under <board>/)
   kb brev <up|sync|bootstrap|run|regrade|pull|down> <instance> [...]   Brev GPU worker lifecycle (scripts/brev_worker.sh)
   kb lambda <list|ls|up|sync|bootstrap|run|regrade|pull|down|ssh> [...]  Lambda Cloud worker (scripts/lambda_worker.sh; $10k Zach credits)
   kb help
@@ -45,6 +46,9 @@ with `kb -b <bench> ...` (or KB_BENCH=cuda). Benches: hard cuda mini mega multi.
 Keys live in ~/.env_vars. Bench a new model: add its key, then  kb sweep <harness> <model>.
 Harnesses: claude codex cursor gemini agy muse grok opencode | zai-claude minimax-claude kimi-claude kinetic-claude deepseek-claude qwen-claude
 """
+
+DEFAULT_BENCH = "cuda"
+DEPRECATED_BENCHES = frozenset({"hard"})
 
 # harness -> required env key for preflight
 _NEED = {
@@ -70,7 +74,7 @@ def repo_root() -> Path:
         return Path(env).resolve()
     cur = Path.cwd().resolve()
     for cand in (cur, *cur.parents):
-        if (cand / "benchmarks" / "hard").is_dir() and (
+        if (cand / "benchmarks" / "cuda").is_dir() and (
             cand / "package.json"
         ).is_file():
             return cand
@@ -165,7 +169,17 @@ def _bench_dir(root: Path, bench: str) -> Path:
     return d
 
 
-def cmd_sweep(root: Path, args: list[str], bench: str = "hard") -> int:
+def _check_deprecated(bench: str, action: str) -> None:
+    if bench in DEPRECATED_BENCHES and os.environ.get("KB_ALLOW_DEPRECATED") != "1":
+        sys.exit(
+            f"kb {action}: '{bench}' is deprecated (superseded by cuda and mega; "
+            "frozen historical archive).\n"
+            f"  Pass KB_ALLOW_DEPRECATED=1 to {action} it anyway."
+        )
+
+
+def cmd_sweep(root: Path, args: list[str], bench: str = DEFAULT_BENCH) -> int:
+    _check_deprecated(bench, "sweep")
     if bench not in SWEEPABLE:
         sys.exit(
             f"kb sweep: '{bench}' has its own driver — see benchmarks/{bench}/scripts/ "
@@ -178,9 +192,10 @@ def cmd_sweep(root: Path, args: list[str], bench: str = "hard") -> int:
     return _exec([str(_bench_dir(root, bench) / "scripts" / "sweep_deck.sh"), *args])
 
 
-def cmd_run(root: Path, args: list[str], bench: str = "hard") -> int:
+def cmd_run(root: Path, args: list[str], bench: str = DEFAULT_BENCH) -> int:
     if len(args) < 3:
         sys.exit("usage: kb [-b bench] run <harness> <model> <problem> [effort]")
+    _check_deprecated(bench, "run")
     if bench not in SWEEPABLE:
         sys.exit(
             f"kb run: '{bench}' has its own driver — see benchmarks/{bench}/scripts/"
@@ -310,11 +325,12 @@ def _stage_sidecar_runs(root: Path, bench: str) -> list[str]:
     return log
 
 
-def cmd_publish(root: Path, args: list[str], bench: str = "hard") -> int:
+def cmd_publish(root: Path, args: list[str], bench: str = DEFAULT_BENCH) -> int:
     push = "--push" in args
     args = [a for a in args if a != "--push"]
     if args:  # positional bench (kb publish mega) wins over -b
         bench = args[0]
+    _check_deprecated(bench, "publish")
     script = {
         "hard": "publish_v2.sh",
         "cuda": "publish_v2.sh",
@@ -323,7 +339,7 @@ def cmd_publish(root: Path, args: list[str], bench: str = "hard") -> int:
     }.get(bench)
     if not script:
         sys.exit(
-            f"kb publish: no publish script for bench '{bench}' (hard|cuda|mini|mega)"
+            f"kb publish: no publish script for bench '{bench}' (cuda|mini|mega; hard deprecated)"
         )
     pub = _bench_dir(root, bench) / "scripts" / script
     staged = _stage_sidecar_runs(root, bench)
@@ -486,7 +502,7 @@ def _check_rid_collisions(
     return rids
 
 
-def cmd_push_runs(root: Path, args: list[str], bench: str = "hard") -> int:
+def cmd_push_runs(root: Path, args: list[str], bench: str = DEFAULT_BENCH) -> int:
     dry = "--dry-run" in args
     args = [a for a in args if a != "--dry-run"]
     dataset = None
@@ -553,11 +569,11 @@ def cmd_push_runs(root: Path, args: list[str], bench: str = "hard") -> int:
     listfile = root / "runs" / bench / "_rids.txt"
     listfile.write_text("\n".join(rids) + "\n")
 
-    # Other benches reuse hard's transcript parser/converter machinery if the
-    # rsynced local copy is missing (mega/cuda normally carry their own).
+    # Other benches reuse cuda's transcript parser/converter machinery if the
+    # rsynced local copy is missing (mega has no local exporter copy).
     conv = bench_dir / "scripts" / "traces_to_hf.py"
     if not conv.exists():
-        conv = _bench_dir(root, "hard") / "scripts" / "traces_to_hf.py"
+        conv = _bench_dir(root, "cuda") / "scripts" / "traces_to_hf.py"
     print(f"converting {len(rids)} published/audited run traces -> {staging} ...")
     bench_env = {k: v for k, v in os.environ.items() if k != "VIRTUAL_ENV"}
     subprocess.run(
@@ -614,11 +630,8 @@ def cmd_push_runs(root: Path, args: list[str], bench: str = "hard") -> int:
     return 0
 
 
-def cmd_deploy(root: Path, args: list[str], bench: str = "hard") -> int:
+def cmd_deploy(root: Path, args: list[str], bench: str = DEFAULT_BENCH) -> int:
     msg = args[0] if args else "publish kernelbench results"
-    subprocess.run(
-        [str(_bench_dir(root, "hard") / "scripts" / "publish_v2.sh")], check=True
-    )
     subprocess.run(
         [str(_bench_dir(root, "cuda") / "scripts" / "publish_v2.sh")], check=True
     )
@@ -637,7 +650,6 @@ def cmd_deploy(root: Path, args: list[str], bench: str = "hard") -> int:
             "git",
             "add",
             "-A",
-            "benchmarks/hard/results",
             "benchmarks/cuda/results",
             "benchmarks/mega/results",
             "public/runs",
@@ -665,15 +677,15 @@ def _js_runner() -> str:
     return "npm"
 
 
-def cmd_dev(root: Path, args: list[str], bench: str = "hard") -> int:
+def cmd_dev(root: Path, args: list[str], bench: str = DEFAULT_BENCH) -> int:
     return _exec([_js_runner(), "run", "dev"], cwd=root)
 
 
-def cmd_build(root: Path, args: list[str], bench: str = "hard") -> int:
+def cmd_build(root: Path, args: list[str], bench: str = DEFAULT_BENCH) -> int:
     return _exec([_js_runner(), "run", "build"], cwd=root)
 
 
-def cmd_audit(root: Path, args: list[str], bench: str = "hard") -> int:
+def cmd_audit(root: Path, args: list[str], bench: str = DEFAULT_BENCH) -> int:
     if not args:
         sys.exit("usage: kb [-b bench] audit <run_id>")
     rid = args[0]
@@ -698,38 +710,38 @@ def cmd_audit(root: Path, args: list[str], bench: str = "hard") -> int:
     return 0
 
 
-def cmd_lint(root: Path, args: list[str], bench: str = "hard") -> int:
-    # mega/multi have no local lint copy; hard's scanner works on any run dir.
+def cmd_lint(root: Path, args: list[str], bench: str = DEFAULT_BENCH) -> int:
+    # mega/multi have no local lint copy; cuda's scanner works on any run dir.
     b = (
         bench
         if (root / "benchmarks" / bench / "scripts" / "reward_hack_lint.py").exists()
-        else "hard"
+        else "cuda"
     )
     script = _bench_dir(root, b) / "scripts" / "reward_hack_lint.py"
     return _exec(["python3", str(script), *args])
 
 
-def cmd_contamination(root: Path, args: list[str], bench: str = "hard") -> int:
+def cmd_contamination(root: Path, args: list[str], bench: str = DEFAULT_BENCH) -> int:
     from kb import contamination
 
     return contamination.run(args, repo_root=root)
 
 
-def cmd_brev(root: Path, args: list[str], bench: str = "hard") -> int:
+def cmd_brev(root: Path, args: list[str], bench: str = DEFAULT_BENCH) -> int:
     """Brev worker lifecycle: kb brev <up|sync|bootstrap|run|regrade|pull|down> ..."""
     return _exec([str(root / "scripts" / "brev_worker.sh"), *args])
 
 
-def cmd_lambda(root: Path, args: list[str], bench: str = "hard") -> int:
+def cmd_lambda(root: Path, args: list[str], bench: str = DEFAULT_BENCH) -> int:
     """Lambda Cloud worker: kb lambda <list|ls|up|sync|bootstrap|run|regrade|pull|down|ssh> ..."""
     return _exec([str(root / "scripts" / "lambda_worker.sh"), *args])
 
 
-def cmd_traces_to_hf(root: Path, args: list[str], bench: str = "hard") -> int:
+def cmd_traces_to_hf(root: Path, args: list[str], bench: str = DEFAULT_BENCH) -> int:
     b = (
         bench
         if (root / "benchmarks" / bench / "scripts" / "traces_to_hf.py").exists()
-        else "hard"
+        else "cuda"
     )
     script = _bench_dir(root, b) / "scripts" / "traces_to_hf.py"
     os.chdir(_bench_dir(root, b))
@@ -755,14 +767,14 @@ _COMMANDS = {
 
 def _pop_bench(argv: list[str]) -> str:
     """Consume -b/--bench wherever it appears; KB_BENCH is the env fallback;
-    hard is the default."""
-    bench = os.environ.get("KB_BENCH", "hard")
+    cuda is the default (hard is deprecated)."""
+    bench = os.environ.get("KB_BENCH", DEFAULT_BENCH)
     i = 0
     while i < len(argv):
         a = argv[i]
         if a in ("-b", "--bench"):
             if i + 1 >= len(argv):
-                sys.exit("kb: -b/--bench needs a value (hard|cuda|mini|mega|multi)")
+                sys.exit("kb: -b/--bench needs a value (cuda|mini|mega|multi|hard)")
             bench = argv[i + 1]
             del argv[i : i + 2]
             continue
@@ -788,8 +800,8 @@ def main(argv: list[str] | None = None) -> int:
         print(USAGE.format(root=repo_root()))
         return 2
     root = repo_root()
-    if bench != "hard" and not (root / "benchmarks" / bench).is_dir():
-        sys.exit(f"kb: no such bench: {bench} (hard|cuda|mini|mega|multi)")
+    if not (root / "benchmarks" / bench).is_dir():
+        sys.exit(f"kb: no such bench: {bench} (cuda|mini|mega|multi|hard)")
     return fn(root, rest, bench)
 
 

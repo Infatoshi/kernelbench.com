@@ -370,7 +370,15 @@ export default async function RunPage({
   return (
     <main className="run-page">
       <p className="page-head-kicker">
-        <Link href={`/#${bench}`}>KernelBench {bench}</Link> · {gpuName}
+        <Link href={bench === "hard" ? "/hard" : `/#${bench}`}>
+          KernelBench {bench}
+        </Link>{" "}
+        {bench === "hard" && (
+          <>
+            <span className="status-pill status-pill-warn">deprecated</span>{" "}
+          </>
+        )}
+        · {gpuName}
       </p>
       <h1 className="page-head-title">
         {problemLabel(problem)}{" "}

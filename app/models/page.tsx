@@ -11,7 +11,7 @@ export const metadata = { title: "models · kernelbench" }
 
 export default async function ModelsPage() {
   const idx = await loadModelIndex()
-  const { board, sink } = rowsForIndex(idx)
+  const { board, archived, sink } = rowsForIndex(idx)
   return (
     <div className="space-y-6">
       <PageHead
@@ -19,7 +19,13 @@ export default async function ModelsPage() {
         title="Models"
         sub={
           <>
-            <strong>{board.length}</strong> models on the boards
+            <strong>{board.length}</strong> models on the active Mega / CUDA boards
+            {archived.length > 0 && (
+              <>
+                {" "}
+                · <span className="mroster-dim">{archived.length} archived (Hard only)</span>
+              </>
+            )}
             {sink.length > 0 && (
               <>
                 {" "}
@@ -31,18 +37,20 @@ export default async function ModelsPage() {
         notes={
           <>
             <p>
-              <strong>Ordering.</strong> Models rank by benches fully passed,
-              then mean score relative to each board&apos;s best published
-              model (1.00 = board leader). Per-bench chips show valid passes;
-              the flag pill counts audited sessions that failed the reward-hack
-              review — it is displayed, never a sort key.
+              <strong>Ordering.</strong> Models rank by active benches (Mega,
+              CUDA) fully passed, then mean score relative to each board&apos;s
+              best published model (1.00 = board leader). Per-bench chips show
+              valid passes; the flag pill counts audited sessions that failed
+              the reward-hack review — it is displayed, never a sort key.
             </p>
             <p>
               <strong>Roster vs charts.</strong> This directory lists every
               published model, including superseded siblings the homepage
-              charts curate away. Click any row for its per-problem cells,
-              audit chips, GPU boards, and integrity record — or open the{" "}
-              <Link href="/runs">run index</Link> for raw transcripts.
+              charts curate away. Deprecated{" "}
+              <Link href="/hard">Hard</Link> runs stay archived on each model
+              page and do not affect rankings. Click any row for its
+              per-problem cells, audit chips, GPU boards, and integrity record
+              — or open the <Link href="/runs">run index</Link> for transcripts.
             </p>
           </>
         }
@@ -117,6 +125,22 @@ export default async function ModelsPage() {
           })}
         </div>
       </div>
+
+      {archived.length > 0 && (
+        <div className="mroster-sink">
+          <p className="board-kicker">
+            archived · deprecated <Link href="/hard">Hard</Link> deck only
+          </p>
+          <div className="mroster-sink-list">
+            {archived.map((row) => (
+              <Link key={row.slug} href={`/models/${row.slug}`} className="mroster-sink-row no-underline">
+                <span className="mroster-sink-name">{row.name}</span>
+                <span className="mroster-lab">{row.lab}</span>
+              </Link>
+            ))}
+          </div>
+        </div>
+      )}
 
       {sink.length > 0 && (
         <div className="mroster-sink">
