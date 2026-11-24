@@ -218,7 +218,7 @@ export default async function RunsIndex({ searchParams }: RunsIndexProps) {
   if (harnessFilter) titleParts.push(harnessLabel(harnessFilter))
 
   return (
-    <div className="container mx-auto px-4 sm:px-6 max-w-7xl pt-6 pb-12 space-y-6">
+    <div className="space-y-6">
       <PageHead
         kicker="Index"
         title={titleParts.join(" · ")}

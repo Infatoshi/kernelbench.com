@@ -67,7 +67,6 @@ const nextConfig = {
       "benchmarks/cuda/results/**",
       "benchmarks/mega/results/**",
       "public/data/**",
-      "public/logos/**",
       "public/runs/**",
     ],
   },

@@ -368,7 +368,7 @@ export default async function RunPage({
   const flagged = verdict && FLAG_VERDICTS.has(verdict)
 
   return (
-    <main className="run-page container mx-auto px-4 sm:px-6 max-w-7xl pt-6 pb-12">
+    <main className="run-page">
       <p className="page-head-kicker">
         <Link href={bench === "hard" ? "/hard" : `/#${bench}`}>
           KernelBench {bench}

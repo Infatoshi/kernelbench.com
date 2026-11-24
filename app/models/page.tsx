@@ -13,7 +13,7 @@ export default async function ModelsPage() {
   const idx = await loadModelIndex()
   const { board, archived, sink } = rowsForIndex(idx)
   return (
-    <div className="container mx-auto px-4 sm:px-6 max-w-7xl pt-6 pb-12 space-y-6">
+    <div className="space-y-6">
       <PageHead
         kicker="Index"
         title="Models"

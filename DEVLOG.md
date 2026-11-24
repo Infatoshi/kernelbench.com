@@ -6,24 +6,11 @@ benchmark. Per-benchmark journals live in `benchmarks/<bench>/DEVLOG.md`;
 
 ---
 
-## 2026-11-23 - Redesign kernelbench.com as a single-page NVIDIA sketchpad
+## 2026-11-23 - Revert single-page sketchpad redesign and drop Models/Runs header tabs
 
-Replaced the multi-page homepage with a single-page NVIDIA dark graph-paper engineer's notepad UI
-(`app/page.tsx`, `app/_components/kernelbench-board.tsx`, `app/_lib/sketchpad.server.ts`,
-`app/_lib/sketches.ts`, `app/sketchpad.css`).
-
-- Plain top-left `kernelbench.com` masthead (no logo, no nav bar) and deterministic hand-sketched
-  vector CUDA grid / warp / `cp.async -> smem -> mma.sync -> shfl.sync` / roofline illustrations.
-- Curated `LIVE_MODEL_SLUGS` in `app/_lib/models.server.ts` to 11 active models (dropping outdated
-  and weak models into `RETIRED_MODEL_SLUGS`, keeping DeepSeek V4.1 Flash, Gemini 4 Argon (High),
-  and Claude Haiku 5.5; excluding invalid/zero-pass entries from the boards). Removed the
-  `Frontier / One per lab / Everything` roster filter and the B200 GPU tab (`RTX PRO 6000` and
-  `H100 PCIe` only).
-- Unified hover/tap interactive popover (zero-gap wrapper + aim-cone grace) on every model row with
-  direct links to `Audit report`, `Kernel solution`, `Agent trace`, and CUDA 3-problem pills, backed
-  by a slide-over audit drawer with every audited run (665 runs across 57 models), per-shape
-  breakdowns, and redacted kernel source. `Method`, `Older & retired models`, and `Hard archive`
-  sit in collapsed bottom disclosures; legacy routes remain reachable for external links.
+Reverted commit `12ab3c5` back to the previous website design (`a61c863`, with Hard deprecated)
+and removed the redundant `Models` and `Runs` top-bar tabs from `app/_components/site-nav.tsx`
+(keeping `/models/[slug]` and `/runs/[gpu]/[rid]` deep links reachable from board cells and rows).
 
 ## 2026-11-23 - Deprecate KernelBench-Hard across benchmark CLI and website
 

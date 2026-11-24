@@ -5,58 +5,56 @@ import type { ModelIndex } from "./models"
 // Server-side loader for the model index. Kept separate from ./models so the
 // shared types/transforms stay importable from client components.
 
-/** Current competitive models shown on the canonical RTX PRO 6000 homepage boards.
- * When a newer model ships, add it here and move the superseded sibling to
- * RETIRED_MODEL_SLUGS below. Historical model pages and audit logs still load
- * the full index. */
-export const LIVE_MODEL_SLUGS = new Set([
+/** Current models shown on the homepage and in the model directory.
+ * Historical model pages and run pages still load the full index. */
+const LIVE_MODEL_SLUGS = new Set([
+  "claude-fable-5",
+  "claude-fable-5-1",
   "claude-fable-5-2",
-  "claude-haiku-5-5",
-  "claude-opus-5-5",
-  "claude-sonnet-5-5",
+  "claude-opus-5",
   "deepseek-flash",
+  "deepseek-v4-flash-0731",
+  "deepseek-v4.1-flash-1017",
+  "gemini-3.8-flash-high",
   "gemini-4-argon-high",
   "gemini-4-carbon-high",
   "gemini-4-neon-xhigh",
   "glm-5.3",
-  "gpt-6.2-astra",
-  "qwen4-max",
-])
-
-/** Models with published cells that are deliberately off the main homepage
- * boards (superseded siblings or retired entries). Every slug in models.json
- * must be here or in LIVE_MODEL_SLUGS (or CHART_HIDDEN_SLUGS);
- * scripts/check_publish_gates.py enforces this on publish. */
-export const RETIRED_MODEL_SLUGS = new Set([
-  "claude-fable-5",
-  "claude-fable-5-1",
-  "claude-opus-4-8",
-  "claude-opus-5",
-  "claude-sonnet-5",
-  "composer-2.5-fast",
-  "deepseek-v4-flash-0731",
-  "deepseek-v4-pro",
-  "deepseek-v4.1-flash-1017",
-  "gemini-3.8-flash-high",
-  "glm-5.2",
   "gpt-5.6-sol",
   "gpt-6-astra-pro",
-  "gpt-6-luna",
+  "gpt-6.2-astra",
   "gpt-6-sol",
   "gpt-6.1-sol",
-  "grok-4.5",
+  "gpt-6-luna",
   "grok-4.6",
   "grok-4.7",
-  "hy3",
-  "inkling",
-  "k3.1-pro",
+  "claude-opus-5-5",
+  "claude-sonnet-5-5",
+  "claude-haiku-5-5",
   "kinetic-0715",
-  "kinetic-0715-1m",
-  "longcat-2.0",
-  "minimax-m3",
+  "k3.1-pro",
   "muse-spark-1.3",
   "ox-alpha",
   "qwen3.8-max",
+  "qwen4-max",
+])
+
+/** Models with published cells that are deliberately off the homepage and
+ * /models roster (superseded or historical). Every slug in models.json must be
+ * here or in LIVE_MODEL_SLUGS; scripts/check_publish_gates.py fails the
+ * publish otherwise, so a fresh model cannot ship invisible again. */
+export const RETIRED_MODEL_SLUGS = new Set([
+  "claude-opus-4-8",
+  "claude-sonnet-5",
+  "composer-2.5-fast",
+  "deepseek-v4-pro",
+  "glm-5.2",
+  "grok-4.5",
+  "hy3",
+  "inkling",
+  "kinetic-0715-1m",
+  "longcat-2.0",
+  "minimax-m3",
   "qwen3.8-max-preview",
 ])
 

@@ -1,17 +1,6 @@
-"use client"
-
 import Link from "next/link"
-import { usePathname } from "next/navigation"
 
-// Sticky site header: wordmark + primary nav + source links. Active route is
-// derived client-side so every page gets the same server-rendered shell.
-
-// Wordmark is the home/dashboard link; primary navigation exposes the ranked
-// models and full run ledger.
-const NAV = [
-  { href: "/models", label: "Models" },
-  { href: "/runs", label: "Runs" },
-]
+// Sticky site header: wordmark + source links.
 
 function Wordmark() {
   return (
@@ -34,29 +23,10 @@ function Wordmark() {
 }
 
 export function SiteNav() {
-  const pathname = usePathname() ?? "/"
   return (
     <header className="site-nav">
       <div className="site-nav-inner">
         <Wordmark />
-        <nav className="nav-links" aria-label="Primary">
-          {NAV.map((item) => {
-            const active =
-              item.href === "/"
-                ? pathname === "/"
-                : pathname === item.href || pathname.startsWith(`${item.href}/`)
-            return (
-              <Link
-                key={item.href}
-                href={item.href}
-                aria-current={active ? "page" : undefined}
-                className={`nav-link no-underline${active ? " nav-link-active" : ""}`}
-              >
-                {item.label}
-              </Link>
-            )
-          })}
-        </nav>
         <div className="nav-icons">
           <a
             href="https://github.com/Infatoshi/kernelbench.com"
