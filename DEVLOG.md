@@ -8,9 +8,10 @@ benchmark. Per-benchmark journals live in `benchmarks/<bench>/DEVLOG.md`;
 
 ## 2026-11-23 - Revert single-page sketchpad redesign and drop Models/Runs header tabs
 
-Reverted commit `12ab3c5` back to the previous website design (`a61c863`, with Hard deprecated)
-and removed the redundant `Models` and `Runs` top-bar tabs from `app/_components/site-nav.tsx`
-(keeping `/models/[slug]` and `/runs/[gpu]/[rid]` deep links reachable from board cells and rows).
+Reverted commit `12ab3c5` back to the previous website design (`a61c863`, with Hard deprecated),
+removed the redundant `Models` and `Runs` top-bar tabs from `app/_components/site-nav.tsx`
+(keeping `/models/[slug]` and `/runs/[gpu]/[rid]` deep links reachable from board cells and rows),
+and hid `B200` site-wide via `SITE_HIDDEN_GPUS` and `HOME_GPU_TABS` in `app/_lib/models.ts`.
 
 ## 2026-11-23 - Deprecate KernelBench-Hard across benchmark CLI and website
 

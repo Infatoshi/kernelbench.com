@@ -178,10 +178,11 @@ export function isCellValid(c: {
 }
 
 /**
- * Boards hidden site-wide (none currently; RTX 3090 was fully removed from
- * the suite 2026-07-21). Filter any per-GPU UI through this before rendering.
+ * Boards hidden site-wide (B200 hidden on 2026-11-23; RTX 3090 was fully
+ * removed from the suite 2026-07-21). Filter any per-GPU UI through this
+ * before rendering.
  */
-export const SITE_HIDDEN_GPUS = new Set<string>([])
+export const SITE_HIDDEN_GPUS = new Set<string>(["b200"])
 
 /**
  * Default GPU board for multi-GPU decks and the homepage ranking toggle.
@@ -194,7 +195,7 @@ export const DEFAULT_GPU = "rtxpro6000"
 export const CANONICAL_GPU = "rtxpro6000"
 
 /**
- * Homepage / deck GPU tabs: H100 → RTX PRO 6000 → B200.
+ * Homepage / deck GPU tabs: H100 PCIe → RTX PRO 6000 (B200 hidden).
  *
  * Labels name the exact part, never a bare family name. "H100" alone is
  * ambiguous in a way that changes the numbers: the PCIe part is HBM2e at
@@ -206,7 +207,6 @@ export const CANONICAL_GPU = "rtxpro6000"
 export const HOME_GPU_TABS: { key: string; label: string }[] = [
   { key: "h100", label: "H100 PCIe" },
   { key: "rtxpro6000", label: "RTX PRO 6000" },
-  { key: "b200", label: "B200" },
 ]
 
 /** Active benchmark decks (Hard was deprecated on 2026-11-23). */
