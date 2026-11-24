@@ -6,6 +6,10 @@ benchmark. Per-benchmark journals live in `benchmarks/<bench>/DEVLOG.md`;
 
 ---
 
+## 2026-11-23 - Retire Grok 4.7 and lower models from live homepage and charts
+
+Moved the 15 models at or below Grok 4.7 on the canonical Mega RTX PRO 6000 board (`grok-4.7`, `gpt-6.1-sol`, `gpt-5.6-sol`, `gpt-6-luna`, `gemini-3.8-flash-high`, `muse-spark-1.3`, `gpt-6-sol`, `claude-haiku-5-5`, `deepseek-v4-flash-0731`, `deepseek-v4.1-flash-1017`, `gemini-4-argon-high`, `grok-4.6`, `k3.1-pro`, `ox-alpha`, `qwen3.8-max`) from `LIVE_MODEL_SLUGS` to `RETIRED_MODEL_SLUGS` in `app/_lib/models.server.ts` and dropped their ids from `LIVE_MODEL_IDS` in `app/_lib/charts.ts`. Historical `/models/[slug]` and `/runs/[gpu]/[rid]` pages stay intact.
+
 ## 2026-11-23 - Revert single-page sketchpad redesign and drop Models/Runs header tabs
 
 Reverted commit `12ab3c5` back to the previous website design (`a61c863`, with Hard deprecated),
