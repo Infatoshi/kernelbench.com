@@ -8,6 +8,10 @@ bun dev          # http://localhost:3000
 bun run build
 ```
 
+## Single-page homepage (2026-11-23 redesign)
+
+`app/page.tsx` renders the entire active site on one page (`app/_components/kernelbench-board.tsx`, data built at build time by `app/_lib/sketchpad.server.ts`, vector engineer's notepad sketches in `app/_lib/sketches.ts`, NVIDIA dark graph-paper CSS in `app/sketchpad.css`). Top-left masthead is plain `kernelbench.com` with no logo or multi-page nav (`app/layout.tsx`). Active GPU tabs are `RTX PRO 6000` and `H100 PCIe` (B200 excluded from board tabs, preserved in audit logs). Hovering (or tapping on mobile) any bar row opens an interactive popover directly under the pointer (`Audit report`, `Kernel solution`, `Agent trace`, plus CUDA 3-problem switcher pills); the full per-model audit log, per-shape breakdowns, and redacted kernels live in the slide-over drawer. `Method`, `Older & retired models`, and `Hard archive` are collapsed bottom disclosures. Legacy deep-link routes (`/models`, `/models/[slug]`, `/runs`, `/runs/[gpu]/[rid]`, `/hard`, `/code`) stay live for external links.
+
 ## Data flow
 
 Site data is baked at build time by `app/_lib/data.ts` from `benchmarks/*/results/` (hard/cuda: `results/leaderboard.json`; mega: `public/data/mega/results.csv`), the annotation YAMLs (`results/annotations/*.yaml`, tiny YAML subset parser in `data.ts`, schema in `benchmarks/hard/AGENTS.md`), and `public/data/models.json`. `kb publish <bench>` regenerates all of these plus the redacted `public/runs/*_solution.py.txt` kernels (mega: `public/data/mega/code/`); never hand-edit them. `git add` new annotation YAMLs before publishing: models.json only joins annotations that git tracks, and an untracked one ships the cell as `unaudited`, which the homepage column chart drops.

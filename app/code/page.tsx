@@ -9,12 +9,14 @@ export const metadata: Metadata = {
 
 export default function CodePage() {
   return (
-    <Suspense
-      fallback={
-        <p className="text-sm text-[var(--color-fg-muted)]">loading…</p>
-      }
-    >
-      <CodeViewer />
-    </Suspense>
+    <div className="container mx-auto px-4 sm:px-6 max-w-7xl pt-6 pb-12">
+      <Suspense
+        fallback={
+          <p className="text-sm text-[var(--color-fg-muted)]">loading…</p>
+        }
+      >
+        <CodeViewer />
+      </Suspense>
+    </div>
   )
 }

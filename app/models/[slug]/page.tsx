@@ -478,7 +478,7 @@ export default async function ModelPage({
   const flagged = benches.reduce((s, b) => s + (model.benches[b]?.flagged ?? 0), 0)
 
   return (
-    <div id="top" className="space-y-6">
+    <div id="top" className="container mx-auto px-4 sm:px-6 max-w-7xl pt-6 pb-12 space-y-6">
       <PageHead
         kicker={`Model · ${model.lab}`}
         title={

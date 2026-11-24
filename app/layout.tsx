@@ -1,8 +1,7 @@
 import type { Metadata } from "next"
+import Link from "next/link"
 import { JetBrains_Mono } from "next/font/google"
-import { SiteNav } from "@/app/_components/site-nav"
 import "./globals.css"
-import { ContactLink } from "./_components/contact-link"
 
 const mono = JetBrains_Mono({
   subsets: ["latin"],
@@ -51,36 +50,38 @@ export default function RootLayout({
   children: React.ReactNode
 }) {
   return (
-    // suppressHydrationWarning: browser extensions (Dark Reader, etc.) inject
-    // attributes on <html>/<body> before React hydrates; without this the
-    // Mac preview shows a noisy hydration overlay that is not app state.
-    <html lang="en" className={mono.variable} data-theme="dark" suppressHydrationWarning>
+    <html
+      lang="en"
+      className={mono.variable}
+      data-theme="dark"
+      suppressHydrationWarning
+    >
       <body className="min-h-screen" suppressHydrationWarning>
-        <SiteNav />
-        <main className="container mx-auto px-4 sm:px-6 max-w-7xl pt-6 pb-12">
-          {children}
-        </main>
-        <Footer />
+        <div
+          className="kb-mast"
+          style={{
+            background: "#000000",
+            borderBottom: "1px solid #333333",
+            padding: "14px 24px",
+          }}
+        >
+          <Link
+            href="/"
+            className="kb-brand no-underline"
+            style={{
+              fontFamily:
+                'var(--font-mono-loaded), "SF Mono", ui-monospace, "JetBrains Mono", Menlo, Consolas, monospace',
+              fontSize: "15px",
+              fontWeight: 600,
+              letterSpacing: "-0.01em",
+              color: "#ffffff",
+            }}
+          >
+            kernelbench.com
+          </Link>
+        </div>
+        {children}
       </body>
     </html>
-  )
-}
-
-function Footer() {
-  return (
-    <footer className="site-footer">
-      <div className="site-footer-inner">
-        <span className="site-footer-line">
-          built by <a href="https://elliotarledge.com">elliot arledge</a>
-          {" · "}
-          <ContactLink />
-          {" · "}
-          <a href="https://github.com/Infatoshi/kernelbench.com">source</a>
-        </span>
-        <span className="site-footer-dim">
-          independent site — not affiliated with Stanford KernelBench
-        </span>
-      </div>
-    </footer>
   )
 }
