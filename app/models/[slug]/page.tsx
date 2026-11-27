@@ -1,3 +1,4 @@
+import type { Metadata } from "next"
 import Link from "next/link"
 import { notFound } from "next/navigation"
 import {
@@ -18,6 +19,7 @@ import {
   type ModelIndex,
 } from "@/app/_lib/models"
 import { loadAllModelIndex } from "@/app/_lib/models.server"
+import { formatCellMetric, SITE_URL } from "@/app/_lib/seo.server"
 import { PageHead } from "@/app/_components/page-head"
 
 // One static page per published model (and per audited-but-unpublished model,
@@ -35,11 +37,49 @@ export async function generateMetadata({
   params,
 }: {
   params: Promise<{ slug: string }>
-}) {
+}): Promise<Metadata> {
   const { slug } = await params
   const idx = await loadAllModelIndex()
   const model = idx.models.find((m) => m.slug === slug)
-  return { title: model ? `${model.name} · kernelbench` : "model · kernelbench" }
+  if (!model) return { title: "Model" }
+
+  const activeBenches: Bench[] = ["mega", "cuda"]
+  const parts: string[] = []
+  let audited = 0
+  let flagged = 0
+  for (const b of activeBenches) {
+    const blk = model.benches[b]
+    if (!blk) continue
+    audited += blk.audited ?? 0
+    flagged += blk.flagged ?? 0
+    const probs = visibleProblems(b, idx.benches[b]?.problems ?? Object.keys(blk.cells))
+    const scores = probs
+      .map((p) => {
+        const c = blk.cells[p]
+        const fmt = c ? formatCellMetric(b, p, c) : null
+        return fmt ? `${problemLabel(p)} ${fmt}` : null
+      })
+      .filter((x): x is string => Boolean(x))
+    if (scores.length) parts.push(`${BENCH_LABELS[b]}: ${scores.join(", ")}`)
+  }
+  const auditNote =
+    audited > 0
+      ? `${audited} audited active sessions${flagged > 0 ? ` (${flagged} flagged)` : ", all clean"}`
+      : "archived benchmark record"
+  const description = parts.length
+    ? `${model.name} (${model.lab}) audited GPU kernel and CUDA optimization results on kernelbench.com. ${parts.join(" · ")}. ${auditNote}, with full kernel source and agent traces.`
+    : `${model.name} (${model.lab}) GPU kernel benchmark record, audit outcomes, kernel source, and transcripts on kernelbench.com.`
+
+  return {
+    title: `${model.name} GPU Kernel & CUDA Benchmark Results`,
+    description,
+    alternates: { canonical: `/models/${slug}` },
+    openGraph: {
+      title: `${model.name} GPU Kernel & CUDA Results · kernelbench.com`,
+      description,
+      url: `${SITE_URL}/models/${slug}`,
+    },
+  }
 }
 
 function fmtDur(sec: number): string {
@@ -479,6 +519,20 @@ export default async function ModelPage({
 
   return (
     <div id="top" className="space-y-6">
+      <script
+        type="application/ld+json"
+        dangerouslySetInnerHTML={{
+          __html: JSON.stringify({
+            "@context": "https://schema.org",
+            "@type": "BreadcrumbList",
+            itemListElement: [
+              { "@type": "ListItem", position: 1, name: "kernelbench.com", item: SITE_URL },
+              { "@type": "ListItem", position: 2, name: "Models", item: `${SITE_URL}/models` },
+              { "@type": "ListItem", position: 3, name: model.name, item: `${SITE_URL}/models/${model.slug}` },
+            ],
+          }),
+        }}
+      />
       <PageHead
         kicker={`Model · ${model.lab}`}
         title={

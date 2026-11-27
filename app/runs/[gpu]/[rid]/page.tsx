@@ -4,6 +4,7 @@ import type { Metadata } from "next"
 import Link from "next/link"
 import { notFound } from "next/navigation"
 import {
+  BENCH_LABELS,
   CANONICAL_GPU,
   FLAG_VERDICTS,
   problemLabel,
@@ -12,6 +13,7 @@ import {
   type ModelCell,
 } from "@/app/_lib/models"
 import { loadAllModelIndex } from "@/app/_lib/models.server"
+import { formatCellMetric, SITE_URL } from "@/app/_lib/seo.server"
 
 // One page per published run: the cell you clicked on a board, expanded.
 // Fully static — every (gpu, run_id) cell in models.json gets a page at
@@ -198,8 +200,27 @@ export async function generateMetadata({
   const { gpu, rid } = await params
   const found = await findCell(gpu, rid)
   if (!found) return {}
-  const title = `${found.modelName} · ${problemLabel(found.problem)} · ${GPU_NAMES[gpu] ?? gpu}`
-  return { title, description: `KernelBench run ${rid}` }
+  const gpuName = GPU_NAMES[gpu] ?? gpu
+  const probName = problemLabel(found.problem)
+  const metric = formatCellMetric(found.bench, found.problem, found.cell)
+  const verdictText = found.cell.verdict ? `audit verdict: ${found.cell.verdict}` : ""
+  const title = `${found.modelName} on ${probName} (${gpuName}) — KernelBench ${BENCH_LABELS[found.bench]}`
+  const summaryBits = [
+    metric ? `Result: ${metric}` : `Outcome: ${found.cell.outcome_label ?? found.cell.failure_reason ?? "no pass"}`,
+    verdictText,
+    found.auditSummary ? found.auditSummary.slice(0, 140) : null,
+  ].filter(Boolean)
+  const description = `${found.modelName} GPU kernel run on ${probName} (${gpuName}). ${summaryBits.join(" · ")}. Inspect per-shape hardware utilization, redacted CUDA kernel source, and full agent trace.`
+  return {
+    title,
+    description,
+    alternates: { canonical: `/runs/${gpu}/${rid}` },
+    openGraph: {
+      title: `${title} · kernelbench.com`,
+      description,
+      url: `${SITE_URL}/runs/${gpu}/${rid}`,
+    },
+  }
 }
 
 function fmtDuration(s: number | null | undefined): string {
@@ -367,8 +388,27 @@ export default async function RunPage({
   const verdict = cell.verdict
   const flagged = verdict && FLAG_VERDICTS.has(verdict)
 
+  const breadcrumb = {
+    "@context": "https://schema.org",
+    "@type": "BreadcrumbList",
+    itemListElement: [
+      { "@type": "ListItem", position: 1, name: "kernelbench.com", item: SITE_URL },
+      { "@type": "ListItem", position: 2, name: "Runs", item: `${SITE_URL}/runs` },
+      {
+        "@type": "ListItem",
+        position: 3,
+        name: `${modelName} · ${problemLabel(problem)} (${gpuName})`,
+        item: `${SITE_URL}/runs/${gpu}/${rid}`,
+      },
+    ],
+  }
+
   return (
-    <main className="run-page">
+    <article className="run-page">
+      <script
+        type="application/ld+json"
+        dangerouslySetInnerHTML={{ __html: JSON.stringify(breadcrumb) }}
+      />
       <p className="page-head-kicker">
         <Link href={bench === "hard" ? "/hard" : `/#${bench}`}>
           KernelBench {bench}
@@ -463,6 +503,6 @@ export default async function RunPage({
       )}
 
       <p className="rdetail-muted run-page-rid tabular">{rid}</p>
-    </main>
+    </article>
   )
 }

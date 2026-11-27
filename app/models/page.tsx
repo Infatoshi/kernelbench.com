@@ -1,19 +1,45 @@
+import type { Metadata } from "next"
 import Link from "next/link"
 import { brandFor, rowsForIndex } from "@/app/_lib/models"
 import { loadModelIndex } from "@/app/_lib/models.server"
+import { SITE_URL } from "@/app/_lib/seo.server"
 import { PageHead } from "@/app/_components/page-head"
 
 // The model directory: every model with published cells, ranked, each row
 // opening its per-model page (cells, audits, integrity record). The homepage
 // column charts stay the comparison view — this is the roster.
 
-export const metadata = { title: "models · kernelbench" }
+export const metadata: Metadata = {
+  title: "Ranked Frontier Models for GPU Kernel Optimization",
+  description:
+    "Full ranked directory of frontier AI coding agents evaluated on KernelBench Mega and KernelBench CUDA, with per-model pass counts, normalized board scores, and reward-hack audit records.",
+  alternates: { canonical: "/models" },
+  openGraph: {
+    title: "Ranked Frontier Models for GPU Kernel Optimization · kernelbench.com",
+    description:
+      "Audited rankings and reward-hack integrity records for frontier models optimizing CUDA and fused GPU inference kernels.",
+    url: `${SITE_URL}/models`,
+  },
+}
 
 export default async function ModelsPage() {
   const idx = await loadModelIndex()
   const { board, archived, sink } = rowsForIndex(idx)
   return (
     <div className="space-y-6">
+      <script
+        type="application/ld+json"
+        dangerouslySetInnerHTML={{
+          __html: JSON.stringify({
+            "@context": "https://schema.org",
+            "@type": "BreadcrumbList",
+            itemListElement: [
+              { "@type": "ListItem", position: 1, name: "kernelbench.com", item: SITE_URL },
+              { "@type": "ListItem", position: 2, name: "Models", item: `${SITE_URL}/models` },
+            ],
+          }),
+        }}
+      />
       <PageHead
         kicker="Index"
         title="Models"

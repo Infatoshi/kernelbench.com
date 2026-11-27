@@ -105,9 +105,11 @@ function Chip({
   const win = pass && chip.score! >= best! - 1e-12
   const blank = !pass
 
-  // pre → grow (line + count-up) → static
-  const [phase, setPhase] = useState<"pre" | "grow" | "static">("pre")
-  const [numLabel, setNumLabel] = useState(pass ? "0" : chip.label)
+  // Start in "static" with the real published label so SSR HTML and search
+  // crawlers read actual benchmark scores (never "0"), then play the smooth
+  // count-up animation after client hydration when motion is allowed.
+  const [phase, setPhase] = useState<"pre" | "grow" | "static">("static")
+  const [numLabel, setNumLabel] = useState(chip.label)
 
   useEffect(() => {
     if (!pass || chip.score == null) {
@@ -294,8 +296,10 @@ function DeckPanel({ deck }: { deck: HomeDeck }) {
         style={{ ["--deck-accent" as string]: deck.accent }}
       >
         <div className="hd-section-label">
-          <span className="hd-k">KernelBench</span>
-          <span className="hd-name">{deck.title}</span>
+          <h2 className="hd-section-title">
+            <span className="hd-k">KernelBench</span>
+            <span className="hd-name">{deck.title}</span>
+          </h2>
           <span className="hd-soon">soon</span>
         </div>
       </section>
@@ -321,10 +325,10 @@ function DeckPanel({ deck }: { deck: HomeDeck }) {
       }
     >
       <div className="hd-section-label">
-        <div className="hd-section-title">
+        <h2 className="hd-section-title">
           <span className="hd-k">KernelBench</span>
           <span className="hd-name">{deck.title}</span>
-        </div>
+        </h2>
         {deck.gpus.length > 1 && (
           <div className="gpu-toggle hd-gpu-toggle" role="tablist" aria-label={`${deck.title} GPU`}>
             {deck.gpus.map((g) => (

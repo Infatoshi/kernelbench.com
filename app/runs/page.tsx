@@ -1,3 +1,4 @@
+import type { Metadata } from "next"
 import Link from "next/link"
 import {
   ACTIVE_BENCHES,
@@ -11,12 +12,24 @@ import {
   type ModelCell,
 } from "@/app/_lib/models"
 import { loadAllModelIndex } from "@/app/_lib/models.server"
+import { SITE_URL } from "@/app/_lib/seo.server"
 import { PageHead } from "@/app/_components/page-head"
 
 // Active run ledger across Mega and CUDA (Hard was deprecated on 2026-11-23
 // and stays archived at /hard and Infatoshi/kernelbench-hard-traces).
 
-export const metadata = { title: "runs · kernelbench" }
+export const metadata: Metadata = {
+  title: "Audited GPU Kernel Run Index & Agent Transcripts",
+  description:
+    "Complete ledger of active KernelBench Mega and CUDA runs with isolated hardware measurements, reward-hack audit verdicts, redacted CUDA kernel source, and HuggingFace transcripts.",
+  alternates: { canonical: "/runs" },
+  openGraph: {
+    title: "Audited GPU Kernel Run Index · kernelbench.com",
+    description:
+      "Inspect every active Mega and CUDA agentic kernel run, per-shape roofline measurement, audit verdict, and transcript.",
+    url: `${SITE_URL}/runs`,
+  },
+}
 
 const MEGA_TRACES_HF =
   "https://huggingface.co/datasets/Infatoshi/kernelbench-mega-traces"
@@ -219,6 +232,19 @@ export default async function RunsIndex({ searchParams }: RunsIndexProps) {
 
   return (
     <div className="space-y-6">
+      <script
+        type="application/ld+json"
+        dangerouslySetInnerHTML={{
+          __html: JSON.stringify({
+            "@context": "https://schema.org",
+            "@type": "BreadcrumbList",
+            itemListElement: [
+              { "@type": "ListItem", position: 1, name: "kernelbench.com", item: SITE_URL },
+              { "@type": "ListItem", position: 2, name: "Runs", item: `${SITE_URL}/runs` },
+            ],
+          }),
+        }}
+      />
       <PageHead
         kicker="Index"
         title={titleParts.join(" · ")}

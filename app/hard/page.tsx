@@ -1,3 +1,4 @@
+import type { Metadata } from "next"
 import Link from "next/link"
 import {
   DEFAULT_GPU,
@@ -5,6 +6,7 @@ import {
   reportCardForBench,
 } from "@/app/_lib/models"
 import { loadModelIndex } from "@/app/_lib/models.server"
+import { SITE_URL } from "@/app/_lib/seo.server"
 import { HomeDecks, type HomeDeck } from "@/app/_components/home-decks"
 import { PageHead } from "@/app/_components/page-head"
 
@@ -12,10 +14,17 @@ import { PageHead } from "@/app/_components/page-head"
 // and active model rankings. Keep /hard as a frozen historical archive so
 // existing links from posts and articles remain readable.
 
-export const metadata = {
-  title: "Hard (deprecated) · kernelbench",
+export const metadata: Metadata = {
+  title: "KernelBench Hard (Deprecated Archive)",
   description:
-    "Archived KernelBench Hard results. KernelBench Hard is deprecated and superseded by Mega and CUDA.",
+    "Frozen historical archive of KernelBench Hard (6 per-op CUDA/Triton kernels on H100 PCIe and RTX PRO 6000), deprecated on 2026-11-23 and superseded by KernelBench Mega and KernelBench CUDA.",
+  alternates: { canonical: "/hard" },
+  openGraph: {
+    title: "KernelBench Hard (Deprecated Archive) · kernelbench.com",
+    description:
+      "Frozen historical archive of KernelBench Hard, superseded by KernelBench Mega and CUDA.",
+    url: `${SITE_URL}/hard`,
+  },
 }
 
 const HARD_TRACES_HF =
@@ -46,6 +55,19 @@ export default async function HardArchivePage() {
 
   return (
     <div className="space-y-8">
+      <script
+        type="application/ld+json"
+        dangerouslySetInnerHTML={{
+          __html: JSON.stringify({
+            "@context": "https://schema.org",
+            "@type": "BreadcrumbList",
+            itemListElement: [
+              { "@type": "ListItem", position: 1, name: "kernelbench.com", item: SITE_URL },
+              { "@type": "ListItem", position: 2, name: "Hard (archived)", item: `${SITE_URL}/hard` },
+            ],
+          }),
+        }}
+      />
       <PageHead
         kicker="Deprecated · Frozen Archive"
         title="KernelBench Hard"
