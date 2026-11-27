@@ -22,6 +22,9 @@ export const metadata: Metadata = {
   authors: [{ name: "Elliot Arledge", url: "https://elliotarledge.com" }],
   creator: "Elliot Arledge",
   publisher: "kernelbench.com",
+  verification: {
+    google: "6BuSZdNoranowl-wL23DBeHQeKda0-6czrIlUH28jC4",
+  },
   robots: {
     index: true,
     follow: true,
